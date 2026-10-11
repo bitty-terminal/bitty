@@ -247,3 +247,22 @@ fn help_subcommand_never_spawns_and_aliases_per_command_help() {
         "unknown help cmd must name valid commands, got {stderr:?}"
     );
 }
+
+#[test]
+fn help_with_unknown_flag_is_usage_error() {
+    // CodeRabbit 4240150291: `bitty help plugin --typo` records `--typo`
+    // in `unknown_flag` (the dash arm has no help handling), so the help
+    // branch must reject it (exit 2) instead of printing help (exit 0).
+    let output = run_bitty(&["help", "plugin", "--typo"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "help with unknown flag must be UsageError (exit 2), stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("unknown flag") && stderr.contains("--typo"),
+        "help unknown flag must name the flag, got {stderr:?}"
+    );
+}

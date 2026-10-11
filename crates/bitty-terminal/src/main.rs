@@ -355,6 +355,17 @@ fn ipc_serve_failure_exit(
     })
 }
 
+/// Whether to store the early-resolved IPC socket path on `Runtime` for PTY
+/// `BITTY_SOCKET` injection (CTX-1117, CodeRabbit 4240150294).
+///
+/// Headless never serves, so it never stores — except test mode, which takes
+/// precedence over headless and still serves IPC after spawning. Storing
+/// when `test_mode` is true (even with `headless`) ensures test-mode shells
+/// receive their instance's socket.
+fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
+    !headless || test_mode
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let args = parse_args(&raw);
@@ -436,6 +447,13 @@ fn main() {
     // program literally named `help` needs `bitty -- help ...`. Unknown
     // names fail closed (exit 2) naming valid commands.
     if args.help_word {
+        // CodeRabbit 4240150291: unknown dash-flags after `help` land in
+        // `unknown_flag` (the dash arm has no help handling), not
+        // `help_args`. Reject them here (exit 2) before printing help.
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!("bitty help: unknown flag '{flag}'\n{}", help_usage());
+            std::process::exit(2);
+        }
         if !args.help_args.is_empty() {
             eprintln!(
                 "bitty help: unexpected argument '{}'\n{}",
@@ -1022,13 +1040,15 @@ fn main() {
     // `PtyBuilder` injection (inherit wins when an outer value is present;
     // precedence `--socket` > `--instance` > `BITTY_SOCKET` /
     // `BITTY_INSTANCE_ID` > exactly-one-live, unchanged). Headless never
-    // serves, so it never stores (no misleading path). `BITTY_INSTANCE_ID`
+    // serves, so it never stores (no misleading path) — except test mode,
+    // which takes precedence over headless and still serves (see
+    // [`should_store_ipc_socket_path`]). `BITTY_INSTANCE_ID`
     // is documented for precedence only (see `ctl --help`); only the socket
     // path is injected. Fail-soft: an unresolvable base stores nothing
     // (same as the servo's fail-soft disable). No process-env mutation
     // (safe under `#![forbid(unsafe_code)]`): children get the socket via
     // explicit builder overrides, grandchildren via inheritance.
-    if !args.headless {
+    if should_store_ipc_socket_path(args.headless, args.test_mode) {
         let env = bitty_ipc::devtools::SocketEnv::from_process_env();
         if let Ok((path, _)) = bitty_ipc::devtools::resolve_socket_path_from_env(&env, None) {
             runtime.set_ipc_socket_path(path);

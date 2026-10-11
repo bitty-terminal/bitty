@@ -87,6 +87,14 @@ fn parse_help_subcommand_never_spawns() {
     assert!(!parsed.help_word);
     assert_eq!(parsed.program.as_deref(), Some("help"));
 
+    // CodeRabbit 4240150291: dash-flags after `help` land in `unknown_flag`
+    // (the dash arm has no help handling), so the help branch must reject
+    // them (exit 2) instead of printing help (exit 0).
+    let parsed = parse_args(&args_of(&["bitty", "help", "plugin", "--typo"]));
+    assert!(parsed.help_word);
+    assert_eq!(parsed.help_cmd.as_deref(), Some("plugin"));
+    assert_eq!(parsed.unknown_flag.as_deref(), Some("--typo"));
+
     // `bitty help` lists 16 subcommands (short help).
     let short = crate::cli::help_text_short(false);
     assert!(short.contains("help [cmd]"), "short help must list help");
@@ -118,6 +126,18 @@ fn parse_help_subcommand_never_spawns() {
     assert_eq!(crate::cli::help_canonical_cmd("ls"), Some("list"));
     assert_eq!(crate::cli::help_canonical_cmd("comp"), Some("completion"));
     assert_eq!(crate::cli::help_canonical_cmd("bogus"), None);
+}
+
+#[test]
+fn ipc_socket_path_stored_unless_headless_without_test_mode() {
+    // CodeRabbit 4240150294: test mode serves IPC even when headless
+    // (BITTY_HEADLESS=1 + --test-mode), so spawned shells must still
+    // receive BITTY_SOCKET. Headless alone never serves (no misleading
+    // path).
+    assert!(super::should_store_ipc_socket_path(false, false));
+    assert!(super::should_store_ipc_socket_path(false, true));
+    assert!(!super::should_store_ipc_socket_path(true, false));
+    assert!(super::should_store_ipc_socket_path(true, true));
 }
 
 #[test]

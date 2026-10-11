@@ -569,10 +569,15 @@ fn control_view_list_terminal_list_window_list_headless() {
 }
 
 #[test]
-fn panel_list_parses_like_other_lists() {
-    // CTX-1117: `panel list` parses with the same needs-live-instance
-    // semantics as other list verbs (rejects extra args and misplaced
-    // split/cwd options, same usage shape).
+fn panel_list_parses_but_stays_unadvertised_until_wired() {
+    // CTX-1145 (issue #1967): `panel list` parses with the same
+    // needs-live-instance semantics as other list verbs (rejects extra args
+    // and misplaced split/cwd options, same usage shape), but usage and help
+    // must NOT advertise it: the pinned `bitty-ipc` rev maps no scope for
+    // `bitty.debug/listPanels`, so both enqueue paths fail closed with
+    // `usage/NotFound` (unknown control method) before the drain ever reaches
+    // the `apply_control` inventory below. Re-advertise here once the verb is
+    // wired end to end (this issue tracks the verb; no separate filing).
     let (req, _) = parse_ctl_request(&words(&["panel", "list"])).expect("must parse");
     assert_eq!(req, CtlRequest::PanelList);
     assert_eq!(req.registry_id(), "core.panel.list");
@@ -582,10 +587,19 @@ fn panel_list_parses_like_other_lists() {
     assert!(parse_ctl_request(&words(&["panel", "list", "extra"])).is_err());
     assert!(parse_ctl_request(&words(&["panel", "list", "--right"])).is_err());
     assert!(parse_ctl_request(&words(&["panel", "list", "--cwd", "/tmp"])).is_err());
-    // Usage and help name the new verb.
-    assert!(ctl_usage().contains("panel list"));
-    assert!(ctl_help_text().contains("panel list"));
-    assert!(ctl_help_text().contains("core.panel.list"));
+    // Unadvertised until wired: neither usage nor help may name the verb.
+    assert!(
+        !ctl_usage().contains("panel list"),
+        "usage must not advertise panel list"
+    );
+    assert!(
+        !ctl_help_text().contains("panel list"),
+        "help must not advertise panel list"
+    );
+    assert!(
+        !ctl_help_text().contains("core.panel.list"),
+        "help must not advertise core.panel.list"
+    );
 }
 
 #[test]

@@ -41,12 +41,19 @@ pub struct CtlTargeting {
     pub format: CtlFormat,
 }
 
-/// Wire method for `ctl panel list` (CTX-1117, issue #1900).
+/// Wire method for the dormant `panel list` inventory (CTX-1117, issue
+/// #1900; unadvertised by CTX-1145, issue #1967).
 ///
 /// Local to `bitty-terminal` (the `bitty-ipc` pin predates it): the servo
 /// registers it additively on its owned `Dispatcher`, and the drain
 /// authorizes it as `view.inspect` (same as `view list`). Unix only; Windows
 /// stays fail-closed via the existing `ctl_roundtrip` stub.
+///
+/// Dormant until wired end to end: the pinned `bitty-ipc` rev maps no scope
+/// for this method, so both enqueue paths fail closed with `usage/NotFound`
+/// before the drain reaches the `apply_control` inventory. Usage and help
+/// must not name the verb until then (this issue tracks the verb; re-add the
+/// `panel list` lines to `ctl_usage`/`ctl_help_text` when live calls succeed).
 pub const METHOD_LIST_PANELS: &str = "bitty.debug/listPanels";
 
 /// One validated `bitty ctl` operation.
@@ -249,7 +256,6 @@ pub fn ctl_usage() -> String {
          \x20 instance list\n\
          \x20 window list\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
-         \x20 panel list\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
@@ -261,7 +267,6 @@ pub fn ctl_usage() -> String {
          \x20 bitty ctl instance list\n\
          \x20 bitty ctl terminal send t:1 \"cargo test\"\n\
          \x20 bitty ctl view split --right\n\
-         \x20 bitty ctl panel list\n\
          \x20 bitty ctl config reload",
     )
 }
@@ -291,7 +296,6 @@ pub fn ctl_help_text() -> String {
             instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
             window list                   core.window.list (view.inspect)\n  \
             view list                     core.view.list (view.inspect)\n  \
-            panel list                    core.panel.list (view.inspect; tiled panels with bounds/role)\n  \
             terminal list                 core.terminal.list (terminal.inspect)\n  \
             terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
             terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
@@ -318,7 +322,7 @@ pub fn ctl_help_text() -> String {
           \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
           \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
           \x20 All other verbs — including view split / view focus (view.manage)\n\
-          \x20 and workspace list / new / focus / move / rename / move-panel, panel list,\n\
+          \x20 and workspace list / new / focus / move / rename / move-panel,\n\
            \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
            \n\
            Send quoting (issue #1939): a bare CR needs ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r')); plain '\\r' sends literal backslash-r bytes (fish shows a shell continuation, not a bitty bug).\n\

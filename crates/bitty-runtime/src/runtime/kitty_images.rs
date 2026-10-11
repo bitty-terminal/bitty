@@ -532,6 +532,20 @@ impl Runtime {
     /// image therefore scrolls at most one screen instead of driving
     /// about 65k linefeeds per placement. In-budget placements (overflow
     /// within one screen) behave exactly as before.
+    ///
+    /// Oversize spans (#1954): kitty moves the cursor down by the full
+    /// placement rows and the screen scrolls to fit, so a
+    /// taller-than-viewport image ends with its bottom edge at the cursor
+    /// row and later text rows print below the blit. Counting only the
+    /// past-bottom overflow under-scrolls whenever the anchor sits above
+    /// the last row (the leading linefeeds walk the cursor down without
+    /// scrolling), leaving the bottom edge below the screen where every
+    /// later row prints underneath the image. The count is therefore the
+    /// full span minus one (kitty's `c->y += rows - 1`), budgeted by the
+    /// decoded pixel extent: genuine pixel rows scroll in full — work
+    /// proportional to the already-capped decode — while a declared-only
+    /// span (hostile `r=65535` on a 1x1 image) keeps the viewport cap.
+    /// The absolute ceiling still bounds everything.
     fn advance_cursor_past_placement(
         &mut self,
         cursor_col: u16,
@@ -548,16 +562,39 @@ impl Runtime {
 
         let effective_cols = if cols_c > 0 { cols_c } else { placement.cols };
         let effective_rows = if rows_r > 0 { rows_r } else { placement.rows };
+        let placed_image = placement.image;
         let new_col = cursor_col.saturating_add(effective_cols);
         let target_row = cursor_row.saturating_add(effective_rows);
         let viewport_rows = u16::try_from(self.state.height()).unwrap_or(u16::MAX);
         let max_row = viewport_rows.saturating_sub(1);
         if target_row > max_row {
-            let overflow = target_row - max_row;
+            // Natural (pixel-derived) cell rows of the decoded image: the
+            // scroll budget for genuine pixel spans. Zero pixel height or
+            // a missing image floors to one row (the viewport cap then
+            // governs, exactly as before); the cell side is non-zero by
+            // `CellMetrics` construction, guarded anyway so degenerate
+            // metrics fail closed instead of dividing by zero.
+            let cell_px = self.live_cell_metrics().height;
+            let natural_rows = self
+                .kitty_images
+                .get(placed_image)
+                .map(|stored| {
+                    if cell_px == 0 {
+                        1u16
+                    } else {
+                        stored
+                            .height
+                            .div_ceil(cell_px)
+                            .max(1)
+                            .min(u32::from(u16::MAX)) as u16
+                    }
+                })
+                .unwrap_or(1);
             let viewport_cap = viewport_rows.max(1);
-            let lines = overflow
-                .min(viewport_cap)
+            let budget = viewport_cap
+                .max(natural_rows)
                 .min(bitty_rich::KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT);
+            let lines = effective_rows.saturating_sub(1).min(budget);
             for _ in 0..lines {
                 self.state.apply(&bitty_vt::TerminalAction::PrintControl(
                     bitty_vt::ControlChar(0x0A),

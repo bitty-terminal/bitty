@@ -447,12 +447,20 @@ impl Runtime {
     /// Arms a transition for `surface` at `now`, returning whether it will
     /// animate (RFC-0002). `false` means the caller applies the end state
     /// immediately (instant, reduced motion, safe mode, or capacity).
+    ///
+    /// The single shared 8-surface budget spans core transitions and fx
+    /// pulses together (CTX-1139): a full pulse set refuses the next core
+    /// trigger exactly like a full core set refuses the next pulse.
     pub fn trigger_animation(
         &mut self,
         kind: AnimationKind,
         surface: Option<ViewId>,
         now: std::time::Instant,
     ) -> bool {
+        if self.animator.active_count(now) + self.fx.active_count(now) >= MAX_CONCURRENT_ANIMATIONS
+        {
+            return false;
+        }
         let armed = self.animator.trigger(kind, surface, now);
         if armed {
             // A new animation needs a frame even when no PTY bytes moved.
@@ -461,17 +469,54 @@ impl Runtime {
         armed
     }
 
-    /// Timer deadline for the next in-flight animation frame, if any
-    /// (RFC-0002 frame-on-demand: `None` when idle, so the app can sleep).
-    #[must_use]
-    pub fn animation_deadline(&self) -> Option<std::time::Instant> {
-        self.animator.next_deadline(std::time::Instant::now())
+    /// Arms a plugin-requested ring pulse for `surface` at `now` (CTX-1139,
+    /// DEC-0110).
+    ///
+    /// Returns `true` when a pulse is now active, or `false` when it was
+    /// instant (the policy gates resolve to 0 ms) or refused at the shared
+    /// capacity — in both cases the committed ring already holds the end
+    /// state. Callers must have validated `surface` against the live layout
+    /// (the fx drain does); an unknown id arms a pulse no present frame
+    /// will ever paint, so validate before calling.
+    pub fn trigger_fx_pulse(&mut self, surface: ViewId, now: std::time::Instant) -> bool {
+        let policy = self.config.animations;
+        let armed = self
+            .fx
+            .trigger(surface, now, &policy, self.animator.active_count(now));
+        if armed {
+            // A new pulse needs a frame even when no PTY bytes moved.
+            self.pending_full_redraw = true;
+        }
+        armed
     }
 
-    /// Whether any panel animation is currently active.
+    /// Eased progress `0..=1` of the active pulse on `surface`, or `None`
+    /// when that surface is not pulsing (CTX-1139).
+    #[must_use]
+    pub fn fx_progress(&self, surface: ViewId, now: std::time::Instant) -> Option<f32> {
+        self.fx.progress(surface, now)
+    }
+
+    /// Timer deadline for the next in-flight animation frame, if any
+    /// (RFC-0002 frame-on-demand: `None` when idle, so the app can sleep).
+    /// Fx pulses join the same gate (CTX-1139): a live pulse is a wakeup
+    /// source, a completed one schedules nothing.
+    #[must_use]
+    pub fn animation_deadline(&self) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        match (self.animator.next_deadline(now), self.fx.next_deadline(now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether any panel animation or fx pulse is currently active.
     #[must_use]
     pub fn animations_active(&self) -> bool {
-        self.animator.is_active(std::time::Instant::now())
+        let now = std::time::Instant::now();
+        self.animator.is_active(now) || self.fx.is_active(now)
     }
 
     /// Eased progress `0..=1` of an active transition, or `None` when that
@@ -586,16 +631,19 @@ impl Runtime {
     /// Advances the animation tracker and drops completed transitions
     /// (RFC-0002). Returns `true` when any transition expired this frame, so
     /// the caller presents exactly one final frame that commits the end state
-    /// (the next frame then idles).
+    /// (the next frame then idles). Fx pulses tick on the same seam
+    /// (CTX-1139): a just-completed pulse forces the final committed frame
+    /// exactly like a just-completed transition.
     pub(super) fn advance_animations(&mut self, now: std::time::Instant) -> bool {
         let expired = self.animator.tick(now);
+        let fx_expired = self.fx.tick(now);
         let before = self.closing_frames.len();
         self.closing_frames.retain(|cf| {
             self.animator
                 .progress(AnimationKind::Close, Some(cf.view), now)
                 .is_some()
         });
-        expired || self.closing_frames.len() != before
+        expired || fx_expired || self.closing_frames.len() != before
     }
 
     /// Decorated View frames in logical pixels for the current workspace

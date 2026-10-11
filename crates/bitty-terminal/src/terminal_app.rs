@@ -1234,6 +1234,9 @@ impl TerminalApp {
         // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
         // present, so the presented frame reflects the pin state.
         self.apply_plugin_pin_requests();
+        // CTX-1139: arm queued `bitty.fx.pulse` intents before present, so
+        // the presented frame reflects the pulse.
+        self.apply_plugin_fx_requests();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -2019,6 +2022,44 @@ impl TerminalApp {
                     format!(
                         "bitty: plugin pin request dropped (unknown panel id {})",
                         queued.panel_id
+                    )
+                });
+            }
+        }
+    }
+
+    /// Arms queued `bitty.fx.pulse` intents (CTX-1139, DEC-0110).
+    ///
+    /// Bounded by the plugin runtime's fx queue capacity. Each intent
+    /// revalidates its target against the live layout before arming the
+    /// Core-owned ring pulse through `Runtime::trigger_fx_pulse`, so plugin
+    /// and Core animation behaviour cannot drift. Fail-closed rules:
+    /// - an intent whose target is not a live leaf drops with a warning and
+    ///   state untouched (never arms a pulse no frame will paint);
+    /// - an intent refused at the shared 8-surface capacity or collapsed by
+    ///   an instant policy (disabled, reduced motion, safe mode) drops with
+    ///   a warning; the committed ring already holds the end state.
+    pub(crate) fn apply_plugin_fx_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let requests = plugin_runtime.drain_fx_pulses();
+        for queued in requests {
+            let id = ViewId::new(queued.view);
+            if !self.runtime.layout().leaf_ids().contains(&id) {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin fx request dropped (unknown view id {})",
+                        queued.view
+                    )
+                });
+                continue;
+            }
+            if !self.runtime.trigger_fx_pulse(id, std::time::Instant::now()) {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin fx request for view {} refused (instant or at capacity)",
+                        queued.view
                     )
                 });
             }

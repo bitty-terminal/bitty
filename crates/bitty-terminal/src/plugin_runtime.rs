@@ -871,4 +871,155 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         assert!(!state.is_live_leaf(ViewId::new(404)));
         assert!(!state.is_pinned(ViewId::new(1)));
     }
+
+    const FX_PROBE_COMMANDS: &[&str] = &["pulse", "pulse_unknown", "pulse_shape"];
+
+    const FX_PROBE: &str = r#"
+local function call(f, ...)
+  local ok, result = pcall(f, ...)
+  if ok then return "OK:" .. tostring(result) end
+  return "ERR:" .. result.code
+end
+
+bitty.commands.register({ id = "pulse", title = "Pulse", run = function()
+  return call(bitty.fx.pulse, 1) end })
+bitty.commands.register({ id = "pulse_unknown", title = "Pulse unknown", run = function()
+  return call(bitty.fx.pulse, 404) end })
+bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = function()
+  return call(bitty.fx.pulse, "1") end })
+"#;
+
+    fn write_fx_probe(root: &Path, id: &str, capabilities: &[&str]) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let qualified: Vec<String> = FX_PROBE_COMMANDS
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect();
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{capabilities_toml}[lazy]\ncommands = [{}]\nevents = []\n",
+                qualified.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), FX_PROBE).expect("init");
+    }
+
+    fn fx_test_app(tag: &str, id: &str, capabilities: &[&str]) -> crate::terminal_app::TerminalApp {
+        let root = pin_test_dir(tag);
+        write_fx_probe(&root, id, capabilities);
+        let live = two_leaf_runtime();
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            leaves: &leaves,
+            pinned: &pinned,
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
+            .expect("dev root must yield a session");
+        let pin_state = Rc::clone(&session.pin_state);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        crate::terminal_app::TerminalApp::with_theme(
+            live,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(session.runtime))
+        .with_live_pin_state(Some(pin_state))
+    }
+
+    /// Run the fx half of the app tick: the fx drain plus a queue-emptiness
+    /// proof, mirroring `drain_pin_tick` without the snapshot publish (the
+    /// fx drain validates against live state, not a published snapshot).
+    fn drain_fx_tick(app: &mut crate::terminal_app::TerminalApp) {
+        app.apply_plugin_fx_requests();
+        assert!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .fx_queue()
+                .borrow()
+                .is_empty(),
+            "the drain must consume every queued intent"
+        );
+    }
+
+    #[test]
+    fn startup_fx_pulse_arms_through_lua_verb_on_tick() {
+        // CTX-1139 prod path: activation shares the fx queue with
+        // `panel.focus` generations, so a granted `bitty.fx.pulse` from Lua
+        // queues and the tick drain arms the Core-owned pulse after
+        // revalidating the target against the live layout.
+        let mut app = fx_test_app("granted", "xuepoo.prodfx", &["panel.focus"]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodfx", "pulse"),
+            "OK:true",
+            "granted pulse queues"
+        );
+        assert!(
+            app.runtime
+                .fx_progress(ViewId::new(1), std::time::Instant::now())
+                .is_none(),
+            "nothing arms before the tick drain"
+        );
+        drain_fx_tick(&mut app);
+        assert!(
+            app.runtime
+                .fx_progress(ViewId::new(1), std::time::Instant::now())
+                .is_some(),
+            "the drain arms the pulse on the live leaf"
+        );
+        // An unknown id queues (acceptance is queued, not applied) and the
+        // drain drops it with state untouched.
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodfx", "pulse_unknown"),
+            "OK:true",
+            "unknown id still queues"
+        );
+        drain_fx_tick(&mut app);
+        assert!(
+            app.runtime
+                .fx_progress(ViewId::new(404), std::time::Instant::now())
+                .is_none(),
+            "a vanished target never arms"
+        );
+        // Shape errors fail closed before any grant or queue is touched.
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodfx", "pulse_shape"),
+            "ERR:E_DEF_INVALID"
+        );
+    }
+
+    #[test]
+    fn startup_fx_pulse_denied_without_panel_focus_grant() {
+        // Grant gating stays: without `panel.focus` the generation shares no
+        // queue and the call-time gate denies first, so the live runtime is
+        // never touched.
+        let mut app = fx_test_app("denied", "xuepoo.prodfxdenied", &[]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodfxdenied", "pulse"),
+            "ERR:E_CAPABILITY_DENIED"
+        );
+        drain_fx_tick(&mut app);
+        assert!(
+            app.runtime
+                .fx_progress(ViewId::new(1), std::time::Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)]
+        );
+    }
 }

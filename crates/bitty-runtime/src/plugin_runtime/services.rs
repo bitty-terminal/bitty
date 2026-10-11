@@ -30,6 +30,7 @@ use bitty_ui::{MAX_HINT_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_BINDINGS, MAX_
 use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
+use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
@@ -1182,6 +1183,10 @@ pub struct PluginServices {
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
     panel_pin_backend: RefCell<Option<PanelPinHandler>>,
+    /// Runtime-shared `bitty.fx.pulse` intent queue (CTX-1139). Shared at
+    /// activation only with `panel.focus` generations; `None` leaves granted
+    /// calls failing closed with `E_NOT_IMPLEMENTED`.
+    fx_requests: RefCell<Option<Rc<RefCell<FxPulseQueue>>>>,
 }
 
 impl PluginServices {
@@ -1236,6 +1241,7 @@ impl PluginServices {
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
             panel_pin_backend: RefCell::new(None),
+            fx_requests: RefCell::new(None),
         }
     }
 
@@ -1253,6 +1259,13 @@ impl PluginServices {
     /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
     pub fn set_panel_pin_backend(&self, backend: Option<PanelPinHandler>) {
         *self.panel_pin_backend.borrow_mut() = backend;
+    }
+
+    /// Attach the runtime-shared fx intent queue for `bitty.fx.pulse`
+    /// (CTX-1139). Without it a granted call fails closed with
+    /// `E_NOT_IMPLEMENTED`, like every other verb without a host.
+    pub fn set_fx_queue(&self, queue: Option<Rc<RefCell<FxPulseQueue>>>) {
+        *self.fx_requests.borrow_mut() = queue;
     }
 
     /// Grant `workspace.read` and/or `workspace.control` from the activation
@@ -2919,6 +2932,29 @@ impl HostServices for PluginServices {
         backend(panel_id, pinned)
     }
 
+    /// Enqueue one ring-pulse intent for `bitty.fx.pulse` (CTX-1139,
+    /// DEC-0110).
+    ///
+    /// Grant-gated on `panel.focus` (`E_CAPABILITY_DENIED` otherwise): the
+    /// pulse targets panel chrome, the same authority family as
+    /// `set_pinned`, so the slice adds no new capability. Returns whether
+    /// the bounded queue accepted the intent; acceptance means queued, not
+    /// applied — the application arms the Core-owned pulse on its next tick
+    /// after revalidating the target against the live layout. A full queue
+    /// returns `false`. Without a shared queue a granted call fails closed
+    /// with `E_NOT_IMPLEMENTED`.
+    fn fx_pulse(&self, view_id: u64) -> Result<bool, BridgeError> {
+        if !self.panel_focus_granted.get() {
+            return Err(BridgeError::capability_denied("panel.focus"));
+        }
+        let queue = self
+            .fx_requests
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.fx.pulse"))?;
+        Ok(queue.borrow_mut().push(QueuedFxPulse { view: view_id }))
+    }
+
     fn panel_get_state(&self, panel_id: u64) -> Result<Option<LuaValue>, BridgeError> {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
@@ -3158,6 +3194,55 @@ mod tests {
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
         let error = focus_only.panel_get_state(1).expect_err("unimplemented");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn fx_pulse_denies_without_grant() {
+        // CTX-1139: `bitty.fx.pulse` is deny-by-default on `panel.focus`,
+        // naming the capability exactly like the sibling panel verbs.
+        let denied = services();
+        let error = denied.fx_pulse(1).expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.message, "capability 'panel.focus' is not granted");
+        // Create-only does not imply the fx verb either.
+        let create_only = services();
+        create_only.set_panel_access(true, false);
+        let error = create_only.fx_pulse(1).expect_err("focus denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    #[test]
+    fn fx_pulse_granted_without_queue_is_not_implemented() {
+        // CTX-1139: a granted call without a shared queue fails closed with
+        // `E_NOT_IMPLEMENTED`, like every other verb without a host.
+        let granted = services();
+        granted.set_panel_access(false, true);
+        let error = granted.fx_pulse(1).expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn fx_pulse_enqueues_bounded_intents_fifo() {
+        // CTX-1139: granted calls enqueue raw view ids; overflow drops the
+        // newest, counts it, and reports `false`. The drain validates
+        // targets against live state, so enqueue carries no validation.
+        use crate::runtime::fx::FX_PULSE_QUEUE_CAPACITY;
+        let granted = services();
+        granted.set_panel_access(false, true);
+        granted.set_fx_queue(Some(Rc::new(RefCell::new(FxPulseQueue::new(2)))));
+        assert!(granted.fx_pulse(1).expect("first intent queues"));
+        assert!(granted.fx_pulse(404).expect("unknown id still queues"));
+        assert!(
+            !granted.fx_pulse(2).expect("overflow reports false"),
+            "a full queue refuses the newest intent"
+        );
+        let queue = granted.fx_requests.borrow().clone().expect("queue");
+        assert_eq!(queue.borrow().dropped(), 1);
+        assert_eq!(
+            queue.borrow_mut().drain(),
+            vec![QueuedFxPulse { view: 1 }, QueuedFxPulse { view: 404 }]
+        );
+        assert_eq!(FX_PULSE_QUEUE_CAPACITY, 16);
     }
 
     #[test]

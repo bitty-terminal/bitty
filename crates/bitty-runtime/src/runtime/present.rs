@@ -2722,10 +2722,23 @@ impl Runtime {
     ///
     /// Each advancing state steps through
     /// [`bitty_term_state::State::advance_kitty_animations`] (IMG-9 33ms
-    /// gap floor, at most 4 timed transitions, leftover dropped), which
-    /// damages exactly the changed images' spans and bumps the generation
-    /// only when something changed — a frozen animation costs the
+    /// gap floor, at most 4 timed transitions, leftover dropped), which is
+    /// pure descriptor math returning the changed wire ids. The tick then
+    /// batches each changed image's terminal-truth spans plus its rich
+    /// spans ([`Self::kitty_wire_spans_for`]) and finalizes once per
+    /// origin — a single damage path per tick with exactly one generation
+    /// bump when anything visible changed. A frozen animation costs the
     /// descriptor scan and never wakes the frame-on-demand present.
+    /// Empty and out-of-bounds spans damage nothing and bump nothing, and
+    /// untouched images gain no damage.
+    ///
+    /// Single-bump note (CTX-1122): the pre-fix tick bumped twice per
+    /// image (truth once in `State::advance`, again in
+    /// `damage_kitty_wire_for_origin`). Collapsing to one bump drops only
+    /// duplicate history batches: the S6 raster cache key binds the rich
+    /// image content generation (not this grid generation) and animation
+    /// ticks never scroll, so neither cache keys nor scroll regions
+    /// depend on the double bump.
     fn advance_kitty_animations_at(
         &mut self,
         now: std::time::Instant,
@@ -2756,8 +2769,25 @@ impl Runtime {
         let steps = bitty_term_state::KITTY_ANIM_MAX_STEPS_PER_TICK;
         if visible.contains(&None) && !alt_screens.contains(&None) {
             let changed = self.state.advance_kitty_animations(elapsed_ms, steps);
-            for id in changed {
-                self.damage_kitty_wire_for_origin(None, id);
+            if !changed.is_empty() {
+                let scrollback_now = self.state.scrollback_len();
+                let grid_width = self.state.width();
+                let grid_height = self.state.height();
+                let mut pushed = false;
+                for id in changed {
+                    pushed |= self.state.damage_kitty_image_batched(id);
+                    let spans = self.kitty_wire_spans_for(
+                        None,
+                        id,
+                        scrollback_now,
+                        grid_width,
+                        grid_height,
+                    );
+                    pushed |= self.state.damage_kitty_spans_batched(&spans);
+                }
+                if pushed {
+                    self.state.finalize_pending_damage();
+                }
             }
         }
         for origin in visible {
@@ -2769,8 +2799,38 @@ impl Runtime {
                 Some(sess) => sess.state.advance_kitty_animations(elapsed_ms, steps),
                 None => Vec::new(),
             };
+            if changed.is_empty() {
+                continue;
+            }
+            let (scrollback_now, grid_width, grid_height) =
+                match self.pane_sessions.get(&ViewId::new(token)) {
+                    Some(sess) => (
+                        sess.state.scrollback_len(),
+                        sess.state.width(),
+                        sess.state.height(),
+                    ),
+                    None => continue,
+                };
+            let mut pushed = false;
             for id in changed {
-                self.damage_kitty_wire_for_origin(Some(token), id);
+                if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                    pushed |= sess.state.damage_kitty_image_batched(id);
+                }
+                let spans = self.kitty_wire_spans_for(
+                    Some(token),
+                    id,
+                    scrollback_now,
+                    grid_width,
+                    grid_height,
+                );
+                if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                    pushed |= sess.state.damage_kitty_spans_batched(&spans);
+                }
+            }
+            if pushed {
+                if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
+                    sess.state.finalize_pending_damage();
+                }
             }
         }
     }

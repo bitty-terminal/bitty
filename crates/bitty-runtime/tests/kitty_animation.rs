@@ -355,6 +355,42 @@ fn partial_frame_with_base_stores_instead_of_mismatching() {
 }
 
 #[test]
+fn tick_damages_single_animating_image_exactly_once() {
+    // CTX-1122 (S1 follow-up): one animating image must damage once per
+    // tick with exactly one generation bump. The pre-fix path damaged
+    // truth spans twice (State::advance plus damage_kitty_wire) with
+    // duplicate rects and a double bump.
+    let mut rt = make_runtime();
+    running_two_frame(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let generation = rt.state().generation();
+    rt.tick_at(t0 + Duration::from_millis(40));
+    assert_eq!(rt.kitty_anim_current_frame(1), 2);
+    let bumped = rt.state().generation().saturating_sub(generation);
+    assert_eq!(
+        bumped, 1,
+        "one advancing image must bump generation exactly once per tick"
+    );
+    let regions = rt.state().damage_since(generation);
+    assert!(
+        !regions.is_empty(),
+        "advancing image must leave damage for the frame"
+    );
+    for region in &regions {
+        match region {
+            bitty_term_state::DamagedRegion::Grid(rect) => assert!(
+                rect.bottom < 2,
+                "damage must stay inside the animating rows 0..1, got {rect:?}"
+            ),
+            bitty_term_state::DamagedRegion::Scrollback { .. } => {
+                panic!("advance must not scroll, got {region:?}")
+            }
+        }
+    }
+}
+
+#[test]
 fn damage_scopes_to_animating_placements_only() {
     let mut rt = make_runtime();
     // Wire 1 animates on rows 0..1; wire 2 sits static on rows 2..3.

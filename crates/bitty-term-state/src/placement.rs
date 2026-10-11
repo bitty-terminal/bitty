@@ -920,9 +920,9 @@ impl PlacementStore {
     /// `Running` ones wrap against their loop budget. Returns the wire
     /// image ids whose current frame changed (bounded by
     /// [`KITTY_ANIM_MAX_IMAGES`]), oldest descriptor first. Pure
-    /// descriptor math: no clocks, no I/O, no damage — the caller
-    /// ([`crate::State::advance_kitty_animations`]) damages the changed
-    /// images.
+    /// descriptor math: no clocks, no I/O, no damage — the present tick
+    /// batches the changed images' truth plus rich spans and finalizes
+    /// once (CTX-1122 single damage path).
     pub fn advance_animations(&mut self, elapsed_ms: u64, max_steps: u32) -> Vec<u32> {
         let mut changed = Vec::new();
         for (id, anim) in &mut self.animations {

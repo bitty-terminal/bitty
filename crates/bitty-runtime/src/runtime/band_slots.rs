@@ -14,7 +14,6 @@
 //! |--------------|--------------------------------------------------------|
 //! | `top`        | top edge band                                          |
 //! | `bottom`     | bottom edge band                                       |
-//! | `statusline` | bottom edge band ("Core places on the bottom band")    |
 //! | `left`       | left edge band — stored, not painted until vertical bands ship |
 //! | `right`      | right edge band — stored, not painted until vertical bands ship |
 //! | `tabline`    | rejected: reserved for PW-10 panel tabs, not a band surface |
@@ -29,8 +28,7 @@
 //!
 //! Stacking: within one edge, surfaces stack from the window edge inward
 //! (index `0` is outermost) in plugin id byte order; mount order never
-//! affects placement, and `statusline` and `bottom` surfaces share one
-//! ordering. The `chrome.<edge>.order` key is not yet wired into the runtime.
+//! affects placement. The `chrome.<edge>.order` key is not yet wired into the runtime.
 //!
 //! CTX-0979: Core draws no workspace display (Hyprland-style). Plugin bands
 //! stack from the window edge inward with no Core reservation; see
@@ -46,9 +44,9 @@
 //!
 //! - Known divergence from the candidate rule "one plugin may hold at most
 //!   one surface per edge; a second mount on the same edge fails": several
-//!   mounts from one plugin on one edge (for example `statusline` and
-//!   `bottom`) are all kept and stack in mount order. Enforcing the candidate
-//!   rule later is a deliberate behavior change, not a regression.
+//!   mounts from one plugin on one edge are all kept and stack in mount
+//!   order. Enforcing the candidate rule later is a deliberate behavior
+//!   change, not a regression.
 
 use bitty_lua::host::BridgeError;
 pub use bitty_lua::host::E_UI_UNAVAILABLE;
@@ -89,7 +87,7 @@ pub enum UiSlotPlacement {
 pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
     match slot {
         UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
-        UiSlot::Bottom | UiSlot::Statusline => UiSlotPlacement::Band(BandEdge::Bottom),
+        UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
         UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
         UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
         UiSlot::Tabline => UiSlotPlacement::Unsupported(
@@ -225,7 +223,7 @@ mod tests {
         for slot in UiSlot::ALL {
             let expected = match slot {
                 UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
-                UiSlot::Bottom | UiSlot::Statusline => UiSlotPlacement::Band(BandEdge::Bottom),
+                UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
                 UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
                 UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
                 UiSlot::Overlay => UiSlotPlacement::Overlay,
@@ -246,7 +244,7 @@ mod tests {
         let (bands, unplaced) = ChromeBands::from_mounts([
             block("a", UiSlot::Top),
             block("b", UiSlot::Bottom),
-            block("c", UiSlot::Statusline),
+            block("c", UiSlot::Bottom),
             block("d", UiSlot::Left),
             block("e", UiSlot::Right),
         ]);
@@ -261,7 +259,7 @@ mod tests {
         assert_eq!(ids(BandEdge::Top), [("a", UiSlot::Top)]);
         assert_eq!(
             ids(BandEdge::Bottom),
-            [("b", UiSlot::Bottom), ("c", UiSlot::Statusline)]
+            [("b", UiSlot::Bottom), ("c", UiSlot::Bottom)]
         );
         assert_eq!(ids(BandEdge::Left), [("d", UiSlot::Left)]);
         assert_eq!(ids(BandEdge::Right), [("e", UiSlot::Right)]);
@@ -287,9 +285,9 @@ mod tests {
     #[test]
     fn stacking_is_plugin_id_order_independent_of_mount_order() {
         let (bands, _) = ChromeBands::from_mounts([
-            block("zeta", UiSlot::Statusline),
+            block("zeta", UiSlot::Bottom),
             block("alpha", UiSlot::Bottom),
-            block("mid", UiSlot::Statusline),
+            block("mid", UiSlot::Bottom),
         ]);
         let order: Vec<_> = bands.bottom.iter().map(|b| b.plugin_id.as_str()).collect();
         assert_eq!(order, ["alpha", "mid", "zeta"]);

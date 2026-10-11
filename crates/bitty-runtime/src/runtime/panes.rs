@@ -523,6 +523,10 @@ impl Runtime {
         // keep occupying the shared image/byte caps (S5 refuses cross-origin
         // eviction, so leaked slots would block other origins).
         self.kitty_images.retire_origin(Some(view.0));
+        // Delete-wins sequencing (CTX-1110 fix pass): a respawn reuses the
+        // same `ViewId`, so pending completions stamped before the retire
+        // must drop instead of landing on the fresh session's grid.
+        self.bump_kitty_local_delete_epoch(Some(view.0));
         // S6 (#1849): the retired origin's images and placements are gone,
         // so their cached blits are dead budget; drop them.
         self.invalidate_kitty_raster_cache();
@@ -810,6 +814,10 @@ impl Runtime {
         // image pixels (origin tokens are `ViewId.0` values) and the dead
         // session's stored images stop occupying the shared caps.
         self.kitty_images.retire_origin(Some(view.0));
+        // Delete-wins sequencing (CTX-1110 fix pass): the generation
+        // survives the retire (never pruned), so a later leaf reusing this
+        // numeric id cannot accept a completion stamped before the close.
+        self.bump_kitty_local_delete_epoch(Some(view.0));
         // S6 (#1849): the retired origin's images and placements are gone,
         // so their cached blits are dead budget; drop them.
         self.invalidate_kitty_raster_cache();

@@ -694,6 +694,94 @@ impl Runtime {
         })
     }
 
+    /// Owned display at an explicit enqueue-time anchor (CTX-1110 fix pass,
+    /// CodeRabbit Major #3, async local-medium completions only).
+    ///
+    /// Identical to [`Self::kitty_display_image_owned_with_wire`] except the
+    /// blit anchors at (`anchor_col`, `anchor_row`, `scrollback_base`)
+    /// captured when the APC drained — not at the live cursor when the
+    /// worker finishes — and the post-placement cursor advance starts from
+    /// that same anchor. This reproduces the sync order (place at the APC
+    /// cursor, then advance past the image) even when prompt or output text
+    /// drained after the enqueue moved the live cursor. Callers on the
+    /// synchronous direct path keep the live-cursor variant above.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_image_owned_with_wire_at_anchor(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        action_a: Option<char>,
+        cols_c: u16,
+        rows_r: u16,
+        cursor_movement_c: u8,
+        payload: Box<[u8]>,
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+        anchor_col: u16,
+        anchor_row: u16,
+        scrollback_base: usize,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        let action = bitty_rich::KittyAction::from_a(action_a);
+        let alt_active = self.state.alt_screen_active();
+        if action.displays() && !alt_active {
+            self.kitty_images
+                .check_placement_quota_for_origin(self.kitty_origin)
+                .map_err(KittyImageError::Placement)?;
+        }
+        let compressed_len = payload.len();
+        let image =
+            self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        self.kitty_images.set_wire_image(image, wire_image);
+        if alt_active {
+            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
+        }
+        if !action.displays() {
+            return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
+                KittyDisplayOutcome::Stored { image }
+            } else {
+                KittyDisplayOutcome::StoredNotDisplayed { image }
+            });
+        }
+        let metrics = self.live_cell_metrics();
+        let rich_metrics = bitty_rich::CellMetrics {
+            width: metrics.width,
+            height: metrics.height,
+        };
+        let placement_id = self
+            .kitty_images
+            .display_for_origin_with_wire(
+                image,
+                anchor_col,
+                anchor_row,
+                cols_c,
+                rows_r,
+                rich_metrics,
+                scrollback_base,
+                z,
+                self.kitty_origin,
+                wire_image,
+                wire_placement,
+            )
+            .map_err(KittyImageError::Placement)?;
+        self.pending_full_redraw = true;
+
+        if cursor_movement_c != 1 {
+            self.advance_cursor_past_placement(
+                anchor_col,
+                anchor_row,
+                cols_c,
+                rows_r,
+                placement_id,
+            );
+        }
+
+        Ok(KittyDisplayOutcome::Displayed {
+            image,
+            placement: placement_id,
+        })
+    }
     /// Decodes, stores and registers a `U=1` virtual prototype with owned
     /// payload (S4, #1849).
     ///
@@ -778,6 +866,66 @@ impl Runtime {
                 width,
                 height,
                 base,
+            )
+            .map_err(KittyImageError::Placement)?;
+        Ok(KittyDisplayOutcome::VirtualPrototype { image })
+    }
+
+    /// Owned virtual-prototype registration at an explicit enqueue-time
+    /// scrollback base (CTX-1110 fix pass, CodeRabbit Major #3, async
+    /// local-medium completions only).
+    ///
+    /// Identical to [`Self::kitty_display_virtual_owned_with_wire`] except
+    /// the prototype registers against `scrollback_base` captured when the
+    /// APC drained, so the runs stay glued to the content they arrived with
+    /// even when later output scrolled the grid before the worker finished.
+    /// The cursor never advances for virtual prototypes in either variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_display_virtual_owned_with_wire_at_base(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        cols_c: u16,
+        rows_r: u16,
+        payload: Box<[u8]>,
+        wire_image: u32,
+        wire_placement: u32,
+        has_parent: bool,
+        scrollback_base: usize,
+    ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        self.kitty_images
+            .check_virtual_quota_for_origin(self.kitty_origin)
+            .map_err(KittyImageError::Placement)?;
+        let compressed_len = payload.len();
+        let image =
+            self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
+        self.kitty_images.set_wire_image(image, wire_image);
+        if self.state.alt_screen_active() {
+            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
+        }
+        if has_parent || (cols_c == 0 && rows_r == 0) {
+            return Ok(KittyDisplayOutcome::Stored { image });
+        }
+        let origin = self.kitty_origin;
+        let (width, height) = {
+            let stored = self
+                .kitty_images
+                .get(image)
+                .expect("image just stored must exist");
+            (stored.width, stored.height)
+        };
+        self.kitty_images
+            .register_virtual_for_origin(
+                origin,
+                wire_image,
+                wire_placement,
+                Some(image),
+                cols_c,
+                rows_r,
+                width,
+                height,
+                scrollback_base,
             )
             .map_err(KittyImageError::Placement)?;
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
@@ -982,7 +1130,9 @@ impl Runtime {
         control: bitty_vt::KittyControlKeys,
         action: &TerminalAction,
     ) -> Result<(), KittyImageError> {
-        let wire = self
+        // Wire check first (preserves the S1 refusal for unresolvable ids
+        // on gap edits too): the value itself is only needed for `r=0`.
+        let _wire = self
             .kitty_wire_target(control.image_id, control.image_number)
             .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
         if rows_r != 0 {
@@ -1007,17 +1157,45 @@ impl Runtime {
             }
             return Ok(());
         }
-        // New frame (`r=0`): resolve the root before any decode work, so
-        // homeless frames fail fast without allocating.
+        // New frame (`r=0`): direct payloads decode in place; local
+        // mediums read first (bounded, fail closed). Both share the
+        // bytes-ingest half below so the async worker (CTX-1110) reuses
+        // the identical decode/append/truth path with worker bytes.
+        if control.medium.is_direct() {
+            return self
+                .kitty_ingest_frame_bytes(format_f, width_s, height_v, payload, &control, action);
+        }
+        let read = self.read_frame_medium(format_f, width_s, height_v, payload, &control)?;
+        self.kitty_ingest_frame_bytes(format_f, width_s, height_v, &read, &control, action)
+    }
+
+    /// Ingests one `r=0` frame from already-available bytes (CTX-1110
+    /// completion seam over the S1 pixel half).
+    ///
+    /// Shared by [`Self::kitty_ingest_frame`] (direct payloads, or local
+    /// reads just finished synchronously) and the async local-medium
+    /// worker completion (worker bytes): resolves the wire target, decodes
+    /// and appends (full or composited partial canvas), then records the
+    /// truth gap on pixel success. Failures store nothing and record
+    /// nothing.
+    pub(super) fn kitty_ingest_frame_bytes(
+        &mut self,
+        format_f: u32,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+        bytes: &[u8],
+        control: &bitty_vt::KittyControlKeys,
+        action: &TerminalAction,
+    ) -> Result<(), KittyImageError> {
+        let wire = self
+            .kitty_wire_target(control.image_id, control.image_number)
+            .ok_or(KittyImageError::NoAnimationTarget(control.image_id))?;
+        // Resolve the root before any decode work, so homeless frames fail
+        // fast without allocating.
         let root = self
             .kitty_images
             .find_root_for_origin(self.kitty_origin, wire)
             .ok_or(KittyImageError::NoAnimationTarget(wire))?;
-        let bytes: &[u8] = if control.medium.is_direct() {
-            payload
-        } else {
-            &self.read_frame_medium(format_f, width_s, height_v, payload, &control)?
-        };
         // Borrowed decode (the caller keeps the wire bytes): admission is
         // for frame arrivals (rare control-plane events), not the hot
         // display path, so the owned zero-copy seam stays display-only.
@@ -1233,6 +1411,12 @@ impl Runtime {
         image_id: u32,
         placement_id: Option<u32>,
     ) -> usize {
+        // Delete-wins sequencing (CTX-1110 fix pass): advance the origin's
+        // delete generation even when nothing is stored yet (removed 0) —
+        // a transmit pending on a hung filesystem completes after this
+        // delete, and its stale completion must drop instead of
+        // resurrecting the image.
+        self.bump_kitty_local_delete_epoch(self.kitty_origin);
         let removed = self
             .kitty_images
             .delete_by_wire(self.kitty_origin, image_id, placement_id);

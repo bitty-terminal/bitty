@@ -22,6 +22,21 @@ fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
 }
 
+/// Drains the CTX-1110 async local-medium worker until no slots pend
+/// (fast disks settle in milliseconds; the bound keeps CI hermetic).
+/// Every local-medium test pumps after feeding PTY bytes because reads no
+/// longer complete inside `handle_pty_bytes`.
+fn pump_settled(rt: &mut Runtime) {
+    for _ in 0..200 {
+        rt.pump_kitty_local_completions();
+        if rt.kitty_local_pending_count() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    rt.pump_kitty_local_completions();
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Test-owned scratch directory under the OS temp dir (never a user file).
@@ -108,10 +123,55 @@ fn file_valid_raw_stores_places_and_paints() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&seq);
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 1);
     assert!(rt.tick().is_some());
     assert_eq!(rt.kitty_last_frame_images(), 1);
+    // `t=f` never deletes: the fixture stays for its owner.
+    assert!(file.is_file(), "t=f must not delete the source file");
+
+    remove_tree_best_effort(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn alt_screen_local_transmit_stores_despite_ticks() {
+    // Alt-epoch fix (CTX-1110, CodeRabbit Major): the paint path bumped
+    // the origin delete epoch on every presented frame while alt was
+    // active, so a tick running before the worker finished advanced the
+    // epoch past the request stamp and the completion dropped silently
+    // (for `t=t`/`t=s` after already unlinking). The epoch now bumps once
+    // on alt entry (latch diff in `collect_tick_basis`), so an alt-screen
+    // transmit stamps the post-entry generation and still stores
+    // (suppressed: no placement while alt is active).
+    let root = temp_root("alt-transmit");
+    let file = root.join("img.bin");
+    std::fs::write(&file, red_2x2_rgba()).expect("fixture must write");
+
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+    assert!(rt.state().alt_screen_active());
+    assert!(rt.tick().is_some(), "alt entry must present");
+    // Transmit while alt is active.
+    rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=f,m=0;", &path_bytes(&file)));
+    // Force a present while the worker is in flight: the completion is
+    // only pumped below, so this tick runs first either way. With the old
+    // per-frame bump it advanced the epoch past the request stamp and the
+    // store dropped; now the epoch is stable and the store lands.
+    rt.handle_pty_bytes(b"x");
+    assert!(rt.tick().is_some());
+    pump_settled(&mut rt);
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "alt-screen local transmit must store"
+    );
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "alt-screen display stays suppressed (stored, not placed)"
+    );
     // `t=f` never deletes: the fixture stays for its owner.
     assert!(file.is_file(), "t=f must not delete the source file");
 
@@ -133,6 +193,7 @@ fn file_traversal_refused_without_touching_filesystem() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", evil.as_bytes()));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
     assert!(!Path::new(&evil).exists() || Path::new(&evil).starts_with(&root));
@@ -150,6 +211,7 @@ fn temp_missing_marker_refused_and_kept() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=t,m=0;", &path_bytes(&file)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
     assert!(file.is_file(), "refused t=t must not delete");
@@ -169,6 +231,7 @@ fn temp_valid_deletes_after_read_and_places() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=32,s=1,v=1,t=t,m=0;", &path_bytes(&file)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 1);
     assert!(!file.exists(), "t=t must delete after reading");
@@ -183,6 +246,7 @@ fn name_nul_refused() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", &name));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 }
@@ -200,11 +264,13 @@ fn offset_out_of_range_refused() {
         "Gf=32,s=2,v=2,t=f,O=4294967295,S=16,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     rt.handle_pty_bytes(&apc_with_path(
         "Gf=32,s=2,v=2,t=f,O=64,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
 
     remove_tree_best_effort(&root);
@@ -224,6 +290,7 @@ fn oversize_file_refused_pre_read() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", &path_bytes(&file)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 
@@ -236,6 +303,7 @@ fn directory_refused_as_not_regular_file() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", &path_bytes(&root)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 
@@ -254,6 +322,7 @@ fn symlink_refused_without_following() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=f,m=0;", &path_bytes(&link)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0, "O_NOFOLLOW must refuse symlinks");
     assert_eq!(rt.kitty_placement_count(), 0);
     assert_eq!(
@@ -281,6 +350,7 @@ fn fifo_refused_without_hanging() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", &path_bytes(&fifo)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
 
@@ -303,6 +373,7 @@ fn offset_size_slice_selects_bytes() {
         "Gf=32,s=2,v=1,t=f,O=4,S=8,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 1);
 
@@ -319,6 +390,7 @@ fn shm_bad_shape_refused() {
     ] {
         let mut rt = make_runtime();
         rt.handle_pty_bytes(&apc_with_path("Gf=100,t=s,m=0;", bad));
+        pump_settled(&mut rt);
         assert_eq!(rt.kitty_image_count(), 0, "bad shm shape {bad:?}");
         assert_eq!(rt.kitty_placement_count(), 0);
     }
@@ -343,6 +415,7 @@ fn shm_valid_roundtrip_unlinks_after_read() {
         "Gf=32,s=1,v=1,t=s,m=0;",
         wire_name.as_bytes(),
     ));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 1);
     assert!(!shm_path.exists(), "t=s must unlink after reading");
@@ -359,6 +432,7 @@ fn query_missing_file_answers_einval_and_honors_quiet() {
         "Gf=100,t=f,a=q,i=31,q=0,m=0;",
         &path_bytes(&missing),
     ));
+    pump_settled(&mut rt);
     let replies: Vec<Vec<u8>> = rt.take_replies().iter().map(|r| r.to_vec()).collect();
     assert_eq!(replies, vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()]);
     assert_eq!(rt.kitty_image_count(), 0);
@@ -368,6 +442,7 @@ fn query_missing_file_answers_einval_and_honors_quiet() {
         "Gf=100,t=f,a=q,i=31,q=2,m=0;",
         &path_bytes(&missing),
     ));
+    pump_settled(&mut rt);
     assert!(rt.take_replies().is_empty(), "q=2 suppresses failures");
     assert_eq!(rt.kitty_image_count(), 0);
 
@@ -386,6 +461,7 @@ fn query_valid_file_answers_ok_and_stores_nothing() {
         "Gf=100,t=f,a=q,i=31,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     let replies: Vec<Vec<u8>> = rt.take_replies().iter().map(|r| r.to_vec()).collect();
     assert_eq!(replies, vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
     assert_eq!(rt.kitty_image_count(), 0, "probes never store");
@@ -405,12 +481,14 @@ fn file_transmit_refused_when_store_full() {
     let mut rt = make_runtime();
     for _ in 0..64 {
         rt.handle_pty_bytes(b"\x1b_Gf=32,s=1,v=1,a=t,m=0;AAAAAA==\x1b\\");
+        pump_settled(&mut rt);
     }
     assert_eq!(rt.kitty_image_count(), 64);
     rt.handle_pty_bytes(&apc_with_path(
         "Gf=32,s=1,v=1,a=t,t=f,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     assert_eq!(
         rt.kitty_image_count(),
         64,
@@ -427,9 +505,11 @@ fn local_mediums_denied_on_windows() {
     // every local medium fails closed with nothing stored.
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=f,m=0;", b"C:\\Temp\\img.png"));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
     rt.handle_pty_bytes(&apc_with_path("Gf=100,t=s,m=0;", b"/shm"));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
 }
 
@@ -444,6 +524,7 @@ fn file_valid_denied_on_windows_keeps_file() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=32,s=2,v=2,t=f,m=0;", &path_bytes(&file)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
     assert!(file.is_file(), "denied t=f must not delete");
@@ -466,6 +547,7 @@ fn temp_valid_denied_on_windows_keeps_file() {
 
     let mut rt = make_runtime();
     rt.handle_pty_bytes(&apc_with_path("Gf=32,s=1,v=1,t=t,m=0;", &path_bytes(&file)));
+    pump_settled(&mut rt);
     assert_eq!(rt.kitty_image_count(), 0);
     assert_eq!(rt.kitty_placement_count(), 0);
     assert!(file.is_file(), "denied t=t must not delete");
@@ -487,6 +569,7 @@ fn query_valid_file_denied_on_windows_answers_einval() {
         "Gf=100,t=f,a=q,i=31,m=0;",
         &path_bytes(&file),
     ));
+    pump_settled(&mut rt);
     let replies: Vec<Vec<u8>> = rt.take_replies().iter().map(|r| r.to_vec()).collect();
     assert_eq!(replies, vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()]);
     assert_eq!(rt.kitty_image_count(), 0, "probes never store");

@@ -133,6 +133,7 @@ pub mod click;
 pub mod close_confirm;
 pub mod copy_mode;
 pub mod cw_live;
+pub mod fx;
 pub mod help;
 pub mod input;
 pub mod kitty_file;
@@ -163,6 +164,9 @@ pub mod workspaces;
 pub use self::animations::{
     AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame, MAX_CONCURRENT_ANIMATIONS,
     PanelAnimator, ReducedMotionMode,
+};
+pub use self::fx::{
+    FX_PULSE_DURATION_MS, FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, FxPulseTracker, QueuedFxPulse,
 };
 pub use self::kitty_file::KittyLocalReadError;
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
@@ -792,6 +796,15 @@ pub struct Runtime {
     /// a completed animation schedules no further wakeups. See
     /// [`crate::runtime::animations`].
     animator: PanelAnimator,
+    /// Plugin-requested chrome-ring pulses (CTX-1139, DEC-0110).
+    ///
+    /// Presentation-only Core-owned fade hints drained from the bounded fx
+    /// intent queue. Shares the single 8-surface budget with `animator`
+    /// (enforced bidirectionally at both trigger sites). Never grid truth;
+    /// frame-on-demand is preserved because `is_active`/`next_deadline`
+    /// join the present-path gates and a completed pulse schedules no
+    /// further wakeups. See [`crate::runtime::fx`].
+    fx: FxPulseTracker,
     /// Frames retained for an in-flight close transition (RFC-0002).
     ///
     /// A removed `View` has no allocation to paint from, so its last presented
@@ -1573,6 +1586,7 @@ impl Runtime {
             border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
+            fx: FxPulseTracker::new(),
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,
@@ -1830,6 +1844,7 @@ impl Runtime {
             border_drag: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
+            fx: FxPulseTracker::new(),
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,

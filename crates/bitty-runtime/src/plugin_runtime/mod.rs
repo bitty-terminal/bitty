@@ -50,6 +50,7 @@ use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{LazyCommand, PluginId, PluginManifest};
 use bitty_plugin_host::{validate_interface_schema, value_satisfies_schema};
 
+pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
 pub use bitty_lua::{
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
@@ -581,6 +582,12 @@ pub struct PluginRuntime {
     /// by the application each tick
     /// ([`PluginRuntime::drain_panel_pin_requests`]).
     panel_pin_requests: Rc<RefCell<PanelPinQueue>>,
+    /// CTX-1139: bounded queue of `bitty.fx.pulse` intents, drained by the
+    /// application each tick ([`PluginRuntime::drain_fx_pulses`]). The drain
+    /// revalidates each intent against the live layout and arms the
+    /// Core-owned ring pulse; refused, instant, or vanished intents drop
+    /// with state untouched.
+    fx_requests: Rc<RefCell<FxPulseQueue>>,
     /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
@@ -648,6 +655,7 @@ impl PluginRuntime {
             ))),
             panel_pin_backend: None,
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
+            fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
@@ -812,6 +820,31 @@ impl PluginRuntime {
     #[must_use]
     pub fn panel_pin_requests_dropped(&self) -> u64 {
         self.panel_pin_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared fx intent queue handle (CTX-1139).
+    ///
+    /// Shared with every activated generation that holds `panel.focus`, so
+    /// granted `bitty.fx.pulse` calls from `panel.focus` generations enqueue
+    /// here. Diagnostics and tests read the live queue through this handle.
+    #[must_use]
+    pub fn fx_queue(&self) -> &Rc<RefCell<FxPulseQueue>> {
+        &self.fx_requests
+    }
+
+    /// Drain queued `bitty.fx.pulse` intents in FIFO order (CTX-1139).
+    ///
+    /// The application arms each intent on its own thread through
+    /// `Runtime::trigger_fx_pulse`, revalidating the target against the live
+    /// layout first. Bounded by [`FX_PULSE_QUEUE_CAPACITY`].
+    pub fn drain_fx_pulses(&mut self) -> Vec<QueuedFxPulse> {
+        self.fx_requests.borrow_mut().drain()
+    }
+
+    /// Fx intents dropped by queue overflow since creation.
+    #[must_use]
+    pub fn fx_requests_dropped(&self) -> u64 {
+        self.fx_requests.borrow().dropped()
     }
 
     /// Runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -1320,6 +1353,13 @@ impl PluginRuntime {
         // keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
         if panel_focus {
             plugin_services.set_panel_pin_backend(self.panel_pin_backend.clone());
+        }
+        // CTX-1139: the `bitty.fx.pulse` intent queue. Shared only with
+        // `panel.focus` generations (no queue without grant); the call-time
+        // grant gate in `fx_pulse` stays as the second layer. Without it a
+        // granted call fails closed with `E_NOT_IMPLEMENTED`.
+        if panel_focus {
+            plugin_services.set_fx_queue(Some(self.fx_requests.clone()));
         }
         plugin_services.set_granted_capabilities(
             granted

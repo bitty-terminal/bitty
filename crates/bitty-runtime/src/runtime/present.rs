@@ -636,9 +636,19 @@ impl Runtime {
                         motion_factor *= p.clamp(0.0, 1.0);
                     }
                 }
+                // CTX-1139 (DEC-0110): a plugin-requested ring pulse fades
+                // the same Core-owned ring from transparent to its committed
+                // color over the fixed fx duration. Only this Core-owned
+                // alpha moves; geometry and terminal content are never
+                // interpolated, and the factor is the final `1.0` when no
+                // pulse is active on this view.
+                let fx_factor = self
+                    .fx_progress(view_id, ctx.now)
+                    .map(|p| p.clamp(0.0, 1.0))
+                    .unwrap_or(1.0);
                 let ring_color = bitty_render::grid::scale_alpha(
                     animated_color,
-                    open_factor * ctx.workspace_factor * motion_factor,
+                    open_factor * ctx.workspace_factor * motion_factor * fx_factor,
                 );
                 combined_rounded.push(bitty_render::grid::RoundedFill {
                     frame: ring_frame,
@@ -1154,7 +1164,9 @@ impl Runtime {
         let expired_animations = self.advance_animations(now);
         let active_workspace = self.active_workspace_index();
         self.detect_panel_animations(&allocations, focused, active_workspace, now);
-        let animations_active = self.animator.is_active(now);
+        // CTX-1139: a live fx pulse is presentation-only chrome motion on the
+        // same footing as a live transition — it forces the frame.
+        let animations_active = self.animator.is_active(now) || self.fx.is_active(now);
         if animations_active || expired_animations {
             // A live (or just-completed) animation is a presentation-only
             // change: force the full per-leaf path for this frame.

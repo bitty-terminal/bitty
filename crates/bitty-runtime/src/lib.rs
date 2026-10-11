@@ -252,12 +252,13 @@ pub use runtime::workspaces::{
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, BandContent, ChromeBands,
     ClosingFrame, DEFAULT_PASTE_CONFIRM_TIMEOUT, DEFAULT_PLUGIN_DROP_POLICY,
-    DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation,
+    DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY, FX_PULSE_DURATION_MS,
+    FX_PULSE_QUEUE_CAPACITY, FileUrlActivation, FxPulseQueue, FxPulseTracker,
     IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome, KittyImageError,
     MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
     POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PTY_FORWARD_CAPACITY_CHUNKS,
-    PanelAnimator, PresentStats, PtyWaker, ReducedMotionMode, Runtime, SYNC_UPDATE_DEFER_TIMEOUT,
-    UrlActivation,
+    PanelAnimator, PresentStats, PtyWaker, QueuedFxPulse, ReducedMotionMode, Runtime,
+    SYNC_UPDATE_DEFER_TIMEOUT, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

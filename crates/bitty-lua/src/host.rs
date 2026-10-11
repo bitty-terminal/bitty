@@ -1672,6 +1672,15 @@ pub trait HostServices {
         Err(BridgeError::capability_denied("panel.focus"))
     }
 
+    /// Enqueue a ring-pulse intent for `bitty.fx.pulse` (CTX-1139, DEC-0110).
+    ///
+    /// Grant-gated on `panel.focus`; returns whether the bounded queue
+    /// accepted the intent (queued, not applied). The default denies.
+    fn fx_pulse(&self, view_id: u64) -> Result<bool, BridgeError> {
+        let _ = view_id;
+        Err(BridgeError::capability_denied("panel.focus"))
+    }
+
     /// Get panel state for `bitty.panel.get_state` (CTX-0915).
     ///
     /// Grant-gated on `panel.focus`; returns a table with panel state fields
@@ -4252,6 +4261,40 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("panel table accepts 'get_state'");
 
+    // CTX-1139 (DEC-0110): `bitty.fx.*` L1 domain. The slice ships one verb,
+    // `pulse`, gated on `panel.focus` (deny-by-default, naming the
+    // capability) that only enqueues a bounded intent (mutation guard) which
+    // the application arms as a Core-owned ring pulse on its next tick. The
+    // id must be an integer view id; anything else fails closed with
+    // `E_DEF_INVALID` before any grant or queue is touched.
+    let fx = Table::new(&ctx);
+    fx.set(
+        ctx,
+        "pulse",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let view_id = match stack.get(0) {
+                    Value::Integer(id) => id as u64,
+                    _ => {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "fx.pulse id must be an integer",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                let accepted = state
+                    .bounded_mutation(|_expiry| state.services.fx_pulse(view_id))
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, Value::Boolean(accepted));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("fx table accepts 'pulse'");
+
     // CTX-0889 (ADR-0014): `bitty.workspace.*` L1 domain. `list` is a
     // `workspace.read` read (`bounded`); every mutation is gated on
     // `workspace.control` and only enqueues a bounded request (mutation
@@ -4902,6 +4945,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts debug");
     root.set(ctx, "panel", readonly_table(ctx, panel))
         .expect("root accepts panel");
+    root.set(ctx, "fx", readonly_table(ctx, fx))
+        .expect("root accepts fx");
     root.set(ctx, "workspace", readonly_table(ctx, workspace))
         .expect("root accepts workspace");
     Value::Table(readonly_table(ctx, root))

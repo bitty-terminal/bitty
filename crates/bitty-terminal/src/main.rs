@@ -599,11 +599,13 @@ fn main() {
         let home = std::env::var("HOME").ok();
         let components_dir = std::env::var("BITTY_COMPONENTS_DIR").ok();
         let system_components_dir = std::env::var("BITTY_SYSTEM_COMPONENTS_DIR").ok();
+        let wsl_distro_env = std::env::var(bitty_runtime::component::WSL_DISTRO_ENV).ok();
         let context = component::ComponentContext {
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
             components_dir: components_dir.as_deref(),
             system_components_dir: system_components_dir.as_deref(),
+            wsl_distro_env: wsl_distro_env.as_deref(),
             pre_format: args.component_format.as_deref(),
             pre_no_color: args.component_no_color,
         };

@@ -118,6 +118,8 @@ pub const MAX_COMPONENT_CONSENT_LINE_BYTES: usize = 64;
 pub const MAX_COMPONENT_CONSENT_ATTEMPTS: usize = 3;
 /// Maximum bytes for a `--digest` value (64 hex chars, bounded like tokens).
 pub const MAX_COMPONENT_DIGEST_BYTES: usize = 256;
+/// Maximum bytes for a `--distro` value (mirrors the WSL module bound).
+pub const MAX_COMPONENT_DISTRO_BYTES: usize = 64;
 /// TOFU pin file name inside `<user>/<name>/` holding the verified CDN
 /// tarball digest (`<hex>\n`, written atomically like `current`).
 pub const TARBALL_PIN_FILE: &str = "tarball.sha256";
@@ -227,6 +229,13 @@ pub struct ComponentRequest {
     /// Never bypasses digest verification; only overwrites the pin after
     /// both-must-match passes.
     pub force: bool,
+    /// `add --distro <name>`: WSL2 guest distro for component execution on
+    /// Windows (explicit selection; `default` means the `wsl.exe` default
+    /// distro). Parsed for `install` only to reject it with a usage error
+    /// naming `add` (install fetches the host triple and cannot stage a guest
+    /// helper). Windows-only in effect: Unix accepts and validates the value
+    /// but stays native (no-op).
+    pub distro: Option<String>,
 }
 
 /// Why parsing failed.
@@ -272,6 +281,20 @@ fn valid_digest_flag(value: &str) -> bool {
     digest_token_ok(value) && crate::component_seed::is_hex_digest(value)
 }
 
+/// Validate a `--distro` value: bounded token plus the WSL distro grammar.
+///
+/// The literal `default` selects the `wsl.exe` default distro; every other
+/// value must pass the WSL distro grammar. Fail-closed as usage (exit 2).
+fn valid_distro_flag(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_COMPONENT_DISTRO_BYTES || value.contains('\0') {
+        return false;
+    }
+    if value == "default" {
+        return true;
+    }
+    bitty_runtime::component::valid_wsl_distro(value)
+}
+
 /// Parse the tokens captured after the `component` word (bounded, fail-closed).
 pub fn parse_component_request(
     raw: &[String],
@@ -286,6 +309,7 @@ pub fn parse_component_request(
     let mut yes = false;
     let mut digest: Option<String> = None;
     let mut force = false;
+    let mut distro: Option<String> = None;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -401,6 +425,42 @@ pub fn parse_component_request(
             index += 2;
             continue;
         }
+        if let Some(value) = token.strip_prefix("--distro=") {
+            if !valid_distro_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --distro".to_string(),
+                ));
+            }
+            distro = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if token == "--distro" {
+            let Some(value) = raw.get(index + 1) else {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: --distro needs a value (a WSL distro name, or `default`)"
+                        .to_string(),
+                ));
+            };
+            if !valid_distro_flag(value) {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: invalid --distro {value:?} (want 1..={MAX_COMPONENT_DISTRO_BYTES} bytes of [A-Za-z0-9._-], or the literal `default`)"
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: duplicate --distro".to_string(),
+                ));
+            }
+            distro = Some(value.clone());
+            index += 2;
+            continue;
+        }
         if token.starts_with('-') && token.len() > 1 {
             return Err(ComponentParseError::Usage(format!(
                 "bitty component: unknown flag {token:?}"
@@ -490,6 +550,12 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --distro only applies to `add` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
         ComponentVerb::Add => {
             if operand.is_none() {
@@ -554,6 +620,15 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            // Fail-closed scope: `install` fetches the host triple (a Windows
+            // PE on Windows hosts) and cannot stage a Linux guest helper, so a
+            // WSL placement for it would re-launch the PE via interop, never a
+            // guest helper. Stage guest helpers with `add` instead.
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest)".to_string(),
+                ));
+            }
         }
         ComponentVerb::Remove => {
             if operand.is_none() {
@@ -593,6 +668,12 @@ pub fn parse_component_request(
                     verb.name()
                 )));
             }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty component: --distro only applies to `add` (got `{}`)",
+                    verb.name()
+                )));
+            }
         }
     }
 
@@ -606,6 +687,7 @@ pub fn parse_component_request(
         yes,
         digest,
         force,
+        distro,
     })
 }
 
@@ -613,7 +695,7 @@ pub fn parse_component_request(
 #[must_use]
 pub fn component_usage() -> String {
     "usage: bitty component list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty component add <path> [--version <semver>]\n\
+     \x20      bitty component add <path> [--version <semver>] [--distro <name|default>]\n\
      \x20      bitty component install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
      \x20      bitty component remove <name> [<version>]\n\
      \n\
@@ -624,7 +706,12 @@ pub fn component_usage() -> String {
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
      else explicit consent, TOFU-pinned; --force re-pins), then the full\n\
      manager takes over; `remove` only touches the user tier (no root required).\n\
-     `bitty component --help` explains sources, ABI checks, and exit codes."
+     On Windows, `add --distro` routes execution through the WSL2 trampoline\n\
+     (wsl.exe --distribution D --exec, default distro with `default`);\n\
+     `install --distro` is rejected (install fetches the host triple and\n\
+     cannot stage a guest helper — use `add`); Unix ignores --distro\n\
+     (native execution). `bitty component --help` explains sources, ABI\n\
+     checks, WSL2 paths and stdio, and exit codes."
         .to_string()
 }
 
@@ -674,6 +761,49 @@ pub fn component_help_text() -> String {
      \x20                             NOT bypass digest verification.\n\
      \x20 --yes                       install only: approve the download consent\n\
      \x20                             non-interactively (no prompt).\n\
+     \x20 --distro <name|default>     add only: WSL2 guest distro for component\n\
+     \x20                             execution on Windows. `default` uses the\n\
+     \x20                             wsl.exe default distro. `install --distro`\n\
+     \x20                             is rejected (install fetches the host triple\n\
+     \x20                             and cannot stage a guest helper — use `add`).\n\
+     \x20                             Windows-only in effect: Unix validates the\n\
+     \x20                             value but stays native (no-op). See `WSL2\n\
+     \x20                             trampoline` below.\n\
+     \n\
+     WSL2 trampoline (Windows only, issue #1908):\n\
+     \x20 Windows component helpers that must run inside a WSL2 guest do so\n\
+     \x20 through wsl.exe [--distribution D] --exec <helper> <fixed-argv>\n\
+     \x20 (PATH-resolved wsl.exe, fixed argv, no shell on either side).\n\
+     \x20 `add` never executes the component here: it stages only and persists\n\
+     \x20 the resolved selection per-component to <user>/<name>/wsl_distro for\n\
+     \x20 later runs (omission preserves any previous placement). `install`\n\
+     \x20 always fetches the host triple (a Windows PE on Windows hosts) and\n\
+     \x20 takes no --distro (flag or env): any selection for it fails as usage\n\
+     \x20 (exit 2) naming `add`, before any fetch or staging. Cross-target\n\
+     \x20 Linux fetching for `install --distro` is a #1908 follow-up, not in\n\
+     \x20 this change. Guest distro selection (`add`): explicit --distro wins,\n\
+     \x20 else BITTY_WSL_DISTRO config wins, else native execution (no\n\
+     \x20 trampoline); pass the literal `default` for the wsl.exe default\n\
+     \x20 distro (no --distribution flag). A selected distro with absent WSL\n\
+     \x20 fails closed before any staging (exit 1): install WSL2 from\n\
+     \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
+     \x20 without --distro. Path mapping (Windows to guest for spawn):\n\
+     \x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
+     \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n\
+     \x20 to their launch distro (cross-distro exec fails closed); device\n\
+     \x20 paths, drive-relative, relative, and other UNC spellings fail closed\n\
+     \x20 (exit 2, no silent mangling). Backslash rewriting happens only inside\n\
+     \x20 path mapping; general argv elements pass through discrete with spaces\n\
+     \x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+     \x20 exists for diagnostics only; other guest paths have no Windows\n\
+     \x20 spelling. Guest env is WSLENV-gated (forwarded proxy/TLS/locale\n\
+     \x20 names only, secrets never, otherwise clean by design). Stdio and\n\
+     \x20 signals: stdin/stdout/stderr pipes pass through wsl.exe unchanged\n\
+     \x20 (binary-safe, no CRLF translation); Ctrl-C propagates via wsl.exe to\n\
+     \x20 the guest helper; the wsl.exe exit status is the helper exit status\n\
+     \x20 (1:1 fidelity, no remapping). Fetch stays native (Windows\n\
+     \x20 curl.exe/tar.exe); the trampoline applies to component execution,\n\
+     \x20 never to downloads.\n\
      \n\
      installer egress:\n\
      \x20 cdn.bitty.run:443 is the core-built-in installer egress: strict\n\
@@ -737,14 +867,16 @@ pub fn component_help_text() -> String {
      \n\
      exit codes:\n\
      \x20 0 success | 1 declined consent, aborted prompt, filesystem\n\
-     \x20 failure, or fetch-environment failure (missing/too-old curl,\n\
-     \x20 missing tar) | 2 usage (including malformed --digest) | 4\n\
+     \x20 failure, fetch-environment failure (missing/too-old curl,\n\
+     \x20 missing tar), or WSL absent when --distro was requested | 2 usage\n\
+     \x20 (including malformed --digest/--distro and unmappable WSL paths) | 4\n\
      \x20 component error (integrity, ABI, digest, pin-mismatch)\n\
      \n\
      examples:\n\
      \x20 bitty component list\n\
      \x20 bitty component list --format json\n\
      \x20 bitty component add ./dist/net --version 0.0.1\n\
+     \x20 bitty component add ./dist/net --distro Ubuntu\n\
      \x20 bitty component install net --version 0.0.23\n\
      \x20 bitty component install net --version 0.0.23 --digest <hex>\n\
      \x20 bitty component install net --version 0.0.23 --force --yes\n\
@@ -768,6 +900,9 @@ pub struct ComponentContext<'a> {
     /// `BITTY_SYSTEM_COMPONENTS_DIR` override (tests; default is the
     /// platform system path).
     pub system_components_dir: Option<&'a str>,
+    /// `BITTY_WSL_DISTRO` environment/config value for guest distro
+    /// selection (tests pass values in; production reads the environment).
+    pub wsl_distro_env: Option<&'a str>,
     /// Pre-word global `--format` fallback.
     pub pre_format: Option<&'a str>,
     /// Pre-word `--no-color`.
@@ -804,6 +939,68 @@ impl ComponentFailure {
     }
 }
 
+/// Validate WSL2 distro selection for `add`/`install` (fail-closed before mutation).
+///
+/// Returns the resolved selection (`None` means native, no trampoline) for the
+/// caller to persist after successful staging; `Err(exit_code)` means exit
+/// early. Invalid selection fails as usage (exit 2) on every platform; on
+/// Windows a selected distro with absent WSL fails as environmental (exit 1).
+/// Unix never probes (no-op, native execution even when selected).
+fn check_wsl_for_store_verb(
+    explicit_distro: Option<&str>,
+    env_distro: Option<&str>,
+) -> Result<Option<bitty_runtime::component::WslDistro>, i32> {
+    let selection = match bitty_runtime::component::select_wsl_distro(explicit_distro, env_distro) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("bitty component: {}", error.message());
+            return Err(EXIT_USAGE);
+        }
+    };
+    // Unix: selection validated above, execution stays native (no probe).
+    #[cfg(not(windows))]
+    {
+        Ok(selection)
+    }
+    // Windows: probe only when a distro was selected; native otherwise.
+    #[cfg(windows)]
+    {
+        if selection.is_some() {
+            if let Err(error) = bitty_runtime::component::detect_wsl_context() {
+                eprintln!("bitty component: {}", error.message());
+                return Err(error.exit_code());
+            }
+        }
+        Ok(selection)
+    }
+}
+
+/// Persist a resolved WSL distro selection for one installed component.
+///
+/// `add`/`install` are staging/fetch operations only (they never execute the
+/// component); this records the execution placement for later runs (broker
+/// reads `<user>/<name>/wsl_distro` when no explicit override is set).
+/// `None` preserves any previous placement (never deletes); `Some` overwrites
+/// atomically. Failures propagate as generic (exit 1) without rolling back
+/// the already-staged component.
+fn persist_wsl_selection(
+    user: &std::path::Path,
+    name: &str,
+    selection: Option<&bitty_runtime::component::WslDistro>,
+) -> Result<(), ComponentFailure> {
+    let Some(distro) = selection else {
+        return Ok(());
+    };
+    let content = match distro {
+        bitty_runtime::component::WslDistro::Default => "default\n".to_string(),
+        bitty_runtime::component::WslDistro::Named(distro) => format!("{distro}\n"),
+    };
+    let path = user
+        .join(name)
+        .join(bitty_runtime::component::WSL_DISTRO_FILE);
+    publish_bytes_atomic(&path, content.as_bytes(), None)
+}
+
 /// Run one `bitty component` invocation; returns the process exit code.
 pub fn run_component_subcommand(
     raw: &[String],
@@ -831,6 +1028,41 @@ pub fn run_component_subcommand(
         context.system_components_dir,
     );
 
+    // WSL2 trampoline gate (#1908): `add` stages guest helpers (validates,
+    // probes on Windows, persists placement); `install` fetches the host
+    // triple and cannot stage a guest helper, so any distro selection for it
+    // (flag or env) fails as usage (exit 2) before any fetch or staging.
+    // Unix never probes (no-op). `list`/`remove` never consult the trampoline.
+    // Neither verb executes the component here; `add` persists the resolved
+    // selection per-component for later runs.
+    let wsl_selection: Option<bitty_runtime::component::WslDistro> = match request.verb {
+        ComponentVerb::Add => {
+            match check_wsl_for_store_verb(request.distro.as_deref(), context.wsl_distro_env) {
+                Ok(selection) => selection,
+                Err(exit) => return exit,
+            }
+        }
+        ComponentVerb::Install => {
+            match bitty_runtime::component::select_wsl_distro(
+                request.distro.as_deref(),
+                context.wsl_distro_env,
+            ) {
+                Ok(None) => None,
+                Ok(Some(_)) => {
+                    eprintln!(
+                        "bitty component: --distro only applies to `add` (guest-helper staging); `install` fetches the host triple and cannot stage a Linux guest helper — stage one with `bitty component add <path> --distro <name>` (e.g. from inside the guest; cross-target Linux fetching is a #1908 follow-up, not in this change)"
+                    );
+                    return EXIT_USAGE;
+                }
+                Err(error) => {
+                    eprintln!("bitty component: {}", error.message());
+                    return EXIT_USAGE;
+                }
+            }
+        }
+        _ => None,
+    };
+
     match request.verb {
         ComponentVerb::List => {
             let summaries = discover_components(user_root.as_deref(), system_root.as_deref());
@@ -852,6 +1084,7 @@ pub fn run_component_subcommand(
                 request.version_flag.as_deref(),
                 user_root.as_deref(),
                 output,
+                wsl_selection.as_ref(),
             ) {
                 Ok(summary) => {
                     let _ = writeln!(output, "{summary}");
@@ -1068,6 +1301,7 @@ fn op_add(
     version_flag: Option<&str>,
     user_root: Option<&Path>,
     _output: &mut dyn std::io::Write,
+    wsl_selection: Option<&bitty_runtime::component::WslDistro>,
 ) -> Result<String, ComponentFailure> {
     if is_url_operand(source) {
         return Err(ComponentFailure::component(format!(
@@ -1094,7 +1328,11 @@ fn op_add(
             core,
         )));
     }
-    install_staged(&staged, user)
+    let summary = install_staged(&staged, user)?;
+    // Persist execution placement for later runs (staging only; never executes
+    // here). `None` preserves any previous placement.
+    persist_wsl_selection(user, &staged.name, wsl_selection)?;
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1446,10 @@ fn check_registry_digest(
 // Nine args: install needs name/version/digest/force/roots/stdio/consent/
 // transport together (all bounded, fail-closed before mutation). A params
 // struct would obscure the call-site audit, so allow the lint here.
+//
+// Note: `install` takes no WSL selection (it fetches the host triple and
+// cannot stage a guest helper; `--distro`/env for it is rejected at dispatch
+// before this runs, so there is nothing to persist here).
 #[allow(clippy::too_many_arguments)]
 fn op_install(
     name: &str,
@@ -1377,6 +1619,8 @@ fn op_install(
     } else {
         String::new()
     };
+    // No WSL persistence here by design: `install` fetches the host triple
+    // (a Windows PE on Windows hosts) and cannot stage a Linux guest helper.
     // Handoff: the seed is done; name the installed executable so the
     // caller (or the user, for the manager itself) invokes the full
     // component directly from here.
@@ -2054,6 +2298,7 @@ mod tests {
                 home: None,
                 components_dir: Some(user),
                 system_components_dir: Some(system),
+                wsl_distro_env: None,
                 pre_format: None,
                 pre_no_color: false,
             },
@@ -2357,6 +2602,214 @@ mod tests {
                 "--force on {verb} must fail"
             );
         }
+    }
+
+    #[test]
+    fn parses_distro_for_add_only() {
+        // `add --distro` parses; `default` selects the `wsl.exe` default
+        // distro. Unix validates but stays native (no-op). `install --distro`
+        // is rejected at parse (install fetches the host triple and cannot
+        // stage a guest helper; cross-target fetching is a follow-up).
+        let request = parse_component_request(
+            &[
+                String::from("add"),
+                String::from("./dist"),
+                String::from("--distro"),
+                String::from("Debian"),
+            ],
+            None,
+        )
+        .expect("add --distro");
+        assert_eq!(request.distro.as_deref(), Some("Debian"));
+
+        let request = parse_component_request(
+            &[
+                String::from("add"),
+                String::from("./dist"),
+                String::from("--distro=default"),
+            ],
+            None,
+        )
+        .expect("add --distro=default");
+        assert_eq!(request.distro.as_deref(), Some("default"));
+
+        for distro_args in [
+            vec![String::from("--distro"), String::from("Ubuntu")],
+            vec![String::from("--distro=default")],
+        ] {
+            let mut args = vec![
+                String::from("install"),
+                String::from("net"),
+                String::from("--version"),
+                String::from("0.0.23"),
+            ];
+            args.extend(distro_args.clone());
+            assert!(
+                parse_component_request(&args, None).is_err(),
+                "install --distro must fail at parse: {distro_args:?}"
+            );
+        }
+
+        // The CLI bound mirrors the WSL module bound.
+        assert_eq!(
+            MAX_COMPONENT_DISTRO_BYTES,
+            bitty_runtime::component::WSL_DISTRO_MAX_BYTES
+        );
+
+        // Malformed, missing, and duplicate values fail as usage (on `add`,
+        // where the flag applies; `install` rejects the flag itself above).
+        for bad in [
+            String::new(),
+            "../evil".to_string(),
+            "Ubuntu/Debian".to_string(),
+            "Ubuntu Debian".to_string(),
+            "a".repeat(65),
+        ] {
+            assert!(
+                parse_component_request(
+                    &[
+                        String::from("add"),
+                        String::from("./dist"),
+                        String::from("--distro"),
+                        bad.clone(),
+                    ],
+                    None,
+                )
+                .is_err(),
+                "malformed --distro must fail: {bad:?}"
+            );
+        }
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("add"),
+                    String::from("./dist"),
+                    String::from("--distro")
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("add"),
+                    String::from("./dist"),
+                    String::from("--distro"),
+                    String::from("Ubuntu"),
+                    String::from("--distro=Debian"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        // `--distro` only applies to `add`.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("list"),
+                    String::from("--distro"),
+                    String::from("Ubuntu")
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("remove"),
+                    String::from("net"),
+                    String::from("--distro"),
+                    String::from("Ubuntu"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn add_persists_distro_selection_for_later_runs() {
+        // `add --distro` stages (never executes) and records placement;
+        // omission preserves (never deletes).
+        let base = scratch("distro-persist");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, _) = run_with(
+            &context,
+            &["add", &source.display().to_string(), "--distro", "Ubuntu"],
+        );
+        assert_eq!(code, EXIT_OK);
+        let user_root = Path::new(context.components_dir.expect("user"));
+        assert_eq!(
+            std::fs::read_to_string(user_root.join("net").join("wsl_distro")).expect("distro file"),
+            "Ubuntu\n"
+        );
+        let persisted = bitty_runtime::component::read_persisted_wsl_distro(&user_root.join("net"))
+            .expect("read")
+            .expect("selected");
+        assert_eq!(
+            persisted,
+            bitty_runtime::component::WslDistro::Named("Ubuntu".to_string())
+        );
+        let source2 = write_source_dir(&base.join("source2"), "net", "0.0.1", "[1, 1]");
+        let (code, _) = run_with(&context, &["add", &source2.display().to_string()]);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(
+            std::fs::read_to_string(user_root.join("net").join("wsl_distro")).expect("preserved"),
+            "Ubuntu\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_rejects_distro_with_usage_and_no_staging() {
+        // `install` fetches the host triple (a Windows PE on Windows hosts)
+        // and cannot stage a Linux guest helper: flag and env selections both
+        // fail as usage (exit 2) before any fetch or staging, naming `add`.
+        let base = scratch("install-distro-reject");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let (code, _) = run_with(
+            &context,
+            &[
+                "install",
+                "net",
+                "--version",
+                "0.0.23",
+                "--distro",
+                "Ubuntu",
+            ],
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert!(!base.join("user").join("net").exists());
+
+        // Env-only selection (no flag) fails the same way at dispatch.
+        let user: &'static str = Box::leak(
+            base.join("user")
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+        );
+        let system: &'static str = Box::leak(
+            base.join("system")
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+        );
+        let env_context = ComponentContext {
+            xdg_data_home: None,
+            home: None,
+            components_dir: Some(user),
+            system_components_dir: Some(system),
+            wsl_distro_env: Some("Ubuntu"),
+            pre_format: None,
+            pre_no_color: false,
+        };
+        let (code, _) = run_with(&env_context, &["install", "net", "--version", "0.0.23"]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(!base.join("user").join("net").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -3466,8 +3919,14 @@ mod tests {
         std::fs::write(user.join("net"), "not-a-dir").expect("file");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("non-directory component dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("non-directory component dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink or non-directory"),
@@ -3490,8 +3949,14 @@ mod tests {
         std::os::unix::fs::symlink(&outside, user.join("net")).expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked component dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked component dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink"),
@@ -3519,8 +3984,14 @@ mod tests {
         std::os::unix::fs::symlink(&outside, user.join("net").join("0.0.1")).expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked version dir must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked version dir must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink"),
@@ -3553,8 +4024,14 @@ mod tests {
         .expect("symlink");
         let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
         let mut out = Vec::new();
-        let error = op_add(&source.display().to_string(), None, Some(&user), &mut out)
-            .expect_err("symlinked executable path must fail");
+        let error = op_add(
+            &source.display().to_string(),
+            None,
+            Some(&user),
+            &mut out,
+            None,
+        )
+        .expect_err("symlinked executable path must fail");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
         assert!(
             error.message.contains("refusing symlink install path"),

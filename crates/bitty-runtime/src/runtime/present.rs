@@ -2594,8 +2594,11 @@ impl Runtime {
     /// band renderer uses (so the v1 scene budgets enforced at mount time
     /// are the bounds painted here), centered over the focused frame and
     /// clipped to it, on the same overlay layer as the banner pills (fills
-    /// plus glyphs, never grid truth). No-op with no surface or empty text,
-    /// so frames without a capture are byte-identical to before.
+    /// plus glyphs, never grid truth). No-op with no surface, so
+    /// capture-less frames are byte-identical to before. A live surface
+    /// with empty text still paints its one-cell pill chrome: the modal
+    /// holds keyboard capture while up, so pixel-invisibility would be a
+    /// fail-open UX (CTX-1143, issue #1966).
     fn paint_plugin_overlay(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
@@ -2606,9 +2609,6 @@ impl Runtime {
             return;
         };
         let text_line = self.extract_text_from_node(&overlay.root);
-        if text_line.is_empty() {
-            return;
-        }
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
             return;
@@ -3478,6 +3478,96 @@ mod present_origin_tests {
         assert_eq!(px_span(u16::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_span_usize(usize::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_side(u32::MAX), i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod plugin_overlay_paint_tests {
+    use super::FrameLayers;
+    use crate::runtime::layout_focus::PresentFrame;
+    use crate::runtime::{BandContent, Runtime, RuntimeConfig};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    fn surface_with_text(text: &str) -> BandContent {
+        BandContent {
+            plugin_id: String::from("bitty-terminal.composer"),
+            slot: bitty_lua::ui::UiSlot::Overlay,
+            root: bitty_lua::ui::UiNode::text(text),
+            version: 1,
+        }
+    }
+
+    fn one_frame() -> PresentFrame {
+        use bitty_render::geometry::RectPx;
+        PresentFrame {
+            view: bitty_ui::ViewId::new(1),
+            frame: RectPx::new(0, 0, 720, 360),
+            content: RectPx::new(8, 8, 704, 344),
+            cols: 80,
+            rows: 24,
+            border: 1,
+            radius: 0,
+            tier: None,
+        }
+    }
+
+    #[test]
+    fn live_empty_overlay_surface_still_paints_pill_chrome() {
+        // CTX-1143 (issue #1966): a live overlay surface with empty text (a
+        // fresh composer buffer, an empty palette list) must still paint its
+        // pill chrome. The modal holds keyboard capture while up, so
+        // pixel-invisibility is a fail-open UX: the user types into a box
+        // that is not there. Glyphs stay empty; the fill plus the draw flag
+        // prove the modal opened.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with_text("")));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            1,
+            "a live surface with empty text must still paint one pill fill"
+        );
+        assert!(
+            layers.combined_glyphs.is_empty(),
+            "empty text paints no glyphs"
+        );
+        assert!(
+            layers.any_needs_draw,
+            "the pill chrome must mark the frame for draw"
+        );
+    }
+
+    #[test]
+    fn live_nonempty_overlay_surface_paints_text_pill() {
+        // Non-empty content keeps its exact behavior: one fill plus glyphs
+        // for the clipped line.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with_text("hello")));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(layers.combined_overlay.len(), 1, "one pill fill");
+        assert!(
+            !layers.combined_glyphs.is_empty(),
+            "non-empty text paints glyphs"
+        );
+        assert!(layers.any_needs_draw);
+    }
+
+    #[test]
+    fn missing_surface_paints_nothing() {
+        // No surface stays a no-op: capture-less frames are byte-identical.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(None);
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert!(layers.combined_overlay.is_empty());
+        assert!(layers.combined_glyphs.is_empty());
+        assert!(!layers.any_needs_draw);
     }
 }
 

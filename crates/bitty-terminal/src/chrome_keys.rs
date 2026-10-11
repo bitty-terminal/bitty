@@ -23,6 +23,18 @@ use bitty_runtime::{
 use crate::spawn::spawn_pane_shell;
 use crate::terminal_app::TerminalApp;
 
+/// Plugin id of the first-party Palette extension (CTX-1143, issue #1966).
+///
+/// Matches the `palette` package manifest (`bitty-plugin.toml`); provenance
+/// comes from discovery, never from this literal.
+pub(crate) const PALETTE_PLUGIN_ID: &str = "bitty-terminal.palette";
+
+/// Palette toggle verb (plugin-qualified `<id>:<verb>` at dispatch).
+///
+/// Mirrors the package manifest `[lazy].commands` verbs; dispatch fails
+/// closed when the plugin did not register the verb.
+pub(crate) const PALETTE_COMMAND_TOGGLE: &str = "toggle";
+
 /// App-side modifier mirror for keymap matching (CTX-0153).
 ///
 /// `KeyEvent` carries no modifier field (modifiers arrive as separate
@@ -1203,19 +1215,32 @@ impl TerminalApp {
                 "fold_collapse",
             ),
             A::TogglePalette => {
-                // CTX-0647 / GitHub #1003 (palette user entry): the palette
-                // ships as the `palette` Lua plugin after the OQ-053 split
-                // (the old bundled Rust helper was removed in CTX-0922) and
-                // the SDK has no focusable overlay/input capture yet, so
-                // there is no Core overlay to toggle. Until that host API
-                // lands, `toggle_palette` parses for forward
-                // compat but is never in defaults: unbound Ctrl+Shift+P
-                // reaches the shell, and an explicitly bound chord is
-                // consumed here as inert with a loud warning (no overlay,
-                // no routing change, Normal Mode stays byte-identical).
-                eprintln!(
-                    "warning: keymap toggle_palette is not yet shipped (see #1003); chord ignored, no palette opened"
-                );
+                // CTX-1143 (issue #1966): the palette UX lives in the
+                // `palette` Lua plugin after the OQ-053 split (the bundled
+                // Rust helper was removed in CTX-0922); the focusable
+                // overlay/input-capture host API it presents through landed
+                // in CTX-0941/0943. There is no retained Core palette to
+                // fall back to, so the chord dispatches
+                // `bitty-terminal.palette:toggle` through the generic
+                // host-mediated invocation path (CTX-1035): an ACTIVE
+                // plugin toggles and its result surfaces on the banner like
+                // every other command dispatch; every other state
+                // (uninstalled, inactive, detached runtime) fails closed
+                // with a diagnostic and untouched terminal state.
+                let qualified = format!("{PALETTE_PLUGIN_ID}:{PALETTE_COMMAND_TOGGLE}");
+                match self.invoke_plugin_command(&qualified, &Self::empty_command_args()) {
+                    Ok(result) => {
+                        self.surface_dispatch_result(
+                            PALETTE_PLUGIN_ID,
+                            PALETTE_COMMAND_TOGGLE,
+                            &result,
+                        );
+                        eprintln!("bitty: keymap {qualified} -> toggled");
+                    }
+                    Err(diagnostic) => {
+                        eprintln!("warning: keymap {qualified} refused ({diagnostic}) — ignoring")
+                    }
+                }
             }
             A::InvokeCommand(qualified) => {
                 // CTX-1035 (#1829): the generic host-mediated invocation
@@ -6148,6 +6173,75 @@ claims = []
     }
 
     #[test]
+    fn toggle_palette_dispatches_to_palette_plugin_toggle() {
+        // CTX-1143 (issue #1966): `toggle_palette` routes to the palette Lua
+        // plugin (`bitty-terminal.palette:toggle`) through the generic
+        // host-mediated invocation path, like `command:<qualified>`
+        // (CTX-1035). The chord previously warned and opened nothing while
+        // the plugin owned the palette UX. A detached runtime or an
+        // undeclared command fails closed with a diagnostic and untouched
+        // terminal state. The action never confirms a window close.
+        use crate::composer_owner::fixture;
+        use bitty_config::ChromeAction;
+        const OWNER: &str = "bitty-terminal.palette";
+        let root = fixture::temp_dir("toggle-palette-dispatch");
+        let plugin = root.join(OWNER);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{OWNER}\"\nname = \"Palette Test\"\nversion = \"0.0.1\"\n\
+                 description = \"palette dispatch test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\nui.rich = true\nui.overlay = true\n\n\
+                 [lazy]\ncommands = [\"{OWNER}:toggle\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "bitty.commands.register({\n\
+             \x20 id = \"toggle\",\n\
+             \x20 title = \"Palette: toggle\",\n\
+             \x20 args_schema = { type = \"object\", properties = {}, additionalProperties = false },\n\
+             \x20 result_schema = { type = \"integer\", minimum = 0, maximum = 8 },\n\
+             \x20 run = function(_args) return 3 end,\n\
+             })\n\
+             return {}\n",
+        )
+        .expect("init");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let leafs = app.runtime.leaf_count();
+        let leaves = app.runtime.layout().leaf_ids();
+        let focused = app.runtime.focused_view();
+        assert_eq!(app.runtime.notification_banner(), None);
+        assert!(!app.apply_chrome_action(ChromeAction::TogglePalette));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-terminal.palette:toggle: 3"),
+            "the palette toggle result must surface on the banner"
+        );
+        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
+        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
+        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        // Detached runtime fails closed: diagnostic only, banner untouched.
+        app = app.with_plugin_runtime(None);
+        assert!(!app.apply_chrome_action(ChromeAction::TogglePalette));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-terminal.palette:toggle: 3"),
+            "a refused dispatch must not disturb the banner"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn composer_cutover_editor_round_trip_keeps_fallback_routed() {
         // E-CUT (CTX-0968): the PTY-leaf editor flow is retired with the
         // composer engine. Hosting an editor leaf still tears down safely;
@@ -6396,12 +6490,13 @@ claims = []
     }
 
     #[test]
-    fn toggle_palette_is_inert_and_unbound_by_default() {
-        // CTX-0647 / #1003 palette entry: the palette is the `palette` Lua
-        // plugin after the OQ-053 split and the SDK has no focusable
-        // overlay yet, so there is no Core overlay to toggle. Until that
-        // host API lands, defaults stay unbound so Ctrl+Shift+P reaches the shell,
-        // and an explicitly bound chord is inert with a warning.
+    fn toggle_palette_unbound_by_default_and_fails_closed_without_plugin() {
+        // CTX-0647 / #1003 palette entry (CTX-1143 dispatch, #1966): the
+        // palette UX lives in the `bitty-terminal.palette` Lua plugin and
+        // `toggle_palette` dispatches its `toggle` command. Defaults stay
+        // unbound so Ctrl+Shift+P reaches the shell, and a bound chord with
+        // no plugin runtime fails closed with a diagnostic (no overlay, no
+        // routing change, Normal Mode stays byte-identical).
         use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
         let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
         assert!(
@@ -6420,7 +6515,8 @@ claims = []
             None,
             "unbound Ctrl+Shift+P must fall through to the PTY"
         );
-        // Bound-but-inert: no runtime mutation, no overlay, no routing change.
+        // Bound without a plugin runtime fails closed: diagnostic only,
+        // no runtime mutation, no overlay, no routing change.
         let mut app = help_test_app(maps);
         let leafs = app.runtime.leaf_count();
         let leaves = app.runtime.layout().leaf_ids();

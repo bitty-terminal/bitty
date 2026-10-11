@@ -28,7 +28,7 @@ diagram lives in `src/lib.rs`.
   `bitty-network-wire` (exact-rev git pin), the dependency-free wire
   protocol v1 codec the component broker speaks (CTX-0906, DIR-030).
 - Native components (`src/component/`): the broker resolves
-  `<data_home>/bitty/components/<name>/current` and the version's
+  `<data_home>/bitty/extensions/<name>/current` and the version's
   `bitty-component.toml` (developer override `BITTY_COMPONENTS_DIR`; never
   `PATH`), validates the descriptor and the executable's SHA-256 before
   every spawn (fail closed), runs the component as a stdio coprocess with a

@@ -327,6 +327,8 @@ and verified prefix never moves:
 | `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); upload lands with the first shippable extension |
 | `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                            |
 
+See `bitty-terminal-docs/architecture/directory-semantics.md` for extension directory semantics.
+
 ### CDN key-to-URL mapping
 
 The CDN serves the bucket root one-to-one: the URL path is the full R2 key,

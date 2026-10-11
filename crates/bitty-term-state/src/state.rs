@@ -2079,48 +2079,100 @@ impl State {
     }
 
     /// Advances every Kitty animation by `elapsed_ms` with tick pacing
-    /// (S1, #1849): each descriptor steps through
-    /// [`placement::KittyAnimation::advance_bounded`] with `max_steps`
-    /// (the present tick passes
+    /// (S1, #1849; CTX-1122 single-damage path): each descriptor steps
+    /// through [`placement::KittyAnimation::advance_bounded`] with
+    /// `max_steps` (the present tick passes
     /// [`placement::KITTY_ANIM_MAX_STEPS_PER_TICK`]), so `Stopped`
     /// descriptors freeze, `Loading` ones park on the last frame, and
     /// `Running` ones wrap against their loop budget.
     ///
-    /// Only images whose current frame changed are damaged
-    /// ([`Self::damage_kitty_image`] scoping: placements of untouched
-    /// images keep no new damage), and the batch finalizes — bumping the
-    /// generation — only when something changed, so a frozen animation
-    /// costs the descriptor scan and never wakes the frame-on-demand
-    /// present. Returns the wire image ids whose frame changed (bounded
-    /// by [`placement::KITTY_ANIM_MAX_IMAGES`]).
+    /// Pure descriptor math: damages nothing and bumps nothing. The
+    /// caller (present tick) batches terminal-truth spans via
+    /// [`Self::damage_kitty_image_batched`] plus rich spans via
+    /// [`Self::damage_kitty_spans_batched`] and finalizes once with
+    /// [`Self::finalize_pending_damage`], so each changed image's spans
+    /// damage exactly once per tick with a single generation bump.
+    /// Scoping is unchanged (placements of untouched images keep no new
+    /// damage) and a frozen animation still costs only the descriptor
+    /// scan. Returns the wire image ids whose frame changed (bounded by
+    /// [`placement::KITTY_ANIM_MAX_IMAGES`]).
     ///
     /// No clocks: the caller (present tick) stamps `elapsed_ms` from its
     /// own clock, keeping playback testable through virtual time.
     pub fn advance_kitty_animations(&mut self, elapsed_ms: u64, max_steps: u32) -> Vec<u32> {
-        let changed = self
-            .kitty_placements
-            .advance_animations(elapsed_ms, max_steps);
-        for id in &changed {
-            self.damage_image_placements(*id);
+        self.kitty_placements
+            .advance_animations(elapsed_ms, max_steps)
+    }
+
+    /// Pushes every span of one image's terminal-truth placements without
+    /// finalizing (CTX-1122 tick batching, S1 #1849).
+    ///
+    /// Same span math as [`Self::damage_kitty_image`] (alt-screen scoped,
+    /// grid-clamped); returns whether at least one rect was pushed. The
+    /// caller batches truth plus rich spans across all changed images and
+    /// finalizes once, so duplicate truth damage collapses to a single
+    /// bump per tick.
+    pub fn damage_kitty_image_batched(&mut self, image_id: u32) -> bool {
+        let before = self.batch_rects.len();
+        self.damage_image_placements(image_id);
+        self.batch_rects.len() != before
+    }
+
+    /// Pushes caller-computed grid spans without finalizing (CTX-1122 tick
+    /// batching, S1 #1849).
+    ///
+    /// Same clamping and empty/out-of-bounds skip as
+    /// [`Self::damage_kitty_spans`]; returns whether at least one rect was
+    /// pushed. The caller finalizes once after batching all changed
+    /// images.
+    pub fn damage_kitty_spans_batched(&mut self, spans: &[(u16, u16, u16, u16)]) -> bool {
+        if spans.is_empty() {
+            return false;
         }
-        if !changed.is_empty() {
-            let _ = self.finalize_batch();
+        let before = self.batch_rects.len();
+        let last_row = self.height as u16 - 1;
+        let last_col = self.width as u16 - 1;
+        for &(row, col, rows, cols) in spans {
+            if rows == 0 || cols == 0 {
+                continue;
+            }
+            if row > last_row || col > last_col {
+                continue;
+            }
+            let bottom = row.saturating_add(rows).saturating_sub(1).min(last_row);
+            let right = col.saturating_add(cols).saturating_sub(1).min(last_col);
+            self.damage_grid_rect(row, col, bottom.max(row), right.max(col));
         }
-        changed
+        self.batch_rects.len() != before
+    }
+
+    /// Finalizes batched tick damage once (CTX-1122, S1 #1849).
+    ///
+    /// Bumps the generation only when the batch holds rects (or scroll
+    /// events), so empty/out-of-bounds ticks cost nothing and never wake
+    /// the frame-on-demand present. Returns whether a bump happened.
+    /// Double State bumps do not affect the S6 raster cache (its key binds
+    /// the rich image content generation, not this grid generation) nor
+    /// scroll regions (animation ticks never scroll); collapsing to one
+    /// bump only drops duplicate history batches.
+    pub fn finalize_pending_damage(&mut self) -> bool {
+        if self.batch_rects.is_empty() && self.batch_scroll_events.is_empty() {
+            return false;
+        }
+        let _ = self.finalize_batch();
+        true
     }
 
     /// Damages every span of one image's placements for a pixel-side
     /// mutation with no grid truth of its own (S1 `a=c` compose, #1849):
     /// the frame bytes changed without moving any anchor, so the placed
     /// spans repaint on the next tick. Scoped to `image_id` exactly like
-    /// [`Self::advance_kitty_animations`]: other images gain no damage.
+    /// the tick path: other images gain no damage.
     /// Finalizes only when at least one span was damaged, so a compose
     /// against an image with no placements costs nothing and never wakes
     /// the frame-on-demand present.
     pub fn damage_kitty_image(&mut self, image_id: u32) {
-        let before = self.batch_rects.len();
-        self.damage_image_placements(image_id);
-        if self.batch_rects.len() != before {
+        if self.damage_kitty_image_batched(image_id) {
             let _ = self.finalize_batch();
         }
     }
@@ -2138,24 +2190,7 @@ impl State {
     /// least one rect was pushed, so unaffected ticks never wake the
     /// frame-on-demand present.
     pub fn damage_kitty_spans(&mut self, spans: &[(u16, u16, u16, u16)]) {
-        if spans.is_empty() {
-            return;
-        }
-        let before = self.batch_rects.len();
-        let last_row = self.height as u16 - 1;
-        let last_col = self.width as u16 - 1;
-        for &(row, col, rows, cols) in spans {
-            if rows == 0 || cols == 0 {
-                continue;
-            }
-            if row > last_row || col > last_col {
-                continue;
-            }
-            let bottom = row.saturating_add(rows).saturating_sub(1).min(last_row);
-            let right = col.saturating_add(cols).saturating_sub(1).min(last_col);
-            self.damage_grid_rect(row, col, bottom.max(row), right.max(col));
-        }
-        if self.batch_rects.len() != before {
+        if self.damage_kitty_spans_batched(spans) {
             let _ = self.finalize_batch();
         }
     }

@@ -2400,9 +2400,11 @@ fn kitty_animation_control_and_frame_cap() {
 
 #[test]
 fn kitty_tick_advance_damages_only_changed_images() {
-    // S1 (#1849) seam contract: `advance_kitty_animations` returns the
-    // wire ids whose frame changed, damages exactly their spans, and
-    // bumps the generation only when something changed.
+    // S1 (#1849) seam contract, CTX-1122 single-damage path:
+    // `advance_kitty_animations` is pure descriptor math returning the
+    // wire ids whose frame changed; the caller batches truth spans plus
+    // rich spans and finalizes once, so exactly the changed images damage
+    // with a single generation bump.
     let mut s = State::new();
     // Image 9 runs on rows 0..1; image 10 stays stopped on rows 2..3.
     s.apply(&kitty_graphics(Some('p'), 2, 2, 0, place_keys(9, 1)));
@@ -2426,6 +2428,22 @@ fn kitty_tick_advance_damages_only_changed_images() {
     assert_eq!(changed, vec![9]);
     assert_eq!(s.kitty_placements().animation(9).unwrap().current(), 2);
     assert_eq!(s.kitty_placements().animation(10).unwrap().current(), 1);
+    // Pure advance damages nothing on its own.
+    assert!(s.damage_since(generation).is_empty());
+    assert_eq!(s.generation(), generation);
+    // Tick batching: truth spans for the changed ids, finalized once.
+    let mut pushed = false;
+    for id in &changed {
+        pushed |= s.damage_kitty_image_batched(*id);
+    }
+    if pushed {
+        assert!(s.finalize_pending_damage());
+    }
+    assert_eq!(
+        s.generation().saturating_sub(generation),
+        1,
+        "one tick must bump generation exactly once"
+    );
     let regions = s.damage_since(generation);
     assert!(!regions.is_empty(), "advance must damage");
     for region in &regions {

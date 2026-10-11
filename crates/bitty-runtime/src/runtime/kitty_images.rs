@@ -1350,12 +1350,14 @@ impl Runtime {
             .collect()
     }
 
-    /// Damages one wire image's spans on one origin's grid (S1, #1849):
-    /// terminal-truth spans (covers `a=p`/virtual placements) plus rich
-    /// spans (covers plain transmit-and-display, which truth never
-    /// records — see [`Self::kitty_wire_spans_for`]). Other images gain no
-    /// damage; origins without the image cost nothing and never wake the
-    /// frame-on-demand present.
+    /// Damages one wire image's spans on one origin's grid (S1, #1849;
+    /// CTX-1122 single damage path): terminal-truth spans (covers
+    /// `a=p`/virtual placements) plus rich spans (covers plain
+    /// transmit-and-display, which truth never records — see
+    /// [`Self::kitty_wire_spans_for`]) batched together and finalized
+    /// once. Other images gain no damage; origins without the image cost
+    /// nothing and never wake the frame-on-demand present. Empty and
+    /// out-of-bounds spans damage nothing and bump nothing.
     pub(super) fn damage_kitty_wire_for_origin(&mut self, origin: Option<u64>, wire_image: u32) {
         let (scrollback_now, grid_width, grid_height) = match origin {
             None => (
@@ -1376,13 +1378,19 @@ impl Runtime {
             self.kitty_wire_spans_for(origin, wire_image, scrollback_now, grid_width, grid_height);
         match origin {
             None => {
-                self.state.damage_kitty_image(wire_image);
-                self.state.damage_kitty_spans(&spans);
+                let mut pushed = self.state.damage_kitty_image_batched(wire_image);
+                pushed |= self.state.damage_kitty_spans_batched(&spans);
+                if pushed {
+                    self.state.finalize_pending_damage();
+                }
             }
             Some(token) => {
                 if let Some(sess) = self.pane_sessions.get_mut(&ViewId::new(token)) {
-                    sess.state.damage_kitty_image(wire_image);
-                    sess.state.damage_kitty_spans(&spans);
+                    let mut pushed = sess.state.damage_kitty_image_batched(wire_image);
+                    pushed |= sess.state.damage_kitty_spans_batched(&spans);
+                    if pushed {
+                        sess.state.finalize_pending_damage();
+                    }
                 }
             }
         }

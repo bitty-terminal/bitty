@@ -168,15 +168,14 @@ fn verbose_help_restores_full_detail() {
 
 #[test]
 fn every_subcommand_still_reachable_via_per_command_help() {
-    // (subcommand, marker that proves its dedicated help rendered;
-    // `config`/`init`/`doctor` fall back to the top-level help, which must
-    // still exit 0 with usage on stdout.)
+    // (subcommand, marker that proves its dedicated help rendered; each
+    // prints its own command help and exits 0.)
     let cases: &[(&str, &str)] = &[
         ("run", "bitty run"),
         ("ctl", "bitty ctl"),
-        ("config", "Usage:"),
-        ("init", "Usage:"),
-        ("doctor", "Usage:"),
+        ("config", "usage: bitty config"),
+        ("init", "usage: bitty init"),
+        ("doctor", "usage: bitty doctor"),
         ("list", "bitty list"),
         ("inspect", "bitty inspect"),
         ("dev", "bitty dev"),
@@ -233,6 +232,18 @@ fn help_subcommand_never_spawns_and_aliases_per_command_help() {
         via_help, via_flag,
         "bitty help plugin must equal bitty plugin --help"
     );
+
+    // CodeRabbit 4240219272: `bitty help <cmd>` must equal
+    // `bitty <cmd> --help` for config/init/doctor too (same text, not the
+    // top-level overview).
+    for sub in ["config", "init", "doctor"] {
+        let via_help = stdout(&run_bitty(&["help", sub]));
+        let via_flag = stdout(&run_bitty(&[sub, "--help"]));
+        assert_eq!(
+            via_help, via_flag,
+            "bitty help {sub} must equal bitty {sub} --help"
+        );
+    }
 
     let output = run_bitty(&["help", "bogus"]);
     assert_eq!(

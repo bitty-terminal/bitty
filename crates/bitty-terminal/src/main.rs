@@ -380,6 +380,23 @@ fn main() {
     // a violation panics in debug (fail-closed development, never production).
     debug_assert!(observability::default_posture_pins_hold(args.safe));
 
+    // CodeRabbit 4240219272: `bitty config/init/doctor --help` must print
+    // the same command help as the documented `bitty help <cmd>` alias
+    // (which prints `config_usage`/`init_usage`/`doctor_usage`), not the
+    // top-level overview. Same `println!` shape as the help-word branch so
+    // the bytes are equal.
+    if args.help && args.config_word {
+        println!("{}", config_usage());
+        std::process::exit(0);
+    }
+    if args.help && args.init_word {
+        println!("{}", init::init_usage());
+        std::process::exit(0);
+    }
+    if args.help && args.doctor_word {
+        println!("{}", doctor::doctor_usage());
+        std::process::exit(0);
+    }
     // `bitty list --help` shows list help (never needs an instance or VM);
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
     // top-level help.

@@ -326,6 +326,20 @@ pub(crate) struct Args {
     /// Raw tokens after the `x` word for [`crate::x::parse_x_request`].
     /// Empty until `x_word` is set.
     pub(crate) x_raw: Vec<String>,
+    /// `bitty help [cmd]` introspection (issue #1900, CTX-1117). True once
+    /// the first positional `help` word is seen; a program literally named
+    /// `help` needs `bitty run -- help ...` or the legacy
+    /// `bitty -- help ...`. The optional `help_cmd` names one subcommand
+    /// (`bitty help plugin` == `bitty plugin --help`); extra positionals
+    /// land in `help_args` and fail closed at dispatch. Bare `bitty help`
+    /// aliases `--help` (short overview, `-v` for full detail) and never
+    /// spawns.
+    pub(crate) help_word: bool,
+    /// Optional subcommand name after `help` (canonical or alias spelling).
+    /// Empty means the top-level overview.
+    pub(crate) help_cmd: Option<String>,
+    /// Unexpected extra positionals in help mode (dispatch errors).
+    pub(crate) help_args: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -463,6 +477,9 @@ impl Args {
             cmd_raw: Vec::new(),
             x_word: false,
             x_raw: Vec::new(),
+            help_word: false,
+            help_cmd: None,
+            help_args: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -927,7 +944,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     i = next;
                     continue;
                 }
-                // In `list`/`inspect`/`dev` mode `--` is a stray separator
+                // In `list`/`inspect`/`dev`/`help` mode `--` is a stray separator
                 // (UsageError at dispatch); elsewhere it ends flags for
                 // PROGRAM argv.
                 if out.list_word {
@@ -942,6 +959,11 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
                 if out.dev_word {
                     out.dev_raw.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.help_word {
+                    out.help_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1406,6 +1428,45 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             _ => {
+                // `bitty help [cmd]` introspection (first positional only;
+                // issue #1900, CTX-1117). Once `help` is seen, later bare
+                // tokens name the subcommand (`help_cmd`) or fail closed
+                // (`help_args`); other subcommand words are never recognized
+                // there (`bitty help plugin` names `plugin`, it is not the
+                // plugin subcommand). A program literally named `help` needs
+                // `bitty -- help ...` (or `bitty run -- help ...`).
+                if out.help_word {
+                    if out.help_cmd.is_none() {
+                        out.help_cmd = Some(token.clone());
+                    } else {
+                        out.help_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if !program_set
+                    && !out.config_word
+                    && !out.init_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.inspect_word
+                    && !out.dev_word
+                    && !out.doctor_word
+                    && !out.plugin_word
+                    && !out.component_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && !out.shell_init_word
+                    && !out.help_word
+                    && token == "help"
+                {
+                    out.help_word = true;
+                    i += 1;
+                    continue;
+                }
                 // `bitty run -- COMMAND...` explicit child launch (CTX-0170,
                 // first positional only; `--` escape bypasses via
                 // after_double_dash). The word `run` is always this
@@ -1421,6 +1482,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.list_word
                     && !out.inspect_word
                     && !out.dev_word
+                    && !out.help_word
                     && token == "run"
                 {
                     out.run_word = true;
@@ -1937,8 +1999,9 @@ pub(crate) fn help_text() -> String {
                              exit code is the child's. `bitty htop` never means\n  \
                              `bitty run -- htop`; colliding names need `run --`.\n  \
             ctl [--socket P] [--instance ID] [--format SHAPE] <resource> <verb>  Control a running instance (runtime)\n  \
-                             instance|window|view|terminal list; terminal spawn|close|send|text;\n  \
-                             view split|focus; config reload. `ctl --help` never needs an instance.\n  \
+                             instance|window|view|terminal|panel|workspace list; terminal spawn|close|send|text;\n  \
+                             view split|focus; workspace new|close|focus|move|rename|move-panel;\n  \
+                             config reload. `ctl --help` never needs an instance.\n  \
             config path      Print the resolved config file path (alias `cfg`)\n\
            config check     Load + validate; print per-key sources\n  \
                             (cli/file/default), exit non-zero on invalid files\n  \
@@ -2006,7 +2069,11 @@ pub(crate) fn help_text() -> String {
             version [--format SHAPE]  Version and build metadata:\n  \
                              `bitty <semver> (<channel> <commit>)` on stdout\n  \
                              (same fields in `--format json`; `-V`/`--version`\n  \
-                             alias; local, no instance)\n\
+                             alias; local, no instance)\n  \
+             help [cmd]       Show the compact overview, or per-command help\n  \
+                              (`bitty help plugin` == `bitty plugin --help`;\n  \
+                              unknown names fail closed naming valid commands;\n  \
+                              never spawns; `bitty -- help` still spawns `help`)\n\
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -2130,27 +2197,104 @@ pub(crate) fn help_text_short(color: bool) -> String {
                --no-color              Disable ANSI coloring (also honors NO_COLOR)\n  \
                --                      End of flags; remaining tokens are PROGRAM argv\n\
          \n\
-         {subcommands}\n  \
-           run -- COMMAND...       Explicit child launch (local)\n  \
-           ctl <resource> <verb>   Control a running instance (runtime)\n  \
-           config <verb>           Config path, check, or edit (alias cfg)\n  \
-           init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
-           doctor                  Diagnose installation and compatibility (local)\n  \
-           list <kind>             Enumerate themes|plugins|instances (alias ls)\n  \
-           inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
-           dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
-           plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
-           component <verb>        Native binary extension management: list|add|install|remove\n  \
-           cmd <id>                Direct qualified executable invocation for automation\n  \
-           x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
-           completion <shell>      Emit shell completion script (alias comp)\n  \
-           shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
-           version                 Version and build metadata\n\
-         \n\
-         {arguments}\n  \
-           PROGRAM             Program to spawn in the PTY (default $SHELL or /bin/sh)\n\
-         \n\
-         Run `bitty --help -v` for all flags, or `bitty <command> --help` for detail.\n",
+          {subcommands}\n  \
+            run -- COMMAND...       Explicit child launch (local)\n  \
+            ctl <resource> <verb>   Control a running instance (runtime)\n  \
+            config <verb>           Config path, check, or edit (alias cfg)\n  \
+            init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
+            doctor                  Diagnose installation and compatibility (local)\n  \
+            list <kind>             Enumerate themes|plugins|instances (alias ls)\n  \
+            inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
+            dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
+            plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
+            component <verb>        Native binary extension management: list|add|install|remove\n  \
+            cmd <id>                Direct qualified executable invocation for automation\n  \
+            x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
+            completion <shell>      Emit shell completion script (alias comp)\n  \
+            shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
+            version                 Version and build metadata\n  \
+            help [cmd]              Show this help, or per-command help (alias for --help)\n\
+          \n\
+          {arguments}\n  \
+            PROGRAM             Program to spawn in the PTY (default $SHELL or /bin/sh)\n\
+          \n\
+          Run `bitty --help -v` for all flags, or `bitty <command> --help` for detail.\n",
         crate::version::version_semver()
+    )
+}
+
+/// Canonical subcommand names for `bitty help [cmd]` (16 total, issue #1900).
+///
+/// Aliases (`cfg`, `ls`, `comp`) map to their canonical help; `help` itself
+/// shows this help. All names are lowercase, case-sensitive.
+#[must_use]
+pub(crate) fn help_valid_commands() -> &'static str {
+    "run, ctl, config (cfg), init, doctor, list (ls), inspect, dev, plugin, component, version, completion (comp), cmd, x, shell-init, help"
+}
+
+/// Normalize one `bitty help [cmd]` name to its canonical subcommand.
+///
+/// Returns `None` for unknown names (dispatch fails closed naming
+/// [`help_valid_commands`]). Aliases map: `cfg` -> `config`, `ls` -> `list`,
+/// `comp` -> `completion`.
+#[must_use]
+pub(crate) fn help_canonical_cmd(raw: &str) -> Option<&'static str> {
+    match raw {
+        "run" => Some("run"),
+        "ctl" => Some("ctl"),
+        "config" | "cfg" => Some("config"),
+        "init" => Some("init"),
+        "doctor" => Some("doctor"),
+        "list" | "ls" => Some("list"),
+        "inspect" => Some("inspect"),
+        "dev" => Some("dev"),
+        "plugin" => Some("plugin"),
+        "component" => Some("component"),
+        "version" => Some("version"),
+        "completion" | "comp" => Some("completion"),
+        "cmd" => Some("cmd"),
+        "x" => Some("x"),
+        "shell-init" => Some("shell-init"),
+        "help" => Some("help"),
+        _ => None,
+    }
+}
+
+/// Short usage for `bitty help` failures (stderr, exit 2 trailer).
+#[must_use]
+pub(crate) fn help_usage() -> String {
+    String::from(
+        "usage: bitty help [cmd]\n\
+         \n\
+         commands:\n\
+         \x20 run, ctl, config (cfg), init, doctor, list (ls), inspect, dev,\n\
+         \x20 plugin, component, version, completion (comp), cmd, x, shell-init, help\n\
+         examples:\n\
+         \x20 bitty help\n\
+         \x20 bitty help plugin\n\
+         \x20 bitty help ctl",
+    )
+}
+
+/// Full help for `bitty help --help` / `bitty help help` (stdout, exit 0).
+#[must_use]
+pub(crate) fn help_help_text() -> String {
+    format!(
+        "bitty help — show help without spawning (local, no instance)\n\
+         \n\
+         Usage: bitty help [cmd]\n\
+         \n\
+         Bare `bitty help` aliases `bitty --help` (compact overview; add `-v`\n\
+         \x20 for full detail via `bitty --help -v`). `bitty help <cmd>` aliases\n\
+         \x20 `bitty <cmd> --help` for one subcommand (e.g. `bitty help plugin`\n\
+         \x20 == `bitty plugin --help`). Unknown names fail closed (exit 2)\n\
+         \x20 naming valid commands: {}.\n\
+         \n\
+         A program literally named `help` needs `bitty -- help ...` (or\n\
+         \x20 `bitty run -- help ...`): bare `bitty help` never spawns.\n\
+         \n\
+         Version: {}\n",
+        help_valid_commands(),
+        crate::version::version_semver(),
     )
 }

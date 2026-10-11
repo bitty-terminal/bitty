@@ -201,6 +201,59 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     }
 }
 
+/// `bitty.debug/listPanels` servo handler (CTX-1117, issue #1900).
+///
+/// Mirrors the shared `handle_control` path for the local panel list verb:
+/// enqueue to the global control queue and wait for the main-thread drain
+/// (`apply_control`). Read-only, `view.inspect`-gated at drain (same as
+/// `view list`); needs a live instance like every other IPC verb. Kept alive
+/// on non-Unix builds for the Windows `-D warnings` cross-check.
+#[allow(dead_code)]
+fn handle_panel_list(
+    context: &bitty_ipc::devtools::ServeContext,
+    request: &bitty_ipc::devtools::DevtoolsRequest,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    // Use the re-exported wire name on all targets so the Windows
+    // `-D warnings` cross-check sees the import as used (the Unix-only
+    // registration below is cfg-gated).
+    debug_assert_eq!(request.method, crate::ctl::METHOD_LIST_PANELS);
+    let reply = if context.authority_required() {
+        let Some(grant) = context.connection_grant() else {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                String::from("connection authority is unavailable"),
+            ));
+        };
+        bitty_ipc::ctl::enqueue_control_and_wait_with_connection(
+            &request.method,
+            request.params_raw.as_deref(),
+            &request.id_raw,
+            grant,
+        )
+    } else {
+        bitty_ipc::ctl::enqueue_control_and_wait(
+            &request.method,
+            request.params_raw.as_deref(),
+            &request.id_raw,
+            context.construction_scopes(),
+        )
+    };
+    if reply.ok {
+        Ok(reply.result_json)
+    } else {
+        let category = match reply.category {
+            "auth" => "scope",
+            other => other,
+        };
+        Err(bitty_ipc::devtools::HandlerError::new(
+            category,
+            reply.code,
+            reply.message,
+        ))
+    }
+}
+
 /// Unix serving path: resolve, prepare, reclaim, bind, attest, spawn.
 /// `env` is the advisory resolution input, passed explicitly so tests can
 /// cover the enabled path without mutating process-global state.
@@ -226,6 +279,14 @@ fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv
             if let Err(err) = crate::consent::register_consent_methods(&mut dispatcher) {
                 crate::logging::warn(|| {
                     format!("bitty: consent methods unavailable: {err} (serving without them)")
+                });
+            }
+            // CTX-1117 (issue #1900): additive panel list surface (same
+            // `handle_control` queue semantics as every other IPC verb).
+            if let Err(err) = dispatcher.register(crate::ctl::METHOD_LIST_PANELS, handle_panel_list)
+            {
+                crate::logging::warn(|| {
+                    format!("bitty: panel list unavailable: {err} (serving without it)")
                 });
             }
             let dispatcher = Arc::new(dispatcher);

@@ -631,6 +631,18 @@ pub struct Runtime {
     overlay_modal_active: bool,
     /// Next workspace creation sequence (display names `ws{seq}`).
     next_workspace_seq: u64,
+    /// Own IPC socket path for PTY `BITTY_SOCKET` injection (CTX-1117,
+    /// issue #1900).
+    ///
+    /// `None` until the embedder stores the early-resolved path (same
+    /// `SocketEnv` + `None` uid as the servo, so the later bind lands on the
+    /// same path); headless never stores. When `Some`, spawn paths inject it
+    /// via an explicit `PtyBuilder` override unless an outer `BITTY_SOCKET`
+    /// is already present (inherit wins; see
+    /// `bitty_pty::bitty_socket_inject_value`). Advisory only, never a
+    /// credential; precedence `--socket` > `--instance` >
+    /// `BITTY_SOCKET`/`BITTY_INSTANCE_ID` > exactly-one-live is unchanged.
+    ipc_socket_path: Option<String>,
     /// CW live present state (CTX-0700): caller-owned fold projection
     /// and cross-panel hint engine.
     ///
@@ -1692,6 +1704,7 @@ impl Runtime {
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
+            ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             // Command targets join every live collection: fold/jump/copy
             // over shell commands is the core hint surface; panels join
@@ -1948,6 +1961,7 @@ impl Runtime {
             help_rows: Vec::new(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
+            ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             // Command targets join every live collection: fold/jump/copy
             // over shell commands is the core hint surface; panels join

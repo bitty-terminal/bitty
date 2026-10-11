@@ -202,5 +202,6 @@ pub use client::{
 };
 pub use render::execute_ctl;
 pub use request::{
-    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, ctl_help_text, ctl_usage, parse_ctl_request,
+    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, ctl_help_text,
+    ctl_usage, parse_ctl_request,
 };

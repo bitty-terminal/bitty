@@ -2141,6 +2141,29 @@ impl Runtime {
         self.panel_spawn_rules = rules;
     }
 
+    /// Own IPC socket path for PTY `BITTY_SOCKET` injection (CTX-1117).
+    ///
+    /// `None` until the embedder stores the early-resolved path; headless
+    /// never stores. See `ipc_socket_path` field for precedence (inherit
+    /// wins when an outer value is present).
+    #[must_use]
+    pub fn ipc_socket_path(&self) -> Option<&str> {
+        self.ipc_socket_path.as_deref()
+    }
+
+    /// Stores the own IPC socket path for future PTY spawns (CTX-1117).
+    ///
+    /// Overwrites any previous value; empty paths clear to `None`
+    /// (fail-closed, never store an empty socket path). Affects future
+    /// spawns only; already-live children keep their environment.
+    pub fn set_ipc_socket_path(&mut self, path: String) {
+        if path.is_empty() {
+            self.ipc_socket_path = None;
+        } else {
+            self.ipc_socket_path = Some(path);
+        }
+    }
+
     /// Stamps a matched rule's `width`/`height` as a durable per-view
     /// fixed-size constraint (CTX-1088).
     ///
@@ -2361,5 +2384,21 @@ mod tests {
         rt.set_panel_layout_mode(PanelLayoutMode::Dwindle);
         assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Dwindle);
         assert!(!rt.panel_split_place_new_first());
+    }
+
+    /// CTX-1117 (issue #1900): own IPC socket path for PTY `BITTY_SOCKET`
+    /// injection is stored verbatim, cleared on empty, and defaults to
+    /// `None` (headless never stores; future spawns only).
+    #[test]
+    fn ipc_socket_path_stores_and_clears() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        assert_eq!(rt.ipc_socket_path(), None);
+        rt.set_ipc_socket_path(String::from("/run/user/1000/bitty/default.sock"));
+        assert_eq!(
+            rt.ipc_socket_path(),
+            Some("/run/user/1000/bitty/default.sock")
+        );
+        rt.set_ipc_socket_path(String::new());
+        assert_eq!(rt.ipc_socket_path(), None);
     }
 }

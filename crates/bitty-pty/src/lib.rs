@@ -103,6 +103,8 @@ mod reader;
 mod tree;
 mod writer;
 
+pub use builder::BITTY_INSTANCE_ID_ENV;
+pub use builder::BITTY_SOCKET_ENV;
 pub use builder::DEFAULT_COLORTERM;
 pub use builder::DEFAULT_COLS;
 pub use builder::DEFAULT_ROWS;
@@ -115,6 +117,8 @@ pub use builder::MAX_ARGV_BYTES;
 pub use builder::MAX_ENV_ENTRIES;
 pub use builder::MAX_ENV_VALUE_BYTES;
 pub use builder::PtyBuilder;
+pub use builder::bitty_socket_inject_value;
+pub use builder::bitty_socket_inject_value_with_outer;
 pub use builder::should_strip_graphics_fingerprint;
 pub use error::PtyError;
 pub use platform::ExitStatus;

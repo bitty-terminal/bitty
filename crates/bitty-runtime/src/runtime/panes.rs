@@ -134,6 +134,14 @@ impl Runtime {
             }
         }
         let mut builder = PtyBuilder::new(program).size(cols, rows);
+        // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` so in-terminal
+        // `bitty ctl` targets its own instance. Explicit override, inherit
+        // wins when an outer value is present (never override).
+        if let Some(socket_path) = self.ipc_socket_path.clone() {
+            if let Some(inject) = bitty_pty::bitty_socket_inject_value(&socket_path) {
+                builder = builder.env(bitty_pty::BITTY_SOCKET_ENV, inject);
+            }
+        }
         // CTX-0585 (M1-25): the primary restart attach must seed its cwd from
         // the captured `OSC 7` report, exactly like a split spawn. The leaf
         // focused at attach time becomes the owner below, so resolve against
@@ -467,6 +475,18 @@ impl Runtime {
             }
         }
         let mut builder = PtyBuilder::new(program).size(cols, rows);
+        // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` so in-terminal
+        // `bitty ctl` targets its own instance. Explicit override, inherit
+        // wins when an outer value is present (never override). Explicit
+        // wins over removals below (builder order: removals then
+        // explicits), so the advisory socket survives a minimized-env scrub
+        // when present — safe (advisory identifier, still authenticated at
+        // connect via socket modes + UID, never a credential).
+        if let Some(socket_path) = self.ipc_socket_path.clone() {
+            if let Some(inject) = bitty_pty::bitty_socket_inject_value(&socket_path) {
+                builder = builder.env(bitty_pty::BITTY_SOCKET_ENV, inject);
+            }
+        }
         // W-103 G-2: caller-requested inherited-environment removals
         // (minimized editor env). Removals precede the explicit overrides,
         // so the builder defaults still win for the same key.

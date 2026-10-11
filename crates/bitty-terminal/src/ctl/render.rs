@@ -294,6 +294,18 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
             out.push_str(result_json);
             out.push('\n');
         }
+        CtlRequest::PanelList => {
+            // CTX-1117: human table with the focused (current) marker; JSON
+            // stays the machine contract (`--format json`). Fail-soft to raw
+            // on an unexpected shape (never corrupt stdout).
+            match format_panels_table(result_json) {
+                Some(table) => out.push_str(&table),
+                None => {
+                    out.push_str(result_json);
+                    out.push('\n');
+                }
+            }
+        }
         CtlRequest::TerminalSend { terminal_id, .. } => {
             out.push_str(&format!(
                 "sent to {terminal_id} on {} ({})\n",
@@ -335,8 +347,16 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
             out.push_str(&format!("focused {view_id} on {}\n", target.instance));
         }
         CtlRequest::WorkspaceList => {
-            out.push_str(result_json);
-            out.push('\n');
+            // CTX-1117 (issue #1900): human table marks the active row from
+            // the server `active`/`active_id` (no new `current` verb; the
+            // marker is the affordance). JSON stays the contract.
+            match format_workspaces_table(result_json) {
+                Some(table) => out.push_str(&table),
+                None => {
+                    out.push_str(result_json);
+                    out.push('\n');
+                }
+            }
         }
         CtlRequest::WorkspaceNew => {
             out.push_str(&format!(
@@ -393,4 +413,364 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         }
     }
     out
+}
+
+// ── human tables with current markers (CTX-1117, issue #1900) ─────────────
+//
+// Tables are human, never a contract (`--format json` stays the machine
+// surface). All parsers are total and fail-soft to `None` (the caller falls
+// back to raw JSON) so an unexpected shape never corrupts stdout. No new
+// `current` verbs: the active/focused row *is* the affordance (documented in
+// the PR body to keep scope tight).
+
+/// Render `workspace list` server JSON as a table marking the active row.
+///
+/// Server shape: `{"workspaces":[...],"names":[...],"active":N,
+/// `"active_id":"ws:M","count":C}`. Marks via `active_id` (stable `ws:N`
+/// identity); falls back to the 1-based `active` index when `active_id` is
+/// absent. Returns `None` on an unexpected shape.
+pub(crate) fn format_workspaces_table(result_json: &str) -> Option<String> {
+    let workspaces = extract_string_array(result_json, "workspaces")?;
+    let names = extract_string_array(result_json, "names").unwrap_or_default();
+    let active_id = extract_string_from(result_json, "active_id");
+    let active_index = extract_number(result_json, "active");
+    let mut out = String::from("WORKSPACE NAME ACTIVE\n");
+    if workspaces.is_empty() {
+        out.push_str("(no workspaces)\n");
+        return Some(out);
+    }
+    for (idx, ws) in workspaces.iter().enumerate() {
+        let name = names.get(idx).map(String::as_str).unwrap_or("-");
+        let is_active = match active_id.as_deref() {
+            Some(id) => ws == id,
+            None => match active_index {
+                Some(n) => (idx as u64) + 1 == n,
+                None => false,
+            },
+        };
+        out.push_str(&format!(
+            "{} {} {}\n",
+            ws,
+            display_name(name),
+            if is_active { "yes" } else { "no" }
+        ));
+    }
+    Some(out)
+}
+
+/// One parsed `panel list` row for table rendering.
+struct PanelRow {
+    id: String,
+    view: String,
+    bounds: String,
+    role: String,
+    focused: bool,
+}
+
+/// Render `panel list` server JSON as a table marking the focused (current)
+/// row.
+///
+/// Server shape: `{"panels":[{"id":"p:N","view":"v:N",
+/// `"bounds":{"x":X,"y":Y,"width":W,"height":H},"role":"tiled",
+/// `"focused":bool}]}`. `focused` is the current-panel marker (mirrors
+/// `view list`; no new `current` verb). Returns `None` on an unexpected
+/// shape.
+pub(crate) fn format_panels_table(result_json: &str) -> Option<String> {
+    let rows = parse_panels(result_json)?;
+    let mut out = String::from("PANEL VIEW BOUNDS ROLE FOCUSED\n");
+    if rows.is_empty() {
+        out.push_str("(no panels)\n");
+        return Some(out);
+    }
+    for row in &rows {
+        out.push_str(&format!(
+            "{} {} {} {} {}\n",
+            row.id,
+            row.view,
+            row.bounds,
+            row.role,
+            if row.focused { "yes" } else { "no" }
+        ));
+    }
+    Some(out)
+}
+
+/// Display-safe workspace name for table output (plain, no quoting).
+///
+/// Names are display state only (renames are bounded server-side); blank
+/// names render as `-` so the column never collapses.
+fn display_name(raw: &str) -> &str {
+    if raw.trim().is_empty() { "-" } else { raw }
+}
+
+/// Extract a top-level `"key": [...]` array of JSON strings as Rust strings.
+///
+/// Quote-aware, handles `\"`/`\\`/`\n`/`\r`/`\t`/`\uXXXX` via the same
+/// unescape as [`extract_string_from`]; returns `None` when the key or a
+/// well-formed array is absent.
+fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
+    let array_body = extract_array_body(text, key)?;
+    let mut items = Vec::new();
+    let bytes = array_body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip whitespace/commas.
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'"' {
+            return None;
+        }
+        let (literal, next) = scan_string_literal(&array_body, i)?;
+        let unescaped = unescape_literal(&literal)?;
+        items.push(unescaped);
+        i = next;
+    }
+    Some(items)
+}
+
+/// Extract a top-level `"key": <number>` as `u64` (for `active`, bounds).
+fn extract_number(text: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse::<u64>().ok()
+}
+
+/// Extract a top-level `"key": true|false` as `bool`.
+fn extract_bool(text: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Extract the raw inside of a top-level `"key": [...]` array (without the
+/// outer brackets), balanced and quote-aware. Returns `None` when absent.
+fn extract_array_body(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (idx, ch) in rest.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[1..idx].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Scan one JSON string literal starting at `start` (which must be `"`).
+/// Returns the literal including quotes plus the next byte index.
+fn scan_string_literal(text: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                return Some((text[start..i + 1].to_string(), i + 1));
+            }
+            b'\\' => {
+                i += 2;
+            }
+            _ => {
+                let ch = text[i..].chars().next()?;
+                i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+/// Unescape one JSON string literal (including surrounding quotes).
+fn unescape_literal(literal: &str) -> Option<String> {
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() != 4 {
+                    return None;
+                }
+                let code = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(code)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parse the `panels` array from `panel list` server JSON into rows.
+fn parse_panels(result_json: &str) -> Option<Vec<PanelRow>> {
+    let body = extract_array_body(result_json, "panels")?;
+    let objects = split_objects(&body)?;
+    let mut rows = Vec::with_capacity(objects.len());
+    for obj in objects {
+        let id = extract_string_from(&obj, "id")?;
+        let view = extract_string_from(&obj, "view").unwrap_or_else(|| String::from("-"));
+        let role = extract_string_from(&obj, "role").unwrap_or_else(|| String::from("tiled"));
+        let focused = extract_bool(&obj, "focused").unwrap_or(false);
+        let bounds = match extract_object_body(&obj, "bounds") {
+            Some(bounds_obj) => {
+                let x = extract_number(&bounds_obj, "x").unwrap_or(0);
+                let y = extract_number(&bounds_obj, "y").unwrap_or(0);
+                let width = extract_number(&bounds_obj, "width").unwrap_or(0);
+                let height = extract_number(&bounds_obj, "height").unwrap_or(0);
+                format!("{width}x{height}+{x}+{y}")
+            }
+            None => String::from("-"),
+        };
+        rows.push(PanelRow {
+            id,
+            view,
+            bounds,
+            role,
+            focused,
+        });
+    }
+    Some(rows)
+}
+
+/// Split an array body into its top-level `{...}` objects (quote-aware).
+fn split_objects(body: &str) -> Option<Vec<String>> {
+    let mut objects = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut start: Option<usize> = None;
+    for (idx, ch) in body.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let s = start?;
+                    objects.push(body[s..idx + ch.len_utf8()].to_string());
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    Some(objects)
+}
+
+/// Extract the raw inside of `"key": {...}` (without outer braces).
+fn extract_object_body(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (idx, ch) in rest.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[1..idx].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

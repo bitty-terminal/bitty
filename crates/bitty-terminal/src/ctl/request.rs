@@ -41,12 +41,21 @@ pub struct CtlTargeting {
     pub format: CtlFormat,
 }
 
+/// Wire method for `ctl panel list` (CTX-1117, issue #1900).
+///
+/// Local to `bitty-terminal` (the `bitty-ipc` pin predates it): the servo
+/// registers it additively on its owned `Dispatcher`, and the drain
+/// authorizes it as `view.inspect` (same as `view list`). Unix only; Windows
+/// stays fail-closed via the existing `ctl_roundtrip` stub.
+pub const METHOD_LIST_PANELS: &str = "bitty.debug/listPanels";
+
 /// One validated `bitty ctl` operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtlRequest {
     InstanceList,
     WindowList,
     ViewList,
+    PanelList,
     TerminalList,
     TerminalSpawn {
         cwd: Option<String>,
@@ -110,6 +119,7 @@ impl CtlRequest {
             Self::InstanceList => "core.instance.list",
             Self::WindowList => "core.window.list",
             Self::ViewList => "core.view.list",
+            Self::PanelList => "core.panel.list",
             Self::TerminalList => "core.terminal.list",
             Self::TerminalSpawn { .. } => "core.terminal.spawn",
             Self::TerminalClose { .. } => "core.terminal.close",
@@ -138,6 +148,7 @@ impl CtlRequest {
             Self::InstanceList => None,
             Self::WindowList => Some(ipc_ctl::METHOD_LIST_WINDOWS),
             Self::ViewList => Some(ipc_ctl::METHOD_LIST_VIEWS),
+            Self::PanelList => Some(METHOD_LIST_PANELS),
             Self::TerminalList => Some(ipc_ctl::METHOD_LIST_TERMINALS),
             Self::TerminalSpawn { .. } => Some(ipc_ctl::METHOD_SPAWN_TERMINAL),
             Self::TerminalClose { .. } => Some(ipc_ctl::METHOD_CLOSE_TERMINAL),
@@ -166,6 +177,7 @@ impl CtlRequest {
             Self::InstanceList
             | Self::WindowList
             | Self::ViewList
+            | Self::PanelList
             | Self::TerminalList
             | Self::WorkspaceList
             | Self::WorkspaceNew
@@ -237,6 +249,7 @@ pub fn ctl_usage() -> String {
          \x20 instance list\n\
          \x20 window list\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
+         \x20 panel list\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
@@ -248,6 +261,7 @@ pub fn ctl_usage() -> String {
          \x20 bitty ctl instance list\n\
          \x20 bitty ctl terminal send t:1 \"cargo test\"\n\
          \x20 bitty ctl view split --right\n\
+         \x20 bitty ctl panel list\n\
          \x20 bitty ctl config reload",
     )
 }
@@ -277,6 +291,7 @@ pub fn ctl_help_text() -> String {
             instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
             window list                   core.window.list (view.inspect)\n  \
             view list                     core.view.list (view.inspect)\n  \
+            panel list                    core.panel.list (view.inspect; tiled panels with bounds/role)\n  \
             terminal list                 core.terminal.list (terminal.inspect)\n  \
             terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
             terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
@@ -297,17 +312,24 @@ pub fn ctl_help_text() -> String {
             consent revoke --scope S      core.consent.revoke_scope (explicit revoke with receipt)\n  \
             consent revoke-session        core.consent.revoke_session (end own session with receipt)\n\
          \n\
-         Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
-            workspace close (terminal.manage), and\n\
-         \x20 config reload (config.modify) need BITTY_CTL_ELEVATE\n\
-         \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
-         \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
-         \x20 All other verbs — including view split / view focus (view.manage)\n\
-         \x20 and workspace list / new / focus / move / rename / move-panel, and every list, terminal send,\n\
-         \x20 and terminal text verb — need no elevation.\n\
-         \n\
-         Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
-         \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
+          Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
+             workspace close (terminal.manage), and\n\
+          \x20 config reload (config.modify) need BITTY_CTL_ELEVATE\n\
+          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
+          \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
+          \x20 All other verbs — including view split / view focus (view.manage)\n\
+          \x20 and workspace list / new / focus / move / rename / move-panel, panel list,\n\
+          \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
+          \n\
+          PTY discovery (issue #1900): each PTY child inherits an advisory\n\
+          \x20 BITTY_SOCKET pointing at its own instance (never overriding an\n\
+          \x20 explicitly-set outer value; inherit wins). BITTY_INSTANCE_ID is\n\
+          \x20 the advisory instance label for the same precedence. Targeting\n\
+          \x20 precedence is unchanged: --socket, --instance,\n\
+          \x20 BITTY_SOCKET/BITTY_INSTANCE_ID, exactly-one-live, else exit 6.\n\
+          \n\
+          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
+          \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
          \n\
          Consent (issue #1520): `consent grant` prompts for an explicit\n\
          \x20 ALLOW phrase on the local terminal and grants only to the calling\n\
@@ -589,6 +611,11 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             reject_extra(rest, "view list")?;
             reject_ctl_options_for("view list", split_dir.is_some(), spawn_cwd.is_some())?;
             Ok((CtlRequest::ViewList, targeting))
+        }
+        (Some("panel"), Some("list")) => {
+            reject_extra(rest, "panel list")?;
+            reject_ctl_options_for("panel list", split_dir.is_some(), spawn_cwd.is_some())?;
+            Ok((CtlRequest::PanelList, targeting))
         }
         (Some("terminal"), Some("list")) => {
             reject_extra(rest, "terminal list")?;

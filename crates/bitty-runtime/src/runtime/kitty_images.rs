@@ -1310,6 +1310,29 @@ impl Runtime {
         Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
         let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        // Fail-closed preflight (CTX-1123 fix): a `z` retarget needs a
+        // pre-existing truth descriptor holding frame `r`. Transmit-only
+        // roots store pixels with no descriptor, so `animation_or_insert`
+        // + `set_gap` would mint one and succeed where the gap update
+        // should refuse; worse, an out-of-range `r` would pass `edit_frame`
+        // then refuse `set_gap`, leaving mutated pixels behind a refused
+        // truth action. Reject before any pixel mutation so a refused
+        // update changes neither pixels nor truth.
+        if control.z_index != 0 {
+            let gap_held = self
+                .state
+                .kitty_placements()
+                .animation(wire)
+                .is_some_and(|anim| u32::from(frame_r) <= anim.frame_count());
+            if !gap_held {
+                return Err(KittyImageError::Placement(
+                    bitty_rich::KittyPlacementError::NoSuchFrame {
+                        image: root,
+                        frame: u32::from(frame_r),
+                    },
+                ));
+            }
+        }
         self.kitty_images
             .edit_frame(
                 root,

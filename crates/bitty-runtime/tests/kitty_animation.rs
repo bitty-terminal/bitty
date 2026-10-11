@@ -519,6 +519,73 @@ fn edit_overcap_refused_with_nothing_stored() {
 }
 
 #[test]
+fn transmit_only_edit_with_z_refused_with_nothing_changed() {
+    // CTX-1123 preflight fix: transmit-only stores frame 1 with no
+    // animation descriptor, so an `r>0` edit carrying nonzero `z` must
+    // refuse before any pixel mutation (fail closed: refused truth
+    // changes neither pixels nor truth). The displayed root shares the
+    // same no-descriptor shape, which makes the stored pixels observable
+    // through the headless present for a byte-identical check.
+    let mut rt = make_runtime();
+    // Displayed 2x2 red on wire 1: stores frame 1 with no descriptor,
+    // placed so pixel bytes are observable through the headless present.
+    display_root(&mut rt);
+    // Transmit-only 2x2 red on wire 7: same no-descriptor shape (pixels
+    // held, no descriptor, never placed).
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=2,v=2,a=t,i=7,m=0;{}",
+        red_2x2_b64()
+    )));
+    assert_eq!(rt.kitty_image_count(), 2);
+    assert_eq!(rt.kitty_anim_frame_count(7), 1);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(7)
+            .map(|anim| anim.frame_count()),
+        None
+    );
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("frame must exist");
+    // Both edits carry `z=40`: no descriptor holds frame 1, so both must
+    // refuse with nothing stored and nothing recorded.
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=7,r=1,x=0,y=0,X=1,z=40,m=0;{}",
+        blue_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(7), 1);
+    assert_eq!(rt.kitty_image_count(), 2);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(7)
+            .map(|anim| anim.frame_count()),
+        None,
+        "refused edit must record no truth gap"
+    );
+    rt.handle_pty_bytes(&apc(&format!(
+        "Gf=32,s=1,v=1,a=f,i=1,r=1,x=0,y=0,X=1,z=40,m=0;{}",
+        blue_1x1_b64()
+    )));
+    assert_eq!(rt.kitty_anim_frame_count(1), 1);
+    assert_eq!(
+        rt.state()
+            .kitty_placements()
+            .animation(1)
+            .map(|anim| anim.frame_count()),
+        None,
+        "refused edit must record no truth gap"
+    );
+    rt.tick_at(t0);
+    let after = rt.headless_rgba().expect("frame must exist");
+    assert_eq!(
+        before, after,
+        "refused edit must leave pixels byte-identical"
+    );
+}
+
+#[test]
 fn edit_invalidates_raster_cache() {
     let mut rt = make_runtime();
     display_root(&mut rt);

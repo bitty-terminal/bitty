@@ -5308,7 +5308,8 @@ fn unified_gate_help_piped_is_plain_forced_still_colors() {
 
 /// [`drive_init_wizard`] with an injected preview baseline; returns answers
 /// plus the wizard output plus the preview (snapshots prove mid-wizard
-/// state headlessly).
+/// state headlessly). No live session (in-memory overlay only), so existing
+/// p1-p3 assertions stay live-free.
 fn drive_init_wizard_with_preview(
     stdin_lines: &str,
     shell_env: Option<&str>,
@@ -5328,6 +5329,7 @@ fn drive_init_wizard_with_preview(
         overrides,
         false,
         Some(&mut preview),
+        None,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed, preview)
@@ -5691,6 +5693,512 @@ fn init_preview_baseline_prefers_loaded_config() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&prof_root);
+}
+
+#[test]
+fn init_live_preview_enabled_gate() {
+    // Interactive TTY without machine flows enables the wizard-owned live
+    // preview; every machine flow keeps the in-memory behavior.
+    let args = Args::new();
+    let env = init_env(None, Some("/bin/bash"), None, Some("/tmp"), true);
+    assert!(crate::init::init_live_preview_enabled(&args, &env));
+
+    let piped = init_env(None, Some("/bin/bash"), None, Some("/tmp"), false);
+    assert!(
+        !crate::init::init_live_preview_enabled(&args, &piped),
+        "piped stdin keeps in-memory preview"
+    );
+
+    let mut yes = Args::new();
+    yes.init_yes = true;
+    assert!(
+        !crate::init::init_live_preview_enabled(&yes, &env),
+        "--yes has no steps to push"
+    );
+
+    let mut safe = Args::new();
+    safe.safe = true;
+    assert!(
+        !crate::init::init_live_preview_enabled(&safe, &env),
+        "--safe keeps in-memory preview"
+    );
+
+    let mut headless = Args::new();
+    headless.headless = true;
+    assert!(
+        !crate::init::init_live_preview_enabled(&headless, &env),
+        "--headless keeps in-memory preview"
+    );
+
+    let mut testmode = Args::new();
+    testmode.test_mode = true;
+    assert!(
+        !crate::init::init_live_preview_enabled(&testmode, &env),
+        "--test-mode keeps in-memory preview"
+    );
+}
+
+#[test]
+fn init_preview_push_live_disabled_is_noop() {
+    // Piped/non-TTY preview never touches a live session.
+    let baseline = bitty_config::fallback_builtin();
+    let cfg = runtime_config_from_effective(&baseline).expect("cfg");
+    let mut runtime =
+        Runtime::with_deterministic_rasterizer(cfg).expect("deterministic runtime builds");
+    let before_background = runtime.active_background();
+    let before_family = runtime.config().font_family.clone();
+    let _ = crate::config_reload::take_app_adoption();
+
+    let disabled = InitPreview::disabled();
+    assert!(!disabled.is_enabled());
+    assert!(
+        crate::init::init_preview_push_live(&mut runtime, &disabled).is_none(),
+        "disabled preview pushes nothing"
+    );
+    assert_eq!(runtime.active_background(), before_background);
+    assert_eq!(runtime.config().font_family, before_family);
+    assert!(
+        crate::config_reload::take_app_adoption().is_none(),
+        "disabled push stashes nothing"
+    );
+    assert!(!runtime.has_pty(), "preview never spawns a shell");
+}
+
+#[test]
+fn init_live_preview_maps_snapshots_per_step() {
+    // Headless hermetic overlay-to-preview mapping (p4 CTX-1119): every
+    // prompted snapshot drives the reload path on a deterministic runtime.
+    // Same custom picks as the in-memory preview test: shell 2, bitty-dark,
+    // Fira Code, 14pt, 10/12/3/8, 50000, always, vim 2.
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.window.opacity = 0.75;
+    baseline.layout.resize_step = 0.02;
+
+    let (_, _, preview) = drive_init_wizard_with_preview(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    let snapshots = preview.snapshots();
+    assert_eq!(snapshots.len(), 11, "every prompted step previews");
+
+    let cfg = runtime_config_from_effective(&baseline).expect("cfg");
+    let mut runtime =
+        Runtime::with_deterministic_rasterizer(cfg).expect("deterministic runtime builds");
+    let _ = crate::config_reload::take_app_adoption();
+
+    let dark_expected =
+        bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("dark")));
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        crate::config_reload::apply_live(&mut runtime, snapshot).expect("snapshot adopts live");
+        let app = crate::config_reload::take_app_adoption().expect("app half stashed");
+        assert!(
+            (runtime.window_opacity() - 0.75).abs() < f32::EPSILON,
+            "snapshot {index} keeps out-of-wizard opacity live"
+        );
+        assert!(
+            (app.resize_step - 0.02).abs() < f32::EPSILON,
+            "snapshot {index} keeps out-of-wizard resize step"
+        );
+        assert!(!runtime.has_pty(), "snapshot {index} spawns nothing");
+        match index {
+            0 => {
+                assert_eq!(
+                    snapshot.terminal.shell.as_deref(),
+                    Some("/bin/sh"),
+                    "shell previews first"
+                );
+                assert_eq!(
+                    runtime.active_background(),
+                    bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(
+                        baseline.appearance.theme.as_deref()
+                    ))
+                    .background,
+                    "shell-only snapshot keeps baseline theme live"
+                );
+                assert!(
+                    snapshot.keymaps.is_empty(),
+                    "effective preset still default before its own step"
+                );
+                assert_eq!(
+                    app.keymaps.len(),
+                    bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+                    "resolved defaults ride the app half"
+                );
+            }
+            1 => {
+                assert_eq!(
+                    runtime.active_background(),
+                    dark_expected.background,
+                    "theme visibly hot-updates second"
+                );
+            }
+            2 => {
+                assert_eq!(runtime.config().font_family, "Fira Code");
+            }
+            3 => {
+                assert!(
+                    (runtime.config().font_size - 14.0).abs() < f32::EPSILON,
+                    "font size adopts live"
+                );
+            }
+            4 => {
+                assert_eq!(runtime.config().decoration.gaps_in, 10);
+            }
+            5 => {
+                assert_eq!(runtime.config().decoration.gaps_out, 12);
+            }
+            6 => {
+                assert_eq!(runtime.config().decoration.border, 3);
+            }
+            7 => {
+                assert_eq!(runtime.config().decoration.radius, 8);
+            }
+            8 => {
+                assert_eq!(
+                    snapshot.terminal.scrollback, 50_000,
+                    "scrollback stages in overlay"
+                );
+                assert_eq!(
+                    runtime.config().scrollback,
+                    baseline_scrollback(&baseline),
+                    "scrollback stays restart-required live"
+                );
+            }
+            9 => {
+                assert_eq!(snapshot.close_confirm, bitty_config::CloseConfirm::Always);
+            }
+            10 => {
+                assert_eq!(
+                    snapshot.keymaps.len(),
+                    bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+                    "vim preset stages explicit effective map"
+                );
+                assert_eq!(
+                    app.keymaps.len(),
+                    bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+                    "vim preset rides the app half live"
+                );
+                assert_eq!(preview.current(), snapshot);
+            }
+            _ => unreachable!("eleven prompted steps"),
+        }
+    }
+    assert!(
+        crate::config_reload::take_app_adoption().is_none(),
+        "single-shot slot leaves nothing behind"
+    );
+}
+
+/// Baseline scrollback the live runtime keeps while the overlay stages a
+/// restart-required scrollback value.
+fn baseline_scrollback(baseline: &bitty_config::EffectiveConfig) -> usize {
+    let cfg = runtime_config_from_effective(baseline).expect("cfg");
+    cfg.scrollback
+}
+
+#[test]
+fn init_preview_push_live_maps_final_overlay() {
+    // The helper pushes the final overlay through the same path and returns
+    // the app half for a preview app to adopt via adopt_live_config.
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.window.opacity = 0.75;
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        Some("/bin/bash"),
+        None,
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    result.expect("custom picks accepted");
+
+    let cfg = runtime_config_from_effective(preview.baseline()).expect("cfg");
+    let mut runtime =
+        Runtime::with_deterministic_rasterizer(cfg).expect("deterministic runtime builds");
+    let _ = crate::config_reload::take_app_adoption();
+    let app = crate::init::init_preview_push_live(&mut runtime, &preview)
+        .expect("final overlay adopts live");
+
+    let dark_expected =
+        bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("dark")));
+    assert_eq!(runtime.active_background(), dark_expected.background);
+    assert_eq!(runtime.config().font_family, "Fira Code");
+    assert!((runtime.config().font_size - 14.0).abs() < f32::EPSILON);
+    assert_eq!(runtime.config().decoration.gaps_in, 10);
+    assert_eq!(runtime.config().decoration.gaps_out, 12);
+    assert_eq!(runtime.config().decoration.border, 3);
+    assert_eq!(runtime.config().decoration.radius, 8);
+    assert!((runtime.window_opacity() - 0.75).abs() < f32::EPSILON);
+    assert_eq!(
+        app.keymaps.len(),
+        bitty_config::keymap::DEFAULT_KEYMAPS.len(),
+        "vim preset rides the app half"
+    );
+    assert!(!runtime.has_pty(), "preview never spawns a shell");
+    assert!(
+        crate::config_reload::take_app_adoption().is_none(),
+        "helper drains the single-shot slot"
+    );
+}
+
+#[test]
+fn init_preview_echo_tracks_running_theme_with_color() {
+    // User-visible half of the live preview (DEC-0109): the running echo is
+    // styled in the running preview theme. Same custom picks as the mapping
+    // test; no live session needed since the echo reads the overlay only.
+    let baseline = bitty_config::fallback_builtin();
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        true,
+        Some(&mut preview),
+        None,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    let echoes: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.contains("(preview:"))
+        .collect();
+    assert_eq!(echoes.len(), 11, "one echo per step, got:\n{printed}");
+    // The first echo still carries the shipped defaults while the last one
+    // carries every custom pick: the echo tracks the running overlay.
+    assert!(
+        echoes[0].contains(bitty_config::types::DEFAULT_FONT_FAMILY),
+        "first echo shows the default family, got: {}",
+        echoes[0]
+    );
+    assert!(
+        !echoes[0].contains("Fira Code"),
+        "first echo predates the family pick, got: {}",
+        echoes[0]
+    );
+    assert!(
+        echoes[10].contains("font=\"Fira Code\" 14pt"),
+        "last echo shows the picked family and size, got: {}",
+        echoes[10]
+    );
+    assert!(
+        echoes[10].contains("gaps 10/12, border 3, radius 8"),
+        "last echo shows the picked decoration, got: {}",
+        echoes[10]
+    );
+    assert!(
+        echoes[10].contains("theme=\"dark\""),
+        "last echo shows the picked theme, got: {}",
+        echoes[10]
+    );
+    // Styled in the running preview theme through the existing convention.
+    let (dark, _) = bitty_config::theme::resolve_theme_with_status(Some("dark"));
+    let foreground = format!(
+        "\u{1b}[38;2;{};{};{}m",
+        dark.foreground[0], dark.foreground[1], dark.foreground[2]
+    );
+    let background = format!(
+        "\u{1b}[48;2;{};{};{}m",
+        dark.background[0], dark.background[1], dark.background[2]
+    );
+    assert!(
+        echoes.iter().any(|line| line.contains(&foreground)),
+        "echo wears the preview theme foreground, got:\n{printed}"
+    );
+    assert!(
+        echoes.iter().any(|line| line.contains(&background)),
+        "echo wears the preview theme background, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_preview_echo_plain_without_color() {
+    // Without color the same running echo stays plain (existing plain-output
+    // contract keeps holding with echoes present).
+    let baseline = bitty_config::fallback_builtin();
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        false,
+        Some(&mut preview),
+        None,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert_eq!(
+        printed.matches("(preview:").count(),
+        11,
+        "one plain echo per step, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("(preview: theme=\"dark\", font=\"Fira Code\" 14pt"),
+        "plain echo carries the running picks, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("\u{1b}["),
+        "plain echo adds no ANSI, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_preview_echo_absent_without_preview() {
+    // Piped/plain path (no preview): prompts behave exactly as before with
+    // no echo lines.
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let result = run_init_interactive(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        true,
+    );
+    result.expect("custom picks accepted");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        !printed.contains("(preview:"),
+        "no preview means no echo, got:\n{printed}"
+    );
+}
+
+// Live-spawn: the wizard-owned preview session hot-updates per step on the
+// real constructor (not the deterministic rasterizer). Unix-only in this
+// slice (no ConPTY coverage); require_pty keeps the force-no-PTY simulation
+// path and proves the preview spawns nothing even when a PTY exists. Plain
+// output only, no stdout color asserts.
+#[test]
+#[cfg(unix)]
+fn init_live_preview_hot_updates_per_step_unix() {
+    require_pty!();
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.window.opacity = 0.75;
+    baseline.layout.resize_step = 0.02;
+    let before = baseline.clone();
+    let cfg = runtime_config_from_effective(&baseline).expect("cfg");
+    let mut live = Runtime::new(cfg).expect("live preview builds");
+    let _ = crate::config_reload::take_app_adoption();
+
+    let mut input = std::io::BufReader::new(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n".as_bytes(),
+    );
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline);
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        false,
+        Some(&mut preview),
+        Some(&mut live),
+    );
+    let answers = result.expect("custom picks accepted");
+    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+    assert_eq!(
+        preview.snapshots().len(),
+        11,
+        "every prompted step previews"
+    );
+
+    let dark_expected =
+        bitty_runtime::ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("dark")));
+    assert_eq!(
+        live.active_background(),
+        dark_expected.background,
+        "theme visibly hot-updates live"
+    );
+    assert_eq!(live.config().font_family, "Fira Code");
+    assert!((live.config().font_size - 14.0).abs() < f32::EPSILON);
+    assert_eq!(live.config().decoration.gaps_in, 10);
+    assert_eq!(live.config().decoration.gaps_out, 12);
+    assert_eq!(live.config().decoration.border, 3);
+    assert_eq!(live.config().decoration.radius, 8);
+    assert!(
+        (live.window_opacity() - 0.75).abs() < f32::EPSILON,
+        "out-of-wizard opacity preserved live"
+    );
+    assert!(!live.has_pty(), "preview spawns no shell even with PTY");
+    assert!(
+        crate::config_reload::take_app_adoption().is_none(),
+        "per-step pushes leave no app-half behind"
+    );
+    assert_eq!(preview.baseline(), &before);
+    assert_eq!(preview.current(), &preview.snapshots()[10]);
+}
+
+// Live-spawn Esc rollback: cancel restores the prior config in memory and
+// the prior live appearance in the preview session. Same unix and PTY gate
+// as the confirm-path live test; plain output only.
+#[test]
+#[cfg(unix)]
+fn init_live_preview_esc_restores_baseline_unix() {
+    require_pty!();
+    let baseline = bitty_config::fallback_builtin();
+    let cfg = runtime_config_from_effective(&baseline).expect("cfg");
+    let mut live = Runtime::new(cfg).expect("live preview builds");
+    let before_background = live.active_background();
+    let before_opacity = live.window_opacity();
+    let _ = crate::config_reload::take_app_adoption();
+
+    let mut input = std::io::BufReader::new("\n\x1b\n".as_bytes());
+    let mut output = Vec::new();
+    let mut preview = InitPreview::enabled(baseline.clone());
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        None,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        false,
+        Some(&mut preview),
+        Some(&mut live),
+    );
+    let err = result.expect_err("Esc cancels");
+    assert!(err.contains("cancelled"), "unexpected: {err}");
+    assert_eq!(preview.snapshots().len(), 1, "only shell previewed");
+    assert_eq!(
+        preview.current(),
+        &baseline,
+        "Esc restores the exact previous config"
+    );
+    assert_eq!(
+        live.active_background(),
+        before_background,
+        "Esc restores the prior live appearance"
+    );
+    assert!(
+        (live.window_opacity() - before_opacity).abs() < f32::EPSILON,
+        "Esc restores prior live opacity"
+    );
+    assert!(!live.has_pty(), "cancel spawns nothing");
+    assert!(
+        crate::config_reload::take_app_adoption().is_none(),
+        "rollback leaves no app-half behind"
+    );
 }
 
 #[test]

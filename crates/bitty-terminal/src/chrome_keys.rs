@@ -1224,8 +1224,20 @@ impl TerminalApp {
                 // foreign-qualified names, args-schema refusals, and callee
                 // failures all land here as loud diagnostics with terminal
                 // state untouched (never a host crash, never PTY bytes).
+                // CTX-1125 (devtools#10 item 1): a successful dispatch
+                // surfaces its result on the bounded banner like every
+                // other command dispatch (band clicks, composer verbs), so
+                // a result-only command invoked from a chord is visible on
+                // a real host. The qualified name parsed before dispatch,
+                // so the split below always succeeds; a missed split keeps
+                // the diagnostic and skips only the banner.
                 match self.invoke_plugin_command(&qualified, &Self::empty_command_args()) {
-                    Ok(_) => eprintln!("bitty: keymap command:{qualified} -> invoked"),
+                    Ok(result) => {
+                        if let Some((owner, command)) = qualified.split_once(':') {
+                            self.surface_dispatch_result(owner, command, &result);
+                        }
+                        eprintln!("bitty: keymap command:{qualified} -> invoked");
+                    }
                     Err(diagnostic) => eprintln!(
                         "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
                     ),
@@ -6067,6 +6079,71 @@ claims = []
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
             "bitty-featured.devtools:plugins".to_string()
         )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invoke_command_keybinding_surfaces_result_on_banner() {
+        // CTX-1125 (devtools#10 item 1): a keybinding
+        // `command:<owner:command>` chord surfaces a successful dispatch
+        // result on the bounded banner like every other command dispatch
+        // (band clicks, composer verbs), so a result-only command with no
+        // notice is visible on a real host. Refusals admit nothing and
+        // leave the live banner untouched.
+        use crate::composer_owner::fixture;
+        use bitty_config::ChromeAction;
+        const OWNER: &str = "bitty-featured.devtools";
+        let root = fixture::temp_dir("invoke-command-surface");
+        let plugin = root.join(OWNER);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{OWNER}\"\nname = \"DevTools Test\"\nversion = \"0.1.0\"\n\
+                 description = \"invoke surfacing test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n\
+                 [lazy]\ncommands = [\"{OWNER}:plugins\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "bitty.commands.register({\n\
+             \x20 id = \"plugins\",\n\
+             \x20 title = \"DevTools: list plugins\",\n\
+             \x20 args_schema = { type = \"object\", properties = {}, additionalProperties = false },\n\
+             \x20 result_schema = { type = \"string\" },\n\
+             \x20 run = function(_args) return \"2 plugins active\" end,\n\
+             })\n\
+             return {}\n",
+        )
+        .expect("init");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert_eq!(app.runtime.notification_banner(), None);
+        assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
+            "bitty-featured.devtools:plugins".to_string()
+        )));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.devtools:plugins: 2 plugins active"),
+            "the keybinding dispatch result must surface on the banner"
+        );
+        // A refused chord admits nothing: the live banner is untouched.
+        assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
+            "bitty-featured.devtools:missing".to_string()
+        )));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.devtools:plugins: 2 plugins active"),
+            "a refused dispatch must not disturb the banner"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

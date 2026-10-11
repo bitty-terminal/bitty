@@ -1504,8 +1504,10 @@ impl TerminalApp {
     /// example `devtools:plugins`) showed nothing on a real host. The
     /// result renders through [`lua_result_summary`] (bounded, single line)
     /// under a `plugin:command` title; failures keep their existing loud
-    /// diagnostic at the call site and never reach the banner.
-    fn surface_dispatch_result(
+    /// diagnostic at the call site and never reach the banner. `pub(crate)`
+    /// for the keybinding dispatch arm (CTX-1125), which surfaces like the
+    /// band-click and composer-verb call sites.
+    pub(crate) fn surface_dispatch_result(
         &mut self,
         plugin_id: &str,
         command: &str,

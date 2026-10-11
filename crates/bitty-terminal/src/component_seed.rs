@@ -18,7 +18,7 @@
 //!   `--proto =https`, no shell interpolation) plus system `tar` for
 //!   extraction plus Rust-side SHA-256 verification. No Rust network stack
 //!   in bitty (DIR-030 D6 / DIR-016 / DIR-017 stay intact).
-//! - Layout: `bitty/components/<name>/<version>/<target>.tar.gz` plus the
+//! - Layout: `bitty/extensions/<name>/<version>/<target>.tar.gz` plus the
 //!   aggregate `SHA256SUMS` manifest (the authoritative checksum record per
 //!   `packaging/README.md`); the tarball holds exactly `bitty-component.toml`
 //!   plus `bitty-<name>` at the archive root.
@@ -258,7 +258,7 @@ pub fn registry_digest_for(_name: &str, _version: &str) -> Option<String> {
 }
 
 /// R2 key prefix for prebuilt component distributions.
-pub const SEED_KEY_PREFIX: &str = "bitty/components";
+pub const SEED_KEY_PREFIX: &str = "bitty/extensions";
 
 /// Maximum bytes of a `--version` value (mirrors the component CLI bound).
 pub const SEED_VERSION_MAX_BYTES: usize = 64;
@@ -331,9 +331,9 @@ pub const SEED_TAR_LIST_MAX_BYTES: usize = 8192;
 /// here with zero spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedUrls {
-    /// `https://cdn.bitty.run/bitty/components/<name>/<version>/<target>.tar.gz`.
+    /// `https://cdn.bitty.run/bitty/extensions/<name>/<version>/<target>.tar.gz`.
     pub tarball_url: String,
-    /// `https://cdn.bitty.run/bitty/components/<name>/<version>/SHA256SUMS`.
+    /// `https://cdn.bitty.run/bitty/extensions/<name>/<version>/SHA256SUMS`.
     pub manifest_url: String,
     /// Tarball file name (`<target>.tar.gz`, the manifest lookup key).
     pub tarball_file: String,
@@ -513,7 +513,7 @@ pub fn valid_seed_target(target: &str) -> bool {
 
 /// Final audit over a constructed URL: exact `https://cdn.bitty.run` base
 /// (built from [`SEED_CDN_HOST`], the single allowlisted host), exact
-/// `bitty/components/` prefix, bounded length, and no byte outside the
+/// `bitty/extensions/` prefix, bounded length, and no byte outside the
 /// URL-safe set the validated parts can produce. Belt and braces after part
 /// validation: the audit pins the invariant for review even though
 /// validated parts cannot violate it.
@@ -681,7 +681,7 @@ pub fn check_curl_version_output(output: &str) -> Result<CurlVersion, SeedError>
     match parse_curl_version(output) {
         Some(version) if version.meets_floor() => Ok(version),
         Some(version) => Err(SeedError::CurlTooOld(format!(
-            "bitty component: curl {version} is too old (need {SEED_CURL_FLOOR} or newer for --proto =https, --connect-timeout, --max-time, --max-filesize; upgrade curl and retry, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/)"
+            "bitty component: curl {version} is too old (need {SEED_CURL_FLOOR} or newer for --proto =https, --connect-timeout, --max-time, --max-filesize; upgrade curl and retry, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/)"
         ))),
         None => Err(SeedError::Fetch(format!(
             "bitty component: cannot parse `curl --version` output (need curl {SEED_CURL_FLOOR} or newer; upgrade curl and retry)"
@@ -739,13 +739,13 @@ fn scrubbed_command(tool: &str) -> Command {
 /// placement path, and that no staging was attempted (exit `1`).
 fn curl_missing_diagnostic() -> String {
     format!(
-        "bitty component: `curl` not found (need curl {SEED_CURL_FLOOR} or newer; install curl first, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/; nothing was fetched or staged)"
+        "bitty component: `curl` not found (need curl {SEED_CURL_FLOOR} or newer; install curl first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)"
     )
 }
 
 /// Actionable diagnostic for absent `tar` (same fail-closed shape).
 fn tar_missing_diagnostic() -> String {
-    "bitty component: `tar` not found (install tar first, or place the release manually under $XDG_DATA_HOME/bitty/components/<name>/<version>/; nothing was fetched or staged)".to_string()
+    "bitty component: `tar` not found (install tar first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)".to_string()
 }
 
 /// Result of the once-per-invocation `curl --version` preflight.
@@ -1672,11 +1672,11 @@ mod tests {
         let urls = seed_urls("net", "0.0.23", "x86_64-unknown-linux-gnu").expect("urls");
         assert_eq!(
             urls.tarball_url,
-            "https://cdn.bitty.run/bitty/components/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz"
+            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz"
         );
         assert_eq!(
             urls.manifest_url,
-            "https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS"
+            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS"
         );
         assert_eq!(urls.tarball_file, "x86_64-unknown-linux-gnu.tar.gz");
     }
@@ -1869,9 +1869,9 @@ mod tests {
     #[test]
     fn builtin_url_check_rejects_hostile_posing() {
         for builtin in [
-            "https://cdn.bitty.run/bitty/components/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run/bitty/components/net/0.0.23/SHA256SUMS",
-            "https://cdn.bitty.run:443/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS",
+            "https://cdn.bitty.run:443/bitty/extensions/net/0.0.23/x.tar.gz",
         ] {
             assert!(
                 is_builtin_installer_url(builtin),
@@ -1879,10 +1879,10 @@ mod tests {
             );
         }
         for hostile in [
-            "https://cdn.bitty.run.evil.com/bitty/components/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run@evil/bitty/components/net/0.0.23/x.tar.gz",
-            "https://CDN.BITTY.RUN/bitty/components/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run:8443/bitty/components/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run.evil.com/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run@evil/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://CDN.BITTY.RUN/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run:8443/bitty/extensions/net/0.0.23/x.tar.gz",
             "https://cdn.bitty.run:80/x",
             "http://cdn.bitty.run/x",
             "HTTPS://cdn.bitty.run/x",
@@ -2324,7 +2324,7 @@ mod tests {
         assert!(message.contains(SEED_CURL_FLOOR), "{message}");
         assert!(message.contains("upgrade"), "{message}");
         assert!(
-            message.contains("$XDG_DATA_HOME/bitty/components/"),
+            message.contains("$XDG_DATA_HOME/bitty/extensions/"),
             "{message}"
         );
         let error = check_curl_version_output("not curl output").expect_err("unparsable must fail");
@@ -2359,7 +2359,7 @@ mod tests {
         let message = error.message();
         assert!(message.contains("not found"), "{message}");
         assert!(
-            message.contains("$XDG_DATA_HOME/bitty/components/"),
+            message.contains("$XDG_DATA_HOME/bitty/extensions/"),
             "{message}"
         );
         assert!(
@@ -2467,11 +2467,11 @@ mod tests {
         let curl = curl_missing_diagnostic();
         assert!(curl.contains("curl"), "{curl}");
         assert!(curl.contains(SEED_CURL_FLOOR), "{curl}");
-        assert!(curl.contains("$XDG_DATA_HOME/bitty/components/"), "{curl}");
+        assert!(curl.contains("$XDG_DATA_HOME/bitty/extensions/"), "{curl}");
         assert!(curl.contains("nothing was fetched or staged"), "{curl}");
         let tar = tar_missing_diagnostic();
         assert!(tar.contains("tar"), "{tar}");
-        assert!(tar.contains("$XDG_DATA_HOME/bitty/components/"), "{tar}");
+        assert!(tar.contains("$XDG_DATA_HOME/bitty/extensions/"), "{tar}");
         assert!(tar.contains("nothing was fetched or staged"), "{tar}");
         assert_eq!(SeedError::ToolMissing(curl).exit_code(), 1);
         assert_eq!(SeedError::CurlTooOld("x".to_string()).exit_code(), 1);

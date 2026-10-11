@@ -1,7 +1,7 @@
 //! `bitty component`: CLI-first native binary extension management (issue #1651).
 //!
-//! Search priority: user `$XDG_DATA_HOME/bitty/components/` wins over system
-//! `/usr/lib/bitty/components/` (or platform equivalent). The user tier is
+//! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over system
+//! `/usr/lib/bitty/extensions/` (or platform equivalent). The user tier is
 //! writable without privilege; the system tier is read-only for this command.
 //!
 //! # Contract (implemented, v1 local-path only)
@@ -700,7 +700,7 @@ pub fn component_usage() -> String {
      \x20      bitty component remove <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
-     $XDG_DATA_HOME/bitty/components/ wins over /usr/lib/bitty/components/.\n\
+     $XDG_DATA_HOME/bitty/extensions/ wins over /usr/lib/bitty/extensions/.\n\
      `add` stages from a local path only (v1 has no registry download);\n\
      `install` fetches one R2 prebuilt release through the hash-verified\n\
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
@@ -727,7 +727,7 @@ pub fn component_help_text() -> String {
      \x20                             name, version, active marker, source\n\
      \x20                             (user|system), ABI compat, and path.\n\
      \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
-     \x20                             ($XDG_DATA_HOME/bitty/components/, no root).\n\
+     \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
      \x20                             A directory holds bitty-component.toml plus\n\
      \x20                             the executable; a bare bitty-<name> file\n\
      \x20                             needs --version <semver>. The digest is\n\
@@ -843,7 +843,7 @@ pub fn component_help_text() -> String {
      \x20 curl 7.68.0 or newer (for --proto =https, --connect-timeout,\n\
      \x20 --max-time, --max-filesize; `curl` resolves via PATH, curl.exe on\n\
      \x20 Windows). A missing curl fails closed: install curl, or place the\n\
-     \x20 release manually under $XDG_DATA_HOME/bitty/components/<name>/\n\
+     \x20 release manually under $XDG_DATA_HOME/bitty/extensions/<name>/\n\
      \x20 <version>/; nothing is fetched or staged (exit 1). A too-old curl\n\
      \x20 fails the same way naming the found version, the floor, and the\n\
      \x20 upgrade hint (exit 1); a missing tar fails likewise (exit 1).\n\
@@ -854,8 +854,8 @@ pub fn component_help_text() -> String {
      \x20 flags.\n\
      \n\
      resolution:\n\
-     \x20 User $XDG_DATA_HOME/bitty/components/ wins over system\n\
-     \x20 /usr/lib/bitty/components/ (or platform equivalent) on collision.\n\
+     \x20 User $XDG_DATA_HOME/bitty/extensions/ wins over system\n\
+     \x20 /usr/lib/bitty/extensions/ (or platform equivalent) on collision.\n\
      \x20 A tampered user install fails closed without system fallback. Every\n\
      \x20 spawn re-verifies name, version, executable name, protocol range,\n\
      \x20 and SHA-256; a protocol range excluding Core fails closed.\n\

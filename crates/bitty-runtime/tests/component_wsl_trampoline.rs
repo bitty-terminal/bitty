@@ -39,12 +39,12 @@ fn wsl_trampoline_gated_live_probe() {
                     .expect("trampoline selected");
                 assert!(wsl_trampoline_active(Some(&selection)));
                 let guest = windows_path_to_guest(
-                    "C:\\Users\\ci\\bitty\\components\\net\\0.0.1\\bitty-net.exe",
+                    "C:\\Users\\ci\\bitty\\extensions\\net\\0.0.1\\bitty-net.exe",
                 )
                 .expect("mappable store path");
                 assert_eq!(
                     guest,
-                    "/mnt/c/Users/ci/bitty/components/net/0.0.1/bitty-net.exe"
+                    "/mnt/c/Users/ci/bitty/extensions/net/0.0.1/bitty-net.exe"
                 );
                 let argv = wsl_argv(&selection, &guest, &[]).expect("fixed argv");
                 assert_eq!(argv[0], "wsl.exe");
@@ -84,11 +84,11 @@ fn wsl_distro_selection_is_pure_on_every_platform() {
     // Pure mapping plus fixed argv also run everywhere (no WSL needed): the
     // primary Windows-to-guest direction and the discrete argv preservation.
     let guest =
-        windows_path_to_guest("C:\\Users\\ci\\bitty\\components\\net\\0.0.1\\bitty-net.exe")
+        windows_path_to_guest("C:\\Users\\ci\\bitty\\extensions\\net\\0.0.1\\bitty-net.exe")
             .expect("mappable");
     assert_eq!(
         guest,
-        "/mnt/c/Users/ci/bitty/components/net/0.0.1/bitty-net.exe"
+        "/mnt/c/Users/ci/bitty/extensions/net/0.0.1/bitty-net.exe"
     );
     let selection = WslDistro::Named("Ubuntu".to_string());
     let argv = wsl_argv(

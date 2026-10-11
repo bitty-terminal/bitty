@@ -95,6 +95,21 @@ fn parse_help_subcommand_never_spawns() {
     assert_eq!(parsed.help_cmd.as_deref(), Some("plugin"));
     assert_eq!(parsed.unknown_flag.as_deref(), Some("--typo"));
 
+    // Issue #1959: `extension` is the canonical verb, `component` the hidden
+    // deprecated alias. Both set the same word flag and capture the tail
+    // verbatim; only the recorded spelling differs (stderr note at dispatch).
+    let parsed = parse_args(&args_of(&["bitty", "extension", "list"]));
+    assert!(parsed.component_word);
+    assert_eq!(parsed.component_spelling, "extension");
+    assert_eq!(parsed.component_raw, vec![String::from("list")]);
+    assert_eq!(parsed.program, None);
+
+    let parsed = parse_args(&args_of(&["bitty", "component", "list"]));
+    assert!(parsed.component_word);
+    assert_eq!(parsed.component_spelling, "component");
+    assert_eq!(parsed.component_raw, vec![String::from("list")]);
+    assert_eq!(parsed.program, None);
+
     // `bitty help` lists 16 subcommands (short help).
     let short = crate::cli::help_text_short(false);
     assert!(short.contains("help [cmd]"), "short help must list help");
@@ -108,7 +123,7 @@ fn parse_help_subcommand_never_spawns() {
         "inspect <target>",
         "dev <verb>",
         "plugin <verb>",
-        "component <verb>",
+        "extension <verb>",
         "cmd <id>",
         "x <id>",
         "completion <shell>",
@@ -125,6 +140,15 @@ fn parse_help_subcommand_never_spawns() {
     assert_eq!(crate::cli::help_canonical_cmd("cfg"), Some("config"));
     assert_eq!(crate::cli::help_canonical_cmd("ls"), Some("list"));
     assert_eq!(crate::cli::help_canonical_cmd("comp"), Some("completion"));
+    assert_eq!(
+        crate::cli::help_canonical_cmd("extension"),
+        Some("extension")
+    );
+    // Hidden deprecated alias (issue #1959): accepted, canonicalizes away.
+    assert_eq!(
+        crate::cli::help_canonical_cmd("component"),
+        Some("extension")
+    );
     assert_eq!(crate::cli::help_canonical_cmd("bogus"), None);
 }
 

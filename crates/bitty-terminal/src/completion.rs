@@ -87,9 +87,11 @@ pub fn shell_list() -> String {
 /// Static core subcommand tokens completed by every script (v1 tree plus the
 /// stable `ls`/`cfg`/`comp` aliases and the extra `init` wizard word).
 /// Test-only single source: [`completion_commands`] plus the per-script test
-/// keep every static script in sync with this table.
+/// keep every static script in sync with this table. The hidden `component`
+/// alias (issue #1959) is deliberately absent: completions offer only the
+/// canonical `extension` spelling, while the parser still accepts `component`.
 #[cfg(test)]
-const COMPLETION_COMMANDS: &str = "run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help";
+const COMPLETION_COMMANDS: &str = "run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help";
 
 /// Static global flags completed by every script.
 #[cfg(test)]
@@ -109,8 +111,7 @@ const COMPLETION_FLAGS: &str = "--help --version --verbose --log-level --headles
 const BASH_SCRIPT: &str = r#"# bitty completion for Bash (static v1 core tree; generated, do not edit).
 # Install: bitty completion bash >> ~/.bash_completion
 _bitty_complete() {
-    local cur cmds flags
-    cmds="run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help"
+    cmds="run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help"
     flags="--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init"
     cur="${COMP_WORDS[COMP_CWORD]}"
     if [[ "$cur" == -* ]]; then
@@ -128,7 +129,7 @@ const ZSH_SCRIPT: &str = r#"#compdef bitty
 # Install: bitty completion zsh > ~/.zsh/completions/_bitty
 _bitty() {
     local -a cmds flags
-    cmds=(run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help)
+    cmds=(run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help)
     flags=(--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init)
     _arguments -C '1: :->cmd' '*: :->args'
     case "$state" in
@@ -141,7 +142,7 @@ _bitty() {
 /// Fish completion script (static core tree).
 const FISH_SCRIPT: &str = r#"# bitty completion for Fish (static v1 core tree; generated, do not edit).
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
-for cmd in run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help
+for cmd in run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help
     complete -c bitty -f -n __fish_use_subcommand -a $cmd
 end
 for flag in --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
@@ -154,7 +155,7 @@ const POWERSHELL_SCRIPT: &str = r#"# bitty completion for PowerShell (static v1 
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 Register-ArgumentCompleter -Native -CommandName @('bitty') -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
-    $cmds = @('run','ctl','config','cfg','plugin','component','list','ls','inspect','dev','doctor','cmd','x','completion','comp','version','init','shell-init','help')
+    $cmds = @('run','ctl','config','cfg','plugin','extension','list','ls','inspect','dev','doctor','cmd','x','completion','comp','version','init','shell-init','help')
     $flags = @('--help','--version','--verbose','--log-level','--headless','--test-mode','--safe','--fail-loud','--mascot','--no-splash','--split','--split-ratio','--stack','--overlay','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--no-color','--yes','--force','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius','--plugins','--no-plugins','--with-components','--no-with-components','--no-components','--without-components','--print-shell-init','--no-print-shell-init','--no-shell-init')
     $pool = if ($wordToComplete.StartsWith('-')) { $flags } else { $cmds }
     $pool | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -167,7 +168,7 @@ Register-ArgumentCompleter -Native -CommandName @('bitty') -ScriptBlock {
 const NUSHELL_SCRIPT: &str = r#"# bitty completion for Nushell (static v1 core tree; generated, do not edit).
 # Install: bitty completion nushell | save -f ~/.config/nushell/completions-bitty.nu
 def "nu-complete bitty commands" [] {
-    [run ctl config cfg plugin component list ls inspect dev doctor cmd x completion comp version init shell-init help]
+    [run ctl config cfg plugin extension list ls inspect dev doctor cmd x completion comp version init shell-init help]
 }
 def "nu-complete bitty flags" [] {
     [--help --version --verbose --log-level --headless --test-mode --safe --fail-loud --mascot --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init]

@@ -3,11 +3,11 @@
 //! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over the
 //! system `/usr/lib/bitty/extensions/` (or platform equivalent). The user
 //! tier is writable without privilege; the system tier is read-only for
-//! `bitty component` (removal there needs a package manager). `PATH` is
+//! `bitty extension` (removal there needs a package manager). `PATH` is
 //! never consulted.
 //!
 //! Install sources in v1 are local paths only through
-//! `bitty component add` (a directory holding `bitty-component.toml` plus the
+//! `bitty extension add` (a directory holding `bitty-component.toml` plus the
 //! executable, or a bare `bitty-<name>` executable with `--version`). No
 //! network fetch, no registry download: a URL operand fails closed with an
 //! actionable diagnostic. Registry/download sources are a follow-up.
@@ -30,11 +30,11 @@ use super::{
 /// configuration surface; mirrors [`super::COMPONENTS_DIR_ENV`]).
 pub const SYSTEM_COMPONENTS_DIR_ENV: &str = "BITTY_SYSTEM_COMPONENTS_DIR";
 
-/// System component root on Unix (read-only for `bitty component`).
+/// System component root on Unix (read-only for `bitty extension`).
 #[cfg(not(windows))]
 pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "/usr/lib/bitty/extensions";
 
-/// System component root on Windows (read-only for `bitty component`).
+/// System component root on Windows (read-only for `bitty extension`).
 #[cfg(windows)]
 pub const SYSTEM_COMPONENTS_DIR_DEFAULT: &str = "C:\\Program Files\\Bitty\\extensions";
 
@@ -235,7 +235,7 @@ pub fn discover_components(
 #[must_use]
 pub fn missing_component_hint(name: &str) -> String {
     format!(
-        "component '{name}' is not installed; install it with `bitty component add <path>` \
+        "component '{name}' is not installed; install it with `bitty extension add <path>` \
          (local directory or `bitty-<name>` executable plus `--version <semver>`; v1 has no registry download)"
     )
 }
@@ -245,7 +245,7 @@ pub fn missing_component_hint(name: &str) -> String {
 pub fn incompatible_component_hint(name: &str, min: u16, max: u16, core: u16) -> String {
     format!(
         "component '{name}' protocol range [{min}, {max}] excludes core protocol {core}; \
-         install a compatible build with `bitty component add <path>`"
+         install a compatible build with `bitty extension add <path>`"
     )
 }
 
@@ -601,7 +601,7 @@ mod tests {
             "protocol mismatch must deny activation: {error:?}"
         );
         let hint = incompatible_component_hint("net", 99, 99, crate::component::PROTOCOL_VERSION);
-        assert!(hint.contains("bitty component add"), "{hint}");
+        assert!(hint.contains("bitty extension add"), "{hint}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -616,7 +616,7 @@ mod tests {
             "{error:?}"
         );
         let hint = missing_component_hint("net");
-        assert!(hint.contains("bitty component add"), "{hint}");
+        assert!(hint.contains("bitty extension add"), "{hint}");
         assert!(hint.contains("local"), "{hint}");
         let _ = std::fs::remove_dir_all(&base);
     }

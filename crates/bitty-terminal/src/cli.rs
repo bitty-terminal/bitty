@@ -275,12 +275,22 @@ pub(crate) struct Args {
     pub(crate) plugin_format: Option<String>,
     /// `--no-color` for plugin table output (global or post-word).
     pub(crate) plugin_no_color: bool,
-    /// `bitty component` native binary extension management (issue #1651).
-    /// True once the first positional `component` word is seen; a program
-    /// literally named `component` needs `bitty -- component ...` (or
-    /// `bitty run -- component ...`). Tokens after the word land verbatim
-    /// in `component_raw` for [`crate::component::parse_component_request`].
+    /// `bitty extension` native binary extension management (issue #1651,
+    /// renamed from `bitty component` by issue #1959). True once the first
+    /// positional `extension` word is seen; `component` is the hidden
+    /// deprecated alias spelling (same word flag, recorded in
+    /// `component_spelling`, stderr deprecation note at dispatch, kept at
+    /// least through 0.1.0). A program literally named `extension` or
+    /// `component` needs `bitty -- <name> ...` (or `bitty run -- <name> ...`).
+    /// Tokens after the word land verbatim in `component_raw` for
+    /// [`crate::component::parse_component_request`].
     pub(crate) component_word: bool,
+    /// Invoked spelling for the extension-management subcommand (`extension`
+    /// canonical, `component` deprecated alias). Defaults to `extension`;
+    /// set when `component_word` is set. Used only for the stderr
+    /// deprecation note — stdout behavior is identical for both spellings
+    /// (shared handlers).
+    pub(crate) component_spelling: String,
     /// Raw tokens after the `component` word (verb, operand, flags) for
     /// [`crate::component::parse_component_request`]. Empty until
     /// `component_word` is set.
@@ -484,6 +494,7 @@ impl Args {
             plugin_format: None,
             plugin_no_color: false,
             component_word: false,
+            component_spelling: String::from("extension"),
             component_raw: Vec::new(),
             component_format: None,
             component_no_color: false,
@@ -1801,13 +1812,16 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.plugin_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
-                // `bitty component` native binary extension management
-                // (issue #1651). The word `component` is always this
-                // subcommand, never a program named `component`: use
-                // `bitty run -- component ...` (or legacy
-                // `bitty -- component ...`) for that program. Tokens after
-                // the word are kept verbatim for
-                // `component::parse_component_request`.
+                // `bitty extension` native binary extension management
+                // (issue #1651, renamed from `bitty component` by issue
+                // #1959). Either word is always this subcommand, never a
+                // program named `extension`/`component`: use
+                // `bitty run -- extension ...` (or legacy
+                // `bitty -- extension ...`) for that program. `component`
+                // is the hidden deprecated alias (not shown in help or
+                // completions; stderr deprecation note at dispatch, kept at
+                // least through 0.1.0). Tokens after the word are kept
+                // verbatim for `component::parse_component_request`.
                 if !program_set
                     && !out.config_word
                     && !out.inspect_word
@@ -1819,9 +1833,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && !out.dev_word
                     && !out.plugin_word
                     && !out.component_word
-                    && token == "component"
+                    && (token == "extension" || token == "component")
                 {
                     out.component_word = true;
+                    out.component_spelling = token.clone();
                     out.component_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
@@ -2047,12 +2062,12 @@ pub(crate) fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                 --format SHAPE  Doctor/ctl/list/inspect/plugin/component/version/cmd/x\n  \
-                              output shape:\n  \
-                              table|json|jsonl (default table; parsed globally,\n  \
-                              consumed by `bitty doctor`, `bitty ctl`,\n  \
-                              `bitty list`, `bitty inspect`,\n  \
-                               `bitty plugin list|info`, `bitty component list`, `bitty version`,\n  \
+                 --format SHAPE  Doctor/ctl/list/inspect/plugin/extension/version/cmd/x\n  \
+                               output shape:\n  \
+                               table|json|jsonl (default table; parsed globally,\n  \
+                               consumed by `bitty doctor`, `bitty ctl`,\n  \
+                               `bitty list`, `bitty inspect`,\n  \
+                                `bitty plugin list|info`, `bitty extension list`, `bitty version`,\n  \
                                `bitty cmd`, and `bitty x` (`bitty completion` and\n  \
                                `bitty shell-init` emit scripts and ignore it; ignored by startup).\n\
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
@@ -2122,7 +2137,7 @@ pub(crate) fn help_text() -> String {
                              managed manifest (bitty-plugins.toml); install\n  \
                              requires capability consent; remove requires\n  \
                              --force; `bitty plugin --help` for detail\n  \
-            component <verb>  Native binary extension management (local, no execution):\n  \
+            extension <verb>  Native binary extension management (local, no execution):\n  \
                               list|add|install|remove over user XDG (wins) and system tiers;\n  \
                               add stages from a local path only (no download);\n  \
                               install fetches one hash-verified R2 release;\n  \
@@ -2283,7 +2298,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
             plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
-            component <verb>        Native binary extension management: list|add|install|remove\n  \
+            extension <verb>        Native binary extension management: list|add|install|remove\n  \
             cmd <id>                Direct qualified executable invocation for automation\n  \
             x <id> <command>        Qualified plugin namespace (extension, no VM load)\n  \
             completion <shell>      Emit shell completion script (alias comp)\n  \
@@ -2301,18 +2316,20 @@ pub(crate) fn help_text_short(color: bool) -> String {
 
 /// Canonical subcommand names for `bitty help [cmd]` (16 total, issue #1900).
 ///
-/// Aliases (`cfg`, `ls`, `comp`) map to their canonical help; `help` itself
-/// shows this help. All names are lowercase, case-sensitive.
+/// Aliases (`cfg`, `ls`, `comp`) map to their canonical help; `component` is
+/// the hidden deprecated alias for `extension` (issue #1959, kept at least
+/// through 0.1.0): accepted but never listed. `help` itself shows this help.
+/// All names are lowercase, case-sensitive.
 #[must_use]
 pub(crate) fn help_valid_commands() -> &'static str {
-    "run, ctl, config (cfg), init, doctor, list (ls), inspect, dev, plugin, component, version, completion (comp), cmd, x, shell-init, help"
+    "run, ctl, config (cfg), init, doctor, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
 }
 
 /// Normalize one `bitty help [cmd]` name to its canonical subcommand.
 ///
 /// Returns `None` for unknown names (dispatch fails closed naming
 /// [`help_valid_commands`]). Aliases map: `cfg` -> `config`, `ls` -> `list`,
-/// `comp` -> `completion`.
+/// `comp` -> `completion`, `component` -> `extension` (deprecated alias).
 #[must_use]
 pub(crate) fn help_canonical_cmd(raw: &str) -> Option<&'static str> {
     match raw {
@@ -2325,7 +2342,8 @@ pub(crate) fn help_canonical_cmd(raw: &str) -> Option<&'static str> {
         "inspect" => Some("inspect"),
         "dev" => Some("dev"),
         "plugin" => Some("plugin"),
-        "component" => Some("component"),
+        "extension" => Some("extension"),
+        "component" => Some("extension"),
         "version" => Some("version"),
         "completion" | "comp" => Some("completion"),
         "cmd" => Some("cmd"),
@@ -2344,7 +2362,7 @@ pub(crate) fn help_usage() -> String {
          \n\
          commands:\n\
          \x20 run, ctl, config (cfg), init, doctor, list (ls), inspect, dev,\n\
-         \x20 plugin, component, version, completion (comp), cmd, x, shell-init, help\n\
+         \x20 plugin, extension, version, completion (comp), cmd, x, shell-init, help\n\
          examples:\n\
          \x20 bitty help\n\
          \x20 bitty help plugin\n\

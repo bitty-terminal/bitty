@@ -11,7 +11,7 @@
 //!
 //! # Contract (implemented, seed only)
 //!
-//! - Shape: `bitty component install <name> --version <X.Y.Z>`. The version
+//! - Shape: `bitty extension install <name> --version <X.Y.Z>`. The version
 //!   is required and exact: components publish no `latest` pointer, and
 //!   version solving arrives with the full manager, not the seed.
 //! - Fetch: fixed-argv system `curl` (pinned to `https://cdn.bitty.run`,
@@ -681,10 +681,10 @@ pub fn check_curl_version_output(output: &str) -> Result<CurlVersion, SeedError>
     match parse_curl_version(output) {
         Some(version) if version.meets_floor() => Ok(version),
         Some(version) => Err(SeedError::CurlTooOld(format!(
-            "bitty component: curl {version} is too old (need {SEED_CURL_FLOOR} or newer for --proto =https, --connect-timeout, --max-time, --max-filesize; upgrade curl and retry, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/)"
+            "bitty extension: curl {version} is too old (need {SEED_CURL_FLOOR} or newer for --proto =https, --connect-timeout, --max-time, --max-filesize; upgrade curl and retry, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/)"
         ))),
         None => Err(SeedError::Fetch(format!(
-            "bitty component: cannot parse `curl --version` output (need curl {SEED_CURL_FLOOR} or newer; upgrade curl and retry)"
+            "bitty extension: cannot parse `curl --version` output (need curl {SEED_CURL_FLOOR} or newer; upgrade curl and retry)"
         ))),
     }
 }
@@ -739,13 +739,13 @@ fn scrubbed_command(tool: &str) -> Command {
 /// placement path, and that no staging was attempted (exit `1`).
 fn curl_missing_diagnostic() -> String {
     format!(
-        "bitty component: `curl` not found (need curl {SEED_CURL_FLOOR} or newer; install curl first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)"
+        "bitty extension: `curl` not found (need curl {SEED_CURL_FLOOR} or newer; install curl first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)"
     )
 }
 
 /// Actionable diagnostic for absent `tar` (same fail-closed shape).
 fn tar_missing_diagnostic() -> String {
-    "bitty component: `tar` not found (install tar first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)".to_string()
+    "bitty extension: `tar` not found (install tar first, or place the release manually under $XDG_DATA_HOME/bitty/extensions/<name>/<version>/; nothing was fetched or staged)".to_string()
 }
 
 /// Result of the once-per-invocation `curl --version` preflight.
@@ -779,13 +779,13 @@ fn tool_version_output(tool: &str, missing: SeedError) -> Result<String, SeedErr
                 missing
             } else {
                 SeedError::Io(format!(
-                    "bitty component: cannot run `{tool} --version`: {error}"
+                    "bitty extension: cannot run `{tool} --version`: {error}"
                 ))
             }
         })?;
     if !output.status.success() {
         return Err(SeedError::Fetch(format!(
-            "bitty component: `{tool} --version` failed ({})",
+            "bitty extension: `{tool} --version` failed ({})",
             output.status
         )));
     }
@@ -904,11 +904,11 @@ impl SystemTransport {
                         tar_missing_diagnostic()
                     } else {
                         format!(
-                            "bitty component: `{tool}` not found (install {tool} first; nothing was staged)"
+                            "bitty extension: `{tool}` not found (install {tool} first; nothing was staged)"
                         )
                     })
                 } else {
-                    SeedError::Io(format!("bitty component: cannot run `{tool}`: {error}"))
+                    SeedError::Io(format!("bitty extension: cannot run `{tool}`: {error}"))
                 }
             })?;
         if !output.status.success() {
@@ -932,7 +932,7 @@ impl SystemTransport {
                 })
                 .collect::<String>();
             return Err(SeedError::Fetch(format!(
-                "bitty component: `{tool}` failed ({}; {tail})",
+                "bitty extension: `{tool}` failed ({}; {tail})",
                 output.status,
                 tail = tail.trim(),
             )));
@@ -961,23 +961,23 @@ impl SeedTransport for SystemTransport {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     SeedError::ToolMissing(tar_missing_diagnostic())
                 } else {
-                    SeedError::Io(format!("bitty component: cannot run `tar`: {error}"))
+                    SeedError::Io(format!("bitty extension: cannot run `tar`: {error}"))
                 }
             })?;
         if !output.status.success() {
             return Err(SeedError::Fetch(format!(
-                "bitty component: `tar -tzf` failed ({})",
+                "bitty extension: `tar -tzf` failed ({})",
                 output.status
             )));
         }
         if output.stdout.len() > SEED_TAR_LIST_MAX_BYTES {
             return Err(SeedError::MemberViolation(format!(
-                "bitty component: archive member list exceeds {SEED_TAR_LIST_MAX_BYTES} bytes"
+                "bitty extension: archive member list exceeds {SEED_TAR_LIST_MAX_BYTES} bytes"
             )));
         }
         let text = std::str::from_utf8(&output.stdout).map_err(|_| {
             SeedError::MemberViolation(
-                "bitty component: archive member names are not UTF-8".to_string(),
+                "bitty extension: archive member names are not UTF-8".to_string(),
             )
         })?;
         Ok(text.lines().map(str::to_string).collect())
@@ -1069,14 +1069,14 @@ impl ScopedDir {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(SeedError::Io(format!(
-                        "bitty component: cannot create staging dir '{}': {error}",
+                        "bitty extension: cannot create staging dir '{}': {error}",
                         path.display()
                     )));
                 }
             }
         }
         Err(SeedError::Io(
-            "bitty component: cannot create staging dir (no fresh name after retries)".to_string(),
+            "bitty extension: cannot create staging dir (no fresh name after retries)".to_string(),
         ))
     }
 }
@@ -1097,7 +1097,7 @@ impl Drop for ScopedDir {
 fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, SeedError> {
     let refuse = |why: &str| {
         SeedError::Manifest(format!(
-            "bitty component: invalid SHA256SUMS manifest ({why})"
+            "bitty extension: invalid SHA256SUMS manifest ({why})"
         ))
     };
     let mut matches = 0usize;
@@ -1139,11 +1139,11 @@ fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, See
         Ok(digest)
     } else if matches == 0 {
         Err(SeedError::Manifest(format!(
-            "bitty component: SHA256SUMS has no entry for {tarball_file:?} (refusing to guess)"
+            "bitty extension: SHA256SUMS has no entry for {tarball_file:?} (refusing to guess)"
         )))
     } else {
         Err(SeedError::Manifest(format!(
-            "bitty component: SHA256SUMS has {matches} entries for {tarball_file:?} (ambiguous)"
+            "bitty extension: SHA256SUMS has {matches} entries for {tarball_file:?} (ambiguous)"
         )))
     }
 }
@@ -1175,16 +1175,16 @@ fn fetch_verified_tarball(
     transport.fetch(&urls.manifest_url, &manifest_path, SEED_MANIFEST_MAX_BYTES)?;
     let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
         SeedError::Io(format!(
-            "bitty component: cannot read fetched manifest: {error}"
+            "bitty extension: cannot read fetched manifest: {error}"
         ))
     })?;
     if manifest_bytes.len() as u64 > SEED_MANIFEST_MAX_BYTES {
         return Err(SeedError::Manifest(format!(
-            "bitty component: fetched manifest exceeds {SEED_MANIFEST_MAX_BYTES} bytes"
+            "bitty extension: fetched manifest exceeds {SEED_MANIFEST_MAX_BYTES} bytes"
         )));
     }
     let manifest = std::str::from_utf8(&manifest_bytes).map_err(|_| {
-        SeedError::Manifest("bitty component: fetched manifest is not UTF-8".to_string())
+        SeedError::Manifest("bitty extension: fetched manifest is not UTF-8".to_string())
     })?;
     let expected = find_tarball_digest(manifest, &urls.tarball_file)?;
 
@@ -1192,29 +1192,29 @@ fn fetch_verified_tarball(
     transport.fetch(&urls.tarball_url, &tarball_path, SEED_TARBALL_MAX_BYTES)?;
     let bytes = std::fs::read(&tarball_path).map_err(|error| {
         SeedError::Io(format!(
-            "bitty component: cannot read fetched tarball: {error}"
+            "bitty extension: cannot read fetched tarball: {error}"
         ))
     })?;
     if bytes.len() as u64 > SEED_TARBALL_MAX_BYTES {
         return Err(SeedError::Fetch(format!(
-            "bitty component: fetched tarball exceeds {SEED_TARBALL_MAX_BYTES} bytes"
+            "bitty extension: fetched tarball exceeds {SEED_TARBALL_MAX_BYTES} bytes"
         )));
     }
     if bytes.is_empty() {
         return Err(SeedError::Fetch(
-            "bitty component: fetched tarball is empty".to_string(),
+            "bitty extension: fetched tarball is empty".to_string(),
         ));
     }
     let actual = bitty_package::integrity::sha256_hex(&bytes);
     if !digests_equal_ct(&actual, &expected) {
         return Err(SeedError::DigestMismatch(format!(
-            "bitty component: tarball digest {actual} does not match SHA256SUMS entry {expected} (tampered or corrupt download; refusing to install)"
+            "bitty extension: tarball digest {actual} does not match SHA256SUMS entry {expected} (tampered or corrupt download; refusing to install)"
         )));
     }
     if let Some(caller) = expected_digest {
         if !digests_equal_ct(&actual, caller) {
             return Err(SeedError::DigestMismatch(format!(
-                "bitty component: tarball digest {actual} does not match expected digest {} (both CDN SHA256SUMS {expected} and the caller-supplied digest must match; refusing to install)",
+                "bitty extension: tarball digest {actual} does not match expected digest {} (both CDN SHA256SUMS {expected} and the caller-supplied digest must match; refusing to install)",
                 caller.to_ascii_lowercase(),
             )));
         }
@@ -1233,18 +1233,18 @@ fn audit_extracted(
     descriptor_name: &str,
     executable_name: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), SeedError> {
-    let refuse = |why: String| SeedError::MemberViolation(format!("bitty component: {why}"));
+    let refuse = |why: String| SeedError::MemberViolation(format!("bitty extension: {why}"));
     let entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|error| {
             SeedError::Io(format!(
-                "bitty component: cannot inspect staging dir '{}': {error}",
+                "bitty extension: cannot inspect staging dir '{}': {error}",
                 dir.display()
             ))
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             SeedError::Io(format!(
-                "bitty component: cannot inspect staging dir '{}': {error}",
+                "bitty extension: cannot inspect staging dir '{}': {error}",
                 dir.display()
             ))
         })?;
@@ -1272,7 +1272,7 @@ fn audit_extracted(
         };
         let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
             SeedError::Io(format!(
-                "bitty component: cannot inspect member {name:?}: {error}"
+                "bitty extension: cannot inspect member {name:?}: {error}"
             ))
         })?;
         // No-follow stat first: a link must fail before any byte is read
@@ -1295,7 +1295,7 @@ fn audit_extracted(
         }
         let bytes = std::fs::read(entry.path()).map_err(|error| {
             SeedError::Io(format!(
-                "bitty component: cannot read member {name:?}: {error}"
+                "bitty extension: cannot read member {name:?}: {error}"
             ))
         })?;
         if kind == "descriptor" {
@@ -1328,7 +1328,7 @@ fn unpack_and_validate(
     let stage = ScopedDir::create("unpack")?;
     let archive_path = stage.path.join("payload.tar.gz");
     std::fs::write(&archive_path, tarball).map_err(|error| {
-        SeedError::Io(format!("bitty component: cannot stage tarball: {error}"))
+        SeedError::Io(format!("bitty extension: cannot stage tarball: {error}"))
     })?;
     let executable_name = format!("{COMPONENT_EXECUTABLE_PREFIX}{name}");
     let members = vec![
@@ -1345,7 +1345,7 @@ fn unpack_and_validate(
     expected.sort();
     if listed != expected {
         return Err(SeedError::MemberViolation(format!(
-            "bitty component: unexpected archive members {listed:?} (want exactly {expected:?})"
+            "bitty extension: unexpected archive members {listed:?} (want exactly {expected:?})"
         )));
     }
     let extract_dir = stage.path.join("extract");
@@ -1362,7 +1362,7 @@ fn unpack_and_validate(
         builder.mode(0o700);
         builder.create(&extract_dir).map_err(|error| {
             SeedError::Io(format!(
-                "bitty component: cannot create extract dir: {error}"
+                "bitty extension: cannot create extract dir: {error}"
             ))
         })?;
     }
@@ -1371,30 +1371,30 @@ fn unpack_and_validate(
         audit_extracted(&extract_dir, COMPONENT_DESCRIPTOR_FILE, &executable_name)?;
     let text = std::str::from_utf8(&descriptor_bytes).map_err(|_| {
         SeedError::DescriptorMismatch(
-            "bitty component: extracted descriptor is not UTF-8".to_string(),
+            "bitty extension: extracted descriptor is not UTF-8".to_string(),
         )
     })?;
     let descriptor = ComponentDescriptor::parse(text).map_err(|error| {
         SeedError::DescriptorMismatch(format!(
-            "bitty component: extracted descriptor is invalid: {error}"
+            "bitty extension: extracted descriptor is invalid: {error}"
         ))
     })?;
     // Substitution/downgrade: the payload must BE the requested release.
     if descriptor.name != name {
         return Err(SeedError::DescriptorMismatch(format!(
-            "bitty component: payload is for '{}', not {name:?} (refusing to install)",
+            "bitty extension: payload is for '{}', not {name:?} (refusing to install)",
             descriptor.name
         )));
     }
     if descriptor.version != version {
         return Err(SeedError::DescriptorMismatch(format!(
-            "bitty component: payload is version {}, not {version} (refusing to install)",
+            "bitty extension: payload is version {}, not {version} (refusing to install)",
             descriptor.version
         )));
     }
     if descriptor.executable != executable_name {
         return Err(SeedError::DescriptorMismatch(format!(
-            "bitty component: payload executable is {:?}, not {executable_name:?} (refusing to install)",
+            "bitty extension: payload executable is {:?}, not {executable_name:?} (refusing to install)",
             descriptor.executable
         )));
     }
@@ -1402,7 +1402,7 @@ fn unpack_and_validate(
     let actual = bitty_package::integrity::sha256_hex(&executable_bytes);
     if descriptor.sha256 != actual {
         return Err(SeedError::DescriptorMismatch(format!(
-            "bitty component: payload descriptor sha256 {} does not match extracted binary digest {actual} (tampered payload; refusing to install)",
+            "bitty extension: payload descriptor sha256 {} does not match extracted binary digest {actual} (tampered payload; refusing to install)",
             descriptor.sha256
         )));
     }

@@ -576,8 +576,8 @@ pub fn plugin_help_text() -> String {
      \x20 answer); `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
      \x20 A decline or EOF exits 1 with nothing changed. Unchanged or\n\
      \x20 narrowed capability sets carry forward silently; added\n\
-     \x20 capabilities always need fresh consent. Native component downloads\n\
-     \x20 (`bitty component install`) follow the same levels: the builtin\n\
+     \x20 capabilities always need fresh consent. Native extension downloads\n\
+     \x20 (`bitty extension install`) follow the same levels: the builtin\n\
      \x20 installer egress cdn.bitty.run:443 needs no extra grant, while\n\
      \x20 third-party hosts stay consent-gated and fail closed.\n\
      \n\

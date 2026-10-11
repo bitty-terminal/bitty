@@ -15,7 +15,7 @@ const NETWORK_CONNECT_PREFIX: &str = "network.connect:";
 
 /// Core-built-in installer egress host (first-party CDN, issue #1905).
 ///
-/// The minimal install seed (`bitty component install`) fetches exactly this
+/// The minimal install seed (`bitty extension install`) fetches exactly this
 /// host over HTTPS; strict configurations must allow it without a per-plugin
 /// `[[network.egress]]` declaration or per-source consent. Every other host
 /// stays consent-gated (fail closed without explicit consent).

@@ -18,7 +18,7 @@
 //!   `/usr/lib/bitty/extensions/` via [`system_components_root_for`]); the
 //!   user tier wins on collision and a tampered user install fails closed
 //!   without system fallback. [`discover_components`] merges both tiers for
-//!   `bitty component list`.
+//!   `bitty extension list`.
 //! - [`ComponentDescriptor`] validation checks the name grammar, the semver
 //!   version, the executable name (no path separators), the protocol range,
 //!   and the SHA-256 digest of the executable. Every spawn re-runs the full

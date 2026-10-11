@@ -6950,6 +6950,29 @@ fn init_yes_no_and_shell_handoff_helpers() {
         "nushell wiring"
     );
 
+    // CodeRabbit 4241676519: Nushell needs two steps — the save command plus
+    // the `source ... config.nu` hint. Other shells get no extra hint.
+    let nu_line = init_shell_init_line("nushell");
+    assert!(
+        nu_line.contains("save -f ~/.config/nushell/bitty-shell-init.nu"),
+        "nu save step: {nu_line}"
+    );
+    let nu_hint = init_shell_source_hint("nushell");
+    assert!(
+        nu_hint.contains("source ~/.config/nushell/bitty-shell-init.nu")
+            && nu_hint.contains("config.nu"),
+        "nu source step: {nu_hint}"
+    );
+    let nu_full = format!("{nu_line}{nu_hint}");
+    assert!(
+        nu_full.contains("save -f") && nu_full.contains("source ~/.config/nushell/"),
+        "nu handoff carries both steps: {nu_full}"
+    );
+    assert_eq!(init_shell_source_hint("bash"), "");
+    assert_eq!(init_shell_source_hint("zsh"), "");
+    assert_eq!(init_shell_source_hint("fish"), "");
+    assert_eq!(init_shell_source_hint("powershell"), "");
+
     // No bundled plugin declares native components today (future [components]
     // flows through the same helper without touching the wizard).
     assert!(init_bundled_plugin_components("bitty-terminal.shell-integration").is_empty());

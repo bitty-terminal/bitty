@@ -308,9 +308,9 @@ use init::{
     init_parse_font_family_answer, init_parse_font_size_answer, init_parse_plugins_answer,
     init_parse_plugins_flag, init_parse_preset_answer, init_parse_scrollback_answer,
     init_parse_shell_answer, init_parse_theme_answer, init_parse_yes_no_answer,
-    init_shell_candidates, init_shell_init_line, init_shell_name_from_path, init_usage,
-    init_yes_defaults, render_init_lua, run_init_interactive, run_init_interactive_with_preview,
-    run_init_subcommand_with_io, write_init_config,
+    init_shell_candidates, init_shell_init_line, init_shell_name_from_path, init_shell_source_hint,
+    init_usage, init_yes_defaults, render_init_lua, run_init_interactive,
+    run_init_interactive_with_preview, run_init_subcommand_with_io, write_init_config,
 };
 
 #[cfg(test)]

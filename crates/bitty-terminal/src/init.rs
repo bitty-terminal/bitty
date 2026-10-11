@@ -610,6 +610,21 @@ pub(crate) fn init_shell_init_line(shell: &str) -> String {
     }
 }
 
+/// Second Nushell setup step (CTX-1132, #1913; CodeRabbit 4241676519).
+///
+/// Nushell parses `source` paths before `save -f` runs, so the save command
+/// from [`init_shell_init_line`] alone leaves integration inactive. The
+/// dispatch appends this hint for `nushell` only (other shells get `""`),
+/// keeping their guidance unchanged.
+pub(crate) fn init_shell_source_hint(shell: &str) -> &'static str {
+    match shell.trim().to_ascii_lowercase().as_str() {
+        "nushell" | "nu" => {
+            " Then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu."
+        }
+        _ => "",
+    }
+}
+
 /// Declared native components for a bundled plugin id (CTX-1132, #1913).
 ///
 /// Current bundled manifests declare no `[components]` section, so this
@@ -3226,8 +3241,9 @@ pub(crate) fn run_init_subcommand_with_io(
             if print_shell_init {
                 let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
                 let line = init_shell_init_line(&detected);
+                let source_hint = init_shell_source_hint(&detected);
                 println!(
-                    "bitty init: wire Tab completion + prompt hooks with `{line}` (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+                    "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
                 );
             }
             0

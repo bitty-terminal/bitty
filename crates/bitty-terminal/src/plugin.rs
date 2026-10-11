@@ -1301,12 +1301,18 @@ pub(crate) fn init_plugin_state_path(
 ///
 /// For each id in `ids` (validated against the same bundled source
 /// `plugin install <id>` uses via [`bundled_manifest_for`], no duplicate
-/// list): when absent, inserts a disabled record (`source = "bundled"`,
+/// list): when absent, inserts a fresh disabled record (`source = "bundled"`,
 /// pinned `manifest_hash`, `enabled = false`, empty grants/denials) so no
-/// capability is granted without explicit consent; when already recorded with
-/// the same hash, leaves it untouched (idempotent). Capability-bearing grants
-/// happen only later via [`init_install_bundled_with_consent`] (the install
-/// consent flow) or a later `plugin install <id>`.
+/// capability is granted without explicit consent.
+///
+/// Merge rules (never clobber user state): an id that already has a record is
+/// always skipped, whatever its stored `manifest_hash`. The existing
+/// `enabled` flag, `granted` set, and durable `denied` set (the deny-loop
+/// guard only consent clears) are preserved untouched, and a stale hash is
+/// never silently refreshed here — hash transitions (including the
+/// `GrantStore::apply_update` gate) belong to the install consent flow via
+/// [`init_install_bundled_with_consent`] or a later `plugin install <id>`.
+/// Only ids with no record at all write fresh disabled records.
 ///
 /// Offline-only: filesystem only, no network, no secrets. Fails closed on an
 /// unknown id, an over-limit state, or any filesystem error (nothing partially
@@ -1335,12 +1341,12 @@ pub(crate) fn init_record_bundled_offline(
             .validate()
             .map_err(|error| format!("bitty init: bundled manifest '{id}' is invalid: {error}"))?;
         let manifest_hash = manifest.manifest_hash();
-        if let Some(existing) = state.get(id.trim()) {
-            if existing.manifest_hash == manifest_hash {
-                continue;
-            }
+        // Never touch an existing record: grants, denials, and hash
+        // transitions belong to the install consent flow.
+        if state.get(id.trim()).is_some() {
+            continue;
         }
-        if state.records.len() >= MAX_STATE_PLUGINS && state.get(id.trim()).is_none() {
+        if state.records.len() >= MAX_STATE_PLUGINS {
             return Err(format!(
                 "bitty init: too many plugins (limit {MAX_STATE_PLUGINS}) — nothing changed"
             ));
@@ -4475,6 +4481,70 @@ mod tests {
         assert_eq!(code, EXIT_PLUGIN);
         let (code, _, _) = run(&["install", "not_an_id", "--yes"], Some(&config), "");
         assert_eq!(code, EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_offline_never_clobbers_existing_records() {
+        // CodeRabbit 4241676524: a pre-existing record with grants + a stale
+        // hash must survive `init --plugins` untouched (no silent disable,
+        // no grant/denial loss); hash transitions belong to the install
+        // consent flow. Absent ids still get fresh disabled records.
+        let dir = scratch_dir("init-noclobber");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+        let path = crate::plugin::init_plugin_state_path(
+            Some(&config),
+            None,
+            None,
+            Some(&dir.display().to_string()),
+        )
+        .expect("state path resolves");
+        let id = "bitty-terminal.shell-integration".to_string();
+
+        // Seed a user record: enabled with a grant + denial under a stale hash.
+        let mut granted = BTreeSet::new();
+        granted.insert(CapabilityId::parse("terminal.semantic-read").expect("cap"));
+        let mut denied = BTreeSet::new();
+        denied.insert(CapabilityId::parse("ui.rich").expect("cap"));
+        let mut records = BTreeMap::new();
+        records.insert(
+            id.clone(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: "00".repeat(32),
+                enabled: true,
+                granted: granted.clone(),
+                denied: denied.clone(),
+            },
+        );
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, PluginState::from_records(records).render()).expect("seed");
+        let before = std::fs::read_to_string(&path).expect("seed readable");
+
+        // Offline recording must skip the existing id (0 newly recorded).
+        let recorded =
+            init_record_bundled_offline(&path, std::slice::from_ref(&id)).expect("offline ok");
+        assert_eq!(recorded, 0);
+        let after = std::fs::read_to_string(&path).expect("state readable");
+        assert_eq!(after, before, "existing record untouched");
+        let state = PluginState::parse(&after).expect("parses");
+        let kept = state.get(&id).expect("record kept");
+        assert!(kept.enabled, "enabled preserved");
+        assert_eq!(kept.granted, granted, "grants preserved");
+        assert_eq!(kept.denied, denied, "denials preserved");
+        assert_eq!(kept.manifest_hash, "00".repeat(32), "stale hash preserved");
+
+        // Absent ids still get fresh disabled records as today.
+        std::fs::remove_file(&path).expect("clear");
+        let recorded =
+            init_record_bundled_offline(&path, std::slice::from_ref(&id)).expect("offline ok");
+        assert_eq!(recorded, 1);
+        let state =
+            PluginState::parse(&std::fs::read_to_string(&path).expect("readable")).expect("parses");
+        let fresh = state.get(&id).expect("fresh record");
+        assert!(!fresh.enabled, "fresh record disabled");
+        assert!(fresh.granted.is_empty() && fresh.denied.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

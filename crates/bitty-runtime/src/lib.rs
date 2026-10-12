@@ -209,10 +209,12 @@ pub use runtime::cw_live::HintLinkOpenError;
 
 pub use component::data_home_for;
 pub use config::{
-    BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
-    MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS, MIN_PASTE_CONFIRM_TIMEOUT_SECS,
-    PanelLayoutMode, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewTarget,
-    ViewAppearanceRule,
+    BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, DEFAULT_STYLE_FADE_UNFOCUSED,
+    DEFAULT_STYLE_GLOW_WIDTH, DEFAULT_STYLE_SHADOW_OFFSET, DEFAULT_STYLE_TINT_STRENGTH,
+    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS,
+    MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, MIN_PASTE_CONFIRM_TIMEOUT_SECS,
+    PanelLayoutMode, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewStyle,
+    RuntimeViewTarget, ViewAppearanceRule,
 };
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};

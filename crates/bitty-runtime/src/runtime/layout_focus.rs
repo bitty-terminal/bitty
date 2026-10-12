@@ -101,7 +101,14 @@ fn clamp_frame_axis(offset_px: f64, cell_px: f64, max: i64) -> u16 {
 /// `content` is the painted rectangle (inside the border and content inset);
 /// both are relative to the container origin, before the window-padding
 /// inset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// CTX-1161 S2: `style` carries the resolved per-`View` chrome style
+/// (populated at present build via [`Runtime::view_style_for`]).
+/// Accepted-but-inert: no present-path consumer reads it until S3, so styled
+/// and unstyled configs present byte-identical frames.
+///
+/// `PartialEq` only: the carried style holds float leaves.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresentFrame {
     /// View this frame paints.
     pub view: ViewId,
@@ -117,6 +124,8 @@ pub struct PresentFrame {
     pub border: u16,
     /// Corner radius in physical px (carried; painted by the present ring).
     pub radius: u16,
+    /// Resolved per-`View` chrome style (CTX-1161 S2, inert until S3).
+    pub style: crate::config::RuntimeViewStyle,
     /// Paint tier of the leaf (`None` = base content, CW-12).
     ///
     /// Frames are stable-sorted on this key (base first, then
@@ -371,6 +380,27 @@ impl Runtime {
             view_id: view_id.0,
         };
         self.config.resolve_view_background(&target)
+    }
+
+    /// Resolves one `View`'s chrome style after per-`View` overrides
+    /// (CTX-1161 S2, DEC-0111 section 2).
+    ///
+    /// Uses exactly the same public layout state as [`Self::view_outline_for`]
+    /// (stable `ViewId`, active workspace label, content kind).
+    /// Presentation-only: no terminal truth is read or mutated.
+    /// Accepted-but-inert in S2: the value is stored on
+    /// [`PresentFrame`](crate::runtime::PresentFrame) at present build with
+    /// no present-path consumer until S3.
+    #[must_use]
+    pub(crate) fn view_style_for(&self, view_id: ViewId) -> crate::config::RuntimeViewStyle {
+        let content = self.view_content_kind(view_id);
+        let workspace_label = self.active_workspace_label();
+        let target = crate::config::RuntimeViewTarget {
+            content,
+            workspace_label,
+            view_id: view_id.0,
+        };
+        self.config.resolve_view_style(&target)
     }
 
     /// Content kind of a leaf for `views` selector matching: `terminal` for a
@@ -1192,6 +1222,9 @@ impl Runtime {
                     border,
                     radius: dv.radius,
                     tier,
+                    // CTX-1161 S2: resolved per-`View` chrome style, stored
+                    // with no present-path consumer until S3 (inert carry).
+                    style: self.view_style_for(view),
                 }
             })
             .collect();

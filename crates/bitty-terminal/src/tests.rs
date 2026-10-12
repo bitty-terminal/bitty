@@ -3375,6 +3375,81 @@ fn runtime_config_carries_global_background_image_fit_and_roots() {
 }
 
 #[test]
+fn runtime_config_carries_style_surface_and_per_view_style() {
+    // CTX-1161 S2: the merged global style surface (`appearance.style`
+    // glow/shadow/fade plus the `decoration` tint pair) and the per-`View`
+    // style quartet flow file -> effective -> runtime by value.
+    // Accepted-but-inert: carried with no render effect until S3.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let source = r##"return { appearance = { style = {
+            glow_color = "#FF0000", glow_width = 8,
+            shadow_color = "#00000080", shadow_offset_x = -4, shadow_offset_y = 5,
+            fade_unfocused = 0.5,
+        } }, decoration = {
+            background_tint = "#112233", background_tint_strength = 0.25,
+        }, views = {
+            ["*"] = { glow_width = 4 },
+            ["view:7"] = { glow_color = "#00FF00", background_tint_strength = 0.75 },
+        } }"##;
+    let plan = parse_lua_config(source, &src).expect("style parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.style_glow_color, Some([0xFF, 0x00, 0x00, 0xFF]));
+    assert_eq!(cfg.style_glow_width, 8);
+    assert_eq!(cfg.style_shadow_color, Some([0x00, 0x00, 0x00, 0x80]));
+    assert_eq!(cfg.style_shadow_offset_x, -4);
+    assert_eq!(cfg.style_shadow_offset_y, 5);
+    assert!((cfg.style_fade_unfocused - 0.5).abs() < f32::EPSILON);
+    assert_eq!(cfg.background_tint, Some([0x11, 0x22, 0x33, 0xFF]));
+    assert!((cfg.background_tint_strength - 0.25).abs() < f32::EPSILON);
+    let by_selector = |name: &str| {
+        cfg.view_appearance
+            .iter()
+            .find(|rule| rule.selector == name)
+            .unwrap_or_else(|| panic!("missing rule {name}"))
+    };
+    assert_eq!(by_selector("*").glow_width, Some(4));
+    assert_eq!(
+        by_selector("view:7").glow_color,
+        Some([0x00, 0xFF, 0x00, 0xFF])
+    );
+    assert!((by_selector("view:7").background_tint_strength.unwrap() - 0.75).abs() < f32::EPSILON);
+    // Sparse leaves inherit: the `*` rule sets only the width, the `view:7`
+    // rule sets no tint color.
+    assert_eq!(by_selector("*").glow_color, None);
+    assert_eq!(by_selector("view:7").background_tint, None);
+    // Safe mode clears the whole style surface and drops per-View rules.
+    let safe_cfg = runtime_config_from_effective(&bitty_config::reload::fallback_builtin())
+        .expect("safe builds");
+    assert_eq!(safe_cfg.style_glow_color, None);
+    assert_eq!(safe_cfg.style_glow_width, 0);
+    assert_eq!(safe_cfg.style_shadow_color, None);
+    assert_eq!(safe_cfg.style_shadow_offset_x, 0);
+    assert_eq!(safe_cfg.style_shadow_offset_y, 0);
+    assert!((safe_cfg.style_fade_unfocused - 1.0).abs() < f32::EPSILON);
+    assert_eq!(safe_cfg.background_tint, None);
+    assert!((safe_cfg.background_tint_strength - 0.0).abs() < f32::EPSILON);
+    assert!(safe_cfg.view_appearance.is_empty());
+}
+
+#[test]
+fn style_bounds_mirror_config_and_runtime() {
+    // CTX-1161 S2: the runtime repeats the `bitty-config` style bounds so a
+    // direct construction cannot arm an unbounded value; pin the pairing.
+    assert_eq!(
+        bitty_runtime::config::MAX_STYLE_GLOW_WIDTH_PX,
+        bitty_config::MAX_STYLE_GLOW_WIDTH_PX
+    );
+    assert_eq!(
+        bitty_runtime::config::MAX_STYLE_SHADOW_OFFSET_PX,
+        bitty_config::MAX_STYLE_SHADOW_OFFSET_PX
+    );
+}
+
+#[test]
 fn expand_home_path_is_injected_and_fails_closed_without_home() {
     // CTX-0347: expansion is hermetic over an injected home, so Windows CI
     // (which has no `$HOME`) never depends on the ambient environment.

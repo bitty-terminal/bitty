@@ -34,6 +34,7 @@ fn frame(view: ViewId) -> PresentFrame {
         border: 0,
         radius: 0,
         tier: None,
+        style: bitty_runtime::RuntimeViewStyle::default(),
     }
 }
 

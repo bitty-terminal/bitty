@@ -220,6 +220,33 @@ pub const DEFAULT_OUTLINE_WIDTH_IDLE: Option<u32> = None;
 /// bound fail-closed so a direct construction cannot arm an oversized ring.
 pub const MAX_OUTLINE_WIDTH_PX: u32 = 16;
 
+/// Maximum chrome-style glow halo width in logical px (CTX-1161 S2,
+/// `0..=16`). Mirrors `bitty-config` `MAX_STYLE_GLOW_WIDTH_PX`; the runtime
+/// repeats the bound fail-closed so a direct construction cannot arm an
+/// oversized halo. Parity is pinned by a cross-crate test in
+/// `bitty-terminal`.
+pub const MAX_STYLE_GLOW_WIDTH_PX: u32 = 16;
+
+/// Maximum absolute chrome-style drop-shadow offset in logical px (CTX-1161
+/// S2, `-8..=8`). Mirrors `bitty-config` `MAX_STYLE_SHADOW_OFFSET_PX`
+/// (same parity pin as above).
+pub const MAX_STYLE_SHADOW_OFFSET_PX: i32 = 8;
+
+/// Default chrome-style glow halo width in logical px (CTX-1161 S2): `0`
+/// paints no halo, reproducing current rendering.
+pub const DEFAULT_STYLE_GLOW_WIDTH: u32 = 0;
+
+/// Default chrome-style drop-shadow offset in logical px (CTX-1161 S2): `0`.
+pub const DEFAULT_STYLE_SHADOW_OFFSET: i32 = 0;
+
+/// Default background tint strength (CTX-1161 S2): `0.0` paints no tint,
+/// reproducing current rendering.
+pub const DEFAULT_STYLE_TINT_STRENGTH: f32 = 0.0;
+
+/// Default inactive-`View` dim factor (CTX-1161 S2): `1.0` applies no fade,
+/// reproducing current rendering.
+pub const DEFAULT_STYLE_FADE_UNFOCUSED: f32 = 1.0;
+
 /// Maximum `background_image` path length in bytes (CTX-0347,
 /// RFC-0001/OQ-042: `<= 4096`). Mirrors `bitty-config`
 /// `MAX_BACKGROUND_IMAGE_PATH_BYTES`.
@@ -381,6 +408,68 @@ pub struct RuntimeViewBackground {
     pub fit: String,
 }
 
+/// One `View`'s resolved chrome style after per-`View` overrides (CTX-1161
+/// S2, DEC-0111 section 2 as corrected by DEC-0113).
+///
+/// The merged global style (glow/shadow/fade plus the tint pair) is the base
+/// tier; a matching `views` rule overrides each of the four per-`View` leaves
+/// (`glow_color`, `glow_width`, `background_tint`,
+/// `background_tint_strength`) independently per tier (`*` < content < `ws:`
+/// < `view:`), regardless of rule order, via
+/// [`RuntimeConfig::resolve_view_style`]. The global-only leaves (shadow,
+/// fade) pass through unchanged for every `View`: no selector can supply
+/// them.
+///
+/// Accepted-but-inert in S2: resolved, carried on
+/// [`PresentFrame`](crate::runtime::PresentFrame), and reported with no
+/// render effect until S3 (no present-path consumer reads this value).
+/// Presentation-only: never participates in cell geometry, hit testing,
+/// selection, or Terminal Truth.
+///
+/// `PartialEq` only: the strength/fade leaves are floats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeViewStyle {
+    /// Resolved glow halo color (`None` = no glow contribution).
+    pub glow_color: Option<bitty_render::grid::Rgba8>,
+    /// Resolved glow halo width in logical px (`0` = no halo).
+    pub glow_width: u32,
+    /// Resolved background tint color (`None` = no tint).
+    pub background_tint: Option<bitty_render::grid::Rgba8>,
+    /// Resolved background tint strength (`0.0` = no tint).
+    pub background_tint_strength: f32,
+    /// Global drop-shadow color (`None` = no shadow).
+    pub shadow_color: Option<bitty_render::grid::Rgba8>,
+    /// Global drop-shadow horizontal offset in logical px.
+    pub shadow_offset_x: i32,
+    /// Global drop-shadow vertical offset in logical px.
+    pub shadow_offset_y: i32,
+    /// Global inactive-`View` dim factor (`1.0` = no fade).
+    pub fade_unfocused: f32,
+}
+
+impl Default for RuntimeViewStyle {
+    fn default() -> Self {
+        Self {
+            glow_color: None,
+            glow_width: DEFAULT_STYLE_GLOW_WIDTH,
+            background_tint: None,
+            background_tint_strength: DEFAULT_STYLE_TINT_STRENGTH,
+            shadow_color: None,
+            shadow_offset_x: DEFAULT_STYLE_SHADOW_OFFSET,
+            shadow_offset_y: DEFAULT_STYLE_SHADOW_OFFSET,
+            fade_unfocused: DEFAULT_STYLE_FADE_UNFOCUSED,
+        }
+    }
+}
+
+impl RuntimeViewStyle {
+    /// Whether every leaf is at its inert default (contributes no paint).
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// The `views` rule (selector plus leaf) that last supplied one resolved
 /// runtime field, used for source-attributed contract diagnostics (CTX-0343).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +492,24 @@ struct RuntimeOutlineSources {
     idle_color: Option<RuntimeViewLeafSource>,
     focused_width: Option<RuntimeViewLeafSource>,
     idle_width: Option<RuntimeViewLeafSource>,
+}
+
+/// Per-field provenance for one resolved runtime style (CTX-1161 S2).
+///
+/// Only the four per-`View` leaves carry provenance; the global-only leaves
+/// (shadow, fade) have no `views` source by construction. `None` means the
+/// merged global value survived.
+///
+/// Test-only until S3 diagnostics consume it: production builds construct the
+/// value inside `resolve_view_style_traced` but only the resolved style is
+/// read (the traced half is exercised by S2 tests).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct RuntimeStyleSources {
+    glow_color: Option<RuntimeViewLeafSource>,
+    glow_width: Option<RuntimeViewLeafSource>,
+    background_tint: Option<RuntimeViewLeafSource>,
+    background_tint_strength: Option<RuntimeViewLeafSource>,
 }
 
 /// Tier of a canonical runtime selector: `*` 0, content 1, `ws:` 2, `view:` 3.
@@ -444,7 +551,12 @@ fn runtime_selector_matches(selector: &str, target: &RuntimeViewTarget<'_>) -> b
 /// `(selector, target)` in the runtime because `bitty-runtime` must not
 /// depend on `bitty-config`. Each field is optional; `None` inherits the
 /// next-less-specific resolved value.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// CTX-1161 S2: the per-`View` style quartet (`glow_color`, `glow_width`,
+/// `background_tint`, `background_tint_strength`) joins the rule; the
+/// global-only leaves (shadow, fade) stay off the rule by construction.
+/// `PartialEq` only: the tint strength leaf is a float.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewAppearanceRule {
     /// Canonical selector (`*`, `empty|terminal|rich|browser`, `ws:<n>`,
     /// `view:<n>`).
@@ -466,6 +578,18 @@ pub struct ViewAppearanceRule {
     pub background_image: Option<String>,
     /// Background fit mode spelled as the accepted enum.
     pub background_fit: Option<String>,
+    /// Glow halo color for this tier (CTX-1161 S2). `None` inherits the
+    /// resolved global glow color.
+    pub glow_color: Option<bitty_render::grid::Rgba8>,
+    /// Glow halo width for this tier in logical px `0..=16` (CTX-1161 S2).
+    /// `None` inherits the resolved global width.
+    pub glow_width: Option<u32>,
+    /// Background tint color for this tier (CTX-1161 S2). `None` inherits
+    /// the resolved global tint color.
+    pub background_tint: Option<bitty_render::grid::Rgba8>,
+    /// Background tint strength for this tier, finite within `[0.0, 1.0]`
+    /// (CTX-1161 S2). `None` inherits the resolved global strength.
+    pub background_tint_strength: Option<f32>,
 }
 
 /// Validates one background-image/root path spelling fail-closed
@@ -736,6 +860,42 @@ pub struct RuntimeConfig {
     /// `decoration.background_image_roots`), deny-by-default. Global-only:
     /// no `views` rule can widen it.
     pub background_image_roots: Vec<String>,
+    /// Global chrome-style glow halo color (CTX-1161 S2
+    /// `appearance.style.glow_color`). `None` means no glow contribution
+    /// unless a `views` rule sets one. Accepted-but-inert in S2: carried
+    /// with no render effect until S3.
+    pub style_glow_color: Option<bitty_render::grid::Rgba8>,
+    /// Global chrome-style glow halo width in logical px (CTX-1161 S2
+    /// `appearance.style.glow_width`), `0..=16`
+    /// ([`MAX_STYLE_GLOW_WIDTH_PX`]); default [`DEFAULT_STYLE_GLOW_WIDTH`]
+    /// (`0` = no halo). Accepted-but-inert in S2.
+    pub style_glow_width: u32,
+    /// Global chrome-style drop-shadow color (CTX-1161 S2
+    /// `appearance.style.shadow_color`). `None` means no shadow.
+    /// Global-only: no `views` rule can supply it. Accepted-but-inert in S2.
+    pub style_shadow_color: Option<bitty_render::grid::Rgba8>,
+    /// Global drop-shadow horizontal offset in logical px (CTX-1161 S2
+    /// `appearance.style.shadow_offset_x`), `-8..=8`
+    /// ([`MAX_STYLE_SHADOW_OFFSET_PX`]); default
+    /// [`DEFAULT_STYLE_SHADOW_OFFSET`]. Global-only, accepted-but-inert.
+    pub style_shadow_offset_x: i32,
+    /// Global drop-shadow vertical offset in logical px; see
+    /// [`Self::style_shadow_offset_x`].
+    pub style_shadow_offset_y: i32,
+    /// Global inactive-`View` dim factor (CTX-1161 S2
+    /// `appearance.style.fade_unfocused`), finite within `[0.0, 1.0]`;
+    /// default [`DEFAULT_STYLE_FADE_UNFOCUSED`] (`1.0` = no fade).
+    /// Global-only, accepted-but-inert in S2.
+    pub style_fade_unfocused: f32,
+    /// Global background tint color (CTX-1161 S2
+    /// `decoration.background_tint`). `None` means no tint unless a `views`
+    /// rule sets one. Accepted-but-inert in S2.
+    pub background_tint: Option<bitty_render::grid::Rgba8>,
+    /// Global background tint strength (CTX-1161 S2
+    /// `decoration.background_tint_strength`), finite within `[0.0, 1.0]`;
+    /// default [`DEFAULT_STYLE_TINT_STRENGTH`] (`0.0` = no tint).
+    /// Accepted-but-inert in S2.
+    pub background_tint_strength: f32,
     /// Window background-image path (CTX-1076, issue #1815
     /// `window.background_image`). `None` means no window image (the
     /// allocation-free fast path). Syntax-validated here and resolved against
@@ -907,6 +1067,14 @@ impl Default for RuntimeConfig {
             background_image: None,
             background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             background_image_roots: Vec::new(),
+            style_glow_color: None,
+            style_glow_width: DEFAULT_STYLE_GLOW_WIDTH,
+            style_shadow_color: None,
+            style_shadow_offset_x: DEFAULT_STYLE_SHADOW_OFFSET,
+            style_shadow_offset_y: DEFAULT_STYLE_SHADOW_OFFSET,
+            style_fade_unfocused: DEFAULT_STYLE_FADE_UNFOCUSED,
+            background_tint: None,
+            background_tint_strength: DEFAULT_STYLE_TINT_STRENGTH,
             window_background_image: None,
             window_background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             window_background_opacity: DEFAULT_WINDOW_BACKGROUND_OPACITY,
@@ -1003,6 +1171,14 @@ impl RuntimeConfig {
             background_image: None,
             background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             background_image_roots: Vec::new(),
+            style_glow_color: None,
+            style_glow_width: DEFAULT_STYLE_GLOW_WIDTH,
+            style_shadow_color: None,
+            style_shadow_offset_x: DEFAULT_STYLE_SHADOW_OFFSET,
+            style_shadow_offset_y: DEFAULT_STYLE_SHADOW_OFFSET,
+            style_fade_unfocused: DEFAULT_STYLE_FADE_UNFOCUSED,
+            background_tint: None,
+            background_tint_strength: DEFAULT_STYLE_TINT_STRENGTH,
             window_background_image: None,
             window_background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
             window_background_opacity: DEFAULT_WINDOW_BACKGROUND_OPACITY,
@@ -1169,6 +1345,52 @@ impl RuntimeConfig {
             if let Some(fit) = &rule.background_fit {
                 validate_background_fit(fit)?;
             }
+            // CTX-1161 S2: the per-`View` style quartet repeats the accepted
+            // bounds fail-closed (`glow_width` `0..=16`, `tint_strength`
+            // finite within `[0.0, 1.0]`); colors need no grammar check here
+            // (already `Rgba8` bytes).
+            if rule.glow_width.is_some_and(|w| w > MAX_STYLE_GLOW_WIDTH_PX) {
+                return Err(RuntimeError::InvalidConfig(
+                    "view_appearance glow width must be within [0, 16] logical pixels",
+                ));
+            }
+            if let Some(strength) = rule.background_tint_strength {
+                if !(strength.is_finite() && (0.0..=1.0).contains(&strength)) {
+                    return Err(RuntimeError::InvalidConfig(
+                        "view_appearance background tint strength must be finite within [0.0, 1.0]",
+                    ));
+                }
+            }
+        }
+        // CTX-1161 S2: the global style surface repeats the accepted bounds
+        // fail-closed; nothing is clamped. The present path does not consume
+        // these values yet (accepted-but-inert), so this is the boundary lock
+        // for direct `RuntimeConfig` construction and the app-layer mapping.
+        if self.style_glow_width > MAX_STYLE_GLOW_WIDTH_PX {
+            return Err(RuntimeError::InvalidConfig(
+                "style glow width must be within [0, 16] logical pixels",
+            ));
+        }
+        for offset in [self.style_shadow_offset_x, self.style_shadow_offset_y] {
+            if offset.abs() > MAX_STYLE_SHADOW_OFFSET_PX {
+                return Err(RuntimeError::InvalidConfig(
+                    "style shadow offset must be within [-8, 8] logical pixels",
+                ));
+            }
+        }
+        if !(self.style_fade_unfocused.is_finite()
+            && (0.0..=1.0).contains(&self.style_fade_unfocused))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "style fade_unfocused must be finite within [0.0, 1.0]",
+            ));
+        }
+        if !(self.background_tint_strength.is_finite()
+            && (0.0..=1.0).contains(&self.background_tint_strength))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "background tint strength must be finite within [0.0, 1.0]",
+            ));
         }
         // CTX-0347 (RFC-0001/OQ-042): the global background image/fit and the
         // deny-by-default root list repeat the accepted bounds fail-closed;
@@ -1292,6 +1514,97 @@ impl RuntimeConfig {
             }
         }
         RuntimeViewBackground { image, fit }
+    }
+
+    /// Resolves one `View`'s chrome style (CTX-1161 S2) from the global style
+    /// surface plus every matching per-`View` rule.
+    ///
+    /// Resolution is per field per tier (`*` < content < `ws:` < `view:`),
+    /// independent of rule order; an unset field inherits the next-less-
+    /// specific value. `target` is the `(content, workspace, view)` tuple the
+    /// caller derives from its public layout state. The global-only leaves
+    /// (shadow, fade) pass through unchanged: no selector can supply them.
+    ///
+    /// Accepted-but-inert in S2: the returned value is stored on
+    /// [`PresentFrame`](crate::runtime::PresentFrame) with no present-path
+    /// consumer until S3.
+    #[must_use]
+    pub fn resolve_view_style(&self, target: &RuntimeViewTarget) -> RuntimeViewStyle {
+        self.resolve_view_style_traced(target).0
+    }
+
+    /// [`Self::resolve_view_style`] plus the winning rule per resolved
+    /// per-`View` field, used by S2 tests and future source-attributed
+    /// diagnostics.
+    fn resolve_view_style_traced(
+        &self,
+        target: &RuntimeViewTarget,
+    ) -> (RuntimeViewStyle, RuntimeStyleSources) {
+        let mut glow_color = self.style_glow_color;
+        let mut glow_width = Some(self.style_glow_width);
+        let mut background_tint = self.background_tint;
+        let mut background_tint_strength = Some(self.background_tint_strength);
+        let mut glow_color_src: Option<RuntimeViewLeafSource> = None;
+        let mut glow_width_src: Option<RuntimeViewLeafSource> = None;
+        let mut background_tint_src: Option<RuntimeViewLeafSource> = None;
+        let mut background_tint_strength_src: Option<RuntimeViewLeafSource> = None;
+        for tier in 0..=3u8 {
+            for rule in &self.view_appearance {
+                if runtime_selector_tier(&rule.selector) != Some(tier)
+                    || !runtime_selector_matches(&rule.selector, target)
+                {
+                    continue;
+                }
+                if let Some(value) = rule.glow_color {
+                    glow_color = Some(value);
+                    glow_color_src = Some(RuntimeViewLeafSource {
+                        selector: rule.selector.clone(),
+                        leaf: "glow_color",
+                    });
+                }
+                if let Some(value) = rule.glow_width {
+                    glow_width = Some(value);
+                    glow_width_src = Some(RuntimeViewLeafSource {
+                        selector: rule.selector.clone(),
+                        leaf: "glow_width",
+                    });
+                }
+                if let Some(value) = rule.background_tint {
+                    background_tint = Some(value);
+                    background_tint_src = Some(RuntimeViewLeafSource {
+                        selector: rule.selector.clone(),
+                        leaf: "background_tint",
+                    });
+                }
+                if let Some(value) = rule.background_tint_strength {
+                    background_tint_strength = Some(value);
+                    background_tint_strength_src = Some(RuntimeViewLeafSource {
+                        selector: rule.selector.clone(),
+                        leaf: "background_tint_strength",
+                    });
+                }
+            }
+        }
+        let sources = RuntimeStyleSources {
+            glow_color: glow_color_src,
+            glow_width: glow_width_src,
+            background_tint: background_tint_src,
+            background_tint_strength: background_tint_strength_src,
+        };
+        (
+            RuntimeViewStyle {
+                glow_color,
+                glow_width: glow_width.unwrap_or(DEFAULT_STYLE_GLOW_WIDTH),
+                background_tint,
+                background_tint_strength: background_tint_strength
+                    .unwrap_or(DEFAULT_STYLE_TINT_STRENGTH),
+                shadow_color: self.style_shadow_color,
+                shadow_offset_x: self.style_shadow_offset_x,
+                shadow_offset_y: self.style_shadow_offset_y,
+                fade_unfocused: self.style_fade_unfocused,
+            },
+            sources,
+        )
     }
 
     /// [`Self::resolve_view_outline`] plus the winning rule per resolved
@@ -1537,6 +1850,209 @@ mod tests {
         RuntimeConfig::default()
             .validate()
             .expect("default must be valid");
+    }
+
+    #[test]
+    fn default_style_surface_is_inert() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.style_glow_color, None);
+        assert_eq!(cfg.style_glow_width, DEFAULT_STYLE_GLOW_WIDTH);
+        assert_eq!(cfg.style_shadow_color, None);
+        assert_eq!(cfg.style_shadow_offset_x, DEFAULT_STYLE_SHADOW_OFFSET);
+        assert_eq!(cfg.style_shadow_offset_y, DEFAULT_STYLE_SHADOW_OFFSET);
+        assert!((cfg.style_fade_unfocused - DEFAULT_STYLE_FADE_UNFOCUSED).abs() < f32::EPSILON);
+        assert_eq!(cfg.background_tint, None);
+        assert!((cfg.background_tint_strength - DEFAULT_STYLE_TINT_STRENGTH).abs() < f32::EPSILON);
+        assert!(RuntimeViewStyle::default().is_inert());
+    }
+
+    fn style_target() -> RuntimeViewTarget<'static> {
+        RuntimeViewTarget {
+            content: "terminal",
+            workspace_label: 2,
+            view_id: 7,
+        }
+    }
+
+    fn style_rule(selector: &str, rule: ViewAppearanceRule) -> ViewAppearanceRule {
+        ViewAppearanceRule {
+            selector: selector.to_string(),
+            ..rule
+        }
+    }
+
+    #[test]
+    fn style_resolution_is_tier_ordered_and_order_independent() {
+        let cfg = RuntimeConfig {
+            style_glow_color: Some([0x01, 0x02, 0x03, 0xFF]),
+            style_glow_width: 2,
+            style_fade_unfocused: 0.9,
+            background_tint: Some([0x04, 0x05, 0x06, 0xFF]),
+            background_tint_strength: 0.25,
+            view_appearance: vec![
+                style_rule(
+                    "view:7",
+                    ViewAppearanceRule {
+                        glow_width: Some(9),
+                        ..Default::default()
+                    },
+                ),
+                style_rule(
+                    "ws:2",
+                    ViewAppearanceRule {
+                        glow_color: Some([0x0A, 0x0B, 0x0C, 0xFF]),
+                        background_tint_strength: Some(0.75),
+                        ..Default::default()
+                    },
+                ),
+                style_rule(
+                    "terminal",
+                    ViewAppearanceRule {
+                        background_tint: Some([0x0D, 0x0E, 0x0F, 0xFF]),
+                        ..Default::default()
+                    },
+                ),
+                style_rule(
+                    "*",
+                    ViewAppearanceRule {
+                        glow_width: Some(4),
+                        background_tint: Some([0x11, 0x12, 0x13, 0xFF]),
+                        ..Default::default()
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        cfg.validate().expect("styled rules must validate");
+        let resolved = cfg.resolve_view_style(&style_target());
+        assert_eq!(resolved.glow_color, Some([0x0A, 0x0B, 0x0C, 0xFF]));
+        assert_eq!(resolved.glow_width, 9);
+        assert_eq!(resolved.background_tint, Some([0x0D, 0x0E, 0x0F, 0xFF]));
+        assert!((resolved.background_tint_strength - 0.75).abs() < f32::EPSILON);
+        assert!((resolved.fade_unfocused - 0.9).abs() < f32::EPSILON);
+
+        let mut reordered = cfg.clone();
+        reordered.view_appearance.reverse();
+        assert_eq!(
+            cfg.resolve_view_style(&style_target()),
+            reordered.resolve_view_style(&style_target())
+        );
+    }
+
+    #[test]
+    fn style_resolution_inherits_unset_fields_per_field() {
+        let cfg = RuntimeConfig {
+            style_glow_color: Some([0x01, 0x02, 0x03, 0xFF]),
+            style_glow_width: 3,
+            style_shadow_color: Some([0x04, 0x05, 0x06, 0xFF]),
+            style_shadow_offset_x: -4,
+            style_fade_unfocused: 0.8,
+            background_tint: Some([0x07, 0x08, 0x09, 0xFF]),
+            background_tint_strength: 0.5,
+            view_appearance: vec![style_rule(
+                "view:7",
+                ViewAppearanceRule {
+                    glow_width: Some(6),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let resolved = cfg.resolve_view_style(&style_target());
+        assert_eq!(resolved.glow_color, Some([0x01, 0x02, 0x03, 0xFF]));
+        assert_eq!(resolved.glow_width, 6);
+        assert_eq!(resolved.background_tint, Some([0x07, 0x08, 0x09, 0xFF]));
+        assert!((resolved.background_tint_strength - 0.5).abs() < f32::EPSILON);
+        assert_eq!(resolved.shadow_color, Some([0x04, 0x05, 0x06, 0xFF]));
+        assert_eq!(resolved.shadow_offset_x, -4);
+        assert_eq!(resolved.shadow_offset_y, DEFAULT_STYLE_SHADOW_OFFSET);
+        assert!((resolved.fade_unfocused - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn style_resolution_sparse_rules_stay_inert() {
+        let cfg = RuntimeConfig {
+            view_appearance: vec![style_rule(
+                "terminal",
+                ViewAppearanceRule {
+                    background_tint_strength: Some(0.5),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let resolved = cfg.resolve_view_style(&style_target());
+        assert_eq!(resolved.glow_color, None);
+        assert_eq!(resolved.glow_width, DEFAULT_STYLE_GLOW_WIDTH);
+        assert_eq!(resolved.background_tint, None);
+        assert!((resolved.background_tint_strength - 0.5).abs() < f32::EPSILON);
+        assert!((resolved.fade_unfocused - DEFAULT_STYLE_FADE_UNFOCUSED).abs() < f32::EPSILON);
+        let other = RuntimeViewTarget {
+            content: "rich",
+            workspace_label: 3,
+            view_id: 9,
+        };
+        assert!(cfg.resolve_view_style(&other).is_inert());
+    }
+
+    #[test]
+    fn style_bounds_are_fail_closed() {
+        let bad = RuntimeConfig {
+            style_glow_width: MAX_STYLE_GLOW_WIDTH_PX + 1,
+            ..Default::default()
+        };
+        bad.validate().expect_err("over-wide glow must fail closed");
+        let bad = RuntimeConfig {
+            style_shadow_offset_x: MAX_STYLE_SHADOW_OFFSET_PX + 1,
+            ..Default::default()
+        };
+        bad.validate()
+            .expect_err("over-wide shadow offset must fail closed");
+        let bad = RuntimeConfig {
+            style_shadow_offset_y: -MAX_STYLE_SHADOW_OFFSET_PX - 1,
+            ..Default::default()
+        };
+        bad.validate()
+            .expect_err("negative over-wide shadow offset must fail closed");
+        for fade in [f32::NAN, f32::INFINITY, -0.5, 1.5] {
+            let bad = RuntimeConfig {
+                style_fade_unfocused: fade,
+                ..Default::default()
+            };
+            bad.validate()
+                .expect_err("non-finite or out-of-range fade must fail closed");
+            let bad = RuntimeConfig {
+                background_tint_strength: fade,
+                ..Default::default()
+            };
+            bad.validate()
+                .expect_err("non-finite or out-of-range tint strength must fail closed");
+        }
+        let bad = RuntimeConfig {
+            view_appearance: vec![style_rule(
+                "*",
+                ViewAppearanceRule {
+                    glow_width: Some(MAX_STYLE_GLOW_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        bad.validate()
+            .expect_err("over-wide per-View glow must fail closed");
+        let bad = RuntimeConfig {
+            view_appearance: vec![style_rule(
+                "view:7",
+                ViewAppearanceRule {
+                    background_tint_strength: Some(2.0),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        bad.validate()
+            .expect_err("out-of-range per-View tint strength must fail closed");
+        RuntimeConfig::default().validate().expect("default valid");
     }
 
     #[test]

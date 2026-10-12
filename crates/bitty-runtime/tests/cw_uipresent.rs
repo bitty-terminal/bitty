@@ -367,6 +367,7 @@ fn cw1395_link_overlay_cells_paint_the_span_cell() {
         border: 0,
         radius: 0,
         tier: None,
+        style: bitty_runtime::RuntimeViewStyle::default(),
     }];
     let cells = rt.cw_hint_overlay_cells(&frames);
     assert_eq!(cells.len(), 1, "armed link label paints one pill");

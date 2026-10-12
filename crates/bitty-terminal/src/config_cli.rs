@@ -1408,6 +1408,14 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
                     .overrides
                     .background_fit
                     .map(|f| f.as_str().to_string()),
+                // CTX-1161 S2: the per-`View` style quartet rides the same
+                // rule in canonical form. Colors are already `Rgba8` bytes;
+                // bounds were enforced fail-closed in `bitty-config` and are
+                // mirrored by `RuntimeConfig::validate`.
+                glow_color: entry.overrides.glow_color.map(|c| c.0),
+                glow_width: entry.overrides.glow_width,
+                background_tint: entry.overrides.background_tint.map(|c| c.0),
+                background_tint_strength: entry.overrides.background_tint_strength,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1498,6 +1506,33 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         cfg.background_image = background_image;
         cfg.background_fit = background_fit.as_str().to_string();
         cfg.background_image_roots = background_image_roots;
+        // CTX-1161 S2: carry the merged global style surface
+        // (`appearance.style` glow/shadow/fade plus the `decoration` tint
+        // pair) onto the runtime config. Bounds were already enforced
+        // fail-closed in `bitty-config`; `RuntimeConfig::validate` mirrors
+        // them so a direct construction cannot arm an unbounded value.
+        // Accepted-but-inert: stored with no render effect until S3.
+        let empty_style = bitty_config::StyleConfig::default();
+        let global_style = effective.appearance.style.as_ref().unwrap_or(&empty_style);
+        cfg.style_glow_color = global_style.glow_color.map(|c| c.0);
+        cfg.style_glow_width = global_style
+            .glow_width
+            .unwrap_or(bitty_runtime::config::DEFAULT_STYLE_GLOW_WIDTH);
+        cfg.style_shadow_color = global_style.shadow_color.map(|c| c.0);
+        cfg.style_shadow_offset_x = global_style
+            .shadow_offset_x
+            .unwrap_or(bitty_runtime::config::DEFAULT_STYLE_SHADOW_OFFSET);
+        cfg.style_shadow_offset_y = global_style
+            .shadow_offset_y
+            .unwrap_or(bitty_runtime::config::DEFAULT_STYLE_SHADOW_OFFSET);
+        cfg.style_fade_unfocused = global_style
+            .fade_unfocused
+            .unwrap_or(bitty_runtime::config::DEFAULT_STYLE_FADE_UNFOCUSED);
+        cfg.background_tint = effective.decoration.background_tint.map(|c| c.0);
+        cfg.background_tint_strength = effective
+            .decoration
+            .background_tint_strength
+            .unwrap_or(bitty_runtime::config::DEFAULT_STYLE_TINT_STRENGTH);
         // CTX-1076 (issue #1815): carry the window background image and its
         // placement (`background_fit` cover/contain/tile vocabulary,
         // `background_opacity` dim, `background_position`). `Runtime::new`

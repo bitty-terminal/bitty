@@ -103,7 +103,7 @@ fn clamp_frame_axis(offset_px: f64, cell_px: f64, max: i64) -> u16 {
 /// inset.
 ///
 /// CTX-1161 S2: `style` carries the resolved per-`View` chrome style
-/// (populated at present build via [`Runtime::view_style_for`).
+/// (populated at present build via [`Runtime::view_style_for`]).
 /// Accepted-but-inert: no present-path consumer reads it until S3, so styled
 /// and unstyled configs present byte-identical frames.
 ///

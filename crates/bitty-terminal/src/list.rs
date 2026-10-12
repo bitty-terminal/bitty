@@ -1063,10 +1063,8 @@ pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
 fn probe_socket_live(path: &Path) -> (bool, String) {
     // CTX-0528 (IPC-001): verify before connect — a planted entry pointing
     // at another owner's socket fails closed here, never reaching I/O.
-    let euid = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata("/proc/self").map(|m| m.uid())
-    };
+    // Portable uid: `/proc/self` metadata is Linux-only (absent on macOS).
+    let euid = bitty_ipc::current_unix_uid();
     if let Ok(uid) = euid {
         let path_str = path.to_string_lossy();
         if bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str.as_ref(), uid).is_err()
@@ -1322,9 +1320,9 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
             // CTX-0528 (IPC-001): verify the endpoint before connect — a
             // forged `--socket`/planted entry pointing at another owner's
             // endpoint fails closed here, never reaching I/O.
-            let uid = std::fs::metadata("/proc/self")
-                .map(|m| m.uid())
-                .unwrap_or(0);
+            // Portable uid: `/proc/self` metadata is Linux-only (absent on
+            // macOS, where it fell back to 0).
+            let uid = bitty_ipc::current_unix_uid().unwrap_or(0);
             if bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str, uid).is_err() {
                 return Ok(vec![InstanceInfo {
                     instance,

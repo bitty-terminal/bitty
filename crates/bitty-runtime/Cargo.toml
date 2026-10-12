@@ -38,7 +38,7 @@ bitty-plugin-host = { version = "0.0.22", path = "../bitty-plugin-host" }
 # workspace crate, no new supply-chain surface (its only syscall dep is the
 # workspace `libc`, Linux-gated there).
 bitty-sandbox = { version = "0.0.22", path = "../bitty-sandbox" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "a9544ac" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
 bitty-package = { version = "0.0.22", path = "../bitty-package" }
@@ -74,7 +74,7 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "a9544ac", features = ["test-support"] }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
 
 # CTX-0903: Windows liveness probes for the owned-tree tests (safe API of

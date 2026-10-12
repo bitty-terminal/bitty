@@ -144,9 +144,9 @@ pub use types::{
     MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
     MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec,
     ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance,
-    ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig, TerminalConfig,
-    ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride, ViewSelector,
-    WindowConfig, WorkspaceConfig,
+    ResolvedViewStyle, ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig,
+    TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride,
+    ViewSelector, WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 pub use wheel::{

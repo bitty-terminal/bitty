@@ -3538,6 +3538,7 @@ mod plugin_overlay_paint_tests {
             border: 1,
             radius: 0,
             tier: None,
+            style: crate::config::RuntimeViewStyle::default(),
         }
     }
 

@@ -1426,6 +1426,25 @@ struct ViewAppearanceSources {
     idle_width: Option<ViewLeafSource>,
 }
 
+/// Per-field provenance for one resolved `View` style (CTX-1161 S2).
+///
+/// Only the four per-`View` leaves carry provenance; the global-only leaves
+/// (`shadow_*`, `fade_unfocused`) have no `views.*` source by construction.
+/// `None` means the merged global value survived (no matching `views` entry
+/// set that leaf).
+///
+/// Test-only until S3 diagnostics consume it: production builds construct the
+/// value inside `resolve_view_style_traced` but only the resolved style is
+/// read (the traced half is exercised by S2 tests).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct ViewStyleSources {
+    glow_color: Option<ViewLeafSource>,
+    glow_width: Option<ViewLeafSource>,
+    background_tint: Option<ViewLeafSource>,
+    background_tint_strength: Option<ViewLeafSource>,
+}
+
 /// One fully resolved per-`View` appearance (RFC-0001/OQ-041).
 ///
 /// Produced by [`EffectiveConfig::resolve_view_appearance`] after applying
@@ -1542,6 +1561,65 @@ impl ResolvedViewAppearance {
         } else {
             None
         }
+    }
+}
+
+/// One fully resolved per-`View` chrome style (CTX-1161 S2, DEC-0111 section 2
+/// as corrected by DEC-0113).
+///
+/// Produced by [`EffectiveConfig::resolve_view_style`] after applying every
+/// matching `views` entry per field in tier order over the merged global
+/// style. The four per-`View` leaves (`glow_color`, `glow_width`,
+/// `background_tint`, `background_tint_strength`) resolve per field per tier
+/// exactly like the outline resolver; the global-only leaves (`shadow_color`,
+/// `shadow_offset_x`/`shadow_offset_y`, `fade_unfocused`) pass through
+/// unchanged for every `View` (no `views.*` entry can supply them).
+/// Accepted-but-inert in S2: resolved, carried, and reported with no render
+/// effect until S3. Presentation-only: never participates in cell geometry,
+/// hit testing, selection, or Terminal Truth.
+///
+/// `PartialEq` only: the strength/fade leaves are floats, same posture as
+/// [`DecorationConfig`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedViewStyle {
+    /// Resolved glow halo color. `None` means no glow contribution.
+    pub glow_color: Option<OutlineColor>,
+    /// Resolved glow halo width in logical px (`0` = no halo).
+    pub glow_width: u32,
+    /// Resolved background tint color. `None` means no tint.
+    pub background_tint: Option<OutlineColor>,
+    /// Resolved background tint strength (`0.0` = no tint).
+    pub background_tint_strength: f32,
+    /// Global drop-shadow color. `None` means no shadow.
+    pub shadow_color: Option<OutlineColor>,
+    /// Global drop-shadow horizontal offset in logical px.
+    pub shadow_offset_x: i32,
+    /// Global drop-shadow vertical offset in logical px.
+    pub shadow_offset_y: i32,
+    /// Global inactive-`View` dim factor (`1.0` = no fade).
+    pub fade_unfocused: f32,
+}
+
+impl Default for ResolvedViewStyle {
+    fn default() -> Self {
+        Self {
+            glow_color: None,
+            glow_width: 0,
+            background_tint: None,
+            background_tint_strength: 0.0,
+            shadow_color: None,
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
+            fade_unfocused: 1.0,
+        }
+    }
+}
+
+impl ResolvedViewStyle {
+    /// Whether every leaf is at its inert default (contributes no paint).
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -4173,6 +4251,99 @@ impl EffectiveConfig {
         )
     }
 
+    /// Resolves one `View`'s chrome style (CTX-1161 S2, DEC-0111 section 2).
+    ///
+    /// Axis 1 (the `LayerKind` stack) is already merged: the base tier is the
+    /// merged global style (`appearance.style` plus the `decoration` tint
+    /// pair). Axis 2 applies every matching `views` entry per field in tier
+    /// order (`*` < content < `ws:` < `view:`) regardless of declaration
+    /// order, exactly like [`Self::resolve_view_appearance`]. An unset field
+    /// inherits the next-less-specific value and never silently shadows it.
+    /// The global-only leaves (`shadow_*`, `fade_unfocused`) pass through
+    /// unchanged: no `views.*` entry can supply them (rejected at
+    /// extraction like `background_image_roots`).
+    ///
+    /// Accepted-but-inert in S2: the returned value is resolved, carried, and
+    /// reported with no render effect until S3.
+    #[must_use]
+    pub fn resolve_view_style(&self, target: &ViewAppearanceTarget) -> ResolvedViewStyle {
+        self.resolve_view_style_traced(target).0
+    }
+
+    /// [`Self::resolve_view_style`] plus the winning selector leaf per
+    /// resolved per-`View` field: the provenance used by S2 tests and future
+    /// source-attributed diagnostics.
+    fn resolve_view_style_traced(
+        &self,
+        target: &ViewAppearanceTarget,
+    ) -> (ResolvedViewStyle, ViewStyleSources) {
+        let empty_style = StyleConfig::default();
+        let global = self.appearance.style.as_ref().unwrap_or(&empty_style);
+        let mut glow_color = global.glow_color;
+        let mut glow_width = global.glow_width;
+        let mut background_tint = self.decoration.background_tint;
+        let mut background_tint_strength = self.decoration.background_tint_strength;
+        let mut glow_color_src: Option<ViewLeafSource> = None;
+        let mut glow_width_src: Option<ViewLeafSource> = None;
+        let mut background_tint_src: Option<ViewLeafSource> = None;
+        let mut background_tint_strength_src: Option<ViewLeafSource> = None;
+        for tier in 0..=3u8 {
+            for entry in &self.views {
+                if entry.selector.tier() != tier || !entry.selector.matches(target) {
+                    continue;
+                }
+                let overrides = &entry.overrides;
+                if let Some(value) = overrides.glow_color {
+                    glow_color = Some(value);
+                    glow_color_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "glow_color",
+                    });
+                }
+                if let Some(value) = overrides.glow_width {
+                    glow_width = Some(value);
+                    glow_width_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "glow_width",
+                    });
+                }
+                if let Some(value) = overrides.background_tint {
+                    background_tint = Some(value);
+                    background_tint_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "background_tint",
+                    });
+                }
+                if let Some(value) = overrides.background_tint_strength {
+                    background_tint_strength = Some(value);
+                    background_tint_strength_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "background_tint_strength",
+                    });
+                }
+            }
+        }
+        let sources = ViewStyleSources {
+            glow_color: glow_color_src,
+            glow_width: glow_width_src,
+            background_tint: background_tint_src,
+            background_tint_strength: background_tint_strength_src,
+        };
+        (
+            ResolvedViewStyle {
+                glow_color,
+                glow_width: glow_width.unwrap_or(0),
+                background_tint,
+                background_tint_strength: background_tint_strength.unwrap_or(0.0),
+                shadow_color: global.shadow_color,
+                shadow_offset_x: global.shadow_offset_x.unwrap_or(0),
+                shadow_offset_y: global.shadow_offset_y.unwrap_or(0),
+                fade_unfocused: global.fade_unfocused.unwrap_or(1.0),
+            },
+            sources,
+        )
+    }
+
     /// Enforces the AC-1/AC-2 contrast contract on one fully resolved `View`
     /// pair (RFC-0001 "Per-View contrast") and names the target plus the
     /// source-attributed `views[<selector>].<field>` leaf in the diagnostic.
@@ -6467,6 +6638,199 @@ mod tests {
         config.decoration.background_fit = None;
         let plain = config.resolve_view_appearance(theme, &other);
         assert_eq!(plain.background_fit, BackgroundFit::Fill);
+    }
+
+    // ── CTX-1161 S2 per-View style resolution (DEC-0111 section 2) ──────────
+
+    fn styled_config(
+        style: StyleConfig,
+        tint: Option<OutlineColor>,
+        tint_strength: Option<f32>,
+        views: Vec<ViewOverride>,
+    ) -> EffectiveConfig {
+        EffectiveConfig {
+            appearance: AppearanceConfig {
+                style: Some(style),
+                ..Default::default()
+            },
+            decoration: DecorationConfig {
+                background_tint: tint,
+                background_tint_strength: tint_strength,
+                ..Default::default()
+            },
+            views,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn style_resolution_defaults_to_inert() {
+        let config = EffectiveConfig::default();
+        let resolved = config.resolve_view_style(&terminal_target());
+        assert_eq!(resolved, ResolvedViewStyle::default());
+        assert!(resolved.is_inert());
+    }
+
+    #[test]
+    fn style_resolution_is_tier_ordered_and_order_independent() {
+        let config = styled_config(
+            StyleConfig {
+                glow_color: Some(color("#010203")),
+                glow_width: Some(2),
+                fade_unfocused: Some(0.9),
+                ..Default::default()
+            },
+            Some(color("#040506")),
+            Some(0.25),
+            vec![
+                entry(
+                    ViewSelector::View(7),
+                    ViewAppearanceOverride {
+                        glow_width: Some(9),
+                        ..Default::default()
+                    },
+                ),
+                entry(
+                    ViewSelector::Workspace(2),
+                    ViewAppearanceOverride {
+                        glow_color: Some(color("#0A0B0C")),
+                        background_tint_strength: Some(0.75),
+                        ..Default::default()
+                    },
+                ),
+                entry(
+                    ViewSelector::Content(ViewContent::Terminal),
+                    ViewAppearanceOverride {
+                        background_tint: Some(color("#0D0E0F")),
+                        ..Default::default()
+                    },
+                ),
+                entry(
+                    ViewSelector::Wildcard,
+                    ViewAppearanceOverride {
+                        glow_width: Some(4),
+                        background_tint: Some(color("#111213")),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let resolved = config.resolve_view_style(&terminal_target());
+        assert_eq!(resolved.glow_color, Some(color("#0A0B0C")));
+        assert_eq!(resolved.glow_width, 9);
+        assert_eq!(resolved.background_tint, Some(color("#0D0E0F")));
+        assert!((resolved.background_tint_strength - 0.75).abs() < f32::EPSILON);
+        assert_eq!(resolved.fade_unfocused, 0.9);
+
+        let mut reordered = config.clone();
+        reordered.views.reverse();
+        assert_eq!(
+            config.resolve_view_style(&terminal_target()),
+            reordered.resolve_view_style(&terminal_target())
+        );
+    }
+
+    #[test]
+    fn style_resolution_inherits_unset_fields_per_field() {
+        let config = styled_config(
+            StyleConfig {
+                glow_color: Some(color("#010203")),
+                glow_width: Some(3),
+                shadow_color: Some(color("#040506")),
+                shadow_offset_x: Some(-4),
+                fade_unfocused: Some(0.8),
+                ..Default::default()
+            },
+            Some(color("#070809")),
+            Some(0.5),
+            vec![entry(
+                ViewSelector::View(7),
+                ViewAppearanceOverride {
+                    glow_width: Some(6),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = config.resolve_view_style(&terminal_target());
+        assert_eq!(resolved.glow_color, Some(color("#010203")));
+        assert_eq!(resolved.glow_width, 6);
+        assert_eq!(resolved.background_tint, Some(color("#070809")));
+        assert!((resolved.background_tint_strength - 0.5).abs() < f32::EPSILON);
+        assert_eq!(resolved.shadow_color, Some(color("#040506")));
+        assert_eq!(resolved.shadow_offset_x, -4);
+        assert_eq!(resolved.shadow_offset_y, 0);
+        assert!((resolved.fade_unfocused - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn style_resolution_sparse_layers_stay_inert() {
+        let config = styled_config(
+            StyleConfig::default(),
+            None,
+            None,
+            vec![entry(
+                ViewSelector::Content(ViewContent::Terminal),
+                ViewAppearanceOverride {
+                    background_tint_strength: Some(0.5),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = config.resolve_view_style(&terminal_target());
+        assert_eq!(resolved.glow_color, None);
+        assert_eq!(resolved.glow_width, 0);
+        assert_eq!(resolved.background_tint, None);
+        assert!((resolved.background_tint_strength - 0.5).abs() < f32::EPSILON);
+        assert!((resolved.fade_unfocused - 1.0).abs() < f32::EPSILON);
+        let other = ViewAppearanceTarget::new(ViewContent::Rich, 3, 9);
+        assert!(config.resolve_view_style(&other).is_inert());
+    }
+
+    #[test]
+    fn style_resolution_traces_per_view_sources() {
+        let config = styled_config(
+            StyleConfig {
+                glow_width: Some(2),
+                ..Default::default()
+            },
+            None,
+            Some(0.25),
+            vec![
+                entry(
+                    ViewSelector::Wildcard,
+                    ViewAppearanceOverride {
+                        glow_width: Some(4),
+                        ..Default::default()
+                    },
+                ),
+                entry(
+                    ViewSelector::View(7),
+                    ViewAppearanceOverride {
+                        glow_color: Some(color("#0A0B0C")),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let (resolved, sources) = config.resolve_view_style_traced(&terminal_target());
+        assert_eq!(resolved.glow_color, Some(color("#0A0B0C")));
+        assert_eq!(resolved.glow_width, 4);
+        let source_path = |source: &Option<ViewLeafSource>| {
+            source
+                .as_ref()
+                .map(|s| format!("views[{}].{}", s.selector.canonical(), s.leaf))
+        };
+        assert_eq!(
+            source_path(&sources.glow_color).as_deref(),
+            Some("views[view:7].glow_color")
+        );
+        assert_eq!(
+            source_path(&sources.glow_width).as_deref(),
+            Some("views[*].glow_width")
+        );
+        assert!(sources.background_tint.is_none());
+        assert!(sources.background_tint_strength.is_none());
+        assert!((resolved.background_tint_strength - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

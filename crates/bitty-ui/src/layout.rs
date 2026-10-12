@@ -367,6 +367,91 @@ impl LayoutNode {
         }
     }
 
+    /// Bounds of the innermost floating overlay containing leaf `id`, if any.
+    ///
+    /// CTX-1150 (float edge-resize): pure query twin of
+    /// [`Self::move_overlay_containing`]. Returns the desired overlay bounds
+    /// in container-local cells for the layer the leaf actually lives on
+    /// (innermost wins); `None` for tiled leaves and unknown ids. The mouse
+    /// path pairs this with [`crate::drag::detect_resize_edge`] and
+    /// [`crate::drag::resize_floating_rect`] plus
+    /// [`Self::set_overlay_bounds_containing`], so the helpers gain a runtime
+    /// caller without changing solver policy.
+    #[must_use]
+    pub fn overlay_bounds_containing(&self, id: ViewId) -> Option<Rect> {
+        match self {
+            Self::Overlay {
+                base,
+                overlay,
+                bounds,
+                ..
+            } => {
+                if let Some(inner) = overlay.overlay_bounds_containing(id) {
+                    return Some(inner);
+                }
+                if overlay.contains_leaf(id) {
+                    return Some(*bounds);
+                }
+                base.overlay_bounds_containing(id)
+            }
+            Self::Split { first, second, .. } => first
+                .overlay_bounds_containing(id)
+                .or_else(|| second.overlay_bounds_containing(id)),
+            Self::Stack(children) => {
+                for c in children {
+                    if let Some(bounds) = c.overlay_bounds_containing(id) {
+                        return Some(bounds);
+                    }
+                }
+                None
+            }
+            Self::Leaf(_) => None,
+        }
+    }
+
+    /// Replaces the bounds of the innermost floating overlay containing leaf
+    /// `id` with `next`.
+    ///
+    /// CTX-1150 (float edge-resize): mutation twin of
+    /// [`Self::overlay_bounds_containing`], mirroring the innermost-wins
+    /// rule of [`Self::move_overlay_containing`]. The caller computes `next`
+    /// via [`crate::drag::resize_floating_rect`] (clamped to view minima and
+    /// the container), so this stays a bounds install with no solver policy
+    /// change. Returns `true` when an owning overlay was found; `false`
+    /// leaves the tree untouched.
+    pub fn set_overlay_bounds_containing(&mut self, id: ViewId, next: Rect) -> bool {
+        match self {
+            Self::Overlay {
+                base,
+                overlay,
+                bounds,
+                ..
+            } => {
+                if overlay.set_overlay_bounds_containing(id, next) {
+                    return true;
+                }
+                if overlay.contains_leaf(id) {
+                    *bounds = next;
+                    return true;
+                }
+                base.set_overlay_bounds_containing(id, next)
+            }
+            Self::Split { first, second, .. } => {
+                first.set_overlay_bounds_containing(id, next)
+                    || second.set_overlay_bounds_containing(id, next)
+            }
+            Self::Stack(children) => {
+                for c in children {
+                    if c.set_overlay_bounds_containing(id, next) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Self::Leaf(_) => false,
+        }
+    }
+
     /// Whether any leaf in this subtree owns `id`.
     fn contains_leaf(&self, id: ViewId) -> bool {
         match self {

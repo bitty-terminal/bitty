@@ -267,7 +267,8 @@ pub use runtime::{
 pub use bitty_ui::{
     DecoratedView, Decoration, DecorationError, DropSpec, FLOATING_CMD_TOGGLE, FloatStore, Focus,
     FocusDirection, Gaps, LayoutNode, OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE,
-    PresentationMode, PseudoConstraint, PseudoError, ScrollbarMode, SplitAxis, View, ViewId,
+    PresentationMode, PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS, ResizeEdge,
+    ScrollbarMode, SplitAxis, View, ViewId,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

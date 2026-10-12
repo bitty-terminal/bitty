@@ -1199,6 +1199,36 @@ impl Runtime {
         // Stable: same-tier frames keep solver order (the `OverlayTier`
         // same-tier conflict rule). `None < Some`, so base always leads.
         frames.sort_by_key(|frame| frame.tier);
+        // CTX-1150 (issue #1980): pixel-smooth Alt+drag. The solver stays
+        // cell-quantized; the sub-cell remainder is a present-only
+        // translation on the dragged frame. Bounded to one live cell each
+        // way at update time and cleared on release (snap), so a stale
+        // offset can never drift the frame or leak into grid truth. The
+        // translated frame clamps into the container area so a sub-cell
+        // remainder at the clamped cell edge cannot push the ghost
+        // off-screen (the pinned clamp test pins this).
+        if let Some(drag) = self.alt_drag {
+            if drag.pixel_dx != 0 || drag.pixel_dy != 0 {
+                if let Some(frame) = frames.iter_mut().find(|frame| frame.view == drag.leaf) {
+                    let want_x = frame.frame.x.saturating_add(drag.pixel_dx);
+                    let want_y = frame.frame.y.saturating_add(drag.pixel_dy);
+                    let min_x = i32::from(area.x);
+                    let min_y = i32::from(area.y);
+                    let max_x =
+                        (min_x + i32::from(area.width) - frame.frame.width as i32).max(min_x);
+                    let max_y =
+                        (min_y + i32::from(area.height) - frame.frame.height as i32).max(min_y);
+                    let got_x = want_x.clamp(min_x, max_x);
+                    let got_y = want_y.clamp(min_y, max_y);
+                    let fix_x = got_x.saturating_sub(frame.frame.x);
+                    let fix_y = got_y.saturating_sub(frame.frame.y);
+                    frame.frame.x = got_x;
+                    frame.frame.y = got_y;
+                    frame.content.x = frame.content.x.saturating_add(fix_x);
+                    frame.content.y = frame.content.y.saturating_add(fix_y);
+                }
+            }
+        }
         frames
     }
 

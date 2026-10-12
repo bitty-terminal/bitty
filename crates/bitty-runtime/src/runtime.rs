@@ -184,7 +184,9 @@ use self::click::ClickTracker;
 use self::close_confirm::PendingCloseConfirm;
 use self::input::ImeKeyClaim;
 use self::layout_focus::{default_container, default_layout};
-use self::mouse_chrome::{AltDragState, BorderDragState, HoverPending, TiledDragState};
+use self::mouse_chrome::{
+    AltDragState, BorderDragState, FloatResizeState, HoverPending, TiledDragState,
+};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer, ImeCaret};
 use self::scrollbar::ScrollbarDrag;
@@ -799,6 +801,14 @@ pub struct Runtime {
     /// and when the cursor leaves the window. Never starts while Shift, Alt,
     /// or Super is held, and never while a mouse-mode app captures the pointer.
     border_drag: Option<BorderDragState>,
+    /// Active Alt+edge float resize (CTX-1150, issue #1980 follow-up).
+    ///
+    /// Alt+Left-press on a structural float border grabs that edge; motion
+    /// resizes the overlay bounds live (clamped, with grid/PTY follow via
+    /// the layout install). `None` when no resize is active; cleared on
+    /// release. Never starts while Shift is held and never while another
+    /// drag is active.
+    float_resize: Option<FloatResizeState>,
     /// Pending dwell before hover activation moves focus (CTX-0334).
     ///
     /// `Some` only while `mouse.focus_follows_mouse` is enabled with a
@@ -1605,6 +1615,7 @@ impl Runtime {
             alt_drag: None,
             tiled_drag: None,
             border_drag: None,
+            float_resize: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),
@@ -1865,6 +1876,7 @@ impl Runtime {
             alt_drag: None,
             tiled_drag: None,
             border_drag: None,
+            float_resize: None,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),

@@ -12,6 +12,8 @@
 //! Security boundary: allowlist bypass is a sandbox escape. Every predicate
 //! fails closed (deny-by-default, explicit `false`, no silent pass).
 
+use std::collections::VecDeque;
+
 /// The only accepted Layer-2 tool (CTX-0425 v1).
 pub const ACCEPTED_TOOL_GIT: &str = "git";
 
@@ -363,6 +365,226 @@ pub fn is_tool_spawn_allowed(tool: &str, args: &[String]) -> bool {
         return is_allowed_git_args(args);
     }
     false
+}
+
+// ── audit ledger (CTX-1152, issue #1985) ──────────────────────────────────
+
+/// Maximum tool-spawn audit entries retained ([`ToolSpawnLedger`], drop-oldest).
+///
+/// Precedent: [`crate::fs_authz::MAX_FS_AUDIT_ENTRIES`] (`1024`) and
+/// [`crate::secrets::MAX_SECRET_AUDIT_ENTRIES`] (`1024`).
+pub const MAX_TOOL_SPAWN_AUDIT_ENTRIES: usize = 1024;
+
+/// Maximum args named in one audit entry's arg list (the remainder is
+/// counted in [`ToolSpawnEntry::args_omitted`], never silently dropped).
+///
+/// Precedent: [`crate::fs_authz::MAX_FS_AUDIT_ITEMS`] (`8`) and
+/// [`crate::secrets::MAX_SECRET_AUDIT_ITEMS`] (`8`).
+pub const MAX_TOOL_SPAWN_AUDIT_ARGS: usize = 8;
+
+/// Maximum bytes stored per arg preview in one audit entry.
+///
+/// Gate-bounded args already reach [`MAX_GIT_ARG_BYTES`] (`256`) each; the
+/// ledger keeps a shorter preview so one entry cannot bank kilobytes of
+/// caller-chosen text for later read-back (bulk exfiltration via audit).
+/// Truncation is char-boundary safe. Over-bound args still authorize on
+/// their full text — only the recorded preview is shortened.
+pub const MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES: usize = 64;
+
+/// Maximum bytes of the caller identity stored in one audit entry.
+///
+/// Precedent: [`crate::identity::MAX_ONTOLOGY_ID_BYTES`] (`128`, the plugin
+/// and client identity bound). Over-bound callers still authorize — only
+/// the recorded identity is clamped.
+pub const MAX_TOOL_SPAWN_CALLER_BYTES: usize = 128;
+
+/// Allow/deny outcome recorded in the [`ToolSpawnLedger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolSpawnDecision {
+    /// The spawn is allowlisted.
+    Allow,
+    /// The spawn is denied (unknown tool, invalid name, or args outside
+    /// the allowlist).
+    Deny,
+}
+
+impl ToolSpawnDecision {
+    /// Stable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolSpawnDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One tool-spawn audit entry: who asked, what was decided, and why.
+///
+/// Tool name, caller identity, and bounded arg previews only. Environment
+/// is never accepted by this API: secret values travel via env and
+/// `secret://` handles ([`crate::secret_tiers`] discipline), so env must
+/// never enter logs or audit. `secret://` handle references are names,
+/// never values, and record like any other arg. Bounded and
+/// sequence-numbered (no wall-clock), mirroring [`crate::fs_authz::FsAuditLedger`]
+/// and [`crate::secrets::SecretAuditLedger`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpawnEntry {
+    /// Monotonic sequence (no wall-clock).
+    pub seq: u64,
+    /// Caller identity that requested the spawn (clamped to
+    /// [`MAX_TOOL_SPAWN_CALLER_BYTES`]).
+    pub caller: String,
+    /// Tool name as presented (clamped to [`TOOL_NAME_MAX_LEN`]).
+    pub tool: String,
+    /// Outcome.
+    pub decision: ToolSpawnDecision,
+    /// Arg previews involved (capped at [`MAX_TOOL_SPAWN_AUDIT_ARGS`], each
+    /// truncated to [`MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES`]).
+    pub args: Vec<String>,
+    /// Args beyond the per-entry cap (counted, never silently dropped).
+    pub args_omitted: usize,
+    /// Bounded host-authored detail (tool/caller/counts only, never env).
+    pub detail: String,
+}
+
+/// Bounded append-only ledger of tool-spawn authorization decisions.
+///
+/// Drop-oldest when full (accepted v1 default, mirroring the FS and secret
+/// audit ledgers); `dropped` counts evicted entries for `bitty plugin doctor`.
+#[derive(Debug, Clone, Default)]
+pub struct ToolSpawnLedger {
+    entries: VecDeque<ToolSpawnEntry>,
+    dropped: u64,
+    next_seq: u64,
+}
+
+impl ToolSpawnLedger {
+    /// Empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one evaluated spawn decision (exactly one entry per call).
+    ///
+    /// CodeQL models any call to these `push_*` entry points as
+    /// log-tainted on the grounds that the ledger can hold caller bytes;
+    /// the payload is attribution-only by construction (tool name, caller
+    /// identity, and truncated arg previews — env is not a parameter, so
+    /// it cannot enter; see the `tool_ledger_never_records_env` test),
+    /// which is the documented barrier the analyzer cannot see. Treat new
+    /// `push_*` call sites as log-tainted until they carry the same
+    /// attribution-only proof.
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be attribution (tool/args/caller),
+    /// never environment values.
+    pub fn push_decision(&mut self, tool: &str, args: &[String], caller: &str, allowed: bool) {
+        let decision = if allowed {
+            ToolSpawnDecision::Allow
+        } else {
+            ToolSpawnDecision::Deny
+        };
+        self.push(decision, tool, args, caller);
+    }
+
+    /// Bounded append shared by both outcomes.
+    fn push(&mut self, decision: ToolSpawnDecision, tool: &str, args: &[String], caller: &str) {
+        if self.entries.len() >= MAX_TOOL_SPAWN_AUDIT_ENTRIES {
+            self.entries.pop_front();
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let kept: Vec<String> = args
+            .iter()
+            .take(MAX_TOOL_SPAWN_AUDIT_ARGS)
+            .map(|arg| clamp_text(arg, MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES))
+            .collect();
+        let args_omitted = args.len().saturating_sub(kept.len());
+        let tool = clamp_text(tool, TOOL_NAME_MAX_LEN);
+        let caller = clamp_text(caller, MAX_TOOL_SPAWN_CALLER_BYTES);
+        let detail = format!(
+            "tool spawn {decision} '{tool}' by '{caller}' ({} args, {args_omitted} omitted)",
+            kept.len(),
+        );
+        self.entries.push_back(ToolSpawnEntry {
+            seq,
+            caller,
+            tool,
+            decision,
+            args: kept,
+            args_omitted,
+            detail,
+        });
+    }
+
+    /// Retained entries, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &ToolSpawnEntry> + '_ {
+        self.entries.iter()
+    }
+
+    /// Number of retained entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no entry is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Entries evicted by the bound so far.
+    #[must_use]
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+/// Clamp `text` to `limit` bytes on a char boundary.
+///
+/// Over-bound input still authorizes on its full text — only the recorded
+/// copy is shortened, so clamping never widens or narrows the gate.
+fn clamp_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// Authorize one tool spawn and record the outcome exactly once.
+///
+/// This is the spawn decision path for `[tools.*]` attribution (CTX-1152):
+/// it evaluates [`is_tool_spawn_allowed`] once and appends exactly one
+/// ledger entry (allow or deny). Spawn callers must enter here — or via
+/// [`crate::host::PluginHost::authorize_tool_spawn`], which delegates here —
+/// rather than calling [`is_tool_spawn_allowed`] directly, so no decision
+/// escapes attribution. Takes no env: environment values never enter the
+/// ledger ([`crate::secret_tiers`] discipline).
+#[must_use]
+pub fn check_tool_spawn(
+    ledger: &mut ToolSpawnLedger,
+    tool: &str,
+    args: &[String],
+    caller: &str,
+) -> bool {
+    let allowed = is_tool_spawn_allowed(tool, args);
+    ledger.push_decision(tool, args, caller, allowed);
+    allowed
 }
 
 #[cfg(test)]
@@ -1136,5 +1358,173 @@ mod tests {
         ));
         assert!(!is_tool_spawn_allowed("", &["status".to_string()]));
         assert!(!is_tool_spawn_allowed("git", &[]));
+    }
+
+    // ── ToolSpawnLedger (CTX-1152, issue #1985) ──
+
+    fn spawn_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn tool_ledger_records_allow_with_attribution() {
+        let mut ledger = ToolSpawnLedger::new();
+        assert!(ledger.is_empty());
+        let allowed = check_tool_spawn(&mut ledger, "git", &spawn_args(&["status"]), "git-panel");
+        assert!(allowed);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.dropped(), 0);
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert_eq!(entry.seq, 0);
+        assert_eq!(entry.caller, "git-panel");
+        assert_eq!(entry.tool, "git");
+        assert_eq!(entry.decision, ToolSpawnDecision::Allow);
+        assert_eq!(entry.args, spawn_args(&["status"]));
+        assert_eq!(entry.args_omitted, 0);
+    }
+
+    #[test]
+    fn tool_ledger_records_deny_for_unaccepted_tool_and_bad_args() {
+        let mut ledger = ToolSpawnLedger::new();
+        assert!(!check_tool_spawn(
+            &mut ledger,
+            "rg",
+            &spawn_args(&["status"]),
+            "git-panel"
+        ));
+        assert!(!check_tool_spawn(
+            &mut ledger,
+            "git",
+            &spawn_args(&["push", "origin"]),
+            "git-panel"
+        ));
+        assert_eq!(ledger.len(), 2);
+        let entries: Vec<&ToolSpawnEntry> = ledger.iter().collect();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.decision == ToolSpawnDecision::Deny),
+            "allow and deny must both record"
+        );
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(entries[0].tool, "rg");
+        assert_eq!(entries[1].tool, "git");
+    }
+
+    #[test]
+    fn tool_ledger_bound_drops_oldest() {
+        let mut ledger = ToolSpawnLedger::new();
+        for i in 0..MAX_TOOL_SPAWN_AUDIT_ENTRIES + 10 {
+            let verb = if i % 2 == 0 { "status" } else { "push" };
+            let allowed = check_tool_spawn(&mut ledger, "git", &spawn_args(&[verb]), "bound-probe");
+            assert_eq!(allowed, i % 2 == 0);
+        }
+        assert_eq!(ledger.len(), MAX_TOOL_SPAWN_AUDIT_ENTRIES);
+        assert_eq!(ledger.dropped(), 10);
+        let oldest = ledger.iter().next().expect("oldest retained entry");
+        assert_eq!(oldest.seq, 10);
+    }
+
+    #[test]
+    fn tool_ledger_truncates_args_to_documented_bounds() {
+        let mut ledger = ToolSpawnLedger::new();
+        let long = "a".repeat(MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES + 16);
+        let multibyte = "é".repeat(MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES);
+        let mut args = vec!["status".to_string(), long.clone(), multibyte.clone()];
+        for i in 0..MAX_TOOL_SPAWN_AUDIT_ARGS {
+            args.push(format!("--flag{i}"));
+        }
+        assert!(check_tool_spawn(
+            &mut ledger,
+            "git",
+            &args,
+            "truncation-probe"
+        ));
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert_eq!(entry.args.len(), MAX_TOOL_SPAWN_AUDIT_ARGS);
+        assert_eq!(
+            entry.args_omitted,
+            args.len() - MAX_TOOL_SPAWN_AUDIT_ARGS,
+            "remainder must be counted"
+        );
+        for preview in &entry.args {
+            assert!(
+                preview.len() <= MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES,
+                "preview over bound: {preview:?}"
+            );
+        }
+        // Full over-bound arg text must not survive anywhere in the entry.
+        assert!(!entry.args.iter().any(|arg| arg == &long));
+        assert!(!entry.detail.contains(&long));
+        assert!(!entry.detail.contains(&multibyte));
+    }
+
+    #[test]
+    fn tool_ledger_never_records_env() {
+        // secret_tiers discipline: secret values travel via env and
+        // `secret://` handles, so env must never enter the ledger. The
+        // decision API takes no env; this test pins that a secret-shaped
+        // value live at the call site cannot leak into entries.
+        let mut ledger = ToolSpawnLedger::new();
+        let env = [(
+            "GIT_TOKEN".to_string(),
+            "sk-live-ENVSECRETMARKER-never-in-ledger-0001".to_string(),
+        )];
+        assert_eq!(env.len(), 1, "env is live at the call site");
+        assert!(check_tool_spawn(
+            &mut ledger,
+            "git",
+            &spawn_args(&["status"]),
+            "env-probe"
+        ));
+        let secret = &env[0].1;
+        let dump = format!("{ledger:?}");
+        assert!(
+            !dump.contains(secret.as_str()),
+            "env value leaked into ledger debug"
+        );
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert!(!entry.detail.contains(secret.as_str()));
+        assert!(!entry.args.iter().any(|arg| arg.contains(secret.as_str())));
+    }
+
+    #[test]
+    fn tool_ledger_records_handle_refs_as_names_only() {
+        // `secret://` handles are names, never values (scrubber
+        // discipline): recording the reference is names-only audit,
+        // consistent with the secret ledgers.
+        assert!(crate::secrets::SecretHandle::is_handle_ref(
+            "secret://api-key"
+        ));
+        let mut ledger = ToolSpawnLedger::new();
+        assert!(check_tool_spawn(
+            &mut ledger,
+            "git",
+            &spawn_args(&["show", "secret://api-key"]),
+            "handle-probe",
+        ));
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert!(entry.args.iter().any(|arg| arg == "secret://api-key"));
+    }
+
+    #[test]
+    fn tool_ledger_clamps_caller_and_tool_identities() {
+        let mut ledger = ToolSpawnLedger::new();
+        let long_caller = "c".repeat(MAX_TOOL_SPAWN_CALLER_BYTES + 8);
+        let long_tool = "t".repeat(TOOL_NAME_MAX_LEN + 8);
+        assert!(!check_tool_spawn(
+            &mut ledger,
+            &long_tool,
+            &spawn_args(&["status"]),
+            &long_caller
+        ));
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert_eq!(entry.decision, ToolSpawnDecision::Deny);
+        assert!(
+            entry.caller.len() <= MAX_TOOL_SPAWN_CALLER_BYTES,
+            "caller over bound"
+        );
+        assert!(entry.tool.len() <= TOOL_NAME_MAX_LEN, "tool over bound");
     }
 }

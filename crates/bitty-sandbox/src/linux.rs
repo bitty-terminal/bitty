@@ -221,7 +221,7 @@ pub(crate) fn elf_interp(path: &Path) -> Option<std::path::PathBuf> {
         return None;
     }
     let (phoff, phentsize, phnum) = if is_64 {
-        let phoff = u64::from_le_bytes(ident[32..40].try_into().ok()?) as u64;
+        let phoff = u64::from_le_bytes(ident[32..40].try_into().ok()?);
         let phentsize = u16::from_le_bytes(ident[54..56].try_into().ok()?) as usize;
         let phnum = u16::from_le_bytes(ident[56..58].try_into().ok()?) as usize;
         if phentsize != 56 {

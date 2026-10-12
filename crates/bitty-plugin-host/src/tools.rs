@@ -568,13 +568,16 @@ fn clamp_text(text: &str, limit: usize) -> String {
 
 /// Authorize one tool spawn and record the outcome exactly once.
 ///
-/// This is the spawn decision path for `[tools.*]` attribution (CTX-1152):
+/// This is the attributed spawn decision path for `[tools.*]` (CTX-1152):
 /// it evaluates [`is_tool_spawn_allowed`] once and appends exactly one
-/// ledger entry (allow or deny). Spawn callers must enter here — or via
-/// [`crate::host::PluginHost::authorize_tool_spawn`], which delegates here —
-/// rather than calling [`is_tool_spawn_allowed`] directly, so no decision
-/// escapes attribution. Takes no env: environment values never enter the
-/// ledger ([`crate::secret_tiers`] discipline).
+/// ledger entry (allow or deny). Attributed spawn callers must enter here —
+/// or via [`crate::host::PluginHost::authorize_tool_spawn`], which delegates
+/// here — rather than calling [`is_tool_spawn_allowed`] directly, so no
+/// attributed decision escapes the ledger. Live runtime dispatch via
+/// `HostToolsAuthorizer` enforces the same predicates but bypasses this
+/// ledger; wiring it into this path is sequel work. Takes no env:
+/// environment values never enter the ledger ([`crate::secret_tiers`]
+/// discipline).
 #[must_use]
 pub fn check_tool_spawn(
     ledger: &mut ToolSpawnLedger,

@@ -805,9 +805,12 @@ impl PluginHost {
     /// Tool-spawn audit ledger (caller/tool/bounded arg previews only;
     /// env never recorded).
     ///
-    /// Existing inspect surface for the CTX-1152 ledger, mirroring
-    /// [`Self::fs_audit`]: attribution for every `[tools.*]` spawn
-    /// decision, inspectable without a new CLI surface.
+    /// Attributed inspect surface for the CTX-1152 ledger, mirroring
+    /// [`Self::fs_audit`]: attribution for `[tools.*]` spawn decisions
+    /// that enter via [`Self::authorize_tool_spawn`], inspectable without
+    /// a new CLI surface. Live runtime dispatch via `HostToolsAuthorizer`
+    /// enforces the same predicates but bypasses this ledger; wiring it
+    /// into the attributed path is sequel work.
     #[must_use]
     pub fn tool_audit(&self) -> &crate::tools::ToolSpawnLedger {
         &self.tool_audit
@@ -936,13 +939,16 @@ impl PluginHost {
 
     /// Authorize one tool spawn through the `[tools.*]` gate with attribution.
     ///
-    /// Single wired decision path (CTX-1152, issue #1985): evaluates
+    /// Attributed decision path (CTX-1152, issue #1985): evaluates
     /// [`crate::tools::is_tool_spawn_allowed`] via
     /// [`crate::tools::check_tool_spawn`] and records exactly one ledger
     /// entry (allow or deny) per call, inspectable via [`Self::tool_audit`].
-    /// Spawn surfaces must enter here rather than calling the predicate
-    /// directly so no decision escapes attribution. Env is never consulted
-    /// and never recorded ([`crate::secret_tiers`] discipline).
+    /// Attributed spawn surfaces must enter here rather than calling the
+    /// predicate directly so no attributed decision escapes the ledger.
+    /// Live runtime dispatch via `HostToolsAuthorizer` enforces the same
+    /// predicates but bypasses this ledger; wiring it into this path is
+    /// sequel work. Env is never consulted and never recorded
+    /// ([`crate::secret_tiers`] discipline).
     pub fn authorize_tool_spawn(&mut self, tool: &str, args: &[String], caller: &str) -> bool {
         crate::tools::check_tool_spawn(&mut self.tool_audit, tool, args, caller)
     }

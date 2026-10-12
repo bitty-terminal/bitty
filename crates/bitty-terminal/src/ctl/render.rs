@@ -118,12 +118,11 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
     let env_instance = std::env::var("BITTY_INSTANCE_ID").ok();
     let env_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     #[cfg(unix)]
-    let uid = {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or(0)
-    };
+    // Portable uid: `/proc/self` metadata is Linux-only (absent on macOS,
+    // where it fell back to 0 and failed endpoint verification against a
+    // user-owned socket dir). `current_unix_uid` is per-platform
+    // (rustix on Linux, nix elsewhere).
+    let uid = bitty_ipc::current_unix_uid().unwrap_or(0);
     #[cfg(not(unix))]
     let uid = 0u32;
     let target = match resolve_ctl_target(
@@ -241,12 +240,11 @@ fn render_outcome(
 fn execute_instance_list(targeting: &CtlTargeting) -> i32 {
     let env_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     #[cfg(unix)]
-    let uid = {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or(0)
-    };
+    // Portable uid: `/proc/self` metadata is Linux-only (absent on macOS,
+    // where it fell back to 0 and failed endpoint verification against a
+    // user-owned socket dir). `current_unix_uid` is per-platform
+    // (rustix on Linux, nix elsewhere).
+    let uid = bitty_ipc::current_unix_uid().unwrap_or(0);
     #[cfg(not(unix))]
     let uid = 0u32;
     // Explicit --socket/--instance with `instance list` still lists all

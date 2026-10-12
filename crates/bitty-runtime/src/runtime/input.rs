@@ -1072,6 +1072,29 @@ impl Runtime {
             {
                 return;
             }
+            // Issue #1979 (CTX-1149): a Mod+Left press that starts a tiled
+            // move owns the gesture even when the focused app tracks the
+            // mouse. Without this the press reported to the app and no drag
+            // ever started, so Mod+drag was dead headed wherever a
+            // mouse-tracking app held focus (and the release arm above could
+            // never fire for a drag that never started). The probe fails
+            // soft on floats, single-leaf trees, and gap bands, so those
+            // presses still reach the app exactly as before; only a press
+            // that actually grabs is consumed. Scrollbar chrome keeps its
+            // non-capture precedence (CTX-0181 sits above the drag grabs
+            // there too), and the Alt+drag float path stays untouched for
+            // CTX-1150: an Alt+press on a float still falls through to the
+            // app here.
+            if event.button == MouseButton::Left
+                && event.state == PressState::Pressed
+                && (self.alt_pressed || self.super_pressed)
+                && self
+                    .last_cursor
+                    .is_some_and(|pos| !self.scrollbar_hit_at(pos))
+                && self.begin_tiled_drag_at(now)
+            {
+                return;
+            }
             if let Some(pos) = self.last_cursor {
                 // CTX-0804 (#1477): pane-local cell of the focused pane that
                 // receives the report, never the primary-global mapping.
@@ -1348,8 +1371,10 @@ impl Runtime {
         }
         // Issue #1694 (CTX-0966): an active Mod tiled-drag consumes motion
         // (it tracks the advisory preview target live; the tree is
-        // untouched until release commits).
-        if self.update_tiled_drag(pos) {
+        // untouched until release commits). CTX-0967: the virtual clock
+        // flows through so the armed drag transition shares the tick's
+        // time base (issue #1979, CTX-1149).
+        if self.update_tiled_drag_at(pos, now) {
             self.clear_hover_pending();
             return;
         }

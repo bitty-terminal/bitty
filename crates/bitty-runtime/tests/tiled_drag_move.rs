@@ -62,6 +62,36 @@ fn two_pane() -> LayoutNode {
     )
 }
 
+fn three_pane() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        ),
+    )
+}
+
+/// True painted position at fractional offsets inside the painted hit frame,
+/// derived from public geometry only (no hard-coded pixel, padding, or
+/// decoration constants): the headed-faithful probe shape (issue #1979).
+fn frame_point(rt: &Runtime, view: ViewId, fx: f64, fy: f64) -> CursorPosition {
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == view)
+        .unwrap_or_else(|| panic!("{view:?} must be presented"));
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.frame.x) + f64::from(frame.frame.width) * fx,
+        y: pad + f64::from(frame.frame.y) + f64::from(frame.frame.height) * fy,
+    }
+}
+
 #[test]
 fn mod_press_grabs_tiled_without_selection_and_focuses_dragged() {
     let mut rt = make_runtime();
@@ -433,6 +463,148 @@ fn cursor_left_cancel_clears_preview_and_repaints() {
         "cancel must repaint so the ghost outline and highlight clear"
     );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+// -- Issue #1979 (CTX-1149) headed-breakage regressions --------------------
+
+#[test]
+fn gaps_out_grab_hits_painted_leaf_not_shifted_neighbour() {
+    // The grab hit-test subtracted the outer gap a second time, so with
+    // nonzero gaps_out a Mod+press on the first gaps_out cells of a pane
+    // grabbed the neighbour while motion preview and release aimed at the
+    // painted leaf. Grab, preview, and drop must agree on the painted leaf
+    // at every position, probed through painted geometry (no hard-coded
+    // pixels).
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 0,
+        gaps_out: 2,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped runtime must build");
+    rt.set_layout(two_pane());
+    for fx in [0.02, 0.05, 0.1, 0.25, 0.5, 0.9] {
+        let pos = frame_point(&rt, ViewId::new(2), fx, 0.5);
+        rt.handle_cursor_moved(pos);
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+        rt.handle_mouse_input(press(MouseButton::Left));
+        assert_eq!(
+            rt.tiled_drag_source(),
+            Some(ViewId::new(2)),
+            "painted position fx {fx} must grab the painted leaf"
+        );
+        rt.handle_cursor_moved(pos);
+        assert_eq!(
+            rt.tiled_drag_preview(),
+            Some(ViewId::new(2)),
+            "preview must agree with the grab at fx {fx}"
+        );
+        rt.handle_mouse_input(release(MouseButton::Left));
+        assert!(!rt.tiled_drag_active());
+        assert!(!rt.has_selection());
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    }
+}
+
+#[test]
+fn mod_press_under_capture_starts_tiled_drag() {
+    // With a mouse-tracking app focused, the capture path reported the
+    // Mod+Left press to the app and no tiled drag ever started headed. The
+    // grab probe now runs before the report: a press that grabs is
+    // consumed, the app sees nothing of the gesture, and the release
+    // commits the drop instead of stranding it.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_pty_bytes(b"primary text");
+    rt.handle_pty_bytes(b"\x1b[?1000h");
+    rt.drain_pending_input();
+    assert!(rt.mouse_capture_active(), "tracking must be active");
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active(), "Mod+press must grab under capture");
+    assert_eq!(rt.tiled_drag_source(), Some(ViewId::new(1)));
+    assert!(
+        rt.pending_input().is_empty(),
+        "grabbing press must not report to the app"
+    );
+    rt.handle_cursor_moved(cell_pixels(70, 12));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert!(
+        rt.pending_input().is_empty(),
+        "release must commit, not report (the app never saw the press)"
+    );
+    assert!(!rt.has_selection());
+    let ratio = rt.layout().split_ratio_at(&[]).expect("root split");
+    assert!(
+        (ratio - 0.75).abs() < 1e-6,
+        "drop must commit position-based sizing, got {ratio}"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn super_press_over_pinned_cover_grabs_no_hidden_tile() {
+    // Store-based floats are invisible to the allocation hit-test, so a
+    // Super+press over a pinned cover grabbed the tiled base beneath it
+    // (the Alt path was already safe: its present-based grab consumes the
+    // press first). The cover owns the press: no tiled grab starts and the
+    // release touches nothing.
+    let mut rt = make_runtime();
+    rt.set_layout(three_pane());
+    rt.pin_floating(ViewId::new(3)).expect("pin must apply");
+    let before = rt.layout().clone();
+    let pos = frame_point(&rt, ViewId::new(3), 0.5, 0.5);
+    rt.handle_cursor_moved(pos);
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        !rt.tiled_drag_active(),
+        "press over a pinned cover must not grab the tile beneath"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(*rt.layout(), before, "release must touch nothing");
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Released));
+}
+
+#[test]
+fn press_over_detached_float_grabs_no_hidden_tile() {
+    // Detach-model twin of the pin cover test: a workspace-detached float
+    // (CTX-1147) is composited over the tiling but absent from it. Alt+press
+    // stays on the float path (Alt+drag owns it) and Super+press must not
+    // grab the tile beneath either.
+    let mut rt = make_runtime();
+    rt.set_layout(three_pane());
+    rt.float_detach(ViewId::new(3)).expect("detach must apply");
+    let before = rt.layout().clone();
+    let pos = frame_point(&rt, ViewId::new(3), 0.5, 0.5);
+    // Alt+press: the float path owns the gesture, never the tiled drag.
+    rt.handle_cursor_moved(pos);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        !rt.tiled_drag_active(),
+        "Alt+press on a float is not a tiled grab"
+    );
+    assert!(
+        rt.alt_drag_active(),
+        "Alt+press on a float stays on the float path"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    // Super+press: no float grab exists for Super, and the hidden tile is
+    // covered — nothing grabs.
+    rt.handle_cursor_moved(pos);
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        !rt.tiled_drag_active(),
+        "Super+press over a detached cover must not grab the tile beneath"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(*rt.layout(), before, "release must touch nothing");
+    rt.handle_key_event(named_key(NamedKey::Super, PressState::Released));
 }
 
 // -- Issue #1710 (CTX-0995) tiled-drag follow-ups -------------------------

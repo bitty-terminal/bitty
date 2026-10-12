@@ -1765,12 +1765,17 @@ impl Runtime {
     /// (CTX-0177).
     ///
     /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
-    /// is leaf-aware: the window padding inset (CTX-0223) and the outer gap
-    /// are subtracted in live pixels, the remainder is divided by the live
-    /// cell metrics (0157 math), the topmost containing gapped allocation is
+    /// is leaf-aware: only the window padding inset (CTX-0223) is subtracted
+    /// in live pixels, the remainder is divided by the live cell metrics
+    /// (0157 math), the topmost containing gapped allocation is
     /// resolved in paint order (a visible float wins over the base leaf it
     /// covers, matching [`Self::cursor_to_present_cell`]), and the leaf
     /// origin is subtracted for the local cell.
+    /// The outer gap is deliberately NOT subtracted here: allocations from
+    /// [`Self::layout_allocations`] already exclude it via `layout_with_gaps`
+    /// (issue #1979, CTX-1149: subtracting it shifted the grab by `gaps_out`
+    /// cells against the same allocations the move/drop path hit-tests
+    /// without the shift, so a Mod+press landed on the neighbour pane).
     /// Positions over the padding band, a gap band (inner or outer), or
     /// outside all leaves yield `None`.
     ///
@@ -1786,8 +1791,8 @@ impl Runtime {
             return None;
         }
         let pad_px = f64::from(self.window_padding_physical());
-        let x = pos.x - pad_px - f64::from(self.config.gaps_out) * cell_w;
-        let y = pos.y - pad_px - f64::from(self.config.gaps_out) * cell_h;
+        let x = pos.x - pad_px;
+        let y = pos.y - pad_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }

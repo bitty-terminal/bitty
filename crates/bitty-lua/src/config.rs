@@ -126,13 +126,23 @@ pub const MAX_CONFIG_FONT_FEATURE_ENTRIES: usize = 32;
 /// downstream in `bitty-config`).
 pub const MAX_CONFIG_FONT_FEATURE_BYTES: usize = 16;
 
+/// Fields rejected until their owning follow-up accepts them (DEC-0111
+/// section 1; CTX-1160 S1).
+///
+/// `shadow_blur` is RESERVED: a blurred shadow needs renderer work (blur
+/// pass or multi-tap halo), so the key rejects fail-closed until a
+/// follow-up RFC defines the blur contract and budget. `ring_alpha` was
+/// never added (the alpha channel already in `#RRGGBBAA` covers it) and
+/// rejects as an undeclared field, not as reserved.
+const STYLE_RESERVED_FIELDS: &[&str] = &["shadow_blur"];
+
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
 ///
 /// CTX-1159 S0 adds the per-View style quartet (`glow_color`,
 /// `glow_width`, `background_tint`, `background_tint_strength`).
 /// `shadow_*` and `fade_unfocused` stay global-only: they are absent here
-/// and reject inside `views.*` like `background_image_roots` does. S1 owns
-/// the extended extractor tests for these leaves.
+/// and reject inside `views.*` like `background_image_roots` does
+/// (CTX-1160 S1 pins the extractor matrix).
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
     "border_color_focused",
@@ -530,8 +540,8 @@ pub struct ColorsData {
 /// widths/offsets are plain integers (floats rejected like every other
 /// px key), and the fade factor is a raw number. Bounds and grammar are
 /// enforced fail-closed downstream in `bitty-config`. `shadow_blur` is
-/// RESERVED (rejected by the closed set) and `ring_alpha` was never added.
-/// S1 owns the extended extractor tests for this table.
+/// RESERVED (rejected with a reserved diagnostic, CTX-1160 S1) and
+/// `ring_alpha` was never added (rejected as undeclared).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StyleData {
     /// Glow halo color hex string when the key is set.
@@ -622,8 +632,8 @@ pub struct ConfigData {
     pub appearance_colors: Option<ColorsData>,
     /// `appearance.animations` table (RFC-0002, CTX-0341).
     pub animations: Option<AnimationsData>,
-    /// `appearance.style` table (CTX-1159 S0 closed chrome-style table).
-    /// S1 owns the extended extractor tests for this table.
+    /// `appearance.style` table (CTX-1159 S0 closed chrome-style table,
+    /// CTX-1160 S1 reserved diagnostics + extractor matrix).
     pub appearance_style: Option<StyleData>,
     /// `font` table.
     pub font: Option<FontData>,
@@ -1372,14 +1382,27 @@ impl ConfigData {
                         }
                         out.animations = Some(data);
                     }
-                    // CTX-1159 S0: `appearance.style` is a closed table of
-                    // typed leaves; strings/integers/numbers only (never
-                    // coerced). `shadow_blur` is RESERVED and rejects here
-                    // via the closed set; bounds/grammar validation is
-                    // fail-closed in `bitty-config`. S1 owns the extended
-                    // extractor tests for this table.
+                    // CTX-1160 S1 (DEC-0111 section 1): `appearance.style`
+                    // is a closed table of typed leaves;
+                    // strings/integers/numbers only (never coerced).
+                    // `shadow_blur` is RESERVED and rejects with a reserved
+                    // diagnostic (not the generic undeclared spelling) so a
+                    // future blur RFC is distinguishable from a typo;
+                    // `ring_alpha` was never added and rejects as undeclared.
+                    // Bounds/grammar validation is fail-closed in
+                    // `bitty-config`.
                     if let Some(style) = get_field(nested, "style") {
                         let style_table = expect_table("appearance.style", style)?;
+                        if let Some(reserved) = style_table
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .find(|k| STYLE_RESERVED_FIELDS.contains(k))
+                        {
+                            return Err(format!(
+                                "appearance.style.{reserved}: reserved field (blurred shadows need \
+                                 a follow-up blur-contract RFC)"
+                            ));
+                        }
                         check_nested_keys(
                             "appearance.style",
                             style_table,
@@ -1889,7 +1912,7 @@ impl ConfigData {
                     // CTX-1159 S0: the tint pair is plain string/number
                     // data here; the canonical color grammar and the
                     // finite `[0.0, 1.0]` bound are enforced fail-closed in
-                    // `bitty-config`. S1 owns the extended extractor tests.
+                    // `bitty-config` (CTX-1160 S1 pins the matrix).
                     let background_tint = match get_field(nested, "background_tint") {
                         Some(v) => Some(expect_string("decoration.background_tint", v)?),
                         None => None,
@@ -2019,8 +2042,8 @@ impl ConfigData {
                                 // CTX-1159 S0: the per-View style quartet
                                 // extracts as raw scalars; bounds/grammar
                                 // stay fail-closed downstream in
-                                // `bitty-config`. S1 owns the extended
-                                // extractor tests for these leaves.
+                                // `bitty-config` (CTX-1160 S1 pins the
+                                // matrix).
                                 "glow_color" => {
                                     data.glow_color = Some(expect_string(&path, value)?);
                                 }
@@ -3185,6 +3208,345 @@ mod tests {
         let data = eval_ok(r#"return { views = { ["ws:16"] = { border_width = 2 } } }"#);
         let views = data.views.expect("views table");
         assert_eq!(views[0].selector, "ws:16");
+    }
+
+    #[test]
+    fn style_extract_and_absent_means_no_override() {
+        // CTX-1160 S1 (DEC-0111 section 1): the full closed `appearance.style`
+        // table extracts as raw scalars; an absent table/leaf is `None` so
+        // merge keeps the lower-precedence value. Colors stay raw strings
+        // (grammar is downstream's job); widths/offsets stay integers;
+        // the fade factor accepts integers and floats alike.
+        let data = eval_ok(
+            r##"return { appearance = { style = {
+                glow_color = "#FF0000", glow_width = 8,
+                shadow_color = "#00000080",
+                shadow_offset_x = -8, shadow_offset_y = 8,
+                fade_unfocused = 0.5 } } }"##,
+        );
+        let style = data.appearance_style.expect("style table");
+        assert_eq!(style.glow_color.as_deref(), Some("#FF0000"));
+        assert_eq!(style.glow_width, Some(8));
+        assert_eq!(style.shadow_color.as_deref(), Some("#00000080"));
+        assert_eq!(style.shadow_offset_x, Some(-8));
+        assert_eq!(style.shadow_offset_y, Some(8));
+        assert!((style.fade_unfocused.unwrap() - 0.5).abs() < f64::EPSILON);
+        // A partial table leaves the other leaves absent.
+        let data = eval_ok(
+            r##"return { appearance = { style = { glow_width = 0, fade_unfocused = 1 } } }"##,
+        );
+        let style = data.appearance_style.expect("style table");
+        assert_eq!(style.glow_width, Some(0));
+        assert!((style.fade_unfocused.unwrap() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(style.glow_color, None);
+        assert_eq!(style.shadow_color, None);
+        assert_eq!(style.shadow_offset_x, None);
+        assert_eq!(style.shadow_offset_y, None);
+        // Absent table is `None` (this layer says nothing).
+        let data = eval_ok(r#"return { appearance = { theme = "dark" } }"#);
+        assert_eq!(data.appearance_style, None);
+        let data = eval_ok(r#"return { appearance = {} }"#);
+        assert_eq!(data.appearance_style, None);
+        let data = eval_ok(r#"return { theme = "dark" }"#);
+        assert_eq!(data.appearance_style, None);
+        // An empty table is present-but-empty (consistent with
+        // `decoration = {}`): every leaf absent, never a shape error.
+        let data = eval_ok(r#"return { appearance = { style = {} } }"#);
+        assert_eq!(data.appearance_style, Some(StyleData::default()));
+        assert!(data.appearance_style.expect("present").glow_width.is_none());
+    }
+
+    #[test]
+    fn style_wrong_types_fail_closed_with_named_paths() {
+        // CTX-1160 S1: every leaf names its own path on a type violation;
+        // values are never coerced and never echoed.
+        let cases = [
+            (
+                r#"return { appearance = { style = { glow_color = 0x112233 } } }"#,
+                "appearance.style.glow_color",
+            ),
+            (
+                r#"return { appearance = { style = { glow_color = true } } }"#,
+                "appearance.style.glow_color",
+            ),
+            (
+                r#"return { appearance = { style = { glow_color = {} } } }"#,
+                "appearance.style.glow_color",
+            ),
+            (
+                r#"return { appearance = { style = { glow_width = 8.0 } } }"#,
+                "appearance.style.glow_width",
+            ),
+            (
+                r#"return { appearance = { style = { glow_width = "8" } } }"#,
+                "appearance.style.glow_width",
+            ),
+            (
+                r#"return { appearance = { style = { glow_width = true } } }"#,
+                "appearance.style.glow_width",
+            ),
+            (
+                r#"return { appearance = { style = { shadow_color = 42 } } }"#,
+                "appearance.style.shadow_color",
+            ),
+            (
+                r#"return { appearance = { style = { shadow_offset_x = 1.5 } } }"#,
+                "appearance.style.shadow_offset_x",
+            ),
+            (
+                r#"return { appearance = { style = { shadow_offset_x = "0" } } }"#,
+                "appearance.style.shadow_offset_x",
+            ),
+            (
+                r#"return { appearance = { style = { shadow_offset_y = false } } }"#,
+                "appearance.style.shadow_offset_y",
+            ),
+            (
+                r#"return { appearance = { style = { fade_unfocused = "0.5" } } }"#,
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                r#"return { appearance = { style = { fade_unfocused = true } } }"#,
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                r#"return { appearance = { style = { fade_unfocused = {} } } }"#,
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                r#"return { appearance = { style = "glow" } }"#,
+                "appearance.style",
+            ),
+            (
+                r#"return { appearance = { style = { bogus_leaf = 1 } } }"#,
+                "appearance.style.bogus_leaf",
+            ),
+        ];
+        for (code, path) in cases {
+            let err = eval_err(code);
+            assert!(err.contains(path), "{code:?}: {err} must name {path}");
+        }
+    }
+
+    #[test]
+    fn style_reserved_and_never_added_reject_with_named_paths() {
+        // CTX-1160 S1 (DEC-0111 section 1): `shadow_blur` is RESERVED and
+        // rejects with a reserved diagnostic (distinguishable from a typo);
+        // `ring_alpha` was never added and rejects as undeclared. Both name
+        // the offending key path.
+        let err = eval_err(r#"return { appearance = { style = { shadow_blur = 2 } } }"#);
+        assert!(err.contains("appearance.style.shadow_blur"), "{err}");
+        assert!(err.contains("reserved"), "{err}");
+        let err = eval_err(r#"return { appearance = { style = { ring_alpha = 0.5 } } }"#);
+        assert!(err.contains("appearance.style.ring_alpha"), "{err}");
+        assert!(err.contains("undeclared"), "{err}");
+    }
+
+    #[test]
+    fn style_float_leaves_pass_non_finite_through_to_downstream() {
+        // CTX-1160 S1: the extractor keeps raw numbers verbatim — NaN/Inf
+        // are NOT clamped, coerced, or rejected here. The finite
+        // `[0.0, 1.0]` bound is enforced fail-closed downstream in
+        // `bitty-config` (pre-cast `f64` check), where the key path is
+        // named again.
+        for code in [
+            r#"return { appearance = { style = { fade_unfocused = 0/0 } } }"#,
+            r#"return { appearance = { style = { fade_unfocused = 1/0 } } }"#,
+            r#"return { appearance = { style = { fade_unfocused = -1/0 } } }"#,
+            r#"return { appearance = { style = { fade_unfocused = math.huge } } }"#,
+            r#"return { decoration = { background_tint_strength = 0/0 } }"#,
+            r#"return { decoration = { background_tint_strength = math.huge } }"#,
+        ] {
+            let data = eval_ok(code);
+            let raw = if code.contains("decoration") {
+                data.decoration
+                    .expect("decoration table")
+                    .background_tint_strength
+                    .expect("strength present")
+            } else {
+                data.appearance_style
+                    .expect("style table")
+                    .fade_unfocused
+                    .expect("fade present")
+            };
+            assert!(
+                !raw.is_finite(),
+                "{code:?}: extractor must pass through {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn style_string_leaves_keep_host_cap_and_raw_bytes() {
+        // CTX-1160 S1: color spellings are bounded by the generic host cap
+        // (2048 bytes) at extraction; NUL bytes pass through verbatim (no
+        // silent truncation) and reject downstream on grammar. Grammar
+        // itself is never checked here.
+        let ok = format!(
+            "return {{ appearance = {{ style = {{ glow_color = \"{}\" }} }} }}",
+            "x".repeat(MAX_CONFIG_STRING_BYTES)
+        );
+        let data = eval_ok(&ok);
+        assert_eq!(
+            data.appearance_style
+                .expect("style table")
+                .glow_color
+                .as_deref()
+                .map(str::len),
+            Some(MAX_CONFIG_STRING_BYTES)
+        );
+        let over = format!(
+            "return {{ appearance = {{ style = {{ glow_color = \"{}\" }} }} }}",
+            "x".repeat(MAX_CONFIG_STRING_BYTES + 1)
+        );
+        let err = eval_err(&over);
+        assert!(err.contains("appearance.style.glow_color"), "{err}");
+        // NUL survives extraction intact (downstream grammar rejects it).
+        let data =
+            eval_ok(r##"return { appearance = { style = { glow_color = "#FF\000000" } } }"##);
+        let color = data
+            .appearance_style
+            .expect("style table")
+            .glow_color
+            .expect("color present");
+        assert!(color.contains('\0'), "NUL must survive extraction verbatim");
+    }
+
+    #[test]
+    fn decoration_tint_extract_and_absent_means_no_override() {
+        // CTX-1160 S1 (DEC-0111 section 1): the tint pair extracts as a raw
+        // string/number; absent keys are `None` so merge inherits. The
+        // canonical color grammar and the finite `[0.0, 1.0]` bound stay
+        // fail-closed downstream in `bitty-config`.
+        let data = eval_ok(
+            r##"return { decoration = { background_tint = "#11223344", background_tint_strength = 0.75 } }"##,
+        );
+        let dec = data.decoration.expect("decoration table");
+        assert_eq!(dec.background_tint.as_deref(), Some("#11223344"));
+        assert!((dec.background_tint_strength.unwrap() - 0.75).abs() < f64::EPSILON);
+        // An integer strength is a number too (numbers accept ints).
+        let data = eval_ok(r#"return { decoration = { background_tint_strength = 1 } }"#);
+        let dec = data.decoration.expect("decoration table");
+        assert!((dec.background_tint_strength.unwrap() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(dec.background_tint, None);
+        let data = eval_ok(r#"return { decoration = { gaps_in = 6 } }"#);
+        let dec = data.decoration.expect("decoration table");
+        assert_eq!(dec.background_tint, None);
+        assert_eq!(dec.background_tint_strength, None);
+    }
+
+    #[test]
+    fn decoration_tint_wrong_types_fail_closed_with_named_paths() {
+        // CTX-1160 S1: wrong scalar types fail closed naming the leaf;
+        // values are never coerced and never echoed.
+        let cases = [
+            (
+                r#"return { decoration = { background_tint = 0x112233 } }"#,
+                "decoration.background_tint",
+            ),
+            (
+                r#"return { decoration = { background_tint = true } }"#,
+                "decoration.background_tint",
+            ),
+            (
+                r#"return { decoration = { background_tint_strength = "0.5" } }"#,
+                "decoration.background_tint_strength",
+            ),
+            (
+                r#"return { decoration = { background_tint_strength = true } }"#,
+                "decoration.background_tint_strength",
+            ),
+            (
+                r#"return { decoration = { background_tint_strength = {} } }"#,
+                "decoration.background_tint_strength",
+            ),
+        ];
+        for (code, path) in cases {
+            let err = eval_err(code);
+            assert!(err.contains(path), "{code:?}: {err} must name {path}");
+        }
+    }
+
+    #[test]
+    fn views_style_quartet_extract_and_absent_means_no_override() {
+        // CTX-1160 S1 (DEC-0111 section 1): the four per-View style leaves
+        // extract as raw scalars per selector; absent keys are `None` so
+        // merge inherits the resolved global value.
+        let data = eval_ok(
+            r##"return { views = { ["*"] = {
+                glow_color = "#00FF00", glow_width = 4,
+                background_tint = "#000000",
+                background_tint_strength = 0.25 } } }"##,
+        );
+        let views = data.views.expect("views table");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].glow_color.as_deref(), Some("#00FF00"));
+        assert_eq!(views[0].glow_width, Some(4));
+        assert_eq!(views[0].background_tint.as_deref(), Some("#000000"));
+        assert!(
+            (views[0].background_tint_strength.unwrap() - 0.25).abs() < f64::EPSILON,
+            "strength extracts"
+        );
+        // A partial entry leaves the other quartet leaves absent.
+        let data = eval_ok(r#"return { views = { terminal = { glow_width = 2 } } }"#);
+        let views = data.views.expect("views table");
+        assert_eq!(views[0].glow_width, Some(2));
+        assert_eq!(views[0].glow_color, None);
+        assert_eq!(views[0].background_tint, None);
+        assert_eq!(views[0].background_tint_strength, None);
+    }
+
+    #[test]
+    fn views_style_wrong_types_and_global_only_fail_closed() {
+        // CTX-1160 S1: quartet type violations name the selector-qualified
+        // path; `shadow_*`/`fade_unfocused` are global-only and reject
+        // inside `views.*` like `background_image_roots` does.
+        let cases = [
+            (
+                r#"return { views = { ["*"] = { glow_color = 42 } } }"#,
+                "views[*].glow_color",
+            ),
+            (
+                r#"return { views = { ["*"] = { glow_width = 4.5 } } }"#,
+                "views[*].glow_width",
+            ),
+            (
+                r#"return { views = { ["*"] = { glow_width = "4" } } }"#,
+                "views[*].glow_width",
+            ),
+            (
+                r#"return { views = { ["*"] = { background_tint = false } } }"#,
+                "views[*].background_tint",
+            ),
+            (
+                r#"return { views = { ["*"] = { background_tint_strength = "0.5" } } }"#,
+                "views[*].background_tint_strength",
+            ),
+            (
+                r##"return { views = { ["*"] = { shadow_color = "#000000" } } }"##,
+                "views[*].shadow_color",
+            ),
+            (
+                r#"return { views = { ["*"] = { shadow_offset_x = 1 } } }"#,
+                "views[*].shadow_offset_x",
+            ),
+            (
+                r#"return { views = { ["*"] = { shadow_offset_y = 1 } } }"#,
+                "views[*].shadow_offset_y",
+            ),
+            (
+                r#"return { views = { ["*"] = { fade_unfocused = 0.5 } } }"#,
+                "views[*].fade_unfocused",
+            ),
+            (
+                r#"return { views = { ["*"] = { shadow_blur = 2 } } }"#,
+                "views[*].shadow_blur",
+            ),
+        ];
+        for (code, path) in cases {
+            let err = eval_err(code);
+            assert!(err.contains(path), "{code:?}: {err} must name {path}");
+        }
     }
 
     #[test]

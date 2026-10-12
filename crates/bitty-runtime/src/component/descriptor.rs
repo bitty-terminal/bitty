@@ -28,6 +28,60 @@ use super::{
 /// Hex length of a SHA-256 digest.
 const SHA256_HEX_LEN: usize = 64;
 
+/// No-obfuscation rule (issue #1986): maximum bytes of one line in
+/// human-readable source text (Lua source and `bitty-component.toml` alike).
+///
+/// Readable Lua averages well under 100 bytes per line and rarely exceeds
+/// 200; minified output collapses to one or two lines of thousands of
+/// bytes. A line over this bound is treated as minified/obfuscated and
+/// refused. Mirrors `scripts/make-component-dist.sh` (`READABLE_MAX_LINE`).
+pub const READABLE_SOURCE_MAX_LINE_BYTES: usize = 1000;
+
+/// No-obfuscation rule (issue #1986): maximum average bytes per line in
+/// human-readable source text.
+///
+/// Total bytes divided by line count; a file averaging over this bound is
+/// treated as minified/obfuscated and refused even when no single line
+/// trips [`READABLE_SOURCE_MAX_LINE_BYTES`]. Mirrors
+/// `scripts/make-component-dist.sh` (`READABLE_MAX_AVG`).
+pub const READABLE_SOURCE_MAX_AVG_LINE_BYTES: usize = 200;
+
+/// Whether human-readable source text looks minified/obfuscated (issue #1986).
+///
+/// Documented heuristic, no new deps, MSRV 1.85: returns `true` when any
+/// line exceeds [`READABLE_SOURCE_MAX_LINE_BYTES`] bytes or the average
+/// line length exceeds [`READABLE_SOURCE_MAX_AVG_LINE_BYTES`] bytes.
+/// Empty text is not obfuscated (other checks handle emptiness). Line
+/// length is measured in bytes; UTF-8 multi-byte sequences count per byte,
+/// so the bound stays conservative for non-ASCII sources.
+///
+/// Used for Lua extension sources and for `bitty-component.toml`
+/// descriptors alike: readability is the mechanism (show-source prints the
+/// pinned bytes, update-diff previews pin changes, and this rule refuses
+/// minified input at pack and stage time).
+#[must_use]
+pub fn is_obfuscated_source_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut lines: u64 = 0;
+    let mut max_line: usize = 0;
+    for line in text.lines() {
+        lines += 1;
+        if line.len() > max_line {
+            max_line = line.len();
+        }
+        if max_line > READABLE_SOURCE_MAX_LINE_BYTES {
+            return true;
+        }
+    }
+    if lines == 0 {
+        return false;
+    }
+    let avg = (text.len() as u64) / lines;
+    avg > (READABLE_SOURCE_MAX_AVG_LINE_BYTES as u64)
+}
+
 /// Component root from explicit inputs.
 ///
 /// `override_dir` is the developer-only `BITTY_COMPONENTS_DIR` value and
@@ -141,7 +195,17 @@ impl std::error::Error for DescriptorError {}
 
 impl ComponentDescriptor {
     /// Parse and validate descriptor text (fail closed).
+    ///
+    /// Enforces the no-obfuscation rule (issue #1986) first: minified text
+    /// (see [`is_obfuscated_source_text`]) is refused before any field is
+    /// read, so a single-line packed descriptor never parses silently.
     pub fn parse(text: &str) -> Result<Self, DescriptorError> {
+        if is_obfuscated_source_text(text) {
+            return Err(DescriptorError::Syntax {
+                line: 1,
+                reason: "descriptor looks minified/obfuscated (readability rule: max 1000 bytes per line, 200 average)",
+            });
+        }
         let mut in_component = false;
         let mut seen_table = false;
         let mut name = None;
@@ -752,5 +816,55 @@ mod tests {
             "bitty-net"
         };
         assert_eq!(executable_file_name("bitty-net"), expected);
+    }
+
+    #[test]
+    fn obfuscation_heuristic_accepts_readable_and_refuses_minified() {
+        // Positive: readable multi-line Lua passes.
+        let readable =
+            "-- helper\nlocal M = {}\nfunction M.bump(n)\n  return n + 1\nend\nreturn M\n";
+        assert!(
+            !is_obfuscated_source_text(readable),
+            "readable Lua must pass"
+        );
+        // Positive: the canonical descriptor shape passes.
+        let descriptor = text("net", "0.1.0", "[1, 1]", "bitty-net", DIGEST);
+        assert!(
+            !is_obfuscated_source_text(&descriptor),
+            "readable descriptor must pass"
+        );
+        assert!(!is_obfuscated_source_text(""), "empty is not obfuscated");
+        // Negative: one very long line (minified) fails.
+        let minified_line = format!("local x={};", "a".repeat(1200));
+        assert!(
+            is_obfuscated_source_text(&minified_line),
+            "single long line must fail"
+        );
+        // Negative: high average even without one huge line fails.
+        let avg_bad = format!("{}\n{}\n", "b".repeat(300), "c".repeat(300));
+        assert!(
+            is_obfuscated_source_text(&avg_bad),
+            "high average line length must fail"
+        );
+        // Thresholds stay documented and pinned.
+        assert_eq!(READABLE_SOURCE_MAX_LINE_BYTES, 1000);
+        assert_eq!(READABLE_SOURCE_MAX_AVG_LINE_BYTES, 200);
+    }
+
+    #[test]
+    fn descriptor_parse_refuses_minified_text() {
+        // A single-line descriptor carrying all fields plus padding trips
+        // the readability gate before field validation.
+        let padding = "x".repeat(1200);
+        let minified = format!(
+            "[component] name=\"net\" version=\"0.1.0\" protocol=[1,1] executable=\"bitty-net\" sha256=\"{DIGEST}\" # {padding}"
+        );
+        assert!(
+            matches!(
+                ComponentDescriptor::parse(&minified),
+                Err(DescriptorError::Syntax { .. })
+            ),
+            "minified descriptor must fail closed"
+        );
     }
 }

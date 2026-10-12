@@ -30,6 +30,17 @@
 # prerelease descriptor the client would install is refused at pack time
 # by policy, never silently repackaged.
 #
+# No-obfuscation rule (issue #1986): human-readable source text (the
+# descriptor plus any Lua sources in the source tree) must not look
+# minified. Documented heuristic, mirrored by bitty-runtime
+# `is_obfuscated_source_text` (max 1000 bytes per line, 200 average):
+# readable Lua averages well under 100 bytes per line, while minified
+# output collapses to one or two lines of thousands of bytes. Lua files
+# (`*.lua` at the source root plus one `lua/` level, at most 64 files of
+# 1 MiB each) are scanned and refused when minified; the tarball still
+# holds exactly the descriptor plus the executable. Anything minified
+# fails closed before any output is written.
+#
 # `--print-url` is a pure mapping (no spawn, no filesystem writes): it
 # validates its inputs against the same allowlist and prints the tarball URL
 # plus the manifest URL. Only `https://cdn.bitty.run` (or an explicit
@@ -49,6 +60,10 @@ DESCRIPTOR_FILE="bitty-component.toml"
 EXECUTABLE_PREFIX="bitty-"
 EXE_MAX_BYTES=268435456   # 256 MiB, mirrors COMPONENT_EXECUTABLE_MAX_BYTES
 DESCRIPTOR_MAX_BYTES=4096 # mirrors COMPONENT_DESCRIPTOR_MAX_BYTES
+READABLE_MAX_LINE=1000    # no-obfuscation rule (issue #1986), mirrors READABLE_SOURCE_MAX_LINE_BYTES
+READABLE_MAX_AVG=200      # no-obfuscation rule (issue #1986), mirrors READABLE_SOURCE_MAX_AVG_LINE_BYTES
+LUA_MAX_FILES=64          # at most this many Lua sources scanned per pack
+LUA_MAX_BYTES=1048576     # at most 1 MiB read per Lua source for the check
 CDN_DEFAULT="https://cdn.bitty.run"
 
 SOURCE=""
@@ -105,6 +120,18 @@ valid_version() {
 
 valid_target() {
   [[ "$1" =~ ^[a-z0-9_]+(-[a-z0-9_]+)+$ ]]
+}
+
+# No-obfuscation gate (issue #1986): refuse minified text. Needs only awk:
+# any line over READABLE_MAX_LINE bytes, or an average over READABLE_MAX_AVG,
+# fails. Empty files pass (other checks own emptiness). awk length() counts
+# characters, so non-ASCII sources undercount slightly and stay conservative.
+check_readable_text() {
+  local file="$1" label="$2"
+  awk -v max="$READABLE_MAX_LINE" -v avg="$READABLE_MAX_AVG" '
+    { total += length($0); n++; if (length($0) > max) bad = 1 }
+    END { if (n == 0) exit 0; if (bad) exit 1; if ((total / n) > avg) exit 1 }
+  ' "$file" || die "$label looks minified/obfuscated (readability rule: max 1000 bytes per line, 200 average): $file"
 }
 
 valid_cdn_base() {
@@ -208,6 +235,7 @@ DESCRIPTOR_PATH="$SOURCE/$DESCRIPTOR_FILE"
 [[ -f "$DESCRIPTOR_PATH" ]] || die "source descriptor not found: $DESCRIPTOR_PATH"
 DESC_SIZE="$(wc -c <"$DESCRIPTOR_PATH" | tr -d ' ')"
 [[ "$DESC_SIZE" -le "$DESCRIPTOR_MAX_BYTES" ]] || die "source descriptor exceeds $DESCRIPTOR_MAX_BYTES bytes"
+check_readable_text "$DESCRIPTOR_PATH" "source descriptor"
 
 # --- closed descriptor subset: exactly [component] + the five known keys ---
 DESC_NAME=""
@@ -297,6 +325,25 @@ BIN_DIGEST="$($SHA256SUM "$BINARY" | cut -d' ' -f1)"
 if [[ "$DESC_SHA256" != "$BIN_DIGEST" ]]; then
   die "source descriptor sha256 $DESC_SHA256 does not match computed digest $BIN_DIGEST for $BINARY"
 fi
+
+# Lua readability sweep (issue #1986): refuse minified/obfuscated Lua in the
+# source tree (top level plus one `lua/` level). The tarball still holds only
+# the two fixed members; this gate keeps obfuscated sources from packing
+# silently. Bounded (at most LUA_MAX_FILES files of LUA_MAX_BYTES bytes);
+# symlinks and oversize files fail closed here (UTF-8 is enforced at
+# stage time by the Rust loader).
+LUA_COUNT=0
+while IFS= read -r -d '' LUA_FILE; do
+  LUA_COUNT=$((LUA_COUNT + 1))
+  [[ "$LUA_COUNT" -le "$LUA_MAX_FILES" ]] || die "too many Lua sources in $SOURCE (at most $LUA_MAX_FILES)"
+  [[ ! -L "$LUA_FILE" ]] || die "refusing symlink Lua source: $LUA_FILE"
+  LUA_SIZE="$(wc -c <"$LUA_FILE" | tr -d ' ')"
+  [[ "$LUA_SIZE" -le "$LUA_MAX_BYTES" ]] || die "Lua source exceeds $LUA_MAX_BYTES bytes: $LUA_FILE"
+  check_readable_text "$LUA_FILE" "Lua source"
+done < <({
+  find "$SOURCE" -maxdepth 1 -name '*.lua' -type f -print0 2>/dev/null
+  find "$SOURCE/lua" -maxdepth 1 -name '*.lua' -type f -print0 2>/dev/null
+} 2>/dev/null)
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/bitty-component-dist.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT

@@ -4,13 +4,24 @@
 //! hidden deprecated alias (same handlers, stderr deprecation note, kept at
 //! least through 0.1.0) and never appears in help or shell completions.
 //!
+//! Source transparency (issue #1986): `show-source` prints the exact pinned
+//! bytes of the installed extension (fail-closed on missing installs and
+//! hash mismatches, provenance on stderr so stdout stays byte-identical for
+//! piping/hashing); `install` renders an update-diff preview when the fetch
+//! would change the TOFU pin (preview only, existing consent/`--force`
+//! semantics unchanged, diff computed locally from fetched-then-pinned
+//! bytes, no network); dist validation refuses minified/obfuscated Lua and
+//! descriptors via the documented readability heuristic (max 1000 bytes per
+//! line, 200 average; see `is_obfuscated_source_text` and
+//! `scripts/make-component-dist.sh`).
+//!
 //! Search priority: user `$XDG_DATA_HOME/bitty/extensions/` wins over system
 //! `/usr/lib/bitty/extensions/` (or platform equivalent). The user tier is
 //! writable without privilege; the system tier is read-only for this command.
 //!
 //! # Contract (implemented, v1 local-path only)
 //!
-//! - Shape: `bitty extension list|add|install|remove` with `list` accepting
+//! - Shape: `bitty extension list|add|install|remove|show-source` with `list` accepting
 //!   `--format table|json|jsonl` (default table) and `--no-color`.
 //! - `list`: read-only enumeration across both tiers (merged, user shadows
 //!   system on the same version). Shows name, version, active marker, source,
@@ -34,6 +45,13 @@
 //!   user version when none is named; removing the version named by `current`
 //!   also removes `current`. Never touches the system tier (needs a package
 //!   manager); a system-only component fails with an actionable diagnostic.
+//! - `show-source <name> [<version>]`: print the exact pinned bytes of the
+//!   installed executable to stdout (the version defaults to the active
+//!   `current` pointer). The executable hash is re-verified against the
+//!   installed descriptor before anything is printed; a missing install or
+//!   a hash mismatch fails closed (exit 4) with nothing on stdout.
+//!   Provenance (name, version, source tier, path, sha256) goes to stderr so
+//!   stdout stays byte-identical for piping and hashing.
 //! - `install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]`:
 //!   fetch one prebuilt release from R2 through the minimal install seed
 //!   (`crate::component_seed`, issue #1791 option A): fixed-argv system
@@ -191,6 +209,8 @@ pub enum ComponentVerb {
     Install,
     /// `remove <name> [<version>]`: drop a user-installed component.
     Remove,
+    /// `show-source <name> [<version>]`: print the pinned executable bytes.
+    ShowSource,
 }
 
 impl ComponentVerb {
@@ -202,6 +222,7 @@ impl ComponentVerb {
             "add" => Some(Self::Add),
             "install" => Some(Self::Install),
             "remove" => Some(Self::Remove),
+            "show-source" => Some(Self::ShowSource),
             _ => None,
         }
     }
@@ -214,6 +235,7 @@ impl ComponentVerb {
             Self::Add => "add",
             Self::Install => "install",
             Self::Remove => "remove",
+            Self::ShowSource => "show-source",
         }
     }
 }
@@ -224,9 +246,9 @@ pub struct ComponentRequest {
     /// Requested verb.
     pub verb: ComponentVerb,
     /// First operand: source path for `add`, component name for
-    /// `install`/`remove`.
+    /// `install`/`remove`/`show-source`.
     pub operand: Option<String>,
-    /// Second operand: version for `remove` (no flag form).
+    /// Second operand: version for `remove`/`show-source` (no flag form).
     pub version_operand: Option<String>,
     /// `--version <semver>` for `add` from a bare executable; required
     /// `X.Y.Z` for `install`.
@@ -500,7 +522,7 @@ pub fn parse_component_request(
                 Some(parsed) => verb = Some(parsed),
                 None => {
                     return Err(ComponentParseError::Usage(format!(
-                        "bitty extension: unknown verb {token:?} (want list|add|install|remove)"
+                        "bitty extension: unknown verb {token:?} (want list|add|install|remove|show-source)"
                     )));
                 }
             }
@@ -524,7 +546,7 @@ pub fn parse_component_request(
 
     let verb = verb.ok_or_else(|| {
         ComponentParseError::Usage(
-            "bitty extension: missing verb (want list|add|install|remove)".to_string(),
+            "bitty extension: missing verb (want list|add|install|remove|show-source)".to_string(),
         )
     })?;
 
@@ -690,6 +712,51 @@ pub fn parse_component_request(
                 )));
             }
         }
+        ComponentVerb::ShowSource => {
+            if operand.is_none() {
+                return Err(ComponentParseError::Usage(
+                    "bitty extension: `show-source` needs a component name (e.g. `bitty extension show-source net`)"
+                        .to_string(),
+                ));
+            }
+            if version_flag.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: `{}` takes an optional version operand, not `--version` (got `{}`)",
+                    verb.name(),
+                    verb.name()
+                )));
+            }
+            if format != ComponentFormat::Table || no_color {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: --format/--no-color only apply to `list` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if yes {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: --yes only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if digest.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: --digest only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if force {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: --force only applies to `install` (got `{}`)",
+                    verb.name()
+                )));
+            }
+            if distro.is_some() {
+                return Err(ComponentParseError::Usage(format!(
+                    "bitty extension: --distro only applies to `add` (got `{}`)",
+                    verb.name()
+                )));
+            }
+        }
     }
 
     Ok(ComponentRequest {
@@ -713,14 +780,18 @@ pub fn component_usage() -> String {
      \x20      bitty extension add <path> [--version <semver>] [--distro <name|default>]\n\
      \x20      bitty extension install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
      \x20      bitty extension remove <name> [<version>]\n\
+     \x20      bitty extension show-source <name> [<version>]\n\
      \n\
      Components are upstream native binaries resolved user-first:\n\
      $XDG_DATA_HOME/bitty/extensions/ wins over /usr/lib/bitty/extensions/.\n\
      `add` stages from a local path only (v1 has no registry download);\n\
      `install` fetches one R2 prebuilt release through the hash-verified\n\
      seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
-     else explicit consent, TOFU-pinned; --force re-pins), then the full\n\
+     else explicit consent, TOFU-pinned; --force re-pins, update-diff preview\n\
+     rendered before any pin change), then the full\n\
      manager takes over; `remove` only touches the user tier (no root required).\n\
+     `show-source` prints the exact pinned executable bytes (hash-verified,\n\
+     provenance on stderr so stdout stays byte-identical).\n\
      On Windows, `add --distro` routes execution through the WSL2 trampoline\n\
      (wsl.exe --distribution D --exec, default distro with `default`);\n\
      `install --distro` is rejected (install fetches the host triple and\n\
@@ -759,6 +830,24 @@ pub fn component_help_text() -> String {
      \x20                             user version when none is named. Removing\n\
      \x20                             the active version also drops `current`.\n\
      \x20                             Never touches the system tier.\n\
+     \x20 show-source <name> [V]     Print the exact pinned executable bytes to\n\
+     \x20                             stdout (version defaults to the active\n\
+     \x20                             `current` pointer). The hash is re-verified\n\
+     \x20                             against the installed descriptor first; a\n\
+     \x20                             missing install or mismatch fails closed\n\
+     \x20                             (exit 4) with nothing on stdout. Provenance\n\
+     \x20                             (name, version, tier, path, sha256) goes to\n\
+     \x20                             stderr so stdout stays byte-identical.\n\
+     \n\
+     source transparency (issue #1986):\n\
+     \x20 `show-source` prints pinned bytes (stdout) with provenance on\n\
+     \x20                             stderr; `install` renders an update-diff\n\
+     \x20                             preview when the fetch would change the TOFU\n\
+     \x20                             pin (preview only, consent and --force still\n\
+     \x20                             apply; diff is local, no network); dist\n\
+     \x20                             validation refuses minified/obfuscated Lua\n\
+     \x20                             and descriptors (readability rule: max 1000\n\
+     \x20                             bytes per line, 200 average).\n\
      \n\
      flags:\n\
      \x20 --format table|json|jsonl   list output shape (default table).\n\
@@ -895,7 +984,9 @@ pub fn component_help_text() -> String {
      \x20 bitty extension install net --version 0.0.23\n\
      \x20 bitty extension install net --version 0.0.23 --digest <hex>\n\
      \x20 bitty extension install net --version 0.0.23 --force --yes\n\
-     \x20 bitty extension remove net 0.0.1"
+     \x20 bitty extension remove net 0.0.1\n\
+     \x20 bitty extension show-source net\n\
+     \x20 bitty extension show-source net 0.0.1"
         .to_string()
 }
 
@@ -1148,6 +1239,28 @@ pub fn run_component_subcommand(
                     let _ = writeln!(output, "{summary}");
                     EXIT_OK
                 }
+                Err(failure) => {
+                    eprintln!("{}", failure.message);
+                    failure.exit
+                }
+            }
+        }
+        ComponentVerb::ShowSource => {
+            let name = request
+                .operand
+                .as_deref()
+                .expect("show-source requires a name");
+            match op_show_source(
+                name,
+                request.version_operand.as_deref(),
+                user_root.as_deref(),
+                system_root.as_deref(),
+                output,
+            ) {
+                // `op_show_source` already wrote the exact pinned bytes to
+                // `output` and provenance to stderr: no summary line follows,
+                // so stdout stays byte-identical for piping/hashing.
+                Ok(()) => EXIT_OK,
                 Err(failure) => {
                     eprintln!("{}", failure.message);
                     failure.exit
@@ -1591,6 +1704,42 @@ fn op_install(
         executable: payload.executable.clone(),
         bytes: payload.bytes,
     };
+    // Update-diff preview (issue #1986): when the fetch would change the
+    // TOFU pin, render a unified diff old-vs-new BEFORE applying. Preview
+    // only — consent and `--force` still apply exactly as before, and the
+    // diff is computed locally from fetched-then-pinned bytes (no network).
+    // First contact (no pin) renders nothing, so existing flows are
+    // byte-identical when there is nothing to preview.
+    {
+        let exe_digest = bitty_package::integrity::sha256_hex(&staged.bytes);
+        let new_descriptor = format!(
+            "[component]\nname = \"{}\"\nversion = \"{}\"\nprotocol = [{}, {}]\nexecutable = \"{}\"\nsha256 = \"{exe_digest}\"\n",
+            staged.name,
+            staged.version,
+            staged.protocol_min,
+            staged.protocol_max,
+            staged.executable,
+        );
+        let previous = load_update_diff_context(user, &staged.name, &staged.version);
+        let pin_would_change = match read_tofu_pin(user, &staged.name) {
+            Ok(Some(pinned)) => !crate::component_seed::digests_equal_ct(&pinned, &verified_digest),
+            Ok(None) => false,
+            // Corrupt pins re-pin only under `--force`; still preview when
+            // prior bytes exist so the operator sees the change.
+            Err(failure) if failure.exit == EXIT_COMPONENT => previous.is_some(),
+            Err(_) => false,
+        };
+        if pin_would_change {
+            render_update_diff_preview(
+                output,
+                &staged.name,
+                &staged.version,
+                &new_descriptor,
+                &verified_digest,
+                previous.as_ref(),
+            );
+        }
+    }
     // TOFU-with-pin (#1906): first contact records the verified CDN digest;
     // later differing digests fail closed as pin-mismatch unless `--force`
     // re-pins. Never auto-updates. Check runs before any mutation so a
@@ -1829,6 +1978,10 @@ fn missing_component_hint_for_add() -> String {
 }
 
 fn load_staged_dir(dir: &Path) -> Result<StagedSource, ComponentFailure> {
+    // No-obfuscation rule (issue #1986): refuse minified Lua in the source
+    // tree before reading the descriptor, so obfuscated sources never stage
+    // silently. Native-binary-only sources (no Lua files) are unaffected.
+    check_staged_lua_readability(dir)?;
     let descriptor_path = dir.join(COMPONENT_DESCRIPTOR_FILE);
     let bytes = std::fs::read(&descriptor_path).map_err(|error| {
         ComponentFailure::component(format!(
@@ -2283,6 +2436,336 @@ fn op_remove(
             Ok(format!("removed component '{name}' (all user versions)"))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// show-source (pinned-byte transparency, issue #1986)
+// ---------------------------------------------------------------------------
+
+/// Print the exact pinned bytes of one installed extension (issue #1986).
+///
+/// Resolution is user-first across both tiers (via `discover_components`):
+/// an explicit `version` selects that version, otherwise the active
+/// `current` pointer wins. The installed descriptor is parsed, the
+/// executable bytes are hashed and compared against the descriptor `sha256`,
+/// and only a match is printed — a missing install or a mismatch fails
+/// closed (exit 4) with nothing on stdout (never print untrusted bytes
+/// silently). Provenance (name, version, tier, path, sha256) goes to stderr
+/// so stdout stays byte-identical for piping and hashing. No execution, no
+/// network, no mutation.
+fn op_show_source(
+    name: &str,
+    version: Option<&str>,
+    user_root: Option<&Path>,
+    system_root: Option<&Path>,
+    output: &mut dyn std::io::Write,
+) -> Result<(), ComponentFailure> {
+    if let Err(error) = validate_component_name(name) {
+        return Err(ComponentFailure::usage(format!(
+            "bitty extension: invalid component name {name:?}: {error}"
+        )));
+    }
+    if let Some(version) = version {
+        if bitty_package::Version::parse(version).is_err() {
+            return Err(ComponentFailure::usage(format!(
+                "bitty extension: invalid version {version:?} (want strict semver)"
+            )));
+        }
+    }
+    let summaries = bitty_runtime::component::discover_components(user_root, system_root);
+    let Some(summary) = summaries.iter().find(|entry| entry.name == name) else {
+        return Err(ComponentFailure::component(
+            bitty_runtime::component::missing_component_hint(name),
+        ));
+    };
+    if summary.versions.is_empty() {
+        return Err(ComponentFailure::component(
+            bitty_runtime::component::missing_component_hint(name),
+        ));
+    }
+    let selected = match version {
+        Some(requested) => summary
+            .versions
+            .iter()
+            .find(|entry| entry.version == requested),
+        None => match summary.active_version.as_deref() {
+            Some(active) => summary
+                .versions
+                .iter()
+                .find(|entry| entry.version == active),
+            None => None,
+        },
+    };
+    let Some(installed) = selected else {
+        if let Some(requested) = version {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: version {requested} of '{name}' is not installed (installed: {})",
+                summary
+                    .versions
+                    .iter()
+                    .map(|entry| entry.version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: '{name}' has no active version (specify one: `bitty extension show-source {name} <version>`; installed: {})",
+            summary
+                .versions
+                .iter()
+                .map(|entry| entry.version.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    };
+    let descriptor_path = installed.version_dir.join(COMPONENT_DESCRIPTOR_FILE);
+    let descriptor_bytes = std::fs::read(&descriptor_path).map_err(|error| {
+        ComponentFailure::generic(format!(
+            "bitty extension: cannot read '{}': {error}",
+            descriptor_path.display()
+        ))
+    })?;
+    let descriptor_text = std::str::from_utf8(&descriptor_bytes).map_err(|_| {
+        ComponentFailure::component(format!(
+            "bitty extension: installed descriptor '{}' is not UTF-8 (refusing to print untrusted bytes)",
+            descriptor_path.display()
+        ))
+    })?;
+    let descriptor = ComponentDescriptor::parse(descriptor_text).map_err(|error| {
+        ComponentFailure::component(format!(
+            "bitty extension: installed descriptor '{}' is invalid: {error} (refusing to print untrusted bytes)",
+            descriptor_path.display()
+        ))
+    })?;
+    if descriptor.name != name || descriptor.version != installed.version {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: installed descriptor '{}' names {} {} (expected {name} {} — refusing to print untrusted bytes)",
+            descriptor_path.display(),
+            descriptor.name,
+            descriptor.version,
+            installed.version,
+        )));
+    }
+    let executable_bytes = std::fs::read(&installed.executable_path).map_err(|error| {
+        ComponentFailure::generic(format!(
+            "bitty extension: cannot read '{}': {error}",
+            installed.executable_path.display()
+        ))
+    })?;
+    let actual = bitty_package::integrity::sha256_hex(&executable_bytes);
+    if actual != descriptor.sha256 {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: hash mismatch for '{name}' version {}: descriptor pins {} but the installed executable hashes {actual} (refusing to print untrusted bytes)",
+            installed.version, descriptor.sha256,
+        )));
+    }
+    eprintln!(
+        "bitty extension: show-source '{}' version {} from {} tier at {} (sha256 {actual})",
+        name,
+        installed.version,
+        installed.source.label(),
+        installed.executable_path.display(),
+    );
+    output.write_all(&executable_bytes).map_err(|error| {
+        ComponentFailure::generic(format!(
+            "bitty extension: cannot write source bytes: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// update-diff preview (issue #1986)
+// ---------------------------------------------------------------------------
+
+/// Render a unified diff preview of old-vs-new text (issue #1986).
+///
+/// Preview only: a whole-file hunk (`--- old` / `+++ new`, removed lines
+/// prefixed `-`, added lines prefixed `+`). No LCS, no context collapsing —
+/// descriptors are small (<4 KiB) so the full hunk stays readable. Equal
+/// inputs render `(no changes)`. Computed locally from fetched-then-pinned
+/// bytes; no network. Callers print the result before applying (or refusing)
+/// the pin change without altering existing consent/`--force` semantics.
+pub(crate) fn unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "--- {old_label}");
+    let _ = writeln!(out, "+++ {new_label}");
+    if old == new {
+        out.push_str("(no changes)\n");
+        return out;
+    }
+    out.push_str("@@ old vs new @@\n");
+    for line in old.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Old-vs-new descriptor context for one install preview.
+struct UpdateDiffContext {
+    /// Previously installed version (from `current` or the requested version).
+    old_version: String,
+    /// Previously installed descriptor text.
+    old_descriptor: String,
+    /// Previously pinned tarball digest (TOFU pin).
+    old_pin: String,
+}
+
+/// Load the previous install context for an update-diff preview.
+///
+/// Returns `None` on first contact (no prior install, nothing to diff) or
+/// when the prior descriptor cannot be read (the caller then renders a
+/// digest-only preview instead of failing the install on a read error).
+fn load_update_diff_context(
+    user: &Path,
+    name: &str,
+    requested_version: &str,
+) -> Option<UpdateDiffContext> {
+    let old_pin = std::fs::read_to_string(user.join(name).join(TARBALL_PIN_FILE))
+        .ok()?
+        .trim()
+        .to_ascii_lowercase();
+    if !crate::component_seed::is_hex_digest(&old_pin) {
+        return None;
+    }
+    // Prefer the active version; fall back to the requested version when no
+    // `current` pointer exists (reinstall of the same version path).
+    let old_version = std::fs::read_to_string(user.join(name).join("current"))
+        .ok()
+        .map(|text| text.trim_end_matches(['\n', '\r']).trim().to_owned())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| requested_version.to_owned());
+    let old_descriptor = std::fs::read_to_string(
+        user.join(name)
+            .join(&old_version)
+            .join(COMPONENT_DESCRIPTOR_FILE),
+    )
+    .ok()?;
+    Some(UpdateDiffContext {
+        old_version,
+        old_descriptor,
+        old_pin,
+    })
+}
+
+/// Render an update-diff preview to `output` before any pin change.
+///
+/// Called from `op_install` after the fetch verifies and before the TOFU
+/// check stages or refuses: prints `update-diff for '<name>': <old> ->
+/// <new>`, the `pin:` digest line, and the descriptor unified diff. Preview
+/// only — the caller still enforces consent and `--force` exactly as before.
+fn render_update_diff_preview(
+    output: &mut dyn std::io::Write,
+    name: &str,
+    new_version: &str,
+    new_descriptor: &str,
+    new_pin: &str,
+    context: Option<&UpdateDiffContext>,
+) {
+    use std::fmt::Write as _;
+    let Some(previous) = context else {
+        return;
+    };
+    let mut preview = String::new();
+    let _ = writeln!(
+        preview,
+        "update-diff for '{name}': {} -> {new_version} (preview only; consent and --force still apply)",
+        previous.old_version,
+    );
+    let _ = writeln!(preview, "pin: {} -> {new_pin}", previous.old_pin);
+    preview.push_str(&unified_diff(
+        &previous.old_descriptor,
+        new_descriptor,
+        &format!(
+            "a/{}/{}/{}",
+            name, previous.old_version, COMPONENT_DESCRIPTOR_FILE
+        ),
+        &format!("b/{name}/{new_version}/{COMPONENT_DESCRIPTOR_FILE}"),
+    ));
+    let _ = output.write_all(preview.as_bytes());
+}
+
+/// Maximum Lua source files scanned per staged source dir (bounded walk).
+const MAX_STAGED_LUA_FILES: usize = 64;
+
+/// Maximum bytes read per Lua source file for the readability check.
+const MAX_STAGED_LUA_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Refuse minified/obfuscated Lua in a staged source dir (issue #1986).
+///
+/// Scans `<dir>` non-recursively plus `<dir>/lua` one level deep for
+/// `*.lua` files (at most [`MAX_STAGED_LUA_FILES`], each at most
+/// [`MAX_STAGED_LUA_FILE_BYTES`] bytes). Readable or absent Lua passes;
+/// minified Lua (see `is_obfuscated_source_text`) fails closed as a
+/// component error. Native-binary-only sources (no Lua files) are unaffected.
+fn check_staged_lua_readability(dir: &Path) -> Result<(), ComponentFailure> {
+    use bitty_runtime::component::is_obfuscated_source_text;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let collect_lua = |search: &Path, out: &mut Vec<PathBuf>| {
+        let Ok(entries) = std::fs::read_dir(search) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= MAX_STAGED_LUA_FILES {
+                break;
+            }
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "lua")
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                out.push(path);
+            }
+        }
+    };
+    collect_lua(dir, &mut candidates);
+    collect_lua(&dir.join("lua"), &mut candidates);
+    for path in &candidates {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            ComponentFailure::component(format!(
+                "bitty extension: cannot inspect '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: refusing symlink Lua source '{}'",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_STAGED_LUA_FILE_BYTES {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: Lua source '{}' exceeds {MAX_STAGED_LUA_FILE_BYTES} bytes (refusing to stage)",
+                path.display()
+            )));
+        }
+        let bytes = std::fs::read(path).map_err(|error| {
+            ComponentFailure::component(format!(
+                "bitty extension: cannot read Lua source '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            ComponentFailure::component(format!(
+                "bitty extension: Lua source '{}' is not UTF-8 (refusing to stage)",
+                path.display()
+            ))
+        })?;
+        if is_obfuscated_source_text(text) {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: Lua source '{}' looks minified/obfuscated (readability rule: max 1000 bytes per line, 200 average; refusing to stage)",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4202,5 +4685,267 @@ mod tests {
 
     fn version_dir_bytes(version_dir: &Path, executable_name: &str) -> Vec<u8> {
         std::fs::read(version_dir.join(executable_name)).expect("installed executable")
+    }
+
+    #[test]
+    fn parses_show_source() {
+        let request =
+            parse_component_request(&[String::from("show-source"), String::from("net")], None)
+                .expect("show-source");
+        assert_eq!(request.verb, ComponentVerb::ShowSource);
+        assert_eq!(request.operand.as_deref(), Some("net"));
+        assert!(request.version_operand.is_none());
+
+        let request = parse_component_request(
+            &[
+                String::from("show-source"),
+                String::from("net"),
+                String::from("0.0.1"),
+            ],
+            None,
+        )
+        .expect("show-source with version");
+        assert_eq!(request.version_operand.as_deref(), Some("0.0.1"));
+
+        // Missing name fails.
+        assert!(parse_component_request(&[String::from("show-source")], None).is_err());
+        // `--version` flag form fails (operand form only, like `remove`).
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("show-source"),
+                    String::from("net"),
+                    String::from("--version"),
+                    String::from("0.0.1"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        // Install-only flags fail on `show-source`.
+        for args in [
+            vec![
+                String::from("show-source"),
+                String::from("net"),
+                String::from("--yes"),
+            ],
+            vec![
+                String::from("show-source"),
+                String::from("net"),
+                String::from("--force"),
+            ],
+            vec![
+                String::from("show-source"),
+                String::from("net"),
+                String::from("--distro"),
+                String::from("Ubuntu"),
+            ],
+            vec![
+                String::from("show-source"),
+                String::from("net"),
+                String::from("--distro=Ubuntu"),
+            ],
+        ] {
+            assert!(
+                parse_component_request(&args, None).is_err(),
+                "{args:?} on show-source must fail"
+            );
+        }
+        // `--format`/`--no-color` only apply to `list`.
+        assert!(
+            parse_component_request(
+                &[
+                    String::from("show-source"),
+                    String::from("net"),
+                    String::from("--format"),
+                    String::from("json"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn show_source_prints_pinned_bytes_and_fails_closed() {
+        let base = scratch("show-source");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, _) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK);
+
+        // Active version resolves without an explicit operand.
+        let (code, stdout) = run_with(&context, &["show-source", "net"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert_eq!(
+            stdout, "net-0.0.1-bytes",
+            "stdout must be the exact pinned bytes"
+        );
+
+        // Explicit version agrees.
+        let (code, stdout) = run_with(&context, &["show-source", "net", "0.0.1"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert_eq!(stdout, "net-0.0.1-bytes");
+
+        // Unknown component fails closed (exit 4).
+        let (code, _) = run_with(&context, &["show-source", "missing"]);
+        assert_eq!(code, EXIT_COMPONENT);
+        // Unknown version fails closed.
+        let (code, _) = run_with(&context, &["show-source", "net", "9.9.9"]);
+        assert_eq!(code, EXIT_COMPONENT);
+
+        // Tampered executable fails closed with nothing on stdout.
+        let user_root = Path::new(context.components_dir.expect("user"));
+        let executable_name = executable_file_name(&format!("{COMPONENT_EXECUTABLE_PREFIX}net"));
+        std::fs::write(
+            user_root.join("net").join("0.0.1").join(&executable_name),
+            b"tampered-bytes",
+        )
+        .expect("tamper");
+        let (code, stdout) = run_with(&context, &["show-source", "net"]);
+        assert_eq!(code, EXIT_COMPONENT);
+        assert!(
+            stdout.is_empty(),
+            "tampered bytes must never reach stdout: {stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unified_diff_renders_old_vs_new() {
+        let old = "[component]\nversion = \"0.0.1\"\n";
+        let new = "[component]\nversion = \"0.0.2\"\n";
+        let diff = unified_diff(old, new, "a/net", "b/net");
+        assert!(diff.contains("--- a/net"), "{diff}");
+        assert!(diff.contains("+++ b/net"), "{diff}");
+        assert!(diff.contains("-version = \"0.0.1\""), "{diff}");
+        assert!(diff.contains("+version = \"0.0.2\""), "{diff}");
+
+        let same = unified_diff(old, old, "a/net", "b/net");
+        assert!(same.contains("(no changes)"), "{same}");
+    }
+
+    #[test]
+    fn install_renders_update_diff_preview_before_pin_refusal() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-diff-preview");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let user = Path::new(context.components_dir.expect("user")).to_path_buf();
+        let target = "x86_64-unknown-linux-gnu";
+        // First contact stages silently (no preview: nothing old to diff).
+        let mut stub = InstallStub::canned("net", "0.0.23", target, b"v1-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("first install");
+        assert!(
+            !String::from_utf8_lossy(&out).contains("update-diff"),
+            "first contact must not preview"
+        );
+        // Upgrading to a new version rotates the tarball digest, so the TOFU
+        // pin would change: without `--force` the install still refuses
+        // (exit 4) but previews the descriptor diff on stdout first.
+        let mut stub = InstallStub::canned("net", "0.0.24", target, b"v2-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.24"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("pin change without --force must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        let preview = String::from_utf8_lossy(&out).into_owned();
+        assert!(preview.contains("update-diff for 'net'"), "{preview}");
+        assert!(preview.contains("0.0.23 -> 0.0.24"), "{preview}");
+        assert!(preview.contains("pin: "), "{preview}");
+        assert!(preview.contains("--- "), "{preview}");
+        assert!(preview.contains("+++ "), "{preview}");
+        // `--force` previews too, then stages the new version.
+        let mut stub = InstallStub::canned("net", "0.0.24", target, b"v2-bytes");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        op_install(
+            "net",
+            Some("0.0.24"),
+            None,
+            true,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("force re-pin");
+        let preview = String::from_utf8_lossy(&out).into_owned();
+        assert!(preview.contains("update-diff for 'net'"), "{preview}");
+        assert_eq!(
+            std::fs::read(
+                user.join("net")
+                    .join("0.0.24")
+                    .join(executable_file_name(&format!(
+                        "{COMPONENT_EXECUTABLE_PREFIX}net"
+                    )))
+            )
+            .expect("installed exe"),
+            b"v2-bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = context;
+    }
+
+    #[test]
+    fn add_refuses_obfuscated_lua_in_source_dir() {
+        let base = scratch("lua-readability");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        // Readable Lua stages fine.
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        std::fs::write(
+            source.join("helper.lua"),
+            "-- helper\nlocal M = {}\nfunction M.bump(n)\n  return n + 1\nend\nreturn M\n",
+        )
+        .expect("readable lua");
+        let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+
+        // Minified single-line Lua fails closed.
+        let source2 = write_source_dir(&base.join("source2"), "net", "0.0.2", "[1, 1]");
+        std::fs::write(
+            source2.join("helper.lua"),
+            format!("local x={};", "a".repeat(1200)),
+        )
+        .expect("minified lua");
+        let (code, _) = run_with(&context, &["add", &source2.display().to_string()]);
+        assert_eq!(code, EXIT_COMPONENT);
+
+        // Minified Lua under `lua/` is also refused.
+        let source3 = write_source_dir(&base.join("source3"), "net", "0.0.3", "[1, 1]");
+        std::fs::create_dir_all(source3.join("lua")).expect("lua dir");
+        std::fs::write(
+            source3.join("lua").join("init.lua"),
+            format!("local y={};", "b".repeat(1200)),
+        )
+        .expect("minified lua subdir");
+        let (code, _) = run_with(&context, &["add", &source3.display().to_string()]);
+        assert_eq!(code, EXIT_COMPONENT);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "bitty-sandbox"
+description = "Narrow inherited-OS-confinement adapter for Bitty plugin-spawned tools (Linux Landlock; fail-closed degrade elsewhere)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["sandbox", "landlock", "bitty"]
+categories = ["os"]
+publish = true
+
+[lints]
+workspace = true
+
+# CTX-1151 (#1984): raw Landlock syscalls need `libc`, but no new crate
+# version — the workspace already pins the 0.2 line (bitty-pty) and the
+# lockfile already carries it. Linux only; every other platform compiles
+# this crate to the portable policy surface with no dependencies at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

@@ -1689,19 +1689,30 @@ impl TerminalApp {
                 }
             }
             A::ToggleFloating => {
-                // CTX-0962 (#1695): toggle the focused leaf Tiled <-> Floating
-                // through the `bitty.workspace:floating-toggle` primitive
-                // semantics (`bitty_ui::presentation::toggle_floating`):
-                // single command so the chord never desyncs from leaf state.
-                // Validate on the live tree BEFORE touching zoom: the zoom
-                // proxy clones the focused leaf, so its presentation is the
-                // real one. Fullscreen/Scratchpad leaves therefore reject
-                // here with a warning and zero state change (no zoom
-                // restore, no layout write). For a valid toggle, zoom
-                // restores next so the mutation lands on the real tiled
-                // tree, not the zoom proxy; the layout solver ignores the
-                // mode, so the round trip restores the exact prior
-                // allocation with no anchor bookkeeping.
+                // CTX-1147 (#1975): toggle the focused leaf between tiled
+                // and detached floating through the
+                // `bitty.workspace:floating-toggle` string dispatch
+                // (`Runtime::apply_floating_command` into
+                // `toggle_floating`). Floating detaches the leaf from
+                // tiling (the vacated slot collapses, siblings refill, no
+                // ghost chrome); toggling again re-inserts it as a fresh
+                // balanced split back to tiling. Validate on the live tree
+                // BEFORE touching zoom (mirroring `TogglePinned`):
+                // Fullscreen/Scratchpad leaves and unknown ids reject with
+                // a warning and zero state change (no zoom restore, no
+                // layout write). A focused leaf that is already detached
+                // lives outside the live layout, so it skips the mode check
+                // and restores. For a valid toggle, zoom restores next so
+                // the mutation lands on the real tree, not the zoom proxy —
+                // except when the backed-up tree holds a single leaf
+                // (CodeRabbit PR #1903 discipline): detaching there refuses
+                // (`StrandedLayout`), so restoring first would consume the
+                // zoom backup behind a refused action. Skipping the restore
+                // on `Some(1)` keeps a refused toggle byte-identical;
+                // restore never refuses on leaf count, and a restore
+                // landing in the proxy is covered by the stale-backup
+                // discipline on disengage. No focused pane warns and keeps
+                // everything.
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
                     None => {
@@ -1709,51 +1720,42 @@ impl TerminalApp {
                         return false;
                     }
                 };
-                let current = match self.runtime.layout().find_leaf(focused) {
-                    Some(leaf) => leaf.presentation(),
-                    None => {
-                        eprintln!(
-                            "warning: keymap toggle_floating found no focused pane — ignoring"
-                        );
-                        return false;
-                    }
-                };
-                let next = match current {
-                    PresentationMode::Tiled => PresentationMode::Floating,
-                    PresentationMode::Floating => PresentationMode::Tiled,
-                    other => {
-                        eprintln!(
-                            "warning: keymap toggle_floating needs a tiled or floating leaf, found {other} — ignoring"
-                        );
-                        return false;
-                    }
-                };
-                if !PresentationMode::can_transition(current, next) {
-                    eprintln!(
-                        "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
-                    );
-                    return false;
-                }
-                self.restore_zoom();
-                let mut layout = self.runtime.layout().clone();
-                match layout.find_leaf_mut(focused) {
-                    Some(leaf) => {
-                        if !PresentationMode::request_transition(leaf, next) {
+                let detaching = !self.runtime.floated_views().contains(&focused);
+                if detaching {
+                    let current = match self.runtime.layout().find_leaf(focused) {
+                        Some(leaf) => leaf.presentation(),
+                        None => {
                             eprintln!(
-                                "warning: keymap toggle_floating transition rejected: {current} -> {next} — ignoring"
+                                "warning: keymap toggle_floating found no focused pane — ignoring"
                             );
                             return false;
                         }
-                    }
-                    None => {
+                    };
+                    if !matches!(
+                        current,
+                        PresentationMode::Tiled | PresentationMode::Floating
+                    ) {
                         eprintln!(
-                            "warning: keymap toggle_floating found no focused pane — ignoring"
+                            "warning: keymap toggle_floating needs a tiled or floating leaf, found {current} — ignoring"
                         );
                         return false;
                     }
                 }
-                self.runtime.set_layout(layout);
-                eprintln!("bitty: keymap toggle_floating -> {focused:?} {current} -> {next}");
+                if !detaching || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                    self.restore_zoom();
+                }
+                match self
+                    .runtime
+                    .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(focused))
+                {
+                    Ok(None) => eprintln!("bitty: keymap toggle_floating -> {focused:?} detached"),
+                    Ok(Some(restored)) => {
+                        eprintln!("bitty: keymap toggle_floating -> {restored:?} restored")
+                    }
+                    Err(err) => {
+                        eprintln!("warning: keymap toggle_floating refused ({err}) — ignoring")
+                    }
+                }
             }
             A::TogglePinned => {
                 // CTX-1083 (follow-up to CTX-1077 #1757): toggle the focused
@@ -4034,10 +4036,11 @@ mod tests {
     }
 
     #[test]
-    fn chrome_toggle_floating_flips_focused_leaf_and_roundtrips() {
-        // CTX-0962 (#1695): the apply path flips the focused leaf
-        // Tiled <-> Floating with no layout surgery (leaf count and focus
-        // stable) and round-trips back to the exact prior mode.
+    fn chrome_toggle_floating_detaches_focused_leaf_and_restores() {
+        // CTX-1147 (#1975): the apply path detaches the focused leaf from
+        // tiling (slot collapses, siblings refill, focus re-homes to the
+        // survivor) and restores it as a fresh split back to tiling with
+        // focus following the restored leaf.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime.set_layout(two_pane_layout());
@@ -4051,27 +4054,29 @@ mod tests {
             PresentationMode::Tiled
         );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert_eq!(app.runtime.leaf_count(), 2, "toggle keeps leaf count");
         assert_eq!(
-            app.runtime.focused_view(),
-            Some(focused),
-            "toggle keeps focus"
+            app.runtime.floated_views(),
+            vec![focused],
+            "first toggle detaches"
         );
         assert_eq!(
-            app.runtime
-                .layout()
-                .find_leaf(focused)
-                .expect("focused leaf")
-                .presentation(),
-            PresentationMode::Floating,
-            "first toggle floats"
+            app.runtime.leaf_count(),
+            1,
+            "the vacated slot collapses to the survivor"
+        );
+        let survivor = app.runtime.focused_view().expect("re-homed focus");
+        assert_ne!(survivor, focused);
+        assert!(
+            app.runtime.set_focus(focused),
+            "the detached float stays focusable"
         );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert_eq!(app.runtime.leaf_count(), 2, "untoggle keeps leaf count");
+        assert!(!app.runtime.floated_occupied(), "second toggle restores");
+        assert_eq!(app.runtime.leaf_count(), 2, "a fresh split returns");
         assert_eq!(
             app.runtime.focused_view(),
             Some(focused),
-            "untoggle keeps focus"
+            "restore focuses the re-inserted leaf"
         );
         assert_eq!(
             app.runtime
@@ -4080,17 +4085,18 @@ mod tests {
                 .expect("focused leaf")
                 .presentation(),
             PresentationMode::Tiled,
-            "second toggle restores tiled"
+            "restore returns to tiling"
         );
     }
 
     #[test]
     fn chrome_toggle_floating_rejects_zoomed_fullscreen_without_state_change() {
-        // CodeRabbit PR #1704 (CTX-0962 follow-up): the leaf validates
-        // before zoom restores. A zoomed Fullscreen/Scratchpad leaf must
-        // reject with zero state change (zoom backup intact, layout and
-        // focus untouched). A zoomed Tiled leaf still toggles: restore
-        // lands on the real tree, then the flip applies.
+        // CodeRabbit PR #1704 (CTX-0962 follow-up) under the CTX-1147
+        // detach model: the leaf validates before zoom restores. A zoomed
+        // Fullscreen/Scratchpad leaf must reject with zero state change
+        // (zoom backup intact, layout and focus untouched). A zoomed Tiled
+        // leaf still detaches: restore lands on the real tree, then the
+        // detach applies.
         use bitty_config::ChromeAction;
         for mode in [PresentationMode::Fullscreen, PresentationMode::Scratchpad] {
             let mut app = workspace_test_app();
@@ -4118,6 +4124,10 @@ mod tests {
                 Some(focused),
                 "rejected toggle keeps focus"
             );
+            assert!(
+                !app.runtime.floated_occupied(),
+                "rejected toggle detaches nothing"
+            );
         }
         let mut app = workspace_test_app();
         app.runtime.set_layout(two_pane_layout());
@@ -4129,16 +4139,12 @@ mod tests {
             !app.chrome.zoom.is_zoomed(&app.runtime),
             "valid toggle consumes the zoom restore"
         );
-        assert_eq!(app.runtime.leaf_count(), 2, "toggle lands on the real tree");
         assert_eq!(
-            app.runtime
-                .layout()
-                .find_leaf(focused)
-                .expect("focused leaf")
-                .presentation(),
-            PresentationMode::Floating,
-            "zoomed tiled leaf floats"
+            app.runtime.floated_views(),
+            vec![focused],
+            "toggle detaches on the real tree"
         );
+        assert_eq!(app.runtime.leaf_count(), 1, "the slot collapses");
     }
 
     #[test]
@@ -4314,6 +4320,47 @@ mod tests {
         assert!(
             app.runtime.pinned_views().is_empty(),
             "refused pin parks nothing"
+        );
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime),
+            "refusal keeps the zoom backup"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "refusal keeps the backed-up leaf count"
+        );
+        assert_eq!(
+            format!("{:?}", app.runtime.layout()),
+            before,
+            "refusal keeps the layout byte-identical"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_floating_keeps_zoom_on_refused_sole_leaf_detach() {
+        // CodeRabbit PR #1903 discipline under the CTX-1147 detach model: a
+        // zoomed single-leaf workspace refuses the detach (it would strand
+        // an empty live layout). The refusal must leave zoom state
+        // untouched: still zoomed, backup intact, layout byte-identical.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "backed-up tree holds the sole leaf"
+        );
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert!(
+            app.runtime.floated_views().is_empty(),
+            "refused detach parks nothing"
         );
         assert!(
             app.chrome.zoom.is_zoomed(&app.runtime),

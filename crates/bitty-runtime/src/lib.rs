@@ -236,9 +236,9 @@ pub use runtime::layout_focus::{HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, P
 pub use runtime::plaintext_url::{HoveredPlaintextUrl, PlaintextUrlSpan};
 pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{
-    MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_GRID_DIM, MAX_SESSION_LAYOUT_DEPTH,
-    MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_TEXT_BYTES, MAX_SESSION_NAME_CHARS,
-    MAX_SESSION_PANES_PER_WORKSPACE, MAX_SESSION_PANES_TOTAL,
+    FloatSnapshot, MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_GRID_DIM,
+    MAX_SESSION_LAYOUT_DEPTH, MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_TEXT_BYTES,
+    MAX_SESSION_NAME_CHARS, MAX_SESSION_PANES_PER_WORKSPACE, MAX_SESSION_PANES_TOTAL,
     MAX_SESSION_SCROLLBACK_LINES_PER_PANE, MAX_SESSION_WORKSPACES, PaneAttachment, PaneRoute,
     PaneSnapshot, PendingPaneRestore, PinnedSnapshot, SESSION_APP_DIR_NAME, SESSION_FILE_NAME,
     SESSION_FORMAT_VERSION, SESSION_MIN_DECODE_VERSION, SESSIONS_DIR_NAME, SessionError,
@@ -265,9 +265,9 @@ pub use runtime::{
 // The runtime depends on `bitty-ui` only via these owned value types; no
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{
-    DecoratedView, Decoration, DecorationError, DropSpec, Focus, FocusDirection, Gaps, LayoutNode,
-    OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE, PresentationMode,
-    PseudoConstraint, PseudoError, ScrollbarMode, SplitAxis, View, ViewId,
+    DecoratedView, Decoration, DecorationError, DropSpec, FLOATING_CMD_TOGGLE, FloatStore, Focus,
+    FocusDirection, Gaps, LayoutNode, OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE,
+    PresentationMode, PseudoConstraint, PseudoError, ScrollbarMode, SplitAxis, View, ViewId,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

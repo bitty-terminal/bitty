@@ -153,6 +153,7 @@ impl Runtime {
         // gesture (focus moves, no selection starts), so it passes the probe
         // via `leaf_is_floating`. A pinned leaf passes the same way
         // (CTX-1081: detached from the tree yet presented at Float tier);
+        // a workspace-local detached float passes the same way (CTX-1147);
         // its motion accumulates a present-time re-anchor offset instead.
         // Tiled leaves fail soft here and the Mod
         // tiled-drag path (`begin_tiled_drag`) owns them instead
@@ -220,6 +221,11 @@ impl Runtime {
             // keeps it (the drop point becomes the new anchor), and unpin
             // drops it. The pinned store itself is never written here.
             //
+            // CTX-1147: a workspace-local detached float is anchored the
+            // same way; its motion accumulates in `float_offsets` (same
+            // clamp discipline, same present composite) and restore drops
+            // it. The float store itself is never written here.
+            //
             // CodeRabbit 1893: the STORED offset clamps into the permitted
             // range from `pinned_anchor` (the same base + cascade +
             // container values the composite uses) right after the
@@ -246,6 +252,29 @@ impl Runtime {
                 };
                 self.pinned_offsets
                     .insert(drag.leaf, (stored_dx, stored_dy));
+                self.pending_full_redraw = true;
+                self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
+            } else if self.floats.contains(drag.leaf) {
+                // CTX-1147: a detached float re-anchors exactly like a pin,
+                // against its own `float_anchor` range; restore drops the
+                // entry.
+                let (cur_dx, cur_dy) = self
+                    .float_offsets
+                    .get(&drag.leaf)
+                    .copied()
+                    .unwrap_or((0, 0));
+                let (next_dx, next_dy) = (cur_dx.saturating_add(dx), cur_dy.saturating_add(dy));
+                let (stored_dx, stored_dy) = match self.float_anchor(drag.leaf) {
+                    Some(anchor) => (
+                        next_dx.clamp(anchor.dx_range.0, anchor.dx_range.1),
+                        next_dy.clamp(anchor.dy_range.0, anchor.dy_range.1),
+                    ),
+                    // Not a composited float (defensive duplicate also
+                    // living in the base layout): the offset paints nothing,
+                    // so store it verbatim; restore still drops the entry.
+                    None => (next_dx, next_dy),
+                };
+                self.float_offsets.insert(drag.leaf, (stored_dx, stored_dy));
                 self.pending_full_redraw = true;
                 self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
             } else if !self.leaf_is_floating(drag.leaf) {
@@ -276,6 +305,9 @@ impl Runtime {
     /// re-anchor offset — the drop point is the new anchor — while a
     /// structural float keeps its moved overlay bounds and a mode float
     /// keeps its anchored frame.
+    ///
+    /// CTX-1147: ending the drag keeps a detached float's accumulated
+    /// re-anchor offset the same way; restore drops it.
     pub fn end_alt_drag(&mut self) -> bool {
         if self.alt_drag.is_none() {
             return false;
@@ -344,6 +376,9 @@ impl Runtime {
     /// Alt+press on a presented pinned frame failed soft in
     /// [`Self::begin_alt_drag`] (no selection started, but no grab either)
     /// while the Mod tiled-drag below could grab the covered base leaf.
+    ///
+    /// CTX-1147: a workspace-local detached float is composited the same
+    /// way, so it counts as floating too.
     fn leaf_is_floating(&self, id: ViewId) -> bool {
         if self
             .layout
@@ -355,6 +390,9 @@ impl Runtime {
             return true;
         }
         if self.pinned.contains(id) {
+            return true;
+        }
+        if self.floats.contains(id) {
             return true;
         }
         self.layout

@@ -29,9 +29,10 @@ pub(crate) const PIN_CASCADE_DX: u16 = 3;
 pub(crate) const PIN_CASCADE_DY: u16 = 2;
 
 /// Anchored geometry plus the permitted Alt+drag re-anchor range for one
-/// composited pinned leaf (CTX-1081, CodeRabbit 1893 follow-up).
+/// composited pinned or detached-float leaf (CTX-1081, CodeRabbit 1893
+/// follow-up; CTX-1147 reuses it for detached floats).
 ///
-/// Single source of truth shared by the pinned composite in
+/// Single source of truth shared by the pinned/detached composite in
 /// [`Runtime::present_frames`] (which composes `origin + clamped drag`)
 /// and the update-time stored-offset clamp in
 /// [`Runtime::update_alt_drag_at`]: both derive base, cascade, and
@@ -750,6 +751,50 @@ impl Runtime {
         })
     }
 
+    /// Anchored geometry + permitted Alt+drag range for detached float `id`
+    /// (CTX-1147).
+    ///
+    /// Mirrors [`Self::pinned_anchor`]: the same centered
+    /// [`float_frame`](bitty_ui::presentation::float_frame) base, the same
+    /// pin-depth cascade step (so stacked floats stay individually visible
+    /// and clickable), and the same container clamp — only the depth counts
+    /// over the workspace-local detached floats instead of the
+    /// window-global pins. Returns `None` when `id` is not a composited
+    /// detached float.
+    pub(super) fn float_anchor(&self, id: ViewId) -> Option<PinnedAnchor> {
+        let base_ids = self.layout.leaf_ids();
+        let depth = self
+            .floats
+            .ids()
+            .into_iter()
+            .filter(|fid| !base_ids.contains(fid))
+            .position(|fid| fid == id)?;
+        let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+        let step = u16::try_from(depth).unwrap_or(u16::MAX);
+        let max_x = self
+            .container
+            .x
+            .saturating_add(self.container.width.saturating_sub(base.width));
+        let max_y = self
+            .container
+            .y
+            .saturating_add(self.container.height.saturating_sub(base.height));
+        let origin_x = i32::from(base.x) + i32::from(PIN_CASCADE_DX.saturating_mul(step));
+        let origin_y = i32::from(base.y) + i32::from(PIN_CASCADE_DY.saturating_mul(step));
+        Some(PinnedAnchor {
+            origin: (origin_x, origin_y),
+            size: (base.width, base.height),
+            dx_range: (
+                i32::from(self.container.x) - origin_x,
+                i32::from(max_x) - origin_x,
+            ),
+            dy_range: (
+                i32::from(self.container.y) - origin_y,
+                i32::from(max_y) - origin_y,
+            ),
+        })
+    }
+
     /// Live-present View frames in physical pixels (CTX-0294).
     ///
     /// The accepted CTX-0118 decoration is logical px; this is the render-time
@@ -808,43 +853,82 @@ impl Runtime {
         // stash/load keep working on the base layout, and the same leaf
         // never lives in two trees at once (a pinned id already present in
         // the base layout is skipped defensively).
+        //
+        // CTX-1147 (#1975): the active workspace's detached floats composite
+        // the same way, ahead of the pins: tiled base, in-tree mode floats,
+        // workspace detached floats in detach order, then pinned leaves in
+        // pin order (sticky chrome stays topmost). Detached ids already
+        // present in the base layout are skipped defensively, exactly like
+        // pins.
         let scene: LayoutNode;
-        let scene = if self.pinned.is_empty() {
+        let scene = if self.pinned.is_empty() && self.floats.is_empty() {
             &self.layout
         } else {
             let base_ids = self.layout.leaf_ids();
-            let layers: Vec<bitty_ui::OverlayLayer> = self
-                .pinned
-                .ids()
-                .into_iter()
-                .filter(|id| !base_ids.contains(id))
-                .filter_map(|id| {
-                    let view = self.pinned.get(id)?.clone();
-                    let anchor = self.pinned_anchor(id)?;
-                    // CTX-1081: an Alt+drag re-anchor offset moves the
-                    // anchored bounds without touching the store (the drop
-                    // point becomes the new anchor; unpin drops the offset).
-                    // The drag clamps into the permitted range first, so the
-                    // composed origin stays in-container even when the
-                    // container shrank after the drop; a missing entry
-                    // drifts nothing.
-                    let (drag_dx, drag_dy) =
-                        self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
-                    let bounds = UiRect::new(
-                        (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
-                            as u16,
-                        (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
-                            as u16,
-                        anchor.size.0,
-                        anchor.size.1,
-                    );
-                    Some(bitty_ui::OverlayLayer::new(
-                        OverlayTier::Float,
-                        LayoutNode::leaf(view),
-                        bounds,
-                    ))
-                })
-                .collect();
+            let mut layers: Vec<bitty_ui::OverlayLayer> = Vec::new();
+            layers.extend(
+                self.floats
+                    .ids()
+                    .into_iter()
+                    .filter(|id| !base_ids.contains(id))
+                    .filter_map(|id| {
+                        let view = self.floats.get(id)?.clone();
+                        let anchor = self.float_anchor(id)?;
+                        // CTX-1147: same re-anchor discipline as pins
+                        // (CTX-1081): the Alt+drag offset moves the anchored
+                        // bounds without touching the store; the drop keeps
+                        // it and restore drops it. Clamped into the
+                        // permitted range first so the composed origin stays
+                        // in-container.
+                        let (drag_dx, drag_dy) =
+                            self.float_offsets.get(&id).copied().unwrap_or((0, 0));
+                        let bounds = UiRect::new(
+                            (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
+                                as u16,
+                            (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
+                                as u16,
+                            anchor.size.0,
+                            anchor.size.1,
+                        );
+                        Some(bitty_ui::OverlayLayer::new(
+                            OverlayTier::Float,
+                            LayoutNode::leaf(view),
+                            bounds,
+                        ))
+                    }),
+            );
+            layers.extend(
+                self.pinned
+                    .ids()
+                    .into_iter()
+                    .filter(|id| !base_ids.contains(id))
+                    .filter_map(|id| {
+                        let view = self.pinned.get(id)?.clone();
+                        let anchor = self.pinned_anchor(id)?;
+                        // CTX-1081: an Alt+drag re-anchor offset moves the
+                        // anchored bounds without touching the store (the drop
+                        // point becomes the new anchor; unpin drops the offset).
+                        // The drag clamps into the permitted range first, so the
+                        // composed origin stays in-container even when the
+                        // container shrank after the drop; a missing entry
+                        // drifts nothing.
+                        let (drag_dx, drag_dy) =
+                            self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
+                        let bounds = UiRect::new(
+                            (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
+                                as u16,
+                            (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
+                                as u16,
+                            anchor.size.0,
+                            anchor.size.1,
+                        );
+                        Some(bitty_ui::OverlayLayer::new(
+                            OverlayTier::Float,
+                            LayoutNode::leaf(view),
+                            bounds,
+                        ))
+                    }),
+            );
             scene = LayoutNode::overlay_stack(self.layout.clone(), layers);
             &scene
         };
@@ -866,9 +950,10 @@ impl Runtime {
                 // CTX-1058 (#1844 P1): mode-aware Float tier. The structural
                 // tier map covers `LayoutNode::Overlay` trees only; a leaf
                 // stamped `Floating` (or a shown `Scratchpad`) carries no
-                // structural tier, so honor the leaf mode here. The solver
-                // still ignores the mode (slot restore stays byte-identical);
-                // only the present tier and geometry lift.
+                // structural tier, so honor the leaf mode here. In-tree
+                // `Floating` leaves now arise only from unpin returns and
+                // pre-detach snapshots (CTX-1147 detaches new floats out of
+                // the tree); only the present tier and geometry lift.
                 let structural = tiers.get(&view).copied().flatten();
                 let mode_tier = scene
                     .find_leaf(view)
@@ -1143,6 +1228,16 @@ impl Runtime {
                 // CTX-1077: the frame belongs to a pinned leaf composited
                 // over the scene; keep its stored dims fresh the same way
                 // so unpin and session capture see live geometry.
+                stored.reflow_to_rect(UiRect::new(
+                    x.min(u32::from(u16::MAX)) as u16,
+                    y.min(u32::from(u16::MAX)) as u16,
+                    frame.cols,
+                    frame.rows,
+                ));
+            } else if let Some(stored) = self.floats.find_mut(frame.view) {
+                // CTX-1147: the frame belongs to a detached float
+                // composited over the scene; keep its stored dims fresh the
+                // same way so restore and session capture see live geometry.
                 stored.reflow_to_rect(UiRect::new(
                     x.min(u32::from(u16::MAX)) as u16,
                     y.min(u32::from(u16::MAX)) as u16,
@@ -1952,7 +2047,12 @@ impl Runtime {
         // CTX-1077: a pinned leaf composited over the scene is a valid focus
         // target even though it lives outside the live layout; its session
         // stays keyed globally by `ViewId`, so input routes to it unchanged.
-        if self.layout.leaf_ids().contains(&id) || self.pinned.contains(id) {
+        // CTX-1147: a workspace-local detached float is a valid focus target
+        // the same way.
+        if self.layout.leaf_ids().contains(&id)
+            || self.pinned.contains(id)
+            || self.floats.contains(id)
+        {
             // Only dirty when the focus actually moves; re-selecting the
             // focused pane is a no-op present-wise.
             if self.focus.focused() != Some(id) {
@@ -2283,7 +2383,13 @@ impl Runtime {
         {
             return Some(size);
         }
-        self.pinned.get(view).and_then(|stored| stored.fixed_size())
+        if let Some(size) = self.pinned.get(view).and_then(|stored| stored.fixed_size()) {
+            return Some(size);
+        }
+        // CTX-1147: detaching moves the whole flagged `View` out of the
+        // layout like pinning does; without this the next sync would size
+        // the detached grid and PTY to the anchor instead of the flag.
+        self.floats.get(view).and_then(|stored| stored.fixed_size())
     }
 
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):

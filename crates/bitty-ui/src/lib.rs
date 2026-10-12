@@ -72,9 +72,10 @@
 //!   `Panel` -> `Activity` spatial/identity model with the
 //!   `PanelId != ViewId != TerminalId` inequality by construction
 //!   (UX-15, CTX-0662, candidate).
-//! - [`presentation::toggle_floating`] /
-//!   [`presentation::apply_floating_toggle`] toggle one leaf Tiled ⇄ Floating
-//!   (UX-03, `bitty.workspace:floating-toggle`).
+//! - [`floated::FloatStore`] — workspace-local detached floating panels:
+//!   detach collapses the slot (siblings refill) and restore re-inserts a
+//!   fresh balanced split back to tiling (CTX-1147,
+//!   `bitty.workspace:floating-toggle`).
 //! - [`ui_levels`] — U-3 five-level architecture contract (UX-16,
 //!   CTX-0668, candidate): L0 Rust mechanisms -> L1 Lua primitives ->
 //!   L2 core -> L3 domain -> L4 apps, with the downward-only dependency
@@ -151,6 +152,7 @@ pub mod canvas;
 pub mod decoration;
 pub mod drag;
 pub mod drag_bar;
+pub mod floated;
 pub mod focus;
 pub mod geometry;
 pub mod gesture;
@@ -218,6 +220,7 @@ pub use drag_bar::{
     BarOutcome, BarPhase, BarUndoStack, BarZone, MAX_BAR_UNDO, MAX_BAR_WORKSPACES,
     classify_bar_drop, undo_bar_drop,
 };
+pub use floated::{FLOAT_RESTORE_RATIO, FloatError, FloatStore};
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
 pub use gesture::{
@@ -272,10 +275,10 @@ pub use panel_state::{
 };
 pub use pinned::{PIN_CMD_TOGGLE, PinnedEntry, PinnedError, PinnedStore, apply_pin_toggle};
 pub use presentation::{
-    FLOATING_CMD_TOGGLE, FloatingToggleError, PRESENTATION_CMD_FLOATING,
-    PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD, PRESENTATION_CMD_TILED,
-    PresentationCommandError, PresentationMode, apply_floating_toggle, apply_presentation_command,
-    presentation_command_for_mode, presentation_mode_for_command,
+    FLOATING_CMD_TOGGLE, PRESENTATION_CMD_FLOATING, PRESENTATION_CMD_FULLSCREEN,
+    PRESENTATION_CMD_SCRATCHPAD, PRESENTATION_CMD_TILED, PresentationCommandError,
+    PresentationMode, apply_presentation_command, presentation_command_for_mode,
+    presentation_mode_for_command,
 };
 pub use provider::{
     DEFAULT_PROVIDER_RATIO, DWINDLE_PROVIDER_ID, DwindleProvider, GRID_PROVIDER_ID, GridProvider,

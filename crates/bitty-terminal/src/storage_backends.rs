@@ -217,6 +217,7 @@ fn storage_snapshot_to_core(snap: &session_codec::SessionSnapshot) -> SessionSna
                     layout,
                     focus: ws.focus.map(ViewId::new),
                     panes,
+                    floats: Vec::new(),
                 }
             })
             .collect(),
@@ -379,7 +380,16 @@ fn encode_pinned_block(pinned: &[PinnedSnapshot]) -> Vec<String> {
 /// codec with the magic rewritten and the pinned block spliced before
 /// `end-session`. Fails closed before any I/O when any ceiling trips,
 /// including escaped pinned lines that would exceed the decode line cap.
+///
+/// CTX-1147: workspace-local detached floats ride the in-memory snapshot
+/// only — the v3 file carries no floats block, so a snapshot with detached
+/// floats fails closed here instead of silently dropping them. A v4 file
+/// follow-up persists them; until then a save with a detached float warns
+/// and keeps the previous complete session authoritative.
 fn encode_v3_snapshot(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
+    if snap.workspaces.iter().any(|ws| !ws.floats.is_empty()) {
+        return Err(SessionError::Corrupt("floats version"));
+    }
     let layout_leaves: std::collections::BTreeSet<ViewId> = snap
         .workspaces
         .iter()
@@ -891,6 +901,7 @@ mod tests {
                         None,
                         PresentationMode::Tiled,
                     )],
+                    floats: Vec::new(),
                 }],
                 active: 0,
                 mru: vec![0],
@@ -924,6 +935,7 @@ mod tests {
                             PresentationMode::Tiled,
                         ),
                     ],
+                    floats: Vec::new(),
                 }],
                 active: 0,
                 mru: vec![0],
@@ -957,6 +969,7 @@ mod tests {
                             PresentationMode::Scratchpad,
                         ),
                     ],
+                    floats: Vec::new(),
                 }],
                 active: 0,
                 mru: vec![0],
@@ -977,6 +990,7 @@ mod tests {
                             Some(PaneAttachment::Session),
                             PresentationMode::Tiled,
                         )],
+                        floats: Vec::new(),
                     },
                     WorkspaceSnapshot {
                         seq: 2,
@@ -1002,6 +1016,7 @@ mod tests {
                                 PresentationMode::Fullscreen,
                             ),
                         ],
+                        floats: Vec::new(),
                     },
                 ],
                 active: 1,
@@ -1022,6 +1037,7 @@ mod tests {
                         Some(PaneAttachment::Session),
                         PresentationMode::Tiled,
                     )],
+                    floats: Vec::new(),
                 }],
                 active: 0,
                 mru: vec![0],
@@ -1326,6 +1342,7 @@ mod tests {
                     PresentationMode::Tiled,
                 ),
             ],
+            floats: Vec::new(),
         }
     }
 

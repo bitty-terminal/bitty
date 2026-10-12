@@ -44,6 +44,12 @@
 //! (the neighboring leaf id at pin time and which side the leaf returns
 //! to); a missing anchor at unpin falls back to docking beside the first
 //! live leaf, exactly like a live unpin whose anchor closed meanwhile.
+//! CTX-1147 detached floats ride the in-memory snapshot only (per-workspace
+//! `floats` on [`WorkspaceSnapshot`], in detach order, no anchor — restore
+//! re-inserts a fresh balanced split): the v3 file carries no floats block,
+//! file encode rejects non-empty floats fail-closed, and file decode yields
+//! empty floats. A v4 file follow-up persists them; the in-memory shape
+//! never smuggles them into v3.
 //! The v2 pane header appends three fixed tokens: `<attach>` is the live
 //! attachment map (`primary` = owned the primary grid, `session` = owned a
 //! private pane session, `detached` = session-less leaf with no state);
@@ -58,15 +64,17 @@
 //!
 //! | File version | Decoder behavior |
 //! |---|----------------------------------------------------------------------------|
-//! | v1 | Migrated in memory (unspecified attachment, terminal route, tiled mode, empty pinned store); capture always writes v3. |
-//! | v2 | Migrated in memory (empty pinned store); the workspace blocks decode exactly like v3. |
-//! | v3 | Native: workspace blocks plus the window-global pinned block. |
+//! | v1 | Migrated in memory (unspecified attachment, terminal route, tiled mode, empty pinned store, empty floats); capture always writes v3. |
+//! | v2 | Migrated in memory (empty pinned store, empty floats); the workspace blocks decode exactly like v3. |
+//! | v3 | Native: workspace blocks plus the window-global pinned block (in-memory snapshots additionally carry per-workspace detached floats, which the file never persists in this slice). |
 //! | anything else | [`SessionError::UnsupportedVersion`]: whole file rejected before any other parsing, runtime untouched. |
 //!
 //! Migration normalizes at decode: downstream (validation, apply,
 //! re-encode) only ever sees [`SESSION_FORMAT_VERSION`] snapshots. A v1/v2
 //! snapshot carrying pinned entries is corrupt (those versions carry no
-//! pinned block by construction). Unknown `<attach>`/`<route>`/`<mode>`
+//! pinned block by construction); a v1/v2/v3 file carrying floats is
+//! impossible (no floats block exists yet — decode always yields empty
+//! floats). Unknown `<attach>`/`<route>`/`<mode>`
 //! tokens in a v2/v3 file are
 //! [`SessionError::Corrupt`], never defaulted — a future activity route or
 //! mode must arrive with its own format version, not smuggled into v3.
@@ -102,6 +110,14 @@
 //!   Alt+drag re-anchor offset is presentation-only and resets: a restored
 //!   pin presents at its cascade anchor, exactly like a fresh pin (unpin
 //!   already drops the offset, so the lifecycle stays consistent).
+//! * Detached floats restore into their workspace's float store (CTX-1147):
+//!   the parked leaf (identity, geometry, `Floating` mode) plus its cwd
+//!   plus scrollback history come back in detach order, so the composited
+//!   scene presents identically. Attached detached floats wait pending like
+//!   attached layout panes; `detached` ones restore empty with no entry.
+//!   The Alt+drag re-anchor offset resets like pins (restore already drops
+//!   it). In-memory only in this slice: the v3 file never carries floats,
+//!   so a file restore always yields empty float stores.
 //!
 //! Field escaping is backslash-only (`\\` → `\`, `\n` → LF, `\r` → CR);
 //! whole-line fields (name, cwd, scrollback) may contain spaces. Transient
@@ -184,7 +200,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bitty_ui::{Focus, LayoutNode, PinnedStore, PresentationMode, View, ViewId};
+use bitty_ui::{FloatStore, Focus, LayoutNode, PinnedStore, PresentationMode, View, ViewId};
 
 use super::panes::osc7_cwd_path;
 use super::workspaces::WorkspaceSlot;
@@ -440,6 +456,29 @@ pub struct PinnedSnapshot {
     pub after: bool,
 }
 
+/// One workspace-local detached float's persisted state (CTX-1147): the
+/// parked view plus its cwd plus scrollback history.
+///
+/// Like [`PinnedSnapshot`] this carries the full stripped [`View`]
+/// (identity, geometry, `Floating` mode) instead of referencing a layout
+/// leaf. Unlike a pin record there is no restore anchor: restore
+/// re-inserts a fresh balanced split, so the original position is never
+/// persisted. In-memory only in this slice: the v3 file codec carries no
+/// floats block (encode rejects non-empty floats fail-closed; decode
+/// yields empty floats) and a v4 file follow-up persists them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSnapshot {
+    /// Parked leaf (stripped: identity, geometry, floating mode).
+    pub view: View,
+    /// Captured `OSC 7` report, if the detached leaf had a live grid.
+    pub cwd: Option<String>,
+    /// Scrollback lines oldest-first, trimmed, bounded like panes.
+    pub scrollback: Vec<String>,
+    /// Live attachment at capture (`primary`/`session` earn a pending
+    /// restore; `detached` restores empty). Always recorded.
+    pub attach: PaneAttachment,
+}
+
 /// One workspace's persisted state: identity plus layout, focus, and panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSnapshot {
@@ -453,6 +492,10 @@ pub struct WorkspaceSnapshot {
     pub focus: Option<ViewId>,
     /// Per-pane history, exactly covering the layout leaves.
     pub panes: Vec<PaneSnapshot>,
+    /// Workspace-local detached floats in detach order (CTX-1147).
+    ///
+    /// Empty for migrated v1/v2/v3 snapshots, which carry no floats block.
+    pub floats: Vec<FloatSnapshot>,
 }
 
 /// A persistable session: all workspaces plus active index, MRU order, and
@@ -477,7 +520,8 @@ pub struct SessionSnapshot {
 pub struct SessionRestoreSummary {
     /// Workspaces rebuilt.
     pub workspaces: usize,
-    /// Panes rebuilt (layout leaves plus restored pinned entries).
+    /// Panes rebuilt (layout leaves plus restored pinned and detached-float
+    /// entries).
     pub panes: usize,
     /// Scrollback lines rehydrated into live grids.
     pub scrollback_lines: usize,
@@ -490,7 +534,8 @@ pub struct SessionRestoreSummary {
 pub struct SessionSaveSummary {
     /// Workspaces persisted.
     pub workspaces: usize,
-    /// Panes persisted (layout leaves plus pinned entries).
+    /// Panes persisted (layout leaves plus pinned and detached-float
+    /// entries).
     pub panes: usize,
     /// Scrollback lines persisted.
     pub scrollback_lines: usize,
@@ -629,9 +674,16 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
     }
     // CTX-1082: only v3 carries a pinned block; an older version claiming
     // pinned entries never came from a decoder (decode migrates to an empty
-    // store) and is corrupt.
+    // store) and is corrupt. CTX-1147: no file version carries a floats
+    // block yet (in-memory only); an older version claiming floats never
+    // came from a decoder and is corrupt the same way.
     if snap.version < SESSION_FORMAT_VERSION && !snap.pinned.is_empty() {
         return Err(SessionError::Corrupt("pinned version"));
+    }
+    if snap.version < SESSION_FORMAT_VERSION
+        && snap.workspaces.iter().any(|ws| !ws.floats.is_empty())
+    {
+        return Err(SessionError::Corrupt("floated version"));
     }
     if snap.workspaces.is_empty() || snap.workspaces.len() > MAX_SESSION_WORKSPACES {
         return Err(SessionError::Corrupt("workspace count"));
@@ -721,6 +773,53 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
         if total_panes > MAX_SESSION_PANES_TOTAL {
             return Err(SessionError::Corrupt("too many panes"));
         }
+        // CTX-1147: workspace-local detached floats share the decode-CPU
+        // total with layout panes (same per-entry history profile) and must
+        // name live ids outside every layout tree and the pinned store; the
+        // mode is always `Floating` (detaching stamps it) and a
+        // session-less detached float carries no state, exactly like a
+        // `detached` layout pane. Unlike pins there is no anchor to carry.
+        // The per-workspace cap covers layout leaves only (floats are
+        // bounded by the same live-leaf population that produced them).
+        for float in &ws.floats {
+            if !all_views.insert(float.view.id()) {
+                return Err(SessionError::Corrupt("duplicate pane"));
+            }
+            if float.view.presentation() != PresentationMode::Floating {
+                return Err(SessionError::Corrupt("floated mode"));
+            }
+            let (cols, rows) = (
+                usize::from(float.view.cols()),
+                usize::from(float.view.rows()),
+            );
+            if !(1..=MAX_SESSION_GRID_DIM).contains(&cols)
+                || !(1..=MAX_SESSION_GRID_DIM).contains(&rows)
+            {
+                return Err(SessionError::Corrupt("floated dims"));
+            }
+            if let Some(cwd) = &float.cwd {
+                if cwd.len() > MAX_SESSION_CWD_BYTES {
+                    return Err(SessionError::Corrupt("cwd bound"));
+                }
+            }
+            if float.scrollback.len() > MAX_SESSION_SCROLLBACK_LINES_PER_PANE {
+                return Err(SessionError::Corrupt("scrollback bound"));
+            }
+            for line in &float.scrollback {
+                if line.len() > MAX_SESSION_LINE_TEXT_BYTES {
+                    return Err(SessionError::Corrupt("scrollback line bound"));
+                }
+            }
+            if float.attach == PaneAttachment::Detached
+                && (float.cwd.is_some() || !float.scrollback.is_empty())
+            {
+                return Err(SessionError::Corrupt("detached pane state"));
+            }
+        }
+        total_panes += ws.floats.len();
+        if total_panes > MAX_SESSION_PANES_TOTAL {
+            return Err(SessionError::Corrupt("too many panes"));
+        }
     }
     // CTX-1082: pinned entries share the decode-CPU total with layout
     // panes (same per-entry history profile) and must name live ids
@@ -767,7 +866,9 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
     // it across the whole file. Pinned entries are excluded from the tally:
     // they never hydrate the shared grid (apply routes every attached pinned
     // leaf to a pending respawn, the stale-owner downgrade by construction),
-    // so a recorded pinned `primary` is not a second grid claim.
+    // so a recorded pinned `primary` is not a second grid claim. CTX-1147:
+    // detached floats are excluded the same way (attached ones wait pending
+    // like pins, never hydrating the grid).
     // Count resolved attachments, not recorded ones:
     // a `None` (v1-legacy) pane resolves through `derive_startup_owner` at
     // encode, so one explicit primary off-owner plus a `None` on the derived
@@ -930,10 +1031,10 @@ impl Runtime {
     pub fn capture_session_snapshot(&self) -> SessionSnapshot {
         let mut workspaces = Vec::with_capacity(self.workspaces.len());
         for (index, slot) in self.workspaces.iter().enumerate() {
-            let (layout, focus) = if index == self.active_workspace {
-                (self.layout.clone(), self.focus.clone())
+            let (layout, focus, floats) = if index == self.active_workspace {
+                (self.layout.clone(), self.focus.clone(), self.floats.ids())
             } else {
-                (slot.layout.clone(), slot.focus.clone())
+                (slot.layout.clone(), slot.focus.clone(), slot.floats.ids())
             };
             let layout = strip_overlays(&layout);
             let leaves = layout.leaf_ids();
@@ -970,12 +1071,61 @@ impl Runtime {
                     mode,
                 });
             }
+            // CTX-1147: the workspace-local detached floats are
+            // layout-detached, so the pane loop above never sees them —
+            // capture every parked leaf in detach order (present-time paint
+            // order) with its live history. The stored view rebuilds
+            // stripped (identity, geometry, floating mode) so origin never
+            // persists, exactly like the pinned capture; the Alt+drag
+            // re-anchor offset is presentation-only and is never captured
+            // (restore re-inserts a fresh split).
+            let floats_store = if index == self.active_workspace {
+                &self.floats
+            } else {
+                &slot.floats
+            };
+            let mut floated = Vec::with_capacity(floats.len());
+            for id in floats {
+                let Some(stored) = floats_store.get(id).cloned() else {
+                    continue;
+                };
+                let mut view = View::with_presentation(
+                    id,
+                    usize::from(stored.cols()),
+                    usize::from(stored.rows()),
+                    PresentationMode::Floating,
+                );
+                view.set_pseudo_constraint(stored.pseudo_constraint());
+                view.set_fixed_size(stored.fixed_size());
+                let state = self.session_state_for(id);
+                let (cwd, scrollback) = match state {
+                    Some(state) => (
+                        state.cwd_report().map(str::to_owned),
+                        scrollback_tail_text(state, MAX_SESSION_SCROLLBACK_LINES_PER_PANE),
+                    ),
+                    None => (None, Vec::new()),
+                };
+                let attach = if self.primary_view == Some(id) {
+                    PaneAttachment::Primary
+                } else if self.pane_sessions.contains_key(&id) {
+                    PaneAttachment::Session
+                } else {
+                    PaneAttachment::Detached
+                };
+                floated.push(FloatSnapshot {
+                    view,
+                    cwd,
+                    scrollback,
+                    attach,
+                });
+            }
             workspaces.push(WorkspaceSnapshot {
                 seq: slot.seq,
                 name: slot.name.clone(),
                 layout,
                 focus: focus.focused(),
                 panes,
+                floats: floated,
             });
         }
         // CTX-1082: the window-global pinned store is layout-detached, so
@@ -1067,6 +1217,15 @@ impl Runtime {
                 return Err(SessionError::Corrupt("attachment in use"));
             }
         }
+        // CTX-1147: detached-float views collide the same way: their pending
+        // restores also drain into fresh grids.
+        for ws in &snap.workspaces {
+            for float in &ws.floats {
+                if self.pane_sessions.contains_key(&float.view.id()) {
+                    return Err(SessionError::Corrupt("attachment in use"));
+                }
+            }
+        }
         // CTX-0567 (#992): fold the outgoing live layout plus every stashed
         // slot into the monotonic high-water before a restore replaces them.
         // An id installed through the `layout_mut` escape never hit an
@@ -1076,11 +1235,18 @@ impl Runtime {
         let mut workspaces = Vec::with_capacity(snap.workspaces.len());
         for ws in &snap.workspaces {
             let focus = ws.focus.map_or_else(Focus::new, Focus::with_focus);
+            // CTX-1147: per-workspace detached floats install with their
+            // slot, in snapshot detach order (present-time paint order).
+            let mut floats = FloatStore::new();
+            for float in &ws.floats {
+                floats.restore_detached(float.view.clone());
+            }
             workspaces.push(WorkspaceSlot {
                 seq: ws.seq,
                 name: ws.name.clone(),
                 layout: ws.layout.clone(),
                 focus,
+                floats,
             });
         }
         self.workspaces = workspaces;
@@ -1088,6 +1254,11 @@ impl Runtime {
         self.workspace_mru = snap.mru.iter().copied().collect::<VecDeque<_>>();
         self.layout = self.workspaces[snap.active].layout.clone();
         self.focus = self.workspaces[snap.active].focus.clone();
+        // CTX-1147: the live floats mirror the newly active slot; the
+        // Alt+drag re-anchor offsets reset like pins (presentation-only,
+        // and restore already drops them).
+        self.floats = self.workspaces[snap.active].floats.clone();
+        self.float_offsets.clear();
         // CTX-1082: a restore installs a whole new world, so the pinned
         // store is replaced wholesale in snapshot pin order (present-time
         // paint order) with the recorded unpin anchors. The Alt+drag
@@ -1167,6 +1338,27 @@ impl Runtime {
                 PaneAttachment::Detached => {}
             }
         }
+        // CTX-1147: attached detached floats wait pending like attached
+        // pinned leaves — detached views never own the primary grid (the
+        // startup recipe binds it at the derived layout owner), so even a
+        // recorded `primary` routes to a pending respawn and keeps its own
+        // history and cwd. `Detached` floats restore empty with no entry,
+        // and the entry drains on the next successful spawn of that view.
+        for ws in &snap.workspaces {
+            for float in &ws.floats {
+                panes += 1;
+                match float.attach {
+                    PaneAttachment::Primary | PaneAttachment::Session => {
+                        self.stage_pending(
+                            float.view.id(),
+                            float.cwd.clone(),
+                            float.scrollback.clone(),
+                        );
+                    }
+                    PaneAttachment::Detached => {}
+                }
+            }
+        }
         // CTX-0873: a restore can change the workspace count across one,
         // which reserves or releases the bar band.
         self.refresh_chrome_band();
@@ -1204,8 +1396,9 @@ impl Runtime {
     }
 
     /// Stages one view's captured history and cwd in the pending map for
-    /// the next successful spawn of that view (shared by layout panes and
-    /// pinned entries, which drain through the same spawn paths).
+    /// the next successful spawn of that view (shared by layout panes,
+    /// pinned entries, and detached floats, which drain through the same
+    /// spawn paths).
     fn stage_pending(&mut self, view: ViewId, cwd: Option<String>, scrollback: Vec<String>) {
         self.session_pending
             .insert(view, PendingPaneRestore { cwd, scrollback });
@@ -1314,6 +1507,14 @@ impl Runtime {
         // layout filter above and cover them here, in stable pin order.
         targets.extend(
             self.pinned
+                .ids()
+                .into_iter()
+                .filter(|view| still_pending(view)),
+        );
+        // CTX-1147: live detached floats live in no layout either — cover
+        // them here in detach order.
+        targets.extend(
+            self.floats
                 .ids()
                 .into_iter()
                 .filter(|view| still_pending(view)),
@@ -1621,6 +1822,7 @@ mod tests {
                 route: PaneRoute::Terminal,
                 mode: PresentationMode::Tiled,
             }],
+            floats: Vec::new(),
         };
         let snap = SessionSnapshot {
             version: SESSION_FORMAT_VERSION,
@@ -1645,6 +1847,7 @@ mod tests {
                     route: PaneRoute::Terminal,
                     mode: PresentationMode::Tiled,
                 }],
+                floats: Vec::new(),
             }],
             active: 0,
             mru: vec![1],
@@ -1727,6 +1930,7 @@ mod tests {
                     },
                     v2_pane(2, Some(PaneAttachment::Session)),
                 ],
+                floats: Vec::new(),
             }],
             active: 0,
             mru: vec![0],
@@ -1821,6 +2025,7 @@ mod tests {
                     v2_pane(2, None),
                     v2_pane(3, None),
                 ],
+                floats: Vec::new(),
             }],
             active: 0,
             mru: vec![0],

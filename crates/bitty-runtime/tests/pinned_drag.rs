@@ -58,12 +58,6 @@ fn install(rt: &mut Runtime, layout: LayoutNode) {
     rt.set_container(UiRect::new(0, 0, 80, 24));
 }
 
-fn toggle(rt: &mut Runtime, id: ViewId) {
-    let mut tree = rt.layout().clone();
-    bitty_ui::presentation::toggle_floating(&mut tree, id).expect("toggle must apply");
-    rt.set_layout(tree);
-}
-
 /// Cursor pixels landing on container cell (col, row) under the default
 /// headless geometry (8px padding inset, 9x19 cells, zero cell gaps, plus
 /// the unified CTX-0294/CTX-0333 default decoration outer gap + border +
@@ -120,7 +114,6 @@ fn alt_drag_grabs_pinned_leaf_not_the_covered_base() {
     })
     .expect("opt-out runtime must build");
     install(&mut rt, two_pane());
-    toggle(&mut rt, ViewId::new(1));
     rt.pin_floating(ViewId::new(1)).expect("pin must apply");
     assert!(rt.set_focus(ViewId::new(2)), "park focus on the base leaf");
 

@@ -14,9 +14,14 @@
 //! drops resolve through the accepted #1804 balanced policy at `0.5`, a
 //! committed drop settles via the move transition, and `Esc` cancels
 //! mid-drag restoring the pre-drag layout byte-identically.
+//!
+//! Issue #1981 (CTX-1167): motion holds the drag arms so ring progress
+//! accumulates toward full visibility; repeat motion never restarts the
+//! transition (which had pinned the ghost near-invisible).
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
 use bitty_runtime::{
-    AnimationKind, DropSpec, LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+    AnimationKind, AnimationPolicy, DropSpec, LayoutNode, ReducedMotionMode, Runtime,
+    RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
 
 fn make_runtime() -> Runtime {
@@ -294,27 +299,59 @@ fn drag_arms_live_preview_and_drop_settles() {
     rt.set_layout(two_pane());
     rt.handle_cursor_moved(cell_pixels(10, 12));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
-    rt.handle_mouse_input(press(MouseButton::Left));
-    assert!(rt.tiled_drag_active());
     let source = ViewId::new(1);
     let target = ViewId::new(2);
-    // Motion arms the ghost outline on the dragged frame plus the
-    // drop-target highlight under the cursor, both at the gesture time.
-    // The event path records the cursor for the live plan seam; the
-    // explicit clock then re-arms both transitions deterministically.
-    let t = Instant::now();
-    rt.handle_cursor_moved(cell_pixels(60, 12));
-    assert!(rt.update_tiled_drag_at(cell_pixels(60, 12), t));
+    // Grab on the virtual clock so the motion sequence below is fully
+    // deterministic (the press event path would arm on the wall clock).
+    let t0 = Instant::now();
+    assert!(rt.begin_tiled_drag_at(t0));
+    assert!(rt.tiled_drag_active());
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), t0),
+        Some(0.0),
+        "grab must arm the ghost outline at the gesture time"
+    );
+    // First motion onto the target arms the drop-target highlight at the
+    // gesture time; the source ghost is already climbing (held, not
+    // restarted).
+    let t1 = t0 + Duration::from_millis(20);
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t1);
     assert_eq!(rt.tiled_drag_preview(), Some(target));
     assert_eq!(
-        rt.animation_progress(AnimationKind::Drag, Some(source), t),
+        rt.animation_progress(AnimationKind::Drag, Some(target), t1),
         Some(0.0),
-        "ghost outline must arm at the gesture time"
+        "first hover must arm the drop-target highlight at the gesture time"
     );
-    assert_eq!(
-        rt.animation_progress(AnimationKind::Drag, Some(target), t),
-        Some(0.0),
-        "drop-target highlight must arm at the gesture time"
+    let p1 = rt
+        .animation_progress(AnimationKind::Drag, Some(source), t1)
+        .expect("ghost outline must stay live during motion");
+    assert!(
+        (0.0..1.0).contains(&p1),
+        "ghost must be visibly climbing at 20 ms, got {p1}"
+    );
+    // Repeat motion on the same target accumulates instead of restarting:
+    // both arms keep climbing from their first arm time. A restart policy
+    // would read back near 0.0 here and hold the ghost near-invisible.
+    let t2 = t1 + Duration::from_millis(40);
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t2);
+    assert_eq!(rt.tiled_drag_preview(), Some(target));
+    let p2 = rt
+        .animation_progress(AnimationKind::Drag, Some(source), t2)
+        .expect("ghost outline must stay live across repeat motion");
+    assert!(
+        p2 > p1,
+        "repeat motion must accumulate the ghost ({p1} -> {p2}), never restart it"
+    );
+    assert!(
+        p2 > 0.3,
+        "ghost must be clearly visible 60 ms into the gesture, got {p2}"
+    );
+    let q2 = rt
+        .animation_progress(AnimationKind::Drag, Some(target), t2)
+        .expect("highlight must stay live across repeat motion");
+    assert!(
+        (0.0..1.0).contains(&q2),
+        "highlight must be visibly climbing, got {q2}"
     );
     // The live plan tracks the hovered edge: the center tie docks left at
     // half, matching the position-based placement a release would commit.
@@ -323,7 +360,7 @@ fn drag_arms_live_preview_and_drop_settles() {
         Some(DropSpec::new(target, SplitAxis::Horizontal, 0.5, false))
     );
     // Mid-transition the preview is still live.
-    let mid = t + Duration::from_millis(75);
+    let mid = t0 + Duration::from_millis(75);
     assert!(
         rt.animation_progress(AnimationKind::Drag, Some(source), mid)
             .is_some(),
@@ -331,11 +368,11 @@ fn drag_arms_live_preview_and_drop_settles() {
     );
     // Release commits the edge insert and settles via the move transition;
     // the preview clears with the gesture.
-    rt.handle_cursor_moved(cell_pixels(70, 12));
-    let t1 = Instant::now();
-    assert!(rt.end_tiled_drag_at(t1));
+    rt.handle_cursor_moved_at(cell_pixels(70, 12), t0 + Duration::from_millis(90));
+    let t4 = t0 + Duration::from_millis(100);
+    assert!(rt.end_tiled_drag_at(t4));
     assert_eq!(
-        rt.animation_progress(AnimationKind::Move, Some(source), t1),
+        rt.animation_progress(AnimationKind::Move, Some(source), t4),
         Some(0.0),
         "committed drop must settle, not snap"
     );
@@ -343,6 +380,117 @@ fn drag_arms_live_preview_and_drop_settles() {
     assert_eq!(rt.tiled_drag_preview(), None);
     assert_eq!(rt.tiled_drag_drop_spec(), None);
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn motion_sequence_accumulates_ghost_monotonically() {
+    use std::time::{Duration, Instant};
+    // CTX-1167: a five-step motion burst on the virtual clock must show a
+    // monotonically climbing ghost — every step advances the same arm, so
+    // the ring is visibly present through the whole gesture instead of
+    // pinned near 0 by per-motion restarts.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let source = ViewId::new(1);
+    let target = ViewId::new(2);
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    let t0 = Instant::now();
+    assert!(rt.begin_tiled_drag_at(t0));
+    let mut prev = 0.0f32;
+    let mut step = 0u64;
+    while step < 5 {
+        step += 1;
+        let at = t0 + Duration::from_millis(10 * step);
+        rt.handle_cursor_moved_at(cell_pixels(60, 12), at);
+        assert_eq!(rt.tiled_drag_preview(), Some(target));
+        let p = rt
+            .animation_progress(AnimationKind::Drag, Some(source), at)
+            .expect("ghost must stay live through the burst");
+        assert!(
+            p > prev,
+            "motion step {step} must advance the ghost ({prev} -> {p}), never restart it"
+        );
+        prev = p;
+    }
+    assert!(
+        prev > 0.3,
+        "ghost must be clearly visible 50 ms into the burst, got {prev}"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn tiled_drag_instant_policies_arm_nothing() {
+    use std::time::{Duration, Instant};
+    // CTX-1167: disabled, reduced-motion-always, safe-mode, and 0 ms
+    // policies arm no tiled-drag transition, while the gesture itself still
+    // tracks the preview and still commits on release.
+    for policy in [
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: [0; AnimationKind::COUNT],
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = Runtime::new(RuntimeConfig {
+            animations: policy,
+            ..RuntimeConfig::default()
+        })
+        .expect("instant runtime must build");
+        let source = ViewId::new(1);
+        let target = ViewId::new(2);
+        rt.set_layout(two_pane());
+        rt.handle_cursor_moved(cell_pixels(10, 12));
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+        let t0 = Instant::now();
+        assert!(rt.begin_tiled_drag_at(t0));
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(source), t0)
+                .is_none(),
+            "suppressed grab must not arm: {policy:?}"
+        );
+        // Motion still tracks the preview; it just never animates.
+        let t1 = t0 + Duration::from_millis(20);
+        rt.handle_cursor_moved_at(cell_pixels(60, 12), t1);
+        assert_eq!(rt.tiled_drag_preview(), Some(target));
+        let t2 = t1 + Duration::from_millis(40);
+        rt.handle_cursor_moved_at(cell_pixels(60, 12), t2);
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(source), t2)
+                .is_none(),
+            "suppressed motion must not arm the ghost: {policy:?}"
+        );
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(target), t2)
+                .is_none(),
+            "suppressed motion must not arm the highlight: {policy:?}"
+        );
+        assert!(!rt.animations_active());
+        assert_eq!(rt.animation_deadline(), None);
+        // Release still ends the gesture; the drop settles instantly.
+        rt.handle_cursor_moved_at(cell_pixels(70, 12), t2 + Duration::from_millis(10));
+        let t4 = t2 + Duration::from_millis(20);
+        assert!(rt.end_tiled_drag_at(t4));
+        assert!(
+            rt.animation_progress(AnimationKind::Move, Some(source), t4)
+                .is_none(),
+            "suppressed drop must settle instantly: {policy:?}"
+        );
+        assert!(!rt.tiled_drag_active());
+        rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    }
 }
 
 #[test]

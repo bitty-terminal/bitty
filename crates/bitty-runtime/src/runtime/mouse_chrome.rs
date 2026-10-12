@@ -19,9 +19,11 @@
 //!
 //! Issue #1811 (CTX-1070): the tiled move shows continuous feedback — the
 //! grab arms the drag transition on the dragged frame (ghost outline) and
-//! every motion re-arms it on the dragged frame plus the hovered drop
-//! target (drop-target highlight), all through the existing Core-owned
-//! chrome-ring fade (geometry and terminal content are never interpolated).
+//! the first hover arms it on the hovered drop target (drop-target
+//! highlight), all through the existing Core-owned chrome-ring fade
+//! (geometry and terminal content are never interpolated). CTX-1167:
+//! motion holds those arms so progress accumulates toward full visibility
+//! instead of restarting near 0 on every motion.
 //! A committed drop arms the move transition on the moved panel so the
 //! result settles instead of snapping, and `Esc` cancels mid-drag with the
 //! tree untouched (the preview never mutates, so cancel restores the
@@ -737,8 +739,9 @@ impl Runtime {
         self.clear_hover_pending();
         // CTX-1070 (issue #1811): the grab arms the drag transition on the
         // dragged frame (ghost outline). The layout is untouched — only the
-        // leaf's chrome ring fades — and repeat motion restarts the bounded
-        // transition instead of accumulating (see `update_tiled_drag_at`).
+        // leaf's chrome ring fades — and repeat motion holds the arm so
+        // progress accumulates toward full visibility instead of
+        // restarting (CTX-1167, see `update_tiled_drag_at`).
         self.trigger_animation(AnimationKind::Drag, Some(leaf), now);
         true
     }
@@ -778,17 +781,30 @@ impl Runtime {
         if drag.session.preview_target() != before {
             self.pending_full_redraw = true;
         }
-        // CTX-1070 (issue #1811): live preview transitions. The dragged
-        // frame keeps its ghost outline while moving and the hovered drop
-        // target highlights under the cursor; both ride the existing
-        // Core-owned chrome-ring fade (geometry and terminal content are
-        // never interpolated). Repeat motion restarts the bounded
-        // transitions instead of accumulating, mirroring the Alt+drag path.
+        // CTX-1167 (issue #1981): accumulate, never restart. The grab
+        // armed the source ghost and the first hover armed the target
+        // highlight; repeat motion holds those arms so the eased ring
+        // progress keeps climbing toward full visibility. Restarting on
+        // every motion pinned progress near 0 and held the ghost
+        // near-invisible for the whole gesture. A surface with no live
+        // Drag arm re-arms here (a fresh hover, or a completed pulse under
+        // continued motion); instant-cut policies still arm nothing,
+        // exactly as before.
         let source = drag.session.source();
         let target = drag.session.preview_target();
-        self.trigger_animation(AnimationKind::Drag, Some(source), now);
+        if self
+            .animation_progress(AnimationKind::Drag, Some(source), now)
+            .is_none()
+        {
+            self.trigger_animation(AnimationKind::Drag, Some(source), now);
+        }
         if let Some(hovered) = target {
-            self.trigger_animation(AnimationKind::Drag, Some(hovered), now);
+            if self
+                .animation_progress(AnimationKind::Drag, Some(hovered), now)
+                .is_none()
+            {
+                self.trigger_animation(AnimationKind::Drag, Some(hovered), now);
+            }
         }
         true
     }

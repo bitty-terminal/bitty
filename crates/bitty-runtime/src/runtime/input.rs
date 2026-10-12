@@ -1015,6 +1015,7 @@ impl Runtime {
                     if self.hyperlink_press_uri.as_ref() == Some(&uri) {
                         self.scrollbar_release();
                         self.end_alt_drag();
+                        self.end_float_resize();
                         self.end_border_drag();
                         self.end_tiled_drag();
                         if self.selection_state.is_some() {
@@ -1026,6 +1027,7 @@ impl Runtime {
                     if self.plaintext_press_uri.as_ref() == Some(&uri) {
                         self.scrollbar_release();
                         self.end_alt_drag();
+                        self.end_float_resize();
                         self.end_border_drag();
                         self.end_tiled_drag();
                         if self.selection_state.is_some() {
@@ -1144,6 +1146,12 @@ impl Runtime {
             if self.end_alt_drag() {
                 return;
             }
+            // CTX-1150: a release also ends a float edge-resize — like the
+            // Alt+drag move it returns early, skipping the selection
+            // commit/copy (the grabbing press never started a selection).
+            if self.end_float_resize() {
+                return;
+            }
             // Issue #1348: a release also ends a border-drag resize — but
             // like the Alt+drag move it returns early, skipping the
             // selection commit/copy (the grabbing press never started a
@@ -1162,6 +1170,18 @@ impl Runtime {
             if self.end_tiled_drag() {
                 return;
             }
+        }
+        // CTX-1150: Alt+Left-press on a float border grabs it for an edge
+        // resize and consumes the event (no selection starts). Runs before
+        // the interior move so edges win over interiors; interiors and
+        // anchored floats fail soft here and fall through to the move below.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.alt_pressed
+            && self.begin_float_resize()
+        {
+            return;
         }
         // CTX-0260: Alt+Left-press on a floating overlay grabs it for an
         // Alt+drag move and consumes the event (no selection starts). The
@@ -1366,6 +1386,13 @@ impl Runtime {
         // CTX-0967: the virtual clock flows through so the armed drag
         // transition shares the tick's time base.
         if self.update_alt_drag_at(pos, now) {
+            self.clear_hover_pending();
+            return;
+        }
+        // CTX-1150: an active float edge-resize consumes motion (it resizes
+        // the grabbed overlay bounds live; selection/hover/capture-motion
+        // all stay out). Mutually exclusive with the move above.
+        if self.update_float_resize_at(pos, now) {
             self.clear_hover_pending();
             return;
         }

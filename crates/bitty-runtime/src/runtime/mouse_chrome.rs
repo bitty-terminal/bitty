@@ -51,7 +51,10 @@
 
 use super::*;
 use bitty_platform::CursorPosition;
-use bitty_ui::{DragMoveSession, DropSpec, Point as UiPoint, SplitAxis, drop_spec_for_point};
+use bitty_ui::{
+    DragMoveSession, DropSpec, Point as UiPoint, RESIZE_HANDLE_CELLS, ResizeEdge, SplitAxis,
+    detect_resize_edge, drop_spec_for_point, resize_floating_rect,
+};
 use std::time::Instant;
 
 /// Pending hover activation with a positive dwell delay (CTX-0334).
@@ -70,10 +73,50 @@ pub(super) struct HoverPending {
 /// Active Alt+drag: which floating leaf is grabbed plus the press-time
 /// anchor in container cells (via [`Runtime::cursor_to_cell`], so deltas
 /// match the overlay-bounds space exactly).
+///
+/// CTX-1150 (issue #1980): pixel-smooth motion. The solver stays
+/// cell-quantized; the sub-cell remainder lives here as a present-only
+/// physical-pixel translation (`pixel_dx`/`pixel_dy`, bounded to one live
+/// cell each way). [`Runtime::present_frames`] adds it to the dragged
+/// frame, and release drops it with the grab so the frame snaps to cells.
+/// `anchor_px_*` is the last-move cursor position in physical pixels
+/// (rounded), so the remainder tracks the pointer without drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AltDragState {
     /// Grabbed floating leaf.
     pub leaf: ViewId,
+    /// Anchor column (container cells) at grab or last move.
+    pub anchor_col: i32,
+    /// Anchor row (container cells) at grab or last move.
+    pub anchor_row: i32,
+    /// Anchor cursor x in physical pixels (rounded) at grab or last move.
+    pub anchor_px_x: i32,
+    /// Anchor cursor y in physical pixels (rounded) at grab or last move.
+    pub anchor_px_y: i32,
+    /// Present-only x remainder in physical pixels (bounded, never grid truth).
+    pub pixel_dx: i32,
+    /// Present-only y remainder in physical pixels (bounded, never grid truth).
+    pub pixel_dy: i32,
+}
+
+/// Active Alt+edge float resize (CTX-1150).
+///
+/// An Alt+Left-press on a structural float border grabs that edge via
+/// [`detect_resize_edge`] (with a [`RESIZE_HANDLE_CELLS`]-cell hit area);
+/// motion resizes the overlay bounds live through [`resize_floating_rect`]
+/// (clamped to view minima and the container) installed via
+/// [`Runtime::set_layout`], so leaf grids and PTY winsize follow exactly
+/// like a keyboard resize. Anchored floats (pinned, detached, mode-floating)
+/// fail soft at grab time and stay on the Alt+drag move path; that deferral
+/// is documented on [`Runtime::begin_float_resize`]. `None` when no resize
+/// is active; cleared on release. Presentation-adjacent but solver-committed
+/// per step (each step is a clamped layout install, never interpolation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatResizeState {
+    /// Grabbed floating leaf (structural overlay only).
+    pub leaf: ViewId,
+    /// Border the grab holds (edges and corners).
+    pub edge: ResizeEdge,
     /// Anchor column (container cells) at grab or last move.
     pub anchor_col: i32,
     /// Anchor row (container cells) at grab or last move.
@@ -113,6 +156,29 @@ pub struct BorderDragState {
     pub anchor_row: i32,
 }
 
+/// Rounds a cursor position to physical pixels, fail-closed.
+///
+/// CTX-1150: the Alt+drag pixel remainder tracks the pointer in whole
+/// physical pixels. Non-finite coordinates yield `0` (the motion path
+/// treats a non-finite position as no movement and stays armed); huge
+/// values saturate instead of wrapping.
+fn round_cursor_px(pos: CursorPosition) -> (i32, i32) {
+    fn round_one(v: f64) -> i32 {
+        if !v.is_finite() {
+            return 0;
+        }
+        let r = v.round();
+        if r >= f64::from(i32::MAX) {
+            i32::MAX
+        } else if r <= f64::from(i32::MIN) {
+            i32::MIN
+        } else {
+            r as i32
+        }
+    }
+    (round_one(pos.x), round_one(pos.y))
+}
+
 impl Runtime {
     /// Whether an Alt+drag move is currently active.
     #[must_use]
@@ -129,8 +195,14 @@ impl Runtime {
     /// `true` when the drag started (caller consumes the press and skips
     /// selection); `false` leaves all state untouched so the press falls
     /// through to selection ("without breaking selection").
+    ///
+    /// CTX-1150: fails soft while a float resize holds the pointer (edge
+    /// wins over interior; see [`Self::begin_float_resize`]).
     pub fn begin_alt_drag(&mut self) -> bool {
         if !self.alt_pressed || self.shift_pressed {
+            return false;
+        }
+        if self.float_resize.is_some() {
             return false;
         }
         let Some(cursor) = self.last_cursor else {
@@ -165,10 +237,15 @@ impl Runtime {
         {
             return false;
         }
+        let (anchor_px_x, anchor_px_y) = round_cursor_px(cursor);
         self.alt_drag = Some(AltDragState {
             leaf,
             anchor_col: i32::from(anchor.col),
             anchor_row: i32::from(anchor.row),
+            anchor_px_x,
+            anchor_px_y,
+            pixel_dx: 0,
+            pixel_dy: 0,
         });
         // Dragging focuses the grabbed pane (no-op present-wise when
         // already focused; `set_focus` dirties only on change).
@@ -178,6 +255,12 @@ impl Runtime {
 
     /// Moves the active Alt+drag to `pos`, offsetting the grabbed overlay
     /// by the cell delta since the grab (or last move).
+    ///
+    /// CTX-1150 (issue #1980): pixel-smooth motion. The solver stays
+    /// cell-quantized; the sub-cell remainder is a present-only
+    /// physical-pixel translation on the dragged frame (see
+    /// [`Runtime::present_frames`]). A zero cell delta with a pixel remainder
+    /// still moves the frame; release snaps to cells by dropping the grab.
     ///
     /// Returns `true` when a drag was active (caller consumes the motion:
     /// no selection update, no hover-focus, no capture motion encoding).
@@ -194,15 +277,46 @@ impl Runtime {
         let Some(drag) = self.alt_drag else {
             return false;
         };
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return true;
+        }
         let cell = self.cursor_to_cell(pos);
         let dx = i32::from(cell.col) - drag.anchor_col;
         let dy = i32::from(cell.row) - drag.anchor_row;
-        if dx == 0 && dy == 0 {
+        let live = self.live_cell_metrics();
+        let cell_w = i32::try_from(live.width).unwrap_or(i32::MAX);
+        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
+        let (cur_px_x, cur_px_y) = round_cursor_px(pos);
+        let dx_px_raw = cur_px_x.saturating_sub(drag.anchor_px_x);
+        let dy_px_raw = cur_px_y.saturating_sub(drag.anchor_px_y);
+        let (inc_x, inc_y) = if cell_w <= 0 || cell_h <= 0 {
+            (0, 0)
+        } else {
+            let ix = (i64::from(dx_px_raw) - i64::from(dx) * i64::from(cell_w))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            let iy = (i64::from(dy_px_raw) - i64::from(dy) * i64::from(cell_h))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            (ix, iy)
+        };
+        let mut next_px_x = drag.pixel_dx.saturating_add(inc_x);
+        let mut next_px_y = drag.pixel_dy.saturating_add(inc_y);
+        if cell_w > 0 {
+            next_px_x = next_px_x.clamp(-cell_w, cell_w);
+        } else {
+            next_px_x = 0;
+        }
+        if cell_h > 0 {
+            next_px_y = next_px_y.clamp(-cell_h, cell_h);
+        } else {
+            next_px_y = 0;
+        }
+        if dx == 0 && dy == 0 && next_px_x == drag.pixel_dx && next_px_y == drag.pixel_dy {
             return true;
         }
-        if !self
-            .layout
-            .move_overlay_containing(drag.leaf, dx, dy, self.container)
+        if (dx != 0 || dy != 0)
+            && !self
+                .layout
+                .move_overlay_containing(drag.leaf, dx, dy, self.container)
         {
             // CTX-1058 (#1844 P2): a mode-floating leaf has anchored
             // (container-derived) geometry with no stored position to move,
@@ -252,8 +366,6 @@ impl Runtime {
                 };
                 self.pinned_offsets
                     .insert(drag.leaf, (stored_dx, stored_dy));
-                self.pending_full_redraw = true;
-                self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
             } else if self.floats.contains(drag.leaf) {
                 // CTX-1147: a detached float re-anchors exactly like a pin,
                 // against its own `float_anchor` range; restore drops the
@@ -275,24 +387,26 @@ impl Runtime {
                     None => (next_dx, next_dy),
                 };
                 self.float_offsets.insert(drag.leaf, (stored_dx, stored_dy));
-                self.pending_full_redraw = true;
-                self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
             } else if !self.leaf_is_floating(drag.leaf) {
                 self.alt_drag = None;
                 return false;
             }
-        } else {
-            self.pending_full_redraw = true;
-            // CTX-0967: a live float move arms the drag transition on the
-            // dragged leaf. The layout commits immediately (terminal content is
-            // never interpolated); only the leaf's chrome ring fades, and repeat
-            // updates restart the bounded transition instead of accumulating.
-            self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
         }
+        // The layout commits immediately (terminal content is never
+        // interpolated); only the leaf chrome ring fades, and repeat updates
+        // restart the bounded transition instead of accumulating. CTX-1150:
+        // sub-cell motion arms the same transition even when the cell model
+        // did not move, so the pixel ghost never lags a frame behind.
+        self.pending_full_redraw = true;
+        self.trigger_animation(AnimationKind::Drag, Some(drag.leaf), now);
         self.alt_drag = Some(AltDragState {
             leaf: drag.leaf,
             anchor_col: i32::from(cell.col),
             anchor_row: i32::from(cell.row),
+            anchor_px_x: cur_px_x,
+            anchor_px_y: cur_px_y,
+            pixel_dx: next_px_x,
+            pixel_dy: next_px_y,
         });
         true
     }
@@ -308,11 +422,175 @@ impl Runtime {
     ///
     /// CTX-1147: ending the drag keeps a detached float's accumulated
     /// re-anchor offset the same way; restore drops it.
+    ///
+    /// CTX-1150: ending the drag drops the present-only pixel remainder, so
+    /// the frame snaps to cells. Cell state (moved bounds, kept offsets)
+    /// persists per the disciplines above; only the sub-cell ghost clears.
     pub fn end_alt_drag(&mut self) -> bool {
         if self.alt_drag.is_none() {
             return false;
         }
         self.alt_drag = None;
+        true
+    }
+
+    /// Whether an Alt+edge float resize is currently active (CTX-1150).
+    #[must_use]
+    pub fn float_resize_active(&self) -> bool {
+        self.float_resize.is_some()
+    }
+
+    /// Grabbed edge for the active float resize, if any (CTX-1150 test seam).
+    #[must_use]
+    pub fn float_resize_edge(&self) -> Option<ResizeEdge> {
+        self.float_resize.map(|resize| resize.edge)
+    }
+
+    /// Grabbed leaf for the active float resize, if any (CTX-1150 test seam).
+    #[must_use]
+    pub fn float_resize_leaf(&self) -> Option<ViewId> {
+        self.float_resize.map(|resize| resize.leaf)
+    }
+
+    /// Edge under the pointer for a structural float, if any (CTX-1150 hover
+    /// affordance query).
+    ///
+    /// Pure query over [`detect_resize_edge`]: resolves the topmost floating
+    /// leaf under `pos` through the present frames, reads its structural
+    /// overlay bounds, and reports which border the pointer grabs. Returns
+    /// `None` over interiors, background, and anchored floats (pinned,
+    /// detached, mode-floating: deferred, see [`Self::begin_float_resize`]).
+    /// The platform layer currently exposes no cursor-icon setter, so no
+    /// caller sets a shape yet; the drag itself works without it (mirrors
+    /// [`Self::border_drag_hover_at`]).
+    #[must_use]
+    pub fn float_resize_hover_at(&self, pos: CursorPosition) -> Option<ResizeEdge> {
+        let (leaf, _) = self.cursor_to_present_cell(pos)?;
+        let point = self.cursor_to_layout_point(pos)?;
+        let bounds = self.layout.overlay_bounds_containing(leaf)?;
+        detect_resize_edge(bounds, point, RESIZE_HANDLE_CELLS)
+    }
+
+    /// Attempts to grab a structural float border for an Alt+edge resize
+    /// (CTX-1150).
+    ///
+    /// Requires Alt held and Shift released (the Alt+drag move family owns
+    /// floats; Shift forces selection per the CTX-0181 precedent), no active
+    /// drag of any kind, a known cursor over a structural float border
+    /// ([`detect_resize_edge`] with a [`RESIZE_HANDLE_CELLS`]-cell hit
+    /// area). The grab focuses the resized pane. Returns `true` when the
+    /// resize started (caller consumes the press and skips selection);
+    /// `false` leaves all state untouched so the press falls through to the
+    /// Alt+drag move (interior) or selection.
+    ///
+    /// Anchored floats (pinned, detached, mode-floating) fail soft here on
+    /// purpose: their present size is container-derived with no free rect to
+    /// resize, so the interior move path keeps them. Free-rect resizing for
+    /// those kinds stays a follow-up; this keeps the solver untouched and
+    /// the gesture fail-closed.
+    pub fn begin_float_resize(&mut self) -> bool {
+        if !self.alt_pressed || self.shift_pressed {
+            return false;
+        }
+        if self.alt_drag.is_some()
+            || self.tiled_drag.is_some()
+            || self.border_drag.is_some()
+            || self.float_resize.is_some()
+        {
+            return false;
+        }
+        let Some(cursor) = self.last_cursor else {
+            return false;
+        };
+        let Some((leaf, _)) = self.cursor_to_present_cell(cursor) else {
+            return false;
+        };
+        let Some(point) = self.cursor_to_layout_point(cursor) else {
+            return false;
+        };
+        let Some(bounds) = self.layout.overlay_bounds_containing(leaf) else {
+            return false;
+        };
+        let Some(edge) = detect_resize_edge(bounds, point, RESIZE_HANDLE_CELLS) else {
+            return false;
+        };
+        self.float_resize = Some(FloatResizeState {
+            leaf,
+            edge,
+            anchor_col: i32::from(point.x),
+            anchor_row: i32::from(point.y),
+        });
+        self.set_focus(leaf);
+        self.clear_hover_pending();
+        true
+    }
+
+    /// Moves the active float resize to `pos`, resizing the grabbed overlay
+    /// bounds live (CTX-1150).
+    ///
+    /// The cell delta since the grab (or last move) flows through
+    /// [`resize_floating_rect`] — the same clamped geometry the unit tests
+    /// pin (view minima, container clip) — installed via
+    /// [`Runtime::set_layout`] so leaf Views, pane sessions, and the primary
+    /// grid reflow exactly like a keyboard resize (live grid and PTY follow;
+    /// no deferral). Overshoot clamps fail-closed; a zero delta keeps the
+    /// resize armed with no redraw. When the layout no longer owns the leaf
+    /// (closed mid-drag) the resize ends fail-soft and `false` is returned.
+    ///
+    /// Returns `true` when a resize was active (caller consumes the motion).
+    pub fn update_float_resize(&mut self, pos: CursorPosition) -> bool {
+        self.update_float_resize_at(pos, Instant::now())
+    }
+
+    /// [`Self::update_float_resize`] with an explicit wall clock (CTX-0967
+    /// virtual-clock seam: tests arm the resize transition deterministically).
+    pub fn update_float_resize_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
+        let Some(resize) = self.float_resize else {
+            return false;
+        };
+        let Some(point) = self.cursor_to_layout_point(pos) else {
+            return true;
+        };
+        let dx_raw = i32::from(point.x) - resize.anchor_col;
+        let dy_raw = i32::from(point.y) - resize.anchor_row;
+        if dx_raw == 0 && dy_raw == 0 {
+            return true;
+        }
+        let Some(current) = self.layout.overlay_bounds_containing(resize.leaf) else {
+            self.float_resize = None;
+            return false;
+        };
+        // `resize_floating_rect` narrows to `i16`: clamp the cell delta so
+        // a pointer teleport can never wrap the resize step.
+        let dx = dx_raw.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let dy = dy_raw.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let next = resize_floating_rect(current, resize.edge, dx, dy, self.container);
+        if next != current {
+            let mut layout = self.layout.clone();
+            if !layout.set_overlay_bounds_containing(resize.leaf, next) {
+                self.float_resize = None;
+                return false;
+            }
+            self.set_layout(layout);
+            self.trigger_animation(AnimationKind::Resize, Some(resize.leaf), now);
+        }
+        self.float_resize = Some(FloatResizeState {
+            leaf: resize.leaf,
+            edge: resize.edge,
+            anchor_col: i32::from(point.x),
+            anchor_row: i32::from(point.y),
+        });
+        true
+    }
+
+    /// Ends the active float resize, if any. Returns `true` when one was
+    /// active (caller skips the selection-release commit/copy: no selection
+    /// was started by the grabbing press).
+    pub fn end_float_resize(&mut self) -> bool {
+        if self.float_resize.is_none() {
+            return false;
+        }
+        self.float_resize = None;
         true
     }
 

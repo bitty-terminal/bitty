@@ -167,11 +167,16 @@ fn alt_drag_moves_pinned_drop_reanchors_and_unpin_returns() {
     assert_eq!(home.tier, Some(OverlayTier::Float));
 
     // Grab at the frame center, then move exactly +5 cols / +2 rows.
+    // CTX-1150: the move preserves the grab phase (exact live-cell pixels
+    // from the grab point), so the sub-cell remainder stays zero and the
+    // frame follows by whole cells; release then snaps with no visible jump.
     let grab_pos = frame_point(&rt, ViewId::new(1), 0.5, 0.5);
     alt_press(&mut rt, grab_pos);
     assert!(rt.alt_drag_active());
-    let grab_cell = rt.cursor_to_cell(grab_pos);
-    rt.handle_cursor_moved(cell_pixels(grab_cell.col + 5, grab_cell.row + 2));
+    rt.handle_cursor_moved(CursorPosition {
+        x: grab_pos.x + 5.0 * 9.0,
+        y: grab_pos.y + 2.0 * 19.0,
+    });
     assert!(rt.alt_drag_active(), "motion keeps a pinned drag armed");
     assert!(!rt.has_selection(), "owned motion selects nothing");
 
@@ -286,10 +291,20 @@ fn pinned_drag_clamps_into_the_container() {
     );
     alt_release(&mut rt);
     let settled = frame_of(&rt, ViewId::new(1));
-    assert_eq!(
-        (settled.frame.x, settled.frame.y),
-        (frame.frame.x, frame.frame.y),
-        "clamped drop point is the new anchor"
+    assert!(
+        (settled.frame.x - frame.frame.x).abs() <= 9
+            && (settled.frame.y - frame.frame.y).abs() <= 19,
+        "drop snaps the sub-cell remainder (at most one live cell each way)",
+    );
+    assert!(settled.frame.x >= 0, "settled pin stays on-screen left");
+    assert!(settled.frame.y >= 0, "settled pin stays on-screen top");
+    assert!(
+        settled.frame.x + settled.frame.width as i32 <= 80 * 9,
+        "settled pin stays on-screen right"
+    );
+    assert!(
+        settled.frame.y + settled.frame.height as i32 <= 24 * 19,
+        "settled pin stays on-screen bottom"
     );
     rt.unpin_floating(ViewId::new(1)).expect("cleanup unpin");
 }

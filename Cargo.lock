@@ -187,7 +187,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=bbcc18e#bbcc18ef5f163be37be5d83f4bc9a4175aa153c4"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-auth",
@@ -198,12 +198,12 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=bbcc18e#bbcc18ef5f163be37be5d83f4bc9a4175aa153c4"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
 
 [[package]]
 name = "bitty-ipc-auth"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=bbcc18e#bbcc18ef5f163be37be5d83f4bc9a4175aa153c4"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
 dependencies = [
  "bitty-ipc-api",
  "getrandom 0.4.3",
@@ -214,7 +214,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-core"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=bbcc18e#bbcc18ef5f163be37be5d83f4bc9a4175aa153c4"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
 dependencies = [
  "bitty-ipc-api",
 ]
@@ -222,7 +222,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-devtools"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=bbcc18e#bbcc18ef5f163be37be5d83f4bc9a4175aa153c4"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
 dependencies = [
  "base16ct",
  "bitty-ipc-api",

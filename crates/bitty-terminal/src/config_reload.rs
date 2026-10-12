@@ -800,14 +800,59 @@ mod tests {
         // CTX-0898 acceptance: iterate the exported single-source Live list
         // that drives `classify_field`, so a new Live leaf without an adopter
         // fails here instead of silently landing in `restart_required`.
+        //
+        // CTX-1159 S0 carve-out (DEC-0113 Fix 3): the eight style leaves are
+        // classified Live in the reload table but stay accepted-but-inert
+        // until S3 — parsed, validated, merged, and reported with no render
+        // effect. They are deliberately NOT in `runtime_adopts` yet (claiming
+        // adoption without `set_chrome_style` would lie in the reply), so a
+        // style-only reload commits to the engine and reports the leaves
+        // under `restart_required` until S3 lands the setter and closes this
+        // carve-out with the adopter audit proof.
+        const STYLE_S0_PENDING: &[&str] = &[
+            "appearance.style.glow_color",
+            "appearance.style.glow_width",
+            "appearance.style.shadow_color",
+            "appearance.style.shadow_offset_x",
+            "appearance.style.shadow_offset_y",
+            "appearance.style.fade_unfocused",
+            "decoration.background_tint",
+            "decoration.background_tint_strength",
+        ];
         for field in bitty_config::LIVE_FIELDS {
             assert_eq!(
                 bitty_config::classify_field(field),
                 ReloadClass::Live,
                 "{field} is listed Live but classifies otherwise"
             );
+            if STYLE_S0_PENDING.contains(field) {
+                assert!(
+                    !runtime_adopts(field),
+                    "{field} must stay unadopted until S3 `set_chrome_style`"
+                );
+                continue;
+            }
             assert!(runtime_adopts(field), "{field} has no live adopter");
         }
+        // The carve-out leaves still report: a style-only edit commits to
+        // the engine and surfaces under `restart_required` (pending until
+        // restart) rather than vanishing.
+        let baseline = bitty_config::fallback_builtin();
+        let mut styled = baseline.clone();
+        styled.appearance.style = Some(bitty_config::types::StyleConfig {
+            glow_width: Some(8),
+            ..Default::default()
+        });
+        styled.decoration.background_tint_strength = Some(0.5);
+        let pending = pending_fields(&baseline, &styled, runtime_adopts);
+        assert!(
+            pending.contains(&String::from("appearance.style.glow_width")),
+            "style leaf must report pending, got {pending:?}"
+        );
+        assert!(
+            pending.contains(&String::from("decoration.background_tint_strength")),
+            "tint leaf must report pending, got {pending:?}"
+        );
         let per_view = format!("{}*]", bitty_config::VIEWS_FIELD_PREFIX);
         assert_eq!(bitty_config::classify_field(&per_view), ReloadClass::Live);
         assert!(runtime_adopts(&per_view), "{per_view} has no live adopter");

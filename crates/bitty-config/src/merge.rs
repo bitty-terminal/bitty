@@ -112,12 +112,25 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "decoration.background_image"
         | "decoration.background_fit"
         | "decoration.background_image_roots"
+        // CTX-1159 S0 (DEC-0111 section 1): the tint pair scalar-replaces
+        // like the outline colors/widths; absent says nothing.
+        | "decoration.background_tint"
+        | "decoration.background_tint_strength"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
         | "mouse.focus_follows_mouse_delay_ms"
         | "appearance.theme"
         | "appearance.colors"
+        // CTX-1159 S0 (DEC-0111 section 1, DEC-0113): the closed
+        // `appearance.style` table scalar-replaces per leaf; absent says
+        // nothing. `shadow_blur` is reserved (rejected, never merged).
+        | "appearance.style.glow_color"
+        | "appearance.style.glow_width"
+        | "appearance.style.shadow_color"
+        | "appearance.style.shadow_offset_x"
+        | "appearance.style.shadow_offset_y"
+        | "appearance.style.fade_unfocused"
         | "appearance.animations.enabled"
         | "appearance.animations.reduced_motion"
         | "appearance.animations.duration_ms.open"
@@ -387,6 +400,83 @@ fn merge_animations_overrides(
 /// the lower-precedence value. Merged entries stay sorted by
 /// `(tier, canonical selector)` so resolution, attribution, and reload diffs
 /// are independent of `init.lua` declaration order.
+/// Merges one layer's `appearance.style` table (CTX-1159 S0, DEC-0111
+/// section 1): per-leaf scalar-replace with attribution; absent leaves
+/// never shadow a lower layer. Shared by both merge paths (the strict and
+/// the allow-policy-violations variant) so the two copies cannot drift.
+///
+/// Accepted-but-inert until S3 (no resolution or consumption yet).
+fn merge_style_table(
+    effective: &mut EffectiveConfig,
+    acc: &mut MergeAccumulators<'_>,
+    src: &ConfigSource,
+    is_policy: bool,
+    style: &crate::types::StyleConfig,
+) {
+    let slot = effective.appearance.style.get_or_insert_default();
+    let mut touched = false;
+    touched |= merge_view_leaf(
+        style.glow_color.as_ref(),
+        &mut slot.glow_color,
+        "appearance.style",
+        "glow_color",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        style.glow_width.as_ref(),
+        &mut slot.glow_width,
+        "appearance.style",
+        "glow_width",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        style.shadow_color.as_ref(),
+        &mut slot.shadow_color,
+        "appearance.style",
+        "shadow_color",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        style.shadow_offset_x.as_ref(),
+        &mut slot.shadow_offset_x,
+        "appearance.style",
+        "shadow_offset_x",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        style.shadow_offset_y.as_ref(),
+        &mut slot.shadow_offset_y,
+        "appearance.style",
+        "shadow_offset_y",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        style.fade_unfocused.as_ref(),
+        &mut slot.fade_unfocused,
+        "appearance.style",
+        "fade_unfocused",
+        src,
+        is_policy,
+        acc,
+    );
+    if touched {
+        acc.attribution
+            .insert("appearance.style".to_string(), src.clone());
+        acc.attribution
+            .insert("appearance".to_string(), src.clone());
+    }
+}
+
 fn merge_views(
     effective: &mut EffectiveConfig,
     acc: &mut MergeAccumulators<'_>,
@@ -485,6 +575,47 @@ fn merge_views(
             is_policy,
             acc,
         );
+        // CTX-1159 S0: the per-View style quartet deep-merges per leaf
+        // like the outline/background leaves; absent inherits, so a lower
+        // layer's explicit member is never reset by a higher layer's
+        // unrelated leaf. Accepted-but-inert until S3 (no resolution or
+        // consumption yet).
+        touched |= merge_view_leaf(
+            entry.overrides.glow_color.as_ref(),
+            &mut slot.glow_color,
+            &base,
+            "glow_color",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.glow_width.as_ref(),
+            &mut slot.glow_width,
+            &base,
+            "glow_width",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.background_tint.as_ref(),
+            &mut slot.background_tint,
+            &base,
+            "background_tint",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.background_tint_strength.as_ref(),
+            &mut slot.background_tint_strength,
+            &base,
+            "background_tint_strength",
+            src,
+            is_policy,
+            acc,
+        );
         if touched {
             acc.attribution.insert(base, src.clone());
         }
@@ -508,12 +639,14 @@ fn merge_views(
     }
 }
 
-/// Maps one `views.<selector>.<leaf>` field to the global `decoration.*`
-/// field it overrides (RFC-0001/OQ-041), so a `SystemPolicy` pin on a global
-/// outline leaf also protects that leaf through every selector tier
-/// (CTX-0343). CTX-0347 gives `background_image`/`background_fit` their
-/// global owners; `decoration.background_image_roots` stays global-only and
-/// deliberately has no `views` leaf to map.
+/// Maps one `views.<selector>.<leaf>` field to the global field it
+/// overrides (RFC-0001/OQ-041), so a `SystemPolicy` pin on a global leaf
+/// also protects that leaf through every selector tier (CTX-0343).
+/// CTX-0347 gives `background_image`/`background_fit` their global owners;
+/// CTX-1159 S0 gives the per-View style quartet its global owners
+/// (`appearance.style.*` for glow, `decoration.*` for tint).
+/// `decoration.background_image_roots` stays global-only and deliberately
+/// has no `views` leaf to map.
 fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
     Some(match leaf {
         "border_color" => "decoration.border_color",
@@ -524,6 +657,10 @@ fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
         "border_width_idle" => "decoration.border_width_idle",
         "background_image" => "decoration.background_image",
         "background_fit" => "decoration.background_fit",
+        "glow_color" => "appearance.style.glow_color",
+        "glow_width" => "appearance.style.glow_width",
+        "background_tint" => "decoration.background_tint",
+        "background_tint_strength" => "decoration.background_tint_strength",
         _ => return None,
     })
 }
@@ -654,6 +791,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "decoration.background_image",
     "decoration.background_fit",
     "decoration.background_image_roots",
+    "decoration.background_tint",
+    "decoration.background_tint_strength",
     "decoration",
     "views",
     "scrollbar.mode",
@@ -664,6 +803,13 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "mouse",
     "appearance.theme",
     "appearance.colors",
+    "appearance.style.glow_color",
+    "appearance.style.glow_width",
+    "appearance.style.shadow_color",
+    "appearance.style.shadow_offset_x",
+    "appearance.style.shadow_offset_y",
+    "appearance.style.fade_unfocused",
+    "appearance.style",
     "appearance.animations.enabled",
     "appearance.animations.reduced_motion",
     "appearance.animations.duration_ms.open",
@@ -1792,6 +1938,27 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 is_policy,
                 &mut decoration_acc,
             );
+            // CTX-1159 S0: the tint pair follows the same "unset says
+            // nothing" scalar-replace rule as the outline colors/widths.
+            // Accepted-but-inert until S3 (no consumption yet).
+            merge_view_leaf(
+                dec.background_tint.as_ref(),
+                &mut effective.decoration.background_tint,
+                "decoration",
+                "background_tint",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_tint_strength.as_ref(),
+                &mut effective.decoration.background_tint_strength,
+                "decoration",
+                "background_tint_strength",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
             attribution.insert("decoration".to_string(), src.clone());
         }
 
@@ -2039,6 +2206,17 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     policy_violations: &mut policy_violations,
                 };
                 merge_animations_overrides(&mut effective, &mut acc, src, is_policy, over);
+            }
+            // CTX-1159 S0: the closed `appearance.style` table deep-merges
+            // per leaf via the shared helper (both merge paths).
+            if let Some(style) = &app.style {
+                let mut acc = MergeAccumulators {
+                    policy_fields: &mut policy_fields,
+                    attribution: &mut attribution,
+                    conflicts: &mut conflicts,
+                    policy_violations: &mut policy_violations,
+                };
+                merge_style_table(&mut effective, &mut acc, src, is_policy, style);
             }
         }
 
@@ -3303,6 +3481,27 @@ fn merge_layers_allow_policy_violations(
                 is_policy,
                 &mut decoration_acc,
             );
+            // CTX-1159 S0: the tint pair follows the same "unset says
+            // nothing" scalar-replace rule as the outline colors/widths.
+            // Accepted-but-inert until S3 (no consumption yet).
+            merge_view_leaf(
+                dec.background_tint.as_ref(),
+                &mut effective.decoration.background_tint,
+                "decoration",
+                "background_tint",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_tint_strength.as_ref(),
+                &mut effective.decoration.background_tint_strength,
+                "decoration",
+                "background_tint_strength",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
             attribution.insert("decoration".to_string(), src.clone());
         }
         // CTX-0343: `views` entries deep-merge per selector per field (see
@@ -3496,6 +3695,17 @@ fn merge_layers_allow_policy_violations(
                     policy_violations: &mut policy_violations,
                 };
                 merge_animations_overrides(&mut effective, &mut acc, src, is_policy, over);
+            }
+            // CTX-1159 S0: the closed `appearance.style` table deep-merges
+            // per leaf via the shared helper (both merge paths).
+            if let Some(style) = &app.style {
+                let mut acc = MergeAccumulators {
+                    policy_fields: &mut policy_fields,
+                    attribution: &mut attribution,
+                    conflicts: &mut conflicts,
+                    policy_violations: &mut policy_violations,
+                };
+                merge_style_table(&mut effective, &mut acc, src, is_policy, style);
             }
         }
         // CTX-0236: `mod_key` is scalar-replace like `appearance.theme`;
@@ -5928,6 +6138,7 @@ mod tests {
                         duration_move: Some(300),
                         ..Default::default()
                     }),
+                    style: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -5947,6 +6158,7 @@ mod tests {
                         easing_resize: Some(AnimationEasing::Linear),
                         ..Default::default()
                     }),
+                    style: None,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -6111,5 +6323,249 @@ mod tests {
         assert_eq!(merged.effective.chrome.top_order[0], "user-a");
         assert_eq!(merged.effective.chrome.top_order[1], "user-b");
         assert_eq!(merged.effective.chrome.bottom_order.len(), 0);
+    }
+
+    #[test]
+    fn style_merge_class_table_coverage() {
+        // CTX-1159 S0: every new leaf is scalar-replace under its closed
+        // table; the tables themselves deep-merge.
+        for field in [
+            "appearance.style.glow_color",
+            "appearance.style.glow_width",
+            "appearance.style.shadow_color",
+            "appearance.style.shadow_offset_x",
+            "appearance.style.shadow_offset_y",
+            "appearance.style.fade_unfocused",
+            "decoration.background_tint",
+            "decoration.background_tint_strength",
+        ] {
+            assert_eq!(
+                merge_class_for(field),
+                Some(MergeClass::ScalarReplace),
+                "{field}"
+            );
+        }
+        assert_eq!(merge_class_for("appearance"), Some(MergeClass::DeepMerge));
+        assert_eq!(merge_class_for("decoration"), Some(MergeClass::DeepMerge));
+    }
+
+    #[test]
+    fn style_merges_per_field_with_attribution() {
+        // CTX-1159 S0: each present style leaf scalar-replaces with its own
+        // attribution; absent leaves inherit the lower layer, never reset
+        // it. Later layers win per leaf, not per table.
+        use crate::types::{AppearanceConfig, StyleConfig};
+        let system = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemDefaults, Some("system.lua")),
+            ConfigPlan {
+                appearance: Some(AppearanceConfig {
+                    theme: None,
+                    colors: None,
+                    animations: None,
+                    style: Some(StyleConfig {
+                        glow_width: Some(4),
+                        fade_unfocused: Some(0.8),
+                        ..Default::default()
+                    }),
+                }),
+                decoration: Some(crate::types::DecorationConfig {
+                    background_tint_strength: Some(0.25),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                appearance: Some(AppearanceConfig {
+                    theme: None,
+                    colors: None,
+                    animations: None,
+                    style: Some(StyleConfig {
+                        glow_width: Some(8),
+                        ..Default::default()
+                    }),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![system, user]).expect("merge");
+        let style = merged
+            .effective
+            .appearance
+            .style
+            .as_ref()
+            .expect("style present");
+        // User wins where it speaks; system survives where the user is silent.
+        assert_eq!(style.glow_width, Some(8));
+        assert_eq!(style.fade_unfocused, Some(0.8));
+        assert_eq!(style.glow_color, None);
+        assert_eq!(
+            merged.effective.decoration.background_tint_strength,
+            Some(0.25)
+        );
+        // Per-leaf attribution answers which layer set each value.
+        assert_eq!(
+            merged
+                .source_of("appearance.style.glow_width")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged
+                .source_of("appearance.style.fade_unfocused")
+                .unwrap()
+                .layer,
+            LayerKind::SystemDefaults
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.background_tint_strength")
+                .unwrap()
+                .layer,
+            LayerKind::SystemDefaults
+        );
+        // Unset leaves backfill to core defaults, so `config show` reports
+        // every schema field.
+        assert_eq!(
+            merged
+                .source_of("appearance.style.shadow_color")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn style_views_merge_per_selector_per_field() {
+        // CTX-1159 S0: the per-View style quartet deep-merges per selector
+        // per field; a higher layer's unrelated leaf never resets a lower
+        // layer's explicit member.
+        use crate::types::{OutlineColor, ViewAppearanceOverride, ViewOverride, ViewSelector};
+        let system = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemDefaults, Some("system.lua")),
+            ConfigPlan {
+                views: Some(vec![ViewOverride {
+                    selector: ViewSelector::Wildcard,
+                    overrides: ViewAppearanceOverride {
+                        glow_width: Some(2),
+                        background_tint_strength: Some(0.5),
+                        ..Default::default()
+                    },
+                }]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                views: Some(vec![ViewOverride {
+                    selector: ViewSelector::Wildcard,
+                    overrides: ViewAppearanceOverride {
+                        glow_color: Some(OutlineColor::parse("#FF0000").expect("color")),
+                        ..Default::default()
+                    },
+                }]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![system, user]).expect("merge");
+        assert_eq!(merged.effective.views.len(), 1);
+        let over = &merged.effective.views[0].overrides;
+        assert_eq!(over.glow_width, Some(2));
+        assert_eq!(over.background_tint_strength, Some(0.5));
+        assert_eq!(
+            over.glow_color,
+            Some(OutlineColor::parse("#FF0000").expect("color"))
+        );
+        assert_eq!(
+            merged.source_of("views[*].glow_width").unwrap().layer,
+            LayerKind::SystemDefaults
+        );
+        assert_eq!(
+            merged.source_of("views[*].glow_color").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn style_policy_pin_protects_global_and_view_leaves() {
+        // CTX-1159 S0 (DEC-0111 section 2): a `SystemPolicy` pin on a style
+        // leaf also protects that leaf through every `views` selector tier
+        // (e.g. force `fade_unfocused=1.0`), exactly like the outline pins.
+        use crate::types::{AppearanceConfig, StyleConfig};
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                appearance: Some(AppearanceConfig {
+                    theme: None,
+                    colors: None,
+                    animations: None,
+                    style: Some(StyleConfig {
+                        glow_width: Some(0),
+                        ..Default::default()
+                    }),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                appearance: Some(AppearanceConfig {
+                    theme: None,
+                    colors: None,
+                    animations: None,
+                    style: Some(StyleConfig {
+                        glow_width: Some(8),
+                        ..Default::default()
+                    }),
+                }),
+                views: Some(vec![crate::types::ViewOverride {
+                    selector: crate::types::ViewSelector::Wildcard,
+                    overrides: crate::types::ViewAppearanceOverride {
+                        glow_width: Some(8),
+                        ..Default::default()
+                    },
+                }]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = try_merge_layers(vec![policy, user]).expect("merge");
+        let style = merged
+            .effective
+            .appearance
+            .style
+            .as_ref()
+            .expect("style present");
+        assert_eq!(style.glow_width, Some(0), "policy value retained");
+        assert_eq!(
+            merged.effective.views[0].overrides.glow_width, None,
+            "pinned leaf stays pinned through the selector tier"
+        );
+        // The global leaf and its per-View projection both report the pin.
+        // (A third violation for `appearance.theme` is pre-existing
+        // behavior: any policy `appearance` table pins the theme leaf even
+        // when it sets no theme. Out of S0 scope.)
+        assert!(
+            merged
+                .policy_violations
+                .iter()
+                .any(|e| e.field() == Some("appearance.style.glow_width"))
+        );
+        assert!(
+            merged
+                .policy_violations
+                .iter()
+                .any(|e| e.field() == Some("views[*].glow_width"))
+        );
     }
 }

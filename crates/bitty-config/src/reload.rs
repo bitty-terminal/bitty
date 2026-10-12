@@ -48,6 +48,20 @@ fn describe_view_override(entry: &ViewOverride) -> String {
     if let Some(width) = o.border_width_idle {
         parts.push(format!("border_width_idle={width}"));
     }
+    // CTX-1159 S0: the per-View style quartet is reported per selector
+    // like every other set leaf (accepted-but-inert until S3).
+    if let Some(color) = o.glow_color {
+        parts.push(format!("glow_color={}", color.to_hex()));
+    }
+    if let Some(width) = o.glow_width {
+        parts.push(format!("glow_width={width}"));
+    }
+    if let Some(color) = o.background_tint {
+        parts.push(format!("background_tint={}", color.to_hex()));
+    }
+    if let Some(strength) = o.background_tint_strength {
+        parts.push(format!("background_tint_strength={strength}"));
+    }
     if let Some(image) = &o.background_image {
         parts.push(format!("background_image={image}"));
     }
@@ -111,6 +125,14 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.background_image`     | Live       |
 /// | `decoration.background_fit`       | Live       |
 /// | `decoration.background_image_roots` | Live     |
+/// | `decoration.background_tint`      | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `decoration.background_tint_strength` | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.glow_color`     | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.glow_width`     | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.shadow_color`   | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.shadow_offset_x`| Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.shadow_offset_y`| Live (CTX-1159 S0 accepted-but-inert) |
+/// | `appearance.style.fade_unfocused` | Live (CTX-1159 S0 accepted-but-inert) |
 /// | `appearance.theme`        | Live               |
 /// | `appearance.colors`       | Live               |
 /// | `mod_key`                 | Live               |
@@ -193,8 +215,23 @@ pub const LIVE_FIELDS: &[&str] = &[
     "decoration.background_image",
     "decoration.background_fit",
     "decoration.background_image_roots",
+    // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the tint pair is
+    // paint-only and classifies Live, but stays accepted-but-inert until
+    // S3 — parsed, validated, merged, and reported with no render effect
+    // (the `set_chrome_style` adopter and its audit land in S3).
+    "decoration.background_tint",
+    "decoration.background_tint_strength",
     "appearance.theme",
     "appearance.colors",
+    // CTX-1159 S0: the closed `appearance.style` table is paint-only and
+    // classifies Live under the same accepted-but-inert terms as the tint
+    // pair above.
+    "appearance.style.glow_color",
+    "appearance.style.glow_width",
+    "appearance.style.shadow_color",
+    "appearance.style.shadow_offset_x",
+    "appearance.style.shadow_offset_y",
+    "appearance.style.fade_unfocused",
     "appearance.animations.enabled",
     "appearance.animations.reduced_motion",
     "appearance.animations.duration_ms.open",
@@ -532,6 +569,23 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
     ] {
         push_if_changed(field, before, after);
     }
+    // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the tint pair is
+    // accepted-but-inert paint state, so each leaf must diff; without these
+    // a tint-only edit reported `unchanged` and never reconciled.
+    for (field, before, after) in [
+        (
+            "decoration.background_tint",
+            format!("{:?}", old.decoration.background_tint),
+            format!("{:?}", new.decoration.background_tint),
+        ),
+        (
+            "decoration.background_tint_strength",
+            format!("{:?}", old.decoration.background_tint_strength),
+            format!("{:?}", new.decoration.background_tint_strength),
+        ),
+    ] {
+        push_if_changed(field, before, after);
+    }
     push_if_changed(
         "terminal.scrollback",
         old.terminal.scrollback.to_string(),
@@ -673,6 +727,50 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         format!("{:?}", old.appearance.colors),
         format!("{:?}", new.appearance.colors),
     );
+    // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the closed
+    // `appearance.style` table is accepted-but-inert paint state, so each
+    // leaf must diff; without these a style-only edit reported `unchanged`
+    // and never reconciled. `None` and an empty table compare equal (both
+    // contribute nothing), so a layer that merely omits the table never
+    // diffs against one that declares it empty.
+    {
+        let old_style = old.appearance.style.clone().unwrap_or_default();
+        let new_style = new.appearance.style.clone().unwrap_or_default();
+        for (field, before, after) in [
+            (
+                "appearance.style.glow_color",
+                format!("{:?}", old_style.glow_color),
+                format!("{:?}", new_style.glow_color),
+            ),
+            (
+                "appearance.style.glow_width",
+                format!("{:?}", old_style.glow_width),
+                format!("{:?}", new_style.glow_width),
+            ),
+            (
+                "appearance.style.shadow_color",
+                format!("{:?}", old_style.shadow_color),
+                format!("{:?}", new_style.shadow_color),
+            ),
+            (
+                "appearance.style.shadow_offset_x",
+                format!("{:?}", old_style.shadow_offset_x),
+                format!("{:?}", new_style.shadow_offset_x),
+            ),
+            (
+                "appearance.style.shadow_offset_y",
+                format!("{:?}", old_style.shadow_offset_y),
+                format!("{:?}", new_style.shadow_offset_y),
+            ),
+            (
+                "appearance.style.fade_unfocused",
+                format!("{:?}", old_style.fade_unfocused),
+                format!("{:?}", new_style.fade_unfocused),
+            ),
+        ] {
+            push_if_changed(field, before, after);
+        }
+    }
     // RFC-0002: presentation-only animation chrome is adopted live by the
     // runtime (`set_animations`), so each leaf reconciles live like the
     // outline pair.
@@ -1793,6 +1891,109 @@ mod ctx0392_tests {
         assert_eq!(
             cur.appearance.colors.unwrap().background,
             [0x1E, 0x1E, 0x2E]
+        );
+    }
+}
+
+#[cfg(test)]
+mod style_s0_tests {
+    use super::*;
+    use crate::types::{OutlineColor, StyleConfig};
+
+    fn styled() -> EffectiveConfig {
+        let mut cfg = EffectiveConfig::default();
+        cfg.appearance.style = Some(StyleConfig {
+            glow_color: OutlineColor::parse("#FF0000"),
+            glow_width: Some(8),
+            shadow_color: OutlineColor::parse("#00000080"),
+            shadow_offset_x: Some(-8),
+            shadow_offset_y: Some(8),
+            fade_unfocused: Some(0.5),
+        });
+        cfg.decoration.background_tint = OutlineColor::parse("#11223344");
+        cfg.decoration.background_tint_strength = Some(0.75);
+        cfg
+    }
+
+    #[test]
+    fn style_leaves_classify_live() {
+        // CTX-1159 S0 (DEC-0113 Fix 3): the new leaves classify Live in
+        // the reload table while staying accepted-but-inert until S3 (the
+        // `set_chrome_style` adopter and its audit land there).
+        for field in [
+            "appearance.style.glow_color",
+            "appearance.style.glow_width",
+            "appearance.style.shadow_color",
+            "appearance.style.shadow_offset_x",
+            "appearance.style.shadow_offset_y",
+            "appearance.style.fade_unfocused",
+            "decoration.background_tint",
+            "decoration.background_tint_strength",
+        ] {
+            assert_eq!(classify_field(field), ReloadClass::Live, "{field}");
+            assert!(
+                LIVE_FIELDS.contains(&field),
+                "{field} must be exported in LIVE_FIELDS"
+            );
+        }
+    }
+
+    #[test]
+    fn style_diff_is_live_and_reconciles() {
+        // Every style leaf diffs as Live, so a style-only edit is never
+        // reported `unchanged`.
+        let old = EffectiveConfig::default();
+        let new = styled();
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live, "{r:?}");
+        assert!(!r.needs_restart);
+        assert!(!r.has_rejected);
+        for field in [
+            "appearance.style.glow_color",
+            "appearance.style.glow_width",
+            "appearance.style.shadow_color",
+            "appearance.style.shadow_offset_x",
+            "appearance.style.shadow_offset_y",
+            "appearance.style.fade_unfocused",
+            "decoration.background_tint",
+            "decoration.background_tint_strength",
+        ] {
+            assert!(r.diffs.iter().any(|d| d.field == field), "missing {field}");
+        }
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("style must reconcile live");
+        assert_eq!(cur.appearance.style.expect("style").glow_width, Some(8));
+        assert_eq!(cur.decoration.background_tint_strength, Some(0.75));
+    }
+
+    #[test]
+    fn style_views_diff_reports_per_selector() {
+        // Per-View style leaves report under their selector path like the
+        // outline leaves (accepted-but-inert until S3).
+        use crate::types::{ViewAppearanceOverride, ViewOverride, ViewSelector};
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.views = vec![ViewOverride {
+            selector: ViewSelector::Wildcard,
+            overrides: ViewAppearanceOverride {
+                glow_width: Some(4),
+                background_tint_strength: Some(0.5),
+                ..Default::default()
+            },
+        }];
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live, "{r:?}");
+        assert!(r.diffs.iter().any(|d| d.field == "views[*]"));
+        let entry = r
+            .diffs
+            .iter()
+            .find(|d| d.field == "views[*]")
+            .expect("diff");
+        assert!(entry.after.contains("glow_width=4"), "{}", entry.after);
+        assert!(
+            entry.after.contains("background_tint_strength=0.5"),
+            "{}",
+            entry.after
         );
     }
 }

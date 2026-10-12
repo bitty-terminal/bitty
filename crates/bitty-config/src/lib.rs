@@ -141,9 +141,10 @@ pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
     AppearanceConfig, BackgroundFit, BackgroundPosition, BellMode, CloseConfirm, CursorStyle,
     DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig,
-    OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths,
-    ResolvedViewAppearance, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
+    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
+    MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec,
+    ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance,
+    ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig, TerminalConfig,
     ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride, ViewSelector,
     WindowConfig, WorkspaceConfig,
 };
@@ -199,6 +200,7 @@ mod integration_tests {
                     colors: None,
                     theme: Some("dark".into()),
                     animations: None,
+                    style: None,
                 }),
                 schema_version: Some(CURRENT_SCHEMA_VERSION),
                 ..Default::default()

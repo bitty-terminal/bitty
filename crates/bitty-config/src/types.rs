@@ -168,6 +168,23 @@ pub const MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST: f64 = 1.5;
 /// Maximum accepted outline color spelling length: `#RRGGBBAA` (9 bytes).
 pub const MAX_DECORATION_COLOR_LEN: usize = 9;
 
+// ── Chrome styling (DEC-0111 section 1, DEC-0113; CTX-1159 S0) ────────────
+//
+// Accepted-but-inert paint surface (S0): parsed, validated, merged,
+// attributed, and reported with no render effect. The setters and the
+// retained-path consumption land in S3; per-View resolution lands in S2.
+
+/// Maximum `appearance.style.glow_width` (and per-View `glow_width`) in
+/// logical px: `0..=16`, mirroring [`MAX_DECORATION_BORDER_WIDTH_PX`] (the
+/// paint-only ring family, never moves the content grid).
+pub const MAX_STYLE_GLOW_WIDTH_PX: u32 = 16;
+
+/// Maximum absolute `appearance.style.shadow_offset_x` /
+/// `shadow_offset_y` in logical px: `-8..=8`. Bounds overdraw DoS (giant
+/// offsets mean unbounded damage rects) and keeps shadows inside the gap
+/// rhythm, never reaching content.
+pub const MAX_STYLE_SHADOW_OFFSET_PX: i32 = 8;
+
 // ── Per-View appearance overrides (RFC-0001/OQ-041, CTX-0343) ─────────────
 //
 // Accepted contract: a `views` table keyed by a closed selector grammar
@@ -1103,7 +1120,14 @@ impl std::fmt::Display for BackgroundFit {
 /// silently shadows it. The set is closed; reserved (`opacity`, `blur`,
 /// `animations`) and unknown fields are rejected before this type is
 /// constructed.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// CTX-1159 S0 (DEC-0111 section 1, DEC-0113): the per-View style quartet
+/// (`glow_color`, `glow_width`, `background_tint`,
+/// `background_tint_strength`) joins the closed set. `shadow_*` and
+/// `fade_unfocused` stay global-only and reject inside `views.*` like
+/// `background_image_roots` does. The new leaves are accepted-but-inert:
+/// stored, validated, merged, and reported with no render effect until S3.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewAppearanceOverride {
     /// Base outline color for both focus states at this tier.
     pub border_color: Option<OutlineColor>,
@@ -1122,6 +1146,18 @@ pub struct ViewAppearanceOverride {
     pub background_image: Option<String>,
     /// Background-image fit mode for this tier.
     pub background_fit: Option<BackgroundFit>,
+    /// Glow halo color for this tier (CTX-1159 S0; canonical grammar
+    /// enforced fail-closed in the file loader). `None` contributes no glow.
+    pub glow_color: Option<OutlineColor>,
+    /// Glow halo width for this tier in logical px `0..=16` (CTX-1159 S0).
+    /// `None` inherits the resolved global width.
+    pub glow_width: Option<u32>,
+    /// Background tint color for this tier (CTX-1159 S0; same canonical
+    /// grammar as the outline colors). `None` means no tint.
+    pub background_tint: Option<OutlineColor>,
+    /// Background tint strength for this tier, finite within `[0.0, 1.0]`
+    /// (CTX-1159 S0). `None` resolves to `0.0` (no tint).
+    pub background_tint_strength: Option<f32>,
 }
 
 impl ViewAppearanceOverride {
@@ -1136,15 +1172,21 @@ impl ViewAppearanceOverride {
             && self.border_width_idle.is_none()
             && self.background_image.is_none()
             && self.background_fit.is_none()
+            && self.glow_color.is_none()
+            && self.glow_width.is_none()
+            && self.background_tint.is_none()
+            && self.background_tint_strength.is_none()
     }
 
-    /// Validates field bounds fail-closed (out-of-range widths and invalid
-    /// image path syntax are rejected, never clamped).
+    /// Validates field bounds fail-closed (out-of-range widths, a
+    /// non-finite or out-of-range tint strength, and invalid image path
+    /// syntax are rejected, never clamped).
     ///
     /// # Errors
     ///
     /// [`ConfigError::Validation`] naming the offending field when a width is
-    /// outside `0..=16` or `background_image` is not a bounded absolute or
+    /// outside `0..=16`, `background_tint_strength` is not finite within
+    /// `[0.0, 1.0]`, or `background_image` is not a bounded absolute or
     /// `~`-anchored path.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, value) in [
@@ -1156,6 +1198,22 @@ impl ViewAppearanceOverride {
                 return Err(ConfigError::validation(
                     field,
                     format!("must be within [0, {MAX_DECORATION_BORDER_WIDTH_PX}]"),
+                ));
+            }
+        }
+        if let Some(width) = self.glow_width {
+            if width > MAX_STYLE_GLOW_WIDTH_PX {
+                return Err(ConfigError::validation(
+                    "glow_width",
+                    format!("must be within [0, {MAX_STYLE_GLOW_WIDTH_PX}]"),
+                ));
+            }
+        }
+        if let Some(strength) = self.background_tint_strength {
+            if !(strength.is_finite() && (0.0..=1.0).contains(&strength)) {
+                return Err(ConfigError::validation(
+                    "background_tint_strength",
+                    "must be finite within [0.0, 1.0]",
                 ));
             }
         }
@@ -1237,7 +1295,10 @@ fn validate_background_image_roots(field: &str, roots: &[String]) -> Result<(), 
 }
 
 /// One merged `views` entry: a parsed selector plus its per-field overrides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// CTX-1159 S0: `PartialEq` only (`ViewAppearanceOverride` carries the
+// `background_tint_strength` float, so `Eq` no longer holds).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViewOverride {
     /// Parsed selector (canonical form preserved implicitly).
     pub selector: ViewSelector,
@@ -2945,7 +3006,10 @@ impl ChromeConfig {
 /// layout.gap_cells * cell_axis`, so with the default `layout` cell gaps of
 /// `0` the effective sibling and container gaps are both the `6` logical px
 /// decoration default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// CTX-1159 S0: `PartialEq` only (`background_tint_strength` is a float,
+// so `Eq` no longer holds — same posture as `LayoutConfig::resize_step`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecorationConfig {
     /// Gap between adjacent views inside one workspace, logical px.
     pub gaps_in: u32,
@@ -2995,6 +3059,17 @@ pub struct DecorationConfig {
     /// denies every path. Global-only policy; deliberately absent from the
     /// `views.*` field set so a per-`View` entry can never widen it.
     pub background_image_roots: Option<Vec<String>>,
+    /// Global background tint color (CTX-1159 S0, DEC-0111 section 1
+    /// `decoration.background_tint`). Lives in `decoration`, not
+    /// `appearance.style`, per the RFC-0001 naming rule (background images
+    /// are owned by the OQ-042 contract). `None` means no tint.
+    /// Accepted-but-inert in S0: validated, merged, and reported with no
+    /// render effect until S3.
+    pub background_tint: Option<OutlineColor>,
+    /// Global background tint strength (CTX-1159 S0
+    /// `decoration.background_tint_strength`), finite within `[0.0, 1.0]`.
+    /// `None` resolves to `0.0` (no tint).
+    pub background_tint_strength: Option<f32>,
 }
 
 impl Default for DecorationConfig {
@@ -3014,6 +3089,8 @@ impl Default for DecorationConfig {
             background_image: None,
             background_fit: None,
             background_image_roots: None,
+            background_tint: None,
+            background_tint_strength: None,
         }
     }
 }
@@ -3024,7 +3101,8 @@ impl DecorationConfig {
     /// mode reproduces the legacy border-only geometry. CTX-0340: the
     /// outline pair is forced to the opaque built-in pair and the explicit
     /// color knobs are cleared, so user colors can never leak into safe
-    /// mode.
+    /// mode. CTX-1159 S0: the tint pair is cleared too, so no surviving
+    /// tint can mask contrast cues.
     #[must_use]
     pub const fn safe() -> Self {
         Self {
@@ -3042,6 +3120,8 @@ impl DecorationConfig {
             background_image: None,
             background_fit: None,
             background_image_roots: None,
+            background_tint: None,
+            background_tint_strength: None,
         }
     }
 
@@ -3183,6 +3263,19 @@ impl DecorationConfig {
         }
         if let Some(roots) = &self.background_image_roots {
             validate_background_image_roots("decoration.background_image_roots", roots)?;
+        }
+        // CTX-1159 S0 (DEC-0111 section 1): the tint strength is finite
+        // within `[0.0, 1.0]` fail-closed, mirroring `window.opacity` /
+        // `window.background_opacity`. Never sanitize-then-accept at the
+        // config layer. No tint-contrast gate in v1 (documented readability
+        // duty, same posture as `background_opacity`).
+        if let Some(strength) = self.background_tint_strength {
+            if !(strength.is_finite() && (0.0..=1.0).contains(&strength)) {
+                return Err(ConfigError::validation(
+                    "decoration.background_tint_strength",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
         }
         Ok(())
     }
@@ -3417,7 +3510,120 @@ impl MouseConfig {
 /// complete palette (4 chrome colors plus exactly 16 ANSI entries); partial
 /// tables fail closed at the file loader, and the effective outline
 /// AC-1/AC-2 contract is enforced against the custom background.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Chrome styling: the closed `appearance.style` table (CTX-1159 S0,
+/// DEC-0111 section 1 as corrected by DEC-0113).
+///
+/// Global scope only. Every leaf is optional: `None` means "this layer says
+/// nothing for that leaf" so merge inherits the lower-precedence value and
+/// never silently shadows it. The set is closed: `shadow_blur` is RESERVED
+/// (present rejects fail-closed) and `ring_alpha` was never added; unknown
+/// fields reject before this type is constructed.
+///
+/// Accepted-but-inert in S0: values are parsed, validated, merged,
+/// attributed, and reported with provably no render effect. Per-View
+/// resolution lands in S2 (`resolve_view_style`); the `set_chrome_style`
+/// adopter and all consumption land in S3. `Default` reproduces current
+/// rendering byte-identically (no glow, no shadow, no fade).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StyleConfig {
+    /// Glow halo color (`appearance.style.glow_color`), canonical
+    /// `#RRGGBB` / `#RRGGBBAA`. `None` means no glow contribution.
+    pub glow_color: Option<OutlineColor>,
+    /// Glow halo width in logical px (`appearance.style.glow_width`),
+    /// `0..=16`. `None` inherits the lower layer; `0` (and the default)
+    /// paints no halo.
+    pub glow_width: Option<u32>,
+    /// Drop-shadow color (`appearance.style.shadow_color`), canonical
+    /// `#RRGGBB` / `#RRGGBBAA`. `None` means no shadow. Global-only.
+    pub shadow_color: Option<OutlineColor>,
+    /// Drop-shadow horizontal offset in logical px
+    /// (`appearance.style.shadow_offset_x`), `-8..=8`. Global-only.
+    pub shadow_offset_x: Option<i32>,
+    /// Drop-shadow vertical offset in logical px
+    /// (`appearance.style.shadow_offset_y`), `-8..=8`. Global-only.
+    pub shadow_offset_y: Option<i32>,
+    /// Inactive-View dim factor (`appearance.style.fade_unfocused`),
+    /// finite within `[0.0, 1.0]`. `None` resolves to `1.0` (no fade).
+    /// Global-only; per-View fade stays reserved under OQ-038.
+    pub fade_unfocused: Option<f32>,
+}
+
+impl StyleConfig {
+    /// Whether every leaf is unset (contributes nothing anywhere).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.glow_color.is_none()
+            && self.glow_width.is_none()
+            && self.shadow_color.is_none()
+            && self.shadow_offset_x.is_none()
+            && self.shadow_offset_y.is_none()
+            && self.fade_unfocused.is_none()
+    }
+
+    /// Cleared style surface for safe mode (`bitty --safe`, DEC-0111
+    /// section 3): no glow, no shadow, no fade. Content equals
+    /// [`Self::default`] today; kept as a separate constructor so the safe
+    /// promise (`0/0/1/0/0` + opaque built-in pair + instant final-state)
+    /// survives any future default that paints.
+    #[must_use]
+    pub fn safe() -> Self {
+        Self {
+            glow_color: None,
+            glow_width: None,
+            shadow_color: None,
+            shadow_offset_x: None,
+            shadow_offset_y: None,
+            fade_unfocused: None,
+        }
+    }
+
+    /// Validates every present leaf fail-closed (out-of-range widths and
+    /// offsets, non-finite or out-of-range fade are rejected, never
+    /// clamped or coerced).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] naming the `appearance.style.*` leaf
+    /// when a width is outside `0..=16`, an offset is outside `-8..=8`,
+    /// or the fade factor is not finite within `[0.0, 1.0]`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(width) = self.glow_width {
+            if width > MAX_STYLE_GLOW_WIDTH_PX {
+                return Err(ConfigError::validation(
+                    "appearance.style.glow_width",
+                    format!("must be within [0, {MAX_STYLE_GLOW_WIDTH_PX}]"),
+                ));
+            }
+        }
+        for (field, value) in [
+            ("appearance.style.shadow_offset_x", self.shadow_offset_x),
+            ("appearance.style.shadow_offset_y", self.shadow_offset_y),
+        ] {
+            if let Some(offset) = value {
+                if offset.abs() > MAX_STYLE_SHADOW_OFFSET_PX {
+                    return Err(ConfigError::validation(
+                        field,
+                        format!(
+                            "must be within [-{MAX_STYLE_SHADOW_OFFSET_PX}, \
+                             {MAX_STYLE_SHADOW_OFFSET_PX}]"
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(fade) = self.fade_unfocused {
+            if !(fade.is_finite() && (0.0..=1.0).contains(&fade)) {
+                return Err(ConfigError::validation(
+                    "appearance.style.fade_unfocused",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppearanceConfig {
     /// Optional theme identifier.
     pub theme: Option<String>,
@@ -3429,6 +3635,25 @@ pub struct AppearanceConfig {
     /// layer says nothing"; a present value deep-merges per leaf, and the
     /// effective concrete [`AnimationsConfig`] lives on [`EffectiveConfig`].
     pub animations: Option<AnimationsOverride>,
+    /// Chrome style overrides (CTX-1159 S0). `None` means "this layer says
+    /// nothing"; a present value deep-merges per leaf into the effective
+    /// style, which stays accepted-but-inert until S3.
+    pub style: Option<StyleConfig>,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        // CTX-1159 S0: the effective style container is always present
+        // (empty = current rendering), so `with_safe_decoration` on a
+        // styled config collapses back to exactly this default and merge
+        // never has to invent the container.
+        Self {
+            theme: None,
+            colors: None,
+            animations: None,
+            style: Some(StyleConfig::default()),
+        }
+    }
 }
 
 impl AppearanceConfig {
@@ -3475,6 +3700,11 @@ impl AppearanceConfig {
         // `EffectiveConfig::validate`).
         if let Some(a) = &self.animations {
             a.validate()?;
+        }
+        // CTX-1159 S0: every present style leaf is bounds-checked
+        // fail-closed with its `appearance.style.*` path.
+        if let Some(s) = &self.style {
+            s.validate()?;
         }
         Ok(())
     }
@@ -3732,6 +3962,10 @@ impl EffectiveConfig {
     #[must_use]
     pub fn with_safe_decoration(mut self) -> Self {
         self.decoration = DecorationConfig::safe();
+        // CTX-1159 S0: the style surface clears with the decoration (any
+        // surviving glow, shadow, tint, or fade would violate the safe
+        // promise and could mask contrast cues).
+        self.appearance.style = Some(StyleConfig::safe());
         self.views.clear();
         self.panel_rules.clear();
         self.animations.duration_ms = AnimationDurations {
@@ -6564,6 +6798,222 @@ mod tests {
         assert_eq!(
             config.effective_theme().background,
             crate::theme::DRACULA.background
+        );
+    }
+
+    #[test]
+    fn style_defaults_reproduce_current_rendering() {
+        // CTX-1159 S0: the default style contributes nothing (no glow, no
+        // shadow, no fade), and the safe surface equals it.
+        let style = StyleConfig::default();
+        assert!(style.is_empty());
+        style.validate().expect("default style valid");
+        assert_eq!(style, StyleConfig::safe());
+        assert_eq!(
+            AppearanceConfig::default().style,
+            Some(StyleConfig::default()),
+            "the effective style container is always present"
+        );
+    }
+
+    #[test]
+    fn style_validation_is_fail_closed_per_leaf() {
+        // Bounds reject with the `appearance.style.*` path, never clamp.
+        let bad_width = StyleConfig {
+            glow_width: Some(MAX_STYLE_GLOW_WIDTH_PX + 1),
+            ..Default::default()
+        };
+        let err = bad_width.validate().unwrap_err();
+        assert_eq!(err.field(), Some("appearance.style.glow_width"));
+        for offset in [
+            MAX_STYLE_SHADOW_OFFSET_PX + 1,
+            -MAX_STYLE_SHADOW_OFFSET_PX - 1,
+        ] {
+            for style in [
+                StyleConfig {
+                    shadow_offset_x: Some(offset),
+                    ..Default::default()
+                },
+                StyleConfig {
+                    shadow_offset_y: Some(offset),
+                    ..Default::default()
+                },
+            ] {
+                assert!(style.validate().is_err(), "offset {offset}");
+            }
+        }
+        let err = StyleConfig {
+            shadow_offset_x: Some(MAX_STYLE_SHADOW_OFFSET_PX + 1),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.field(), Some("appearance.style.shadow_offset_x"));
+        // Float poison rejects: NaN, infinities, and out-of-range values.
+        for fade in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5, 1.5] {
+            let err = StyleConfig {
+                fade_unfocused: Some(fade),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.field(), Some("appearance.style.fade_unfocused"));
+        }
+        // Boundary values accept.
+        StyleConfig {
+            glow_width: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .expect("zero glow width valid");
+        StyleConfig {
+            glow_width: Some(MAX_STYLE_GLOW_WIDTH_PX),
+            ..Default::default()
+        }
+        .validate()
+        .expect("max glow width valid");
+        StyleConfig {
+            shadow_offset_x: Some(-MAX_STYLE_SHADOW_OFFSET_PX),
+            shadow_offset_y: Some(MAX_STYLE_SHADOW_OFFSET_PX),
+            ..Default::default()
+        }
+        .validate()
+        .expect("offset extremes valid");
+        for fade in [0.0, 0.5, 1.0] {
+            StyleConfig {
+                fade_unfocused: Some(fade),
+                ..Default::default()
+            }
+            .validate()
+            .expect("in-range fade valid");
+        }
+    }
+
+    #[test]
+    fn decoration_tint_validation_is_fail_closed() {
+        // The tint pair validates with the `decoration.*` paths; the color
+        // grammar is enforced at the file loader (pre-parsed here).
+        DecorationConfig::default()
+            .validate()
+            .expect("default valid");
+        for strength in [f32::NAN, f32::INFINITY, -0.25, 1.25] {
+            let err = DecorationConfig {
+                background_tint_strength: Some(strength),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.field(), Some("decoration.background_tint_strength"));
+        }
+        DecorationConfig {
+            background_tint: OutlineColor::parse("#FF000080"),
+            background_tint_strength: Some(0.5),
+            ..Default::default()
+        }
+        .validate()
+        .expect("tinted decoration valid");
+        // Safe mode clears the tint pair with the rest of the surface.
+        let safe = DecorationConfig::safe();
+        assert_eq!(safe.background_tint, None);
+        assert_eq!(safe.background_tint_strength, None);
+        safe.validate().expect("safe decoration valid");
+    }
+
+    #[test]
+    fn view_style_quartet_validation_is_fail_closed() {
+        // Per-View style leaves validate with the bare leaf path; the
+        // selector qualification happens in `ViewOverride::validate`.
+        let err = ViewAppearanceOverride {
+            glow_width: Some(MAX_STYLE_GLOW_WIDTH_PX + 1),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.field(), Some("glow_width"));
+        let err = ViewAppearanceOverride {
+            background_tint_strength: Some(f32::NAN),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.field(), Some("background_tint_strength"));
+        let err = ViewAppearanceOverride {
+            background_tint_strength: Some(2.0),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.field(), Some("background_tint_strength"));
+        ViewAppearanceOverride {
+            glow_color: OutlineColor::parse("#33CCFF"),
+            glow_width: Some(4),
+            background_tint: OutlineColor::parse("#00000080"),
+            background_tint_strength: Some(0.25),
+            ..Default::default()
+        }
+        .validate()
+        .expect("styled override valid");
+        // The quartet participates in emptiness (an override carrying only
+        // style leaves is not empty).
+        assert!(
+            !ViewAppearanceOverride {
+                glow_width: Some(0),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // Selector-qualified diagnostics name `views[<selector>].<field>`.
+        let entry = ViewOverride {
+            selector: ViewSelector::Wildcard,
+            overrides: ViewAppearanceOverride {
+                glow_width: Some(MAX_STYLE_GLOW_WIDTH_PX + 1),
+                ..Default::default()
+            },
+        };
+        let err = entry.validate().unwrap_err();
+        assert_eq!(err.field(), Some("views[*].glow_width"));
+    }
+
+    #[test]
+    fn safe_mode_clears_the_style_surface() {
+        // CTX-1159 S0: safe mode promises no surviving glow, shadow, tint,
+        // or fade, and drops every `views.*` style override with the rest.
+        let styled = EffectiveConfig {
+            appearance: AppearanceConfig {
+                style: Some(StyleConfig {
+                    glow_color: OutlineColor::parse("#FF0000"),
+                    glow_width: Some(8),
+                    shadow_color: OutlineColor::parse("#000000"),
+                    shadow_offset_x: Some(4),
+                    shadow_offset_y: Some(-4),
+                    fade_unfocused: Some(0.5),
+                }),
+                ..Default::default()
+            },
+            decoration: DecorationConfig {
+                background_tint: OutlineColor::parse("#11223344"),
+                background_tint_strength: Some(0.75),
+                ..Default::default()
+            },
+            views: vec![ViewOverride {
+                selector: ViewSelector::Wildcard,
+                overrides: ViewAppearanceOverride {
+                    glow_width: Some(2),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let safe = styled.with_safe_decoration();
+        assert_eq!(safe.appearance.style, Some(StyleConfig::safe()));
+        assert_eq!(safe.decoration.background_tint, None);
+        assert_eq!(safe.decoration.background_tint_strength, None);
+        assert!(safe.views.is_empty());
+        safe.validate().expect("safe config valid");
+        assert_eq!(
+            safe,
+            EffectiveConfig::default().with_safe_decoration(),
+            "safe is deterministic regardless of input styling"
         );
     }
 }

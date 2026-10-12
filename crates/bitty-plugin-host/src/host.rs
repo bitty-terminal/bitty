@@ -176,6 +176,7 @@ pub struct PluginHost {
     secrets: crate::secrets::SecretStore,
     fs_policy: crate::fs_authz::SensitivePathPolicy,
     fs_audit: crate::fs_authz::FsAuditLedger,
+    tool_audit: crate::tools::ToolSpawnLedger,
 }
 
 impl PluginHost {
@@ -199,6 +200,7 @@ impl PluginHost {
             secrets: crate::secrets::SecretStore::new(),
             fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
             fs_audit: crate::fs_authz::FsAuditLedger::new(),
+            tool_audit: crate::tools::ToolSpawnLedger::new(),
         }
     }
 
@@ -218,6 +220,7 @@ impl PluginHost {
             secrets: crate::secrets::SecretStore::new(),
             fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
             fs_audit: crate::fs_authz::FsAuditLedger::new(),
+            tool_audit: crate::tools::ToolSpawnLedger::new(),
         }
     }
 
@@ -799,6 +802,20 @@ impl PluginHost {
         &self.fs_audit
     }
 
+    /// Tool-spawn audit ledger (caller/tool/bounded arg previews only;
+    /// env never recorded).
+    ///
+    /// Attributed inspect surface for the CTX-1152 ledger, mirroring
+    /// [`Self::fs_audit`]: attribution for `[tools.*]` spawn decisions
+    /// that enter via [`Self::authorize_tool_spawn`], inspectable without
+    /// a new CLI surface. Live runtime dispatch via `HostToolsAuthorizer`
+    /// enforces the same predicates but bypasses this ledger; wiring it
+    /// into the attributed path is sequel work.
+    #[must_use]
+    pub fn tool_audit(&self) -> &crate::tools::ToolSpawnLedger {
+        &self.tool_audit
+    }
+
     /// Grant explicit user consent for exactly one sensitive path.
     ///
     /// Consent is keyed by normalized path and audited; it never widens
@@ -918,6 +935,22 @@ impl PluginHost {
                 format!("fs denied ({kind}) '{path}'"),
             )),
         }
+    }
+
+    /// Authorize one tool spawn through the `[tools.*]` gate with attribution.
+    ///
+    /// Attributed decision path (CTX-1152, issue #1985): evaluates
+    /// [`crate::tools::is_tool_spawn_allowed`] via
+    /// [`crate::tools::check_tool_spawn`] and records exactly one ledger
+    /// entry (allow or deny) per call, inspectable via [`Self::tool_audit`].
+    /// Attributed spawn surfaces must enter here rather than calling the
+    /// predicate directly so no attributed decision escapes the ledger.
+    /// Live runtime dispatch via `HostToolsAuthorizer` enforces the same
+    /// predicates but bypasses this ledger; wiring it into this path is
+    /// sequel work. Env is never consulted and never recorded
+    /// ([`crate::secret_tiers`] discipline).
+    pub fn authorize_tool_spawn(&mut self, tool: &str, args: &[String], caller: &str) -> bool {
+        crate::tools::check_tool_spawn(&mut self.tool_audit, tool, args, caller)
     }
 
     /// Scrub read bytes against the live secret store (P0-AC-026).
@@ -2239,6 +2272,40 @@ mod effective_tests {
             entry.denial,
             Some(crate::fs_authz::FsDenialKind::HostilePattern)
         );
+    }
+
+    #[test]
+    fn host_authorize_tool_spawn_audits_allow_and_deny_exactly_once() {
+        // CTX-1152: the host tool-spawn seam evaluates the predicate and
+        // records exactly one ledger entry per decision (allow and deny).
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        assert!(host.tool_audit().is_empty());
+        assert!(host.authorize_tool_spawn("git", &["status".to_string()], "git-panel"));
+        assert!(!host.authorize_tool_spawn(
+            "git",
+            &["push".to_string(), "origin".to_string()],
+            "git-panel"
+        ));
+        assert!(!host.authorize_tool_spawn("rg", &["status".to_string()], "git-panel"));
+        assert_eq!(host.tool_audit().len(), 3);
+        assert_eq!(host.tool_audit().dropped(), 0);
+        let decisions: Vec<crate::tools::ToolSpawnDecision> = host
+            .tool_audit()
+            .iter()
+            .map(|entry| entry.decision)
+            .collect();
+        assert_eq!(
+            decisions,
+            vec![
+                crate::tools::ToolSpawnDecision::Allow,
+                crate::tools::ToolSpawnDecision::Deny,
+                crate::tools::ToolSpawnDecision::Deny,
+            ]
+        );
+        let first = host.tool_audit().iter().next().expect("audit entry");
+        assert_eq!(first.seq, 0);
+        assert_eq!(first.caller, "git-panel");
+        assert_eq!(first.tool, "git");
     }
 
     #[test]

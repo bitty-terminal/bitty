@@ -6199,9 +6199,94 @@ mod style_s0_tests {
     }
 
     #[test]
+    fn lua_style_round_trip_to_effective_values() {
+        // CTX-1160 S1: lua -> plan -> merge -> effective carries every style
+        // leaf as its typed value; unset leaves stay `None` through the
+        // whole pipeline (absent says nothing, never a mid-pipeline
+        // default). Resolution (S2) and consumption (S3) own whatever
+        // happens next; this test pins the extraction handoff only.
+        use crate::merge::merge_layers;
+        use crate::plan::LayeredPlan;
+
+        let plan = parse_lua_config(&style_s0_lua(), &style_source()).expect("styled parses");
+        plan.validate().expect("styled validates");
+        let merged = merge_layers(vec![LayeredPlan::new(style_source(), plan)]).expect("merge");
+        merged.effective.validate().expect("effective valid");
+
+        let style = merged
+            .effective
+            .appearance
+            .style
+            .as_ref()
+            .expect("effective style present");
+        assert_eq!(style.glow_color, OutlineColor::parse("#FF0000"));
+        assert_eq!(style.glow_width, Some(8));
+        assert_eq!(style.shadow_color, OutlineColor::parse("#00000080"));
+        assert_eq!(style.shadow_offset_x, Some(-8));
+        assert_eq!(style.shadow_offset_y, Some(8));
+        assert_eq!(style.fade_unfocused, Some(0.5));
+        assert_eq!(
+            merged.effective.decoration.background_tint,
+            OutlineColor::parse("#11223344")
+        );
+        assert_eq!(
+            merged.effective.decoration.background_tint_strength,
+            Some(0.75)
+        );
+        let views = &merged.effective.views;
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].selector.canonical(), "*");
+        assert_eq!(
+            views[0].overrides.glow_color,
+            OutlineColor::parse("#00FF00")
+        );
+        assert_eq!(views[0].overrides.glow_width, Some(4));
+        assert_eq!(
+            views[0].overrides.background_tint,
+            OutlineColor::parse("#000000")
+        );
+        assert_eq!(views[0].overrides.background_tint_strength, Some(0.25));
+
+        // A sparse layer stays sparse end to end: set leaves carry, unset
+        // leaves stay `None` (merge inherits, never defaults).
+        let partial = parse_lua_config(
+            "return { appearance = { style = { glow_color = \"#112233\" } }, \
+             views = { terminal = { glow_width = 2 } } }",
+            &style_source(),
+        )
+        .expect("partial parses");
+        let merged = merge_layers(vec![LayeredPlan::new(style_source(), partial)]).expect("merge");
+        let style = merged
+            .effective
+            .appearance
+            .style
+            .as_ref()
+            .expect("effective style present");
+        assert_eq!(style.glow_color, OutlineColor::parse("#112233"));
+        assert_eq!(style.glow_width, None);
+        assert_eq!(style.shadow_color, None);
+        assert_eq!(style.shadow_offset_x, None);
+        assert_eq!(style.shadow_offset_y, None);
+        assert_eq!(style.fade_unfocused, None);
+        assert_eq!(merged.effective.decoration.background_tint, None);
+        assert_eq!(merged.effective.decoration.background_tint_strength, None);
+        assert_eq!(merged.effective.views.len(), 1);
+        assert_eq!(merged.effective.views[0].selector.canonical(), "terminal");
+        assert_eq!(merged.effective.views[0].overrides.glow_width, Some(2));
+        assert_eq!(merged.effective.views[0].overrides.glow_color, None);
+        assert_eq!(merged.effective.views[0].overrides.background_tint, None);
+        assert_eq!(
+            merged.effective.views[0].overrides.background_tint_strength,
+            None
+        );
+    }
+
+    #[test]
     fn lua_style_vectors_fail_closed_with_named_paths() {
         // CTX-1159 S0: every bound violation rejects the whole reload with
         // a diagnostic naming the offending leaf path (never a clamp).
+        // CTX-1160 S1 extends the matrix to every leaf (valid/invalid),
+        // reserved rejections, overlong/NUL spellings, and NaN/Inf floats.
         let cases = [
             (
                 "glow_width high",
@@ -6219,13 +6304,63 @@ mod style_s0_tests {
                 "appearance.style.glow_width",
             ),
             (
+                "glow_width string",
+                "return { appearance = { style = { glow_width = \"8\" } } }",
+                "appearance.style.glow_width",
+            ),
+            (
+                "shadow_color malformed",
+                "return { appearance = { style = { shadow_color = \"black\" } } }",
+                "appearance.style.shadow_color",
+            ),
+            (
+                "shadow_color empty",
+                "return { appearance = { style = { shadow_color = \"\" } } }",
+                "appearance.style.shadow_color",
+            ),
+            (
+                "shadow_color overlong",
+                "return { appearance = { style = { shadow_color = \"#RRGGBBAAx\" } } }",
+                "appearance.style.shadow_color",
+            ),
+            (
+                "shadow_color NUL",
+                "return { appearance = { style = { shadow_color = \"#FF\\000000\" } } }",
+                "appearance.style.shadow_color",
+            ),
+            (
                 "shadow_offset_x high",
                 "return { appearance = { style = { shadow_offset_x = 9 } } }",
                 "appearance.style.shadow_offset_x",
             ),
             (
+                "shadow_offset_x low",
+                "return { appearance = { style = { shadow_offset_x = -9 } } }",
+                "appearance.style.shadow_offset_x",
+            ),
+            (
+                "shadow_offset_x float",
+                "return { appearance = { style = { shadow_offset_x = 1.5 } } }",
+                "appearance.style.shadow_offset_x",
+            ),
+            (
+                "shadow_offset_x string",
+                "return { appearance = { style = { shadow_offset_x = \"0\" } } }",
+                "appearance.style.shadow_offset_x",
+            ),
+            (
                 "shadow_offset_y low",
                 "return { appearance = { style = { shadow_offset_y = -9 } } }",
+                "appearance.style.shadow_offset_y",
+            ),
+            (
+                "shadow_offset_y high",
+                "return { appearance = { style = { shadow_offset_y = 9 } } }",
+                "appearance.style.shadow_offset_y",
+            ),
+            (
+                "shadow_offset_y bool",
+                "return { appearance = { style = { shadow_offset_y = false } } }",
                 "appearance.style.shadow_offset_y",
             ),
             (
@@ -6274,6 +6409,34 @@ mod style_s0_tests {
                 "appearance.style.fade_unfocused",
             ),
             (
+                "fade_unfocused bool",
+                "return { appearance = { style = { fade_unfocused = true } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "fade_unfocused NaN",
+                "return { appearance = { style = { fade_unfocused = 0/0 } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "fade_unfocused +Inf",
+                "return { appearance = { style = { fade_unfocused = math.huge } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "fade_unfocused -Inf",
+                "return { appearance = { style = { fade_unfocused = -math.huge } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            // Pre-cast check: 1.00000001 rounds to exactly 1.0 in `f32`
+            // but is out of range as `f64`, so it must reject here (the
+            // same fail-closed contract as `window.background_opacity`).
+            (
+                "fade_unfocused pre-cast over",
+                "return { appearance = { style = { fade_unfocused = 1.00000001 } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
                 "style not a table",
                 "return { appearance = { style = \"glow\" } }",
                 "appearance.style",
@@ -6284,8 +6447,58 @@ mod style_s0_tests {
                 "decoration.background_tint_strength",
             ),
             (
+                "tint strength negative",
+                "return { decoration = { background_tint_strength = -0.5 } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint strength NaN",
+                "return { decoration = { background_tint_strength = 0/0 } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint strength +Inf",
+                "return { decoration = { background_tint_strength = math.huge } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint strength pre-cast over",
+                "return { decoration = { background_tint_strength = 1.00000001 } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint strength string",
+                "return { decoration = { background_tint_strength = \"0.5\" } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint strength bool",
+                "return { decoration = { background_tint_strength = true } }",
+                "decoration.background_tint_strength",
+            ),
+            (
                 "tint color malformed",
                 "return { decoration = { background_tint = \"blue\" } }",
+                "decoration.background_tint",
+            ),
+            (
+                "tint color empty",
+                "return { decoration = { background_tint = \"\" } }",
+                "decoration.background_tint",
+            ),
+            (
+                "tint color overlong",
+                "return { decoration = { background_tint = \"#RRGGBBAAx\" } }",
+                "decoration.background_tint",
+            ),
+            (
+                "tint color NUL",
+                "return { decoration = { background_tint = \"#FF\\000000\" } }",
+                "decoration.background_tint",
+            ),
+            (
+                "tint color int",
+                "return { decoration = { background_tint = 42 } }",
                 "decoration.background_tint",
             ),
             (
@@ -6294,9 +6507,39 @@ mod style_s0_tests {
                 "views[*].shadow_color",
             ),
             (
+                "shadow_offset_x global-only in views",
+                "return { views = { [\"*\"] = { shadow_offset_x = 1 } } }",
+                "views[*].shadow_offset_x",
+            ),
+            (
+                "shadow_offset_y global-only in views",
+                "return { views = { [\"*\"] = { shadow_offset_y = 1 } } }",
+                "views[*].shadow_offset_y",
+            ),
+            (
                 "fade global-only in views",
                 "return { views = { [\"*\"] = { fade_unfocused = 0.5 } } }",
                 "views[*].fade_unfocused",
+            ),
+            (
+                "shadow_blur unknown in views",
+                "return { views = { [\"*\"] = { shadow_blur = 2 } } }",
+                "views[*].shadow_blur",
+            ),
+            (
+                "opacity reserved in views",
+                "return { views = { [\"*\"] = { opacity = 0.5 } } }",
+                "views[*].opacity",
+            ),
+            (
+                "blur reserved in views",
+                "return { views = { [\"*\"] = { blur = 4 } } }",
+                "views[*].blur",
+            ),
+            (
+                "animations reserved in views",
+                "return { views = { [\"*\"] = { animations = { enabled = false } } } }",
+                "views[*].animations",
             ),
             (
                 "views glow_width high",
@@ -6304,13 +6547,78 @@ mod style_s0_tests {
                 "views[*].glow_width",
             ),
             (
+                "views glow_width negative",
+                "return { views = { [\"*\"] = { glow_width = -1 } } }",
+                "views[*].glow_width",
+            ),
+            (
+                "views glow_width float",
+                "return { views = { [\"*\"] = { glow_width = 2.5 } } }",
+                "views[*].glow_width",
+            ),
+            (
+                "views glow_width string",
+                "return { views = { [\"*\"] = { glow_width = \"2\" } } }",
+                "views[*].glow_width",
+            ),
+            (
+                "views glow_color malformed",
+                "return { views = { [\"*\"] = { glow_color = \"green\" } } }",
+                "views[*].glow_color",
+            ),
+            (
+                "views glow_color empty",
+                "return { views = { [\"*\"] = { glow_color = \"\" } } }",
+                "views[*].glow_color",
+            ),
+            (
+                "views glow_color NUL",
+                "return { views = { [\"*\"] = { glow_color = \"#FF\\000000\" } } }",
+                "views[*].glow_color",
+            ),
+            (
                 "views tint strength high",
                 "return { views = { [\"*\"] = { background_tint_strength = 5.0 } } }",
                 "views[*].background_tint_strength",
             ),
             (
+                "views tint strength negative",
+                "return { views = { [\"*\"] = { background_tint_strength = -1.0 } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
+                "views tint strength NaN",
+                "return { views = { [\"*\"] = { background_tint_strength = 0/0 } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
+                "views tint strength +Inf",
+                "return { views = { [\"*\"] = { background_tint_strength = math.huge } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
+                "views tint strength pre-cast over",
+                "return { views = { [\"*\"] = { background_tint_strength = 1.00000001 } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
+                "views tint strength string",
+                "return { views = { [\"*\"] = { background_tint_strength = \"0.25\" } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
                 "views tint color malformed",
                 "return { views = { [\"*\"] = { background_tint = \"nope\" } } }",
+                "views[*].background_tint",
+            ),
+            (
+                "views tint color empty",
+                "return { views = { [\"*\"] = { background_tint = \"\" } } }",
+                "views[*].background_tint",
+            ),
+            (
+                "views tint color overlong",
+                "return { views = { [\"*\"] = { background_tint = \"#RRGGBBAAx\" } } }",
                 "views[*].background_tint",
             ),
         ];
@@ -6321,6 +6629,26 @@ mod style_s0_tests {
                 "{name}: error {err} must name {path}"
             );
         }
+        // The S1 reserved diagnostic names the key AND says reserved (a
+        // future blur-contract RFC is distinguishable from a typo).
+        let err = parse_lua_config(
+            "return { appearance = { style = { shadow_blur = 2 } } }",
+            &style_source(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("appearance.style.shadow_blur"), "{err}");
+        assert!(err.contains("reserved"), "{err}");
+        // The extractor host cap (2048 bytes) still guards color spellings
+        // before the downstream grammar runs; the diagnostic names the leaf.
+        let overlong = format!(
+            "return {{ appearance = {{ style = {{ glow_color = \"{}\" }} }} }}",
+            "x".repeat(2049)
+        );
+        let err = parse_lua_config(&overlong, &style_source())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("appearance.style.glow_color"), "{err}");
     }
 
     #[test]

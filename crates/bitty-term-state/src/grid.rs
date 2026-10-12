@@ -103,13 +103,6 @@ impl Grid {
         self.cells.clone().into_boxed_slice()
     }
 
-    /// Replaces an entire row; the caller supplies exactly `cols` cells.
-    pub fn replace_row(&mut self, row: usize, cells: &mut [Cell]) {
-        debug_assert_eq!(cells.len(), self.cols);
-        let start = row * self.cols;
-        self.cells[start..start + self.cols].swap_with_slice(&mut cells[..]);
-    }
-
     /// Takes a copy of the row's cells (used to push lines into scrollback).
     pub fn snapshot_row(&self, row: usize) -> Vec<Cell> {
         self.row(row).to_vec()
@@ -309,6 +302,12 @@ impl Grid {
     /// rows. This is "scroll region up"; returned rows may be captured into
     /// scrollback by the caller. Wrap flags travel with their rows; the
     /// freed bottom rows reset to unwrapped.
+    ///
+    /// Zero-alloc shift (CTX-1154): surviving rows move with one `copy_within`
+    /// memmove and the freed rows are filled in place. The only allocations
+    /// are the returned snapshot rows themselves, which the caller retains
+    /// as scrollback. The old per-row `to_vec` + blank-row churn (one Vec
+    /// per shifted row per scrolled line) is gone.
     pub fn remove_lines_up(
         &mut self,
         top: usize,
@@ -318,18 +317,24 @@ impl Grid {
     ) -> Vec<(Vec<Cell>, bool)> {
         let span = bottom - top + 1;
         let count = count.min(span);
+        let cols = self.cols;
         let mut removed = Vec::with_capacity(count);
-        for _ in 0..count {
-            removed.push((self.snapshot_row(top), self.wrapped(top)));
-            for r in top..bottom {
-                let mut carried: Vec<Cell> = self.row(r + 1).to_vec();
-                self.replace_row(r, &mut carried);
-                let w = self.wrapped(r + 1);
-                self.set_wrapped(r, w);
-            }
-            let mut blank = vec![Cell::erased(*erase_style); self.cols];
-            self.replace_row(bottom, &mut blank);
-            self.set_wrapped(bottom, false);
+        for r in top..top + count {
+            removed.push((self.snapshot_row(r), self.wrapped(r)));
+        }
+        if count < span {
+            // Shift rows `[top + count..=bottom]` up by `count` rows in
+            // place; row `r` lands at `r - count`, flags travel with cells.
+            self.cells
+                .copy_within((top + count) * cols..(bottom + 1) * cols, top * cols);
+            self.wraps.copy_within(top + count..=bottom, top);
+        }
+        // Blank the freed bottom rows in place.
+        let blank = Cell::erased(*erase_style);
+        for r in (bottom + 1 - count)..=bottom {
+            let start = r * cols;
+            self.cells[start..start + cols].fill(blank);
+            self.wraps[r] = false;
         }
         removed
     }
@@ -339,6 +344,10 @@ impl Grid {
     /// scrollback: RFC invariant 4 restricts capture to scroll-under-region).
     /// Wrap flags travel with their rows; inserted rows are unwrapped and the
     /// incoming edge `top - 1` is broken.
+    ///
+    /// Zero-alloc shift (CTX-1154): one `copy_within` memmove plus in-place
+    /// fill, mirroring [`Self::remove_lines_up`]. No per-row or blank-row
+    /// Vec churn.
     pub fn insert_blank_lines_down(
         &mut self,
         top: usize,
@@ -348,16 +357,22 @@ impl Grid {
     ) {
         let span = bottom - top + 1;
         let count = count.min(span);
-        for _ in 0..count {
-            for r in (top..bottom).rev() {
-                let mut carried: Vec<Cell> = self.row(r).to_vec();
-                self.replace_row(r + 1, &mut carried);
-                let w = self.wrapped(r);
-                self.set_wrapped(r + 1, w);
-            }
-            let mut blank = vec![Cell::erased(*erase_style); self.cols];
-            self.replace_row(top, &mut blank);
-            self.set_wrapped(top, false);
+        let cols = self.cols;
+        if count < span {
+            // Shift rows `[top..=bottom - count]` down by `count` rows in
+            // place; row `r` lands at `r + count`, flags travel with cells.
+            // `copy_within` is memmove: overlapping ranges stay exact.
+            self.cells.copy_within(
+                top * cols..(bottom + 1 - count) * cols,
+                (top + count) * cols,
+            );
+            self.wraps.copy_within(top..=bottom - count, top + count);
+        }
+        let blank = Cell::erased(*erase_style);
+        for r in top..top + count {
+            let start = r * cols;
+            self.cells[start..start + cols].fill(blank);
+            self.wraps[r] = false;
         }
         if top > 0 {
             // Inserted blanks break continuation from above.

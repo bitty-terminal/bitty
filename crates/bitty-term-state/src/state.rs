@@ -443,15 +443,18 @@ impl State {
         // CTX-0469); the cursor mapping additionally reuses the reflow's
         // per-logical row counts instead of rewrapping every logical again.
         let width_changed = cols != old_cols;
+        // Pre-take scrollback length for cursor bookkeeping: the take below
+        // drains the buffer, so the combined index must use this snapshot.
+        let sb_len_before = self.scrollback.len();
         let (old_logicals, row_map): (Vec<Vec<Cell>>, Vec<(usize, usize)>) = if width_changed {
-            Self::collect_logical_lines(&self.screens.main, &self.scrollback, old_rows)
+            Self::take_logical_lines(&self.screens.main, &mut self.scrollback, old_rows)
         } else {
             (Vec::new(), Vec::new())
         };
         let cursor_logical: Option<(usize, usize)> = if !alt_active && width_changed {
             let crow = self.cursor.position.row as usize;
             let ccol = self.cursor.position.col as usize;
-            let sb_len = self.scrollback.len();
+            let sb_len = sb_len_before;
             // Cursor offset: leads before `ccol` within its row, clamped
             // to the trimmed segment (blank tail -> end-of-content).
             let cursor_combined = sb_len + crow;
@@ -472,24 +475,33 @@ impl State {
         } else {
             None
         };
-        let reflow_counts: Vec<usize> = if cols == old_cols {
+        let (reflow_counts, cursor_cells): (Vec<usize>, Option<Vec<Cell>>) = if cols == old_cols {
             // Height-only: no logical rewrapping. Truncate/pad both grids;
             // scrollback widths already match.
             self.screens.main.resize(rows, cols, &erase);
             self.screens.alt.resize(rows, cols, &erase);
-            Vec::new()
+            (Vec::new(), None)
         } else {
             // Width change: reflow primary (main + scrollback), truncate alt.
+            // The take above already drained the scrollback into
+            // `old_logicals`; the reflow consumes them (no clone twin) and
+            // rebuilds with fresh ids. Keep one clone of the cursor's
+            // logical (one row, kilobytes) for post-reflow cursor mapping;
+            // the rest is consumed so peak stays near one generation.
+            let cursor_cells: Option<Vec<Cell>> = cursor_logical
+                .map(|(line_idx, _)| line_idx)
+                .filter(|line_idx| *line_idx < old_logicals.len())
+                .map(|line_idx| old_logicals[line_idx].clone());
             let counts = Self::reflow_primary(
                 &mut self.screens.main,
                 &mut self.scrollback,
-                &old_logicals,
+                old_logicals,
                 cols,
                 rows,
                 &erase,
             );
             self.screens.alt.resize(rows, cols, &erase);
-            counts
+            (counts, cursor_cells)
         };
         // Resize tab lattice: preserve stops that still fit, default for new columns.
         let old_len = self.tabs.len();
@@ -511,9 +523,9 @@ impl State {
         if let Some((line_idx, unit_offset)) = cursor_logical {
             // Map the saved logical position through the new width. Find
             // where logical `line_idx` starts in the new combined order and
-            // offset within it.
-            if line_idx < old_logicals.len() {
-                let logical = &old_logicals[line_idx];
+            // offset within it. Uses the single retained clone: the full
+            // logical list was consumed by the reflow above.
+            if let Some(logical) = cursor_cells.as_deref() {
                 // Rewrap just this logical to locate the target row/col.
                 let (row_off, col) = map_unit_to_rewrapped(logical, unit_offset, cols, &erase);
                 // This logical's start in the new total order is the prefix
@@ -610,20 +622,37 @@ impl State {
         damage
     }
 
-    /// Collects combined (scrollback + grid) physical rows into logical
-    /// lines by unwrapping via soft-wrap flags, oldest first. Called once by
+    /// Takes combined (scrollback + grid) physical rows into logical lines by
+    /// unwrapping via soft-wrap flags, oldest first. Called once by
     /// [`State::resize`] and consumed by [`State::reflow_primary`], so a
     /// width resize collects exactly once (CTX-0469).
+    ///
+    /// Unlike a borrowing collect, scrollback boxes are DRAINED (moved out,
+    /// oldest first) instead of cloned while the originals stay live: a
+    /// full-scrollback reflow otherwise peaks at three resident generations
+    /// (originals plus collected logicals plus rebuilt rows, ~270 MB at
+    /// 10k x 152-col lines) and the freed twins fragment the heap around
+    /// the live rebuild (CTX-1154: ~90 MB pinned waste after scroll-spam).
+    /// Draining frees each box as its cells move into the logicals, so the
+    /// rebuild reuses just-freed bins and peak stays near one generation.
+    /// Grid rows are small (one viewport) and stay cloned; the scrollback
+    /// is left empty and rebuilt by `reflow_primary` with fresh ids.
     ///
     /// Returns the logical lines plus a per-combined-row map of
     /// `(logical_idx, seg_start_in_logical)` for cursor bookkeeping. The
     /// last grid row is always a hard break (no next grid row).
     /// Deterministic, headless, bounded.
-    fn collect_logical_lines(
+    fn take_logical_lines(
         main: &Grid,
-        scrollback: &Scrollback,
+        scrollback: &mut Scrollback,
         old_rows: usize,
     ) -> (Vec<Vec<Cell>>, Vec<(usize, usize)>) {
+        fn trim_owned(cells: &mut Vec<Cell>) {
+            cells.retain(|cell| !cell.spacer);
+            while cells.last().is_some_and(Cell::is_blank) {
+                cells.pop();
+            }
+        }
         let sb_len = scrollback.len();
         let total = sb_len + old_rows;
         let mut logicals: Vec<Vec<Cell>> = Vec::new();
@@ -631,9 +660,9 @@ impl State {
         // (logical_idx, seg_start_in_logical) per combined row.
         let mut row_map: Vec<(usize, usize)> = Vec::with_capacity(total);
         for combined in 0..total {
-            let (segment, wrapped) = if combined < sb_len {
-                let line = scrollback.line(combined).expect("scrollback index");
-                (trim_row_to_leads(&line.cells), line.wrapped)
+            let (mut segment, wrapped) = if combined < sb_len {
+                let line = scrollback.pop_front_line().expect("scrollback index");
+                (Vec::from(line.cells), line.wrapped)
             } else {
                 let gr = combined - sb_len;
                 let row_cells = main.row(gr).to_vec();
@@ -643,10 +672,11 @@ impl State {
                 } else {
                     false
                 };
-                (trim_row_to_leads(&row_cells), w)
+                (row_cells, w)
             };
+            trim_owned(&mut segment);
             row_map.push((logicals.len(), cur.len()));
-            cur.extend(segment);
+            cur.append(&mut segment);
             if !wrapped {
                 logicals.push(std::mem::take(&mut cur));
             }
@@ -670,10 +700,15 @@ impl State {
     ///
     /// Returns the physical row count per input logical line so callers can
     /// map positions without rewrapping again (CTX-0469).
+    ///
+    /// Consumes the taken logicals (CTX-1154): each logical is dropped as
+    /// its rewrapped rows land, and rewrapped rows move (not clone) into
+    /// the rebuilt scrollback and grid. Combined with the draining take,
+    /// peak stays near one resident generation instead of three.
     fn reflow_primary(
         grid: &mut crate::grid::Grid,
         scrollback: &mut crate::scrollback::Scrollback,
-        logicals: &[Vec<Cell>],
+        logicals: Vec<Vec<Cell>>,
         new_cols: usize,
         new_rows: usize,
         erase: &Style,
@@ -682,10 +717,14 @@ impl State {
         let new_rows = new_rows.max(1);
         let (old_rows, _) = grid.dims();
         // Rewrap every logical line, recording row counts for the caller.
+        // Each logical is consumed in turn (`ll` drops at the end of its
+        // iteration) so only the current logical plus the growing physical
+        // output are live — never the whole taken set alongside its
+        // rewrapped twin.
         let mut physical: Vec<(Vec<Cell>, bool)> = Vec::new();
         let mut row_counts: Vec<usize> = Vec::with_capacity(logicals.len());
         for ll in logicals {
-            let rewrapped = rewrap_one_logical(ll, new_cols, erase);
+            let rewrapped = rewrap_one_logical(&ll, new_cols, erase);
             row_counts.push(rewrapped.len());
             physical.extend(rewrapped);
         }
@@ -720,22 +759,27 @@ impl State {
             }
         }
         let split = physical.len() - new_rows;
-        let (sb_part, grid_part) = physical.split_at(split);
         // Rebuild scrollback with fresh ids (monotonic), oldest-first, capped
-        // at this buffer's configured capacity.
+        // at this buffer's configured capacity. Rows move (not clone) into
+        // their boxes: rewrapped rows are already exactly `new_cols` wide,
+        // so `into_boxed_slice` reuses their buffers.
         let max_lines = scrollback.max_lines();
         scrollback.clear();
-        let start = sb_part.len().saturating_sub(max_lines);
-        for (cells, wrapped) in &sb_part[start..] {
-            scrollback.push_with_wrap(cells.clone(), *wrapped);
+        let start = split.saturating_sub(max_lines);
+        let mut physical = physical.into_iter();
+        for _ in 0..start {
+            drop(physical.next());
         }
-        // Rebuild grid.
+        for (cells, wrapped) in physical.by_ref().take(split - start) {
+            scrollback.push_with_wrap(cells, wrapped);
+        }
+        // Rebuild grid: the last `new_rows` rows move into the flat store.
         let mut new_cells: Vec<Cell> = Vec::with_capacity(new_rows * new_cols);
         let mut new_wraps: Vec<bool> = Vec::with_capacity(new_rows);
-        for (cells, wrapped) in grid_part {
+        for (cells, wrapped) in physical {
             debug_assert_eq!(cells.len(), new_cols);
-            new_cells.extend(cells.iter().cloned());
-            new_wraps.push(*wrapped);
+            new_cells.extend(cells);
+            new_wraps.push(wrapped);
         }
         grid.replace_grid(new_rows, new_cols, new_cells, new_wraps);
         row_counts

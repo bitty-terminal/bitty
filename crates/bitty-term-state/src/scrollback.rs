@@ -171,6 +171,17 @@ impl Scrollback {
         }
     }
 
+    /// Removes and returns the oldest retained line, if any.
+    ///
+    /// Crate-internal drain primitive for resize reflow (CTX-1154): the
+    /// reflow consumes retained boxes into the rewrapped rebuild instead of
+    /// cloning every line while the originals stay live (which doubles peak
+    /// transient to three scrollback generations and fragments the heap).
+    /// Normal scroll capture keeps using [`Self::push_with_wrap`].
+    pub(crate) fn pop_front_line(&mut self) -> Option<ScrollbackLine> {
+        self.lines.pop_front()
+    }
+
     /// Owned heap retained by this buffer (CTX-1026).
     ///
     /// Ring-buffer capacity plus every boxed line's cells. Each

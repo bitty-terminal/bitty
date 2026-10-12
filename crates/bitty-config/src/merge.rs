@@ -405,7 +405,7 @@ fn merge_animations_overrides(
 /// never shadow a lower layer. Shared by both merge paths (the strict and
 /// the allow-policy-violations variant) so the two copies cannot drift.
 ///
-/// Accepted-but-inert until S3 (no resolution or consumption yet).
+/// Consumed by the S3 present path (CTX-1162).
 fn merge_style_table(
     effective: &mut EffectiveConfig,
     acc: &mut MergeAccumulators<'_>,
@@ -578,8 +578,7 @@ fn merge_views(
         // CTX-1159 S0: the per-View style quartet deep-merges per leaf
         // like the outline/background leaves; absent inherits, so a lower
         // layer's explicit member is never reset by a higher layer's
-        // unrelated leaf. Accepted-but-inert until S3 (no resolution or
-        // consumption yet).
+        // unrelated leaf (consumed by the S3 present path).
         touched |= merge_view_leaf(
             entry.overrides.glow_color.as_ref(),
             &mut slot.glow_color,
@@ -1939,8 +1938,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 &mut decoration_acc,
             );
             // CTX-1159 S0: the tint pair follows the same "unset says
-            // nothing" scalar-replace rule as the outline colors/widths.
-            // Accepted-but-inert until S3 (no consumption yet).
+            // nothing" scalar-replace rule as the outline colors/widths
+            // (consumed by the S3 present path).
             merge_view_leaf(
                 dec.background_tint.as_ref(),
                 &mut effective.decoration.background_tint,
@@ -3482,8 +3481,8 @@ fn merge_layers_allow_policy_violations(
                 &mut decoration_acc,
             );
             // CTX-1159 S0: the tint pair follows the same "unset says
-            // nothing" scalar-replace rule as the outline colors/widths.
-            // Accepted-but-inert until S3 (no consumption yet).
+            // nothing" scalar-replace rule as the outline colors/widths
+            // (consumed by the S3 present path).
             merge_view_leaf(
                 dec.background_tint.as_ref(),
                 &mut effective.decoration.background_tint,

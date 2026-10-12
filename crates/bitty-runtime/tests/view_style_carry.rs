@@ -1,15 +1,16 @@
-//! Chrome-style S2 carry (CTX-1161).
+//! Chrome-style S2 carry (CTX-1161), consumed by the S3 present path
+//! (CTX-1162).
 //!
 //! Proves headlessly, without a display server or GPU, that
-//! `resolve_view_style` plus the [`RuntimeViewStyle`] carry is
-//! accepted-but-inert: values resolve per `View` (global base plus per-field
-//! per-tier `views` overrides), are stored on every [`PresentFrame`] at
-//! present build, and have zero render effect until S3.
+//! `resolve_view_style` plus the [`RuntimeViewStyle`] carry resolves per
+//! `View` (global base plus per-field per-tier `views` overrides) and is
+//! stored on every [`PresentFrame`] at present build.
 //!
-//! Later stages (glow/shadow/tint/fade paint in the present path plus the
-//! `set_chrome_style` adopter) are separate tasks and must not change this
-//! file's inertness expectation: S2 adds no DrawList/present consumer for
-//! the stored value.
+//! S3 owns the present-path paint plus the `set_chrome_style` adopter: the
+//! carry-population tests below still hold, while the byte-identical and
+//! no-consumer expectations that S2 pinned for its inert stage moved to the
+//! S3 suite (`style_present_s3`), where styled configs paint and unstyled
+//! ones stay byte-identical.
 
 #![forbid(unsafe_code)]
 
@@ -115,11 +116,10 @@ fn default_carry_is_inert() {
 }
 
 #[test]
-fn styled_and_unstyled_configs_render_identically() {
-    // Same bytes through two runtimes differing only in the stored style
-    // surface (max globals plus a per-View override): surface extent, frame
-    // geometry, and composited RGBA must all agree, proving the carry is
-    // stored but unread by render.
+fn styled_config_paints_while_geometry_ignores_the_carry() {
+    // S3 (CTX-1162): the stored style now paints, so the max-style surface
+    // diverges in pixels — while frame geometry still ignores the carry
+    // (style paint never moves content).
     let mut plain = Runtime::with_defaults().expect("default builds");
     let mut styled = styled_runtime();
 
@@ -141,12 +141,12 @@ fn styled_and_unstyled_configs_render_identically() {
         "the styled run must actually carry style (else the comparison is vacuous)"
     );
 
-    let a = present_bytes(&mut plain, b"HELLO style S2");
-    let b = present_bytes(&mut styled, b"HELLO style S2");
+    let a = present_bytes(&mut plain, b"HELLO style S3");
+    let b = present_bytes(&mut styled, b"HELLO style S3");
     assert_eq!(a.len(), b.len());
-    assert_eq!(
+    assert_ne!(
         a, b,
-        "max style surface must render byte-identically (S2 no-op)"
+        "max style surface must paint in S3 (defaults still match: see style_present_s3)"
     );
 }
 
@@ -163,33 +163,31 @@ fn style_rules_do_not_break_view_first_match() {
 }
 
 #[test]
-fn present_path_has_no_style_consumer() {
-    // Grep-level proof that S2 stores but never reads: the production half
-    // of the present path (before any `#[cfg(test)]` helper) must not name
-    // any chrome-style resolver, value type, or leaf. The `#[cfg(test)]`
-    // region is excluded so this test cannot satisfy itself, following the
+fn present_path_consumes_style_through_the_s3_seam() {
+    // S3 (CTX-1162) replaces the S2 no-consumer proof: the production half
+    // of the present path must name the chrome-style consumers (the `S3`
+    // push/fade helpers), and the layout build must keep populating the
+    // per-View carry the consumers read. The `#[cfg(test)]` region is
+    // excluded so this test cannot satisfy itself, following the
     // `effective_validate_calls_every_section_validator` precedent.
     let src = include_str!("../src/runtime/present.rs");
     let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-    for token in [
-        "view_style_for",
-        "resolve_view_style",
-        "RuntimeViewStyle",
-        "style_glow",
-        "style_shadow",
-        "style_fade",
-        "fade_unfocused",
-        "background_tint",
-        "glow_color",
-        "glow_width",
-    ] {
+    for token in ["push_leaf_glow", "push_leaf_shadow", "leaf_fade_factor"] {
         assert!(
-            !prod.contains(token),
-            "present path must not consume style: found {token}"
+            prod.contains(token),
+            "present path must consume style through the S3 seam: missing {token}"
         );
     }
-    // The population site stays exactly one stored (not read) carry in the
-    // layout build: the frame construction stores the resolved value.
+    // The live adopter lives beside the consumers: the production half of
+    // the live-config module must own `set_chrome_style`.
+    let live = include_str!("../src/runtime/live_config.rs");
+    let live_prod = live.split("#[cfg(test)]").next().unwrap_or(live);
+    assert!(
+        live_prod.contains("pub fn set_chrome_style"),
+        "the S3 live adopter must exist"
+    );
+    // The population site stays exactly one stored carry in the layout
+    // build: the frame construction stores the resolved value.
     let layout = include_str!("../src/runtime/layout_focus.rs");
     let layout_prod = layout.split("#[cfg(test)]").next().unwrap_or(layout);
     assert!(

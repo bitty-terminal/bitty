@@ -49,7 +49,7 @@ fn describe_view_override(entry: &ViewOverride) -> String {
         parts.push(format!("border_width_idle={width}"));
     }
     // CTX-1159 S0: the per-View style quartet is reported per selector
-    // like every other set leaf (accepted-but-inert until S3).
+    // like every other set leaf (consumed by the S3 present path).
     if let Some(color) = o.glow_color {
         parts.push(format!("glow_color={}", color.to_hex()));
     }
@@ -125,14 +125,14 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.background_image`     | Live       |
 /// | `decoration.background_fit`       | Live       |
 /// | `decoration.background_image_roots` | Live     |
-/// | `decoration.background_tint`      | Live (CTX-1159 S0 accepted-but-inert) |
-/// | `decoration.background_tint_strength` | Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.glow_color`     | Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.glow_width`     | Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.shadow_color`   | Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.shadow_offset_x`| Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.shadow_offset_y`| Live (CTX-1159 S0 accepted-but-inert) |
-/// | `appearance.style.fade_unfocused` | Live (CTX-1159 S0 accepted-but-inert) |
+/// | `decoration.background_tint`      | Live (CTX-1162 S3 present path) |
+/// | `decoration.background_tint_strength` | Live (CTX-1162 S3 present path) |
+/// | `appearance.style.glow_color`     | Live (CTX-1162 S3 present path) |
+/// | `appearance.style.glow_width`     | Live (CTX-1162 S3 present path) |
+/// | `appearance.style.shadow_color`   | Live (CTX-1162 S3 present path) |
+/// | `appearance.style.shadow_offset_x`| Live (CTX-1162 S3 present path) |
+/// | `appearance.style.shadow_offset_y`| Live (CTX-1162 S3 present path) |
+/// | `appearance.style.fade_unfocused` | Live (CTX-1162 S3 present path) |
 /// | `appearance.theme`        | Live               |
 /// | `appearance.colors`       | Live               |
 /// | `mod_key`                 | Live               |
@@ -216,16 +216,14 @@ pub const LIVE_FIELDS: &[&str] = &[
     "decoration.background_fit",
     "decoration.background_image_roots",
     // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the tint pair is
-    // paint-only and classifies Live, but stays accepted-but-inert until
-    // S3 — parsed, validated, merged, and reported with no render effect
-    // (the `set_chrome_style` adopter and its audit land in S3).
+    // paint-only and classifies Live, consumed by the S3 present path
+    // through the `set_chrome_style` adopter.
     "decoration.background_tint",
     "decoration.background_tint_strength",
     "appearance.theme",
     "appearance.colors",
     // CTX-1159 S0: the closed `appearance.style` table is paint-only and
-    // classifies Live under the same accepted-but-inert terms as the tint
-    // pair above.
+    // classifies Live under the same terms as the tint pair above.
     "appearance.style.glow_color",
     "appearance.style.glow_width",
     "appearance.style.shadow_color",
@@ -570,8 +568,8 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         push_if_changed(field, before, after);
     }
     // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the tint pair is
-    // accepted-but-inert paint state, so each leaf must diff; without these
-    // a tint-only edit reported `unchanged` and never reconciled.
+    // paint state, so each leaf must diff; without these a tint-only edit
+    // reported `unchanged` and never reconciled.
     for (field, before, after) in [
         (
             "decoration.background_tint",
@@ -728,9 +726,9 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         format!("{:?}", new.appearance.colors),
     );
     // CTX-1159 S0 (DEC-0111 section 1, DEC-0113 Fix 3): the closed
-    // `appearance.style` table is accepted-but-inert paint state, so each
-    // leaf must diff; without these a style-only edit reported `unchanged`
-    // and never reconciled. `None` and an empty table compare equal (both
+    // `appearance.style` table is paint state, so each leaf must diff;
+    // without these a style-only edit reported `unchanged` and never
+    // reconciled. `None` and an empty table compare equal (both
     // contribute nothing), so a layer that merely omits the table never
     // diffs against one that declares it empty.
     {
@@ -1918,8 +1916,8 @@ mod style_s0_tests {
     #[test]
     fn style_leaves_classify_live() {
         // CTX-1159 S0 (DEC-0113 Fix 3): the new leaves classify Live in
-        // the reload table while staying accepted-but-inert until S3 (the
-        // `set_chrome_style` adopter and its audit land there).
+        // the reload table; CTX-1162 S3 adopts them through the
+        // `set_chrome_style` adopter.
         for field in [
             "appearance.style.glow_color",
             "appearance.style.glow_width",
@@ -1969,7 +1967,7 @@ mod style_s0_tests {
     #[test]
     fn style_views_diff_reports_per_selector() {
         // Per-View style leaves report under their selector path like the
-        // outline leaves (accepted-but-inert until S3).
+        // outline leaves (consumed by the S3 present path).
         use crate::types::{ViewAppearanceOverride, ViewOverride, ViewSelector};
         let old = EffectiveConfig::default();
         let mut new = old.clone();

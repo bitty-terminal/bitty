@@ -154,6 +154,27 @@ impl Runtime {
         }
     }
 
+    /// Chrome-style drop-shadow offset in physical pixels at the live DPI
+    /// scale (CTX-1162 S3 `appearance.style.shadow_offset_*`).
+    ///
+    /// The configured logical offset scaled by the sanitized live factor,
+    /// rounded half away from zero — the same rule as
+    /// [`Self::outline_width_physical`] so shadow chrome agrees with ring
+    /// chrome about the pixel grid. Sign-preserving (`-0` rounds to `0`) and
+    /// saturating at [`i32::MAX`]/[`i32::MIN`] for a hostile scale.
+    #[must_use]
+    pub fn style_offset_physical(&self, logical_px: i32) -> i32 {
+        let scaled = f64::from(logical_px) * sanitize_dpi_scale(self.dpi_scale());
+        let rounded = scaled.round();
+        if rounded >= f64::from(i32::MAX) {
+            i32::MAX
+        } else if rounded <= f64::from(i32::MIN) {
+            i32::MIN
+        } else {
+            rounded as i32
+        }
+    }
+
     /// Window padding in physical pixels at the live DPI scale (CTX-0223).
     ///
     /// The configured logical padding scaled by the sanitized live factor,

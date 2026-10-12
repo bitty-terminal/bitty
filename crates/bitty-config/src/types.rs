@@ -170,9 +170,9 @@ pub const MAX_DECORATION_COLOR_LEN: usize = 9;
 
 // ── Chrome styling (DEC-0111 section 1, DEC-0113; CTX-1159 S0) ────────────
 //
-// Accepted-but-inert paint surface (S0): parsed, validated, merged,
-// attributed, and reported with no render effect. The setters and the
-// retained-path consumption land in S3; per-View resolution lands in S2.
+// Paint surface (S0 schema, S2 resolution, S3 present consumption): parsed,
+// validated, merged, attributed, reported, and painted. Per-View resolution
+// landed in S2; the setters and the retained-path consumption land in S3.
 
 /// Maximum `appearance.style.glow_width` (and per-View `glow_width`) in
 /// logical px: `0..=16`, mirroring [`MAX_DECORATION_BORDER_WIDTH_PX`] (the
@@ -1125,8 +1125,8 @@ impl std::fmt::Display for BackgroundFit {
 /// (`glow_color`, `glow_width`, `background_tint`,
 /// `background_tint_strength`) joins the closed set. `shadow_*` and
 /// `fade_unfocused` stay global-only and reject inside `views.*` like
-/// `background_image_roots` does. The new leaves are accepted-but-inert:
-/// stored, validated, merged, and reported with no render effect until S3.
+/// `background_image_roots` does. The new leaves are stored, validated,
+/// merged, and reported, and consumed by the S3 present path.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewAppearanceOverride {
     /// Base outline color for both focus states at this tier.
@@ -1574,9 +1574,8 @@ impl ResolvedViewAppearance {
 /// exactly like the outline resolver; the global-only leaves (`shadow_color`,
 /// `shadow_offset_x`/`shadow_offset_y`, `fade_unfocused`) pass through
 /// unchanged for every `View` (no `views.*` entry can supply them).
-/// Accepted-but-inert in S2: resolved, carried, and reported with no render
-/// effect until S3. Presentation-only: never participates in cell geometry,
-/// hit testing, selection, or Terminal Truth.
+/// Consumed by the S3 present path (CTX-1162). Presentation-only: never
+/// participates in cell geometry, hit testing, selection, or Terminal Truth.
 ///
 /// `PartialEq` only: the strength/fade leaves are floats, same posture as
 /// [`DecorationConfig`].
@@ -3141,8 +3140,7 @@ pub struct DecorationConfig {
     /// `decoration.background_tint`). Lives in `decoration`, not
     /// `appearance.style`, per the RFC-0001 naming rule (background images
     /// are owned by the OQ-042 contract). `None` means no tint.
-    /// Accepted-but-inert in S0: validated, merged, and reported with no
-    /// render effect until S3.
+    /// Validated, merged, and reported; consumed by the S3 present path.
     pub background_tint: Option<OutlineColor>,
     /// Global background tint strength (CTX-1159 S0
     /// `decoration.background_tint_strength`), finite within `[0.0, 1.0]`.
@@ -3597,11 +3595,11 @@ impl MouseConfig {
 /// (present rejects fail-closed) and `ring_alpha` was never added; unknown
 /// fields reject before this type is constructed.
 ///
-/// Accepted-but-inert in S0: values are parsed, validated, merged,
-/// attributed, and reported with provably no render effect. Per-View
-/// resolution lands in S2 (`resolve_view_style`); the `set_chrome_style`
-/// adopter and all consumption land in S3. `Default` reproduces current
-/// rendering byte-identically (no glow, no shadow, no fade).
+/// Parsed, validated, merged, attributed, and reported at the config layer
+/// (CTX-1159 S0). Per-View resolution lands in S2 (`resolve_view_style`);
+/// the `set_chrome_style` adopter and all present consumption land in S3
+/// (CTX-1162). `Default` reproduces current rendering byte-identically (no
+/// glow, no shadow, no fade).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StyleConfig {
     /// Glow halo color (`appearance.style.glow_color`), canonical
@@ -3715,7 +3713,7 @@ pub struct AppearanceConfig {
     pub animations: Option<AnimationsOverride>,
     /// Chrome style overrides (CTX-1159 S0). `None` means "this layer says
     /// nothing"; a present value deep-merges per leaf into the effective
-    /// style, which stays accepted-but-inert until S3.
+    /// style, which the S3 present path consumes.
     pub style: Option<StyleConfig>,
 }
 
@@ -4263,8 +4261,7 @@ impl EffectiveConfig {
     /// unchanged: no `views.*` entry can supply them (rejected at
     /// extraction like `background_image_roots`).
     ///
-    /// Accepted-but-inert in S2: the returned value is resolved, carried, and
-    /// reported with no render effect until S3.
+    /// Consumed by the S3 present path (CTX-1162).
     #[must_use]
     pub fn resolve_view_style(&self, target: &ViewAppearanceTarget) -> ResolvedViewStyle {
         self.resolve_view_style_traced(target).0

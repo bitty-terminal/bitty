@@ -3379,7 +3379,7 @@ fn runtime_config_carries_style_surface_and_per_view_style() {
     // CTX-1161 S2: the merged global style surface (`appearance.style`
     // glow/shadow/fade plus the `decoration` tint pair) and the per-`View`
     // style quartet flow file -> effective -> runtime by value.
-    // Accepted-but-inert: carried with no render effect until S3.
+    // Consumed by the S3 present path (CTX-1162).
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));

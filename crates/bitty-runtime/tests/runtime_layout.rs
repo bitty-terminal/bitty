@@ -185,15 +185,18 @@ fn cursor_to_cell_subtracts_outer_gap_and_decoration() {
 fn leaf_hit_testing_accounts_for_inner_and_outer_gaps() {
     // CTX-0177: leaf-aware hit-testing over a gapped two-pane layout
     // (allocations a=(1,1,38,22), b=(41,1,38,22) at 9x19 live cells).
-    // Physical x for container col c is pad + outer_px + c * 9 + 1
-    // (CTX-0223: the default 8px window padding inset comes first).
+    // Physical x for container col c is pad + c * 9 + 1 (CTX-0223: the
+    // default 8px window padding inset comes first). Container cols are
+    // absolute: allocation origins already include the outer gap, so the
+    // outer gap is never re-added here (issue #1979, CTX-1149: the old
+    // helper added it, double-counting the inset the mapping subtracts).
     let mut rt = make_gapped_runtime(2, 1);
     rt.set_layout(two_pane_layout());
     rt.set_container(UiRect::new(0, 0, 80, 24));
     rt.reflow_layout();
     let at = |c: u16, r: u16| CursorPosition {
-        x: 8.0 + 9.0 + f64::from(c) * 9.0 + 1.0,
-        y: 8.0 + 19.0 + f64::from(r) * 19.0 + 1.0,
+        x: 8.0 + f64::from(c) * 9.0 + 1.0,
+        y: 8.0 + f64::from(r) * 19.0 + 1.0,
     };
     // Inside left leaf: local cell is container minus leaf origin.
     assert_eq!(

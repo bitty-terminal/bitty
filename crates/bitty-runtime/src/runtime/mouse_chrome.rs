@@ -434,6 +434,20 @@ impl Runtime {
         if self.leaf_is_floating(leaf) {
             return false;
         }
+        // CTX-1149 (issue #1979): the allocation hit-test above cannot see
+        // store-based floats (pinned leaves, workspace-detached floats):
+        // they live outside the layout tree, so the press resolves to the
+        // tiled base leaf painted beneath them. When the painted topmost
+        // leaf under the press is a floating cover, the cover owns the
+        // press — grabbing the hidden base would move a pane the pointer
+        // never visibly touched (the Alt path is already safe: its
+        // present-based grab runs first and consumes the press; this guard
+        // closes the Super path, which skips that grab).
+        if let Some((top, _)) = self.cursor_to_present_cell(cursor) {
+            if top != leaf && self.leaf_is_floating(top) {
+                return false;
+            }
+        }
         if self.layout.leaf_count() < 2 {
             return false;
         }

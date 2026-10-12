@@ -105,7 +105,7 @@ use bitty_render::{
 use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
-    CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
+    CellPos, FloatStore, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
     PinnedStore, Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View,
     ViewId, search::SearchState,
 };
@@ -549,6 +549,27 @@ pub struct Runtime {
     /// workspace with default anchored geometry. Presentation-only: never
     /// grid truth.
     pinned_offsets: std::collections::HashMap<ViewId, (i32, i32)>,
+    /// Workspace-local detached floating panels for the active workspace
+    /// (CTX-1147, issue #1975).
+    ///
+    /// Holds every leaf floated out of the live layout; detached leaves
+    /// never enter the layout solver. Stashed into the outgoing workspace
+    /// slot on every switch and loaded from the incoming slot, so floats
+    /// stay with their workspace (unlike the window-global pinned store).
+    /// The present path composites them over the active scene at
+    /// [`OverlayTier::Float`](bitty_ui::OverlayTier::Float), painted before
+    /// pinned leaves in detach order.
+    floats: FloatStore,
+    /// Alt+drag re-anchor offsets for detached floats (CTX-1147).
+    ///
+    /// Mirrors `pinned_offsets`: a detached float has anchored
+    /// (container-derived) present geometry with no stored position to
+    /// move, so an Alt+drag accumulates its cell delta here instead of in
+    /// the layout tree. Window-global keyed by [`ViewId`] (ids are unique
+    /// across slots, so no stash/load is needed); bounded by the live-leaf
+    /// population. Dropped on restore: restore re-inserts a fresh split
+    /// with default geometry. Presentation-only: never grid truth.
+    float_offsets: std::collections::HashMap<ViewId, (i32, i32)>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -1703,6 +1724,8 @@ impl Runtime {
             scratchpad_primary_owner: None,
             pinned: PinnedStore::new(),
             pinned_offsets: std::collections::HashMap::new(),
+            floats: FloatStore::new(),
+            float_offsets: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -1961,6 +1984,8 @@ impl Runtime {
             scratchpad_primary_owner: None,
             pinned: PinnedStore::new(),
             pinned_offsets: std::collections::HashMap::new(),
+            floats: FloatStore::new(),
+            float_offsets: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

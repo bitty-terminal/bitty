@@ -849,13 +849,15 @@ pub enum ChromeAction {
     /// (no overlay, no routing change) — the bundled-disabled decision is
     /// kept, and the entry exists as forward-compat wiring.
     TogglePalette,
-    /// Toggle the focused panel between tiled and floating
-    /// (`toggle_floating`, alias `floating_toggle`; CTX-0962 issue #1695).
+    /// Toggle the focused panel between tiled and detached floating
+    /// (`toggle_floating`, alias `floating_toggle`; CTX-0962 issue #1695,
+    /// CTX-1147 detach-restore issue #1975).
     ///
     /// Present-path verb over the live layout: the app resolves the focused
-    /// view and flips its [`PresentationMode`](bitty_ui::PresentationMode)
-    /// through the `bitty.workspace:floating-toggle` primitive
-    /// (`bitty_ui::presentation::toggle_floating`). Default chord `alt+a`
+    /// view and detaches it into the workspace-local float store (or
+    /// restores a detached float as a fresh balanced split) through the
+    /// `bitty.workspace:floating-toggle` command
+    /// (`bitty_runtime::Runtime::apply_floating_command`). Default chord `alt+a`
     /// (both `alt+a`/`alt+v` were free; fish reserves `alt+v` for `$EDITOR`
     /// so `Mod+v` is unusable there). The chord carries the Mod slot so a
     /// Super flip rebinds it to `super+a`. User-overridable via an explicit

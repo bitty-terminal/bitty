@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitty_runtime::runtime::session::{
-    MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE,
-    PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot, SESSION_FORMAT_VERSION, SessionError,
-    SessionSnapshot, WorkspaceSnapshot,
+    FloatSnapshot, MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES,
+    MAX_SESSION_SCROLLBACK_LINES_PER_PANE, PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot,
+    SESSION_FORMAT_VERSION, SessionError, SessionSnapshot, WorkspaceSnapshot,
 };
 use bitty_runtime::{
     Focus, LayoutNode, PresentationMode, Runtime, SessionFileBackend, SplitAxis, UiRect, View,
@@ -81,6 +81,7 @@ fn single_leaf_snapshot(id: u64, cwd: Option<String>, history: &str) -> SessionS
                 route: PaneRoute::Terminal,
                 mode: PresentationMode::Tiled,
             }],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -434,6 +435,7 @@ fn hostile_cwd_that_escapes_past_line_cap_fails_closed_pre_io() {
                 route: PaneRoute::Terminal,
                 mode: PresentationMode::Tiled,
             }],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -510,6 +512,7 @@ fn inactive_workspace_respawns_pending_panes_on_first_switch() {
             route: PaneRoute::Terminal,
             mode: PresentationMode::Tiled,
         }],
+        floats: Vec::new(),
     };
     let snap = SessionSnapshot {
         version: SESSION_FORMAT_VERSION,
@@ -570,6 +573,7 @@ fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
             route: PaneRoute::Terminal,
             mode: PresentationMode::Tiled,
         }],
+        floats: Vec::new(),
     };
     let snap = SessionSnapshot {
         version: SESSION_FORMAT_VERSION,
@@ -660,6 +664,7 @@ fn workspace_close_rehomes_primary_onto_pending_leaf_and_drains_restore() {
             route: PaneRoute::Terminal,
             mode: PresentationMode::Tiled,
         }],
+        floats: Vec::new(),
     };
     let snap = SessionSnapshot {
         version: SESSION_FORMAT_VERSION,
@@ -1126,6 +1131,7 @@ fn apply_routes_panes_by_recorded_attachment() {
                     mk_pane(100, Some(PaneAttachment::Primary), &["owner-history"]),
                     mk_pane(101, Some(PaneAttachment::Detached), &[]),
                 ],
+                floats: Vec::new(),
             },
             WorkspaceSnapshot {
                 seq: 2,
@@ -1137,6 +1143,7 @@ fn apply_routes_panes_by_recorded_attachment() {
                     Some(PaneAttachment::Session),
                     &["pending-history"],
                 )],
+                floats: Vec::new(),
             },
         ],
         active: 0,
@@ -1214,6 +1221,7 @@ fn recorded_primary_elsewhere_downgrades_to_pending() {
                 mk_pane(100, PaneAttachment::Session, "focus-history"),
                 mk_pane(101, PaneAttachment::Primary, "stale-owner-history"),
             ],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -1265,6 +1273,7 @@ fn ambiguous_resolved_ownership_rejected_at_load_not_round_trip() {
             ),
             focus: Some(ViewId::new(100)),
             panes: vec![pane(100, None), pane(101, Some(PaneAttachment::Primary))],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -1332,6 +1341,7 @@ fn modes_survive_file_round_trip_into_live_layout() {
                 route: PaneRoute::Terminal,
                 mode: PresentationMode::Floating,
             }],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -1383,6 +1393,7 @@ fn detached_leaf_never_respawns_on_first_switch() {
                 layout: LayoutNode::leaf(View::new(ViewId::new(100), 80, 24)),
                 focus: Some(ViewId::new(100)),
                 panes: vec![mk_pane(100, PaneAttachment::Primary, &["ws0-history"])],
+                floats: Vec::new(),
             },
             WorkspaceSnapshot {
                 seq: 2,
@@ -1398,6 +1409,7 @@ fn detached_leaf_never_respawns_on_first_switch() {
                     mk_pane(200, PaneAttachment::Session, &["ws1-history"]),
                     mk_pane(201, PaneAttachment::Detached, &[]),
                 ],
+                floats: Vec::new(),
             },
         ],
         active: 0,
@@ -1460,6 +1472,7 @@ fn pinned_store_round_trips_through_v3_file() {
                     mode: PresentationMode::Tiled,
                 },
             ],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -1510,6 +1523,69 @@ fn pinned_store_round_trips_through_v3_file() {
             .expect("leaf back in the live tree")
             .presentation(),
         PresentationMode::Floating
+    );
+}
+
+/// CTX-1147: workspace-local detached floats ride the in-memory snapshot
+/// only — the v3 file carries no floats block, so file encode rejects a
+/// snapshot with detached floats fail-closed (never a silent drop), while a
+/// floats-free v3 file still decodes to empty float stores. A v4 file
+/// follow-up persists them; until then a save with a detached float warns
+/// and keeps the previous complete session authoritative.
+#[test]
+fn detached_floats_fail_file_encode_closed_and_decode_empty() {
+    let pane = |id: u64, attach: PaneAttachment| PaneSnapshot {
+        view: ViewId::new(id),
+        cwd: None,
+        scrollback: Vec::new(),
+        attach: Some(attach),
+        route: PaneRoute::Terminal,
+        mode: PresentationMode::Tiled,
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            ),
+            focus: Some(ViewId::new(2)),
+            panes: vec![
+                pane(1, PaneAttachment::Primary),
+                pane(2, PaneAttachment::Session),
+            ],
+            floats: vec![FloatSnapshot {
+                view: View::with_presentation(ViewId::new(9), 80, 24, PresentationMode::Floating),
+                cwd: None,
+                scrollback: vec!["floated-history".to_string()],
+                attach: PaneAttachment::Session,
+            }],
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: Vec::new(),
+    };
+    let error = backend()
+        .encode_snapshot(&snap)
+        .expect_err("floats must fail file encode");
+    assert!(
+        matches!(error, SessionError::Corrupt(_)),
+        "fail-closed content-free error, never a silent drop: {error:?}"
+    );
+
+    // A floats-free v3 snapshot still encodes; decode yields empty floats.
+    let mut plain = snap;
+    plain.workspaces[0].floats.clear();
+    let bytes = backend().encode_snapshot(&plain).expect("v3 encodes");
+    let back = backend().decode_snapshot(&bytes).expect("v3 decodes");
+    assert_eq!(back, plain, "floats-free snapshot round-trips");
+    assert!(
+        back.workspaces.iter().all(|ws| ws.floats.is_empty()),
+        "v3 files carry no floats block"
     );
 }
 
@@ -1579,6 +1655,7 @@ fn respawn_snapshot() -> SessionSnapshot {
                     mode: PresentationMode::Tiled,
                 },
             ],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -1662,6 +1739,7 @@ fn restored_attached_pin_respawns_on_workspace_switch() {
             route: PaneRoute::Terminal,
             mode: PresentationMode::Tiled,
         }],
+        floats: Vec::new(),
     });
     snap.mru = vec![0, 1];
     rt.apply_session_snapshot(&snap).expect("apply valid");

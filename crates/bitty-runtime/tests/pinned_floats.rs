@@ -47,9 +47,15 @@ fn install(rt: &mut Runtime, layout: LayoutNode) {
     rt.set_container(UiRect::new(0, 0, 80, 24));
 }
 
-fn toggle(rt: &mut Runtime, id: ViewId) {
+/// Stamp one in-tree leaf Floating directly (sets up the legacy
+/// unpin-return shape the detach model no longer produces via toggle).
+fn stamp_floating(rt: &mut Runtime, id: ViewId) {
     let mut tree = rt.layout().clone();
-    bitty_ui::presentation::toggle_floating(&mut tree, id).expect("toggle must apply");
+    let leaf = tree.find_leaf_mut(id).expect("leaf must exist");
+    assert!(PresentationMode::request_transition(
+        leaf,
+        PresentationMode::Floating
+    ));
     rt.set_layout(tree);
 }
 
@@ -84,8 +90,6 @@ fn release(button: MouseButton) -> bitty_platform::MouseEvent {
 fn pin_survives_workspace_switch_without_duplicating_views() {
     let mut rt = make_runtime();
     install(&mut rt, two_pane());
-    toggle(&mut rt, ViewId::new(1));
-
     rt.pin_floating(ViewId::new(1)).expect("pin must apply");
     assert_eq!(rt.pinned_views(), vec![ViewId::new(1)]);
     assert!(rt.pinned_occupied());
@@ -120,7 +124,6 @@ fn pin_survives_workspace_switch_without_duplicating_views() {
 fn unpin_returns_floating_panel_to_active_workspace() {
     let mut rt = make_runtime();
     install(&mut rt, two_pane());
-    toggle(&mut rt, ViewId::new(1));
     rt.pin_floating(ViewId::new(1)).expect("pin must apply");
 
     rt.workspace_new().expect("second workspace must open");
@@ -156,9 +159,9 @@ fn unpin_returns_floating_panel_to_active_workspace() {
 fn pinned_paints_above_float_above_tiled() {
     let mut rt = make_runtime();
     install(&mut rt, three_pane());
-    // Leaf 2 is a same-workspace mode float; leaf 3 pins (tiled converges
-    // on floating at pin time).
-    toggle(&mut rt, ViewId::new(2));
+    // Leaf 2 is a same-workspace in-tree float (stamped directly, like an
+    // unpin return); leaf 3 pins (tiled converges on floating at pin time).
+    stamp_floating(&mut rt, ViewId::new(2));
     rt.pin_floating(ViewId::new(3)).expect("pin must apply");
 
     let frames = rt.present_frames();
@@ -186,7 +189,6 @@ fn click_focuses_pinned_float_in_another_workspace() {
     })
     .expect("opt-out runtime must build");
     install(&mut rt, two_pane());
-    toggle(&mut rt, ViewId::new(1));
     rt.pin_floating(ViewId::new(1)).expect("pin must apply");
     rt.workspace_new().expect("second workspace must open");
 
@@ -303,7 +305,6 @@ fn pin_command_dispatch_routes_the_toggle_verb_and_rejects() {
 fn focus_clamps_when_pinned_leaf_unpins_elsewhere() {
     let mut rt = make_runtime();
     install(&mut rt, two_pane());
-    toggle(&mut rt, ViewId::new(1));
     rt.pin_floating(ViewId::new(1)).expect("pin must apply");
     // Focus the sticky float, then switch away: the stashed focus names a
     // leaf outside every slot layout.
@@ -336,8 +337,6 @@ fn stacked_pins_cascade_so_each_stays_visible() {
     // pin offsets by pin depth (3 right, 2 down, clamped to the container).
     let mut rt = make_runtime();
     install(&mut rt, three_pane());
-    toggle(&mut rt, ViewId::new(1));
-    toggle(&mut rt, ViewId::new(2));
     rt.pin_floating(ViewId::new(1)).expect("pin 1 must apply");
     rt.pin_floating(ViewId::new(2)).expect("pin 2 must apply");
     let first = frame_of(&rt, ViewId::new(1));
@@ -458,6 +457,7 @@ fn pinned_session_history_waits_pending_and_unpins_after_restore() {
                 pane(100, PaneAttachment::Primary, &["owner-history"]),
                 pane(101, PaneAttachment::Detached, &[]),
             ],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],
@@ -530,6 +530,7 @@ fn old_version_snapshot_without_pinned_still_applies() {
                 pane(1, PaneAttachment::Primary),
                 pane(2, PaneAttachment::Session),
             ],
+            floats: Vec::new(),
         }],
         active: 0,
         mru: vec![0],

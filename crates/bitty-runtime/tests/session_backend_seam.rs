@@ -47,6 +47,7 @@ impl StubBackend {
                     route: PaneRoute::Terminal,
                     mode: PresentationMode::Tiled,
                 }],
+                floats: Vec::new(),
             }],
             active: 0,
             mru: vec![0],

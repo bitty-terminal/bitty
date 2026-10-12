@@ -70,6 +70,12 @@ pub struct WorkspaceSlot {
     pub layout: LayoutNode,
     /// Stashed focus (fresh while this slot is inactive).
     pub focus: Focus,
+    /// Stashed workspace-local detached floats (CTX-1147, issue #1975).
+    ///
+    /// Fresh while this slot is inactive; the live `Runtime::floats` mirrors
+    /// the active slot. Floats stay with their workspace across switches
+    /// (unlike the window-global pinned store).
+    pub floats: FloatStore,
 }
 
 /// Plain-data read view of one workspace (CTX-0889, ADR-0014).
@@ -198,6 +204,7 @@ impl Runtime {
             name: String::from("ws1"),
             layout: self.layout.clone(),
             focus: self.focus.clone(),
+            floats: self.floats.clone(),
         }];
         self.active_workspace = 0;
         self.workspace_mru = VecDeque::from([0]);
@@ -480,8 +487,119 @@ impl Runtime {
         self.pinned.ids()
     }
 
+    /// Workspace-local detached floating panels (CTX-1147, issue #1975).
+    ///
+    /// Floating detaches a live leaf into the active workspace's float
+    /// store and stamps it `Floating`; the present path composites it over
+    /// the refilled tiling, so no slot chrome can ghost. Only
+    /// `Tiled`/`Floating` leaves detach (`Tiled` converges on `Floating`,
+    /// so an in-tree `Floating` leaf from an unpin detaches the same way);
+    /// `Fullscreen`/`Scratchpad` leaves are refused. Sessions stay keyed
+    /// globally by [`ViewId`](bitty_ui::ViewId) and are never killed here.
+    ///
+    /// Fail-closed with state untouched: unknown id, already-detached id,
+    /// unsupported mode, or detaching the live layout's last leaf (an empty
+    /// live layout would strand focus and present).
+    pub fn float_detach(&mut self, id: ViewId) -> Result<(), String> {
+        self.floats
+            .detach(&mut self.layout, id)
+            .map_err(|error| error.to_string())?;
+        // A fresh detach starts at the anchored composite: drop any stale
+        // re-anchor offset so a re-detach never inherits a past drag
+        // (mirrors the fresh-pin discipline).
+        self.float_offsets.remove(&id);
+        // Shared post-edit fixups: focus moves off the detached leaf onto
+        // the first surviving leaf and primary-grid ownership follows (a
+        // detached leaf is no longer in any workspace layout). Like unpin,
+        // restore never hands primary ownership back: the handoff keeps it.
+        self.after_scratchpad_move(Some(id));
+        Ok(())
+    }
+
+    /// Restore the detached leaf `id` into the live (active-workspace)
+    /// layout as a fresh split and focus it (CTX-1147, issue #1975).
+    ///
+    /// Placement follows the accepted #1804 balanced policy over the live
+    /// allocations (largest-area leaf, physical-aspect axis, `0.5`, after);
+    /// the leaf stamps back to `Tiled` (untoggle returns to tiling — the
+    /// original position is deliberately forgotten). Fail-closed with state
+    /// untouched when the leaf is not detached.
+    ///
+    /// Restore also drops the leaf's Alt+drag re-anchor offset: the offset
+    /// is present-only for the detached composite, so the panel returns
+    /// with default split geometry.
+    pub fn float_restore(&mut self, id: ViewId) -> Result<ViewId, String> {
+        let allocations = self.layout_allocations();
+        let container = self.container;
+        let id = self
+            .floats
+            .restore(&mut self.layout, id, &allocations, container)
+            .map_err(|error| error.to_string())?;
+        self.float_offsets.remove(&id);
+        self.focus = Focus::with_focus(id);
+        self.after_scratchpad_move(None);
+        Ok(id)
+    }
+
+    /// Toggle the workspace-local detached-float store (CTX-1147, #1975).
+    ///
+    /// Restores `target` when detached (returning the restored id),
+    /// otherwise detaches it (returning `None`). Same fail-closed rules as
+    /// [`Self::float_detach`] and [`Self::float_restore`].
+    pub fn toggle_floating(&mut self, target: Option<ViewId>) -> Result<Option<ViewId>, String> {
+        let id = target.ok_or_else(|| String::from("float toggle needs a target leaf"))?;
+        if self.floats.contains(id) {
+            self.float_restore(id).map(Some)
+        } else {
+            self.float_detach(id).map(|()| None)
+        }
+    }
+
+    /// Apply the `bitty.workspace:floating-toggle` workspace command string
+    /// to the workspace-local detached-float store (CTX-1147, #1975).
+    ///
+    /// String-dispatch twin of [`Self::toggle_floating`] for the keymap
+    /// (`toggle_floating` chrome action) path, mirroring the
+    /// [`bitty_ui::pinned::apply_pin_toggle`] command-registry shape but
+    /// with the runtime post-edit fixups (slot collapse on detach, fresh
+    /// balanced placement on restore, focus re-home, primary-grid
+    /// ownership). Only [`bitty_ui::FLOATING_CMD_TOGGLE`] is accepted;
+    /// anything else fails with an unknown-command error and touches no
+    /// state. Otherwise delegates to [`Self::toggle_floating`], so the
+    /// same fail-closed rules apply (missing target, unknown id,
+    /// unsupported mode, stranded layout).
+    pub fn apply_floating_command(
+        &mut self,
+        command: &str,
+        target: Option<ViewId>,
+    ) -> Result<Option<ViewId>, String> {
+        if command != bitty_ui::FLOATING_CMD_TOGGLE {
+            return Err(format!("unknown floating command: {command}"));
+        }
+        self.toggle_floating(target)
+    }
+
+    /// Number of workspace-local detached floating panels.
+    #[must_use]
+    pub fn floated_count(&self) -> usize {
+        self.floats.len()
+    }
+
+    /// Whether the active workspace holds any detached floating panel.
+    #[must_use]
+    pub fn floated_occupied(&self) -> bool {
+        !self.floats.is_empty()
+    }
+
+    /// Detached floating leaf ids in detach order (present-time paint order).
+    #[must_use]
+    pub fn floated_views(&self) -> Vec<ViewId> {
+        self.floats.ids()
+    }
+
     /// Shared post-edit fixups after the live layout lost or gained a leaf
-    /// through the scratchpad slot (CTX-0954) or the pinned store (CTX-1077).
+    /// through the scratchpad slot (CTX-0954), the pinned store (CTX-1077),
+    /// or the detached-float store (CTX-1147).
     ///
     /// `hidden` is the just-parked leaf, if any: focus moves off it onto the
     /// first surviving leaf, and primary-grid ownership follows (a parked leaf
@@ -686,6 +804,13 @@ impl Runtime {
         // from every slot layout); covering them keeps the allocator from
         // re-handing an id before it is unpinned.
         raws.extend(self.pinned.ids().iter().map(|id| id.0));
+        // CTX-1147: detached floats are workspace-owned while detached
+        // (live plus every stashed slot); covering them keeps the allocator
+        // from re-handing an id before it is restored or closed.
+        raws.extend(self.floats.ids().iter().map(|id| id.0));
+        for slot in &self.workspaces {
+            raws.extend(slot.floats.ids().iter().map(|id| id.0));
+        }
         raws
     }
 
@@ -694,6 +819,7 @@ impl Runtime {
         if let Some(slot) = self.workspaces.get_mut(self.active_workspace) {
             slot.layout = self.layout.clone();
             slot.focus = self.focus.clone();
+            slot.floats = self.floats.clone();
         }
     }
 
@@ -705,16 +831,19 @@ impl Runtime {
         if let Some(slot) = self.workspaces.get(index) {
             self.layout = slot.layout.clone();
             self.focus = slot.focus.clone();
+            self.floats = slot.floats.clone();
         }
         // CTX-1077: the stashed focus may name a leaf that left every layout
         // since (pinned, then unpinned into another workspace, then switched
         // back here). Clamp to the first live leaf so focus never dangles
         // behind the read guard; a still-pinned focus is kept as-is.
-        if self
-            .focus
-            .focused()
-            .is_some_and(|id| !self.layout.leaf_ids().contains(&id) && !self.pinned.contains(id))
-        {
+        // CTX-1147: a focus naming a detached float of the loaded slot is
+        // kept the same way (floats ride the slot like layout leaves).
+        if self.focus.focused().is_some_and(|id| {
+            !self.layout.leaf_ids().contains(&id)
+                && !self.pinned.contains(id)
+                && !self.floats.contains(id)
+        }) {
             if let Some(first) = self.layout.leaf_ids().into_iter().next() {
                 self.focus = Focus::with_focus(first);
             }
@@ -817,11 +946,14 @@ impl Runtime {
         let focus = Focus::with_focus(fresh_id);
         self.layout = layout.clone();
         self.focus = focus.clone();
+        // CTX-1147: the fresh workspace starts with no detached floats.
+        self.floats = FloatStore::new();
         self.workspaces.push(WorkspaceSlot {
             seq,
             name: format!("ws{seq}"),
             layout,
             focus,
+            floats: FloatStore::new(),
         });
         let index = self.workspaces.len() - 1;
         self.active_workspace = index;
@@ -1110,13 +1242,27 @@ impl Runtime {
     /// by design — stashed only on switch-away). A fresh primary-only shell
     /// counts 0 (idle baseline); the runtime-global primary is never counted
     /// and never killed here.
+    ///
+    /// CTX-1147: workspace-local detached floats count like layout leaves
+    /// (deliberately unlike pinned sessions, which are window-global and
+    /// survive the close): a close destroys their workspace, so a live
+    /// detached shell must arm the confirm gate instead of dying silently.
     #[must_use]
     pub fn workspace_live_count(&self, index: usize) -> usize {
         let ids: Vec<ViewId> = if index == self.active_workspace {
-            self.layout.leaf_ids()
+            self.layout
+                .leaf_ids()
+                .into_iter()
+                .chain(self.floats.ids())
+                .collect()
         } else {
             match self.workspaces.get(index) {
-                Some(slot) => slot.layout.leaf_ids(),
+                Some(slot) => slot
+                    .layout
+                    .leaf_ids()
+                    .into_iter()
+                    .chain(slot.floats.ids())
+                    .collect(),
                 None => return 0,
             }
         };
@@ -1144,12 +1290,25 @@ impl Runtime {
 
     /// Kill every pane session owned by workspace `index`'s leaves.
     /// Returns the number torn down.
+    ///
+    /// CTX-1147: workspace-local detached floats die with their workspace,
+    /// so their sessions are torn down here too (unlike pinned sessions,
+    /// which are window-global and survive the close).
     fn kill_workspace_sessions(&mut self, index: usize) -> usize {
         let ids: Vec<ViewId> = if index == self.active_workspace {
-            self.layout.leaf_ids()
+            self.layout
+                .leaf_ids()
+                .into_iter()
+                .chain(self.floats.ids())
+                .collect()
         } else {
             match self.workspaces.get(index) {
-                Some(slot) => slot.layout.leaf_ids(),
+                Some(slot) => slot
+                    .layout
+                    .leaf_ids()
+                    .into_iter()
+                    .chain(slot.floats.ids())
+                    .collect(),
                 None => return 0,
             }
         };
@@ -1188,20 +1347,28 @@ impl Runtime {
         // CTX-0461: leaves destroyed with the workspace can never respawn,
         // so capture them before the removal to drop any pending restores
         // they still hold (stale entries leak and misreport session state).
+        // CTX-1147: the slot's detached floats die with it too (their
+        // sessions were torn down by the caller through
+        // `kill_workspace_sessions`).
         let removed_leaves = self.workspaces[index].layout.leaf_ids();
+        let removed_floats = self.workspaces[index].floats.ids();
 
         // CTX-0907: capture workspace name and whether it's active before removal
         let workspace_name = self.workspaces[index].name.clone();
         let removing_active = index == self.active_workspace;
 
         self.workspaces.remove(index);
-        for view in removed_leaves {
+        for view in removed_leaves.into_iter().chain(removed_floats) {
             self.session_pending.remove(&view);
             // CTX-0585: a destroyed primary owner can never respawn; drop its
             // captured cwd so the slot does not outlive the leaf.
             if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(view) {
                 self.session_primary_cwd = None;
             }
+            // CTX-1147: a destroyed float's re-anchor offset paints nothing;
+            // drop it so a later id reuse (quarantined, but defensive) never
+            // inherits a past drag.
+            self.float_offsets.remove(&view);
         }
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();
@@ -1215,6 +1382,7 @@ impl Runtime {
                 name: format!("ws{seq}"),
                 layout,
                 focus,
+                floats: FloatStore::new(),
             });
         }
         // Remap: drop the removed index, shift higher ones down.
@@ -1429,9 +1597,11 @@ impl Runtime {
     ///   touched and kill-confirm stays with close (the pending close arm,
     ///   if any, is preserved untouched).
     ///
-    /// Float-to-tiled note: [`bitty_ui::toggle_floating`] from `Floating` to
-    /// `Tiled` stamps the mode only (the solver ignores it), so the prior
-    /// allocation restores exactly with no insertion or bisect placement.
+    /// Detached-float note (CTX-1147): a detached float lives outside the
+    /// live layout in the workspace-local float store, so moving the
+    /// focused leaf never carries it along; floats stay with their
+    /// workspace across this move (the source keeps them, the target keeps
+    /// its own).
     pub fn workspace_move_focused_to(&mut self, index: usize) -> Result<ViewId, String> {
         self.workspace_move_focused_to_at(index, std::time::Instant::now())
     }
@@ -1503,20 +1673,33 @@ impl Runtime {
             // own pending (if any) survives because it stays live in the
             // target. Drop pending only for non-moved ids found in the live
             // layout or the slot (defensive: live mirrors the slot here).
+            // CTX-1147: the removed source's detached floats die with it
+            // (the moved leaf is layout-owned, never detached): tear down
+            // their sessions and drop their pending entries and offsets.
             let mut doomed: Vec<ViewId> = self.layout.leaf_ids();
             if let Some(slot) = self.workspaces.get(source_index) {
                 doomed.extend(slot.layout.leaf_ids());
+            }
+            let mut doomed_floats: Vec<ViewId> = self.floats.ids();
+            if let Some(slot) = self.workspaces.get(source_index) {
+                doomed_floats.extend(slot.floats.ids());
+            }
+            doomed_floats.sort();
+            doomed_floats.dedup();
+            for view in &doomed_floats {
+                self.close_pane_session(view);
             }
             // Removal below; pending cleanup for non-moved ids happens
             // after the index shift (ids, not indices, are the keys).
             let doomed_non_moved: Vec<ViewId> =
                 doomed.into_iter().filter(|id| *id != focused).collect();
             self.workspaces.remove(source_index);
-            for view in doomed_non_moved {
+            for view in doomed_non_moved.into_iter().chain(doomed_floats) {
                 self.session_pending.remove(&view);
                 if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(view) {
                     self.session_primary_cwd = None;
                 }
+                self.float_offsets.remove(&view);
             }
             // Remap MRU: drop the removed index, shift higher ones down.
             self.workspace_mru.retain(|&i| i != source_index);
@@ -1755,14 +1938,26 @@ impl Runtime {
             if let Some(slot) = self.workspaces.get(source_index) {
                 doomed.extend(slot.layout.leaf_ids());
             }
+            // CTX-1147: the removed source's detached floats die with it
+            // (same discipline as `workspace_move_focused_to_at`).
+            let mut doomed_floats: Vec<ViewId> = self.floats.ids();
+            if let Some(slot) = self.workspaces.get(source_index) {
+                doomed_floats.extend(slot.floats.ids());
+            }
+            doomed_floats.sort();
+            doomed_floats.dedup();
+            for view in &doomed_floats {
+                self.close_pane_session(view);
+            }
             let doomed_non_moved: Vec<ViewId> =
                 doomed.into_iter().filter(|id| *id != focused).collect();
             self.workspaces.remove(source_index);
-            for view in doomed_non_moved {
+            for view in doomed_non_moved.into_iter().chain(doomed_floats) {
                 self.session_pending.remove(&view);
                 if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(view) {
                     self.session_primary_cwd = None;
                 }
+                self.float_offsets.remove(&view);
             }
             self.workspace_mru.retain(|&i| i != source_index);
             for i in self.workspace_mru.iter_mut() {
@@ -1803,6 +1998,7 @@ impl Runtime {
             name: format!("ws{one_based}"),
             layout: LayoutNode::leaf(moved_view),
             focus: Focus::with_focus(focused),
+            floats: FloatStore::new(),
         };
         self.workspaces.push(new_slot);
         if one_based >= self.next_workspace_seq {

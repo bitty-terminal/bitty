@@ -437,11 +437,15 @@ impl Runtime {
         // CTX-1082: pinned panels are live, presented, focusable views
         // outside every layout tree — spawning into one gives it the
         // session its pending restore drains into (startup/deferred
-        // respawn after a session restore). Anything else is still
+        // respawn after a session restore). CTX-1147: workspace-local
+        // detached floats are live the same way. Anything else is still
         // rejected fail-closed before any spawn.
-        if !self.layout.leaf_ids().contains(&view) && !self.pinned.contains(view) {
+        if !self.layout.leaf_ids().contains(&view)
+            && !self.pinned.contains(view)
+            && !self.floats.contains(view)
+        {
             return Err(RuntimeError::InvalidConfig(
-                "view is not a leaf of the current layout or the pinned store",
+                "view is not a leaf of the current layout, the pinned store, or the detached-float store",
             ));
         }
         // CTX-0343: a pane bind turns (or keeps) the leaf at `terminal`

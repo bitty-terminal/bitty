@@ -43,7 +43,8 @@ pub(crate) const PIN_CASCADE_DY: u16 = 2;
 pub(super) struct PinnedAnchor {
     /// Cascaded anchored origin in container cells: centered
     /// [`float_frame`](bitty_ui::presentation::float_frame) plus the
-    /// pin-depth cascade offset.
+    /// cascade offset (pin depth for pins; composited pin count plus
+    /// detach position for detached floats, CTX-1166).
     pub(super) origin: (i32, i32),
     /// Anchored size in container cells.
     pub(super) size: (u16, u16),
@@ -791,14 +792,28 @@ impl Runtime {
     /// over the workspace-local detached floats instead of the
     /// window-global pins. Returns `None` when `id` is not a composited
     /// detached float.
+    ///
+    /// CTX-1166 (#1994): the depth additionally absorbs the composited pin
+    /// count. Pinning detaches a live leaf into the window-global store, so
+    /// a pinned depth-zero leaf and a detached depth-zero leaf share one
+    /// anchor and a fresh detach lands exactly over an existing pin. The
+    /// transient detached side absorbs the pin count (sticky pins never
+    /// shift for transient floats); pure-detached scenes are unchanged.
     pub(super) fn float_anchor(&self, id: ViewId) -> Option<PinnedAnchor> {
         let base_ids = self.layout.leaf_ids();
-        let depth = self
+        let pins_above = self
+            .pinned
+            .ids()
+            .into_iter()
+            .filter(|pid| !base_ids.contains(pid))
+            .count();
+        let position = self
             .floats
             .ids()
             .into_iter()
             .filter(|fid| !base_ids.contains(fid))
             .position(|fid| fid == id)?;
+        let depth = pins_above.saturating_add(position);
         let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
         let step = u16::try_from(depth).unwrap_or(u16::MAX);
         let max_x = self

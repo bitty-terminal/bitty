@@ -248,6 +248,191 @@ fn ctl_help_names_panel_list_and_panel_needs_live_instance() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn ctl_panel_list_live_roundtrip_via_test_mode_instance() {
+    // CTX-1158 (issue #1967): `panel list` must round-trip live through the
+    // enqueue path (dispatcher scope plus control queue plus drain), not just
+    // parse or apply headless. Spawns an isolated `--test-mode` instance (own
+    // PID, own socket, no desktop), runs the built binary's `ctl panel list`
+    // against it, and asserts exit 0 plus panel data in JSON and table
+    // shapes. No elevation: `view.inspect` rides the CLI default.
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct LiveDir(std::path::PathBuf);
+    impl LiveDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let path = std::path::PathBuf::from(format!(
+                "/tmp/bitty-ctl-panel-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create live dir");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("live dir mode 0700");
+            Self(path)
+        }
+    }
+    impl Drop for LiveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct LiveInstance {
+        child: Child,
+        socket: String,
+        stderr_path: std::path::PathBuf,
+        _dir: LiveDir,
+    }
+    impl LiveInstance {
+        fn spawn() -> Self {
+            let dir = LiveDir::new();
+            let socket = dir.0.join("s.sock").to_string_lossy().into_owned();
+            assert!(socket.len() < 100, "socket path must fit AF_UNIX: {socket}");
+            let stderr_path = dir.0.join("stderr.log");
+            let stderr = std::fs::File::create(&stderr_path).expect("live stderr log");
+            let mut cmd = Command::new(BITTY_BIN);
+            cmd.arg("--test-mode")
+                .arg("--safe")
+                .env("BITTY_SOCKET", &socket)
+                .env("BITTY_INSTANCE_ID", "e2e-ctl-panel")
+                .env("SHELL", "/bin/sh")
+                .env("XDG_CONFIG_HOME", dir.0.as_os_str())
+                .env("XDG_DATA_HOME", dir.0.as_os_str())
+                .env("XDG_RUNTIME_DIR", dir.0.as_os_str())
+                .env("HOME", dir.0.as_os_str())
+                .env_remove("BITTY_CTL_ELEVATE")
+                .current_dir(dir.0.as_path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(stderr));
+            let child = cmd
+                .spawn()
+                .unwrap_or_else(|err| panic!("spawn {BITTY_BIN}: {err}"));
+            Self {
+                child,
+                socket,
+                stderr_path,
+                _dir: dir,
+            }
+        }
+
+        fn stderr_tail(&self) -> String {
+            std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+        }
+
+        fn wait_for_socket(&mut self) {
+            let start = Instant::now();
+            let deadline = Duration::from_secs(20);
+            loop {
+                if std::path::Path::new(&self.socket).exists() {
+                    return;
+                }
+                if let Some(status) = self.child.try_wait().expect("try_wait") {
+                    panic!(
+                        "test-mode exited early ({status}) before serving {}; stderr:\n{}",
+                        self.socket,
+                        self.stderr_tail()
+                    );
+                }
+                assert!(
+                    start.elapsed() < deadline,
+                    "timed out waiting for {}; stderr:\n{}",
+                    self.socket,
+                    self.stderr_tail()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn run_ctl(&self, args: &[&str]) -> Output {
+            // Explicit `--socket` bypasses discovery; clear inherited
+            // endpoint env so the test never picks a developer instance.
+            let mut cmd = Command::new(BITTY_BIN);
+            cmd.args(args)
+                .env_remove("BITTY_SOCKET")
+                .env_remove("BITTY_INSTANCE_ID");
+            cmd.output()
+                .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
+        }
+    }
+    impl Drop for LiveInstance {
+        fn drop(&mut self) {
+            // Own PID only: never pattern-kill, never touch other instances.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let mut instance = LiveInstance::spawn();
+    instance.wait_for_socket();
+
+    // JSON is the machine contract: single value, v1 envelope, ok true,
+    // tiled panel with bounds and focus marker. Poll briefly: the socket
+    // file can exist just before the drain loop starts serving.
+    let start = Instant::now();
+    let deadline = Duration::from_secs(20);
+    let json_text = loop {
+        let output = instance.run_ctl(&[
+            "ctl",
+            "--socket",
+            instance.socket.as_str(),
+            "panel",
+            "list",
+            "--format",
+            "json",
+        ]);
+        let text = stdout(&output);
+        if output.status.code() == Some(0)
+            && text.contains("\"ok\":true")
+            && text.contains("\"command\":\"core.panel.list\"")
+        {
+            break text;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "panel list never succeeded; exit={:?} stdout={text:?} stderr={:?} server:\n{}",
+            output.status.code(),
+            stderr(&output),
+            instance.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        json_text.contains("\"v\":1")
+            && json_text.contains("\"id\":\"p:1\"")
+            && json_text.contains("\"view\":\"v:1\"")
+            && json_text.contains("\"bounds\"")
+            && json_text.contains("\"role\":\"tiled\"")
+            && json_text.contains("\"focused\":true"),
+        "live panel JSON must carry the tiled panel, got {json_text:?}"
+    );
+    assert_eq!(
+        json_text.trim().lines().count(),
+        1,
+        "json stdout must be one value, got {json_text:?}"
+    );
+
+    // Table is the human shape: header plus the focused marker row.
+    let output = instance.run_ctl(&["ctl", "--socket", instance.socket.as_str(), "panel", "list"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "panel list table must exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let table = stdout(&output);
+    assert!(
+        table.contains("PANEL VIEW BOUNDS ROLE FOCUSED") && table.contains("p:1"),
+        "live panel table must list p:1, got {table:?}"
+    );
+}
+
 #[test]
 fn ctl_workspace_bad_id_is_usage_error() {
     for args in [

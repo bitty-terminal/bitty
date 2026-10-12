@@ -50,6 +50,15 @@
 //! - **No shell, ever**: argv arrays go directly to
 //!   [`std::process::Command`]; `sh -c`, `cmd /C`, and friends are never
 //!   constructed on any platform. Metacharacters in args are inert data.
+//! - **Inherited exec confinement** (CTX-1151): admitted Layer-2 tool
+//!   invocations additionally run under `bitty-sandbox` inherited OS
+//!   confinement — on Linux a Landlock `EXECUTE` ruleset (tool binaries
+//!   plus their loaders) applied in the child via `pre_exec`, so an
+//!   admitted binary cannot exec outside the allowlist from inside.
+//!   Confinement setup failure refuses the spawn fail-closed as
+//!   `Unavailable` with a confinement diagnostic; non-Linux platforms
+//!   refuse admitted spawns the same way until their sequel mechanisms
+//!   (macOS `sandbox-exec`, Windows job-object confinement) land.
 //! - **Closed env**: the child starts from `env_clear()` plus the request's
 //!   explicit vars only; ambient environment never crosses the boundary
 //!   (mirrors [`EnvPolicy`]). Besides determinism (no `GIT_PAGER`/`PATH`
@@ -127,7 +136,8 @@ use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::tools::{
-    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env, is_valid_tool_name,
+    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
+    is_tool_spawn_allowed, is_valid_tool_name,
 };
 
 /// Panel-path per-stream output budget (`8 KiB`).
@@ -740,12 +750,59 @@ pub(crate) fn spawn_process(
         request.cwd.as_deref(),
         &request.env_policy,
     );
+    // CTX-1151 (#1984): every *admitted* Layer-2 tool invocation runs
+    // under inherited OS exec confinement (`bitty-sandbox`): on Linux the
+    // child may exec only the allowlisted tool binaries (plus their
+    // loaders), so a GTFOBins-class binary cannot escape to a shell from
+    // inside. The guard must stay alive across `spawn` (it owns the
+    // ruleset fd the child hook captured); any setup failure returns
+    // `Unavailable` *before* any process starts — fail-closed, diagnosed,
+    // never silently unconfined. Non-tool requests carry no allowlist
+    // basis and keep their scope/consent gates unchanged.
+    let _confinement = if is_tool_spawn_allowed(&request.executable, &request.args) {
+        let exec_paths =
+            bitty_sandbox::resolve_tool_execs(&request.executable).map_err(|error| {
+                IpcError::Unavailable {
+                    reason: format!(
+                        "tool spawn confinement refused '{}': {}",
+                        request.executable,
+                        truncate_message(error.to_string(), 96),
+                    ),
+                }
+            })?;
+        Some(
+            bitty_sandbox::confine_command_to_execs(&mut command, &exec_paths).map_err(
+                |error| IpcError::Unavailable {
+                    reason: format!(
+                        "tool spawn confinement refused '{}': {}",
+                        request.executable,
+                        truncate_message(error.to_string(), 96),
+                    ),
+                },
+            )?,
+        )
+    } else {
+        None
+    };
     let child = command.spawn().map_err(|error| IpcError::Unavailable {
-        reason: format!(
-            "spawn failed for '{}': {}",
-            request.executable,
-            truncate_message(error.to_string(), 128)
-        ),
+        reason: if _confinement.is_some() {
+            // The spawn ran with confinement armed (Landlock hook
+            // installed): any failure here — a `pre_exec` refusal on a
+            // locked-down host as well as a genuine exec denial — is a
+            // fail-closed confinement refusal, so the diagnostic names it
+            // instead of passing a bare OS error up.
+            format!(
+                "spawn failed for '{}' under tool confinement (fail-closed): {}",
+                request.executable,
+                truncate_message(error.to_string(), 96),
+            )
+        } else {
+            format!(
+                "spawn failed for '{}': {}",
+                request.executable,
+                truncate_message(error.to_string(), 128)
+            )
+        },
     })?;
     // CTX-0526: from this point the child is live, so it is owned by a
     // cleanup guard. Every early `return`/`?` below must pass through the
@@ -2033,6 +2090,47 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn admitted_git_spawn_runs_under_inherited_confinement() {
+        // CTX-1151 wiring proof: an admitted `git status` flows through
+        // `spawn_process` into `bitty-sandbox` confinement. The spawn
+        // itself is the proof — under enforcement the OS allows the exec
+        // (the exit code is git's business: outside a repository it fails
+        // non-zero but still spawns). Where the host cannot enforce
+        // (pre-Landlock kernel, missing `git`, or a container policy that
+        // forbids unprivileged `restrict_self`), the fail-closed
+        // `Unavailable` carrying a confinement diagnostic is the accepted
+        // outcome instead: either way no admitted spawn runs unconfined.
+        let request = bitty_ipc::execution::ExecutionRequest::new("git", vec!["status".to_owned()]);
+        match spawn_process(&request) {
+            Ok(_) => {}
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    matches!(error, IpcError::Unavailable { .. }) && text.contains("confinement"),
+                    "admitted spawn must either run confined or refuse fail-closed with a confinement diagnostic, got {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn admitted_tool_spawn_refused_fail_closed_off_linux() {
+        // CTX-1151 degrade proof: without a Linux Landlock mechanism the
+        // choke point refuses admitted spawns fail-closed (no process
+        // starts), naming confinement in the diagnostic.
+        let request = bitty_ipc::execution::ExecutionRequest::new("git", vec!["status".to_owned()]);
+        let error = spawn_process(&request).expect_err("non-Linux tool spawn must refuse");
+        assert!(
+            matches!(error, IpcError::Unavailable { .. }),
+            "got {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("confinement"), "{text}");
     }
 
     #[test]

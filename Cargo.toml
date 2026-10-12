@@ -8,6 +8,7 @@ members = [
   "crates/bitty-plugin-host",
   "crates/bitty-pty",
   "crates/bitty-rich",
+  "crates/bitty-sandbox",
   "crates/bitty-vt",
   "crates/bitty-term-state",
   "crates/bitty-test-support",

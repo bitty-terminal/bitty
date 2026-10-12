@@ -338,6 +338,7 @@ dependencies = [
  "bitty-pty",
  "bitty-render",
  "bitty-rich",
+ "bitty-sandbox",
  "bitty-term-state",
  "bitty-test-support",
  "bitty-ui",
@@ -346,6 +347,13 @@ dependencies = [
  "bitty-winjob",
  "nix 0.31.3",
  "rustix 1.1.5",
+]
+
+[[package]]
+name = "bitty-sandbox"
+version = "0.0.22"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

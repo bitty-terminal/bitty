@@ -33,6 +33,11 @@ bitty-platform = { version = "0.0.22", path = "../bitty-platform" }
 bitty-ui = { version = "0.0.22", path = "../bitty-ui" }
 bitty-lua = { version = "0.0.22", path = "../bitty-lua" }
 bitty-plugin-host = { version = "0.0.22", path = "../bitty-plugin-host" }
+# CTX-1151 (#1984): inherited-OS-confinement adapter for admitted tool
+# spawns (Linux Landlock; fail-closed degrade elsewhere). First-party
+# workspace crate, no new supply-chain surface (its only syscall dep is the
+# workspace `libc`, Linux-gated there).
+bitty-sandbox = { version = "0.0.22", path = "../bitty-sandbox" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "a9544ac" }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.

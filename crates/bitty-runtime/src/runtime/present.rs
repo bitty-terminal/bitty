@@ -1364,6 +1364,32 @@ impl Runtime {
                     self.push_leaf_ring(frame, view_id, open_factor, &ring_ctx, &mut built.rounded);
                 built.needs_draw |= ring_painted;
 
+                // CTX-1148 (#1978): detached floats must paint opaque. The
+                // grid fills cover only the content rect; the decoration
+                // frame (border plus content-inset band, sub-cell remainder)
+                // would otherwise show tiled content beneath (siblings refill
+                // the container after detach, unlike the keep-slot model).
+                // One theme-bg fill covering the float frame occludes the base
+                // beneath the cell fills; the chrome ring still paints above.
+                // Float tier only, so the tiled baseline is unchanged. Empty
+                // frames skip fail-closed. Bounded: one fill per float frame.
+                if frame.tier == Some(OverlayTier::Float)
+                    && frame.frame.width > 0
+                    && frame.frame.height > 0
+                {
+                    let bg = self.renderer.theme_palette().background;
+                    built.fills.push(bitty_render::grid::FillRect {
+                        rect: bitty_render::geometry::RectPx::new(
+                            px_add(pad_px, frame.frame.x),
+                            px_add(pad_px, frame.frame.y),
+                            frame.frame.width,
+                            frame.frame.height,
+                        ),
+                        color: bg,
+                    });
+                    built.needs_draw = true;
+                }
+
                 // CTX-0347 (RFC-0001/OQ-042): the resolved per-`View` background
                 // image paints inside the content rect, above cell backgrounds
                 // and the decoration ring, below overlay fills and glyphs. It

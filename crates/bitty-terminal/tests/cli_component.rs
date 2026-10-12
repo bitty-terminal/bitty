@@ -810,3 +810,67 @@ fn component_alias_works_and_warns() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn extension_show_source_prints_pinned_bytes() {
+    // Issue #1986: `show-source` prints the exact pinned executable bytes to
+    // stdout (provenance on stderr so stdout stays byte-identical), version
+    // defaulting to the active `current` pointer.
+    let home = scratch_dir("ext-show-source");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let source = write_source_dir(&home.join("source"), "net", "0.0.1", "[1, 1]");
+    let source = source.display().to_string();
+
+    let output = run_in(&home, &system, &["extension", "add", &source]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let output = run_in(&home, &system, &["extension", "show-source", "net"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "net-0.0.1-bytes");
+    let provenance = stderr(&output);
+    assert!(
+        provenance.contains("show-source") && provenance.contains("net"),
+        "provenance must name the verb and component: {provenance}"
+    );
+
+    // Explicit version agrees byte-for-byte.
+    let output = run_in(
+        &home,
+        &system,
+        &["extension", "show-source", "net", "0.0.1"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "net-0.0.1-bytes");
+
+    // Missing installs fail closed (exit 4) with nothing on stdout.
+    let output = run_in(&home, &system, &["extension", "show-source", "missing"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    let output = run_in(
+        &home,
+        &system,
+        &["extension", "show-source", "net", "9.9.9"],
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_show_source_is_visible_in_help() {
+    // Issue #1986: `show-source` is a visible verb (unlike the hidden
+    // `component` alias, which never appears in help or completions).
+    let home = scratch_dir("ext-show-source-help");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+
+    let output = run_in(&home, &system, &["extension", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("show-source"),
+        "extension help must document show-source:\n{}",
+        stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

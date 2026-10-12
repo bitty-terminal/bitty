@@ -236,6 +236,49 @@ expect_bad_descriptor "key outside table" \
   "name = \"$NAME\"" "[component]" "version = \"$VERSION\"" \
   "protocol = [1, 1]" "executable = \"bitty-$NAME\""
 
+# --- no-obfuscation rule (issue #1986): readable Lua packs, minified refuses ---
+# Positive fixture: readable Lua at the root and under lua/ is tolerated and
+# ignored (the tarball still holds exactly the two fixed members).
+printf -- '-- helper\nlocal M = {}\nfunction M.bump(n)\n  return n + 1\nend\nreturn M\n' >"$SRC/helper.lua"
+mkdir -p "$SRC/lua"
+printf -- '-- init\nlocal helper = require("helper")\nreturn {}\n' >"$SRC/lua/init.lua"
+if "$SCRIPT" --source "$SRC" --version "$VERSION" --target "$TARGET" \
+  --binary "$SRC/bitty-net" --output "$OUT/$TARGET.tar.gz" >/dev/null 2>&1; then
+  ACTUAL_LUA="$(tar -tzf "$OUT/$TARGET.tar.gz" | LC_ALL=C sort)"
+  if [[ "$ACTUAL_LUA" == "$EXPECTED" ]]; then
+    pass "readable Lua packs (ignored, member list unchanged)"
+  else
+    fail "readable Lua changed the member list:
+$ACTUAL_LUA"
+  fi
+else
+  fail "readable Lua refused assembly"
+fi
+rm -f "$SRC/helper.lua" "$SRC/lua/init.lua"
+rmdir "$SRC/lua" 2>/dev/null || true
+
+# Negative fixtures: minified Lua (one very long line) fails closed.
+printf 'local x=%s;' "$(printf 'a%.0s' $(seq 1 1200))" >"$SRC/helper.lua"
+expect_fail "minified Lua at root" --source "$SRC" --version "$VERSION" --target "$TARGET" \
+  --binary "$SRC/bitty-net" --output "$OUT/$TARGET.tar.gz"
+rm -f "$SRC/helper.lua"
+mkdir -p "$SRC/lua"
+printf 'local y=%s;' "$(printf 'b%.0s' $(seq 1 1200))" >"$SRC/lua/init.lua"
+expect_fail "minified Lua under lua/" --source "$SRC" --version "$VERSION" --target "$TARGET" \
+  --binary "$SRC/bitty-net" --output "$OUT/$TARGET.tar.gz"
+rm -rf "$SRC/lua"
+
+# Negative fixture: a valid descriptor carrying a 1200-byte comment line
+# trips the readability gate (parse would otherwise accept the comment).
+{
+  cat "$SRC/bitty-component.toml"
+  printf '# %s\n' "$(printf 'x%.0s' $(seq 1 1200))"
+} >"$TMP_BASE/long-comment.toml"
+cp "$TMP_BASE/long-comment.toml" "$SRC/bitty-component.toml"
+expect_fail "descriptor with overlong comment line" --source "$SRC" --version "$VERSION" --target "$TARGET" \
+  --binary "$SRC/bitty-net" --output "$OUT/$TARGET.tar.gz"
+write_descriptor
+
 # An empty binary fails closed.
 EMPTY_SRC="$TMP_BASE/empty-src"
 mkdir -p "$EMPTY_SRC"

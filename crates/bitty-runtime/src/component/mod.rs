@@ -88,8 +88,9 @@ pub use broker::{
     effective_max_body_bytes, effective_timeout,
 };
 pub use descriptor::{
-    ComponentDescriptor, DescriptorError, ResolveError, ResolvedComponent, components_root_for,
-    executable_file_name, resolve, validate_component_name,
+    ComponentDescriptor, DescriptorError, READABLE_SOURCE_MAX_AVG_LINE_BYTES,
+    READABLE_SOURCE_MAX_LINE_BYTES, ResolveError, ResolvedComponent, components_root_for,
+    executable_file_name, is_obfuscated_source_text, resolve, validate_component_name,
 };
 pub use env::{ComponentEnv, is_allowlisted_env};
 pub use grant::{

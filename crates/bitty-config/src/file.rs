@@ -214,9 +214,10 @@ use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
     AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
     LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
-    MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig,
-    ScrollbarMode, SelectionConfig, SessionConfig, TerminalConfig, ViewAppearanceOverride,
-    ViewOverride, ViewSelector, WindowConfig,
+    MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
+    MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig,
+    SessionConfig, StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector,
+    WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -621,6 +622,7 @@ impl CliOverrides {
                 theme: Some(trimmed.to_string()),
                 colors: None,
                 animations: None,
+                style: None,
             }),
             schema_version: Some(CURRENT_SCHEMA_VERSION),
             ..Default::default()
@@ -708,6 +710,7 @@ impl CliOverrides {
             theme: Some(t.to_string()),
             colors: None,
             animations: None,
+            style: None,
         });
         let plan = ConfigPlan {
             appearance,
@@ -1277,9 +1280,14 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
-    let appearance = match (theme, data.appearance_colors, animations) {
-        (None, None, None) => None,
-        (theme, colors_data, animations) => {
+    let appearance = match (
+        theme,
+        data.appearance_colors,
+        animations,
+        data.appearance_style,
+    ) {
+        (None, None, None, None) => None,
+        (theme, colors_data, animations, style_data) => {
             // CTX-0392: inline `appearance.colors` custom palette. Complete
             // palette required (4 chrome + exactly 16 ANSI); any missing,
             // short/long, or malformed leaf rejects the whole reload
@@ -1348,6 +1356,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 theme,
                 colors,
                 animations,
+                style: convert_style_table(style_data)?,
             })
         }
     };
@@ -1863,6 +1872,17 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 },
             };
             let background_image_roots = d.background_image_roots.clone();
+            // CTX-1159 S0 (DEC-0111 section 1): the tint pair is optional
+            // like the outline colors/widths — absent says nothing so merge
+            // inherits the lower layer. Present values are parsed
+            // fail-closed here and again by `DecorationConfig::validate`
+            // via `plan.validate()`.
+            let background_tint =
+                parse_style_color("decoration.background_tint", d.background_tint.as_deref())?;
+            let background_tint_strength = check_style_float(
+                "decoration.background_tint_strength",
+                d.background_tint_strength,
+            )?;
             Some(DecorationConfig {
                 gaps_in,
                 gaps_out,
@@ -1878,6 +1898,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 background_image,
                 background_fit,
                 background_image_roots,
+                background_tint,
+                background_tint_strength,
             })
         }
     };
@@ -1979,6 +2001,41 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         }
                     },
                 };
+                // CTX-1159 S0 (DEC-0111 section 1): the per-View style
+                // quartet parses fail-closed with the selector-qualified
+                // path, mirroring the outline leaves above. `shadow_*` and
+                // `fade_unfocused` never reach this type: the extractor
+                // rejects them inside `views.*` like `background_image_roots`.
+                let glow_color =
+                    parse_style_color(&path("glow_color"), entry.glow_color.as_deref())?;
+                let glow_width = match entry.glow_width {
+                    None => None,
+                    Some(v) => {
+                        if !(0..=i64::from(MAX_STYLE_GLOW_WIDTH_PX)).contains(&v) {
+                            return Err(ConfigError::validation(
+                                path("glow_width"),
+                                format!(
+                                    "must be within [0, {MAX_STYLE_GLOW_WIDTH_PX}] (found {v})"
+                                ),
+                            ));
+                        }
+                        Some(v as u32)
+                    }
+                };
+                let background_tint =
+                    parse_style_color(&path("background_tint"), entry.background_tint.as_deref())?;
+                let background_tint_strength = match entry.background_tint_strength {
+                    None => Ok(None),
+                    Some(v) => {
+                        if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                            return Err(ConfigError::validation(
+                                path("background_tint_strength"),
+                                format!("must be finite within [0.0, 1.0] (found {v})"),
+                            ));
+                        }
+                        Ok(Some(v as f32))
+                    }
+                }?;
                 let overrides = ViewAppearanceOverride {
                     border_color,
                     border_color_focused,
@@ -1988,6 +2045,10 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     border_width_idle,
                     background_image,
                     background_fit,
+                    glow_color,
+                    glow_width,
+                    background_tint,
+                    background_tint_strength,
                 };
                 // Fail-closed field bounds with the selector-qualified path
                 // (image path syntax lives in `ViewOverride::validate`).
@@ -2422,6 +2483,105 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     };
     plan.validate()?;
     Ok(plan)
+}
+
+/// Parses one style color leaf fail-closed with its field path (CTX-1159
+/// S0): canonical `#RRGGBB` / `#RRGGBBAA` only; empty/NUL/overlong/
+/// malformed spellings reject naming the offending key, mirroring the
+/// `decoration.border_color*` posture.
+fn parse_style_color(field: &str, raw: Option<&str>) -> Result<Option<OutlineColor>, ConfigError> {
+    match raw {
+        None => Ok(None),
+        Some(text) => match OutlineColor::parse(text) {
+            Some(color) => Ok(Some(color)),
+            None => Err(ConfigError::validation(
+                field,
+                format!(
+                    "must be '#RRGGBB' or '#RRGGBBAA' (found \"{}\")",
+                    text.trim()
+                ),
+            )),
+        },
+    }
+}
+
+/// Range-checks one style float leaf fail-closed with its field path
+/// (CTX-1159 S0): finite within `[0.0, 1.0]`, validated on the `f64`
+/// BEFORE the `f32` conversion — values like `1.00000001` round to `1.0`
+/// in `f32` and would pass a post-conversion range check (the same
+/// fail-closed contract as `window.background_opacity`).
+fn check_style_float(field: &str, raw: Option<f64>) -> Result<Option<f32>, ConfigError> {
+    match raw {
+        None => Ok(None),
+        Some(v) => {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("must be finite within [0.0, 1.0] (found {v})"),
+                ));
+            }
+            Ok(Some(v as f32))
+        }
+    }
+}
+
+/// Converts the raw `appearance.style` table into its typed form
+/// (CTX-1159 S0, DEC-0111 section 1).
+///
+/// The table is fully optional ("absent means this layer says nothing").
+/// Present leaves are parsed fail-closed with their field paths and the
+/// result is re-checked by `StyleConfig::validate` via `plan.validate()`.
+/// `shadow_blur` never reaches this type: the extractor's closed set
+/// rejects it (RESERVED posture).
+fn convert_style_table(
+    data: Option<bitty_lua::config::StyleData>,
+) -> Result<Option<StyleConfig>, ConfigError> {
+    let Some(s) = data else {
+        return Ok(None);
+    };
+    let glow_color = parse_style_color("appearance.style.glow_color", s.glow_color.as_deref())?;
+    let glow_width = match s.glow_width {
+        None => None,
+        Some(v) => {
+            if !(0..=MAX_STYLE_GLOW_WIDTH_PX as i64).contains(&v) {
+                return Err(ConfigError::validation(
+                    "appearance.style.glow_width",
+                    format!("must be within [0, {MAX_STYLE_GLOW_WIDTH_PX}] (found {v})"),
+                ));
+            }
+            Some(v as u32)
+        }
+    };
+    let shadow_color =
+        parse_style_color("appearance.style.shadow_color", s.shadow_color.as_deref())?;
+    let check_offset = |field: &str, raw: Option<i64>| match raw {
+        None => Ok(None),
+        Some(v) => {
+            if v.abs() > i64::from(MAX_STYLE_SHADOW_OFFSET_PX) {
+                return Err(ConfigError::validation(
+                    field,
+                    format!(
+                        "must be within [-{MAX_STYLE_SHADOW_OFFSET_PX}, \
+                         {MAX_STYLE_SHADOW_OFFSET_PX}] (found {v})"
+                    ),
+                ));
+            }
+            // The bound keeps the value inside `i32`; the cast cannot
+            // truncate.
+            Ok(Some(v as i32))
+        }
+    };
+    let shadow_offset_x = check_offset("appearance.style.shadow_offset_x", s.shadow_offset_x)?;
+    let shadow_offset_y = check_offset("appearance.style.shadow_offset_y", s.shadow_offset_y)?;
+    let fade_unfocused = check_style_float("appearance.style.fade_unfocused", s.fade_unfocused)?;
+    Ok(Some(StyleConfig {
+        glow_color,
+        glow_width,
+        shadow_color,
+        shadow_offset_x,
+        shadow_offset_y,
+        fade_unfocused,
+    }))
 }
 
 /// Bounds a config key for diagnostics (never echoes an unbounded hostile
@@ -5979,5 +6139,260 @@ mod ctx0392_tests {
             "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }}, theme_file = \"x.lua\" }} }} }}"
         );
         assert!(parse_lua_config(&bad, &ctx0392_source()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod style_s0_tests {
+    use super::*;
+    use crate::plan::{ConfigSource, LayerKind};
+
+    /// Fully styled S0 config: every global style leaf plus the per-View
+    /// quartet (CTX-1159 S0, DEC-0111 section 1).
+    fn style_source() -> ConfigSource {
+        ConfigSource::new(LayerKind::User, Some("init.lua"))
+    }
+
+    fn style_s0_lua() -> String {
+        "return { \
+            appearance = { style = { \
+                glow_color = \"#FF0000\", glow_width = 8, \
+                shadow_color = \"#00000080\", \
+                shadow_offset_x = -8, shadow_offset_y = 8, \
+                fade_unfocused = 0.5 } }, \
+            decoration = { background_tint = \"#11223344\", \
+                background_tint_strength = 0.75 }, \
+            views = { [\"*\"] = { \
+                glow_color = \"#00FF00\", glow_width = 4, \
+                background_tint = \"#000000\", \
+                background_tint_strength = 0.25 } } \
+        }"
+        .to_string()
+    }
+
+    #[test]
+    fn lua_style_table_parses_green() {
+        // CTX-1159 S0: a fully styled config parses and validates clean.
+        let plan = parse_lua_config(&style_s0_lua(), &style_source()).expect("styled parses");
+        plan.validate().expect("styled validates");
+        let style = plan
+            .appearance
+            .as_ref()
+            .and_then(|a| a.style.as_ref())
+            .expect("style table present");
+        assert_eq!(
+            style.glow_color,
+            OutlineColor::parse("#FF0000"),
+            "color parsed to typed value"
+        );
+        assert_eq!(style.glow_width, Some(8));
+        assert_eq!(style.shadow_offset_x, Some(-8));
+        assert_eq!(style.shadow_offset_y, Some(8));
+        assert_eq!(style.fade_unfocused, Some(0.5));
+        let decoration = plan.decoration.as_ref().expect("decoration present");
+        assert_eq!(decoration.background_tint, OutlineColor::parse("#11223344"));
+        assert_eq!(decoration.background_tint_strength, Some(0.75));
+        let views = plan.views.as_ref().expect("views present");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].overrides.glow_width, Some(4));
+        assert_eq!(views[0].overrides.background_tint_strength, Some(0.25));
+    }
+
+    #[test]
+    fn lua_style_vectors_fail_closed_with_named_paths() {
+        // CTX-1159 S0: every bound violation rejects the whole reload with
+        // a diagnostic naming the offending leaf path (never a clamp).
+        let cases = [
+            (
+                "glow_width high",
+                "return { appearance = { style = { glow_width = 17 } } }",
+                "appearance.style.glow_width",
+            ),
+            (
+                "glow_width negative",
+                "return { appearance = { style = { glow_width = -1 } } }",
+                "appearance.style.glow_width",
+            ),
+            (
+                "glow_width float",
+                "return { appearance = { style = { glow_width = 1.5 } } }",
+                "appearance.style.glow_width",
+            ),
+            (
+                "shadow_offset_x high",
+                "return { appearance = { style = { shadow_offset_x = 9 } } }",
+                "appearance.style.shadow_offset_x",
+            ),
+            (
+                "shadow_offset_y low",
+                "return { appearance = { style = { shadow_offset_y = -9 } } }",
+                "appearance.style.shadow_offset_y",
+            ),
+            (
+                "shadow_blur reserved",
+                "return { appearance = { style = { shadow_blur = 2 } } }",
+                "appearance.style.shadow_blur",
+            ),
+            (
+                "ring_alpha never added",
+                "return { appearance = { style = { ring_alpha = 0.5 } } }",
+                "appearance.style.ring_alpha",
+            ),
+            (
+                "glow_color malformed",
+                "return { appearance = { style = { glow_color = \"red\" } } }",
+                "appearance.style.glow_color",
+            ),
+            (
+                "glow_color empty",
+                "return { appearance = { style = { glow_color = \"\" } } }",
+                "appearance.style.glow_color",
+            ),
+            (
+                "glow_color overlong",
+                "return { appearance = { style = { glow_color = \"#RRGGBBAAx\" } } }",
+                "appearance.style.glow_color",
+            ),
+            (
+                "glow_color NUL",
+                "return { appearance = { style = { glow_color = \"#FF\\000000\" } } }",
+                "appearance.style.glow_color",
+            ),
+            (
+                "fade_unfocused high",
+                "return { appearance = { style = { fade_unfocused = 1.5 } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "fade_unfocused negative",
+                "return { appearance = { style = { fade_unfocused = -0.5 } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "fade_unfocused string",
+                "return { appearance = { style = { fade_unfocused = \"0.5\" } } }",
+                "appearance.style.fade_unfocused",
+            ),
+            (
+                "style not a table",
+                "return { appearance = { style = \"glow\" } }",
+                "appearance.style",
+            ),
+            (
+                "tint strength high",
+                "return { decoration = { background_tint_strength = 2.0 } }",
+                "decoration.background_tint_strength",
+            ),
+            (
+                "tint color malformed",
+                "return { decoration = { background_tint = \"blue\" } }",
+                "decoration.background_tint",
+            ),
+            (
+                "shadow global-only in views",
+                "return { views = { [\"*\"] = { shadow_color = \"#000000\" } } }",
+                "views[*].shadow_color",
+            ),
+            (
+                "fade global-only in views",
+                "return { views = { [\"*\"] = { fade_unfocused = 0.5 } } }",
+                "views[*].fade_unfocused",
+            ),
+            (
+                "views glow_width high",
+                "return { views = { [\"*\"] = { glow_width = 99 } } }",
+                "views[*].glow_width",
+            ),
+            (
+                "views tint strength high",
+                "return { views = { [\"*\"] = { background_tint_strength = 5.0 } } }",
+                "views[*].background_tint_strength",
+            ),
+            (
+                "views tint color malformed",
+                "return { views = { [\"*\"] = { background_tint = \"nope\" } } }",
+                "views[*].background_tint",
+            ),
+        ];
+        for (name, lua, path) in cases {
+            let err = parse_lua_config(lua, &style_source()).unwrap_err();
+            assert!(
+                err.to_string().contains(path),
+                "{name}: error {err} must name {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn style_s0_accepted_but_inert_snapshot() {
+        // CTX-1159 S0 (DEC-0113 Fix 3): a fully styled config is parsed,
+        // validated, merged, attributed, and reported — with provably no
+        // render effect. The pin: the reload diff against defaults contains
+        // EXACTLY the style surface (8 global leaves + the one `views`
+        // selector entry), so no render-relevant field moved; safe mode
+        // collapses back to exactly the unstyled defaults; and the reload
+        // reconciles Live. No `set_chrome_style` exists yet (S3 owns it),
+        // so no present/render path can read these values.
+        use crate::merge::merge_layers;
+        use crate::plan::LayeredPlan;
+        use crate::reload::{ReloadClass, diff, reconcile_live};
+        use crate::types::EffectiveConfig;
+
+        let plan = parse_lua_config(&style_s0_lua(), &style_source()).expect("styled parses");
+        plan.validate().expect("styled validates");
+        let merged = merge_layers(vec![LayeredPlan::new(style_source(), plan)]).expect("merge");
+        merged.effective.validate().expect("effective valid");
+
+        // Reported: the diff pins the exact style surface, nothing more.
+        let report = diff(&EffectiveConfig::default(), &merged.effective);
+        assert_eq!(report.overall, ReloadClass::Live, "{report:?}");
+        let mut fields: Vec<&str> = report.diffs.iter().map(|d| d.field.as_str()).collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "appearance.style.fade_unfocused",
+                "appearance.style.glow_color",
+                "appearance.style.glow_width",
+                "appearance.style.shadow_color",
+                "appearance.style.shadow_offset_x",
+                "appearance.style.shadow_offset_y",
+                "decoration.background_tint",
+                "decoration.background_tint_strength",
+                "views[*]",
+            ],
+            "style-only edit must move exactly the style surface: {report:?}"
+        );
+        // The per-View entry reports exactly its style quartet.
+        let views_diff = report
+            .diffs
+            .iter()
+            .find(|d| d.field == "views[*]")
+            .expect("views diff");
+        assert_eq!(
+            views_diff.after,
+            "glow_color=#00FF00,glow_width=4,background_tint=#000000,\
+             background_tint_strength=0.25"
+        );
+        // Attributed: every moved leaf answers the user layer.
+        for field in fields.iter().filter(|f| **f != "views[*]") {
+            assert_eq!(
+                merged.source_of(field).unwrap().layer,
+                LayerKind::User,
+                "{field}"
+            );
+        }
+        // Safe mode collapses styled state to exactly the unstyled safe
+        // baseline (no surviving glow, shadow, tint, fade, or override).
+        assert_eq!(
+            merged.effective.clone().with_safe_decoration(),
+            EffectiveConfig::default().with_safe_decoration(),
+            "styled config under --safe equals the unstyled safe baseline"
+        );
+        // Live reconcile applies the styled config clean.
+        let mut current = EffectiveConfig::default();
+        let applied = reconcile_live(&mut current, &merged.effective).expect("reconciles live");
+        assert!(applied.is_live());
+        assert_eq!(current, merged.effective);
     }
 }

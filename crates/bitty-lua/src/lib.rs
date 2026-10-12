@@ -71,7 +71,7 @@ pub mod ui;
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
-    LayoutData, MouseData, PluginData, ScrollbarData, SelectionData, TerminalData,
+    LayoutData, MouseData, PluginData, ScrollbarData, SelectionData, StyleData, TerminalData,
     ViewOverrideData, WindowData,
 };
 pub use host::{

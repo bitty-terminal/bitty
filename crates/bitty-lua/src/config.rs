@@ -127,6 +127,12 @@ pub const MAX_CONFIG_FONT_FEATURE_ENTRIES: usize = 32;
 pub const MAX_CONFIG_FONT_FEATURE_BYTES: usize = 16;
 
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
+///
+/// CTX-1159 S0 adds the per-View style quartet (`glow_color`,
+/// `glow_width`, `background_tint`, `background_tint_strength`).
+/// `shadow_*` and `fade_unfocused` stay global-only: they are absent here
+/// and reject inside `views.*` like `background_image_roots` does. S1 owns
+/// the extended extractor tests for these leaves.
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
     "border_color_focused",
@@ -136,6 +142,10 @@ const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_width_idle",
     "background_image",
     "background_fit",
+    "glow_color",
+    "glow_width",
+    "background_tint",
+    "background_tint_strength",
 ];
 
 /// Fields rejected until their owning OQ accepts them (RFC-0001/OQ-041).
@@ -405,6 +415,12 @@ pub struct DecorationData {
     /// path strings, bounded and syntax-checked downstream in `bitty-config`
     /// (fail-closed). Global-only: the key is rejected inside `views.*`.
     pub background_image_roots: Option<Vec<String>>,
+    /// Global background tint color (CTX-1159 S0); raw canonical string,
+    /// grammar-checked downstream in `bitty-config` (fail-closed).
+    pub background_tint: Option<String>,
+    /// Global background tint strength (CTX-1159 S0); raw number,
+    /// bounds-checked downstream in `bitty-config` (fail-closed).
+    pub background_tint_strength: Option<f64>,
 }
 
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
@@ -507,6 +523,31 @@ pub struct ColorsData {
     pub ansi: Option<Vec<String>>,
 }
 
+/// Chrome styling, plain data (CTX-1159 S0, DEC-0111 section 1; see
+/// [`FontData`] for `Option` semantics).
+///
+/// The closed `appearance.style` table: colors are raw canonical strings,
+/// widths/offsets are plain integers (floats rejected like every other
+/// px key), and the fade factor is a raw number. Bounds and grammar are
+/// enforced fail-closed downstream in `bitty-config`. `shadow_blur` is
+/// RESERVED (rejected by the closed set) and `ring_alpha` was never added.
+/// S1 owns the extended extractor tests for this table.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StyleData {
+    /// Glow halo color hex string when the key is set.
+    pub glow_color: Option<String>,
+    /// Glow halo width in logical px when the key is set.
+    pub glow_width: Option<i64>,
+    /// Drop-shadow color hex string when the key is set.
+    pub shadow_color: Option<String>,
+    /// Drop-shadow horizontal offset in logical px when the key is set.
+    pub shadow_offset_x: Option<i64>,
+    /// Drop-shadow vertical offset in logical px when the key is set.
+    pub shadow_offset_y: Option<i64>,
+    /// Inactive-View dim factor when the key is set.
+    pub fade_unfocused: Option<f64>,
+}
+
 /// One `views.<selector>` entry, plain data (RFC-0001/OQ-041, CTX-0343; see
 /// [`FontData`] for `Option` semantics).
 ///
@@ -514,7 +555,9 @@ pub struct ColorsData {
 /// downstream in `bitty-config`; the extractor only enforces the closed field
 /// set (accepted fields plus reserved-field rejection) and the scalar leaf
 /// types, naming the offending key path.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+//
+// CTX-1159 S0: `PartialEq` only (`background_tint_strength` is a float).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewOverrideData {
     /// Raw selector key (grammar checked fail-closed downstream).
     pub selector: String,
@@ -534,6 +577,18 @@ pub struct ViewOverrideData {
     pub background_image: Option<String>,
     /// Background fit mode string (closed enum checked downstream).
     pub background_fit: Option<String>,
+    /// Glow halo color hex string (CTX-1159 S0; raw canonical string,
+    /// grammar checked downstream).
+    pub glow_color: Option<String>,
+    /// Glow halo width in logical px (CTX-1159 S0; bounds checked
+    /// downstream).
+    pub glow_width: Option<i64>,
+    /// Background tint color hex string (CTX-1159 S0; raw canonical string,
+    /// grammar checked downstream).
+    pub background_tint: Option<String>,
+    /// Background tint strength (CTX-1159 S0; raw number, bounds checked
+    /// downstream).
+    pub background_tint_strength: Option<f64>,
 }
 
 /// `input` table, plain data (CTX-1002 / issue #1650; see [`FontData`] for
@@ -567,6 +622,9 @@ pub struct ConfigData {
     pub appearance_colors: Option<ColorsData>,
     /// `appearance.animations` table (RFC-0002, CTX-0341).
     pub animations: Option<AnimationsData>,
+    /// `appearance.style` table (CTX-1159 S0 closed chrome-style table).
+    /// S1 owns the extended extractor tests for this table.
+    pub appearance_style: Option<StyleData>,
     /// `font` table.
     pub font: Option<FontData>,
     /// `window` table.
@@ -646,6 +704,7 @@ impl ConfigData {
             && self.appearance_theme.is_none()
             && self.appearance_colors.is_none()
             && self.animations.is_none()
+            && self.appearance_style.is_none()
             && self.font.is_none()
             && self.window.is_none()
             && self.terminal.is_none()
@@ -1113,7 +1172,7 @@ impl ConfigData {
                 "theme" => out.theme = Some(expect_string(key, val)?),
                 "appearance" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["theme", "colors", "animations"])?;
+                    check_nested_keys(key, nested, &["theme", "colors", "animations", "style"])?;
                     if let Some(t) = get_field(nested, "theme") {
                         out.appearance_theme = Some(expect_string("appearance.theme", t)?);
                     }
@@ -1312,6 +1371,59 @@ impl ConfigData {
                             };
                         }
                         out.animations = Some(data);
+                    }
+                    // CTX-1159 S0: `appearance.style` is a closed table of
+                    // typed leaves; strings/integers/numbers only (never
+                    // coerced). `shadow_blur` is RESERVED and rejects here
+                    // via the closed set; bounds/grammar validation is
+                    // fail-closed in `bitty-config`. S1 owns the extended
+                    // extractor tests for this table.
+                    if let Some(style) = get_field(nested, "style") {
+                        let style_table = expect_table("appearance.style", style)?;
+                        check_nested_keys(
+                            "appearance.style",
+                            style_table,
+                            &[
+                                "glow_color",
+                                "glow_width",
+                                "shadow_color",
+                                "shadow_offset_x",
+                                "shadow_offset_y",
+                                "fade_unfocused",
+                            ],
+                        )?;
+                        let glow_color = match get_field(style_table, "glow_color") {
+                            Some(v) => Some(expect_string("appearance.style.glow_color", v)?),
+                            None => None,
+                        };
+                        let glow_width = match get_field(style_table, "glow_width") {
+                            Some(v) => Some(expect_integer("appearance.style.glow_width", v)?),
+                            None => None,
+                        };
+                        let shadow_color = match get_field(style_table, "shadow_color") {
+                            Some(v) => Some(expect_string("appearance.style.shadow_color", v)?),
+                            None => None,
+                        };
+                        let shadow_offset_x = match get_field(style_table, "shadow_offset_x") {
+                            Some(v) => Some(expect_integer("appearance.style.shadow_offset_x", v)?),
+                            None => None,
+                        };
+                        let shadow_offset_y = match get_field(style_table, "shadow_offset_y") {
+                            Some(v) => Some(expect_integer("appearance.style.shadow_offset_y", v)?),
+                            None => None,
+                        };
+                        let fade_unfocused = match get_field(style_table, "fade_unfocused") {
+                            Some(v) => Some(expect_number("appearance.style.fade_unfocused", v)?),
+                            None => None,
+                        };
+                        out.appearance_style = Some(StyleData {
+                            glow_color,
+                            glow_width,
+                            shadow_color,
+                            shadow_offset_x,
+                            shadow_offset_y,
+                            fade_unfocused,
+                        });
                     }
                 }
                 "font" => {
@@ -1694,6 +1806,8 @@ impl ConfigData {
                             "background_image",
                             "background_fit",
                             "background_image_roots",
+                            "background_tint",
+                            "background_tint_strength",
                         ],
                     )?;
                     let gaps_in = match get_field(nested, "gaps_in") {
@@ -1772,6 +1886,21 @@ impl ConfigData {
                         )?),
                         None => None,
                     };
+                    // CTX-1159 S0: the tint pair is plain string/number
+                    // data here; the canonical color grammar and the
+                    // finite `[0.0, 1.0]` bound are enforced fail-closed in
+                    // `bitty-config`. S1 owns the extended extractor tests.
+                    let background_tint = match get_field(nested, "background_tint") {
+                        Some(v) => Some(expect_string("decoration.background_tint", v)?),
+                        None => None,
+                    };
+                    let background_tint_strength =
+                        match get_field(nested, "background_tint_strength") {
+                            Some(v) => {
+                                Some(expect_number("decoration.background_tint_strength", v)?)
+                            }
+                            None => None,
+                        };
                     out.decoration = Some(DecorationData {
                         gaps_in,
                         gaps_out,
@@ -1787,6 +1916,8 @@ impl ConfigData {
                         background_image,
                         background_fit,
                         background_image_roots,
+                        background_tint,
+                        background_tint_strength,
                     });
                 }
                 "views" => {
@@ -1884,6 +2015,24 @@ impl ConfigData {
                                 }
                                 "background_fit" => {
                                     data.background_fit = Some(expect_string(&path, value)?);
+                                }
+                                // CTX-1159 S0: the per-View style quartet
+                                // extracts as raw scalars; bounds/grammar
+                                // stay fail-closed downstream in
+                                // `bitty-config`. S1 owns the extended
+                                // extractor tests for these leaves.
+                                "glow_color" => {
+                                    data.glow_color = Some(expect_string(&path, value)?);
+                                }
+                                "glow_width" => {
+                                    data.glow_width = Some(expect_integer(&path, value)?);
+                                }
+                                "background_tint" => {
+                                    data.background_tint = Some(expect_string(&path, value)?);
+                                }
+                                "background_tint_strength" => {
+                                    data.background_tint_strength =
+                                        Some(expect_number(&path, value)?);
                                 }
                                 // `check_nested_keys` already rejected every
                                 // other field, so this arm is unreachable.

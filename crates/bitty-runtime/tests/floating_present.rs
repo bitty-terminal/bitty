@@ -447,3 +447,176 @@ fn pinned_interplay_is_unchanged_and_justified() {
         "unpin keeps the floating panel contract"
     );
 }
+
+#[test]
+fn detach_primary_owner_keeps_shell_live_on_the_float() {
+    // CodeRabbit PR #1977: detaching the primary owner must keep primary
+    // ownership on the detached float — the primary grid and PTY stay
+    // sized to its frame, so its shell stays live and typable. Moving
+    // ownership to the survivor strands the shell: focusing the float
+    // buffers input and restore never hands ownership back.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "detach keeps primary ownership on the float"
+    );
+    assert!(rt.is_primary_view(&ViewId::new(1)));
+    // Focus still re-homes onto the survivor (the float stays focusable).
+    assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+    assert!(rt.set_focus(ViewId::new(1)));
+    // The primary grid follows the detached float's frame, not the
+    // survivor's: survivors keep their own solver geometry.
+    let float_frame = frame_of(&rt, ViewId::new(1));
+    assert_eq!(rt.state().width(), usize::from(float_frame.cols));
+    assert_eq!(rt.state().height(), usize::from(float_frame.rows));
+    let survivor_alloc = rt
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == ViewId::new(2))
+        .map(|(_, rect)| rect)
+        .expect("survivor keeps a solver allocation");
+    assert_eq!(survivor_alloc, UiRect::new(0, 0, 80, 24));
+}
+
+#[test]
+fn detach_restore_cycle_returns_sane_focus_and_ownership() {
+    // The full cycle keeps one owner throughout: detach keeps ownership,
+    // restore keeps it on the re-inserted leaf with focus following.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    assert!(rt.set_focus(ViewId::new(1)));
+
+    let restored = rt
+        .float_restore(ViewId::new(1))
+        .expect("restore must apply");
+    assert_eq!(restored, ViewId::new(1));
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    // The grid re-syncs to the re-inserted tiled frame.
+    let tiled_frame = frame_of(&rt, ViewId::new(1));
+    assert_eq!(tiled_frame.tier, None);
+    assert_eq!(rt.state().width(), usize::from(tiled_frame.cols));
+    assert_eq!(rt.state().height(), usize::from(tiled_frame.rows));
+}
+
+#[test]
+fn detach_non_primary_leaves_ownership_untouched() {
+    // Detaching a leaf that does not own the primary changes nothing
+    // about ownership (no regression on the common path).
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    let restored = rt
+        .float_restore(ViewId::new(2))
+        .expect("restore must apply");
+    assert_eq!(restored, ViewId::new(2));
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+}
+
+#[test]
+fn detached_primary_float_keeps_ownership_across_switch() {
+    // The detached primary stays owned by its home slot across switches:
+    // the grid is untouched while away (owner absent from the scene, the
+    // long-standing inactive-owner precedent) and re-syncs on return.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    let home_frame = frame_of(&rt, ViewId::new(1));
+    assert_eq!(rt.state().width(), usize::from(home_frame.cols));
+
+    rt.workspace_new().expect("second workspace must open");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    assert_eq!(rt.floated_views(), Vec::<ViewId>::new());
+
+    rt.workspace_prev();
+    assert_eq!(rt.floated_views(), vec![ViewId::new(1)]);
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    let back = frame_of(&rt, ViewId::new(1));
+    assert_eq!(back.frame, home_frame.frame);
+    assert_eq!(rt.state().width(), usize::from(back.cols));
+}
+
+#[test]
+fn workspace_close_rehomes_dead_float_primary() {
+    // Closing a workspace whose detached float owned the primary re-homes
+    // ownership onto the loaded slot's focus instead of dangling.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    rt.workspace_new().expect("second workspace must open");
+
+    rt.workspace_close_at(0).expect("close must apply");
+    let owner = rt
+        .primary_view()
+        .expect("ownership re-homed, never dangling");
+    assert!(
+        rt.layout().leaf_ids().contains(&owner),
+        "re-homed owner is a live leaf"
+    );
+    assert_eq!(rt.focused_view(), Some(owner));
+}
+
+#[test]
+fn singleton_move_rehomes_doomed_float_primary() {
+    // The source layout holds a single tiled leaf while its detached float
+    // owns the primary: moving the tiled leaf out removes the source
+    // workspace and dooms the float, so the primary re-homes onto the move
+    // target instead of dangling on a dead id.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    assert!(rt.set_focus(ViewId::new(2)));
+    rt.workspace_new().expect("second workspace must open");
+    rt.workspace_prev();
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(2)]);
+    assert_eq!(rt.floated_views(), vec![ViewId::new(1)]);
+
+    let moved = rt.workspace_move_focused_to(1).expect("move must apply");
+    assert_eq!(moved, ViewId::new(2));
+    let owner = rt
+        .primary_view()
+        .expect("ownership re-homed, never dangling");
+    assert_eq!(owner, ViewId::new(2));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+    assert!(rt.floated_views().is_empty());
+}
+
+#[test]
+fn detached_primary_float_capture_waits_pending_like_pinned() {
+    // A detached float owning the primary captures a Primary attach like a
+    // pinned primary does; apply routes it to a pending respawn (the
+    // startup recipe binds the grid at the derived layout owner), never
+    // into the shared grid.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+
+    let snap = rt.capture_session_snapshot();
+    let float = &snap.workspaces[0].floats[0];
+    assert_eq!(float.view.id(), ViewId::new(1));
+    assert_eq!(float.attach, bitty_runtime::PaneAttachment::Primary);
+
+    let mut restored = make_runtime();
+    restored.set_container(UiRect::new(0, 0, 80, 24));
+    let summary = restored
+        .apply_session_snapshot(&snap)
+        .expect("captured snapshot applies");
+    assert_eq!(summary.panes, 2);
+    assert_eq!(summary.pending, 1, "the primary float waits pending");
+    assert!(restored.session_pending_contains(&ViewId::new(1)));
+    assert_eq!(restored.floated_views(), vec![ViewId::new(1)]);
+    assert_ne!(
+        restored.primary_view(),
+        Some(ViewId::new(1)),
+        "startup binds the grid at the derived layout owner"
+    );
+}

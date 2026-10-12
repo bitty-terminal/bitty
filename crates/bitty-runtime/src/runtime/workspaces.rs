@@ -509,10 +509,14 @@ impl Runtime {
         // (mirrors the fresh-pin discipline).
         self.float_offsets.remove(&id);
         // Shared post-edit fixups: focus moves off the detached leaf onto
-        // the first surviving leaf and primary-grid ownership follows (a
-        // detached leaf is no longer in any workspace layout). Like unpin,
-        // restore never hands primary ownership back: the handoff keeps it.
-        self.after_scratchpad_move(Some(id));
+        // the first surviving leaf, but primary-grid ownership stays on the
+        // detached float (CodeRabbit PR #1977): the primary grid and PTY
+        // keep sizing to its composited frame, so its shell stays live and
+        // typable while detached. Moving ownership to the survivor would
+        // strand the shell — focusing the float would buffer input, and
+        // restore never hands ownership back. Restore therefore needs no
+        // ownership change either: the cycle keeps one owner throughout.
+        self.after_leaf_parked(Some(id), false);
         Ok(())
     }
 
@@ -606,6 +610,20 @@ impl Runtime {
     /// paints nothing). Geometry, mode caches, hover dwell, and view bindings
     /// follow the cross-workspace move precedent.
     fn after_scratchpad_move(&mut self, hidden: Option<ViewId>) {
+        self.after_leaf_parked(hidden, true);
+    }
+
+    /// Shared post-edit fixups after the live layout lost or gained a leaf,
+    /// with explicit primary-ownership discipline.
+    ///
+    /// `follow_primary` moves primary-grid ownership off the parked leaf
+    /// onto the surviving focus (scratchpad and pin: a parked leaf paints
+    /// nothing there). Detached floats pass `false` (CodeRabbit PR #1977):
+    /// the parked float keeps the primary grid and PTY — it stays
+    /// composited over the scene at its own frame, so its shell stays live
+    /// and typable while detached, and the detach/restore cycle keeps one
+    /// owner throughout with no hand-back.
+    fn after_leaf_parked(&mut self, hidden: Option<ViewId>, follow_primary: bool) {
         // CTX-0334: restructuring the live tree abandons any pending hover
         // dwell, mirroring the cross-workspace move.
         self.clear_hover_pending();
@@ -615,7 +633,7 @@ impl Runtime {
                     self.focus = Focus::with_focus(first);
                 }
             }
-            if self.primary_view == Some(id) {
+            if follow_primary && self.primary_view == Some(id) {
                 self.primary_view = self.focus.focused();
             }
         }
@@ -1118,6 +1136,11 @@ impl Runtime {
     /// leaf with no shell behind it, `Runtime` construction): headless with
     /// no attach owns nothing. Time O(l) over the workspace leaves; space
     /// O(l) for the id list.
+    ///
+    /// CTX-1147: a detached float keeps primary ownership while detached
+    /// (CodeRabbit PR #1977), so detached floats count like layout leaves
+    /// here — otherwise a workspace whose only live shell sits on a float
+    /// would read idle.
     #[must_use]
     pub fn workspace_owns_primary(&self, index: usize) -> bool {
         if self.primary_spawn.is_none() {
@@ -1127,11 +1150,11 @@ impl Runtime {
             return false;
         };
         if index == self.active_workspace {
-            self.layout.leaf_ids().contains(&owner)
+            self.layout.leaf_ids().contains(&owner) || self.floats.contains(owner)
         } else {
-            self.workspaces
-                .get(index)
-                .is_some_and(|slot| slot.layout.leaf_ids().contains(&owner))
+            self.workspaces.get(index).is_some_and(|slot| {
+                slot.layout.leaf_ids().contains(&owner) || slot.floats.contains(owner)
+            })
         }
     }
 
@@ -1420,28 +1443,9 @@ impl Runtime {
         // CTX-0873: dropping to one workspace releases the bar band.
         self.refresh_chrome_band();
         // CTX-0405: removing a slot destroys every leaf it owns, including a
-        // primary owner moved into it earlier. Re-home the primary grid to
-        // the loaded slot's focused leaf so ownership never dangles on a
-        // dead id; an owner still live in another slot is preserved.
-        if let Some(owner) = self.primary_view {
-            if !self.live_view_raws().contains(&owner.0) {
-                self.primary_view = self.focus.focused();
-                // CTX-0803 (#1476): primary ownership just moved off a dead
-                // id; a selection still owned by it is dropped.
-                self.invalidate_stale_view_bindings();
-                self.sync_primary_geometry();
-                // CTX-0501: the re-homed leaf may still carry a pending
-                // restore. Primary ownership supersedes the pane spawn — the
-                // hook below skips the owner by design — so drain that
-                // history into the primary grid (parity with
-                // `rehydrate_pane`'s owner branch and the startup primary
-                // attach). Otherwise the entry lingers with no path that can
-                // ever spawn it and `session_pending_len` misreports.
-                if let Some(new_owner) = self.primary_view {
-                    let _ = self.hydrate_session_pending_for(new_owner);
-                }
-            }
-        }
+        // primary owner moved into it earlier (or a detached float primary
+        // doomed with it, CTX-1147). Re-home so ownership never dangles.
+        self.rehome_dead_primary();
         // CTX-0461 (CTX-0393 P3 follow-up): the close path installs a slot
         // exactly like a switch, so the loaded workspace's still-pending
         // leaves respawn here too (CTX-0393 P2-2 parity). Without this,
@@ -1472,6 +1476,37 @@ impl Runtime {
         }
 
         self.pending_full_redraw = true;
+    }
+
+    /// Re-home the primary grid onto the loaded slot's focused leaf when
+    /// the recorded owner died with a removed workspace.
+    ///
+    /// CTX-0405: removing a slot destroys every leaf it owns, including a
+    /// primary owner moved into it earlier — and, since CTX-1147, a
+    /// detached float primary doomed with it (singleton moves doom the
+    /// source's floats the same way closes do). An owner still live in
+    /// another slot is preserved. Shared by `remove_workspace` and the
+    /// singleton-move paths so ownership never dangles on a dead id.
+    fn rehome_dead_primary(&mut self) {
+        if let Some(owner) = self.primary_view {
+            if !self.live_view_raws().contains(&owner.0) {
+                self.primary_view = self.focus.focused();
+                // CTX-0803 (#1476): primary ownership just moved off a dead
+                // id; a selection still owned by it is dropped.
+                self.invalidate_stale_view_bindings();
+                self.sync_primary_geometry();
+                // CTX-0501: the re-homed leaf may still carry a pending
+                // restore. Primary ownership supersedes the pane spawn — the
+                // hook below skips the owner by design — so drain that
+                // history into the primary grid (parity with
+                // `rehydrate_pane`'s owner branch and the startup primary
+                // attach). Otherwise the entry lingers with no path that can
+                // ever spawn it and `session_pending_len` misreports.
+                if let Some(new_owner) = self.primary_view {
+                    let _ = self.hydrate_session_pending_for(new_owner);
+                }
+            }
+        }
     }
 
     /// Close the active workspace with the kill-confirm gate.
@@ -1820,6 +1855,10 @@ impl Runtime {
         // fresh single-leaf target tiles the full container with no ghost.
         self.active_workspace = adjusted_index;
         self.load_slot(adjusted_index);
+        // CTX-1147: a singleton removal dooms the source's detached floats
+        // with it; when the primary died there, re-home it onto the move
+        // target instead of dangling (mirrors `remove_workspace`).
+        self.rehome_dead_primary();
         self.mru_front(adjusted_index);
         // CTX-0393 P2-2 parity: the newly active target may hold pending
         // restores (a restored inactive workspace arrives without live
@@ -2013,6 +2052,10 @@ impl Runtime {
         // full container with no ghost remnant.
         self.active_workspace = new_idx;
         self.load_slot(new_idx);
+        // CTX-1147: a singleton removal dooms the source's detached floats
+        // with it; when the primary died there, re-home it onto the new
+        // slot instead of dangling (mirrors `remove_workspace`).
+        self.rehome_dead_primary();
         self.mru_front(new_idx);
         self.spawn_session_pending_for_active();
         self.refresh_chrome_band();

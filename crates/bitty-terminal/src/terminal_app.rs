@@ -1259,6 +1259,14 @@ impl TerminalApp {
         // observations on the cold tick path so session end is observable
         // without polling.
         self.deliver_overlay_released();
+        // CTX-1170 (issue #1972): deliver the `overlay.input.available`
+        // pump nudge on the same cold path when a live capture owner has
+        // undrained queued input, so buffer arrival repaints the modal
+        // without polling. Ordered after `overlay.released`: a session end
+        // is always observable before any new-session data nudge, and a
+        // release clears its queue, so the nudge can never name a dead
+        // session.
+        self.deliver_overlay_input_available();
         self.update_plugin_overlay();
         // CTX-0943 + #1759/#1760: while a focusable overlay capture holds,
         // suppress underlying hyperlink hover affordances (the modal owns
@@ -1644,6 +1652,39 @@ impl TerminalApp {
             ]);
             plugin_runtime.deliver_event("overlay.released", &payload);
         }
+    }
+
+    /// Deliver the `overlay.input.available` pump nudge (CTX-1170, #1972).
+    ///
+    /// Called on the application tick right after
+    /// [`Self::deliver_overlay_released`]: when a live capture owner has
+    /// undrained queued input, one observation-only event with payload
+    /// `{ owner, queued }` tells the owner to drain through
+    /// `ui.overlay.poll` and repaint. Level-triggered and bounded: at most
+    /// one event per tick no matter how deep the queue is, on the cold tick
+    /// path only — never on the input hot path (`P0-AC-015`). The snapshot
+    /// borrow is released before delivery, so an owner handler that
+    /// re-enters through `poll` cannot alias it. No-op without a plugin
+    /// runtime, with no live owner, or with an empty queue.
+    fn deliver_overlay_input_available(&mut self) {
+        let pending = self
+            .plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.overlay_capture().borrow().input_available());
+        let Some((owner, queued)) = pending else {
+            return;
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let payload = LuaValue::table([
+            ("owner", LuaValue::String(owner)),
+            (
+                "queued",
+                LuaValue::Integer(i64::try_from(queued).unwrap_or(i64::MAX)),
+            ),
+        ]);
+        plugin_runtime.deliver_event("overlay.input.available", &payload);
     }
 
     /// Enforce the 30s transient timeout (contract idle timeout). No-op

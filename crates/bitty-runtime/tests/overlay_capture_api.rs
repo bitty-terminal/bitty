@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use bitty_lua::{HostServices, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
+    LifecycleState, PluginRuntime, PluginRuntimeConfig, PluginRuntimeError, SettingsSource,
+    SnapshotSource,
 };
 use std::collections::BTreeMap;
 
@@ -835,4 +836,155 @@ fn overlay_focus_denied_without_grant_v1_slot_unaffected() {
         !fixture.runtime.overlay_capture().borrow().is_active(),
         "denied acquire starts no session"
     );
+}
+
+/// Buffer arrival is observable without polling: while a live capture owner
+/// has undrained queued input, the cold-tick pump nudge
+/// `overlay.input.available` carries `{ owner, queued }` (no input bytes),
+/// and a drained queue reports nothing on the next tick.
+#[test]
+fn overlay_input_available_nudge_observed_with_owner_and_depth() {
+    let mut holder = Fixture::activate_full(
+        "avail-holder",
+        "bitty-featured.uiavailholder",
+        FOCUS_GRANTS,
+        &["probe"],
+        &[],
+        r#"
+        bitty.commands.register({
+          id = "probe",
+          title = "Probe",
+          run = function(key)
+            local h = bitty.ui.overlay.acquire({ title = "Test" })
+            bitty.store.set(key .. "_handle", h)
+            return true
+          end,
+        })
+        return {}
+        "#,
+    );
+    // A second plugin in the same runtime subscribes to the pump nudge and
+    // records the observed envelope. Observation needs no capture grant.
+    let watcher = "bitty-featured.uiavailwatcher";
+    write_plugin(
+        &holder.root,
+        watcher,
+        &[],
+        &[],
+        &["overlay.input.available"],
+        "^1.0",
+        r#"
+        bitty.events.subscribe("overlay.input.available", function(envelope)
+          bitty.store.set("kind", envelope.kind)
+          bitty.store.set("owner", envelope.payload.owner)
+          bitty.store.set("queued", envelope.payload.queued)
+        end)
+        return {}
+        "#,
+    );
+    holder.runtime.discover();
+    let watcher_id = plugin_id(watcher);
+    let report = holder
+        .runtime
+        .activate(&watcher_id)
+        .expect("watcher activates");
+    assert_eq!(report.state, LifecycleState::Active);
+    holder
+        .runtime
+        .dispatch_command(&holder.id, "probe", &[LuaValue::String("x".to_string())])
+        .expect("dispatch");
+    assert!(
+        holder.runtime.push_overlay_input("key", "h"),
+        "capture holds, input queues"
+    );
+    assert!(holder.runtime.push_overlay_input("text", "i"));
+    // Mimic the application tick: snapshot the live owner plus depth, then
+    // deliver exactly one observation on the cold path.
+    let pending = holder.runtime.overlay_capture().borrow().input_available();
+    assert_eq!(
+        pending,
+        Some((holder.id.as_str().to_string(), 2)),
+        "snapshot names the live owner and the queued depth"
+    );
+    let (owner, queued) = pending.expect("pending input");
+    let payload = LuaValue::table([
+        ("owner", LuaValue::String(owner.clone())),
+        (
+            "queued",
+            LuaValue::Integer(i64::try_from(queued).unwrap_or(i64::MAX)),
+        ),
+    ]);
+    let delivered = holder
+        .runtime
+        .deliver_event("overlay.input.available", &payload);
+    assert_eq!(delivered, 1, "exactly the subscriber observes the nudge");
+    assert_eq!(
+        store_value(&holder.runtime, &watcher_id, "kind"),
+        Some(LuaValue::String("overlay.input.available".to_string()))
+    );
+    assert_eq!(
+        store_value(&holder.runtime, &watcher_id, "owner"),
+        Some(LuaValue::String(holder.id.as_str().to_string()))
+    );
+    assert_eq!(
+        store_value(&holder.runtime, &watcher_id, "queued"),
+        Some(LuaValue::Integer(2))
+    );
+    // The owner drains through poll on its own path; the next tick reports
+    // nothing, so no second nudge fires for a drained queue.
+    let handle = match store_value(&holder.runtime, &holder.id, "x_handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("probe must store a numeric handle, got {other:?}"),
+    };
+    let services = holder
+        .runtime
+        .services(&holder.id)
+        .expect("services")
+        .clone();
+    let poll = services
+        .ui_overlay_poll_detailed(handle, 8)
+        .expect("owned poll");
+    assert!(poll.active);
+    assert_eq!(poll.events.len(), 2);
+    assert_eq!(
+        holder.runtime.overlay_capture().borrow().input_available(),
+        None,
+        "a drained queue reports nothing on the next tick"
+    );
+}
+
+/// Declared-kind gating: subscribing to `overlay.input.available` without a
+/// manifest `lazy.events` declaration fails activation fail-closed, so an
+/// undeclared observer can never silently tap the pump.
+#[test]
+fn overlay_input_available_requires_manifest_declaration() {
+    let root = temp_dir("avail-declare-root");
+    let data = temp_dir("avail-declare-data");
+    let id = "bitty-featured.uiavailundeclared";
+    write_plugin(
+        &root,
+        id,
+        &[],
+        &[],
+        &[],
+        "^1.0",
+        r#"
+        bitty.events.subscribe("overlay.input.available", function(_envelope)
+        end)
+        return {}
+        "#,
+    );
+    let mut rt = runtime(vec![root.clone()], data.clone());
+    rt.discover();
+    let pid = plugin_id(id);
+    let error = rt.activate(&pid).expect_err("undeclared kind must fail");
+    match error {
+        PluginRuntimeError::Capture { detail, .. } => assert!(
+            detail.contains("overlay.input.available") && detail.contains("not declared"),
+            "denial names the kind and the missing declaration: {detail}"
+        ),
+        other => panic!("undeclared subscribe must fail capture validation, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
 }

@@ -3130,13 +3130,8 @@ impl Runtime {
             if row >= frame.rows {
                 continue;
             }
-            // Width in cells (char count, not bytes), clipped to the frame.
-            let text_cells = text_line
-                .chars()
-                .count()
-                .min(usize::from(frame.cols))
-                .max(1);
-            let clipped: String = text_line.chars().take(text_cells).collect();
+            // Width in display cells (wide glyphs count 2), clipped to the frame.
+            let (clipped, text_cells) = clip_to_width_cells(text_line, frame.cols);
             // Center the pill in the focused frame on its row.
             let pill_w = px_span_usize(text_cells, live.width);
             let origin_px_x = px_add(
@@ -4502,5 +4497,50 @@ mod selection_window_clip_tests {
         let (start, end) = (CellPos::new(0, 0), CellPos::new(1, 1));
         assert_eq!(clip_span_to_window(start, end, 0, 0, COLS), None);
         assert_eq!(clip_span_to_window(start, end, 0, ROWS, 0), None);
+    }
+}
+
+/// Clip a scene row to a frame width in display cells (wide glyphs count 2).
+///
+/// Returns the clipped string plus its display width (minimum 1, matching the
+/// pill-width floor). A wide glyph straddling the limit is dropped whole so a
+/// pill never claims a half cell.
+fn clip_to_width_cells(text: &str, cols: u16) -> (String, usize) {
+    let mut width = 0usize;
+    let mut clipped = String::new();
+    for c in text.chars() {
+        let w = usize::from(bitty_term_state::char_cell_width(c));
+        if width + w > usize::from(cols) {
+            break;
+        }
+        width += w;
+        clipped.push(c);
+    }
+    (clipped, width.max(1))
+}
+
+#[cfg(test)]
+mod clip_width_cells_tests {
+    use super::clip_to_width_cells;
+
+    #[test]
+    fn ascii_counts_one_cell_each() {
+        assert_eq!(clip_to_width_cells("hi", 10), ("hi".to_string(), 2));
+        assert_eq!(clip_to_width_cells("abcdef", 4), ("abcd".to_string(), 4));
+    }
+
+    #[test]
+    fn cjk_counts_two_cells_each() {
+        assert_eq!(clip_to_width_cells("界界", 10), ("界界".to_string(), 4));
+    }
+
+    #[test]
+    fn straddling_wide_glyph_drops_whole() {
+        assert_eq!(clip_to_width_cells("a界", 2), ("a".to_string(), 1));
+    }
+
+    #[test]
+    fn empty_keeps_unit_floor() {
+        assert_eq!(clip_to_width_cells("", 10), (String::new(), 1));
     }
 }

@@ -824,9 +824,10 @@ impl Runtime {
                 .animation_progress(AnimationKind::Drag, Some(source), now)
                 .is_none()
             && self.trigger_animation(AnimationKind::Drag, Some(source), now)
-            && let Some(drag) = self.tiled_drag.as_mut()
         {
-            drag.source_armed = true;
+            if let Some(drag) = self.tiled_drag.as_mut() {
+                drag.source_armed = true;
+            }
         }
         match target {
             Some(hovered) if target_held != Some(hovered) => {
@@ -834,9 +835,10 @@ impl Runtime {
                     .animation_progress(AnimationKind::Drag, Some(hovered), now)
                     .is_none()
                     && self.trigger_animation(AnimationKind::Drag, Some(hovered), now)
-                    && let Some(drag) = self.tiled_drag.as_mut()
                 {
-                    drag.armed_target = Some(hovered);
+                    if let Some(drag) = self.tiled_drag.as_mut() {
+                        drag.armed_target = Some(hovered);
+                    }
                 }
             }
             None if target_held.is_some() => {

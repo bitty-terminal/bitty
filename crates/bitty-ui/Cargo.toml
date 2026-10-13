@@ -15,10 +15,6 @@ workspace = true
 
 [dependencies]
 bitty-term-state = { version = "0.0.22", path = "../bitty-term-state" }
-# CTX-1176: SnapshotHost seam owns snapshot semantics; Core implements the
-# host side only. `version` satisfies `cargo publish`; the git rev stays the
-# build source until bitty-a11y lands on crates.io.
-bitty-a11y = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-a11y", rev = "206b3bc" }
 
 
 [dev-dependencies]

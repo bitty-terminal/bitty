@@ -24,7 +24,7 @@
 //!   bumps only on structural change, and the report carries the
 //!   invalidation set ([`UiChange`]) for layout, hit-test, and paint.
 //! - [`a11y_role_of`] — the accessibility mapping for every primitive,
-//!   returning the extension [`Role`](bitty_a11y::Role) vocabulary so no
+//!   reusing the crate [`A11yRole`](crate::a11y::A11yRole) vocabulary so no
 //!   second role table is introduced.
 //!
 //! Relationship to the accepted Rich `Scene`/`SceneNode` model: this tree
@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use bitty_a11y::Role;
+use crate::a11y::A11yRole;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -642,20 +642,20 @@ impl UiTree {
 
 /// Maps a primitive to its accessible role.
 ///
-/// Total: every [`UiNodeKind`] maps, reusing the extension [`Role`]
-/// vocabulary owned by `bitty-a11y`. Interactive semantics stay disciplined
-/// — `TextInput` exposes `input`; no primitive guesses a button role.
-/// Visual styling is free; this mapping is the fixed semantic half.
+/// Total: every [`UiNodeKind`] maps, reusing the crate [`A11yRole`]
+/// vocabulary. Interactive semantics stay disciplined — `TextInput`
+/// exposes `input`; no primitive guesses a button role. Visual styling is
+/// free; this mapping is the fixed semantic half.
 #[must_use]
-pub fn a11y_role_of(kind: &UiNodeKind) -> Role {
+pub fn a11y_role_of(kind: &UiNodeKind) -> A11yRole {
     match kind {
         UiNodeKind::Box | UiNodeKind::ScrollView | UiNodeKind::Canvas | UiNodeKind::Overlay => {
-            Role::Group
+            A11yRole::Group
         }
-        UiNodeKind::Text(_) | UiNodeKind::Terminal => Role::Text,
-        UiNodeKind::Image => Role::Image,
-        UiNodeKind::VirtualList => Role::List,
-        UiNodeKind::TextInput { .. } => Role::Input,
+        UiNodeKind::Text(_) | UiNodeKind::Terminal => A11yRole::Text,
+        UiNodeKind::Image => A11yRole::Image,
+        UiNodeKind::VirtualList => A11yRole::List,
+        UiNodeKind::TextInput { .. } => A11yRole::Input,
     }
 }
 
@@ -830,15 +830,15 @@ mod tests {
         for kind in &kinds {
             let _ = a11y_role_of(kind);
         }
-        assert_eq!(a11y_role_of(&UiNodeKind::Terminal), Role::Text);
+        assert_eq!(a11y_role_of(&UiNodeKind::Terminal), A11yRole::Text);
         assert_eq!(
             a11y_role_of(&UiNodeKind::TextInput {
                 value: String::new(),
                 placeholder: String::new(),
             }),
-            Role::Input
+            A11yRole::Input
         );
-        assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), Role::List);
+        assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), A11yRole::List);
     }
 
     #[test]

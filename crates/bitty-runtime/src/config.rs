@@ -420,11 +420,13 @@ pub struct RuntimeViewBackground {
 /// fade) pass through unchanged for every `View`: no selector can supply
 /// them.
 ///
-/// Accepted-but-inert in S2: resolved, carried on
-/// [`PresentFrame`](crate::runtime::PresentFrame), and reported with no
-/// render effect until S3 (no present-path consumer reads this value).
-/// Presentation-only: never participates in cell geometry, hit testing,
-/// selection, or Terminal Truth.
+/// Consumed by the S3 present path (CTX-1162): resolved, carried on
+/// [`PresentFrame`](crate::runtime::PresentFrame), and painted as
+/// glow/shadow/tint/fade. Presentation-only: never participates in cell
+/// geometry, hit testing, selection, or Terminal Truth.
+///
+/// S4 seam: follow-up fx verbs read this RESOLVED per-`View` value (never
+/// config leaves directly) and supply only the target id.
 ///
 /// `PartialEq` only: the strength/fade leaves are floats.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -463,6 +465,65 @@ impl Default for RuntimeViewStyle {
 }
 
 impl RuntimeViewStyle {
+    /// Whether every leaf is at its inert default (contributes no paint).
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Resolved global chrome style, adopted live as one value (CTX-1162 S3,
+/// DEC-0111 section 4 as corrected by DEC-0113).
+///
+/// The eight global-only style leaves: glow/shadow/fade from
+/// `appearance.style` plus the `decoration` tint pair. The per-`View`
+/// glow/tint quartet rides [`ViewAppearanceRule`] instead (adopted through
+/// `set_background_appearance`); this value carries only the globals that
+/// [`Runtime::set_chrome_style`](crate::Runtime::set_chrome_style) adopts.
+/// Presentation-only paint state: never participates in cell geometry, hit
+/// testing, selection, or Terminal Truth.
+///
+/// `PartialEq` only: the strength/fade leaves are floats. This is also the
+/// S4 seam: follow-up fx verbs read these RESOLVED values (plus the
+/// `AnimationPolicy` and the shared animation-budget cap) and supply only
+/// the target id — verbs never carry timing, geometry, colors, or curves.
+/// No new render primitive or shader is admitted through this seam.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChromeStyle {
+    /// Global glow halo color (`None` = no glow contribution).
+    pub glow_color: Option<bitty_render::grid::Rgba8>,
+    /// Global glow halo width in logical px (`0` = no halo).
+    pub glow_width: u32,
+    /// Global drop-shadow color (`None` = no shadow).
+    pub shadow_color: Option<bitty_render::grid::Rgba8>,
+    /// Global drop-shadow horizontal offset in logical px.
+    pub shadow_offset_x: i32,
+    /// Global drop-shadow vertical offset in logical px.
+    pub shadow_offset_y: i32,
+    /// Global inactive-`View` dim factor (`1.0` = no fade).
+    pub fade_unfocused: f32,
+    /// Global background tint color (`None` = no tint).
+    pub background_tint: Option<bitty_render::grid::Rgba8>,
+    /// Global background tint strength (`0.0` = no tint).
+    pub background_tint_strength: f32,
+}
+
+impl Default for ChromeStyle {
+    fn default() -> Self {
+        Self {
+            glow_color: None,
+            glow_width: DEFAULT_STYLE_GLOW_WIDTH,
+            shadow_color: None,
+            shadow_offset_x: DEFAULT_STYLE_SHADOW_OFFSET,
+            shadow_offset_y: DEFAULT_STYLE_SHADOW_OFFSET,
+            fade_unfocused: DEFAULT_STYLE_FADE_UNFOCUSED,
+            background_tint: None,
+            background_tint_strength: DEFAULT_STYLE_TINT_STRENGTH,
+        }
+    }
+}
+
+impl ChromeStyle {
     /// Whether every leaf is at its inert default (contributes no paint).
     #[must_use]
     pub fn is_inert(&self) -> bool {
@@ -862,22 +923,23 @@ pub struct RuntimeConfig {
     pub background_image_roots: Vec<String>,
     /// Global chrome-style glow halo color (CTX-1161 S2
     /// `appearance.style.glow_color`). `None` means no glow contribution
-    /// unless a `views` rule sets one. Accepted-but-inert in S2: carried
-    /// with no render effect until S3.
+    /// unless a `views` rule sets one. Consumed by the S3 present path
+    /// (`push_leaf_glow`); adopted live by `set_chrome_style`.
     pub style_glow_color: Option<bitty_render::grid::Rgba8>,
     /// Global chrome-style glow halo width in logical px (CTX-1161 S2
     /// `appearance.style.glow_width`), `0..=16`
     /// ([`MAX_STYLE_GLOW_WIDTH_PX`]); default [`DEFAULT_STYLE_GLOW_WIDTH`]
-    /// (`0` = no halo). Accepted-but-inert in S2.
+    /// (`0` = no halo). Consumed by the S3 present path.
     pub style_glow_width: u32,
     /// Global chrome-style drop-shadow color (CTX-1161 S2
     /// `appearance.style.shadow_color`). `None` means no shadow.
-    /// Global-only: no `views` rule can supply it. Accepted-but-inert in S2.
+    /// Global-only: no `views` rule can supply it. Consumed by the S3
+    /// present path (`push_leaf_shadow`).
     pub style_shadow_color: Option<bitty_render::grid::Rgba8>,
     /// Global drop-shadow horizontal offset in logical px (CTX-1161 S2
     /// `appearance.style.shadow_offset_x`), `-8..=8`
     /// ([`MAX_STYLE_SHADOW_OFFSET_PX`]); default
-    /// [`DEFAULT_STYLE_SHADOW_OFFSET`]. Global-only, accepted-but-inert.
+    /// [`DEFAULT_STYLE_SHADOW_OFFSET`]. Global-only, consumed by S3.
     pub style_shadow_offset_x: i32,
     /// Global drop-shadow vertical offset in logical px; see
     /// [`Self::style_shadow_offset_x`].
@@ -885,16 +947,16 @@ pub struct RuntimeConfig {
     /// Global inactive-`View` dim factor (CTX-1161 S2
     /// `appearance.style.fade_unfocused`), finite within `[0.0, 1.0]`;
     /// default [`DEFAULT_STYLE_FADE_UNFOCUSED`] (`1.0` = no fade).
-    /// Global-only, accepted-but-inert in S2.
+    /// Global-only, consumed by the S3 present path (unfocused-leaf fade).
     pub style_fade_unfocused: f32,
     /// Global background tint color (CTX-1161 S2
     /// `decoration.background_tint`). `None` means no tint unless a `views`
-    /// rule sets one. Accepted-but-inert in S2.
+    /// rule sets one. Consumed by the S3 present path (per-`View` blits).
     pub background_tint: Option<bitty_render::grid::Rgba8>,
     /// Global background tint strength (CTX-1161 S2
     /// `decoration.background_tint_strength`), finite within `[0.0, 1.0]`;
     /// default [`DEFAULT_STYLE_TINT_STRENGTH`] (`0.0` = no tint).
-    /// Accepted-but-inert in S2.
+    /// Consumed by the S3 present path.
     pub background_tint_strength: f32,
     /// Window background-image path (CTX-1076, issue #1815
     /// `window.background_image`). `None` means no window image (the
@@ -1363,9 +1425,10 @@ impl RuntimeConfig {
             }
         }
         // CTX-1161 S2: the global style surface repeats the accepted bounds
-        // fail-closed; nothing is clamped. The present path does not consume
-        // these values yet (accepted-but-inert), so this is the boundary lock
-        // for direct `RuntimeConfig` construction and the app-layer mapping.
+        // fail-closed; nothing is clamped. This is the boundary lock for
+        // direct `RuntimeConfig` construction, the app-layer mapping, and
+        // the `set_chrome_style` live adopter (CTX-1162 S3 mirrors these
+        // bounds before mutating).
         if self.style_glow_width > MAX_STYLE_GLOW_WIDTH_PX {
             return Err(RuntimeError::InvalidConfig(
                 "style glow width must be within [0, 16] logical pixels",
@@ -1525,9 +1588,9 @@ impl RuntimeConfig {
     /// caller derives from its public layout state. The global-only leaves
     /// (shadow, fade) pass through unchanged: no selector can supply them.
     ///
-    /// Accepted-but-inert in S2: the returned value is stored on
-    /// [`PresentFrame`](crate::runtime::PresentFrame) with no present-path
-    /// consumer until S3.
+    /// Consumed by the S3 present path (CTX-1162): the returned value is
+    /// stored on [`PresentFrame`](crate::runtime::PresentFrame) and painted
+    /// as glow/shadow/tint/fade.
     #[must_use]
     pub fn resolve_view_style(&self, target: &RuntimeViewTarget) -> RuntimeViewStyle {
         self.resolve_view_style_traced(target).0
@@ -1605,6 +1668,26 @@ impl RuntimeConfig {
             },
             sources,
         )
+    }
+
+    /// Current global chrome style as one live-adoptable value (CTX-1162 S3).
+    ///
+    /// Reads the eight global-only style leaves verbatim (no `views`
+    /// resolution: selectors cannot supply globals). Powers the
+    /// `set_chrome_style` idempotence check and the app-layer reload mapping
+    /// so both compare one value, not eight fields.
+    #[must_use]
+    pub fn chrome_style(&self) -> ChromeStyle {
+        ChromeStyle {
+            glow_color: self.style_glow_color,
+            glow_width: self.style_glow_width,
+            shadow_color: self.style_shadow_color,
+            shadow_offset_x: self.style_shadow_offset_x,
+            shadow_offset_y: self.style_shadow_offset_y,
+            fade_unfocused: self.style_fade_unfocused,
+            background_tint: self.background_tint,
+            background_tint_strength: self.background_tint_strength,
+        }
     }
 
     /// [`Self::resolve_view_outline`] plus the winning rule per resolved

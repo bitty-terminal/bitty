@@ -105,8 +105,9 @@ fn clamp_frame_axis(offset_px: f64, cell_px: f64, max: i64) -> u16 {
 ///
 /// CTX-1161 S2: `style` carries the resolved per-`View` chrome style
 /// (populated at present build via [`Runtime::view_style_for`]).
-/// Accepted-but-inert: no present-path consumer reads it until S3, so styled
-/// and unstyled configs present byte-identical frames.
+/// Consumed by the S3 present path (CTX-1162): glow/shadow/tint/fade paint
+/// from this value, so styled configs diverge from unstyled ones exactly by
+/// their style contribution.
 ///
 /// `PartialEq` only: the carried style holds float leaves.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -389,9 +390,9 @@ impl Runtime {
     /// Uses exactly the same public layout state as [`Self::view_outline_for`]
     /// (stable `ViewId`, active workspace label, content kind).
     /// Presentation-only: no terminal truth is read or mutated.
-    /// Accepted-but-inert in S2: the value is stored on
-    /// [`PresentFrame`](crate::runtime::PresentFrame) at present build with
-    /// no present-path consumer until S3.
+    /// Consumed by the S3 present path: the value is stored on
+    /// [`PresentFrame`](crate::runtime::PresentFrame) at present build and
+    /// painted as glow/shadow/tint/fade.
     #[must_use]
     pub(crate) fn view_style_for(&self, view_id: ViewId) -> crate::config::RuntimeViewStyle {
         let content = self.view_content_kind(view_id);
@@ -1238,7 +1239,7 @@ impl Runtime {
                     radius: dv.radius,
                     tier,
                     // CTX-1161 S2: resolved per-`View` chrome style, stored
-                    // with no present-path consumer until S3 (inert carry).
+                    // for the S3 present path (glow/shadow/tint/fade).
                     style: self.view_style_for(view),
                 }
             })

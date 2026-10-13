@@ -1511,7 +1511,7 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         // pair) onto the runtime config. Bounds were already enforced
         // fail-closed in `bitty-config`; `RuntimeConfig::validate` mirrors
         // them so a direct construction cannot arm an unbounded value.
-        // Accepted-but-inert: stored with no render effect until S3.
+        // Consumed by the S3 present path (CTX-1162).
         let empty_style = bitty_config::StyleConfig::default();
         let global_style = effective.appearance.style.as_ref().unwrap_or(&empty_style);
         cfg.style_glow_color = global_style.glow_color.map(|c| c.0);

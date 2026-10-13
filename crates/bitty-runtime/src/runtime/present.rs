@@ -229,6 +229,12 @@ pub(super) struct PresentedLeaf {
     /// Scroll offset the list was rendered at. A mismatch forces a fresh
     /// leaf render (scrollback composites a different cell window).
     pub(super) scroll_offset: usize,
+    /// Inactive-`View` fade factor applied to the stored fills/glyphs
+    /// (CTX-1162 S3). A mismatch forces a fresh leaf render: the retained
+    /// list carries baked alpha, so a focus flip or a `fade_unfocused`
+    /// live-adopt must never reuse a stale factor (DEC-0113 Fix 2a,
+    /// bounded to the visible leaf set).
+    pub(super) fade_factor: f32,
     /// Complete translated cell fills.
     pub(super) fills: Vec<bitty_render::grid::FillRect>,
     /// Complete translated glyph instances (inner-arc clip attached).
@@ -559,6 +565,7 @@ impl Runtime {
         frame: &layout_focus::PresentFrame,
         view_id: ViewId,
         open_factor: f32,
+        fade: f32,
         ctx: &RingFrameContext,
         combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
     ) -> (Option<bitty_render::grid::RoundedClip>, bool) {
@@ -646,9 +653,15 @@ impl Runtime {
                     .fx_progress(view_id, ctx.now)
                     .map(|p| p.clamp(0.0, 1.0))
                     .unwrap_or(1.0);
+                // CTX-1162 S3: unfocused leaves dim their Core-owned chrome
+                // with the same fade factor the fills/glyphs below carry, so
+                // the ring never stays bright on a faded pane. The focused
+                // leaf reads exactly `1.0` (no-op fast path). `fade` is
+                // computed once per leaf by the caller so the gate, the
+                // stored alpha, and the chrome agree bit-for-bit.
                 let ring_color = bitty_render::grid::scale_alpha(
                     animated_color,
-                    open_factor * ctx.workspace_factor * motion_factor * fx_factor,
+                    open_factor * ctx.workspace_factor * motion_factor * fx_factor * fade,
                 );
                 combined_rounded.push(bitty_render::grid::RoundedFill {
                     frame: ring_frame,
@@ -665,6 +678,173 @@ impl Runtime {
                 bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
         }
         (frame_clip, painted)
+    }
+
+    /// Inactive-`View` fade factor for one leaf (CTX-1162 S3, DEC-0111
+    /// section 4 as corrected by DEC-0113 Fix 2).
+    ///
+    /// The focused leaf always reads `1.0` (no fade). An unfocused leaf reads
+    /// the global `fade_unfocused`, animated through the EXISTING
+    /// `animation_progress(Focus)` value armed on the newly focused view when
+    /// it animates — so the fade obeys the accepted RFC-0002
+    /// durations/easings/reduced-motion/safe gates with zero new
+    /// `AnimationKind` — and the committed factor otherwise (instant policies
+    /// and the steady state snap to the end value). Sanitized
+    /// (non-finite reads as opaque) so a directly constructed config can
+    /// never poison the retained alpha.
+    fn leaf_fade_factor(&self, is_focused_view: bool, now: std::time::Instant) -> f32 {
+        if is_focused_view {
+            return 1.0;
+        }
+        let fade = self.config.style_fade_unfocused;
+        if !fade.is_finite() {
+            return 1.0;
+        }
+        let fade = fade.clamp(0.0, 1.0);
+        if fade >= 1.0 {
+            return 1.0;
+        }
+        // The fade animates with the focus transition armed on the newly
+        // focused view: at flip instant its progress is `0.0` (the leaf that
+        // just lost focus starts bright) and it settles at the committed
+        // factor as the ring cross-fades in.
+        let progress = self
+            .focus
+            .focused()
+            .and_then(|focused| self.animation_progress(AnimationKind::Focus, Some(focused), now));
+        match progress {
+            Some(p) => 1.0 + (fade - 1.0) * p.clamp(0.0, 1.0),
+            None => fade,
+        }
+    }
+
+    /// Pushes the Core-owned drop shadow for one leaf (CTX-1162 S3, DEC-0113
+    /// Fix 1).
+    ///
+    /// The shadow is one `RoundedFill { border: 0 }` (the solid rounded-rect
+    /// SDF path, shared with the glow halo and the ring — zero new
+    /// primitives, zero new shaders) at
+    /// `(frame.x + shadow_offset_x, frame.y + shadow_offset_y)` with the
+    /// frame's outer radius, so it inherits corner-correct AA instead of a
+    /// square `FillRect` overhang. Painted FIRST in the leaf's
+    /// `combined.rounded` order (shadow, then glow, then ring,
+    /// back-to-front); cell fills composite beneath while glyphs and
+    /// background blits composite above. Paint-only:
+    /// cell metrics, insets, and clip rects are untouched. Returns whether a
+    /// shadow was pushed. An unset shadow color pushes nothing, so unstyled
+    /// configs present exactly as before.
+    fn push_leaf_shadow(
+        &self,
+        frame: &layout_focus::PresentFrame,
+        open_factor: f32,
+        fade: f32,
+        ctx: &RingFrameContext,
+        combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+    ) -> bool {
+        let Some(shadow_color) = frame.style.shadow_color else {
+            return false;
+        };
+        if frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        let color = bitty_render::grid::scale_alpha(
+            shadow_color,
+            open_factor * ctx.workspace_factor * fade,
+        );
+        let shadow_frame = bitty_render::geometry::RectPx::new(
+            px_add(
+                px_add(ctx.pad_px, frame.frame.x),
+                self.style_offset_physical(frame.style.shadow_offset_x),
+            ),
+            px_add(
+                px_add(ctx.pad_px, frame.frame.y),
+                self.style_offset_physical(frame.style.shadow_offset_y),
+            ),
+            frame.frame.width,
+            frame.frame.height,
+        );
+        combined_rounded.push(bitty_render::grid::RoundedFill {
+            frame: shadow_frame,
+            border: 0,
+            radius: frame.radius,
+            color,
+        });
+        true
+    }
+
+    /// Pushes the Core-owned glow halo for one leaf (CTX-1162 S3, DEC-0111
+    /// section 4).
+    ///
+    /// The halo is one `RoundedFill { border: 0 }` (same struct, same SDF
+    /// shader as the shadow and the ring) sized `frame + glow_width` per
+    /// side with a concentric radius (square frames stay square), painted
+    /// after the shadow and before the ring. Same factor chain as the ring
+    /// (open, workspace, motion, fx) plus the unfocused fade. Paint-only:
+    /// cell metrics, insets, and clip rects are untouched. Returns whether a
+    /// halo was pushed. An unset glow color or a zero width pushes nothing,
+    /// so unstyled configs present exactly as before.
+    fn push_leaf_glow(
+        &self,
+        frame: &layout_focus::PresentFrame,
+        view_id: ViewId,
+        open_factor: f32,
+        fade: f32,
+        ctx: &RingFrameContext,
+        combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+    ) -> bool {
+        let Some(glow_color) = frame.style.glow_color else {
+            return false;
+        };
+        if frame.style.glow_width == 0 || frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        // The halo width scales at the live DPI factor exactly like the ring
+        // width; `0` logical stays `0` (no halo from rounding).
+        let halo = self.outline_width_physical(frame.style.glow_width);
+        if halo == 0 {
+            return false;
+        }
+        let mut motion_factor = 1.0f32;
+        for kind in [
+            AnimationKind::Move,
+            AnimationKind::Resize,
+            AnimationKind::Drag,
+        ] {
+            let per_leaf = self.animation_progress(kind, Some(view_id), ctx.now);
+            let global = self.animation_progress(kind, None, ctx.now);
+            if let Some(p) = per_leaf.or(global) {
+                motion_factor *= p.clamp(0.0, 1.0);
+            }
+        }
+        let fx_factor = self
+            .fx_progress(view_id, ctx.now)
+            .map(|p| p.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        let color = bitty_render::grid::scale_alpha(
+            glow_color,
+            open_factor * ctx.workspace_factor * motion_factor * fx_factor * fade,
+        );
+        let pad = u32::from(halo);
+        let glow_frame = bitty_render::geometry::RectPx::new(
+            px_add(ctx.pad_px, frame.frame.x).saturating_sub(i32::from(halo)),
+            px_add(ctx.pad_px, frame.frame.y).saturating_sub(i32::from(halo)),
+            frame.frame.width.saturating_add(pad.saturating_mul(2)),
+            frame.frame.height.saturating_add(pad.saturating_mul(2)),
+        );
+        // Concentric halo: the radius grows with the inflation so the band
+        // stays uniform; square frames (`radius == 0`) stay square.
+        let radius = if frame.radius == 0 {
+            0
+        } else {
+            frame.radius.saturating_add(halo)
+        };
+        combined_rounded.push(bitty_render::grid::RoundedFill {
+            frame: glow_frame,
+            border: 0,
+            radius,
+            color,
+        });
+        true
     }
 
     /// Repaints the focused cursor from live state without building a
@@ -1347,6 +1527,14 @@ impl Runtime {
                 let damage_evicted = origin_gen.saturating_sub(origin_last)
                     > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
                 let leaf_damaged = !leaf_damage.is_empty() || damage_evicted;
+                // CTX-1162 S3 (DEC-0113 Fix 2a): the leaf fade factor gates
+                // retained reuse. The stored fills/glyphs carry baked alpha,
+                // so a factor change (focus flip, `fade_unfocused`
+                // live-adopt, workspace switch) re-renders even when origin
+                // and scroll offset match. Bounded: at most the visible leaf
+                // set. The factor is computed once here so the gate, the
+                // stored alpha, and the chrome below agree bit-for-bit.
+                let fade = self.leaf_fade_factor(ring_ctx.focused_id == Some(view_id), now);
                 let reuse = !full_frame
                     && !leaf_damaged
                     && self
@@ -1356,13 +1544,32 @@ impl Runtime {
                             leaf.origin == (frame.content.x, frame.content.y)
                                 && leaf.scroll_offset
                                     == view.map(|v| v.scroll_offset()).unwrap_or(0)
+                                && leaf.fade_factor == fade
                         });
 
-                // CTX-0311 ring: shared by the reuse and re-render paths so a
-                // retained leaf still paints its live focus/open outline.
-                let (frame_clip, ring_painted) =
-                    self.push_leaf_ring(frame, view_id, open_factor, &ring_ctx, &mut built.rounded);
-                built.needs_draw |= ring_painted;
+                // CTX-0311 ring (+ CTX-1162 S3 shadow/glow): shared by the
+                // reuse and re-render paths so a retained leaf still paints
+                // its live focus/open chrome. Back-to-front in
+                // `combined.rounded`: shadow, then glow, then ring.
+                let shadow_painted =
+                    self.push_leaf_shadow(frame, open_factor, fade, &ring_ctx, &mut built.rounded);
+                let glow_painted = self.push_leaf_glow(
+                    frame,
+                    view_id,
+                    open_factor,
+                    fade,
+                    &ring_ctx,
+                    &mut built.rounded,
+                );
+                let (frame_clip, ring_painted) = self.push_leaf_ring(
+                    frame,
+                    view_id,
+                    open_factor,
+                    fade,
+                    &ring_ctx,
+                    &mut built.rounded,
+                );
+                built.needs_draw |= shadow_painted || glow_painted || ring_painted;
 
                 // CTX-1148 (#1978): detached floats must paint opaque. The
                 // grid fills cover only the content rect; the decoration
@@ -1438,6 +1645,29 @@ impl Runtime {
                                         && built.background_bytes.saturating_add(bytes)
                                             <= bitty_rich::BG_PRESENT_MAX_BYTES_PER_FRAME
                                     {
+                                        let mut rgba = blit.rgba.clone();
+                                        // CTX-1162 S3: the resolved per-`View`
+                                        // tint washes the blit at strength
+                                        // (opaque full-strength stamps the
+                                        // tint RGB, coverage preserved). A
+                                        // tint without an image stays inert:
+                                        // this is the only tint consumer.
+                                        if let Some(tint) = frame.style.background_tint {
+                                            if frame.style.background_tint_strength > 0.0 {
+                                                bitty_render::grid::tint_rgba(
+                                                    &mut rgba,
+                                                    tint,
+                                                    frame.style.background_tint_strength,
+                                                );
+                                            }
+                                        }
+                                        // CTX-1162 S3: unfocused leaves fade
+                                        // the blit exactly like their
+                                        // fills/glyphs. Rebuilt every frame,
+                                        // so no retained gate is needed here.
+                                        if fade < 1.0 {
+                                            bitty_render::window::dim_rgba_alpha(&mut rgba, fade);
+                                        }
                                         if let Ok(entry) = bitty_render::grid::ImageBlit::try_new(
                                             bitty_render::geometry::RectPx::new(
                                                 blit.dest.x,
@@ -1445,7 +1675,7 @@ impl Runtime {
                                                 blit.dest.width,
                                                 blit.dest.height,
                                             ),
-                                            blit.rgba.clone(),
+                                            rgba,
                                         ) {
                                             built.background_bytes =
                                                 built.background_bytes.saturating_add(bytes);
@@ -1598,6 +1828,12 @@ impl Runtime {
                 for fill in &mut fills {
                     fill.rect.x = px_add(fill.rect.x, origin_px_x);
                     fill.rect.y = px_add(fill.rect.y, origin_px_y);
+                    // CTX-1162 S3: unfocused leaves bake the fade factor into
+                    // cell fills at build time. `1.0` skips the write so
+                    // focused (and default) leaves stay byte-identical.
+                    if fade < 1.0 {
+                        fill.color = bitty_render::grid::scale_alpha(fill.color, fade);
+                    }
                 }
                 let mut glyphs = list.glyphs;
                 for glyph in &mut glyphs {
@@ -1606,6 +1842,12 @@ impl Runtime {
                     // CTX-0311 inner-arc clip: only decorated rounded frames
                     // set it; square frames keep the documented overhang.
                     glyph.clip = frame_clip;
+                    // CTX-1162 S3: same fade for glyph-instance alpha (the
+                    // retained list reuses these verbatim, guarded by the
+                    // `fade_factor` gate above).
+                    if fade < 1.0 {
+                        glyph.color = bitty_render::grid::scale_alpha(glyph.color, fade);
+                    }
                 }
                 built.needs_draw |= leaf_painted || !fills.is_empty() || !glyphs.is_empty();
                 self.presented_leaf_frames.insert(
@@ -1613,6 +1855,7 @@ impl Runtime {
                     PresentedLeaf {
                         origin: (frame.content.x, frame.content.y),
                         scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
+                        fade_factor: fade,
                         fills: fills.clone(),
                         glyphs: glyphs.clone(),
                     },

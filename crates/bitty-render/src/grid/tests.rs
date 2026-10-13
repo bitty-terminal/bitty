@@ -2558,3 +2558,42 @@ fn ctx1007_underline_patterns_scale_with_dpi() {
         "26px curly crest must rise above the 8x16 crest row 8, got {curly_26:?}"
     );
 }
+
+#[test]
+fn tint_rgba_washes_rgb_and_preserves_alpha() {
+    use super::tint_rgba;
+    // Opaque red wash at full strength stamps the tint RGB, keeps coverage.
+    let mut px = vec![10, 20, 30, 200, 250, 251, 252, 40];
+    tint_rgba(&mut px, [255, 0, 0, 255], 1.0);
+    assert_eq!(px, vec![255, 0, 0, 200, 255, 0, 0, 40]);
+    // Zero strength is a no-op with no write.
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 255], 0.0);
+    assert_eq!(px, vec![10, 20, 30, 255]);
+    // Transparent tint contributes nothing even at full strength.
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 0], 1.0);
+    assert_eq!(px, vec![10, 20, 30, 255]);
+    // Half strength with opaque tint lerps halfway (10 -> 132.5 -> 133).
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 255], 0.5);
+    assert_eq!(px, vec![133, 10, 15, 255]);
+    // Half-alpha tint at full strength halves the effective wash.
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 128], 1.0);
+    assert_eq!(px[3], 255, "coverage must survive the wash");
+    assert!(
+        (px[0] as i16 - 133).abs() <= 1 && px[1] < px[0] && px[2] < px[0],
+        "wash must pull toward red, got {px:?}"
+    );
+    // Hostile strengths sanitize to a no-op, never invert.
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 255], f32::NAN);
+    tint_rgba(&mut px, [255, 0, 0, 255], f32::INFINITY);
+    tint_rgba(&mut px, [255, 0, 0, 255], -1.0);
+    assert_eq!(px, vec![10, 20, 30, 255]);
+    // Over-range strength clamps to the full wash.
+    let mut px = vec![10, 20, 30, 255];
+    tint_rgba(&mut px, [255, 0, 0, 255], 2.0);
+    assert_eq!(px, vec![255, 0, 0, 255]);
+}

@@ -6655,12 +6655,13 @@ mod style_s0_tests {
     fn style_s0_accepted_but_inert_snapshot() {
         // CTX-1159 S0 (DEC-0113 Fix 3): a fully styled config is parsed,
         // validated, merged, attributed, and reported — with provably no
-        // render effect. The pin: the reload diff against defaults contains
+        // render effect at this layer. The pin: the reload diff against defaults contains
         // EXACTLY the style surface (8 global leaves + the one `views`
         // selector entry), so no render-relevant field moved; safe mode
         // collapses back to exactly the unstyled defaults; and the reload
-        // reconciles Live. No `set_chrome_style` exists yet (S3 owns it),
-        // so no present/render path can read these values.
+        // reconciles Live. No present/render path in THIS crate can read
+        // these values (the S3 `set_chrome_style` adopter lives in
+        // bitty-runtime).
         use crate::merge::merge_layers;
         use crate::plan::LayeredPlan;
         use crate::reload::{ReloadClass, diff, reconcile_live};

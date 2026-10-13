@@ -29,9 +29,12 @@
 //! * runtime (CTX-0898, #1522): `appearance.theme` / `appearance.colors`
 //!   (`set_theme_palette`), `font.family` / `font.line_height` /
 //!   `font.letter_spacing` (`set_font_face`: face reload + atlas rebuild +
-//!   reflow), `window.opacity` (`set_window_opacity`: GPU surface alpha), and
+//!   reflow), `window.opacity` (`set_window_opacity`: GPU surface alpha),
 //!   `decoration.background_*` plus `views` (`set_background_appearance`: the
-//!   full fail-closed load pipeline before any swap);
+//!   full fail-closed load pipeline before any swap), and the eight global
+//!   chrome-style leaves (CTX-1162 S3: `appearance.style` glow/shadow/fade
+//!   plus the `decoration` tint pair, adopted as one `ChromeStyle` via
+//!   `set_chrome_style` right after `set_background_appearance`);
 //! * app chrome (CTX-0898): `keymaps`, `mod_key`, `leader_key`,
 //!   `leader_timeout_ms`, `hints_enabled`, `layout.resize_step` (CTX-0963),
 //!   and the platform window transparency hint for `window.opacity`. The
@@ -152,6 +155,14 @@ fn runtime_adopts(field: &str) -> bool {
             | "decoration.background_image"
             | "decoration.background_fit"
             | "decoration.background_image_roots"
+            | "decoration.background_tint"
+            | "decoration.background_tint_strength"
+            | "appearance.style.glow_color"
+            | "appearance.style.glow_width"
+            | "appearance.style.shadow_color"
+            | "appearance.style.shadow_offset_x"
+            | "appearance.style.shadow_offset_y"
+            | "appearance.style.fade_unfocused"
             | "appearance.theme"
             | "appearance.colors"
             | "keymaps"
@@ -383,6 +394,9 @@ pub(crate) fn apply_live_presentation(
     runtime
         .set_outline_widths(resolved.outline_width_focused, resolved.outline_width_idle)
         .map_err(|err| format!("decoration.border_width: {err}"))?;
+    // Captured before the background setter moves the appearance fields out
+    // of `resolved` below (`ChromeStyle` is `Copy`: eight scalar leaves).
+    let chrome_style = resolved.chrome_style();
     runtime
         .set_background_appearance(
             resolved.view_appearance,
@@ -395,6 +409,12 @@ pub(crate) fn apply_live_presentation(
             resolved.window_background_position,
         )
         .map_err(|err| format!("background: {err}"))?;
+    // CTX-1162 S3: the eight global chrome-style leaves adopt as one value
+    // right after the backgrounds/views set (which owns the per-`View`
+    // glow/tint quartet), so a style-only reload repaints on the next tick.
+    runtime
+        .set_chrome_style(chrome_style)
+        .map_err(|err| format!("chrome style: {err}"))?;
     runtime.set_animations(resolved.animations);
     runtime
         .set_window_padding(effective.window.padding)
@@ -801,42 +821,19 @@ mod tests {
         // that drives `classify_field`, so a new Live leaf without an adopter
         // fails here instead of silently landing in `restart_required`.
         //
-        // CTX-1159 S0 carve-out (DEC-0113 Fix 3): the eight style leaves are
-        // classified Live in the reload table but stay accepted-but-inert
-        // until S3 — parsed, validated, merged, and reported with no render
-        // effect. They are deliberately NOT in `runtime_adopts` yet (claiming
-        // adoption without `set_chrome_style` would lie in the reply), so a
-        // style-only reload commits to the engine and reports the leaves
-        // under `restart_required` until S3 lands the setter and closes this
-        // carve-out with the adopter audit proof.
-        const STYLE_S0_PENDING: &[&str] = &[
-            "appearance.style.glow_color",
-            "appearance.style.glow_width",
-            "appearance.style.shadow_color",
-            "appearance.style.shadow_offset_x",
-            "appearance.style.shadow_offset_y",
-            "appearance.style.fade_unfocused",
-            "decoration.background_tint",
-            "decoration.background_tint_strength",
-        ];
+        // CTX-1162 S3 closes the CTX-1159 S0 carve-out (DEC-0113 Fix 3): the
+        // eight style leaves are adopted live by `set_chrome_style` (driven
+        // from `apply_live_presentation`), so every Live leaf now names its
+        // adopter and a style-only reload reports nothing pending.
         for field in bitty_config::LIVE_FIELDS {
             assert_eq!(
                 bitty_config::classify_field(field),
                 ReloadClass::Live,
                 "{field} is listed Live but classifies otherwise"
             );
-            if STYLE_S0_PENDING.contains(field) {
-                assert!(
-                    !runtime_adopts(field),
-                    "{field} must stay unadopted until S3 `set_chrome_style`"
-                );
-                continue;
-            }
             assert!(runtime_adopts(field), "{field} has no live adopter");
         }
-        // The carve-out leaves still report: a style-only edit commits to
-        // the engine and surfaces under `restart_required` (pending until
-        // restart) rather than vanishing.
+        // A style-only edit is fully adopted: nothing stays pending.
         let baseline = bitty_config::fallback_builtin();
         let mut styled = baseline.clone();
         styled.appearance.style = Some(bitty_config::types::StyleConfig {
@@ -844,14 +841,10 @@ mod tests {
             ..Default::default()
         });
         styled.decoration.background_tint_strength = Some(0.5);
-        let pending = pending_fields(&baseline, &styled, runtime_adopts);
         assert!(
-            pending.contains(&String::from("appearance.style.glow_width")),
-            "style leaf must report pending, got {pending:?}"
-        );
-        assert!(
-            pending.contains(&String::from("decoration.background_tint_strength")),
-            "tint leaf must report pending, got {pending:?}"
+            pending_fields(&baseline, &styled, runtime_adopts).is_empty(),
+            "style leaves must adopt live, got {:?}",
+            pending_fields(&baseline, &styled, runtime_adopts)
         );
         let per_view = format!("{}*]", bitty_config::VIEWS_FIELD_PREFIX);
         assert_eq!(bitty_config::classify_field(&per_view), ReloadClass::Live);
@@ -859,6 +852,38 @@ mod tests {
         for field in bitty_config::RESTART_REQUIRED_FIELDS {
             assert!(!runtime_adopts(field), "{field} must stay restart-required");
         }
+    }
+
+    #[test]
+    fn apply_live_presentation_adopts_chrome_style() {
+        // CTX-1162 S3 apply path: a style-carrying effective config lands on
+        // the runtime through `set_chrome_style` (globals) while the
+        // backgrounds/views setter keeps owning the per-`View` quartet.
+        let mut runtime = bitty_runtime::Runtime::new(bitty_runtime::RuntimeConfig::default())
+            .expect("default runtime builds");
+        assert!(runtime.config().chrome_style().is_inert());
+        let mut effective = bitty_config::fallback_builtin();
+        effective.appearance.style = Some(bitty_config::types::StyleConfig {
+            glow_color: bitty_config::types::OutlineColor::parse("#FF0000"),
+            glow_width: Some(6),
+            shadow_color: bitty_config::types::OutlineColor::parse("#00000080"),
+            shadow_offset_x: Some(4),
+            shadow_offset_y: Some(-4),
+            fade_unfocused: Some(0.5),
+        });
+        effective.decoration.background_tint = bitty_config::types::OutlineColor::parse("#112233");
+        effective.decoration.background_tint_strength = Some(0.25);
+        apply_live_presentation(&mut runtime, &effective).expect("style adopts live");
+        let adopted = runtime.config().chrome_style();
+        assert_eq!(adopted.glow_color, Some([0xFF, 0x00, 0x00, 0xFF]));
+        assert_eq!(adopted.glow_width, 6);
+        assert_eq!(adopted.shadow_color, Some([0x00, 0x00, 0x00, 0x80]));
+        assert_eq!(adopted.shadow_offset_x, 4);
+        assert_eq!(adopted.shadow_offset_y, -4);
+        assert!((adopted.fade_unfocused - 0.5).abs() < f32::EPSILON);
+        assert_eq!(adopted.background_tint, Some([0x11, 0x22, 0x33, 0xFF]));
+        assert!((adopted.background_tint_strength - 0.25).abs() < f32::EPSILON);
+        assert!(!adopted.is_inert());
     }
 
     #[test]

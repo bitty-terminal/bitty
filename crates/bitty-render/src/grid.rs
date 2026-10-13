@@ -133,6 +133,44 @@ pub fn lerp_rgba(from: Rgba8, to: Rgba8, t: f32) -> Rgba8 {
     ]
 }
 
+/// Washes straight-alpha RGBA8 bytes in place toward a tint color (CTX-1162
+/// S3 `decoration.background_tint`).
+///
+/// Each pixel's RGB lerps toward the tint RGB by `strength * tint_alpha /
+/// 255` (the `dim_rgba_alpha` raster-time precedent, extended from an
+/// opacity multiply to a color wash); the pixel alpha channel is preserved
+/// so the blit's coverage is unchanged. `strength` is sanitized
+/// (non-finite reads as `0.0`, then clamped to `[0.0, 1.0]`) so a hostile
+/// value can never invert the wash. `0.0` effective strength is a no-op
+/// early-out with no write. Total over every input length (a trailing
+/// partial pixel is ignored, never panicking).
+pub fn tint_rgba(rgba: &mut [u8], tint: Rgba8, strength: f32) {
+    let strength = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let k = strength * f32::from(tint[3]) / 255.0;
+    if k <= 0.0 {
+        return;
+    }
+    if k >= 1.0 {
+        // Opaque tint at full strength: stamp the tint RGB, keep coverage.
+        for chunk in rgba.chunks_exact_mut(4) {
+            chunk[0] = tint[0];
+            chunk[1] = tint[1];
+            chunk[2] = tint[2];
+        }
+        return;
+    }
+    for chunk in rgba.chunks_exact_mut(4) {
+        for (i, channel) in chunk.iter_mut().enumerate().take(3) {
+            let mixed = f32::from(*channel) + (f32::from(tint[i]) - f32::from(*channel)) * k;
+            *channel = mixed.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 /// Default foreground: Bitty Dark `#cdd6f4`, fully opaque.
 ///
 /// Mirrors [`bitty_config::theme::BITTY_DARK`]`foreground`: a soft

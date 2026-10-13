@@ -12,6 +12,9 @@
 //!   the derived base cell) in one atlas rebuild;
 //! * [`Runtime::set_outline_widths`] — the resolved `decoration.border_width*`
 //!   focus/idle ring pair;
+//! * [`Runtime::set_chrome_style`] — the eight global chrome-style leaves
+//!   (CTX-1162 S3: `appearance.style` glow/shadow/fade plus the
+//!   `decoration` tint pair, adopted as one [`ChromeStyle`](crate::ChromeStyle));
 //! * [`Runtime::set_window_opacity`] — `window.opacity` on the GPU surface.
 //!
 //! Every setter validates fail-closed before mutating, is idempotent for an
@@ -233,6 +236,69 @@ impl Runtime {
         Ok(())
     }
 
+    /// Live-adopts the resolved global chrome style without restart (CTX-1162
+    /// S3, DEC-0111 section 4 as corrected by DEC-0113).
+    ///
+    /// Covers the eight global-only style leaves (`appearance.style`
+    /// glow/shadow/fade plus the `decoration` tint pair) as one
+    /// [`ChromeStyle`](crate::ChromeStyle). The per-`View` glow/tint quartet
+    /// rides `view_appearance` through [`Self::set_background_appearance`];
+    /// callers adopt the chrome style after it, mirroring the
+    /// `set_outline_widths`-before-`set_background_appearance` order. A
+    /// change forces one full redraw so the new paint appears on the next
+    /// present; leaves whose fade factor moved re-render through the
+    /// per-leaf retained-fade gate (bounded to the visible set), and an
+    /// unchanged value is a no-op. Paint-only: content geometry is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] for a glow width outside `0..=16`, a
+    /// shadow offset outside `-8..=8`, or a non-finite or out-of-range fade
+    /// or tint strength (the [`RuntimeConfig::validate`](crate::config::RuntimeConfig::validate)
+    /// style bounds, mirrored so a direct caller cannot arm hostile paint);
+    /// nothing is changed.
+    pub fn set_chrome_style(
+        &mut self,
+        style: crate::config::ChromeStyle,
+    ) -> Result<(), RuntimeError> {
+        if style.glow_width > crate::config::MAX_STYLE_GLOW_WIDTH_PX {
+            return Err(RuntimeError::InvalidConfig(
+                "style glow width must be within [0, 16] logical pixels",
+            ));
+        }
+        for offset in [style.shadow_offset_x, style.shadow_offset_y] {
+            if offset.abs() > crate::config::MAX_STYLE_SHADOW_OFFSET_PX {
+                return Err(RuntimeError::InvalidConfig(
+                    "style shadow offset must be within [-8, 8] logical pixels",
+                ));
+            }
+        }
+        if !(style.fade_unfocused.is_finite() && (0.0..=1.0).contains(&style.fade_unfocused)) {
+            return Err(RuntimeError::InvalidConfig(
+                "style fade_unfocused must be finite within [0.0, 1.0]",
+            ));
+        }
+        if !(style.background_tint_strength.is_finite()
+            && (0.0..=1.0).contains(&style.background_tint_strength))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "background tint strength must be finite within [0.0, 1.0]",
+            ));
+        }
+        if self.config.chrome_style() != style {
+            self.config.style_glow_color = style.glow_color;
+            self.config.style_glow_width = style.glow_width;
+            self.config.style_shadow_color = style.shadow_color;
+            self.config.style_shadow_offset_x = style.shadow_offset_x;
+            self.config.style_shadow_offset_y = style.shadow_offset_y;
+            self.config.style_fade_unfocused = style.fade_unfocused;
+            self.config.background_tint = style.background_tint;
+            self.config.background_tint_strength = style.background_tint_strength;
+            self.pending_full_redraw = true;
+        }
+        Ok(())
+    }
+
     /// Requested window opacity on the attached surface (`1.0` = opaque),
     /// sanitized.
     #[must_use]
@@ -424,6 +490,55 @@ mod tests {
         let over = crate::config::MAX_OUTLINE_WIDTH_PX + 1;
         assert!(rt.set_outline_widths(Some(over), None).is_err());
         assert_eq!(rt.config().outline_width_focused, Some(3), "unchanged");
+    }
+
+    #[test]
+    fn chrome_style_adopts_live_repaints_once_and_rejects_bad_input() {
+        use crate::config::ChromeStyle;
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let _ = rt.tick().expect("first tick presents");
+        assert_eq!(rt.tick(), None, "idle on unchanged frame");
+        assert!(rt.config().chrome_style().is_inert());
+        let styled = ChromeStyle {
+            glow_color: Some([0xFF, 0x00, 0x00, 0xFF]),
+            glow_width: 4,
+            shadow_color: Some([0x00, 0x00, 0x00, 0x80]),
+            shadow_offset_x: 3,
+            shadow_offset_y: -3,
+            fade_unfocused: 0.5,
+            background_tint: Some([0x11, 0x22, 0x33, 0xFF]),
+            background_tint_strength: 0.25,
+        };
+        assert!(!styled.is_inert());
+        rt.set_chrome_style(styled).expect("adopt");
+        assert_eq!(rt.config().chrome_style(), styled);
+        assert!(rt.tick().is_some(), "a chrome style change repaints");
+        assert_eq!(rt.tick(), None, "must idle after one repaint");
+        // A no-op set does not force another frame.
+        rt.set_chrome_style(styled).expect("same value valid");
+        assert_eq!(rt.tick(), None, "no-op set must not repaint");
+        // Out-of-bound values fail closed and retain the previous value.
+        let over_glow = ChromeStyle {
+            glow_width: crate::config::MAX_STYLE_GLOW_WIDTH_PX + 1,
+            ..styled
+        };
+        assert!(rt.set_chrome_style(over_glow).is_err());
+        let over_shadow = ChromeStyle {
+            shadow_offset_x: crate::config::MAX_STYLE_SHADOW_OFFSET_PX + 1,
+            ..styled
+        };
+        assert!(rt.set_chrome_style(over_shadow).is_err());
+        let bad_fade = ChromeStyle {
+            fade_unfocused: f32::NAN,
+            ..styled
+        };
+        assert!(rt.set_chrome_style(bad_fade).is_err());
+        let bad_strength = ChromeStyle {
+            background_tint_strength: 2.0,
+            ..styled
+        };
+        assert!(rt.set_chrome_style(bad_strength).is_err());
+        assert_eq!(rt.config().chrome_style(), styled, "unchanged");
     }
 
     #[test]

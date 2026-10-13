@@ -38,7 +38,10 @@ bitty-plugin-host = { version = "0.0.22", path = "../bitty-plugin-host" }
 # workspace crate, no new supply-chain surface (its only syscall dep is the
 # workspace `libc`, Linux-gated there).
 bitty-sandbox = { version = "0.0.22", path = "../bitty-sandbox" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }
+# `version` below is required for `cargo publish` (lockfile pins 0.0.1 for
+# each); the git rev stays the build source until each crate lands on
+# crates.io (see CTX-1172 publish order notes).
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
 bitty-package = { version = "0.0.22", path = "../bitty-package" }
@@ -50,18 +53,18 @@ bitty-rich = { version = "0.0.22", path = "../bitty-rich" }
 # protocol v1 to out-of-process components (first: `bitty-net`). Core links
 # the dependency-free codec crate only, never a network implementation
 # crate; same exact-rev pin pattern as `bitty-ipc`.
-bitty-network-wire = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
+bitty-network-wire = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
 # Issue #1760 (OQ-004): plaintext URL pattern detection wires the
 # dependency-free matcher crate (`bitty-url-detector` v0.0.1, `forbid(unsafe)`,
 # `std` only) into the same `ValidatedUrl` + `ActivationGesture` pipeline as
 # OSC 8. No crates.io release yet, so the same git-rev pin convention as
 # `bitty-ipc` / `bitty-network-wire` applies (7-char short SHA).
-bitty-url-detector = { git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "d211490" }
+bitty-url-detector = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "d211490" }
 # CTX-1008 (#1763, OQ-076): Core consumes the platform notification bridge
 # for the defensive second rate cap. Same exact-rev pin pattern as
 # `bitty-ipc` / `bitty-network-wire`: the bridge receives an already-gated
 # `{title, body}` pair and re-caps over-ceiling callers fail-closed.
-bitty-platform-services = { git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "2fc794a" }
+bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "2fc794a" }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).
@@ -74,7 +77,7 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d", features = ["test-support"] }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
 
 # CTX-0903: Windows liveness probes for the owned-tree tests (safe API of

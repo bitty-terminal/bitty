@@ -17,6 +17,30 @@ use bitty_runtime::{
 use std::collections::HashMap;
 
 const THEME_BG: [u8; 4] = [0x1E, 0x1E, 0x2E, 0xFF];
+const IMAGE_RED: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF];
+
+/// 4x4 opaque-red PNG (same bytes as the `background_images_present`
+/// fixture, embedded so the window-background probe stays hermetic).
+const RED_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x06, 0x00, 0x00, 0x00, 0xA9, 0xF1, 0x9E,
+    0x7E, 0x00, 0x00, 0x00, 0x15, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xFC, 0xCF, 0xC0, 0xF0,
+    0x9F, 0x01, 0x09, 0x30, 0x21, 0x73, 0x88, 0x13, 0x00, 0x00, 0x83, 0xD1, 0x02, 0x06, 0x04, 0xBC,
+    0x24, 0x47, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-ctx1181-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
 
 fn make_runtime() -> Runtime {
     Runtime::with_deterministic_rasterizer(RuntimeConfig {
@@ -343,4 +367,180 @@ fn stacked_floats_colored_text_upper_wins_across_reuse() {
     rt.tick()
         .expect("upper damage must present with lower reuse");
     check_overlap(&rt, "reuse");
+}
+
+#[test]
+fn float_occludes_window_background_gap() {
+    // CTX-1181 (#2041): the window background image paints whole-window in
+    // the backgrounds layer, above the CTX-1148 opaque float fill in fills.
+    // A gap band between tiled survivors behind a float must not render
+    // through the float frame.
+    let root = scratch_dir("window-gap");
+    let path = root.join("red.png");
+    std::fs::write(&path, RED_PNG).expect("write fixture");
+    let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        window_background_image: Some(path.display().to_string()),
+        window_background_fit: "stretch".to_string(),
+        background_image_roots: vec![root.display().to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("window image must load");
+    install(&mut rt, three_pane());
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    let stats = rt.tick().expect("baseline must present");
+    assert!(
+        stats.backgrounds >= 1,
+        "window blit must present or the probe is vacuous"
+    );
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.tick().expect("float frame must present");
+
+    let frames = rt.present_frames();
+    let frame_of = |view: ViewId| {
+        *frames
+            .iter()
+            .find(|frame| frame.view == view)
+            .unwrap_or_else(|| panic!("{view:?} must be presented"))
+    };
+    let left_survivor = frame_of(ViewId::new(2));
+    let right_survivor = frame_of(ViewId::new(3));
+    let float_frame = frame_of(ViewId::new(1));
+    let (gap_left, gap_right) = if left_survivor.frame.x <= right_survivor.frame.x {
+        (
+            left_survivor.frame.x as i64 + i64::from(left_survivor.frame.width),
+            right_survivor.frame.x as i64,
+        )
+    } else {
+        (
+            right_survivor.frame.x as i64 + i64::from(right_survivor.frame.width),
+            left_survivor.frame.x as i64,
+        )
+    };
+    assert!(
+        gap_right > gap_left,
+        "tiled survivors must leave a gap band for the probe"
+    );
+    let pad = i64::from(rt.window_padding_physical());
+    let gap_top =
+        (pad + i64::from(left_survivor.frame.y)).max(pad + i64::from(right_survivor.frame.y));
+    let gap_bottom =
+        (pad + i64::from(left_survivor.frame.y) + i64::from(left_survivor.frame.height))
+            .min(pad + i64::from(right_survivor.frame.y) + i64::from(right_survivor.frame.height));
+    assert!(
+        gap_bottom > gap_top,
+        "survivor gap band must span rows for the probe"
+    );
+    let gap_x = (pad + (gap_left + gap_right) / 2) as u32;
+    let float_x0 = pad + i64::from(float_frame.frame.x);
+    let float_x1 = float_x0 + i64::from(float_frame.frame.width);
+    assert!(
+        i64::from(gap_x) >= float_x0 && i64::from(gap_x) < float_x1,
+        "float must cover the gap column for the probe"
+    );
+    let float_y0 = pad + i64::from(float_frame.frame.y);
+    let float_y1 = float_y0 + i64::from(float_frame.frame.height);
+    let mut under: Option<u32> = None;
+    let mut free: Option<u32> = None;
+    for y in gap_top..gap_bottom {
+        if y >= float_y0 + 4 && y < float_y1 - 4 {
+            under.get_or_insert(y as u32);
+        } else {
+            free.get_or_insert(y as u32);
+        }
+    }
+    let under_y = under.expect("float must cover the gap band for the probe");
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let extent = rt.surface_extent().expect("extent");
+    let (width, height) = (extent.width(), extent.height());
+    assert!(
+        gap_x < width && under_y < height,
+        "gap-under-float probe stays inside the window"
+    );
+    assert_eq!(
+        pixel(&rgba, width, gap_x, under_y),
+        THEME_BG,
+        "gap band under the float must stay opaque theme background"
+    );
+    if let Some(free_y) = free {
+        assert_eq!(
+            pixel(&rgba, width, gap_x, free_y),
+            IMAGE_RED,
+            "gap band past the float still shows the window image"
+        );
+    } else {
+        assert!(pad > 2, "padding band must exist for the fallback probe");
+        let (px, py) = (1u32, 1u32);
+        assert_eq!(
+            pixel(&rgba, width, px, py),
+            IMAGE_RED,
+            "padding past the float still shows the window image"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn float_occludes_kitty_image_behind() {
+    // CTX-1181 (#2041): kitty image blits composite topmost, above the
+    // CTX-1148 opaque float fill and the CTX-1165 glyph filter. An image
+    // placed by a behind tiled panel must not show through the float frame.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    let payload = [0xFFu8, 0x00, 0x00, 0xFF].repeat(16);
+    rt.kitty_display_image(32, Some(4), Some(4), None, 48, 16, 0, &payload, 0)
+        .expect("display must store and place");
+    rt.tick().expect("image frame must present");
+    assert!(
+        rt.kitty_last_frame_images() >= 1,
+        "behind image must composite or the probe is vacuous"
+    );
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let extent = rt.surface_extent().expect("extent");
+    let (width, height) = (extent.width(), extent.height());
+    let (tx0, ty0, _tx1, _ty1) = win_content(&rt, ViewId::new(1));
+    let (fx0, fy0, fx1, fy1) = win_frame(&rt, ViewId::new(2));
+    let (cell_w, cell_h) = rt.live_cell_size();
+    assert!(cell_w > 0 && cell_h > 0, "cell metrics must be live");
+    let (ix1, iy1) = (
+        tx0.saturating_add(48u32.saturating_mul(cell_w)),
+        ty0.saturating_add(16u32.saturating_mul(cell_h)),
+    );
+    let (ox0, oy0, ox1, oy1) = (tx0.max(fx0), ty0.max(fy0), ix1.min(fx1), iy1.min(fy1));
+    assert!(
+        ox1 > ox0 && oy1 > oy0,
+        "float must cover the behind image for the probe"
+    );
+    let probe = (tx0, ty0, tx0.saturating_add(20), ty0.saturating_add(20));
+    assert!(
+        probe.2 <= fx0 || probe.3 <= fy0,
+        "behind-only probe must sit outside the float frame"
+    );
+    let (_, behind_only) = non_bg_colors(&rgba, width, height, probe, 4_000);
+    assert!(
+        behind_only.contains_key(&IMAGE_RED),
+        "behind image must stay visible past the float"
+    );
+    let (ix0, iy0, ix1, iy1) = (
+        ox0.saturating_add(4),
+        oy0.saturating_add(4),
+        ox1.saturating_sub(4),
+        oy1.saturating_sub(4),
+    );
+    assert!(
+        ix1 > ix0 && iy1 > iy0,
+        "shrunk overlap must stay non-empty outside the ring edge"
+    );
+    let (_, overlap) = non_bg_colors(&rgba, width, height, (ix0, iy0, ix1, iy1), 120_000);
+    assert_eq!(
+        non_bg_count(&overlap),
+        0,
+        "behind kitty image must not show through the float frame"
+    );
 }

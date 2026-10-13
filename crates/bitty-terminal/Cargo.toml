@@ -8,7 +8,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["terminal", "bitty"]
 categories = ["command-line-utilities"]
-publish = true
+# Never published to crates.io: thin composition root, and the `bitty` name
+# on crates.io belongs to an unrelated project (see packaging/README.md and
+# packaging/INSTALL.md). Install from git instead.
+publish = false
 
 [lints]
 workspace = true

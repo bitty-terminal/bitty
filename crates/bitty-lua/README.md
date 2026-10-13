@@ -8,7 +8,7 @@
 ## Purpose
 
 `bitty-lua` wraps the pure-Rust `phodopus` VM (sole third-party dependency
-per `Cargo.toml`, exact git revision `1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0`)
+per `Cargo.toml`, exact git revision `f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344`)
 to give Bitty deterministic, bounded Lua execution for per-plugin isolation
 and, per DEC-0011, user configuration evaluation (`src/lib.rs`,
 `src/config.rs`). Each VM instance gets isolated globals with a restricted
@@ -21,9 +21,9 @@ the determinism contract are documented in `src/lib.rs`.
 ## Boundaries
 
 - Sole third-party dependency, per `Cargo.toml`: `phodopus` pinned at exact
-  git revision `1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0`; no
+  git revision `f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344`; no
   network-facing dependency is declared.
-- Standard library baseline at `phodopus@1653c51f`: in-core `utf8` and
+- Standard library baseline at `phodopus@f6aa59a`: in-core `utf8` and
   `string.format` with proportional fuel charging, plus retained bounded
   `string.byte`/`char`, `table.concat`/`sort`, and restricted
   `os.time`/`clock`/`date` (`src/stdlib.rs`); no ambient `io` authority,
@@ -43,7 +43,7 @@ the determinism contract are documented in `src/lib.rs`.
 ## Evidence
 
 - `tests/readiness_mirror.rs` (RUN-29) mirrors the Phodopus executable gate
-  (`phodopus@1653c51f`, `crates/phodopus/tests/readiness_gate.rs`) at the
+  (`phodopus@f6aa59a`, `crates/phodopus/tests/readiness_gate.rs`) at the
   bitty seam: RC-1 instruction/wall budgets, RC-2 quota refusal, FS-1
   denial atomicity, FS-3 fault containment, FS-5 recovery, FS-9 no-bypass,
   the stdlib allowlist, module isolation, and host-op cancellation as typed

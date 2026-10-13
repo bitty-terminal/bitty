@@ -27,14 +27,12 @@ use super::descriptor::{ResolveError, validate_component_name};
 use super::env::ComponentEnv;
 use super::grant::PluginGrant;
 use super::inventory::resolve_search;
-use super::policy::{CrashTracker, DeadlineStrikes, SpawnGate};
+use super::policy::{CrashTracker, DeadlineStrikes, SpawnGate, SupervisionPolicy};
 use super::stderr::{StderrRing, stderr_log_tail};
 use super::{
-    COMPONENT_EXIT_RECHECK, COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT,
-    COMPONENT_INBOUND_QUEUE_FRAMES, COMPONENT_MAX_BODY_BYTES_CEILING, COMPONENT_MAX_IN_FLIGHT,
-    COMPONENT_OUTBOUND_QUEUE_BATCHES, COMPONENT_POLL_MAX_FRAMES, COMPONENT_REQUEST_DEADLINE_GRACE,
-    COMPONENT_REQUEST_DEFAULT_TIMEOUT, COMPONENT_REQUEST_MAX_TIMEOUT, COMPONENT_SHUTDOWN_GRACE,
-    COMPONENT_STDERR_MAX_BYTES, COMPONENT_STDERR_READ_CHUNK,
+    COMPONENT_EXIT_RECHECK, COMPONENT_INBOUND_QUEUE_FRAMES, COMPONENT_MAX_BODY_BYTES_CEILING,
+    COMPONENT_MAX_IN_FLIGHT, COMPONENT_OUTBOUND_QUEUE_BATCHES, COMPONENT_POLL_MAX_FRAMES,
+    COMPONENT_REQUEST_DEADLINE_GRACE, COMPONENT_STDERR_MAX_BYTES, COMPONENT_STDERR_READ_CHUNK,
 };
 
 /// Broker-assigned request id (non-zero, unique for the broker lifetime).
@@ -80,18 +78,17 @@ where
 }
 
 /// Core timeout for one request (DIR-030 D2): the requested `timeout_ms`,
-/// or [`COMPONENT_REQUEST_DEFAULT_TIMEOUT`] when none was requested,
-/// clamped to [`COMPONENT_REQUEST_MAX_TIMEOUT`]. The result is forwarded
+/// or the supervision policy default (30 s) when none was requested,
+/// clamped to the policy maximum (300 s). The result is forwarded
 /// as the wire `timeout_ms`, so the component's own deadline fires first
 /// and Core's grace-covered deadline only catches a silent component.
+///
+/// Implemented through the supervision seam
+/// ([`SupervisionPolicy::effective_deadline`]); this wrapper keeps the
+/// historical call-site shape.
 #[must_use]
 pub fn effective_timeout(timeout_ms: u32) -> Duration {
-    let base = if timeout_ms == 0 {
-        COMPONENT_REQUEST_DEFAULT_TIMEOUT
-    } else {
-        Duration::from_millis(u64::from(timeout_ms))
-    };
-    base.min(COMPONENT_REQUEST_MAX_TIMEOUT)
+    SupervisionPolicy::core_defaults().effective_deadline(timeout_ms)
 }
 
 /// Core response body budget for one request (DIR-030 D3): the requested
@@ -138,17 +135,19 @@ pub struct BrokerConfig {
 
 impl BrokerConfig {
     /// DIR-030 defaults for `root` and `env` (system tier disabled, native
-    /// execution on every platform).
+    /// execution on every platform). Timeout fields come from the
+    /// supervision seam ([`SupervisionPolicy::core_defaults`]).
     #[must_use]
     pub fn new(root: Option<PathBuf>, env: ComponentEnv) -> Self {
+        let policy = SupervisionPolicy::core_defaults();
         Self {
             root,
             system_root: None,
             env,
             core_version: env!("CARGO_PKG_VERSION").to_owned(),
-            idle_timeout: COMPONENT_IDLE_TIMEOUT,
-            shutdown_grace: COMPONENT_SHUTDOWN_GRACE,
-            handshake_timeout: COMPONENT_HANDSHAKE_TIMEOUT,
+            idle_timeout: policy.idle_timeout,
+            shutdown_grace: policy.shutdown_grace,
+            handshake_timeout: policy.handshake_timeout,
             wsl: None,
         }
     }
@@ -1425,6 +1424,10 @@ fn kill_and_reap(slot: &mut Slot, outcome: StopOutcome) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT, COMPONENT_REQUEST_DEFAULT_TIMEOUT,
+        COMPONENT_REQUEST_MAX_TIMEOUT, COMPONENT_SHUTDOWN_GRACE,
+    };
     use super::*;
     use bitty_network_wire::{FRAME_HEADER_BYTES, decode};
 
@@ -1527,6 +1530,31 @@ mod tests {
             COMPONENT_REQUEST_MAX_TIMEOUT
         );
         assert_eq!(effective_timeout(u32::MAX), COMPONENT_REQUEST_MAX_TIMEOUT);
+    }
+
+    #[test]
+    fn effective_timeout_routes_through_the_supervision_policy() {
+        // CTX-1177 seam: the broker timeout is the supervision policy's
+        // effective deadline, so the contract numbers have one owner.
+        let policy = SupervisionPolicy::core_defaults();
+        for requested in [0, 1, 999, 30_000, 300_000, 999_000_000, u32::MAX] {
+            assert_eq!(
+                effective_timeout(requested),
+                policy.effective_deadline(requested)
+            );
+        }
+    }
+
+    #[test]
+    fn broker_config_defaults_come_from_the_supervision_policy() {
+        let policy = SupervisionPolicy::core_defaults();
+        let config = BrokerConfig::new(None, ComponentEnv::empty());
+        assert_eq!(config.idle_timeout, policy.idle_timeout);
+        assert_eq!(config.idle_timeout, COMPONENT_IDLE_TIMEOUT);
+        assert_eq!(config.shutdown_grace, policy.shutdown_grace);
+        assert_eq!(config.shutdown_grace, COMPONENT_SHUTDOWN_GRACE);
+        assert_eq!(config.handshake_timeout, policy.handshake_timeout);
+        assert_eq!(config.handshake_timeout, COMPONENT_HANDSHAKE_TIMEOUT);
     }
 
     #[test]

@@ -1,23 +1,26 @@
 //! CTX-1033 (issue #1827) plugin-notification admission into the bounded
-//! banner surface.
+//! banner surface, plus CTX-1178 (issue #1998) single-path OS dispatch.
 //!
 //! Headless and deterministic; `cargo test` on CI without a display server.
 //! These tests pin the application-facing half of #1827 at the `Runtime`
 //! seam: grant-gated plugin notices (`platform.notify`, already enforced
 //! when queued) admit into the same one-banner-at-a-time in-grid surface
-//! plus the installed OS sink that terminal-originated notifications use —
-//! with no OSC-consent gate, with the shared `RC-8` rate ceiling and the
-//! bounded queue enforced, and with every refusal counted.
+//! plus the bridge-dispatched OS hand-off that terminal-originated
+//! notifications use — with no OSC-consent gate, with the shared `RC-8`
+//! rate ceiling and the bounded queue enforced, and with every refusal
+//! counted.
 
 #![forbid(unsafe_code)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bitty_platform::{DesktopNotification, NotificationSink, OsDeliveryOutcome};
+use bitty_platform_services::{
+    DeliveryOutcome, DesktopNotification, NotificationBackend, SkipReason,
+};
 use bitty_runtime::{NOTIFICATION_BANNER_DURATION, NOTIFICATION_TEXT_MAX_CHARS, Runtime};
 
-/// Recording [`NotificationSink`] double: captures payloads.
+/// Recording [`NotificationBackend`] double: captures payloads.
 #[derive(Clone, Default)]
 struct NotificationProbe {
     received: Arc<Mutex<Vec<(String, String)>>>,
@@ -32,8 +35,16 @@ impl NotificationProbe {
     }
 }
 
-impl NotificationSink for NotificationProbe {
-    fn deliver(&self, notification: &DesktopNotification) -> OsDeliveryOutcome {
+impl NotificationBackend for NotificationProbe {
+    fn name(&self) -> &'static str {
+        "notification-probe"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn deliver(&self, notification: &DesktopNotification) -> DeliveryOutcome {
         self.received
             .lock()
             .expect("probe mutex must not be poisoned")
@@ -41,7 +52,25 @@ impl NotificationSink for NotificationProbe {
                 notification.title().to_owned(),
                 notification.body().to_owned(),
             ));
-        OsDeliveryOutcome::Delivered
+        DeliveryOutcome::Delivered
+    }
+}
+
+/// Backend double that always reports the defensive cap tripped: pins the
+/// single-path mapping of an over-ceiling OS hand-off without timing.
+struct RateLimitedBackend;
+
+impl NotificationBackend for RateLimitedBackend {
+    fn name(&self) -> &'static str {
+        "rate-limited-probe"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn deliver(&self, _notification: &DesktopNotification) -> DeliveryOutcome {
+        DeliveryOutcome::Skipped(SkipReason::RateLimited)
     }
 }
 
@@ -117,10 +146,10 @@ fn plugin_rate_and_queue_overflow_counted_never_blocks() {
 }
 
 #[test]
-fn plugin_notice_reaches_os_sink_at_admission_time() {
+fn plugin_notice_reaches_backend_at_admission_time() {
     let mut rt = runtime();
     let probe = NotificationProbe::default();
-    rt.set_notification_sink(Some(Box::new(probe.clone())));
+    rt.set_notification_backend(Box::new(probe.clone()));
     let now = Instant::now();
     assert!(rt.admit_plugin_notification("Sample", "ok", now));
     assert_eq!(
@@ -132,7 +161,7 @@ fn plugin_notice_reaches_os_sink_at_admission_time() {
 }
 
 #[test]
-fn plugin_notice_without_sink_still_paints_and_counts_miss() {
+fn plugin_notice_without_backend_still_paints_and_counts_miss() {
     let mut rt = runtime();
     let now = Instant::now();
     assert!(rt.admit_plugin_notification("Sample", "ok", now));
@@ -142,6 +171,24 @@ fn plugin_notice_without_sink_still_paints_and_counts_miss() {
     );
     assert_eq!(rt.notifications_os_delivered(), 0);
     assert_eq!(rt.notifications_os_undelivered(), 1);
+}
+
+#[test]
+fn plugin_notice_rate_limited_handoff_keeps_banner_and_counts_drop() {
+    // Single-path parity with the terminal stream: an over-ceiling OS
+    // hand-off refuses delivery and counts the rate drop, while the
+    // RC-8-admitted banner still paints.
+    let mut rt = runtime();
+    rt.set_notification_backend(Box::new(RateLimitedBackend));
+    let now = Instant::now();
+    assert!(rt.admit_plugin_notification("Sample", "ok", now));
+    assert_eq!(
+        rt.notification_banner_at(now).as_deref(),
+        Some("Sample: ok")
+    );
+    assert_eq!(rt.notifications_os_delivered(), 0);
+    assert_eq!(rt.notifications_os_undelivered(), 1);
+    assert_eq!(rt.bell_rate_dropped(), 1);
 }
 
 #[test]

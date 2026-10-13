@@ -798,10 +798,17 @@ impl UiBlocks {
 /// One published service record in the runtime service directory (LUA-OQ-8).
 ///
 /// Published at activation from the provider manifest's `services.provided`
-/// entry (version and schemas) plus the generation capture (impl functions);
-/// version and schemas come from the manifest, never from Lua. The provider
-/// VM is held weakly: dispose drops the strong handle, so a stale consumer
-/// route upgrades to nothing and fails closed with `E_SERVICE_GONE`.
+/// entry (version, schemas, and backing capability heads) plus the generation
+/// capture (impl functions); version, schemas, and heads come from the
+/// manifest, never from Lua. The provider VM is held weakly: dispose drops
+/// the strong handle, so a stale consumer route upgrades to nothing and
+/// fails closed with `E_SERVICE_GONE`.
+///
+/// A provided interface projects only already-existing Core capability heads
+/// through a grant and never mints authority (dynapi gating, bitty#2005):
+/// the manifest declares the heads, activation rejects unbacked provisions
+/// and heads the provider was never granted, and consumers resolve only
+/// when their own grant covers every head.
 ///
 /// Cloned out of the directory before any VM invocation, so the directory
 /// borrow never spans a (potentially re-entrant) provider call.
@@ -824,11 +831,99 @@ pub struct ServiceRecord {
     pub args_schema: Option<String>,
     /// Optional JSON Schema for call results (manifest table form).
     pub result_schema: Option<String>,
+    /// Backing Core capability heads from the manifest's `services.provided`
+    /// entry (never empty on a published record; validated at install and
+    /// re-checked at record time).
+    pub heads: Vec<String>,
     /// Provider VM (weak: dispose invalidates without directory coordination).
     pub vm: Weak<RefCell<LuaVm>>,
     /// Set while the provider is suspended; suspended records resolve and
     /// serve nothing until resume republishes them in place.
     pub suspended: bool,
+}
+
+/// One brokered service call for the observability ledger (dynapi 4/4 input).
+///
+/// Recorded by the [`HostServices::service_call`] broker after every gate
+/// passes and before the provider VM runs: the provider owner plus the
+/// backing head(s) the call projects. Plain metadata only (no args, no
+/// results); the argv-first invocation, deadlines, and per-call budgets on
+/// the execution path itself are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCallRecord {
+    /// Providing plugin id that served the call.
+    pub provider: String,
+    /// Service interface name.
+    pub iface: String,
+    /// Called method name.
+    pub method: String,
+    /// Backing Core capability heads projected by this call.
+    pub heads: Vec<String>,
+}
+
+/// Bounded brokered-call ledger (`RC-8` rate governance; overflow drops newest).
+///
+/// Runtime-shared like [`ServiceDirectory`]: every generation's services hold
+/// the same handle, so the ledger spans plugins and survives reload. Entries
+/// are snapshots (no VM references); suspend/dispose never prune history.
+#[derive(Debug)]
+pub struct ServiceCallLedger {
+    items: VecDeque<ServiceCallRecord>,
+    capacity: usize,
+    dropped: u64,
+}
+
+/// Maximum brokered service calls retained for observability.
+///
+/// Precedent: the notification queue bounds one generation's async surface;
+/// the call ledger spans the runtime, so it keeps an order of magnitude
+/// more entries while staying headless-bounded.
+pub const SERVICE_CALL_LEDGER_CAPACITY: usize = 256;
+
+impl ServiceCallLedger {
+    /// Create a bounded ledger.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Record one dispatched call; returns whether it was retained.
+    pub fn push(&mut self, record: ServiceCallRecord) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(record);
+        true
+    }
+
+    /// Cloned retained calls in dispatch order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<ServiceCallRecord> {
+        self.items.iter().cloned().collect()
+    }
+
+    /// Number retained.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the ledger is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
 }
 
 /// Live per-runtime service directory (LUA-OQ-8).
@@ -1310,6 +1405,11 @@ pub struct PluginServices {
     service_provided: RefCell<Vec<ProvidedService>>,
     service_required: RefCell<Vec<(String, String)>>,
     service_directory: RefCell<Option<Rc<RefCell<ServiceDirectory>>>>,
+    /// Runtime-shared brokered-call ledger (dynapi observability input).
+    ///
+    /// Wired once at activation; without it calls still serve (the ledger
+    /// is observe-only) but nothing is recorded.
+    service_call_ledger: RefCell<Option<Rc<RefCell<ServiceCallLedger>>>>,
     command_directory: RefCell<Option<Rc<RefCell<CommandDirectory>>>>,
     debug_inspect: Cell<bool>,
     debug_trace: Cell<bool>,
@@ -1382,6 +1482,7 @@ impl PluginServices {
             service_provided: RefCell::new(Vec::new()),
             service_required: RefCell::new(Vec::new()),
             service_directory: RefCell::new(None),
+            service_call_ledger: RefCell::new(None),
             command_directory: RefCell::new(None),
             debug_inspect: Cell::new(false),
             debug_trace: Cell::new(false),
@@ -2070,6 +2171,30 @@ impl PluginServices {
         *self.service_directory.borrow_mut() = Some(directory);
     }
 
+    /// Attach the runtime-shared brokered-call ledger for this generation.
+    ///
+    /// Wired once at activation alongside the service directory. Observe-only:
+    /// a missing ledger never blocks a call, it only leaves the call
+    /// unrecorded.
+    pub fn set_service_call_ledger(&self, ledger: Rc<RefCell<ServiceCallLedger>>) {
+        *self.service_call_ledger.borrow_mut() = Some(ledger);
+    }
+
+    /// Whether this generation's activation grant snapshot covers every one
+    /// of `heads` (exact id match, no implication — the same rule as
+    /// [`Self::has_granted_capability`]).
+    ///
+    /// O(h log g) over the sorted snapshot (h heads, g grants).
+    #[must_use]
+    pub fn service_heads_covered(&self, heads: &[String]) -> bool {
+        let granted = self.granted_capabilities.borrow();
+        heads.iter().all(|head| {
+            granted
+                .binary_search_by(|granted| granted.as_str().cmp(head.as_str()))
+                .is_ok()
+        })
+    }
+
     /// Attach the runtime-shared command directory for this generation
     /// (CTX-1035).
     ///
@@ -2096,6 +2221,13 @@ impl PluginServices {
     /// Record this generation's own granted capability ids (activation
     /// snapshot) for the `grants` inspect target. Stored sorted and
     /// de-duplicated; other plugins' grants are never reachable.
+    ///
+    /// The snapshot is fixed at activation: a live grant-store revocation
+    /// takes effect for service gating at the next activation (a new
+    /// generation snapshots the new grant set), not mid-generation.
+    /// `service_resolve`/`service_call` re-check this snapshot on every
+    /// lookup and every call, so a generation renewed after revocation
+    /// fails closed immediately with no restart beyond re-activation.
     pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
         capabilities.sort();
         capabilities.dedup();
@@ -2841,19 +2973,39 @@ impl HostServices for PluginServices {
         if self.service_directory.borrow().is_none() {
             return Err(BridgeError::not_implemented("bitty.services.provide"));
         }
-        if self
+        let declared = self
             .service_provided
             .borrow()
             .iter()
-            .any(|service| service.iface == iface)
-        {
-            return Ok(());
+            .find(|service| service.iface == iface)
+            .cloned();
+        let Some(declared) = declared else {
+            return Err(BridgeError::new(
+                "validation",
+                "E_SERVICE_UNDECLARED",
+                format!("service '{iface}' is not declared in services.provided"),
+            ));
+        };
+        // Dynapi gating (bitty#2005): the provide projects the manifest's
+        // backing heads through this generation's grant. Unbacked provides
+        // are rejected with a naming diagnostic; heads this generation was
+        // never granted (head-spoofing) fail closed as capability denials.
+        // No new authority is minted anywhere on this path.
+        if declared.heads.is_empty() {
+            return Err(BridgeError::new(
+                "validation",
+                "E_SERVICE_UNDECLARED",
+                format!(
+                    "service '{iface}' declares no backing capability head (services.provided.{iface}.heads)"
+                ),
+            ));
         }
-        Err(BridgeError::new(
-            "validation",
-            "E_SERVICE_UNDECLARED",
-            format!("service '{iface}' is not declared in services.provided"),
-        ))
+        for head in &declared.heads {
+            if !self.service_heads_covered(std::slice::from_ref(head)) {
+                return Err(BridgeError::capability_denied(head.as_str()));
+            }
+        }
+        Ok(())
     }
 
     fn service_resolve(
@@ -2886,9 +3038,19 @@ impl HostServices for PluginServices {
         // version wins, ties break by provider id. Unparseable requirements
         // or versions satisfy nothing (fail-closed, same grammar as the
         // policy registry gate).
+        //
+        // Dynapi gating (bitty#2005): records whose backing heads this
+        // generation's grant does not cover are skipped as if absent, so an
+        // ungranted consume is indistinguishable from no provider
+        // (`E_SERVICE_RESOLUTION`, or nil when optional — the same posture
+        // as `bitty.env`, whose ungranted reads share the backend-absent
+        // code). No new authority is minted anywhere on this path.
         let mut best: Option<(Version, String, ServiceRecord)> = None;
         for record in directory.borrow().active_for(iface) {
             if !service_version_satisfies(&record.version, &effective) {
+                continue;
+            }
+            if !self.service_heads_covered(&record.heads) {
                 continue;
             }
             let Ok(version) = Version::parse(&record.version) else {
@@ -2953,6 +3115,18 @@ impl HostServices for PluginServices {
                 "service method '{iface}.{method}' is not published"
             )));
         }
+        // Dynapi gating (bitty#2005): the caller's grant is re-checked on
+        // every call, so a generation renewed after revocation fails closed
+        // here with no restart beyond re-activation. A revoked or never-held
+        // head shares the parked-provider code (`E_SERVICE_GONE`), so the
+        // denial is indistinguishable from the provider being gone. The
+        // argv-first invocation, deadlines, and per-call budgets below are
+        // unchanged; only authority is gated, never execution shape.
+        if !self.service_heads_covered(&record.heads) {
+            return Err(service_gone_error(format!(
+                "service '{iface}' is unavailable"
+            )));
+        }
         // Args cross as JSON and are validated before the provider runs, so
         // a schema violation never executes callee code.
         if let Some(schema) = &record.args_schema {
@@ -2964,6 +3138,18 @@ impl HostServices for PluginServices {
                     format!("service '{iface}.{method}' args do not satisfy the interface schema"),
                 ));
             }
+        }
+        // Broker observability (dynapi 4/4 input): record the provider owner
+        // plus the backing heads projected by this call. Only dispatched
+        // calls record (rejected calls never reach a provider). Observe-only:
+        // a missing or full ledger never blocks the call.
+        if let Some(ledger) = self.service_call_ledger.borrow().clone() {
+            ledger.borrow_mut().push(ServiceCallRecord {
+                provider: record.provider.clone(),
+                iface: record.iface.clone(),
+                method: method.to_string(),
+                heads: record.heads.clone(),
+            });
         }
         let vm = record
             .vm
@@ -5090,6 +5276,9 @@ mod tests {
         });
     }
 
+    /// Backing head shared by the service unit-test fixtures.
+    const TEST_HEAD: &str = "runtime.inspect";
+
     fn service_host() -> (Rc<RefCell<ServiceDirectory>>, PluginServices) {
         let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
         let host = services();
@@ -5100,9 +5289,11 @@ mod tests {
                 version: "1.0.0".to_string(),
                 args_schema: None,
                 result_schema: None,
+                heads: vec![TEST_HEAD.to_string()],
             }],
             vec![("calc.add".to_string(), ">=1.0".to_string())],
         );
+        host.set_granted_capabilities(vec![TEST_HEAD.to_string()]);
         (directory, host)
     }
 
@@ -5114,6 +5305,26 @@ mod tests {
         version: &str,
         methods: &[&str],
     ) {
+        publish_backed_record(
+            directory,
+            provider,
+            generation,
+            iface,
+            version,
+            methods,
+            &[TEST_HEAD],
+        );
+    }
+
+    fn publish_backed_record(
+        directory: &Rc<RefCell<ServiceDirectory>>,
+        provider: &str,
+        generation: u32,
+        iface: &str,
+        version: &str,
+        methods: &[&str],
+        heads: &[&str],
+    ) {
         directory.borrow_mut().publish(ServiceRecord {
             provider: provider.to_string(),
             generation,
@@ -5123,6 +5334,7 @@ mod tests {
             funcs: BTreeMap::new(),
             args_schema: None,
             result_schema: None,
+            heads: heads.iter().map(|head| (*head).to_string()).collect(),
             vm: Weak::new(),
             suspended: false,
         });
@@ -5141,6 +5353,147 @@ mod tests {
     }
 
     #[test]
+    fn provide_check_unbacked_rejected_with_naming_diagnostic() {
+        let (_, host) = service_host();
+        host.set_service_manifest(
+            vec![ProvidedService {
+                iface: "calc.raw".to_string(),
+                version: "1.0.0".to_string(),
+                args_schema: None,
+                result_schema: None,
+                heads: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        let error = host
+            .service_provide_check("calc.raw")
+            .expect_err("unbacked provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert!(error.message.contains("calc.raw"), "names the iface");
+        assert!(error.message.contains("heads"), "names the field");
+    }
+
+    #[test]
+    fn provide_check_ungranted_head_denied_without_new_authority() {
+        let (_, host) = service_host();
+        host.set_granted_capabilities(Vec::new());
+        let error = host
+            .service_provide_check("calc.add")
+            .expect_err("head-spoofing provide must fail");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.class, "runtime");
+        // The denial names the head, never a minted authority.
+        assert!(error.message.contains(TEST_HEAD));
+    }
+
+    #[test]
+    fn resolve_skips_records_whose_heads_are_uncovered() {
+        let (directory, host) = service_host();
+        publish_record(
+            &directory,
+            "xuepoo.granted",
+            1,
+            "calc.add",
+            "1.0.0",
+            &["add"],
+        );
+        publish_backed_record(
+            &directory,
+            "xuepoo.other",
+            1,
+            "calc.add",
+            "2.0.0",
+            &["add"],
+            &["workspace.read"],
+        );
+        // The higher version is unresolvable without its head: resolution
+        // serves the covered record, minting nothing.
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("resolution serves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.granted");
+
+        // With no covered record the failure is indistinguishable from
+        // absent: the same code as no provider, nil when optional.
+        host.set_granted_capabilities(Vec::new());
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("ungranted consume must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", None, true).expect("optional serves"),
+            None,
+            "ungranted optional consume resolves nil like an absent service"
+        );
+    }
+
+    #[test]
+    fn service_call_without_covering_grant_fails_closed_as_gone() {
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 7, "calc.add", "1.0.0", &["add"]);
+        host.set_granted_capabilities(Vec::new());
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("ungranted call must fail closed");
+        // Indistinguishable from a parked provider: same code, no head names.
+        assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn service_call_records_provider_owner_and_backing_heads() {
+        let (directory, host) = service_host();
+        let ledger = Rc::new(RefCell::new(ServiceCallLedger::new(
+            SERVICE_CALL_LEDGER_CAPACITY,
+        )));
+        host.set_service_call_ledger(ledger.clone());
+        publish_backed_record(
+            &directory,
+            "xuepoo.calc",
+            7,
+            "calc.add",
+            "1.0.0",
+            &["add"],
+            &[TEST_HEAD],
+        );
+        // No live VM behind the stashed record (Weak::new), so the call
+        // itself fails closed — but the broker records the dispatch first.
+        let _ =
+            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil);
+        let calls = ledger.borrow().calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider, "xuepoo.calc");
+        assert_eq!(calls[0].iface, "calc.add");
+        assert_eq!(calls[0].method, "add");
+        assert_eq!(calls[0].heads, vec![TEST_HEAD.to_string()]);
+        // Ungranted calls record nothing: the gate runs before the ledger.
+        host.set_granted_capabilities(Vec::new());
+        let _ =
+            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil);
+        assert_eq!(ledger.borrow().len(), 1);
+    }
+
+    #[test]
+    fn service_call_ledger_drops_newest_past_capacity() {
+        let mut ledger = ServiceCallLedger::new(2);
+        for method in ["a", "b"] {
+            assert!(ledger.push(ServiceCallRecord {
+                provider: "xuepoo.calc".to_string(),
+                iface: "calc.add".to_string(),
+                method: method.to_string(),
+                heads: vec![TEST_HEAD.to_string()],
+            }));
+        }
+        assert!(!ledger.push(ServiceCallRecord {
+            provider: "xuepoo.calc".to_string(),
+            iface: "calc.add".to_string(),
+            method: "c".to_string(),
+            heads: vec![TEST_HEAD.to_string()],
+        }));
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.dropped(), 1);
+        assert_eq!(ledger.calls()[1].method, "b");
+    }
+
+    #[test]
     fn provide_check_without_directory_is_not_implemented() {
         let host = services();
         host.set_service_manifest(
@@ -5149,6 +5502,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 args_schema: None,
                 result_schema: None,
+                heads: vec![TEST_HEAD.to_string()],
             }],
             Vec::new(),
         );
@@ -5359,6 +5713,7 @@ mod tests {
                     .to_string(),
             ),
             result_schema: None,
+            heads: vec![TEST_HEAD.to_string()],
             vm: Weak::new(),
             suspended: false,
         });

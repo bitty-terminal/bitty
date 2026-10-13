@@ -1036,13 +1036,18 @@ pub struct Runtime {
     notifications: bell::TerminalNotificationQueue,
     /// Bounded assembler for chunked Kitty `OSC 99` groups (CTX-1008).
     kitty_assembler: bell::KittyNotificationAssembler,
-    /// Defensive second rate cap from the platform bridge crate (CTX-1008).
+    /// Defensive second rate cap plus OS dispatch from the platform bridge
+    /// crate (CTX-1008, CTX-1178, issue #1998).
     ///
     /// Core enforces RC-8 in [`Self::bell_limiter`] before anything reaches
     /// the OS; this bridge re-caps so a misbehaving caller can never flood
-    /// the backend. Over-ceiling calls surface as rate drops, never queue
-    /// without bound. Backed by `NoopBackend` for the cap-only gate: real
-    /// delivery still flows through [`Self::notification_sink`].
+    /// the backend, then dispatches through the installed backend in the same
+    /// call: one rate/dispatch path for the notification stream.
+    /// Over-ceiling calls surface as rate drops, never queue without bound.
+    /// The default backend is fail-closed (`NoopBackend`): admitted
+    /// notifications still paint the in-grid banner while the OS miss is
+    /// counted. Real runs install the per-platform backend via
+    /// [`Self::install_platform_notification_backend`].
     notification_bridge: bitty_platform_services::NotificationBridge,
     /// Instant the visual bell flash was last admitted (bounded display).
     bell_flash_at: Option<std::time::Instant>,
@@ -1050,7 +1055,8 @@ pub struct Runtime {
     notification_banner: Option<(String, std::time::Instant)>,
     /// Count of OSC notification requests dropped because consent is absent.
     notifications_denied: u64,
-    /// Count of bell/notification events dropped by the `RC-8` limiter.
+    /// Count of bell/notification events dropped by the `RC-8` limiter, plus
+    /// OS hand-offs refused by the bridge defensive cap (CTX-1178).
     bell_rate_dropped: u64,
     /// OS hand-off for an admitted audible bell (CTX-0754, issue #1361).
     ///
@@ -1059,11 +1065,6 @@ pub struct Runtime {
     /// app installs [`bitty_platform::OsBellSink`] at startup for real
     /// runs; tests install a recording double.
     bell_sink: Option<Box<dyn bitty_platform::BellSink>>,
-    /// OS hand-off for an admitted terminal notification (CTX-0754).
-    ///
-    /// Same seam discipline as [`Self::bell_sink`]: `None` by default, the
-    /// app installs [`bitty_platform::OsNotificationSink`] for real runs.
-    notification_sink: Option<Box<dyn bitty_platform::NotificationSink>>,
     /// Admitted audible bell requests (`BellMode::Audible`/`Both`, past
     /// the `RC-8` limiter), whether or not a sink was installed.
     audible_bell_requests: u64,
@@ -1681,7 +1682,6 @@ impl Runtime {
             notifications_denied: 0,
             bell_rate_dropped: 0,
             bell_sink: None,
-            notification_sink: None,
             audible_bell_requests: 0,
             audible_bell_delivered: 0,
             audible_bell_undelivered: 0,
@@ -1942,7 +1942,6 @@ impl Runtime {
             notifications_denied: 0,
             bell_rate_dropped: 0,
             bell_sink: None,
-            notification_sink: None,
             audible_bell_requests: 0,
             audible_bell_delivered: 0,
             audible_bell_undelivered: 0,
@@ -2455,17 +2454,21 @@ impl Runtime {
         self.notifications_denied
     }
 
-    /// Count of bell/notification events dropped by the `RC-8` limiter.
+    /// Count of bell/notification events dropped by the `RC-8` limiter, plus
+    /// OS hand-offs refused by the bridge defensive cap (CTX-1178).
     #[must_use]
     pub const fn bell_rate_dropped(&self) -> u64 {
         self.bell_rate_dropped
     }
 
-    /// Over-ceiling events dropped by the bridge defensive cap (CTX-1008).
+    /// Over-ceiling events refused by the bridge defensive cap (CTX-1008,
+    /// CTX-1178).
     ///
     /// Core enforces RC-8 before the bridge runs, so this counter stays zero
-    /// in normal operation; it only advances when a caller bypasses RC-8 or
-    /// when both caps trip on the same flood.
+    /// in normal operation; it advances only when the defensive window
+    /// disagrees with RC-8 (mixed terminal-plus-plugin bursts inside one
+    /// second). Each refusal is also counted in [`Self::bell_rate_dropped`]
+    /// and [`Self::notifications_os_undelivered`].
     #[must_use]
     pub const fn notifications_bridge_dropped(&self) -> u64 {
         self.notification_bridge.rate_dropped()
@@ -2565,10 +2568,9 @@ impl Runtime {
     /// Kitty `OSC 99` (assembled) request (CTX-0577/CTX-1008). Returns `true`
     /// when the notification was admitted into the bounded queue.
     ///
-    /// An admitted notification is additionally handed to the installed
-    /// [`bitty_platform::NotificationSink`] at admission time (CTX-0754),
-    /// so desktop delivery never waits behind the one-banner-at-a-time
-    /// in-grid queue. Delivery is counted
+    /// An admitted notification is additionally handed to the platform bridge
+    /// at admission time (CTX-1178), so desktop delivery never waits behind
+    /// the one-banner-at-a-time in-grid queue. Delivery is counted
     /// ([`Self::notifications_os_delivered`] /
     /// [`Self::notifications_os_undelivered`]) and never blocks.
     pub(super) fn apply_notification_policy(
@@ -2584,27 +2586,6 @@ impl Runtime {
             self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
             return false;
         }
-        // Defensive second cap (CTX-1008): the bridge re-caps over-ceiling
-        // callers fail-closed even if RC-8 above is bypassed in a future
-        // refactor. The bridge holds a cap-only `NoopBackend`, so admission
-        // here never touches the OS; real delivery flows through
-        // `deliver_notification_to_os` below.
-        let title = notification
-            .title
-            .as_ref()
-            .map_or("", |title| title.as_str());
-        let bridge_notification =
-            bitty_platform_services::DesktopNotification::new(title, notification.body.as_str());
-        let bridge_outcome = self.notification_bridge.notify_parsed(&bridge_notification);
-        if matches!(
-            bridge_outcome,
-            bitty_platform_services::DeliveryOutcome::Skipped(
-                bitty_platform_services::SkipReason::RateLimited
-            )
-        ) {
-            self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
-            return false;
-        }
         // Show immediately when no banner is live, so an admitted
         // notification is never silently parked until a frame arrives; queue
         // it otherwise (the present path advances the queue on expiry).
@@ -2614,7 +2595,7 @@ impl Runtime {
             self.notifications.push(notification.clone())
         };
         if admitted {
-            self.deliver_notification_to_os(notification);
+            self.deliver_notification_to_os(notification, now);
         }
         admitted
     }
@@ -2655,8 +2636,8 @@ impl Runtime {
     /// [`crate::plugin_runtime::PluginRuntime::drain_notifications`] once per
     /// tick and feeds each entry here, so `bitty.notify.show` output (for
     /// example `devtools:plugins`) paints on a real host through the same
-    /// one-banner-at-a-time in-grid surface (plus the installed OS sink)
-    /// the terminal-originated notifications use. No consent gate: the
+    /// one-banner-at-a-time in-grid surface (plus the bridge-dispatched OS
+    /// hand-off) the terminal-originated notifications use. No consent gate: the
     /// `platform.notify` grant was already enforced when the plugin queued
     /// the entry, and safe mode never creates the originating VM.
     ///
@@ -2667,8 +2648,8 @@ impl Runtime {
     /// counted in [`Self::plugin_notifications_dropped`] (and in the shared
     /// [`Self::notifications_queue_dropped`]); empty-after-sanitize calls
     /// are refused without counting. Admitted notifications reach the OS
-    /// sink inline, counted delivered/undelivered exactly like the terminal
-    /// path and never blocking. Plugin text is untrusted display data:
+    /// through the platform bridge inline, counted delivered/undelivered
+    /// exactly like the terminal path and never blocking. Plugin text is untrusted display data:
     /// sanitized and single-line bounded before painting, never executed.
     pub fn admit_plugin_notification(
         &mut self,
@@ -2704,37 +2685,57 @@ impl Runtime {
             self.notifications.push(notification.clone())
         };
         if admitted {
-            self.deliver_notification_to_os(&notification);
+            self.deliver_notification_to_os(&notification, now);
         } else {
             self.plugin_notifications_dropped = self.plugin_notifications_dropped.saturating_add(1);
         }
         admitted
     }
 
-    /// Hands one admitted notification to the installed OS sink (CTX-0754).
+    /// Hands one admitted notification to the OS through the platform bridge
+    /// (CTX-1178, issue #1998): the single rate/dispatch path for the
+    /// notification stream.
     ///
-    /// Fail-closed: with no sink installed the notification still shows in
-    /// the bounded in-grid banner, and the miss is counted in
-    /// [`Self::notifications_os_undelivered`].
-    fn deliver_notification_to_os(&mut self, notification: &bitty_vt::Notification) {
+    /// Fail-closed: with the default fail-closed backend the notification
+    /// still shows in the bounded in-grid banner, and the miss is counted in
+    /// [`Self::notifications_os_undelivered`]. Over-ceiling events trip the
+    /// bridge defensive cap here and are additionally counted in
+    /// [`Self::bell_rate_dropped`]: the banner already admitted them under
+    /// Core `RC-8`, so only the OS hand-off is refused, never the in-app
+    /// surface.
+    fn deliver_notification_to_os(
+        &mut self,
+        notification: &bitty_vt::Notification,
+        now: std::time::Instant,
+    ) {
         let title = notification
             .title
             .as_ref()
             .map_or("", |title| title.as_str());
-        let os_notification =
-            bitty_platform::DesktopNotification::new(title, notification.body.as_str());
-        if os_notification.is_empty() {
+        let bridge_notification =
+            bitty_platform_services::DesktopNotification::new(title, notification.body.as_str());
+        if bridge_notification.is_empty() {
             return;
         }
         let outcome = self
-            .notification_sink
-            .as_ref()
-            .map(|sink| sink.deliver(&os_notification));
+            .notification_bridge
+            .notify_parsed_at(&bridge_notification, now);
         match outcome {
-            Some(bitty_platform::OsDeliveryOutcome::Delivered) => {
+            bitty_platform_services::DeliveryOutcome::Delivered => {
                 self.notifications_os_delivered = self.notifications_os_delivered.saturating_add(1);
             }
-            _ => {
+            bitty_platform_services::DeliveryOutcome::Skipped(
+                bitty_platform_services::SkipReason::RateLimited,
+            ) => {
+                self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
+                self.notifications_os_undelivered =
+                    self.notifications_os_undelivered.saturating_add(1);
+            }
+            bitty_platform_services::DeliveryOutcome::Skipped(_) => {
+                self.notifications_os_undelivered =
+                    self.notifications_os_undelivered.saturating_add(1);
+            }
+            bitty_platform_services::DeliveryOutcome::Failed(_) => {
                 self.notifications_os_undelivered =
                     self.notifications_os_undelivered.saturating_add(1);
             }
@@ -2749,15 +2750,27 @@ impl Runtime {
         self.bell_sink = sink;
     }
 
-    /// Installs the OS hand-off for admitted notifications (CTX-0754).
+    /// Installs the OS hand-off backend for admitted notifications (CTX-1178,
+    /// issue #1998).
     ///
-    /// Same seam discipline as [`Self::set_bell_sink`]: the app installs
-    /// [`bitty_platform::OsNotificationSink`] for real runs.
-    pub fn set_notification_sink(
+    /// Tests install a recording double; real runs install the per-platform
+    /// backend via [`Self::install_platform_notification_backend`].
+    /// Installing the fail-closed `NoopBackend` restores the default.
+    pub fn set_notification_backend(
         &mut self,
-        sink: Option<Box<dyn bitty_platform::NotificationSink>>,
+        backend: Box<dyn bitty_platform_services::NotificationBackend>,
     ) {
-        self.notification_sink = sink;
+        self.notification_bridge = bitty_platform_services::NotificationBridge::new(backend);
+    }
+
+    /// Installs the per-platform OS notification backend for real runs
+    /// (CTX-1178, issue #1998): Linux `notify-send`, macOS `osascript`,
+    /// fail-closed elsewhere until a scoped `ffi` decision lands.
+    ///
+    /// Headless and test-mode runs stay on the fail-closed default, so CI
+    /// and deterministic runs never touch the OS.
+    pub fn install_platform_notification_backend(&mut self) {
+        self.set_notification_backend(bitty_platform_services::platform_backend());
     }
 
     /// Admitted audible bell requests, whether or not a sink was installed.

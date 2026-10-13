@@ -24,6 +24,12 @@ pub const MAX_EVENT_TYPES: usize = 256;
 pub const MAX_FS_PATTERNS_PER_KIND: usize = 32;
 /// Maximum provided services.
 pub const MAX_PROVIDED_SERVICES: usize = 16;
+/// Maximum backing capability heads per provided service interface.
+///
+/// Precedent: [`MAX_PROVIDED_SERVICES`] (16) bounds the interface count; one
+/// interface projecting more than a handful of distinct Core heads is a
+/// design smell, so the per-interface head list is capped well below it.
+pub const MAX_SERVICE_BACKING_HEADS: usize = 8;
 /// Maximum required services.
 pub const MAX_REQUIRED_SERVICES: usize = 16;
 /// Maximum plugin dependencies.
@@ -1257,9 +1263,12 @@ impl PluginDependency {
 ///
 /// String form (`"iface" = "1.0.0"`) carries no schemas and is resolvable by
 /// non-schema consumers only. Table form
-/// (`"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}" }`)
-/// additionally declares the typed call shape; only table-form providers are
-/// resolvable by schema-validating consumers.
+/// (`"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}", heads = ["..."] }`)
+/// additionally declares the typed call shape plus the backing capability
+/// head(s); only table-form providers are resolvable by schema-validating
+/// consumers, and only backed providers (non-empty `heads`) record at all:
+/// a provided interface projects already-existing Core capability heads
+/// through a grant and never mints authority (dynapi gating, bitty#2005).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvidedService {
     /// Service interface name (dot-separated grammar).
@@ -1270,10 +1279,18 @@ pub struct ProvidedService {
     pub args_schema: Option<String>,
     /// Optional JSON Schema for call results.
     pub result_schema: Option<String>,
+    /// Backing Core capability head(s) this interface projects (distinct
+    /// closed capability ids, e.g. `network.connect`). Empty means unbacked:
+    /// the provide is rejected at install/record time with a naming
+    /// diagnostic. The provider must hold a grant for every head
+    /// (head-spoofing fails closed) and a consumer resolves only when its
+    /// own grant covers every head (ungranted consumes fail closed,
+    /// indistinguishable from absent).
+    pub heads: Vec<String>,
 }
 
 impl ProvidedService {
-    /// Validate interface name, version, and any declared schemas.
+    /// Validate interface name, version, any declared schemas, and backing heads.
     pub fn validate(&self) -> Result<(), PluginError> {
         validate_service_iface(&self.iface, "services.provided")?;
         validate_semver(&self.version, "services.provided")?;
@@ -1282,6 +1299,40 @@ impl ProvidedService {
         }
         if let Some(schema) = &self.result_schema {
             validate_interface_schema(schema, "services.provided.result_schema")?;
+        }
+        if self.heads.is_empty() {
+            return Err(PluginError::manifest(
+                "services.provided",
+                format!(
+                    "service '{}' declares no backing capability head (services.provided.{}.heads)",
+                    self.iface, self.iface
+                ),
+            ));
+        }
+        if self.heads.len() > MAX_SERVICE_BACKING_HEADS {
+            return Err(PluginError::LimitExceeded {
+                field: format!("services.provided.{}.heads", self.iface),
+                limit: MAX_SERVICE_BACKING_HEADS,
+                actual: self.heads.len(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for head in &self.heads {
+            if !seen.insert(head.clone()) {
+                return Err(PluginError::Duplicate {
+                    kind: "service backing head".to_string(),
+                    value: format!("{}.heads:{head}", self.iface),
+                });
+            }
+            if let Err(error) = CapabilityId::parse(head) {
+                return Err(PluginError::manifest(
+                    "services.provided",
+                    format!(
+                        "service '{}' backing head '{head}' is not a Core capability: {error}",
+                        self.iface
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -2093,7 +2144,7 @@ impl PluginManifest {
     /// Sorted, cross-platform, no wall-clock. Covers identity, compat, resolved
     /// capability set (including filesystem `fs.read:PARAM`/`fs.write:PARAM` expansion),
     /// dependencies (with per-edge prerelease opt-in), provided services (with
-    /// interface schemas), required services, Layer-2 `tools`
+    /// interface schemas and backing capability heads), required services, Layer-2 `tools`
     /// declarations, structured `network.egress` destinations, lazy command
     /// declarations (with schemas), and `[limits]`
     /// budgets. Used to bind grant records to the exact manifest
@@ -2151,18 +2202,32 @@ impl PluginManifest {
             buf.push(',');
         }
         buf.push('|');
-        // Services sorted (v5 segment: `iface=version` plus schema presence
-        // and content, so adding a schema re-binds grants).
+        // Services sorted (v5 segment: `iface=version:schemas:heads` plus
+        // schema presence and content plus backing heads, so adding a schema
+        // or a head re-binds grants).
         let mut svcs: Vec<String> = self
             .provided_services
             .iter()
             .map(|svc| {
+                let mut heads = svc.heads.clone();
+                heads.sort_unstable();
+                // Escape `+` inside heads before joining: params may contain
+                // `+`, so `fs.read:foo+runtime.inspect` (one head) must not
+                // hash like `fs.read:foo` + `runtime.inspect` (two heads).
+                // Heads always start with `[a-z]`, so `++`-escaping keeps the
+                // encoding unambiguous and grants stay bound to the exact set.
+                let encoded_heads = heads
+                    .iter()
+                    .map(|head| head.replace('+', "++"))
+                    .collect::<Vec<_>>()
+                    .join("+");
                 format!(
-                    "{}={}:{}:{}",
+                    "{}={}:{}:{}:{}",
                     svc.iface,
                     svc.version,
                     svc.args_schema.as_deref().unwrap_or(""),
-                    svc.result_schema.as_deref().unwrap_or("")
+                    svc.result_schema.as_deref().unwrap_or(""),
+                    encoded_heads
                 )
             })
             .collect();
@@ -3148,6 +3213,97 @@ mod tests {
         m.required_services
             .push(("markdown.render".to_string(), "^1.0".to_string()));
         assert!(m.validate().is_ok());
+    }
+
+    fn backed_service(iface: &str) -> ProvidedService {
+        ProvidedService {
+            iface: iface.to_string(),
+            version: "1.0.0".to_string(),
+            args_schema: None,
+            result_schema: None,
+            heads: vec!["runtime.inspect".to_string()],
+        }
+    }
+
+    #[test]
+    fn provided_services_require_backing_heads() {
+        // Backed provides validate.
+        let mut m = minimal_manifest("xuepoo.test");
+        m.provided_services.push(backed_service("markdown.render"));
+        assert!(m.validate().is_ok());
+
+        // Unbacked provides are rejected with a naming diagnostic.
+        let mut m = minimal_manifest("xuepoo.test");
+        m.provided_services.push(ProvidedService {
+            iface: "markdown.render".to_string(),
+            version: "1.0.0".to_string(),
+            args_schema: None,
+            result_schema: None,
+            heads: Vec::new(),
+        });
+        let err = m.validate().unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("markdown.render"), "names the iface: {text}");
+        assert!(text.contains("heads"), "names the field: {text}");
+    }
+
+    #[test]
+    fn provided_services_reject_unknown_duplicate_and_over_limit_heads() {
+        // Unknown (non-Core) head fails closed.
+        let mut m = minimal_manifest("xuepoo.test");
+        let mut svc = backed_service("markdown.render");
+        svc.heads = vec!["telemetry.exfiltrate".to_string()];
+        m.provided_services.push(svc);
+        let err = m.validate().unwrap_err();
+        assert!(format!("{err}").contains("markdown.render"));
+
+        // Duplicate heads fail closed.
+        let mut m = minimal_manifest("xuepoo.test");
+        let mut svc = backed_service("markdown.render");
+        svc.heads = vec!["runtime.inspect".to_string(), "runtime.inspect".to_string()];
+        m.provided_services.push(svc);
+        assert!(m.validate().is_err());
+
+        // Over-limit head lists fail closed.
+        let mut m = minimal_manifest("xuepoo.test");
+        let mut svc = backed_service("markdown.render");
+        svc.heads = vec!["runtime.inspect".to_string(); MAX_SERVICE_BACKING_HEADS + 1];
+        m.provided_services.push(svc);
+        let err = m.validate().unwrap_err();
+        assert!(format!("{err}").contains("heads"));
+
+        // Parameterized Core heads stay accepted (exact-match grant coverage).
+        let mut m = minimal_manifest("xuepoo.test");
+        let mut svc = backed_service("markdown.render");
+        svc.heads = vec!["process.spawn:git".to_string()];
+        m.provided_services.push(svc);
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn manifest_hash_covers_backing_heads() {
+        let mut m1 = minimal_manifest("xuepoo.test");
+        m1.provided_services.push(backed_service("markdown.render"));
+        let mut m2 = m1.clone();
+        m2.provided_services[0].heads = vec!["workspace.read".to_string()];
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
+        assert_eq!(m1.manifest_hash(), m1.clone().manifest_hash());
+    }
+
+    #[test]
+    fn manifest_hash_distinguishes_plus_in_head_from_head_separator() {
+        // One head containing `+` must not hash like two heads split at it.
+        let mut m1 = minimal_manifest("xuepoo.test");
+        let mut svc1 = backed_service("markdown.render");
+        svc1.heads = vec!["fs.read:foo+runtime.inspect".to_string()];
+        m1.provided_services.push(svc1);
+        let mut m2 = minimal_manifest("xuepoo.test");
+        let mut svc2 = backed_service("markdown.render");
+        svc2.heads = vec!["fs.read:foo".to_string(), "runtime.inspect".to_string()];
+        m2.provided_services.push(svc2);
+        assert!(m1.validate().is_ok());
+        assert!(m2.validate().is_ok());
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
     }
 
     #[test]

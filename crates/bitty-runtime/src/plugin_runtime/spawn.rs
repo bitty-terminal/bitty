@@ -125,12 +125,14 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use bitty_ipc::execution::{
     DEFAULT_EXEC_TIMEOUT_MS, EnvPolicy, EnvVar, ExecutionRequest, ExecutionResult,
     MAX_EXEC_ARG_BYTES, MAX_EXEC_ARGS, MAX_EXEC_ARGS_TOTAL_BYTES, MAX_EXEC_CLIENT_ID_BYTES,
     MAX_EXEC_ENV_VARS, MAX_EXEC_OUTPUT_BUDGET_BYTES, MAX_EXEC_TIMEOUT_MS, MAX_EXECUTABLE_BYTES,
+    MAX_TRACKED_EXECUTIONS,
 };
 use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
@@ -139,6 +141,7 @@ use bitty_plugin_host::tools::{
     ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
     is_tool_spawn_allowed, is_valid_tool_name,
 };
+use bitty_pty::TreeBackend;
 
 /// Panel-path per-stream output budget (`8 KiB`).
 ///
@@ -162,6 +165,14 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// yet ample for a killed child's pipes to close on every platform.
 const SPAWN_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Pipe drain chunk size (`8 KiB`).
+///
+/// One blocking read per drain iteration; matches the registry drain chunk
+/// and the `bitty-pty` read-chunk precedent, so neither side re-derives its
+/// own. Named (instead of an inline literal) so the seam policy below can
+/// own the number and the parity test can pin it.
+const SPAWN_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
+
 /// Maximum bytes of one host-authored bridge message (`E_SPAWN_*` reasons).
 ///
 /// Reuses the bounded human-message precedent
@@ -170,6 +181,369 @@ const SPAWN_BRIDGE_MESSAGE_BYTES: usize = bitty_ipc::devtools::MAX_ERROR_MESSAGE
 
 /// Scope guarding every spawn (always separate; requires elevation).
 pub const SPAWN_SCOPE: Scope = Scope::ProcessSpawn;
+
+// ── execution seam (CTX-1182, issue #1997) ──────────────────────────────────
+//
+// Core-owned spawn-execution seam: [`SpawnMechanicsPolicy`] adopts the
+// published execution sidecar contract numbers verbatim (supervisor poll,
+// drain chunk, tracked-outcome ceiling, output ceiling, typed-cancel grace),
+// [`SpawnKillScope`] mirrors `KillScope::for_backend`, and the
+// [`SpawnGeneration`] / [`SpawnHandle`] / [`SpawnCancelRequest`] /
+// [`SpawnCancelOutcome`] / [`SpawnCancelReceipt`] vocabulary mirrors the
+// generation-fenced typed cancel (`cancel_sidecar_typed`). The small-core
+// graph fence keeps Core from importing the execution crate directly, so
+// this module owns the copy and the parity tests below pin every number and
+// behavior against the contract; the composition root bridges this seam to
+// the execution implementation as follow-up work.
+//
+// Ownership boundaries (unchanged by this seam):
+// - Shape and allowlist gates ([`SpawnRequest::validate`], [`SpawnAuthorizer`])
+//   stay host-owned and are never re-derived here.
+// - One-shot kills are [`SpawnKillScope::DirectChild`]: no owned-tree backend
+//   is adopted for a synchronous spawn, so a grandchild holding a pipe is met
+//   by the bounded drain detach (partial output preserved), never by a tree
+//   kill. Long-lived supervision adopts the owned tree as follow-up work.
+// - A synchronous spawn has no live job to cancel: every cancel resolves on
+//   the spot (unknown id fails closed, stored outcome reports its terminal
+//   state). Generation fencing and live kills belong to the async supervisor
+//   follow-up; the vocabulary below exists so that follow-up needs no new
+//   Core vocabulary.
+// - The drain join stays `1 s` while the long-lived registry supervisor joins
+//   drains under a wider `5 s` bound: a one-shot spawn answers against its
+//   `30 s` ceiling, so the tighter bound keeps it total without changing the
+//   mechanism (concurrent bounded drain, bounded join, detach with partial).
+
+/// Bounded spawn-execution numbers the spawn surface enforces.
+///
+/// Every default is the shared contract number, adopted verbatim from the
+/// published execution sidecar contract where the two sides overlap (poll,
+/// drain chunk, tracked ceiling, output ceiling, cancel grace); the drain
+/// join keeps the one-shot `1 s` bound documented above. A host with an
+/// approved reason tunes one field while keeping the rest. Fields are public
+/// for that reason; use sites clamp defensively (`saturating_add` for the
+/// overflow spare), mirroring the drain below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnMechanicsPolicy {
+    /// Supervisor poll interval (`SPAWN_POLL_INTERVAL`, 10 ms).
+    pub poll_interval: Duration,
+    /// Pipe drain chunk (`SPAWN_DRAIN_CHUNK_BYTES`, 8 KiB).
+    pub drain_chunk_bytes: usize,
+    /// Bounded drain-join budget (`SPAWN_DRAIN_JOIN_TIMEOUT`, 1 s).
+    pub drain_join_timeout: Duration,
+    /// Tracked-outcome ceiling (`MAX_TRACKED_EXECUTIONS`, 64).
+    pub tracked_cap: usize,
+    /// Panel-path per-stream budget (`SPAWN_PANEL_OUTPUT_BUDGET`, 8 KiB).
+    pub panel_output_budget: usize,
+    /// Output budget ceiling (`MAX_EXEC_OUTPUT_BUDGET_BYTES`, 256 KiB).
+    pub output_budget_max: usize,
+    /// Largest grace a typed cancel request may carry (60 s).
+    pub cancel_grace_max_ms: u64,
+    /// Grace of a graceful-then-kill request (5 s).
+    pub cancel_grace_default_ms: u64,
+}
+
+impl SpawnMechanicsPolicy {
+    /// Contract numbers, matching the execution sidecar defaults exactly
+    /// except the documented one-shot drain-join bound.
+    #[must_use]
+    pub const fn core_defaults() -> Self {
+        Self {
+            poll_interval: SPAWN_POLL_INTERVAL,
+            drain_chunk_bytes: SPAWN_DRAIN_CHUNK_BYTES,
+            drain_join_timeout: SPAWN_DRAIN_JOIN_TIMEOUT,
+            tracked_cap: MAX_TRACKED_EXECUTIONS,
+            panel_output_budget: SPAWN_PANEL_OUTPUT_BUDGET,
+            output_budget_max: MAX_EXEC_OUTPUT_BUDGET_BYTES,
+            cancel_grace_max_ms: 60_000,
+            cancel_grace_default_ms: 5_000,
+        }
+    }
+
+    /// Bytes one drain retains for a `stream_budget`: the budget plus one
+    /// overflow spare so the service can detect overflow and mark
+    /// `truncated`. Saturates instead of wrapping at the address-space top.
+    #[must_use]
+    pub fn drain_retain_cap(&self, stream_budget: usize) -> usize {
+        stream_budget.saturating_add(1)
+    }
+}
+
+/// Kill scope a spawn cancel may request.
+///
+/// Mirrors `KillScope`: [`SpawnKillScope::DirectChild`] terminates the direct
+/// child only (the one-shot spawn scope; the caller owns the orphan gap via
+/// the bounded drain detach), while [`SpawnKillScope::OwnedTree`] terminates
+/// the whole owned process tree (long-lived supervision follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnKillScope {
+    /// Terminate the direct child only (fallback where no tree backend is
+    /// adopted; the caller owns the orphan gap).
+    DirectChild,
+    /// Terminate the whole owned process tree.
+    OwnedTree,
+}
+
+impl SpawnKillScope {
+    /// Scope the backend can honor: tree backends take
+    /// [`SpawnKillScope::OwnedTree`], [`TreeBackend::Unsupported`] degrades to
+    /// [`SpawnKillScope::DirectChild`]. Mirrors `KillScope::for_backend`.
+    #[must_use]
+    pub const fn for_tree_backend(backend: TreeBackend) -> Self {
+        match backend {
+            TreeBackend::Unsupported => Self::DirectChild,
+            TreeBackend::ProcessGroupPidfd
+            | TreeBackend::ProcessGroupKqueue
+            | TreeBackend::JobObject => Self::OwnedTree,
+        }
+    }
+
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectChild => "direct_child",
+            Self::OwnedTree => "owned_tree",
+        }
+    }
+}
+
+impl fmt::Display for SpawnKillScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Spawn generation: the host's handle generation, minted per spawn.
+///
+/// A handle carrying another generation is stale and the host rejects it
+/// (`StaleGeneration`). Mirrors the execution `ExecutionGeneration`: zero is
+/// never a generation, and the display is sixteen lowercase hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpawnGeneration(NonZeroU64);
+
+impl SpawnGeneration {
+    /// Wraps a raw generation; `None` for 0.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match NonZeroU64::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+
+    /// Raw generation value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for SpawnGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0.get())
+    }
+}
+
+/// Host handle for one spawn: execution id plus generation.
+///
+/// The id is the synchronous spawn's `execution_id` (zero is a valid id in
+/// the one-shot space); the generation fences stale cancels. Mirrors the
+/// execution `ExecutionHandle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpawnHandle {
+    /// Spawn execution id.
+    pub id: u64,
+    /// Generation the handle was minted with.
+    pub generation: SpawnGeneration,
+}
+
+/// How the host stops a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelMode {
+    /// Deliver a graceful stop request, then wait up to the grace period;
+    /// never escalates. A spawn still running afterwards keeps running.
+    Graceful,
+    /// Kill the owned scope now.
+    Immediate,
+    /// Graceful stop, wait, then kill the owned scope.
+    GracefulThenKill,
+}
+
+impl SpawnCancelMode {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Immediate => "immediate",
+            Self::GracefulThenKill => "graceful_then_kill",
+        }
+    }
+
+    /// Escalation rank: a later request with a higher rank upgrades a cancel
+    /// already executing; equal or lower ranks coalesce into it.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Graceful => 0,
+            Self::GracefulThenKill => 1,
+            Self::Immediate => 2,
+        }
+    }
+}
+
+/// A typed spawn-cancel request.
+///
+/// Carries the handle (id plus generation the host checks itself), the mode,
+/// and the grace period per graceful step. Mirrors the execution
+/// `CancelRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnCancelRequest {
+    handle: SpawnHandle,
+    mode: SpawnCancelMode,
+    grace: Duration,
+}
+
+impl SpawnCancelRequest {
+    /// Builds a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` when `grace` exceeds the policy maximum
+    /// (`cancel_grace_max_ms`). A zero grace is allowed: graceful steps then
+    /// only check whether the spawn already stopped.
+    pub fn new(
+        handle: SpawnHandle,
+        mode: SpawnCancelMode,
+        grace: Duration,
+    ) -> Result<Self, IpcError> {
+        let max_ms = SpawnMechanicsPolicy::core_defaults().cancel_grace_max_ms;
+        if grace > Duration::from_millis(max_ms) {
+            return Err(IpcError::LimitExceeded {
+                field: "spawn cancel grace".into(),
+                limit: max_ms as usize,
+                actual: grace.as_millis().min(usize::MAX as u128) as usize,
+            });
+        }
+        Ok(Self {
+            handle,
+            mode,
+            grace,
+        })
+    }
+
+    /// An [`SpawnCancelMode::Immediate`] request (no grace).
+    #[must_use]
+    pub const fn immediate(handle: SpawnHandle) -> Self {
+        Self {
+            handle,
+            mode: SpawnCancelMode::Immediate,
+            grace: Duration::ZERO,
+        }
+    }
+
+    /// A [`SpawnCancelMode::GracefulThenKill`] request with the policy
+    /// default grace.
+    #[must_use]
+    pub const fn graceful_then_kill(handle: SpawnHandle) -> Self {
+        Self {
+            handle,
+            mode: SpawnCancelMode::GracefulThenKill,
+            grace: Duration::from_millis(
+                SpawnMechanicsPolicy::core_defaults().cancel_grace_default_ms,
+            ),
+        }
+    }
+
+    /// Handle the request targets.
+    #[must_use]
+    pub const fn handle(&self) -> SpawnHandle {
+        self.handle
+    }
+
+    /// Requested mode.
+    #[must_use]
+    pub const fn mode(&self) -> SpawnCancelMode {
+        self.mode
+    }
+
+    /// Grace period per graceful step.
+    #[must_use]
+    pub const fn grace(&self) -> Duration {
+        self.grace
+    }
+}
+
+/// Typed result of one spawn-cancel request.
+///
+/// Mirrors the execution `CancelOutcome` so the async follow-up needs no new
+/// vocabulary: a stale generation changes nothing, a terminal spawn answers
+/// without touching anything, and a graceful-only request may leave the
+/// spawn running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelOutcome {
+    /// The request landed before the process existed; nothing ran.
+    CancelledBeforeStart,
+    /// The spawn exited within a grace period after a graceful stop request.
+    CancelledGracefully,
+    /// The host killed the owned scope and reaped the spawn.
+    Killed,
+    /// The spawn had already reached a terminal outcome; nothing changed.
+    AlreadyExited,
+    /// The kernel refused the stop signal; the spawn keeps running.
+    PermissionDenied,
+    /// The handle's generation is not the spawn's; nothing changed.
+    StaleGeneration,
+    /// A graceful-only request was delivered, but the spawn still runs after
+    /// the grace period (no escalation was asked for).
+    StillRunning,
+    /// No graceful stop exists for this spawn on this platform (no owned-tree
+    /// backend); nothing was sent. Use an escalating mode to stop it.
+    Unsupported,
+    /// The host could not determine what the request did.
+    Unknown,
+}
+
+impl SpawnCancelOutcome {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelledBeforeStart => "cancelled_before_start",
+            Self::CancelledGracefully => "cancelled_gracefully",
+            Self::Killed => "killed",
+            Self::AlreadyExited => "already_exited",
+            Self::PermissionDenied => "permission_denied",
+            Self::StaleGeneration => "stale_generation",
+            Self::StillRunning => "still_running",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for SpawnCancelOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Immediate answer to a spawn-cancel request.
+///
+/// Mirrors the execution `CancelReceipt`: accepted requests execute and
+/// resolve exactly once, while stale or terminal handles answer on the spot
+/// without touching the spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelReceipt {
+    /// Accepted: the host executes it and resolves exactly once. Requests
+    /// arriving while a cancel executes coalesce into it (a stronger mode
+    /// escalates it).
+    Accepted,
+    /// Answered on the spot without touching the spawn
+    /// ([`SpawnCancelOutcome::AlreadyExited`] or
+    /// [`SpawnCancelOutcome::StaleGeneration`]).
+    Resolved(SpawnCancelOutcome),
+}
 
 // ── request ─────────────────────────────────────────────────────────────────
 
@@ -829,7 +1203,8 @@ pub(crate) fn spawn_process(
     // bounded join can still return partial output when a grandchild inherits
     // the pipe and holds EOF open forever.
     use std::sync::{Arc, Mutex};
-    let cap = request.effective_stream_budget().saturating_add(1);
+    let cap =
+        SpawnMechanicsPolicy::core_defaults().drain_retain_cap(request.effective_stream_budget());
     let stdout_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut stdout_thread = match guard.child_mut().stdout.take() {
@@ -984,7 +1359,7 @@ pub(crate) fn spawn_process(
                     effect_state: EffectState::Unknown,
                 });
             }
-            None => std::thread::sleep(SPAWN_POLL_INTERVAL),
+            None => std::thread::sleep(SpawnMechanicsPolicy::core_defaults().poll_interval),
         }
     }
 }
@@ -1146,7 +1521,7 @@ fn drain_bounded_shared(
     cap: usize,
     shared: &std::sync::Mutex<Vec<u8>>,
 ) {
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; SPAWN_DRAIN_CHUNK_BYTES];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break,
@@ -1189,7 +1564,8 @@ fn join_drain_bounded(
     handle: std::thread::JoinHandle<()>,
     shared: &std::sync::Mutex<Vec<u8>>,
 ) -> (Vec<u8>, bool) {
-    let deadline = std::time::Instant::now() + SPAWN_DRAIN_JOIN_TIMEOUT;
+    let deadline =
+        std::time::Instant::now() + SpawnMechanicsPolicy::core_defaults().drain_join_timeout;
     loop {
         if handle.is_finished() {
             let _ = handle.join();
@@ -1201,7 +1577,7 @@ fn join_drain_bounded(
             drop(handle);
             return (clone_shared(shared), true);
         }
-        std::thread::sleep(SPAWN_POLL_INTERVAL);
+        std::thread::sleep(SpawnMechanicsPolicy::core_defaults().poll_interval);
     }
 }
 
@@ -1406,7 +1782,7 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
         next_id.set(id.saturating_add(1));
         let request = SpawnRequest::new("git", args.to_vec())
             .with_timeout_ms(DEFAULT_EXEC_TIMEOUT_MS)
-            .with_output_budget(SPAWN_PANEL_OUTPUT_BUDGET)
+            .with_output_budget(SpawnMechanicsPolicy::core_defaults().panel_output_budget)
             .with_allow_effects(true);
         match service
             .borrow_mut()
@@ -2045,6 +2421,171 @@ mod tests {
     fn spawn_scope_is_process_spawn() {
         assert_eq!(SPAWN_SCOPE, Scope::ProcessSpawn);
         assert_eq!(SPAWN_PANEL_OUTPUT_BUDGET, 8 * 1024);
+    }
+
+    #[test]
+    fn spawn_mechanics_policy_core_defaults_match_the_contract() {
+        // CTX-1182 parity: every field adopts the published execution
+        // contract default verbatim, except the documented one-shot
+        // drain-join bound. The contract lives outside this repository, so
+        // the numbers are pinned here field by field; any contract change
+        // must update both.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.poll_interval, Duration::from_millis(10));
+        assert_eq!(policy.drain_chunk_bytes, 8 * 1024);
+        assert_eq!(policy.drain_join_timeout, Duration::from_secs(1));
+        assert_eq!(policy.tracked_cap, 64);
+        assert_eq!(policy.panel_output_budget, 8 * 1024);
+        assert_eq!(policy.output_budget_max, 256 * 1024);
+        assert_eq!(policy.cancel_grace_max_ms, 60_000);
+        assert_eq!(policy.cancel_grace_default_ms, 5_000);
+    }
+
+    #[test]
+    fn spawn_mechanics_policy_agrees_with_core_sources() {
+        // The Core constants stay the canonical source; the policy only
+        // routes through them, so drift in either direction fails here.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.poll_interval, super::SPAWN_POLL_INTERVAL);
+        assert_eq!(policy.drain_chunk_bytes, super::SPAWN_DRAIN_CHUNK_BYTES);
+        assert_eq!(policy.drain_join_timeout, super::SPAWN_DRAIN_JOIN_TIMEOUT);
+        assert_eq!(policy.tracked_cap, MAX_TRACKED_EXECUTIONS);
+        assert_eq!(policy.tracked_cap, bitty_ipc::channel::MAX_PENDING_REQUESTS);
+        assert_eq!(policy.panel_output_budget, SPAWN_PANEL_OUTPUT_BUDGET);
+        assert_eq!(policy.output_budget_max, MAX_EXEC_OUTPUT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn spawn_drain_retain_cap_adds_the_overflow_spare() {
+        // The drain retains budget + 1 bytes so the service can detect
+        // overflow and mark truncated; the spare saturates at the top.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.drain_retain_cap(0), 1);
+        assert_eq!(policy.drain_retain_cap(16), 17);
+        assert_eq!(policy.drain_retain_cap(16 * 1024), 16 * 1024 + 1);
+        assert_eq!(policy.drain_retain_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn spawn_kill_scope_matches_the_tree_backend() {
+        // Contract mapping: tree backends take the owned tree, otherwise
+        // only the direct child is reachable and the gap stays surfaced.
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::ProcessGroupPidfd),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::ProcessGroupKqueue),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::JobObject),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::Unsupported),
+            SpawnKillScope::DirectChild
+        );
+        for backend in [
+            TreeBackend::ProcessGroupPidfd,
+            TreeBackend::ProcessGroupKqueue,
+            TreeBackend::JobObject,
+            TreeBackend::Unsupported,
+        ] {
+            assert_eq!(
+                backend.kills_owned_tree(),
+                SpawnKillScope::for_tree_backend(backend) == SpawnKillScope::OwnedTree,
+                "{backend} capability must agree with its kill scope"
+            );
+        }
+        assert_eq!(SpawnKillScope::DirectChild.as_str(), "direct_child");
+        assert_eq!(SpawnKillScope::OwnedTree.as_str(), "owned_tree");
+        assert_eq!(SpawnKillScope::OwnedTree.to_string(), "owned_tree");
+    }
+
+    #[test]
+    fn spawn_cancel_grace_is_bounded() {
+        let generation = SpawnGeneration::from_raw(7).expect("generation");
+        let handle = SpawnHandle { id: 1, generation };
+        assert!(
+            SpawnCancelRequest::new(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(60_000)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            SpawnCancelRequest::new(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(60_001)
+            ),
+            Err(IpcError::LimitExceeded { .. })
+        ));
+        assert!(
+            SpawnCancelRequest::new(handle, SpawnCancelMode::GracefulThenKill, Duration::ZERO)
+                .is_ok()
+        );
+        let immediate = SpawnCancelRequest::immediate(handle);
+        assert_eq!(immediate.mode(), SpawnCancelMode::Immediate);
+        assert_eq!(immediate.grace(), Duration::ZERO);
+        assert_eq!(immediate.handle(), handle);
+        assert_eq!(
+            SpawnCancelRequest::graceful_then_kill(handle).grace(),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn spawn_cancel_escalation_ranks_order_the_modes() {
+        assert!(SpawnCancelMode::Graceful.rank() < SpawnCancelMode::GracefulThenKill.rank());
+        assert!(SpawnCancelMode::GracefulThenKill.rank() < SpawnCancelMode::Immediate.rank());
+    }
+
+    #[test]
+    fn spawn_generation_zero_is_not_a_generation() {
+        assert!(SpawnGeneration::from_raw(0).is_none());
+        assert_eq!(
+            SpawnGeneration::from_raw(9).map(SpawnGeneration::get),
+            Some(9)
+        );
+        let generation = SpawnGeneration::from_raw(7).expect("generation");
+        assert_eq!(generation.to_string(), format!("{:016x}", 7u64));
+    }
+
+    #[test]
+    fn spawn_cancel_names_are_stable() {
+        assert_eq!(SpawnCancelMode::Graceful.as_str(), "graceful");
+        assert_eq!(SpawnCancelMode::Immediate.as_str(), "immediate");
+        assert_eq!(
+            SpawnCancelMode::GracefulThenKill.as_str(),
+            "graceful_then_kill"
+        );
+        let outcomes = [
+            (
+                SpawnCancelOutcome::CancelledBeforeStart,
+                "cancelled_before_start",
+            ),
+            (
+                SpawnCancelOutcome::CancelledGracefully,
+                "cancelled_gracefully",
+            ),
+            (SpawnCancelOutcome::Killed, "killed"),
+            (SpawnCancelOutcome::AlreadyExited, "already_exited"),
+            (SpawnCancelOutcome::PermissionDenied, "permission_denied"),
+            (SpawnCancelOutcome::StaleGeneration, "stale_generation"),
+            (SpawnCancelOutcome::StillRunning, "still_running"),
+            (SpawnCancelOutcome::Unsupported, "unsupported"),
+            (SpawnCancelOutcome::Unknown, "unknown"),
+        ];
+        for (outcome, name) in outcomes {
+            assert_eq!(outcome.as_str(), name);
+        }
+        assert_eq!(
+            SpawnCancelOutcome::StaleGeneration.to_string(),
+            "stale_generation"
+        );
     }
 
     #[test]

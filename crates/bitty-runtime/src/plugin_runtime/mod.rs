@@ -72,9 +72,10 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
     MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PanelPinHandler,
-    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedWorkspaceRequest,
-    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, UiAccess, UiBlock, UiBlocks,
-    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedThemeRequest,
+    QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource,
+    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -112,6 +113,15 @@ pub const WORKSPACE_REQUEST_QUEUE_CAPACITY: usize = 2 * WORKSPACE_LIST_MAX_ITEMS
 /// legitimate burst (one intent per panel per tick across the window).
 /// Overflow drops the newest intent and the Lua call returns `false`.
 pub const PANEL_PIN_QUEUE_CAPACITY: usize = 64;
+
+/// Bound on queued `bitty.theme.preview`/`confirm` intents across all plugins
+/// between two app ticks (CTX-1169, issue #1976).
+///
+/// Same governance as [`PANEL_PIN_QUEUE_CAPACITY`]: theme changes are rare
+/// (one preview or confirm per user gesture), so 16 holds a legitimate
+/// variant-generation burst while a hostile loop still cannot queue unbounded
+/// work. Overflow drops the newest intent and the Lua call returns `false`.
+pub const THEME_REQUEST_QUEUE_CAPACITY: usize = 16;
 
 /// Event-kind prefix of the workspace domain (CTX-0889, ADR-0014).
 ///
@@ -588,6 +598,25 @@ pub struct PluginRuntime {
     /// Core-owned ring pulse; refused, instant, or vanished intents drop
     /// with state untouched.
     fx_requests: Rc<RefCell<FxPulseQueue>>,
+    /// CTX-1169: approved wallpaper roots for `bitty.image.read`, seeded
+    /// from the live `background_image_roots` through
+    /// [`PluginRuntime::set_image_roots`]. Shared with activated generations
+    /// that hold `platform.image-file` only; empty (including `--safe`,
+    /// whose effective config clears the roots) denies every read.
+    image_roots: Vec<PathBuf>,
+    /// CTX-1169: bounded queue of `bitty.theme.preview`/`confirm` intents,
+    /// drained by the application each tick
+    /// ([`PluginRuntime::drain_theme_requests`]). The drain live-applies
+    /// previews through `Runtime::set_theme_palette` and commits confirms
+    /// through the persist backend first, so a preview can never persist.
+    theme_requests: Rc<RefCell<ThemeRequestQueue>>,
+    /// CTX-1169: durable-commit backend behind confirmed colorschemes.
+    ///
+    /// `None` by default (no persist configured): confirms drain to a
+    /// warning with state untouched, mirroring the pin-backend pattern.
+    /// Replaceable through [`PluginRuntime::set_theme_persist_backend`] so
+    /// durability and failure can be injected deterministically.
+    theme_persist_backend: Option<ThemePersistHandler>,
     /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
@@ -656,6 +685,11 @@ impl PluginRuntime {
             panel_pin_backend: None,
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
+            image_roots: Vec::new(),
+            theme_requests: Rc::new(RefCell::new(ThemeRequestQueue::new(
+                THEME_REQUEST_QUEUE_CAPACITY,
+            ))),
+            theme_persist_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
@@ -780,6 +814,31 @@ impl PluginRuntime {
         self.panel_pin_backend = backend;
     }
 
+    /// Seed the approved wallpaper roots for `bitty.image.read` (CTX-1169,
+    /// issue #1976). Call before activation with the live
+    /// `background_image_roots`; each generation captures the roots when its
+    /// services are built, and only when `platform.image-file` is granted
+    /// (no roots without grant). Empty (including `--safe`) denies every
+    /// read.
+    pub fn set_image_roots(&mut self, roots: Vec<PathBuf>) {
+        self.image_roots = roots;
+    }
+
+    /// Install the durable-commit backend for confirmed colorschemes
+    /// (CTX-1169, issue #1976). Call before or after activation: the drain
+    /// reads the current backend on every tick, so rotation never strands a
+    /// queued confirm. `None` leaves confirms failing closed at drain time
+    /// with state untouched.
+    pub fn set_theme_persist_backend(&mut self, backend: Option<ThemePersistHandler>) {
+        self.theme_persist_backend = backend;
+    }
+
+    /// Current durable-commit backend for confirmed colorschemes, if any.
+    #[must_use]
+    pub fn theme_persist_backend(&self) -> Option<ThemePersistHandler> {
+        self.theme_persist_backend.clone()
+    }
+
     /// Drain queued `bitty.workspace.*` mutations in FIFO order (CTX-0889).
     ///
     /// The application applies each request on its own thread through the
@@ -845,6 +904,33 @@ impl PluginRuntime {
     #[must_use]
     pub fn fx_requests_dropped(&self) -> u64 {
         self.fx_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared theme intent queue handle (CTX-1169, issue #1976).
+    ///
+    /// Shared with every activated generation that holds `runtime.configure`,
+    /// so granted `preview`/`confirm` calls from those generations enqueue
+    /// here. Diagnostics and tests read the live queue through this handle.
+    #[must_use]
+    pub fn theme_queue(&self) -> &Rc<RefCell<ThemeRequestQueue>> {
+        &self.theme_requests
+    }
+
+    /// Drain queued `bitty.theme.preview`/`confirm` intents in FIFO order
+    /// (CTX-1169, issue #1976).
+    ///
+    /// The application applies each intent on its own thread: previews
+    /// through `Runtime::set_theme_palette` with no durable write, confirms
+    /// through the persist backend first and `set_theme_palette` only on
+    /// commit success. Bounded by [`THEME_REQUEST_QUEUE_CAPACITY`].
+    pub fn drain_theme_requests(&mut self) -> Vec<QueuedThemeRequest> {
+        self.theme_requests.borrow_mut().drain()
+    }
+
+    /// Theme intents dropped by queue overflow since creation.
+    #[must_use]
+    pub fn theme_requests_dropped(&self) -> u64 {
+        self.theme_requests.borrow().dropped()
     }
 
     /// Runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -1258,6 +1344,16 @@ impl PluginRuntime {
         let workspace_control = granted
             .iter()
             .any(|capability| capability.as_str() == "workspace.control");
+        // CTX-1169 (issue #1976): the colorscheme grants are independent
+        // (image input never implies theme output). Both ride closed heads
+        // that already exist in the capability grammar with zero prior
+        // implementation; wiring them here changes no other verb.
+        let image_file = granted
+            .iter()
+            .any(|capability| capability.as_str() == "platform.image-file");
+        let runtime_configure = granted
+            .iter()
+            .any(|capability| capability.as_str() == "runtime.configure");
         // CTX-0889 fail-closed: declaring a `workspace.*` event kind (which
         // admits both subscription and `debug.trace` observation) requires
         // `workspace.read`. Reject before any VM exists instead of letting
@@ -1360,6 +1456,20 @@ impl PluginRuntime {
         // granted call fails closed with `E_NOT_IMPLEMENTED`.
         if panel_focus {
             plugin_services.set_fx_queue(Some(self.fx_requests.clone()));
+        }
+        // CTX-1169 (issue #1976): the colorscheme backends. Roots ride only
+        // with `platform.image-file` generations and the theme queue only
+        // with `runtime.configure` generations (no backend without grant);
+        // the call-time grant gates stay as the second layer. The persist
+        // backend is read at drain time, so it needs no per-generation
+        // capture here.
+        plugin_services.set_image_access(image_file);
+        if image_file {
+            plugin_services.set_image_roots(Some(self.image_roots.clone()));
+        }
+        plugin_services.set_theme_access(runtime_configure);
+        if runtime_configure {
+            plugin_services.set_theme_queue(Some(self.theme_requests.clone()));
         }
         plugin_services.set_granted_capabilities(
             granted

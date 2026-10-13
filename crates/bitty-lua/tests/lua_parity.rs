@@ -144,6 +144,11 @@ fn parity_namespaces_present_with_accepted_spellings() {
             assert(type(bitty.panel.get_state) == "function")
             assert(type(bitty.fx) == "table")
             assert(type(bitty.fx.pulse) == "function")
+            assert(type(bitty.image) == "table")
+            assert(type(bitty.image.read) == "function")
+            assert(type(bitty.theme) == "table")
+            assert(type(bitty.theme.preview) == "function")
+            assert(type(bitty.theme.confirm) == "function")
         "#,
         )
         .expect("execute");
@@ -168,6 +173,11 @@ fn parity_tables_are_read_only() {
         "bitty.panel.create = 1",
         "bitty.fx = {}",
         "bitty.fx.pulse = 1",
+        "bitty.image = {}",
+        "bitty.image.read = 1",
+        "bitty.theme = {}",
+        "bitty.theme.preview = 1",
+        "bitty.theme.confirm = 1",
     ] {
         let outcome = vm.execute_bounded(chunk).expect("execute");
         assert!(

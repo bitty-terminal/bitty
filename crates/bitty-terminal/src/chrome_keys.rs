@@ -6289,6 +6289,160 @@ claims = []
     }
 
     #[test]
+    fn ctx1183_toggle_palette_chord_opens_palette_overlay() {
+        // CTX-1183 (issue #1966): end-to-end through the real intercept. A
+        // user `ctrl+shift+p -> toggle_palette` chord dispatches the palette
+        // plugin toggle, the toggle acquires the focusable overlay, and the
+        // next tick surfaces the block for present. The CTX-1143 dispatch
+        // proof used a stub command that never acquired; this chord proof
+        // requires the capture plus the surfaced overlay block.
+        use crate::composer_owner::fixture;
+        const OWNER: &str = "bitty-terminal.palette";
+        let root = fixture::temp_dir("ctx1183-palette-chord");
+        let plugin = root.join(OWNER);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{OWNER}\"\nname = \"Palette Test\"\nversion = \"0.0.1\"\n\
+                 description = \"palette chord test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\nui.overlay.focus = true\n\n\
+                 [lazy]\ncommands = [\"{OWNER}:toggle\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "bitty.commands.register({\n\
+             \x20 id = \"toggle\",\n\
+             \x20 title = \"Palette: toggle\",\n\
+             \x20 run = function(_args)\n\
+             \x20 \x20 local handle = bitty.ui.overlay.acquire({ title = \"Palette\", placeholder = \"Filter commands\" })\n\
+             \x20 \x20 bitty.ui.overlay.update(handle, { kind = \"List\", children = {\n\
+             \x20 \x20 \x20 { kind = \"Text\", text = \"Palette\" },\n\
+             \x20 \x20 \x20 { kind = \"Text\", text = \"entry-one\" },\n\
+             \x20 \x20 } })\n\
+             \x20 \x20 return 1\n\
+             \x20 end,\n\
+             })\n\
+             return {}\n",
+        )
+        .expect("init");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: vec![bitty_config::KeymapEntry {
+                chord: "ctrl+shift+p".into(),
+                action: "toggle_palette".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert!(!app.overlay_capture_active(), "no capture before the chord");
+        assert!(!drive_chrome(&mut app, mods_event(true, true)));
+        assert!(
+            drive_chrome(&mut app, char_press("P", "P", false)),
+            "the bound palette chord is chrome-owned"
+        );
+        assert!(
+            app.overlay_capture_active(),
+            "the toggle must hold the focusable capture after dispatch"
+        );
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the tick must surface the palette block for present"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctx1183_open_composer_chord_opens_composer_overlay() {
+        // CTX-1183 (issue #1966): end-to-end through the real intercept. A
+        // user `alt+e -> open_composer` chord dispatches the composer plugin
+        // open, the open acquires the focusable overlay, and the next tick
+        // surfaces the block for present. Headed evidence showed the dispatch
+        // banner (`{ok=true}`) with no modal; this chord proof requires the
+        // capture plus the surfaced overlay block.
+        use crate::composer_owner::{
+            COMPOSER_COMMAND_OPEN, COMPOSER_PLUGIN_ID, COMPOSER_REQUIRED_CAPABILITIES,
+            ComposerOwner, fixture,
+        };
+        let root = fixture::temp_dir("ctx1183-composer-chord");
+        let plugin = root.join(COMPOSER_PLUGIN_ID);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let caps = COMPOSER_REQUIRED_CAPABILITIES
+            .iter()
+            .map(|c| format!("{c} = true"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{COMPOSER_PLUGIN_ID}\"\nname = \"Composer Test\"\nversion = \"0.0.1\"\n\
+                 description = \"composer chord test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n{caps}\n\n\
+                 [lazy]\ncommands = [\"{COMPOSER_PLUGIN_ID}:{COMPOSER_COMMAND_OPEN}\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "bitty.commands.register({\n\
+             \x20 id = \"open\",\n\
+             \x20 title = \"Composer: open\",\n\
+             \x20 run = function(_args)\n\
+             \x20 \x20 local handle = bitty.ui.overlay.acquire({ title = \"Composer\", placeholder = \"Type a command\" })\n\
+             \x20 \x20 bitty.ui.overlay.update(handle, { kind = \"List\", children = {\n\
+             \x20 \x20 \x20 { kind = \"Text\", text = \"Composer\" },\n\
+             \x20 \x20 \x20 { kind = \"Text\", text = \"Type a command\" },\n\
+             \x20 \x20 } })\n\
+             \x20 \x20 return { ok = true }\n\
+             \x20 end,\n\
+             })\n\
+             return {}\n",
+        )
+        .expect("init");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(COMPOSER_PLUGIN_ID).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: vec![bitty_config::KeymapEntry {
+                chord: "alt+e".into(),
+                action: "open_composer".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
+        assert!(!app.overlay_capture_active(), "no capture before the chord");
+        assert!(!drive_chrome(&mut app, alt_mods()));
+        assert!(
+            drive_chrome(&mut app, char_press("e", "e", false)),
+            "the bound composer chord is chrome-owned"
+        );
+        assert!(
+            app.overlay_capture_active(),
+            "the open must hold the focusable capture after dispatch"
+        );
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the tick must surface the composer block for present"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn composer_cutover_editor_round_trip_keeps_fallback_routed() {
         // E-CUT (CTX-0968): the PTY-leaf editor flow is retired with the
         // composer engine. Hosting an editor leaf still tears down safely;

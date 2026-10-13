@@ -3089,6 +3089,12 @@ impl Runtime {
     /// with empty text still paints its one-cell pill chrome: the modal
     /// holds keyboard capture while up, so pixel-invisibility would be a
     /// fail-open UX (CTX-1143, issue #1966).
+    ///
+    /// CTX-1170 (issue #1972) scene chrome: a titled `List`/`Column` scene
+    /// paints one pill row per child — the title row plus the input/item
+    /// rows — instead of one flattened pill, so the modal reads as a titled
+    /// command line (never a bare pill). Rows past the frame bottom clip
+    /// away; per-row width clips to the frame like the single pill did.
     fn paint_plugin_overlay(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
@@ -3098,7 +3104,7 @@ impl Runtime {
         let Some(overlay) = self.plugin_overlay.clone() else {
             return;
         };
-        let text_line = self.extract_text_from_node(&overlay.root);
+        let rows = self.overlay_scene_rows(&overlay.root);
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
             return;
@@ -3113,42 +3119,74 @@ impl Runtime {
         if frame.rows == 0 || frame.cols == 0 {
             return;
         }
-        // Width in cells (char count, not bytes), clipped to the frame.
-        let text_cells = text_line
-            .chars()
-            .count()
-            .min(usize::from(frame.cols))
-            .max(1);
-        let text_line: String = text_line.chars().take(text_cells).collect();
-        // Center the pill in the focused frame, middle row.
         let full_w = px_span(frame.cols, live.width);
-        let pill_w = px_span_usize(text_cells, live.width);
-        let origin_px_x = px_add(
-            px_add(pad_px, frame.content.x),
-            px_side(full_w.saturating_sub(pill_w)) / 2,
-        );
         let mid_row = frame.rows.saturating_sub(1) / 2;
-        let origin_px_y = px_add(
-            pad_px,
-            px_offset_cells(frame.content.y, mid_row, live.height),
-        );
-        layers.combined_overlay.push(bitty_render::grid::FillRect {
-            rect: bitty_render::geometry::RectPx::new(
-                origin_px_x,
-                origin_px_y,
-                pill_w,
-                live.height,
-            ),
-            color: self.config.theme.background,
-        });
-        let glyphs = self.renderer.overlay_text_glyphs(
-            &text_line,
-            (origin_px_x, origin_px_y),
-            text_cells,
-            self.config.theme.foreground,
-        );
-        layers.combined_glyphs.extend(glyphs);
+        // Center the row stack on the middle row: the title row lands just
+        // above middle for a two-row modal, exactly on it for one row.
+        let half = u16::try_from(rows.len().saturating_sub(1) / 2).unwrap_or(u16::MAX);
+        let start_row = mid_row.saturating_sub(half);
+        for (index, text_line) in rows.iter().enumerate() {
+            let row = start_row.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+            if row >= frame.rows {
+                continue;
+            }
+            // Width in cells (char count, not bytes), clipped to the frame.
+            let text_cells = text_line
+                .chars()
+                .count()
+                .min(usize::from(frame.cols))
+                .max(1);
+            let clipped: String = text_line.chars().take(text_cells).collect();
+            // Center the pill in the focused frame on its row.
+            let pill_w = px_span_usize(text_cells, live.width);
+            let origin_px_x = px_add(
+                px_add(pad_px, frame.content.x),
+                px_side(full_w.saturating_sub(pill_w)) / 2,
+            );
+            let origin_px_y = px_add(pad_px, px_offset_cells(frame.content.y, row, live.height));
+            layers.combined_overlay.push(bitty_render::grid::FillRect {
+                rect: bitty_render::geometry::RectPx::new(
+                    origin_px_x,
+                    origin_px_y,
+                    pill_w,
+                    live.height,
+                ),
+                color: self.config.theme.background,
+            });
+            let glyphs = self.renderer.overlay_text_glyphs(
+                &clipped,
+                (origin_px_x, origin_px_y),
+                text_cells,
+                self.config.theme.foreground,
+            );
+            layers.combined_glyphs.extend(glyphs);
+        }
         layers.any_needs_draw = true;
+    }
+
+    /// One text row per scene line for the overlay surface (CTX-1170).
+    ///
+    /// A `List`/`Column` root yields one row per direct child (each child
+    /// flattened with [`Self::extract_text_from_node`], so nested `Row`
+    /// children still join horizontally); any other root yields its single
+    /// flattened line. Never empty: a childless scene falls back to one
+    /// empty row so a live surface keeps its one-cell pill chrome
+    /// (CTX-1143). Total text stays inside the mount-time `SCN-1`/`SCN-3`
+    /// budgets the flattened walk already relied on.
+    fn overlay_scene_rows(&self, node: &bitty_lua::ui::UiNode) -> Vec<String> {
+        use bitty_lua::ui::UiNode;
+        let rows = match node {
+            UiNode::Column { children, .. } | UiNode::List { children, .. } => children
+                .iter()
+                .map(|child| self.extract_text_from_node(child))
+                .collect(),
+            _ => vec![self.extract_text_from_node(node)],
+        };
+        if rows.is_empty() {
+            vec![String::new()]
+        } else {
+            rows
+        }
     }
 
     /// Extracts text content from a UiNode tree (CTX-0911).
@@ -3991,6 +4029,19 @@ mod plugin_overlay_paint_tests {
         }
     }
 
+    fn surface_with_rows(rows: &[&str]) -> BandContent {
+        BandContent {
+            plugin_id: String::from("bitty-terminal.composer"),
+            slot: bitty_lua::ui::UiSlot::Overlay,
+            root: bitty_lua::ui::UiNode::list(
+                rows.iter()
+                    .map(|row| bitty_lua::ui::UiNode::text(*row))
+                    .collect(),
+            ),
+            version: 1,
+        }
+    }
+
     fn one_frame() -> PresentFrame {
         use bitty_render::geometry::RectPx;
         PresentFrame {
@@ -4059,6 +4110,98 @@ mod plugin_overlay_paint_tests {
         assert!(layers.combined_overlay.is_empty());
         assert!(layers.combined_glyphs.is_empty());
         assert!(!layers.any_needs_draw);
+    }
+
+    #[test]
+    fn titled_list_scene_paints_stacked_title_and_input_rows() {
+        // CTX-1170 (issue #1972) scene chrome: the composer open scene
+        // (`List` of title plus input line) paints one pill row per child
+        // instead of one flattened pill, so the modal reads as a titled
+        // command line. The rows stack vertically in declared order; each
+        // keeps its own centered pill.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", "hi"])));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            2,
+            "title plus input paint two pill fills"
+        );
+        assert!(!layers.combined_glyphs.is_empty(), "both rows paint glyphs");
+        let first = &layers.combined_overlay[0].rect;
+        let second = &layers.combined_overlay[1].rect;
+        assert_eq!(
+            second.y - first.y,
+            first.height as i32,
+            "rows stack exactly one cell tall"
+        );
+        assert_eq!(first.height, second.height, "uniform pill height");
+        assert!(
+            first.y < second.y,
+            "declared order is kept: title above input"
+        );
+        assert!(layers.any_needs_draw);
+    }
+
+    #[test]
+    fn title_row_geometry_survives_an_input_repaint() {
+        // Typing repaints the input row while the title row stays pixel
+        // put: the chrome is stable across buffer arrivals.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", ""])));
+        let mut before = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut before);
+        rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", "hi"])));
+        let mut after = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut after);
+        assert_eq!(before.combined_overlay.len(), 2);
+        assert_eq!(after.combined_overlay.len(), 2);
+        assert_eq!(
+            before.combined_overlay[0].rect, after.combined_overlay[0].rect,
+            "the title pill must not move when the input line changes"
+        );
+        assert_ne!(
+            before.combined_overlay[1].rect, after.combined_overlay[1].rect,
+            "the input pill re-centers as its text grows"
+        );
+    }
+
+    #[test]
+    fn empty_list_scene_keeps_one_pill_chrome() {
+        // A childless scene still paints its one-cell pill: the modal holds
+        // capture while up, so pixel-invisibility would be fail-open
+        // (CTX-1143 guard applied to the row path).
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with_rows(&[])));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            1,
+            "an empty scene keeps one pill fill"
+        );
+        assert!(layers.combined_glyphs.is_empty());
+        assert!(layers.any_needs_draw);
+    }
+
+    #[test]
+    fn rows_past_the_frame_bottom_clip_away() {
+        // A tall scene stays bounded: rows past the frame bottom never
+        // paint, so a hostile plugin cannot turn one modal into unbounded
+        // per-frame glyph work.
+        let mut rt = runtime();
+        let many: Vec<String> = (0..40).map(|index| format!("row-{index}")).collect();
+        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
+        rt.set_plugin_overlay(Some(surface_with_rows(&borrowed)));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            24,
+            "only the 24 visible frame rows paint"
+        );
+        assert!(layers.any_needs_draw);
     }
 }
 

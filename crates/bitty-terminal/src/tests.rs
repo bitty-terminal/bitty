@@ -1541,6 +1541,183 @@ ui.overlay.focus = true
 }
 
 #[test]
+fn overlay_input_available_pump_nudge_on_tick_with_released_ordering() {
+    // CTX-1170 (issue #1972) host pump driver: when a live capture owner
+    // has undrained queued input, `drive_tick` delivers one
+    // `overlay.input.available` observation (`{ owner, queued }`) on the
+    // cold tick path so buffer arrival repaints the modal without polling.
+    // Ordered after `overlay.released`: a session end is always observable
+    // before any new-session data nudge. Headless: a real plugin runtime
+    // with fixture plugins, no PTY and no window, so no `cfg(unix)` gate.
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(
+            &self,
+            _scope: &str,
+        ) -> Result<
+            bitty_runtime::plugin_runtime::LuaValue,
+            bitty_runtime::plugin_runtime::BridgeError,
+        > {
+            Ok(bitty_runtime::plugin_runtime::LuaValue::table([
+                (
+                    "version",
+                    bitty_runtime::plugin_runtime::LuaValue::Integer(1),
+                ),
+                (
+                    "zones",
+                    bitty_runtime::plugin_runtime::LuaValue::array(vec![]),
+                ),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1170-overlay-pump-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let holder_id = "bitty-featured.ctx1170pumpholder";
+    let watcher_id = "bitty-featured.ctx1170pumpwatcher";
+    let write_manifest = |id: &str, caps: &str, commands: &str, events: &str| {
+        let plugin_dir = root.join(id);
+        std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin_dir.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"CTX-1170 pump test\"\nversion = \"0.1.0\"\n\
+                 description = \"overlay input pump test\"\n\n\
+                 [compat]\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n{caps}\n\n\
+                 [lazy]\ncommands = [{commands}]\nevents = [{events}]\n",
+            ),
+        )
+        .expect("manifest");
+    };
+    write_manifest(
+        holder_id,
+        "ui.rich = true\nui.overlay = true\nui.overlay.focus = true\n",
+        &format!("\"{holder_id}:probe\""),
+        "",
+    );
+    std::fs::write(
+        root.join(holder_id).join("lua/init.lua"),
+        r#"
+        bitty.commands.register({
+          id = "probe",
+          title = "Probe",
+          run = function()
+            bitty.ui.overlay.acquire({ title = "Composer", placeholder = "Type a command" })
+            return true
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+    write_manifest(
+        watcher_id,
+        "",
+        &format!("\"{watcher_id}:report\""),
+        "\"overlay.released\", \"overlay.input.available\"",
+    );
+    std::fs::write(
+        root.join(watcher_id).join("lua/init.lua"),
+        r#"
+        local seen = {}
+        bitty.events.subscribe("overlay.released", function(envelope)
+          seen[#seen + 1] = "released:" .. tostring(envelope.payload.reason)
+        end)
+        bitty.events.subscribe("overlay.input.available", function(envelope)
+          seen[#seen + 1] = "available:" .. tostring(envelope.payload.owner)
+            .. "/" .. tostring(envelope.payload.queued)
+        end)
+        bitty.commands.register({
+          id = "report",
+          title = "Report",
+          run = function() return table.concat(seen, ",") end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let holder = bitty_plugin_host::manifest::PluginId::new(holder_id).expect("valid id");
+    let watcher = bitty_plugin_host::manifest::PluginId::new(watcher_id).expect("valid id");
+    assert_eq!(
+        plugin_runtime.activate(&holder).expect("activate").state,
+        LifecycleState::Active
+    );
+    assert_eq!(
+        plugin_runtime.activate(&watcher).expect("activate").state,
+        LifecycleState::Active
+    );
+    // Session A opens, then ends by runtime revoke (focus-switch cause):
+    // its `overlay.released` observation waits for the next tick.
+    plugin_runtime
+        .dispatch_command(&holder, "probe", &[])
+        .expect("open session A");
+    assert!(plugin_runtime.overlay_capture().borrow().is_active());
+    assert!(plugin_runtime.revoke_overlay_capture_with_reason("cancelled"));
+    // Session B opens on the same tick window and queues three inputs.
+    plugin_runtime
+        .dispatch_command(&holder, "probe", &[])
+        .expect("open session B");
+    for text in ["h", "i", "!"] {
+        assert!(
+            plugin_runtime.push_overlay_input("key", text),
+            "session B must queue input"
+        );
+    }
+
+    let rt = Runtime::with_defaults().expect("must build");
+    let app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let mut app = app.with_plugin_runtime(Some(plugin_runtime));
+    let _ = app.drive_tick();
+    // Exactly one nudge for three queued events (level-triggered bound),
+    // ordered after the session-A release.
+    let report = app
+        .invoke_plugin_command(
+            &format!("{watcher_id}:report"),
+            &TerminalApp::empty_command_args(),
+        )
+        .expect("report dispatches");
+    assert_eq!(
+        report,
+        bitty_runtime::plugin_runtime::LuaValue::String(format!(
+            "released:cancelled,available:{holder_id}/3"
+        )),
+        "tick must deliver released before input.available with owner and depth"
+    );
+    // The modal surface follows the live session: title plus input rows.
+    assert!(app.overlay_capture_active());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn osc8_hover_syncs_the_os_pointer_shape() {
     // Issues #1759/#1762 precedence: hover `Pointer` wins, else the focused
     // pane's `OSC 22` shape, else `Default`. Unified on the 34-variant

@@ -181,6 +181,17 @@ pub enum EventKind {
     /// text). Any subscriber may observe it; no phase may intercept or veto
     /// it. Acquisition needs no bus event.
     OverlayReleased,
+    /// Focusable-overlay capture input-availability nudge (CTX-1170, #1972).
+    ///
+    /// Additive v2 growth: while a live capture owner has undrained queued
+    /// input, the host delivers this observation-only bus event on the cold
+    /// tick path with payload `{ owner, queued }` (text owner id, queued
+    /// event count) so the owner can drain through `ui.overlay.poll` and
+    /// repaint. Level-triggered: at most one per tick while the queue stays
+    /// non-empty, never on the input hot path (`P0-AC-015`). The payload
+    /// carries no input bytes, only the drain nudge. Any subscriber may
+    /// observe it; no phase may intercept or veto it.
+    OverlayInputAvailable,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -211,6 +222,7 @@ impl EventKind {
             "workspace.focused" => Ok(Self::WorkspaceFocused),
             "workspace.changed" => Ok(Self::WorkspaceChanged),
             "overlay.released" => Ok(Self::OverlayReleased),
+            "overlay.input.available" => Ok(Self::OverlayInputAvailable),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -242,6 +254,7 @@ impl EventKind {
             Self::WorkspaceFocused => "workspace.focused",
             Self::WorkspaceChanged => "workspace.changed",
             Self::OverlayReleased => "overlay.released",
+            Self::OverlayInputAvailable => "overlay.input.available",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -271,7 +284,8 @@ impl EventKind {
             | Self::WorkspaceRenamed
             | Self::WorkspaceFocused
             | Self::WorkspaceChanged
-            | Self::OverlayReleased => EventClass::Observation,
+            | Self::OverlayReleased
+            | Self::OverlayInputAvailable => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -281,8 +295,11 @@ impl EventKind {
 
     /// Whether this kind is coalescable (latest value collapses when queue holds undelivered copies).
     ///
-    /// Coalescable: title/cwd/focus/selection changes. Non-coalescable: opened/closed/exited/bell
-    /// preserve one-by-one delivery up to the queue bound.
+    /// Coalescable: title/cwd/focus/selection changes, plus the overlay
+    /// input-availability nudge (CTX-1170: a level signal — "drain now" —
+    /// where the newest supersedes older copies). Non-coalescable:
+    /// opened/closed/exited/bell/released preserve one-by-one delivery up to
+    /// the queue bound.
     #[must_use]
     pub fn is_coalescable(&self) -> bool {
         matches!(
@@ -291,6 +308,7 @@ impl EventKind {
                 | Self::TerminalCwdChanged
                 | Self::FocusChanged
                 | Self::SelectionChanged
+                | Self::OverlayInputAvailable
         )
     }
 
@@ -340,6 +358,7 @@ impl EventKind {
             | Self::WorkspaceFocused
             | Self::WorkspaceChanged
             | Self::OverlayReleased
+            | Self::OverlayInputAvailable
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,
@@ -1797,5 +1816,23 @@ mod tests {
             p.drain(&pid("xuepoo.a"), &EventKind::TerminalBell).unwrap()[0].sequence,
             1
         );
+    }
+
+    #[test]
+    fn overlay_input_available_kind_contract() {
+        // CTX-1170 (#1972): the cold-tick input pump nudge is a registered
+        // kind: it parses, round-trips, observes (never intercepts), and
+        // coalesces like the other level signals (focus.changed), while its
+        // payload stays ungated (owner id plus queued count, no input
+        // bytes). Unknown spellings nearby still fail closed.
+        let kind = EventKind::parse("overlay.input.available").expect("known kind");
+        assert_eq!(kind, EventKind::OverlayInputAvailable);
+        assert_eq!(kind.as_str(), "overlay.input.available");
+        assert_eq!(kind.class(), EventClass::Observation);
+        assert!(!kind.is_interception());
+        assert!(kind.is_coalescable());
+        assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
+        assert!(EventKind::parse("overlay.input").is_err());
+        assert!(EventKind::parse("overlay.input.available.extra").is_err());
     }
 }

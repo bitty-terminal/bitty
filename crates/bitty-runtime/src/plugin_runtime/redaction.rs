@@ -221,6 +221,8 @@ mod tests {
             "terminal.cwd-changed",
             "terminal.bell",
             "focus.changed",
+            "overlay.released",
+            "overlay.input.available",
             "selection.changed",
             "process.exited",
             "config.reloaded",

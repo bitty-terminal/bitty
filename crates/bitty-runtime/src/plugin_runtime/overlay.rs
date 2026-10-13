@@ -528,6 +528,27 @@ impl OverlayCapture {
         self.queue.len()
     }
 
+    /// Level snapshot of undrained capture input for the cold-tick pump
+    /// nudge (CTX-1170, issue #1972).
+    ///
+    /// Returns the live owner's plugin id plus the queued event count when
+    /// a session holds capture AND its queue is non-empty; `None` otherwise
+    /// (no owner, or an owner with nothing to drain). Non-draining: the
+    /// queue is untouched — the owner drains through [`OverlayCapture::poll`]
+    /// / [`OverlayCapture::poll_detailed`] on its own cold path, and the
+    /// application delivers at most one `overlay.input.available`
+    /// observation per tick from this snapshot, so tick cost stays O(1) no
+    /// matter how deep the queue is. A released session clears its queue in
+    /// `finish_session`, so this can never report a dead session.
+    #[must_use]
+    pub fn input_available(&self) -> Option<(String, usize)> {
+        let owner = self.owner.as_ref()?;
+        if self.queue.is_empty() {
+            return None;
+        }
+        Some((owner.plugin_id.clone(), self.queue.len()))
+    }
+
     /// Number of events dropped by queue overflow since creation.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -857,5 +878,41 @@ mod tests {
             "newest observations survive the bound"
         );
         assert!(capture.drain_released_events().is_empty());
+    }
+
+    #[test]
+    fn input_available_reports_live_owner_with_queued_input_only() {
+        // CTX-1170 (#1972): the cold-tick pump snapshot fires only for a
+        // live owner with undrained input. No owner, an owner with an empty
+        // queue, and a released session all report nothing, so the tick
+        // delivers no nudge it cannot back.
+        let mut capture = OverlayCapture::new();
+        assert_eq!(capture.input_available(), None, "no owner, no nudge");
+        capture.acquire("a", 1, future(60_000)).expect("acquire");
+        assert_eq!(
+            capture.input_available(),
+            None,
+            "owner with an empty queue drains nothing"
+        );
+        assert!(capture.enqueue("key", "h"));
+        assert!(capture.enqueue("text", "i"));
+        assert_eq!(
+            capture.input_available(),
+            Some((String::from("a"), 2)),
+            "live owner plus queued input snapshots owner and depth"
+        );
+        // The snapshot never drains: the owner still polls both events.
+        assert_eq!(capture.queued_len(), 2);
+        let drained = capture.poll("a", 1, 8).expect("owned poll");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(
+            capture.input_available(),
+            None,
+            "a drained queue reports nothing on the next tick"
+        );
+        // A released session clears its queue: no nudge for a dead session.
+        assert!(capture.enqueue("key", "x"));
+        assert!(capture.release_with_reason("a", 1, "cancelled"));
+        assert_eq!(capture.input_available(), None);
     }
 }

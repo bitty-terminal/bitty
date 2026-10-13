@@ -134,9 +134,6 @@ pub use keyboard::{
     encode_named_key, ext_functional_key, ext_keypad_char_key, ext_keypad_named_key,
     ext_modifier_key,
 };
-pub use notification::{
-    BellSink, DesktopNotification, NOTIFICATION_BODY_MAX_CHARS, NOTIFICATION_TITLE_MAX_CHARS,
-    NotificationSink, OsBellSink, OsDeliveryOutcome, OsDeliverySkip, OsNotificationSink,
-};
+pub use notification::{BellSink, OsBellSink, OsDeliveryOutcome, OsDeliverySkip};
 pub use surface::{SurfaceTarget, map_resize_to_surface_extent};
 pub use url::{URL_MAX_LEN, ValidatedUrl, validate_file_url, validate_url};

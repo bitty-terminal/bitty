@@ -963,13 +963,15 @@ fn main() {
     runtime.set_session_backend(Some(Arc::new(
         storage_backends::StorageSessionBackend::new(),
     )));
-    // CTX-0754 (issue #1361): OS delivery for bells/notifications is an
-    // embedder capability, fail-closed by default (no sink: counted, silent).
-    // Real runs install the best-effort OS sinks; headless/test-mode runs
-    // stay sink-free so CI and deterministic E2E never touch the OS.
+    // CTX-0754 (issue #1361) plus CTX-1178 (issue #1998): OS delivery for
+    // bells/notifications is an embedder capability, fail-closed by default
+    // (no sink, fail-closed bridge backend: counted, silent). Real runs
+    // install the best-effort bell sink plus the per-platform notification
+    // backend; headless/test-mode runs stay OS-free so CI and deterministic
+    // E2E never touch the OS.
     if !args.headless && !args.test_mode {
         runtime.set_bell_sink(Some(Box::new(bitty_platform::OsBellSink)));
-        runtime.set_notification_sink(Some(Box::new(bitty_platform::OsNotificationSink)));
+        runtime.install_platform_notification_backend();
     }
     // Validate that the config-derived extent is non-zero (defense in depth;
     // Runtime::new already validates, but the app documents the invariant).

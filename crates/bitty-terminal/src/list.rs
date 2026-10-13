@@ -93,7 +93,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Exit codes (stable taxonomy, cli-contract-rfc.md)
@@ -119,7 +121,7 @@ pub const EXIT_PERM: i32 = 7;
 // Bounds
 // ---------------------------------------------------------------------------
 
-/// Maximum bytes for a kind token (plenty for `themes|plugins|instances|actions|keymaps`).
+/// Maximum bytes for a kind token (plenty for `themes|plugins|instances|actions|keymaps|services`).
 pub const MAX_LIST_KIND_LEN: usize = 32;
 /// Maximum bytes for a `--format` value.
 pub const MAX_LIST_FORMAT_LEN: usize = 16;
@@ -147,6 +149,9 @@ pub enum ListKind {
     Actions,
     /// Resolved chord to action keymaps (local, shipped defaults).
     Keymaps,
+    /// Registered extension interfaces (static registration observed
+    /// without loading any plugin VM; dynapi observability, bitty#2002).
+    Services,
 }
 
 impl ListKind {
@@ -163,6 +168,7 @@ impl ListKind {
             "instances" | "instance" => Some(Self::Instances),
             "actions" | "action" => Some(Self::Actions),
             "keymaps" | "keymap" => Some(Self::Keymaps),
+            "services" | "service" => Some(Self::Services),
             _ => None,
         }
     }
@@ -176,6 +182,7 @@ impl ListKind {
             Self::Instances => "instances",
             Self::Actions => "actions",
             Self::Keymaps => "keymaps",
+            Self::Services => "services",
         }
     }
 
@@ -191,6 +198,7 @@ impl ListKind {
             Self::Instances => "core.list.instances",
             Self::Actions => "core.list.actions",
             Self::Keymaps => "core.list.keymaps",
+            Self::Services => "core.list.services",
         }
     }
 }
@@ -265,13 +273,13 @@ impl ListRequest {
         let kind_token = kind_raw.ok_or_else(|| {
             format!(
                 "{}\n{}",
-                "bitty list: missing <kind> (want themes|plugins|instances|actions|keymaps)",
+                "bitty list: missing <kind> (want themes|plugins|instances|actions|keymaps|services)",
                 list_usage()
             )
         })?;
         let kind = ListKind::parse(kind_token).ok_or_else(|| {
             format!(
-                "bitty list: unknown kind {kind_token:?} (want themes|plugins|instances|actions|keymaps)\n{}",
+                "bitty list: unknown kind {kind_token:?} (want themes|plugins|instances|actions|keymaps|services)\n{}",
                 list_usage()
             )
         })?;
@@ -346,7 +354,7 @@ fn validate_instance_value(value: &str) -> Result<(), String> {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn list_usage() -> String {
-    "usage: bitty list <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)"
+    "usage: bitty list <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)\n  services   registered extension interfaces, no VM (local, safe-mode clean)"
         .to_string()
 }
 
@@ -356,7 +364,7 @@ pub fn list_help_text(invoked_as: &str) -> String {
     format!(
         "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
-         Usage: bitty {invoked_as} <themes|plugins|instances|actions|keymaps> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
+          Usage: bitty {invoked_as} <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
            themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
@@ -380,11 +388,18 @@ pub fn list_help_text(invoked_as: &str) -> String {
                       or class runtime (core). Each chrome row carries its effective\n  \
                       binding (user-configured chord first, default fallback, null\n  \
                       only for manual-bind-only); core rows always report null binding.\n  \
-           keymaps    Resolved chord to action table (config overrides plus defaults,\n  \
-                      same resolver `list actions` bindings read: shared code path,\n  \
-                      no fork). Local class: no instance; user file read best-effort\n  \
-                      with shipped-default fallback. Header and JSON meta carry the\n  \
-                      mod_key context (alt default, super when rebound).\n\
+            keymaps    Resolved chord to action table (config overrides plus defaults,\n  \
+                       same resolver `list actions` bindings read: shared code path,\n  \
+                       no fork). Local class: no instance; user file read best-effort\n  \
+                       with shipped-default fallback. Header and JSON meta carry the\n  \
+                       mod_key context (alt default, super when rebound).\n  \
+            services   Registered extension interfaces (dynapi observability): one\n  \
+                       row per backing head of each registered provision, computed\n  \
+                       from validated manifests plus install records — never\n  \
+                       provider-reported strings, no plugin VM loaded. Local class:\n  \
+                       bundled catalog plus discovery roots; invalid manifests\n  \
+                       are skipped, never fatal; `--safe` skips third-party\n  \
+                       sources like startup.\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
@@ -409,11 +424,17 @@ pub fn list_help_text(invoked_as: &str) -> String {
            (same strings inspect key shows); core descriptions reuse the\n  \
            inspect command registry summaries. Manual-bind-only is derived from\n  \
            DEFAULT_KEYMAPS (absent means manual).\n  \
-           keymaps result keys: kind, count, mod_key, source, keymaps\n  \
-           (array of {{\"chord\",\"action\",\"description\",\"context\",\"source\"}}).\n  \
-           The table header names mod_key and source; JSON meta carries both.\n  \
-           Both actions bindings and keymaps rows come from the same resolved\n  \
-           table (config overrides plus defaults, no fork).\n\
+            keymaps result keys: kind, count, mod_key, source, keymaps\n  \
+            (array of {{\"chord\",\"action\",\"description\",\"context\",\"source\"}}).\n  \
+            The table header names mod_key and source; JSON meta carries both.\n  \
+            Both actions bindings and keymaps rows come from the same resolved\n  \
+            table (config overrides plus defaults, no fork).\n  \
+            services result keys: kind, count, services\n  \
+            (array of {{\"interface\",\"owner\",\"version\",\"provider\",\"backing_head\",\"grant_source\",\"status\"}}).\n  \
+            Every value is a required string (v1 never emits null); the table\n  \
+            renders absent cells as `-` (reserved null marker, currently\n  \
+            unreachable) and scrubs control characters so hostile provider\n  \
+            strings render safely.\n\
          \n\
          Exit codes:\n  \
            0 success (empty instances is success with count 0)\n  \
@@ -428,6 +449,7 @@ pub fn list_help_text(invoked_as: &str) -> String {
            bitty list instances --format jsonl\n  \
            bitty list actions --format json\n  \
            bitty list keymaps --format table\n  \
+           bitty list services --format json\n  \
            bitty ls themes --format table\n"
     )
 }
@@ -790,6 +812,260 @@ pub fn resolved_for_catalog(
         Err(_) => bitty_config::keymap::default_keymaps_with_mod(effective.mod_key)
             .unwrap_or_else(|_| bitty_config::keymap::shipped_resolved_keymaps()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service registration catalog (dynapi observability, bitty#2002)
+// ---------------------------------------------------------------------------
+
+/// One registered extension-interface row: Core-computed from validated
+/// registration state, never provider-reported strings.
+///
+/// A row is one attachment: one backing head projected by one interface
+/// version of one provider. Multi-head provisions expand to one row per
+/// head, so every JSON value stays a scalar string and the keys stay
+/// frozen (the #1934 catalog discipline: stable keys, documented
+/// nullables, shared envelope).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInfo {
+    /// Short interface name as declared (e.g. `calc.add`).
+    pub interface: String,
+    /// Owner segment of the providing plugin id (e.g. `xuepoo`).
+    pub owner: String,
+    /// Declared exact interface version (the negotiation candidate set is
+    /// exactly these declarations; live per-attachment negotiation stays
+    /// runtime-side).
+    pub version: String,
+    /// Providing plugin id (e.g. `xuepoo.calc`).
+    pub provider: String,
+    /// Single backing Core capability head this row projects.
+    pub backing_head: String,
+    /// Where the covering grant comes from: `manifest` (declared
+    /// capabilities back it directly) or `install-record` (persisted
+    /// consent backs it).
+    pub grant_source: String,
+    /// Registration status observed without loading any plugin VM:
+    /// `active` (registered + grant-covered). Frozen as part of the row
+    /// contract; reserved for future live states behind a live transport.
+    pub status: String,
+}
+
+/// Registration status for listed rows (frozen contract value).
+pub const SERVICE_STATUS_ACTIVE: &str = "active";
+
+/// Grant provenance: declared capabilities back the provision directly
+/// (bundled and development sources carry no persisted grant record).
+pub const SERVICE_GRANT_MANIFEST: &str = "manifest";
+
+/// Grant provenance: persisted install-record consent backs the provision
+/// (store-resolved packages).
+pub const SERVICE_GRANT_INSTALL_RECORD: &str = "install-record";
+
+/// Table null marker for the services table.
+///
+/// v1 rows carry no nulls (every field is a required string; unbacked and
+/// ungranted provisions never list), and JSON never emits null in v1.
+/// `-` stays frozen as the marker an absent cell renders, following the
+/// plugins table precedent, so tables can never disagree with JSON
+/// silently.
+pub const SERVICES_NULL: &str = "-";
+
+/// Scrub one table cell: empty renders as the null marker, control
+/// characters (terminal-injection vectors) render as the replacement
+/// character. Defense in depth over manifest validation (which already
+/// constrains every row charset): a hostile provider string can never
+/// reach the terminal raw through this table.
+#[must_use]
+pub fn sanitize_service_cell(raw: &str) -> String {
+    if raw.is_empty() {
+        return SERVICES_NULL.to_string();
+    }
+    raw.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// Owned provision source for the services catalog: one validated
+/// manifest entry plus its provider identity and effective grant set.
+struct ServiceProvisionSource {
+    provider: String,
+    owner: String,
+    iface: String,
+    version: String,
+    heads: Vec<String>,
+    grants: BTreeSet<String>,
+    grant_source: &'static str,
+}
+
+/// One input provision for the services catalog: a validated manifest
+/// entry plus its provider identity and effective grant set.
+///
+/// The builder below is generic over these inputs — no per-extension
+/// branches exist anywhere on this path, so registering a new extension
+/// needs no Core change (a regression test pins exactly that by varying
+/// the provider count over the same builder).
+pub struct ServiceListingInput<'a> {
+    /// Providing plugin id.
+    pub provider: &'a str,
+    /// Owner segment of the provider id.
+    pub owner: &'a str,
+    /// Short interface name as declared.
+    pub iface: &'a str,
+    /// Declared exact interface version.
+    pub version: &'a str,
+    /// Declared backing Core capability heads.
+    pub heads: &'a [String],
+    /// Effective grant set backing this provider (recorded consent, else
+    /// declared capabilities).
+    pub grants: &'a BTreeSet<String>,
+    /// Grant provenance (`SERVICE_GRANT_MANIFEST` / `SERVICE_GRANT_INSTALL_RECORD`).
+    pub grant_source: &'static str,
+}
+
+/// Build service rows from validated inputs (pure, no I/O, no VM).
+///
+/// One row per (provision, head), sorted by (provider, interface, version,
+/// backing head) for stable output. Unbacked provisions never record so
+/// they never list (fail-closed); grant-uncovered provisions are skipped
+/// as absent — indistinguishable from undeclared, the same posture as
+/// `services.get` (a malicious provider can neither hide a registered
+/// row nor inject display text: every field renders from validated
+/// records through the escaping formatters).
+#[must_use]
+pub fn list_services_from_inputs(inputs: &[ServiceListingInput<'_>]) -> Vec<ServiceInfo> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(&str, &str, &str, &str)> = BTreeSet::new();
+    for input in inputs {
+        for head in input.heads {
+            if !input.grants.contains(head.as_str()) {
+                continue;
+            }
+            let key = (input.provider, input.iface, input.version, head.as_str());
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(ServiceInfo {
+                interface: input.iface.to_string(),
+                owner: input.owner.to_string(),
+                version: input.version.to_string(),
+                provider: input.provider.to_string(),
+                backing_head: head.clone(),
+                grant_source: input.grant_source.to_string(),
+                status: SERVICE_STATUS_ACTIVE.to_string(),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.provider, &a.interface, &a.version, &a.backing_head).cmp(&(
+            &b.provider,
+            &b.interface,
+            &b.version,
+            &b.backing_head,
+        ))
+    });
+    out
+}
+
+/// Effective grant set plus provenance for one discovered package.
+///
+/// Store-resolved packages carry persisted consent (`install-record`);
+/// bundled and development sources carry none, so their declared
+/// capabilities back provisions directly (`manifest`).
+fn service_effective_grants(
+    manifest: &bitty_plugin_host::PluginManifest,
+    recorded: Option<&[String]>,
+) -> (BTreeSet<String>, &'static str) {
+    match recorded {
+        Some(granted) => (
+            granted.iter().cloned().collect(),
+            SERVICE_GRANT_INSTALL_RECORD,
+        ),
+        None => (
+            manifest
+                .capabilities
+                .all_ids()
+                .unwrap_or_default()
+                .iter()
+                .map(|id| id.as_str().to_string())
+                .collect(),
+            SERVICE_GRANT_MANIFEST,
+        ),
+    }
+}
+
+/// Enumerate registered extension interfaces (no plugin VM loaded).
+///
+/// Sources: the compiled-in bundled catalog plus a headless discovery
+/// pass over development roots (`BITTY_PLUGIN_DIR`) and the install
+/// store — manifests parse and validate, nothing activates, so an
+/// invalid manifest fails its root closed (gone), never fatal, and never
+/// executes. Safe-mode discovery skips third-party sources exactly like
+/// startup, so `bitty --safe list services` stays safe-mode clean.
+/// Every row is a registered, grant-covered provision; unbacked and
+/// ungranted provisions are absent, never denied.
+#[must_use]
+pub fn list_services(safe_mode: bool) -> Vec<ServiceInfo> {
+    let mut sources: Vec<ServiceProvisionSource> = Vec::new();
+    for manifest in bitty_plugin_host::bundled::all_bundled_manifests() {
+        let (grants, source) = service_effective_grants(&manifest, None);
+        let id = manifest.id().clone();
+        for svc in &manifest.provided_services {
+            sources.push(ServiceProvisionSource {
+                provider: id.to_string(),
+                owner: id.owner().to_string(),
+                iface: svc.iface.clone(),
+                version: svc.version.clone(),
+                heads: svc.heads.clone(),
+                grants: grants.clone(),
+                grant_source: source,
+            });
+        }
+    }
+    if !safe_mode {
+        let mut runtime = bitty_runtime::plugin_runtime::PluginRuntime::new(
+            bitty_runtime::plugin_runtime::PluginRuntimeConfig {
+                safe_mode,
+                data_dir: None,
+                store_root: crate::plugin_runtime::store_root(),
+                bundled_roots: Vec::new(),
+                third_party_roots: crate::plugin_runtime::dev_roots(),
+                settings: Rc::new(bitty_runtime::plugin_runtime::EmptySettings),
+                snapshot: Rc::new(bitty_runtime::plugin_runtime::UnavailableSnapshot),
+            },
+        );
+        let _ = runtime.discover();
+        for id in runtime.discovered_ids() {
+            let Some(package) = runtime.discovered_package(&id) else {
+                continue;
+            };
+            let (grants, source) =
+                service_effective_grants(&package.manifest, package.granted.as_deref());
+            for svc in &package.manifest.provided_services {
+                sources.push(ServiceProvisionSource {
+                    provider: id.to_string(),
+                    owner: id.owner().to_string(),
+                    iface: svc.iface.clone(),
+                    version: svc.version.clone(),
+                    heads: svc.heads.clone(),
+                    grants: grants.clone(),
+                    grant_source: source,
+                });
+            }
+        }
+    }
+    let borrowed: Vec<ServiceListingInput<'_>> = sources
+        .iter()
+        .map(|source| ServiceListingInput {
+            provider: &source.provider,
+            owner: &source.owner,
+            iface: &source.iface,
+            version: &source.version,
+            heads: &source.heads,
+            grants: &source.grants,
+            grant_source: source.grant_source,
+        })
+        .collect();
+    list_services_from_inputs(&borrowed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1601,6 +1877,11 @@ pub fn format_success_envelope(
                 json_escape(&meta.source)
             );
         }
+        ListKind::Services => {
+            // Same total-shape note as `Actions`: the `services` dispatch uses
+            // `format_services_envelope`.
+            out.push_str(",\"count\":0,\"services\":[]");
+        }
     }
     out.push_str("}}");
     out
@@ -1713,6 +1994,78 @@ pub fn format_keymaps_envelope(
         );
     }
     out.push_str("]}}");
+    out
+}
+
+/// Render the success envelope for `bitty list services` (dynapi
+/// observability, bitty#2002).
+///
+/// Frozen keys: `kind`, `count`, `services` (array of
+/// `{"interface","owner","version","provider","backing_head","grant_source","status"}`).
+/// Every value is a required string — v1 never emits null. Documented in
+/// `list --help` output contract.
+#[must_use]
+pub fn format_services_envelope(spelling: &str, services: &[ServiceInfo]) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = write!(
+        out,
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"services\",\"count\":{},\"services\":[",
+        json_escape(spelling),
+        services.len()
+    );
+    for (i, s) in services.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"interface\":\"{}\",\"owner\":\"{}\",\"version\":\"{}\",\"provider\":\"{}\",\"backing_head\":\"{}\",\"grant_source\":\"{}\",\"status\":\"{}\"}}",
+            json_escape(&s.interface),
+            json_escape(&s.owner),
+            json_escape(&s.version),
+            json_escape(&s.provider),
+            json_escape(&s.backing_head),
+            json_escape(&s.grant_source),
+            json_escape(&s.status)
+        );
+    }
+    out.push_str("]}}");
+    out
+}
+
+/// Render services as a human table.
+///
+/// Columns mirror the frozen JSON keys; absent cells render the reserved
+/// null marker (`-`, currently unreachable — v1 rows are total) and
+/// control characters are scrubbed so hostile provider strings render
+/// safely.
+#[must_use]
+pub fn format_services_table(services: &[ServiceInfo], no_color: bool) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}\n",
+        bold(
+            "INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS",
+            color
+        )
+    ));
+    if services.is_empty() {
+        out.push_str("(no services)\n");
+        return out;
+    }
+    for s in services {
+        out.push_str(&format!(
+            "{} {} {} {} {} {} {}\n",
+            sanitize_service_cell(&s.interface),
+            sanitize_service_cell(&s.owner),
+            sanitize_service_cell(&s.version),
+            sanitize_service_cell(&s.provider),
+            sanitize_service_cell(&s.backing_head),
+            sanitize_service_cell(&s.grant_source),
+            sanitize_service_cell(&s.status)
+        ));
+    }
     out
 }
 
@@ -1988,23 +2341,27 @@ pub fn format_keymaps_table(meta: &KeymapMeta, keymaps: &[KeymapInfo], no_color:
 /// Run `bitty list` from a validated request; prints to stdout, diagnostics
 /// to stderr, and returns the process exit code.
 ///
-/// - Themes/plugins/actions/keymaps always succeed (exit 0, even when empty
-///   in tests). Actions and keymaps are local (no instance); the catalog
-///   dispatch reads the user file best-effort with shipped-default fallback
-///   (see [`run_list_with_effective`]).
+/// - Themes/plugins/actions/keymaps/services always succeed (exit 0, even
+///   when empty in tests). Actions and keymaps are local (no instance);
+///   the catalog dispatch reads the user file best-effort with
+///   shipped-default fallback (see [`run_list_with_effective`]).
+///   Services discovers manifests without loading any plugin VM.
 /// - Instances maps discovery failures to ok:false envelopes for json/jsonl
 ///   (exit 6/7) and to stderr + exit code for table (no partial table).
 pub fn run_list(request: &ListRequest) -> i32 {
-    run_list_with_effective(request, &bitty_config::EffectiveConfig::default())
+    run_list_with_effective(request, &bitty_config::EffectiveConfig::default(), false)
 }
 
 /// Run `bitty list` against any effective config.
 ///
 /// Shared resolver (no fork): both `Actions` bindings and `Keymaps` rows come
 /// from the same [`resolved_for_catalog`] table (config overrides + defaults).
+/// `safe_mode` mirrors startup for the `services` catalog only (`--safe`
+/// skips third-party sources); every other kind ignores it.
 pub fn run_list_with_effective(
     request: &ListRequest,
     effective: &bitty_config::EffectiveConfig,
+    safe_mode: bool,
 ) -> i32 {
     match request.kind {
         ListKind::Themes => {
@@ -2121,7 +2478,29 @@ pub fn run_list_with_effective(
             }
             EXIT_OK
         }
+        ListKind::Services => run_list_services(request, safe_mode),
     }
+}
+
+/// Run `bitty list services` from a validated request (dynapi
+/// observability, bitty#2002).
+///
+/// Discovery is VM-less (manifests parse and validate, nothing
+/// activates); `safe_mode` mirrors startup (`--safe` skips third-party
+/// sources exactly like the runtime). Always succeeds (exit 0, even when
+/// empty): missing or invalid manifests and records are skipped, never
+/// fatal.
+pub fn run_list_services(request: &ListRequest, safe_mode: bool) -> i32 {
+    let services = list_services(safe_mode);
+    match request.format {
+        ListFormat::Table => {
+            print!("{}", format_services_table(&services, request.no_color));
+        }
+        ListFormat::Json | ListFormat::Jsonl => {
+            println!("{}", format_services_envelope(&request.spelling, &services));
+        }
+    }
+    EXIT_OK
 }
 
 // ---------------------------------------------------------------------------
@@ -2166,12 +2545,14 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
         }
     };
     // Only the catalog kinds need the effective config; the others stay
-    // config-free (safe-mode clean, no file I/O).
+    // config-free (safe-mode clean, no file I/O). Services threads the
+    // startup safe flag through so `--safe` skips third-party sources.
     match request.kind {
         ListKind::Actions | ListKind::Keymaps => {
             let effective = effective_for_catalog(args);
-            run_list_with_effective(&request, &effective)
+            run_list_with_effective(&request, &effective, args.safe)
         }
+        ListKind::Services => run_list_services(&request, args.safe),
         _ => run_list(&request),
     }
 }
@@ -2193,6 +2574,9 @@ mod tests {
         assert_eq!(ListKind::parse("Action"), Some(ListKind::Actions));
         assert_eq!(ListKind::parse("keymaps"), Some(ListKind::Keymaps));
         assert_eq!(ListKind::parse("Keymap"), Some(ListKind::Keymaps));
+        assert_eq!(ListKind::parse("services"), Some(ListKind::Services));
+        assert_eq!(ListKind::parse("Service"), Some(ListKind::Services));
+        assert_eq!(ListKind::Services.name(), "services");
         assert_eq!(ListKind::parse("fonts"), None);
         assert_eq!(ListKind::parse(""), None);
         assert_eq!(ListKind::parse("themes;rm"), None);
@@ -3027,5 +3411,218 @@ mod tests {
             help.contains("bitty list actions"),
             "help must carry examples, got {help:?}"
         );
+    }
+
+    fn service_input<'a>(
+        provider: &'a str,
+        owner: &'a str,
+        iface: &'a str,
+        version: &'a str,
+        heads: &'a [String],
+        grants: &'a BTreeSet<String>,
+    ) -> ServiceListingInput<'a> {
+        ServiceListingInput {
+            provider,
+            owner,
+            iface,
+            version,
+            heads,
+            grants,
+            grant_source: SERVICE_GRANT_MANIFEST,
+        }
+    }
+
+    fn grant_set(heads: &[&str]) -> BTreeSet<String> {
+        heads.iter().map(|h| (*h).to_string()).collect()
+    }
+
+    #[test]
+    fn services_builder_lists_one_row_per_head() {
+        // Dynapi observability (bitty#2002): one row per (provision, head)
+        // with frozen scalar fields, sorted for stable output.
+        let grants = grant_set(&["runtime.inspect", "workspace.read"]);
+        let heads = vec!["workspace.read".to_string(), "runtime.inspect".to_string()];
+        let inputs = vec![service_input(
+            "xuepoo.calc",
+            "xuepoo",
+            "calc.add",
+            "1.0.0",
+            &heads,
+            &grants,
+        )];
+        let rows = list_services_from_inputs(&inputs);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].backing_head, "runtime.inspect");
+        assert_eq!(rows[1].backing_head, "workspace.read");
+        for row in &rows {
+            assert_eq!(row.interface, "calc.add");
+            assert_eq!(row.owner, "xuepoo");
+            assert_eq!(row.version, "1.0.0");
+            assert_eq!(row.provider, "xuepoo.calc");
+            assert_eq!(row.grant_source, SERVICE_GRANT_MANIFEST);
+            assert_eq!(row.status, SERVICE_STATUS_ACTIVE);
+        }
+    }
+
+    #[test]
+    fn services_builder_is_generic_over_providers() {
+        // No Core change per extension: the same builder serves any
+        // provider count with no per-extension branches.
+        let grants = grant_set(&["runtime.inspect"]);
+        for count in [1, 2, 5] {
+            let providers: Vec<String> = (0..count).map(|i| format!("xuepoo.ext{i}")).collect();
+            let heads = vec!["runtime.inspect".to_string()];
+            let inputs: Vec<ServiceListingInput<'_>> = providers
+                .iter()
+                .map(|p| service_input(p, "xuepoo", "duet.play", "1.0.0", &heads, &grants))
+                .collect();
+            let rows = list_services_from_inputs(&inputs);
+            assert_eq!(rows.len(), count, "one row per provider");
+            let listed: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
+            let mut expected: Vec<&str> = providers.iter().map(|p| p.as_str()).collect();
+            expected.sort();
+            assert_eq!(listed, expected, "sorted by provider");
+        }
+    }
+
+    #[test]
+    fn services_builder_drops_unbacked_and_ungranted() {
+        // Unbacked provisions never record (fail-closed); ungranted
+        // provisions are absent — indistinguishable from undeclared, the
+        // same posture as `services.get`.
+        let grants = grant_set(&["runtime.inspect"]);
+        let empty: Vec<String> = Vec::new();
+        let spoofed = vec!["workspace.read".to_string()];
+        let backed = vec!["runtime.inspect".to_string()];
+        let inputs = vec![
+            service_input(
+                "xuepoo.solo",
+                "xuepoo",
+                "calc.solo",
+                "1.0.0",
+                &empty,
+                &grants,
+            ),
+            service_input(
+                "xuepoo.spoof",
+                "xuepoo",
+                "calc.spoof",
+                "1.0.0",
+                &spoofed,
+                &grants,
+            ),
+            service_input(
+                "xuepoo.calc",
+                "xuepoo",
+                "calc.add",
+                "1.0.0",
+                &backed,
+                &grants,
+            ),
+        ];
+        let rows = list_services_from_inputs(&inputs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "xuepoo.calc");
+    }
+
+    #[test]
+    fn services_envelope_freezes_json_keys_without_nulls() {
+        // Frozen contract: exact keys, required strings, no nulls.
+        let grants = grant_set(&["runtime.inspect"]);
+        let heads = vec!["runtime.inspect".to_string()];
+        let inputs = vec![service_input(
+            "xuepoo.calc",
+            "xuepoo",
+            "calc.add",
+            "1.0.0",
+            &heads,
+            &grants,
+        )];
+        let rows = list_services_from_inputs(&inputs);
+        let envelope = format_services_envelope("list", &rows);
+        assert!(
+            envelope.contains("\"kind\":\"services\""),
+            "kind: {envelope:?}"
+        );
+        assert!(envelope.contains("\"count\":1"), "count: {envelope:?}");
+        for key in [
+            "\"interface\"",
+            "\"owner\"",
+            "\"version\"",
+            "\"provider\"",
+            "\"backing_head\"",
+            "\"grant_source\"",
+            "\"status\"",
+        ] {
+            assert!(envelope.contains(key), "frozen key {key}: {envelope:?}");
+        }
+        assert!(
+            !envelope.contains("null"),
+            "v1 emits no nulls: {envelope:?}"
+        );
+        assert!(
+            envelope.contains("\"interface\":\"calc.add\""),
+            "values: {envelope:?}"
+        );
+    }
+
+    #[test]
+    fn services_table_renders_hostile_strings_safely() {
+        // A hostile provider string (control characters, empty cells)
+        // renders safely: controls scrubbed, empties show the reserved
+        // null marker. Fed directly to prove the formatter is total even
+        // if validation ever loosens.
+        assert_eq!(SERVICES_NULL, "-");
+        assert_eq!(sanitize_service_cell(""), SERVICES_NULL);
+        assert_eq!(
+            sanitize_service_cell("a\x00b\x1bc\x7f"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}"
+        );
+        let hostile = ServiceInfo {
+            interface: "calc\x01.add".to_string(),
+            owner: "xuepoo".to_string(),
+            version: "1.0.0".to_string(),
+            provider: "xuepoo.calc".to_string(),
+            backing_head: "runtime.inspect".to_string(),
+            grant_source: SERVICE_GRANT_MANIFEST.to_string(),
+            status: SERVICE_STATUS_ACTIVE.to_string(),
+        };
+        let table = format_services_table(std::slice::from_ref(&hostile), true);
+        assert!(
+            !table.chars().any(|c| c.is_control() && c != '\n'),
+            "no raw control chars reach the terminal: {table:?}"
+        );
+        assert!(table.contains("calc"), "keeps readable text: {table:?}");
+        let json = format_services_envelope("list", std::slice::from_ref(&hostile));
+        assert!(
+            json.contains("calc\\u0001.add"),
+            "JSON escapes controls: {json:?}"
+        );
+    }
+
+    #[test]
+    fn services_table_empty_hint_and_header() {
+        let table = format_services_table(&[], true);
+        assert!(
+            table.contains("INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS"),
+            "header names every frozen key: {table:?}"
+        );
+        assert!(table.contains("(no services)"), "empty hint: {table:?}");
+    }
+
+    #[test]
+    fn list_help_documents_services_contract() {
+        let help = list_help_text("list");
+        assert!(help.contains("services"), "help must name services");
+        assert!(
+            help.contains("backing_head"),
+            "help must document services JSON keys, got {help:?}"
+        );
+        assert!(
+            help.contains("bitty list services"),
+            "help must carry an example, got {help:?}"
+        );
+        let usage = list_usage();
+        assert!(usage.contains("services"), "usage must name services");
     }
 }

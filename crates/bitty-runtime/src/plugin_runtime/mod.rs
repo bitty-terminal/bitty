@@ -749,6 +749,18 @@ impl PluginRuntime {
         self.order.clone()
     }
 
+    /// Borrow one discovered package's manifest, provenance, and recorded
+    /// grants, if discovered.
+    ///
+    /// Read-only introspection for VM-less surfaces (e.g. `bitty list
+    /// services`, dynapi observability bitty#2002): manifests parse at
+    /// discovery, so this never loads a plugin VM. Returns `None` for
+    /// undiscovered ids.
+    #[must_use]
+    pub fn discovered_package(&self, id: &PluginId) -> Option<&PluginPackage> {
+        self.entries.get(id).map(|entry| &entry.package)
+    }
+
     /// Lifecycle state for `id`, if discovered.
     #[must_use]
     pub fn state(&self, id: &PluginId) -> Option<&LifecycleState> {

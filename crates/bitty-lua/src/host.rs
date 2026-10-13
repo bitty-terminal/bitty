@@ -1420,11 +1420,12 @@ pub trait HostServices {
 
     /// Invoke one provided service method (LUA-OQ-8).
     ///
-    /// `provider`/`generation`/`iface`/`method` pin the exact published record
-    /// the consumer handle captured (no re-resolution: a republished
-    /// replacement never hijacks a live handle, and a stale generation fails
-    /// closed with `E_SERVICE_GONE`). The default fails closed
-    /// with `E_NOT_IMPLEMENTED`; the runtime overrides it with
+    /// `provider`/`generation`/`iface`/`version`/`method` pin the exact
+    /// published record the consumer handle captured (no re-resolution: a
+    /// republished replacement never hijacks a live handle, a stale
+    /// generation fails closed with `E_SERVICE_GONE`, and a side-by-side
+    /// sibling version never serves through this handle). The default fails
+    /// closed with `E_NOT_IMPLEMENTED`; the runtime overrides it with
     /// generation-checked schema-validated cross-VM invocation
     /// (`E_SERVICE_GONE` past disappearance, `E_SERVICE_INVALID` on
     /// schema violation).
@@ -1433,10 +1434,11 @@ pub trait HostServices {
         provider: &str,
         generation: u32,
         iface: &str,
+        version: &str,
         method: &str,
         args: &LuaValue,
     ) -> Result<LuaValue, BridgeError> {
-        let _ = (provider, generation, iface, method, args);
+        let _ = (provider, generation, iface, version, method, args);
         Err(BridgeError::not_implemented("bitty.services.get"))
     }
 
@@ -3466,6 +3468,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         let state = state.clone();
                         let provider = route.provider.clone();
                         let generation = route.generation;
+                        let version = route.version.clone();
                         let iface = route.iface.clone();
                         let name = method.clone();
                         let method = method.clone();
@@ -3482,7 +3485,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                                     let result = state
                                         .bounded(|_expiry| {
                                             state.services.service_call(
-                                                &provider, generation, &iface, &method, &arg,
+                                                &provider, generation, &iface, &version, &method,
+                                                &arg,
                                             )
                                         })
                                         .map_err(|error| error.to_error(ctx))?;
@@ -3624,14 +3628,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             )
                             .to_error(ctx));
                         }
-                        if capture.services.iter().any(|p| p.iface == iface) {
-                            return Err(BridgeError::new(
-                                "validation",
-                                "E_DEF_INVALID",
-                                format!("duplicate service provision '{iface}'"),
-                            )
-                            .to_error(ctx));
-                        }
+                        // Side-by-side versions (dynapi negotiation,
+                        // bitty#2006) share one short interface: repeated
+                        // provisions are captured, and the commit gate binds
+                        // each occurrence to its declared (interface,
+                        // version) in order, rejecting over-count as
+                        // undeclared. The per-table method dedup above
+                        // stays; only the cross-provision iface dedup goes.
                         capture.services.push(ServiceProvision { iface, methods });
                     }
                     stack.replace(ctx, Value::Boolean(true));

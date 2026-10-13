@@ -1370,6 +1370,11 @@ impl PluginDependency {
 /// consumers, and only backed providers (non-empty `heads`) record at all:
 /// a provided interface projects already-existing Core capability heads
 /// through a grant and never mints authority (dynapi gating, bitty#2005).
+///
+/// The same interface may repeat at distinct exact versions: side-by-side
+/// versions coexist in the directory and consumers pin independently
+/// (dynapi negotiation, bitty#2006). Repeating an (interface, version)
+/// pair stays a duplicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvidedService {
     /// Service interface name: short form only (dot-separated grammar, e.g.
@@ -2457,7 +2462,9 @@ impl PluginManifest {
     /// - `plugin` identity (id, semver, bounded display strings),
     /// - `compat` version requirement syntax,
     /// - dependency count and version req syntax (8 max, cycle check is in registry),
-    /// - provided services count and identifier syntax (16 max),
+    /// - provided services count and identifier syntax (16 max; the same
+    ///   interface may repeat at distinct exact versions for side-by-side
+    ///   negotiation, exact (interface, version) duplicates rejected),
     /// - required services count, identifier syntax, and requirement syntax
     ///   (16 max, duplicate interfaces rejected; satisfaction is resolve-time),
     /// - capability closed-set validation (unknown identifiers fail, no wildcards),
@@ -2516,14 +2523,18 @@ impl PluginManifest {
         for svc in &self.provided_services {
             svc.validate()?;
         }
-        // Duplicate provided interfaces rejected (would be silent shadowing otherwise).
+        // Duplicate provided (interface, version) pairs rejected (would be
+        // silent shadowing otherwise). The same interface at distinct
+        // versions may repeat: side-by-side versions of one interface
+        // coexist in the directory, and consumers pin independently
+        // (dynapi negotiation, bitty#2006).
         {
             let mut seen = BTreeSet::new();
             for svc in &self.provided_services {
-                if !seen.insert(svc.iface.clone()) {
+                if !seen.insert((svc.iface.clone(), svc.version.clone())) {
                     return Err(PluginError::Duplicate {
                         kind: "provided-service".to_string(),
-                        value: svc.iface.clone(),
+                        value: format!("{}@{}", svc.iface, svc.version),
                     });
                 }
             }
@@ -3460,6 +3471,58 @@ mod tests {
         let text = format!("{err}");
         assert!(text.contains("markdown.render"), "names the iface: {text}");
         assert!(text.contains("heads"), "names the field: {text}");
+    }
+
+    #[test]
+    fn provided_services_allow_side_by_side_versions_reject_exact_dupes() {
+        // Dynapi negotiation (bitty#2006): the same interface at distinct
+        // exact versions validates; repeating an (interface, version) pair
+        // fails closed naming the pair.
+        let mut m = minimal_manifest("xuepoo.test");
+        m.provided_services.push(backed_service("duet.play"));
+        let mut v2 = backed_service("duet.play");
+        v2.version = "2.0.0".to_string();
+        m.provided_services.push(v2);
+        assert!(m.validate().is_ok());
+
+        let mut m = minimal_manifest("xuepoo.test");
+        m.provided_services.push(backed_service("duet.play"));
+        m.provided_services.push(backed_service("duet.play"));
+        let err = m.validate().expect_err("exact dupe must fail");
+        let text = format!("{err}");
+        assert!(text.contains("duet.play@1.0.0"), "names the pair: {text}");
+    }
+
+    #[test]
+    fn service_version_requirement_matrix() {
+        // Dynapi negotiation (bitty#2006): the broker's matching grammar
+        // (`>=`, `^`, `~`, exact) resolves identically here and in the
+        // policy registry gate. Fail-closed rows: unparseable versions or
+        // requirements never satisfy, and stable-only requirements never
+        // match prereleases.
+        for (provided, requirement, expected) in [
+            ("1.2.0", ">=1.0", true),
+            ("1.0.0", ">=1.0", true),
+            ("0.9.0", ">=1.0", false),
+            ("1.5.0", "^1.2", true),
+            ("2.0.0", "^1.2", false),
+            ("1.2.9", "~1.2.0", true),
+            ("1.3.0", "~1.2.0", false),
+            ("1.2.0", "1.2.0", true),
+            ("1.2.1", "1.2.0", false),
+            ("1.2.0", ">=1.2,<1.5", true),
+            ("1.5.0", ">=1.2,<1.5", false),
+            ("not-a-version", ">=1.0", false),
+            ("1.2.0", "nonsense", false),
+            ("1.2.0", "", false),
+            ("2.0.0-alpha", "^2.0", false),
+        ] {
+            assert_eq!(
+                service_version_satisfies(provided, requirement),
+                expected,
+                "provided={provided:?} requirement={requirement:?}"
+            );
+        }
     }
 
     #[test]

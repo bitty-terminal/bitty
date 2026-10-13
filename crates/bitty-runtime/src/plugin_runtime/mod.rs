@@ -2232,12 +2232,15 @@ impl PluginRuntime {
     /// Publish a generation's captured service provisions (LUA-OQ-8).
     ///
     /// Called after [`validate_capture`] and before the atomic commit, so
-    /// every provision here is declared in the manifest, uniquely named,
+    /// every provision here is declared in the manifest, uniquely versioned,
     /// backed by at least one granted head, and within bounds. Version,
     /// schemas, and backing heads come from the manifest's
     /// `services.provided` entry (never from Lua); impl functions come from
     /// the capture; the provider VM is held weakly so dispose invalidates
-    /// consumer handles without further coordination.
+    /// consumer handles without further coordination. Side-by-side versions
+    /// (dynapi negotiation, bitty#2006) bind by occurrence: the nth
+    /// provision of one interface publishes the nth declared (interface,
+    /// version), mirroring [`validate_capture`].
     fn publish_services(
         &self,
         id: &PluginId,
@@ -2247,12 +2250,16 @@ impl PluginRuntime {
         vm: &Rc<RefCell<LuaVm>>,
     ) {
         let mut directory = self.service_directory.borrow_mut();
+        let mut service_occurrences: BTreeMap<String, usize> = BTreeMap::new();
         for provision in &capture.services {
-            let declared = manifest
-                .provided_services
-                .iter()
-                .find(|service| service.iface == provision.iface)
-                .expect("validate_capture guarantees declared provisions");
+            let occurrence = service_occurrences
+                .entry(provision.iface.clone())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(0);
+            let occurrence = *occurrence;
+            let declared =
+                declared_provision_slot(&manifest.provided_services, &provision.iface, occurrence)
+                    .expect("validate_capture guarantees declared provisions");
             let mut funcs = BTreeMap::new();
             for method in &provision.methods {
                 funcs.insert(method.name.clone(), method.func.clone());
@@ -2551,6 +2558,26 @@ fn invalid_plugin_id() -> PluginId {
     PluginId::new("invalid.root").expect("static id is valid")
 }
 
+/// Bind the nth provision of one interface to the nth declared
+/// (interface, version) in manifest order.
+///
+/// Side-by-side versions (dynapi negotiation, bitty#2006) share one short
+/// interface: each `provide` call binds by occurrence, versions resolve
+/// from the manifest (never from Lua), and a provision past the declared
+/// count finds no slot (`None` → undeclared). Shared by
+/// [`validate_capture`] and [`PluginRuntime::publish_services`] so the
+/// gate and the publisher can never disagree on the binding.
+fn declared_provision_slot<'a>(
+    provided: &'a [bitty_plugin_host::manifest::ProvidedService],
+    iface: &str,
+    occurrence: usize,
+) -> Option<&'a bitty_plugin_host::manifest::ProvidedService> {
+    provided
+        .iter()
+        .filter(|service| service.iface == iface)
+        .nth(occurrence)
+}
+
 /// Validate a registration capture against the manifest, fail closed.
 ///
 /// Defense-in-depth complement to the bridge admission caps (`HOST-002`):
@@ -2821,6 +2848,7 @@ fn validate_capture(
         });
     }
     let mut seen_services = BTreeSet::new();
+    let mut service_occurrences: BTreeMap<String, usize> = BTreeMap::new();
     for provision in &capture.services {
         // Dynapi arbitration (bitty#2003): provisions name the short
         // interface only, never a Core-reserved spelling. A hand-built
@@ -2845,10 +2873,18 @@ fn validate_capture(
                 });
             }
         }
-        let declared = manifest
-            .provided_services
-            .iter()
-            .find(|service| service.iface == provision.iface);
+        // Side-by-side versions (dynapi negotiation, bitty#2006): the nth
+        // provision of one interface binds to the nth declared
+        // (interface, version) via [`declared_provision_slot`]. Versions
+        // come from the manifest, never from Lua; a provision past the
+        // declared count fails closed as undeclared.
+        let occurrence = service_occurrences
+            .entry(provision.iface.clone())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(0);
+        let occurrence = *occurrence;
+        let declared =
+            declared_provision_slot(&manifest.provided_services, &provision.iface, occurrence);
         let Some(declared) = declared else {
             return Err(PluginRuntimeError::Capture {
                 plugin: id.to_string(),
@@ -2881,7 +2917,7 @@ fn validate_capture(
                 });
             }
         }
-        if !seen_services.insert(provision.iface.clone()) {
+        if !seen_services.insert((provision.iface.clone(), declared.version.clone())) {
             return Err(PluginRuntimeError::Capture {
                 plugin: id.to_string(),
                 detail: format!("duplicate service provision '{}'", provision.iface),
@@ -3351,6 +3387,49 @@ mod tests {
             assert!(text.contains(iface), "names the iface: {text}");
             assert!(text.contains(want), "names the rule: {text}");
         }
+    }
+
+    #[test]
+    fn declared_provision_slot_binds_by_occurrence() {
+        // Dynapi negotiation (bitty#2006): the nth provision of one
+        // interface binds to the nth declared (interface, version) in
+        // manifest order; past the declared count there is no slot.
+        // (Stashed functions need a VM, so the binding rule is pinned
+        // here on plain declarations; end-to-end activation covers the
+        // full path in `plugin_services`.)
+        let mut one = backed_service("duet.play", vec!["runtime.inspect"]);
+        one.version = "1.0.0".to_string();
+        let mut two = backed_service("duet.play", vec!["workspace.read"]);
+        two.version = "2.0.0".to_string();
+        let mut other = backed_service("other.svc", vec!["runtime.inspect"]);
+        other.version = "3.0.0".to_string();
+        let provided = vec![one, other, two];
+        assert_eq!(
+            declared_provision_slot(&provided, "duet.play", 0)
+                .expect("first slot")
+                .version,
+            "1.0.0"
+        );
+        assert_eq!(
+            declared_provision_slot(&provided, "duet.play", 1)
+                .expect("second slot")
+                .version,
+            "2.0.0"
+        );
+        assert_eq!(
+            declared_provision_slot(&provided, "other.svc", 0)
+                .expect("other iface unaffected")
+                .version,
+            "3.0.0"
+        );
+        assert!(
+            declared_provision_slot(&provided, "duet.play", 2).is_none(),
+            "past the declared count there is no slot"
+        );
+        assert!(
+            declared_provision_slot(&provided, "missing.svc", 0).is_none(),
+            "unknown interfaces have no slot"
+        );
     }
 
     #[test]

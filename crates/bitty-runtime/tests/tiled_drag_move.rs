@@ -48,13 +48,15 @@ fn release(button: MouseButton) -> bitty_platform::MouseEvent {
 }
 
 /// Cursor pixels landing on container cell (col, row) under the default
-/// headless geometry (8px padding, 9x19 cells, zero gaps). Matches the
-/// `cursor_to_leaf_cell` / `cursor_to_layout_point` origin (no decoration
-/// offset) so drop positions map to exact cells for position-based sizing.
+/// headless geometry (8px padding, 9x19 cells, zero gaps, plus the 6px
+/// decoration outer inset at scale 1). Matches the
+/// `cursor_to_leaf_cell` / `cursor_to_layout_point` origin (padding plus
+/// decoration outer, CTX-1168 issue 1983) so drop positions map to exact
+/// cells for position-based sizing.
 fn cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 9.0,
     }
 }
 
@@ -990,5 +992,41 @@ fn capacity_refused_arm_retries_on_later_motion() {
         (0.0..1.0).contains(&p),
         "retried ghost must accumulate, got {p}"
     );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn deco_outer_band_press_grabs_no_tile_and_headed_origin_grabs() {
+    // CTX-1168 issue 1983: the allocation origin includes the 6px decoration
+    // outer inset at scale 1. A press in the outer band belongs to no leaf so
+    // no tiled drag starts, while the headed container origin grabs the left
+    // pane. Fails pre-fix where the mapping is pad-only and the outer band
+    // resolves to the first leaf.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let outer = CursorPosition { x: 11.0, y: 100.0 };
+    rt.handle_cursor_moved(outer);
+    assert_eq!(
+        rt.cursor_to_leaf_cell(outer),
+        None,
+        "outer band must own no leaf"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        !rt.tiled_drag_active(),
+        "outer-band Mod+press must not grab a tile"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    rt.handle_cursor_moved(cell_pixels(0, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.tiled_drag_source(),
+        Some(ViewId::new(1)),
+        "headed origin must grab the left pane"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }

@@ -140,15 +140,22 @@ fn hit_testing_subtracts_the_inset() {
             .is_none(),
         "padding band must not resolve to a leaf cell"
     );
-    // The first grid cell starts at the inset origin.
+    // A click inside the 6px decoration outer band is background too
+    // (CTX-1168 issue 1983: pad 8 plus 6px outer at scale 1).
+    assert!(
+        rt.cursor_to_leaf_cell(CursorPosition { x: 10.0, y: 10.0 })
+            .is_none(),
+        "decoration outer band must not resolve to a leaf cell"
+    );
+    // The first grid cell starts at the inset origin (pad plus outer).
     let (id, cell) = rt
-        .cursor_to_leaf_cell(CursorPosition { x: 8.0, y: 8.0 })
+        .cursor_to_leaf_cell(CursorPosition { x: 14.0, y: 14.0 })
         .expect("inset origin is cell (0, 0)");
     assert_eq!((cell.row, cell.col), (0, 0));
     let _ = id;
     // Second column starts one cell past the inset.
     let (_, cell) = rt
-        .cursor_to_leaf_cell(CursorPosition { x: 17.0, y: 8.0 })
+        .cursor_to_leaf_cell(CursorPosition { x: 23.0, y: 14.0 })
         .expect("second column");
     assert_eq!((cell.row, cell.col), (0, 1));
 }

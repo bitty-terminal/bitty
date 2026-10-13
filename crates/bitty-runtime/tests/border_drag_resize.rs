@@ -26,12 +26,13 @@ fn release(button: MouseButton) -> bitty_platform::MouseEvent {
 }
 
 /// Cursor pixels landing on container cell (col, row) under the default
-/// headless geometry: 8px window padding, 9x19 cells, zero gaps. The
-/// `+4.0`/`+9.0` inset lands inside the target cell (never on an edge).
+/// headless geometry: 8px window padding, 6px decoration outer inset at
+/// scale 1, 9x19 cells, zero gaps. The `+4.0`/`+9.0` inset lands inside
+/// the target cell (never on an edge).
 fn cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 9.0,
     }
 }
 
@@ -84,7 +85,7 @@ fn border_press_grabs_divider_without_selection_or_focus_move() {
     rt.set_layout(two_pane_horizontal());
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
     // Column 40 is the zero-gap boundary line between the 40-col panes.
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(
         rt.border_drag_active(),
@@ -105,11 +106,11 @@ fn border_press_grabs_divider_without_selection_or_focus_move() {
 fn drag_right_grows_first_pane_live() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.border_drag_active());
     // +8 cells on an 80-col container: 0.5 -> 0.6, applied live.
-    rt.handle_cursor_moved(cell_pixels(48, 12));
+    rt.handle_cursor_moved(cell_pixels(47, 12));
     assert!((ratio(&rt) - 0.6).abs() < 1e-6);
     let left = rt
         .layout_allocations()
@@ -119,7 +120,7 @@ fn drag_right_grows_first_pane_live() {
         .expect("left pane must be allocated");
     assert_eq!(left.width, 48);
     // Incremental: a further +4 cells lands at 0.65.
-    rt.handle_cursor_moved(cell_pixels(52, 12));
+    rt.handle_cursor_moved(cell_pixels(51, 12));
     assert!((ratio(&rt) - 0.65).abs() < 1e-6);
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
@@ -143,7 +144,7 @@ fn drag_left_shrinks_first_pane() {
 fn overshoot_clamps_fail_closed_and_tree_survives() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     // Far-right teleport clamps at MAX_RATIO instead of breaking the tree.
     rt.handle_cursor_moved(cell_pixels(79, 12));
@@ -179,9 +180,9 @@ fn pane_press_starts_selection_not_drag() {
 fn release_ends_drag_and_later_motion_is_inert() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
-    rt.handle_cursor_moved(cell_pixels(48, 12));
+    rt.handle_cursor_moved(cell_pixels(47, 12));
     assert!((ratio(&rt) - 0.6).abs() < 1e-6);
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
@@ -252,7 +253,7 @@ fn alt_press_on_border_keeps_alt_drag_routing() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
     set_modifiers(&mut rt, false, true);
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(
         !rt.border_drag_active(),
@@ -265,16 +266,16 @@ fn alt_press_on_border_keeps_alt_drag_routing() {
 fn vertical_split_consumes_row_delta_only() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_vertical());
-    // Row 12 is the zero-gap boundary line between the 12-row panes.
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    // Row 11 sits on the headed 6px band between the 12-row panes.
+    rt.handle_cursor_moved(cell_pixels(39, 11));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.border_drag_active());
     // Pure column motion: consumed, ratio untouched.
-    rt.handle_cursor_moved(cell_pixels(60, 12));
+    rt.handle_cursor_moved(cell_pixels(60, 11));
     assert!((ratio(&rt) - 0.5).abs() < 1e-6);
     assert!(rt.border_drag_active());
     // +4 rows on a 24-row container: 0.5 -> 0.5 + 4/24.
-    rt.handle_cursor_moved(cell_pixels(60, 16));
+    rt.handle_cursor_moved(cell_pixels(60, 15));
     let expected = 0.5 + 4.0f32 / 24.0;
     assert!((ratio(&rt) - expected).abs() < 1e-6);
     rt.handle_mouse_input(release(MouseButton::Left));
@@ -285,9 +286,9 @@ fn vertical_split_consumes_row_delta_only() {
 fn dragged_size_persists_across_reflow() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
-    rt.handle_cursor_moved(cell_pixels(48, 12));
+    rt.handle_cursor_moved(cell_pixels(47, 12));
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!((ratio(&rt) - 0.6).abs() < 1e-6);
     // Ratios live in the tree: reflow (and any later present) preserves
@@ -308,7 +309,7 @@ fn hover_query_reports_divider_axis() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
     assert_eq!(
-        rt.border_drag_hover_at(cell_pixels(40, 12)),
+        rt.border_drag_hover_at(cell_pixels(39, 12)),
         Some(SplitAxis::Horizontal),
         "hovering the divider reports its axis for cursor feedback"
     );
@@ -323,7 +324,7 @@ fn hover_query_reports_divider_axis() {
 fn cursor_leaving_window_ends_drag() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
-    rt.handle_cursor_moved(cell_pixels(40, 12));
+    rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.border_drag_active());
     cursor_left(&mut rt);
@@ -614,4 +615,35 @@ fn corner_drag_with_gaps_center_press_fails_closed() {
         "ambiguous center gap press must not grab"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn deco_outer_shifts_divider_hover_to_headed_origin() {
+    // CTX-1168 issue 1983: the layout-point origin includes the 6px decoration
+    // outer inset at scale 1. The headed divider hovers its axis, the stale
+    // pad-only divider pixels sit one cell inside the left pane and hover
+    // nothing, and the outer band hovers nothing. Both divider assertions
+    // fail pre-fix where the mapping is pad-only.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    assert_eq!(
+        rt.border_drag_hover_at(cell_pixels(39, 12)),
+        Some(SplitAxis::Horizontal),
+        "headed divider must hover its axis"
+    );
+    let stale = CursorPosition {
+        x: 8.0 + f64::from(39) * 9.0 + 4.0,
+        y: 8.0 + f64::from(12) * 19.0 + 9.0,
+    };
+    assert_eq!(
+        rt.border_drag_hover_at(stale),
+        None,
+        "stale pad-only divider pixels must miss headed"
+    );
+    let outer = CursorPosition { x: 11.0, y: 245.0 };
+    assert_eq!(
+        rt.border_drag_hover_at(outer),
+        None,
+        "outer band must hover no divider"
+    );
 }

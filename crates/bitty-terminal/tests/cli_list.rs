@@ -541,7 +541,7 @@ impl ServicesFixture {
         .unwrap();
         std::fs::write(
             plugin.join("lua/init.lua"),
-            "os.execute('touch pwned-by-list-test')\nreturn {}\n",
+            "error(\"sentinel: list services must not execute plugin VM\")\nreturn {}\n",
         )
         .unwrap();
     }
@@ -549,23 +549,20 @@ impl ServicesFixture {
     fn run(&self, args: &[&str]) -> Output {
         let env = self.env();
         let refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        run_bitty(args, &refs)
+        let output = run_bitty(args, &refs);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "list services must succeed without executing plugin VM, args={args:?}, stderr={:?}",
+            stderr(&output)
+        );
+        output
     }
 }
 
 impl Drop for ServicesFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
-        // The listing must never execute plugin payloads.
-        assert!(
-            !self.root.join("pwned-by-list-test").exists()
-                && !self
-                    .root
-                    .join("plugins")
-                    .join("pwned-by-list-test")
-                    .exists(),
-            "list services must never execute plugin init.lua"
-        );
     }
 }
 
@@ -600,7 +597,7 @@ fn list_services_empty_without_fixtures_is_success_with_count_zero() {
 #[test]
 fn list_services_registered_rows_carry_frozen_keys() {
     // Register (fixture present) -> listed with every frozen key; the
-    // hostile init.lua beside it never executes (Drop asserts).
+    // sentinel init.lua beside it never executes (every run asserts exit 0).
     let fixture = ServicesFixture::new("registered");
     fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
     let output = fixture.run(&["list", "services", "--format", "json"]);
@@ -705,6 +702,7 @@ fn list_services_unregister_is_gone_and_safe_skips_third_party() {
     let fixture = ServicesFixture::new("gone");
     fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
     let before = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(before.status.code(), Some(0));
     assert!(parse_stdout_json(&stdout(&before)).contains("\"count\":1"));
     std::fs::remove_dir_all(fixture.root.join("plugins").join("xuepoo.calc")).unwrap();
     let after = fixture.run(&["list", "services", "--format", "json"]);

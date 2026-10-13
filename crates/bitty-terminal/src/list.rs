@@ -983,7 +983,8 @@ fn service_effective_grants(
         None => (
             manifest
                 .capabilities
-                .ids
+                .all_ids()
+                .unwrap_or_default()
                 .iter()
                 .map(|id| id.as_str().to_string())
                 .collect(),

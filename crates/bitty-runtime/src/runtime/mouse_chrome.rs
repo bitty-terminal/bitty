@@ -922,17 +922,24 @@ impl Runtime {
     /// Maps a physical cursor position to container-cell coordinates for
     /// split-handle and tiled-drop hit-testing (issues #1348, #1710).
     ///
-    /// Removes only the window padding inset and converts with live cell
+    /// Removes the window padding inset plus the decoration outer inset
+    /// (CTX-1168, issue #1983) and converts with live cell
     /// metrics, keeping the point in container coordinates: layout
     /// hit-tests (`hit_test_leaf`, `hit_test_split_handle(s)`,
-    /// `drop_spec_for_point`) apply the outer gap inset themselves via
-    /// `layout_with_gaps`, so subtracting `gaps_out` here would shift the
-    /// drop target with nonzero outer gaps. Unlike the leaf variant there
+    /// `drop_spec_for_point`) apply the cell outer gap inset themselves via
+    /// `layout_with_gaps`, so subtracting cell `gaps_out` here would shift the
+    /// drop target with nonzero outer gaps. The px decoration outer gap is
+    /// different: cell allocations never include it, so headed frames sit
+    /// `gaps_out` px inside the container origin and a pad-only mapping
+    /// drifts sub-cell at scale 1. Unlike the leaf variant there
     /// is no leaf lookup: gap bands and zero-gap boundary lines own no
     /// leaf but may own a split handle.
     /// Returns `None` when the pointer maps outside the container origin
     /// or the cell metrics are degenerate.
     fn cursor_to_layout_point(&self, pos: CursorPosition) -> Option<UiPoint> {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
+        }
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
@@ -940,8 +947,16 @@ impl Runtime {
             return None;
         }
         let pad_px = f64::from(self.window_padding_physical());
-        let x = pos.x - pad_px;
-        let y = pos.y - pad_px;
+        let deco_outer_px = {
+            let scaled = f64::from(self.config.decoration.gaps_out) * self.dpi_scale();
+            if !scaled.is_finite() || scaled <= 0.0 {
+                0.0
+            } else {
+                scaled.round()
+            }
+        };
+        let x = pos.x - pad_px - deco_outer_px;
+        let y = pos.y - pad_px - deco_outer_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -953,6 +968,33 @@ impl Runtime {
         Some(UiPoint::new(col as u16, row as u16))
     }
 
+    /// Whether `pos` lies inside any present content rectangle (CTX-1168).
+    ///
+    /// Headed content starts inside the frame (outer plus border plus inset):
+    /// a pointer there owns a selection, never a divider grab. The cell
+    /// hit test below still reports the zero-gap boundary cols (39 and 40
+    /// for a 40|40 split), so without this guard a content press would
+    /// resize instead of selecting once the outer inset is accounted.
+    /// Band, border, and inset presses (frame but outside content, or no
+    /// frame) return false so dividers still grab.
+    fn pointer_in_content(&self, pos: CursorPosition) -> bool {
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad;
+        let y = pos.y - pad;
+        if x < 0.0 || y < 0.0 {
+            return false;
+        }
+        self.present_frames().into_iter().any(|frame| {
+            let c = frame.content;
+            if c.width == 0 || c.height == 0 {
+                return false;
+            }
+            let right = f64::from(c.x) + f64::from(c.width);
+            let bottom = f64::from(c.y) + f64::from(c.height);
+            x >= f64::from(c.x) && x < right && y >= f64::from(c.y) && y < bottom
+        })
+    }
+
     /// Split axis under the pointer, if any (issue #1348 hover affordance).
     ///
     /// Pure query over [`LayoutNode::hit_test_split_handle`]: returns the
@@ -962,6 +1004,9 @@ impl Runtime {
     /// drag itself works without it.
     #[must_use]
     pub fn border_drag_hover_at(&self, pos: CursorPosition) -> Option<SplitAxis> {
+        if self.pointer_in_content(pos) {
+            return None;
+        }
         let point = self.cursor_to_layout_point(pos)?;
         let path = self
             .layout
@@ -1010,6 +1055,9 @@ impl Runtime {
         let Some(cursor) = self.last_cursor else {
             return false;
         };
+        if self.pointer_in_content(cursor) {
+            return false;
+        }
         let Some(point) = self.cursor_to_layout_point(cursor) else {
             return false;
         };
@@ -1194,7 +1242,12 @@ impl Runtime {
     ///
     /// Pure twin of the hit test inside [`Self::begin_border_drag`], used by
     /// the capture pre-focus (CTX-0804) so a divider press never moves focus.
+    /// Content presses (inside any present content rect) are never dividers
+    /// (CTX-1168): they own a selection and must still move focus.
     fn pointer_on_split_handle(&self, pos: CursorPosition) -> bool {
+        if self.pointer_in_content(pos) {
+            return false;
+        }
         self.cursor_to_layout_point(pos).is_some_and(|point| {
             !self
                 .layout

@@ -1844,25 +1844,34 @@ impl Runtime {
     /// (CTX-0177).
     ///
     /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
-    /// is leaf-aware: only the window padding inset (CTX-0223) is subtracted
+    /// is leaf-aware: the window padding inset (CTX-0223) and the
+    /// decoration outer inset (CTX-1168, issue #1983) are subtracted
     /// in live pixels, the remainder is divided by the live cell metrics
     /// (0157 math), the topmost containing gapped allocation is
     /// resolved in paint order (a visible float wins over the base leaf it
     /// covers, matching [`Self::cursor_to_present_cell`]), and the leaf
     /// origin is subtracted for the local cell.
-    /// The outer gap is deliberately NOT subtracted here: allocations from
+    /// The cell outer gap is deliberately NOT subtracted here: allocations from
     /// [`Self::layout_allocations`] already exclude it via `layout_with_gaps`
     /// (issue #1979, CTX-1149: subtracting it shifted the grab by `gaps_out`
     /// cells against the same allocations the move/drop path hit-tests
     /// without the shift, so a Mod+press landed on the neighbour pane).
-    /// Positions over the padding band, a gap band (inner or outer), or
-    /// outside all leaves yield `None`.
+    /// The decoration outer gap is different: cell allocations never include
+    /// the px decoration (the present solver insets it after the cell gaps),
+    /// so headed frames sit `gaps_out` px inside the container origin and a
+    /// pad-only mapping drifts sub-cell at scale 1. Border and content inset
+    /// stay inside the frame and do not shift the container-cell lookup.
+    /// Positions over the padding band, the decoration outer band, a gap band
+    /// (inner or outer), or outside all leaves yield `None`.
     ///
     /// No wide-spacer snapping is applied (that needs the target pane's
     /// snapshot; callers use `bitty_ui::snap_to_leading` with it). Local
     /// cells are clamped to the leaf allocation defensively.
     #[must_use]
     pub fn cursor_to_leaf_cell(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
+        }
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
@@ -1870,8 +1879,16 @@ impl Runtime {
             return None;
         }
         let pad_px = f64::from(self.window_padding_physical());
-        let x = pos.x - pad_px;
-        let y = pos.y - pad_px;
+        let deco_outer_px = {
+            let scaled = f64::from(self.config.decoration.gaps_out) * self.dpi_scale();
+            if !scaled.is_finite() || scaled <= 0.0 {
+                0.0
+            } else {
+                scaled.round()
+            }
+        };
+        let x = pos.x - pad_px - deco_outer_px;
+        let y = pos.y - pad_px - deco_outer_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }

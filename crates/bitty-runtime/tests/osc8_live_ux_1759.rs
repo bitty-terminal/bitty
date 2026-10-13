@@ -340,12 +340,13 @@ fn tick_clears_a_hover_whose_link_scrolled_away() {
 }
 
 /// Headless pixel for container cell (col, row) under the default headless
-/// geometry (8px window padding, 9x19 cells, zero gaps), matching
-/// `border_drag_resize.rs`: the inset lands inside the target cell.
+/// geometry (8px window padding, 6px decoration outer at scale 1, 9x19
+/// cells, zero gaps), matching `border_drag_resize.rs`: the inset lands
+/// inside the target cell.
 fn container_cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 9.0,
     }
 }
 
@@ -392,7 +393,7 @@ fn ctrl_press_on_divider_then_release_over_link_ends_drag_without_mint() {
     hold_ctrl(&mut rt);
 
     // Ctrl+press on the divider grabs the border drag.
-    let divider = container_cell_pixels(40, 12);
+    let divider = container_cell_pixels(39, 12);
     move_to(&mut rt, divider);
     press(&mut rt);
     assert!(

@@ -508,12 +508,13 @@ fn overlay_cell_pixels(col: u16, row: u16) -> CursorPosition {
     }
 }
 
-/// Cursor pixels for the split-handle path (8px padding, 9x19 cells, zero
-/// gaps): column 40 is the zero-gap boundary line of a 40|40 split.
+/// Cursor pixels for the split-handle path (8px padding, 6px decoration
+/// outer at scale 1, 9x19 cells, zero gaps): column 40 is the zero-gap
+/// boundary line of a 40|40 split.
 fn border_cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 9.0,
     }
 }
 
@@ -619,13 +620,13 @@ fn border_drag_arms_whole_surface_resize() {
     // ratio live, and idles after the 120 ms default.
     let mut rt = runtime_with(AnimationPolicy::default());
     rt.set_layout(two_pane_split());
-    rt.handle_cursor_moved(border_cell_pixels(40, 12));
+    rt.handle_cursor_moved(border_cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.border_drag_active(), "border press must grab");
 
     let t = Instant::now();
     assert!(
-        rt.update_border_drag_at(border_cell_pixels(48, 12), t),
+        rt.update_border_drag_at(border_cell_pixels(47, 12), t),
         "drag motion must apply"
     );
     let ratio = rt

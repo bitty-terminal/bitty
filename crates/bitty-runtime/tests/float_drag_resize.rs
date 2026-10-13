@@ -49,12 +49,15 @@ fn move_cell_pixels(col: u16, row: u16) -> CursorPosition {
 }
 
 /// Cursor pixels for the layout-point path (edge resize): 8px padding,
-/// 9x19 cells, zero gaps, matching the split-handle origin so edge cells
-/// map exactly.
+/// 6px decoration outer at scale 1, 9x19 cells, zero gaps, matching the
+/// split-handle origin so edge cells map exactly. The 1px interior offset
+/// keeps right/bottom edges inside their present frames (the frame ends
+/// where the container cell ends, so a middle offset would sit past a
+/// free float edge headed).
 fn layout_cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 1.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 1.0,
     }
 }
 

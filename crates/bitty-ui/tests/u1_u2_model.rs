@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_ui::a11y::A11yRole;
+use bitty_a11y::Role;
 use bitty_ui::{
     ActivityId, ActivityStack, LayerEntry, LayoutNode, PanelId, Rect, SceneLayer, SplitAxis,
     TerminalBinding, UiNode, UiNodeId, UiNodeKind, UiTree, View, ViewId, WorkspaceScene,
@@ -71,7 +71,7 @@ fn frame_on_demand_drives_paint_scheduling() {
 fn terminal_primitive_carries_no_handle() {
     let node = UiNode::leaf(UiNodeId::new(1), UiNodeKind::Terminal);
     assert!(node.children().is_empty());
-    assert_eq!(a11y_role_of(node.kind()), A11yRole::Text);
+    assert_eq!(a11y_role_of(node.kind()), Role::Text);
     // The scene join needs an explicit binding the tree cannot supply.
     let mut scene = scene_two_leaf();
     scene

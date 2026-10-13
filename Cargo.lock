@@ -177,6 +177,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-a11y"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=206b3bc#206b3bc1d999a9ec71096cd6b5da75326d384dcc"
+
+[[package]]
 name = "bitty-config"
 version = "0.0.22"
 dependencies = [
@@ -402,6 +407,7 @@ version = "0.0.22"
 name = "bitty-ui"
 version = "0.0.22"
 dependencies = [
+ "bitty-a11y",
  "bitty-rich",
  "bitty-term-state",
  "bitty-vt",

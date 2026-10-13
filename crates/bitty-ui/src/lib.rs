@@ -67,7 +67,11 @@
 //!   display state in `bitty-runtime`).
 //! - [`uitree`] — retained declarative `UiTree` with Level-1 primitives,
 //!   stable `UiNodeId` diffing identities, revision-gated paint scheduling,
-//!   and the `A11yRole` mapping (UX-13/UX-14, CTX-0662, candidate).
+//!   and the extension `Role` mapping (UX-13/UX-14, CTX-0662, candidate).
+//! - [`a11y_host`] — `SnapshotHost` implementation over the `bitty-a11y`
+//!   seam (CTX-1176): terminal text-run projection with the stated fidelity
+//!   boundary, `UiSnapshotHost` owned-values-only host, and core-owned
+//!   `A11ySettings` composition.
 //! - [`workspace_scene`] — four-layer `WorkspaceScene` -> `View` ->
 //!   `Panel` -> `Activity` spatial/identity model with the
 //!   `PanelId != ViewId != TerminalId` inequality by construction
@@ -145,7 +149,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod a11y;
+pub mod a11y_host;
 pub mod annotation_layer;
 pub mod budget;
 pub mod canvas;

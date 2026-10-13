@@ -44,6 +44,25 @@ fn three_pane() -> LayoutNode {
     )
 }
 
+fn four_pane() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(4), 80, 24)),
+        ),
+    )
+}
+
 fn install(rt: &mut Runtime, layout: LayoutNode) {
     rt.set_layout(layout);
     rt.set_container(UiRect::new(0, 0, 80, 24));
@@ -618,5 +637,147 @@ fn detached_primary_float_capture_waits_pending_like_pinned() {
         restored.primary_view(),
         Some(ViewId::new(1)),
         "startup binds the grid at the derived layout owner"
+    );
+}
+
+#[test]
+fn two_detached_floats_cascade_with_equal_size() {
+    // CTX-1166 (#1994): detaching a second float while one is already
+    // detached offsets by depth instead of landing exactly over the first;
+    // both floats keep the same anchored size.
+    let mut rt = make_runtime();
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    let first = frame_of(&rt, ViewId::new(1));
+    let second = frame_of(&rt, ViewId::new(2));
+    assert_eq!(first.tier, Some(OverlayTier::Float));
+    assert_eq!(second.tier, Some(OverlayTier::Float));
+    assert_ne!(
+        (first.frame.x, first.frame.y),
+        (second.frame.x, second.frame.y),
+        "second detach must offset past the first"
+    );
+    assert!(
+        second.frame.x > first.frame.x && second.frame.y > first.frame.y,
+        "cascade steps down-right, got {first:?} then {second:?}"
+    );
+    assert_eq!(
+        (first.frame.width, first.frame.height),
+        (second.frame.width, second.frame.height),
+        "cascaded floats keep the same size"
+    );
+    assert_eq!(
+        (first.cols, first.rows),
+        (second.cols, second.rows),
+        "cascaded floats keep the same grid"
+    );
+}
+
+#[test]
+fn three_detached_floats_keep_cascading_in_detach_order() {
+    // CTX-1166 (#1994): the cascade continues per depth — each new float
+    // steps further down-right — and paint order follows detach order so
+    // the newest stays topmost.
+    let mut rt = make_runtime();
+    install(&mut rt, four_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    rt.float_detach(ViewId::new(3)).expect("detach must apply");
+    let frames: Vec<PresentFrame> = rt.present_frames();
+    let origin_of = |view: ViewId| {
+        frames
+            .iter()
+            .find(|frame| frame.view == view)
+            .map(|frame| (frame.frame.x, frame.frame.y))
+            .expect("detached leaf still presents")
+    };
+    let (x1, y1) = origin_of(ViewId::new(1));
+    let (x2, y2) = origin_of(ViewId::new(2));
+    let (x3, y3) = origin_of(ViewId::new(3));
+    assert!(
+        x1 < x2 && x2 < x3 && y1 < y2 && y2 < y3,
+        "three detaches must keep cascading, got ({x1},{y1}) ({x2},{y2}) ({x3},{y3})"
+    );
+    let position_of = |view: ViewId| {
+        frames
+            .iter()
+            .position(|frame| frame.view == view)
+            .expect("detached leaf still presents")
+    };
+    assert!(
+        position_of(ViewId::new(1)) < position_of(ViewId::new(2))
+            && position_of(ViewId::new(2)) < position_of(ViewId::new(3)),
+        "paint order follows detach order"
+    );
+}
+
+#[test]
+fn detached_cascade_clamps_inside_a_small_container() {
+    // CTX-1166 (#1994): deep cascade steps clamp to the container edge —
+    // every float stays fully inside the tiled base extent, never spilling
+    // past it.
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane());
+    rt.set_container(UiRect::new(0, 0, 20, 10));
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    rt.float_detach(ViewId::new(3)).expect("detach must apply");
+    let base = frame_of(&rt, ViewId::new(4));
+    assert_eq!(base.tier, None, "survivor stays tiled");
+    for view in [ViewId::new(1), ViewId::new(2), ViewId::new(3)] {
+        let floated = frame_of(&rt, view);
+        assert_eq!(floated.tier, Some(OverlayTier::Float));
+        assert!(
+            floated.frame.x >= base.frame.x && floated.frame.y >= base.frame.y,
+            "{view:?} must stay inside the container origin"
+        );
+        assert!(
+            i64::from(floated.frame.x) + i64::from(floated.frame.width)
+                <= i64::from(base.frame.x) + i64::from(base.frame.width),
+            "{view:?} must not spill past the container right edge"
+        );
+        assert!(
+            i64::from(floated.frame.y) + i64::from(floated.frame.height)
+                <= i64::from(base.frame.y) + i64::from(base.frame.height),
+            "{view:?} must not spill past the container bottom edge"
+        );
+    }
+    let first = frame_of(&rt, ViewId::new(1));
+    let second = frame_of(&rt, ViewId::new(2));
+    assert_ne!(
+        (first.frame.x, first.frame.y),
+        (second.frame.x, second.frame.y),
+        "shallow cascade steps stay distinct before the clamp bites"
+    );
+}
+
+#[test]
+fn detached_float_cascades_past_an_existing_pin() {
+    // CTX-1166 (#1994): pinning detaches a leaf into the window-global
+    // store, so a fresh detach while a pin is composited must offset past
+    // the pin — both families shared cascade depth zero before, and the new
+    // float spawned exactly over the pin.
+    let mut rt = make_runtime();
+    install(&mut rt, three_pane());
+    rt.pin_floating(ViewId::new(1)).expect("pin must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    let pinned = frame_of(&rt, ViewId::new(1));
+    let floated = frame_of(&rt, ViewId::new(2));
+    assert_eq!(pinned.tier, Some(OverlayTier::Float));
+    assert_eq!(floated.tier, Some(OverlayTier::Float));
+    assert_ne!(
+        (pinned.frame.x, pinned.frame.y),
+        (floated.frame.x, floated.frame.y),
+        "detach must offset past the existing pin"
+    );
+    assert!(
+        floated.frame.x > pinned.frame.x && floated.frame.y > pinned.frame.y,
+        "detach cascades down-right past the pin, got {pinned:?} then {floated:?}"
+    );
+    assert_eq!(
+        (pinned.frame.width, pinned.frame.height),
+        (floated.frame.width, floated.frame.height),
+        "cascaded float keeps the same size as the pin"
     );
 }

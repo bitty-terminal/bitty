@@ -965,6 +965,89 @@ return {}
 }
 
 #[test]
+fn side_by_side_versions_coexist_and_pins_survive_republication() {
+    // bitty#2006: two versions of one interface coexist; a range serves
+    // the highest compatible (never a silent downgrade), an exact pin
+    // serves its release, an empty intersection fails closed listing the
+    // available versions, and a pinned consumer survives republication
+    // (dispose + re-activate) still pinned.
+    let root = temp_dir("negotiation");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.duet",
+        "[services.provided]\n\"duet.play\" = { version = [\"1.0.0\", \"2.0.0\"], heads = [\"runtime.inspect\"] }\n",
+        TEST_GRANT,
+        &["xuepoo.duet:ping"],
+        r#"
+bitty.commands.register({
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+})
+bitty.services.provide("duet.play", { play = function(args) return "v1" end })
+bitty.services.provide("duet.play", { play = function(args) return "v2" end })
+return {}
+"#,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.duetfan",
+        "[services.required]\n\"duet.play\" = \">=1.0\"\n",
+        TEST_GRANT,
+        &["xuepoo.duetfan:probe"],
+        r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local latest = bitty.services.get("duet.play")
+bitty.store.set("latest", latest.play({}))
+local pinned = bitty.services.get("duet.play", { version = "1.0.0" })
+bitty.store.set("pinned", pinned.play({}))
+local ok, err = pcall(bitty.services.get, "duet.play", { version = ">=9.0" })
+bitty.store.set("empty_code", ok and "NONE" or err.code)
+bitty.store.set("empty_msg", ok and "" or err.message)
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    rt.discover();
+    let duet_id = PluginId::new("xuepoo.duet").expect("id");
+    let fan_id = PluginId::new("xuepoo.duetfan").expect("id");
+    rt.activate(&duet_id).expect("provider activates");
+    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    rt.activate(&fan_id).expect("consumer activates");
+    assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
+    assert_eq!(store_string(&rt, &fan_id, "pinned"), Some("v1".to_string()));
+    assert_eq!(
+        store_string(&rt, &fan_id, "empty_code"),
+        Some("E_SERVICE_RESOLUTION".to_string())
+    );
+    let msg = store_string(&rt, &fan_id, "empty_msg").expect("diagnostic message");
+    assert!(msg.contains(">=9.0"), "names the range: {msg}");
+    assert!(msg.contains("1.0.0"), "lists v1: {msg}");
+    assert!(msg.contains("2.0.0"), "lists v2: {msg}");
+    // Negotiation results are recorded per call for observability (4/4):
+    // the range call served v2, the pinned call served v1.
+    let calls = rt.service_call_ledger().borrow().calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].version, "2.0.0");
+    assert_eq!(calls[1].version, "1.0.0");
+    // Republication (the upgrade path: dispose + re-activate) keeps the
+    // pin on its release instead of rebinding or breaking.
+    rt.dispose(&duet_id).expect("dispose");
+    rt.dispose(&fan_id).expect("consumer dispose");
+    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    rt.activate(&duet_id).expect("re-activate after dispose");
+    rt.activate(&fan_id).expect("consumer re-activates");
+    assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
+    assert_eq!(store_string(&rt, &fan_id, "pinned"), Some("v1".to_string()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn core_reserved_provide_rejected_at_install() {
     // bitty#2003: the `bitty.*` namespace stays frozen — an extension
     // manifest claiming it fails closed at install (discover) time.

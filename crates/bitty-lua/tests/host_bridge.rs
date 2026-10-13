@@ -1132,7 +1132,7 @@ fn timer_handle_allocation_is_checked_not_wrapping() {
 // ── LUA-OQ-8 services bridge (get/provide ↔ HostServices) ────────────────
 
 /// One recorded `service_call`: provider, generation, iface, method, args.
-type ServiceCall = (String, u32, String, String, LuaValue);
+type ServiceCall = (String, u32, String, String, String, LuaValue);
 
 /// Canned `HostServices` service backend: scripted routes and gate errors,
 /// recorded invocations. Proves the bridge delegates shape-valid calls to
@@ -1211,6 +1211,7 @@ impl HostServices for ServiceStub {
         provider: &str,
         generation: u32,
         iface: &str,
+        version: &str,
         method: &str,
         args: &LuaValue,
     ) -> Result<LuaValue, BridgeError> {
@@ -1218,6 +1219,7 @@ impl HostServices for ServiceStub {
             provider.to_string(),
             generation,
             iface.to_string(),
+            version.to_string(),
             method.to_string(),
             args.clone(),
         ));
@@ -1376,6 +1378,32 @@ fn services_get_qualified_reference_reaches_host() {
 }
 
 #[test]
+fn services_provide_repeated_iface_captures_for_side_by_side() {
+    // Dynapi negotiation (bitty#2006): side-by-side versions share one
+    // short interface, so repeated provisions are captured in call order;
+    // the commit gate binds each occurrence to its declared version.
+    let services = Rc::new(ServiceStub::default());
+    let mut vm = gate_vm("svc-provide-side-by-side");
+    install_services(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            bitty.services.provide("duet.play", { play = function(a) return "v1" end })
+            bitty.services.provide("duet.play", { play = function(a) return "v2" end })
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    let capture = vm.take_registrations();
+    assert_eq!(capture.services.len(), 2);
+    assert_eq!(capture.services[0].iface, "duet.play");
+    assert_eq!(capture.services[1].iface, "duet.play");
+}
+
+#[test]
 fn services_provide_qualified_reference_is_captured_for_host_gate() {
     // The bridge admits the qualified shape on provide too; the host gate
     // (stubbed to accept here, arbitration-checked in the runtime) owns
@@ -1453,14 +1481,15 @@ fn services_get_builds_pinned_handle() {
         services.store.borrow().get("out"),
         Some(&LuaValue::Integer(3))
     );
-    // The closure pins provider, generation, interface, and method; the
-    // marshalled args cross as values.
+    // The closure pins provider, generation, interface, version, and
+    // method; the marshalled args cross as values.
     assert_eq!(
         services.calls.borrow().as_slice(),
         &[(
             "xuepoo.calc".to_string(),
             7,
             "calc.add".to_string(),
+            "1.0.0".to_string(),
             "add".to_string(),
             LuaValue::table([("a", LuaValue::Integer(1))]),
         )]

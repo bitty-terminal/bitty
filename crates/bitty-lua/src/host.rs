@@ -5709,12 +5709,15 @@ fn optional_string<'gc>(ctx: Context<'gc>, table: Table<'gc>, field: &str) -> Op
     }
 }
 
-/// Shape-check one service interface name (LUA-OQ-8 admission bound).
+/// Shape-check one service reference (LUA-OQ-8 admission bound).
 ///
-/// Mirrors the manifest `services.provided` ceiling (1..128 bytes,
-/// dot-separated non-empty segments of at most 64 bytes, no NUL or
-/// space); the full grammar stays host-side, the bridge rejects only
-/// malformed shapes with a static detail for the caller to wrap.
+/// Admits short (`calc.add`) and owner-qualified (`xuepoo.calc:calc.add`)
+/// references: at most one `:`, both sides non-empty, 1..128 bytes total,
+/// no NUL or space, dot-separated non-empty short segments of at most 64
+/// bytes. Mirrors the manifest `services.provided` ceiling; the full
+/// grammar (owner identity, Core reservation) stays host-side, the bridge
+/// rejects only malformed shapes with a static detail for the caller to
+/// wrap.
 fn check_service_iface_shape(iface: &str) -> Result<(), &'static str> {
     if iface.is_empty() || iface.len() > SERVICE_MAX_IFACE_BYTES {
         return Err("service interface must be 1..128 bytes");
@@ -5722,7 +5725,16 @@ fn check_service_iface_shape(iface: &str) -> Result<(), &'static str> {
     if iface.contains('\0') || iface.contains(' ') {
         return Err("service interface must not contain NUL or space");
     }
-    for segment in iface.split('.') {
+    let short = match iface.split_once(':') {
+        None => iface,
+        Some((owner, short)) => {
+            if owner.is_empty() || short.is_empty() || short.contains(':') {
+                return Err("service reference must be 'iface' or 'owner:iface'");
+            }
+            short
+        }
+    };
+    for segment in short.split('.') {
         if segment.is_empty() || segment.len() > 64 {
             return Err("service interface segment must be 1..64 bytes");
         }

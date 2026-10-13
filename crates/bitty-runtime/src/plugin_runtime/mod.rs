@@ -73,9 +73,10 @@ pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
     MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PanelPinHandler,
     PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedThemeRequest,
-    QueuedWorkspaceRequest, ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource,
-    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
-    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord,
+    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, ThemePersistHandler,
+    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableWorkspaces,
+    WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -551,6 +552,13 @@ pub struct PluginRuntime {
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
     service_directory: Rc<RefCell<ServiceDirectory>>,
+    /// Dynapi gating (bitty#2005): runtime-shared brokered-call ledger
+    /// (provider owner plus backing heads per dispatched call, the input for
+    /// the observability issue 4/4). Shared with every generation's services
+    /// alongside the service directory; activation never clears it (history
+    /// survives reload) and suspend/dispose never prune it (entries are
+    /// snapshots with no VM references).
+    service_call_ledger: Rc<RefCell<ServiceCallLedger>>,
     /// CTX-1035: runtime-shared command directory for the generic
     /// host-mediated invocation path (`bitty.commands.list`/`invoke`,
     /// keybinding `command:<qualified>`, palette selection). Shared with
@@ -675,6 +683,9 @@ impl PluginRuntime {
             entries: BTreeMap::new(),
             order: Vec::new(),
             service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            service_call_ledger: Rc::new(RefCell::new(ServiceCallLedger::new(
+                SERVICE_CALL_LEDGER_CAPACITY,
+            ))),
             command_directory: Rc::new(RefCell::new(CommandDirectory::new())),
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
@@ -1432,6 +1443,7 @@ impl PluginRuntime {
         // revokes. Without both, `services.get`/`provide` fail closed with
         // `E_NOT_IMPLEMENTED`.
         plugin_services.set_service_directory(self.service_directory.clone());
+        plugin_services.set_service_call_ledger(self.service_call_ledger.clone());
         // CTX-1035: command directory wiring for the generic host-mediated
         // invocation path. Without it `commands.list`/`invoke` fail closed
         // with `E_NOT_IMPLEMENTED`.
@@ -1595,7 +1607,7 @@ impl PluginRuntime {
             }
         }
         let capture = vm.take_registrations();
-        if let Err(error) = validate_capture(id, &manifest, &capture) {
+        if let Err(error) = validate_capture(id, &manifest, &capture, &granted) {
             self.rollback(id, error.to_string());
             return Err(error);
         }
@@ -1603,8 +1615,8 @@ impl PluginRuntime {
         let (commands, events) = (capture.commands.len(), capture.events.len());
         // LUA-OQ-8: publish captured provisions into the live directory
         // before committing the generation. `validate_capture` already
-        // rejected undeclared/duplicate/over-limit provisions, so the
-        // manifest lookup below is infallible; version and schemas come from
+        // rejected undeclared/duplicate/over-limit/unbacked/ungranted provisions, so the
+        // manifest lookup below is infallible; version, schemas, and heads come from
         // the manifest, impl functions from the capture, the VM weakly.
         let vm = Rc::new(RefCell::new(vm));
         // Store the strong VM reference in the entry BEFORE publishing services
@@ -2218,8 +2230,9 @@ impl PluginRuntime {
     /// Publish a generation's captured service provisions (LUA-OQ-8).
     ///
     /// Called after [`validate_capture`] and before the atomic commit, so
-    /// every provision here is declared in the manifest, uniquely named, and
-    /// within bounds. Version and schemas come from the manifest's
+    /// every provision here is declared in the manifest, uniquely named,
+    /// backed by at least one granted head, and within bounds. Version,
+    /// schemas, and backing heads come from the manifest's
     /// `services.provided` entry (never from Lua); impl functions come from
     /// the capture; the provider VM is held weakly so dispose invalidates
     /// consumer handles without further coordination.
@@ -2251,6 +2264,7 @@ impl PluginRuntime {
                 funcs,
                 args_schema: declared.args_schema.clone(),
                 result_schema: declared.result_schema.clone(),
+                heads: declared.heads.clone(),
                 vm: Rc::downgrade(vm),
                 suspended: false,
             });
@@ -2451,6 +2465,12 @@ impl PluginRuntime {
         &self.service_directory
     }
 
+    /// Shared brokered-call ledger (diagnostics, tests, dynapi 4/4 input).
+    #[must_use]
+    pub fn service_call_ledger(&self) -> &Rc<RefCell<ServiceCallLedger>> {
+        &self.service_call_ledger
+    }
+
     /// Shared live command directory (diagnostics, tests).
     #[must_use]
     pub fn command_directory(&self) -> &Rc<RefCell<CommandDirectory>> {
@@ -2546,6 +2566,7 @@ fn validate_capture(
     id: &PluginId,
     manifest: &PluginManifest,
     capture: &RegistrationCapture,
+    granted: &BTreeSet<CapabilityId>,
 ) -> Result<(), PluginRuntimeError> {
     if capture.commands.len() > bitty_lua::REGISTRATION_MAX_COMMANDS {
         return Err(PluginRuntimeError::Capture {
@@ -2777,10 +2798,16 @@ fn validate_capture(
     // LUA-OQ-8: the bridge captures service provisions, so the commit gate
     // re-checks their bounds here like commands/events/timers/tasks. Every
     // provision must be declared in the manifest's `services.provided`
-    // (version and schemas resolve from the manifest, never from Lua).
-    // Unlike commands there is no reverse equivalence: a declared service
-    // with no provision simply never publishes, and resolution fails closed
-    // (`E_SERVICE_RESOLUTION`) instead of activation failing.
+    // (version, schemas, and backing heads resolve from the manifest, never
+    // from Lua). Unlike commands there is no reverse equivalence: a declared
+    // service with no provision simply never publishes, and resolution fails
+    // closed (`E_SERVICE_RESOLUTION`) instead of activation failing.
+    //
+    // Dynapi gating (bitty#2005): the declared entry must name at least one
+    // backing head and every head must sit in this activation's grant set.
+    // Unbacked provisions and head-spoofing (naming a head never granted)
+    // fail activation here with a naming diagnostic, so no unbacked or
+    // ungranted record ever reaches the directory.
     if capture.services.len() > bitty_lua::REGISTRATION_MAX_SERVICES {
         return Err(PluginRuntimeError::Capture {
             plugin: id.to_string(),
@@ -2791,14 +2818,13 @@ fn validate_capture(
             ),
         });
     }
-    let declared_services: BTreeSet<&str> = manifest
-        .provided_services
-        .iter()
-        .map(|service| service.iface.as_str())
-        .collect();
     let mut seen_services = BTreeSet::new();
     for provision in &capture.services {
-        if !declared_services.contains(provision.iface.as_str()) {
+        let declared = manifest
+            .provided_services
+            .iter()
+            .find(|service| service.iface == provision.iface);
+        let Some(declared) = declared else {
             return Err(PluginRuntimeError::Capture {
                 plugin: id.to_string(),
                 detail: format!(
@@ -2806,6 +2832,29 @@ fn validate_capture(
                     provision.iface
                 ),
             });
+        };
+        if declared.heads.is_empty() {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "service '{}' declares no backing capability head (services.provided.{}.heads)",
+                    provision.iface, provision.iface
+                ),
+            });
+        }
+        for head in &declared.heads {
+            let covered = granted
+                .iter()
+                .any(|capability| capability.as_str() == head.as_str());
+            if !covered {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "service '{}' backing head '{head}' is not granted",
+                        provision.iface
+                    ),
+                });
+            }
         }
         if !seen_services.insert(provision.iface.clone()) {
             return Err(PluginRuntimeError::Capture {
@@ -3162,6 +3211,93 @@ mod tests {
         raw.iter()
             .map(|grant| CapabilityId::parse(grant).expect("test grant parses"))
             .collect()
+    }
+
+    fn service_test_manifest(
+        provided: Vec<bitty_plugin_host::manifest::ProvidedService>,
+    ) -> PluginManifest {
+        use bitty_plugin_host::manifest::{
+            CapabilityRequests, Compat, LazyTriggers, PluginIdentity, PluginLimits,
+        };
+        PluginManifest {
+            identity: PluginIdentity {
+                id: PluginId::new("xuepoo.test").expect("id"),
+                name: "Test".to_string(),
+                version: "0.1.0".to_string(),
+                description: "test".to_string(),
+                license: None,
+            },
+            compat: Compat {
+                bitty: None,
+                plugin_api: Some("^1.0".to_string()),
+            },
+            dependencies: Vec::new(),
+            provided_services: provided,
+            required_services: Vec::new(),
+            capabilities: CapabilityRequests::default(),
+            tools: Vec::new(),
+            network: Vec::new(),
+            limits: PluginLimits::default(),
+            lazy: LazyTriggers {
+                commands: Vec::new(),
+                events: Vec::new(),
+                claims: Vec::new(),
+            },
+            raw_bytes_len: 512,
+        }
+    }
+
+    fn backed_service(
+        iface: &str,
+        heads: Vec<&str>,
+    ) -> bitty_plugin_host::manifest::ProvidedService {
+        bitty_plugin_host::manifest::ProvidedService {
+            iface: iface.to_string(),
+            version: "1.0.0".to_string(),
+            args_schema: None,
+            result_schema: None,
+            heads: heads.iter().map(|head| (*head).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_capture_rejects_unbacked_and_ungranted_provisions() {
+        use bitty_lua::ServiceProvision;
+        let id = PluginId::new("xuepoo.test").expect("id");
+        // Method validation runs after the heads gate, so an empty method
+        // list isolates the gate under test (granted heads fall through to
+        // the method-count failure).
+        let mut capture = RegistrationCapture::new();
+        capture.services.push(ServiceProvision {
+            iface: "calc.add".to_string(),
+            methods: Vec::new(),
+        });
+        let granted = parsed_grants(&["runtime.inspect"]);
+
+        let manifest = service_test_manifest(vec![backed_service("calc.add", Vec::new())]);
+        let err = validate_capture(&id, &manifest, &capture, &granted)
+            .expect_err("unbacked provision must fail");
+        let text = format!("{err}");
+        assert!(text.contains("calc.add"), "names the iface: {text}");
+        assert!(text.contains("heads"), "names the field: {text}");
+
+        let manifest =
+            service_test_manifest(vec![backed_service("calc.add", vec!["workspace.read"])]);
+        let err = validate_capture(&id, &manifest, &capture, &granted)
+            .expect_err("spoofed provision must fail");
+        assert!(
+            format!("{err}").contains("workspace.read"),
+            "names the head: {err}"
+        );
+
+        let manifest =
+            service_test_manifest(vec![backed_service("calc.add", vec!["runtime.inspect"])]);
+        let err = validate_capture(&id, &manifest, &capture, &granted)
+            .expect_err("empty methods still fail");
+        assert!(
+            format!("{err}").contains("method count"),
+            "granted heads pass the gate: {err}"
+        );
     }
 
     #[test]

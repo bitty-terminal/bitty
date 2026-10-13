@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::PluginError;
 use crate::manifest::{
-    LazyCommand, PluginId, PluginManifest, QualifiedName, service_version_satisfies,
-    summarize_interface_schema,
+    LazyCommand, PluginId, PluginManifest, QualifiedName, parse_service_reference,
+    service_version_satisfies, summarize_interface_schema,
 };
 
 /// Monotonic instance counter per plugin id.
@@ -358,23 +358,39 @@ impl Registry {
                 continue;
             }
             for (iface, req) in &entry.manifest.required_services {
-                if entry
-                    .manifest
-                    .provided_services
-                    .iter()
-                    .any(|svc| &svc.iface == iface && service_version_satisfies(&svc.version, req))
-                {
+                // Dynapi arbitration (bitty#2003): requirements are short
+                // or owner-qualified. `declare` validated every manifest,
+                // but the graph gate re-parses fail-closed rather than
+                // trusting stored text; a qualified requirement pins the
+                // owner, a short one matches any provider.
+                let (owner, short) =
+                    parse_service_reference(iface, "services.required").map_err(|error| {
+                        PluginError::registry(format!(
+                            "plugin '{pid}' requires invalid service '{iface}': {error}"
+                        ))
+                    })?;
+                if entry.manifest.provided_services.iter().any(|svc| {
+                    svc.iface == short
+                        && owner.as_deref().is_none_or(|wanted| wanted == pid.as_str())
+                        && service_version_satisfies(&svc.version, req)
+                }) {
                     continue;
                 }
                 let mut satisfied_by = Vec::new();
                 let mut seen_versions = Vec::new();
-                if let Some(candidates) = providers.get(iface) {
+                if let Some(candidates) = providers.get(&short) {
                     for (provider_pid, p_ver) in candidates {
                         if provider_pid == pid {
                             // Self provides the interface but not at a
                             // satisfying version (checked above): report the
                             // version without adding a self-loop edge.
                             seen_versions.push(format!("'{provider_pid}'={p_ver}"));
+                            continue;
+                        }
+                        if owner
+                            .as_deref()
+                            .is_some_and(|wanted| wanted != provider_pid)
+                        {
                             continue;
                         }
                         seen_versions.push(format!("'{provider_pid}'={p_ver}"));
@@ -1146,6 +1162,66 @@ mod tests {
         reg.resolve_all().unwrap();
         assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Resolved);
         assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+    }
+
+    #[test]
+    fn service_requirements_qualified_pins_owner() {
+        // Dynapi arbitration (bitty#2003): an owner-qualified requirement
+        // resolves only against that owner's provision. A same-named
+        // provision from another owner does not satisfy it, and the
+        // short form still matches any provider.
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.alpha",
+            vec![("calc.add", "1.0.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.beta",
+            vec![("calc.add", "1.0.0")],
+            vec![],
+        ))
+        .unwrap();
+        // Pinned to beta: alpha's provision must not satisfy.
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("xuepoo.beta:calc.add", "^1.0")],
+        ))
+        .unwrap();
+        reg.resolve_all().unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+    }
+
+    #[test]
+    fn service_requirements_qualified_wrong_owner_fails_closed() {
+        // A qualified requirement naming an owner with no satisfying
+        // provision fails closed even when another owner provides the
+        // same short name at a satisfying version.
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.alpha",
+            vec![("calc.add", "1.0.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.beta",
+            vec![("other.svc", "1.0.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("xuepoo.beta:calc.add", "^1.0")],
+        ))
+        .unwrap();
+        let err = reg.resolve_all().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("xuepoo.beta:calc.add"), "{msg}");
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Declared);
     }
 
     #[test]

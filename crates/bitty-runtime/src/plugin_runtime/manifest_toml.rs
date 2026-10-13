@@ -32,8 +32,8 @@ use std::collections::BTreeSet;
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::{
     ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand,
-    LazyTriggers, NetworkEgress, PluginDependency, PluginIdentity, PluginLimits, PluginManifest,
-    ProvidedService, QualifiedName, ToolDeclaration,
+    LazyTriggers, MAX_PROVIDED_SERVICES, NetworkEgress, PluginDependency, PluginIdentity,
+    PluginLimits, PluginManifest, ProvidedService, QualifiedName, ToolDeclaration,
 };
 
 /// Parse a bounded `bitty-plugin.toml` body.
@@ -417,7 +417,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                         dependencies.push(parse_dependency_entry(&key, &value)?);
                     }
                     "services.provided" => {
-                        provided_services.push(parse_provided_entry(&key, &value)?);
+                        provided_services.extend(parse_provided_entry(&key, &value)?);
                     }
                     _ => {
                         let req = parse_required_entry(&key, &value)?;
@@ -739,7 +739,15 @@ fn parse_dependency_entry(key: &str, value: &str) -> Result<PluginDependency, St
 }
 
 /// Parse one `[services.provided]` value: string form or
-/// `{ version, args_schema, result_schema, heads }`.
+/// `{ version, args_schema, result_schema, heads }`, expanding to one
+/// [`ProvidedService`] per declared version.
+///
+/// `version` is one exact-SemVer string or a non-empty array of them:
+/// side-by-side versions of one interface coexist in the directory and
+/// consumers pin independently (dynapi negotiation, bitty#2006). Every
+/// expanded entry shares the schemas and backing heads; SemVer validity
+/// stays with [`ProvidedService::validate`], like every other manifest
+/// field.
 ///
 /// The string form carries no backing heads and is rejected later by manifest
 /// validation (unbacked provides never record); the table form must name the
@@ -747,11 +755,11 @@ fn parse_dependency_entry(key: &str, value: &str) -> Result<PluginDependency, St
 /// Head identifiers are validated as closed capabilities at manifest
 /// validation; grant coverage is enforced at activation (provider) and
 /// resolution/call time (consumer).
-fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, String> {
+fn parse_provided_entry(key: &str, value: &str) -> Result<Vec<ProvidedService>, String> {
     if value.trim_start().starts_with('{') {
         let fields = parse_inline_table(value)
             .map_err(|e| format!("invalid '[services.provided] {key}': {e}"))?;
-        let version = inline_required_string(&fields, "version", "services.provided", key)?;
+        let versions = inline_required_versions(&fields, "services.provided", key)?;
         let args_schema = inline_optional_string(&fields, "args_schema", "services.provided", key)?;
         let result_schema =
             inline_optional_string(&fields, "result_schema", "services.provided", key)?;
@@ -762,23 +770,70 @@ fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, Strin
             "services.provided",
             key,
         )?;
-        return Ok(ProvidedService {
-            iface: key.to_string(),
-            version,
-            args_schema,
-            result_schema,
-            heads,
-        });
+        return Ok(versions
+            .into_iter()
+            .map(|version| ProvidedService {
+                iface: key.to_string(),
+                version,
+                args_schema: args_schema.clone(),
+                result_schema: result_schema.clone(),
+                heads: heads.clone(),
+            })
+            .collect());
     }
     let version =
         parse_string(value).map_err(|e| format!("invalid '[services.provided] {key}': {e}"))?;
-    Ok(ProvidedService {
+    Ok(vec![ProvidedService {
         iface: key.to_string(),
         version,
         args_schema: None,
         result_schema: None,
         heads: Vec::new(),
-    })
+    }])
+}
+
+/// Required `version` field of a `[services.provided]` inline table: one
+/// exact-SemVer string or a non-empty array of them (side-by-side versions,
+/// bitty#2006).
+///
+/// Shape-checked here (strings, non-empty, capped at
+/// `MAX_PROVIDED_SERVICES` so one entry cannot smuggle an unbounded
+/// declaration past the table ceiling); SemVer validity stays with
+/// [`ProvidedService::validate`], not here.
+fn inline_required_versions(
+    fields: &[(String, String)],
+    section: &str,
+    entry: &str,
+) -> Result<Vec<String>, String> {
+    let raw = fields
+        .iter()
+        .find(|(key, _)| key == "version")
+        .map(|(_, value)| value.as_str())
+        .ok_or_else(|| format!("'[{section}] {entry}' is missing 'version = \"...\"'"))?;
+    if raw.trim_start().starts_with('[') {
+        let versions =
+            parse_array(raw).map_err(|e| format!("'[{section}] {entry}' field 'version': {e}"))?;
+        if versions.is_empty() {
+            return Err(format!(
+                "'[{section}] {entry}' field 'version' must list at least one version"
+            ));
+        }
+        if versions.len() > MAX_PROVIDED_SERVICES {
+            return Err(format!(
+                "'[{section}] {entry}' field 'version' lists {} versions (max {MAX_PROVIDED_SERVICES})",
+                versions.len()
+            ));
+        }
+        return Ok(versions);
+    }
+    if raw.trim_start().starts_with('{') {
+        return Err(format!(
+            "'[{section}] {entry}' field 'version' must be a string or string array (nested tables are not supported)"
+        ));
+    }
+    parse_string(raw)
+        .map(|version| vec![version])
+        .map_err(|e| format!("'[{section}] {entry}' field 'version': {e}"))
 }
 
 /// Parse one `[services.required]` value: string form or `{ version }`.
@@ -1419,6 +1474,77 @@ mod tests {
     }
 
     #[test]
+    fn provided_version_array_expands_to_side_by_side_entries() {
+        // Dynapi negotiation (bitty#2006): one table entry may declare
+        // several exact versions; each expands to its own provided entry
+        // sharing schemas and backing heads.
+        let body = format!(
+            "{}\n[services.provided]\n\"duet.play\" = {{ version = [\"1.0.0\", \"2.0.0\"], heads = [\"runtime.inspect\"] }}\n",
+            minimal_body("xuepoo.svcsidebyside")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("version array must parse");
+        assert_eq!(manifest.provided_services.len(), 2);
+        assert_eq!(manifest.provided_services[0].iface, "duet.play");
+        assert_eq!(manifest.provided_services[0].version, "1.0.0");
+        assert_eq!(manifest.provided_services[1].version, "2.0.0");
+        assert_eq!(
+            manifest.provided_services[0].heads,
+            manifest.provided_services[1].heads
+        );
+    }
+
+    #[test]
+    fn provided_version_array_rejects_empty_and_over_limit() {
+        for (tag, fragment) in [
+            (
+                "empty",
+                "[services.provided]\n\"duet.play\" = { version = [], heads = [\"runtime.inspect\"] }\n",
+            ),
+            (
+                "table",
+                "[services.provided]\n\"duet.play\" = { version = { exact = \"1.0.0\" }, heads = [\"runtime.inspect\"] }\n",
+            ),
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbadversions"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "{tag}: malformed version must fail closed"
+            );
+        }
+        // Seventeen versions exceed the per-table ceiling of sixteen.
+        let many = (0..17)
+            .map(|i| format!("\"1.0.{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "{}\n[services.provided]\n\"duet.play\" = {{ version = [{many}], heads = [\"runtime.inspect\"] }}\n",
+            minimal_body("xuepoo.svcmanyversions")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("over-limit array must fail");
+        assert!(err.contains("duet.play"), "names the iface: {err}");
+    }
+
+    #[test]
+    fn provided_version_array_rejects_non_semver_and_exact_dupes() {
+        // Non-SemVer items fail at validation (same rule as the string form).
+        let body = format!(
+            "{}\n[services.provided]\n\"duet.play\" = {{ version = [\"1.0.0\", \"not-a-version\"], heads = [\"runtime.inspect\"] }}\n",
+            minimal_body("xuepoo.svcbadsemver")
+        );
+        assert!(
+            parse_manifest(body.as_bytes()).is_err(),
+            "non-SemVer array item must fail closed"
+        );
+        // Exact (interface, version) duplicates fail at validation.
+        let body = format!(
+            "{}\n[services.provided]\n\"duet.play\" = {{ version = [\"1.0.0\", \"1.0.0\"], heads = [\"runtime.inspect\"] }}\n",
+            minimal_body("xuepoo.svcdupeversion")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("exact dupe must fail");
+        assert!(err.contains("duet.play@1.0.0"), "names the pair: {err}");
+    }
+
+    #[test]
     fn provided_table_form_without_heads_rejects_with_naming_diagnostic() {
         let body = format!(
             "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\" }}\n",
@@ -1427,6 +1553,43 @@ mod tests {
         let err = parse_manifest(body.as_bytes()).expect_err("heads-less provide must reject");
         assert!(err.contains("markdown.render"), "names the iface: {err}");
         assert!(err.contains("heads"), "names the field: {err}");
+    }
+
+    #[test]
+    fn provided_core_reserved_names_reject_at_parse() {
+        // Dynapi arbitration (bitty#2003): the `bitty.*` namespace stays
+        // frozen — a manifest claiming it fails closed at parse with a
+        // diagnostic naming the reservation.
+        for iface in ["bitty.echo", "bitty"] {
+            let body = format!(
+                "{}\n[services.provided]\n\"{iface}\" = {{ version = \"1.0.0\", heads = [\"runtime.inspect\"] }}\n",
+                minimal_body("xuepoo.svcreserved")
+            );
+            let err = parse_manifest(body.as_bytes()).expect_err("reserved provide must reject");
+            assert!(err.contains(iface), "names the iface: {err}");
+            assert!(err.contains("Core-reserved"), "names the rule: {err}");
+        }
+    }
+
+    #[test]
+    fn required_qualified_and_reserved_shapes_parse() {
+        // Owner-qualified requires parse for arbitration pinning; reserved
+        // shorts fail closed.
+        let body = format!(
+            "{}\n[services.required]\n\"xuepoo.calc:calc.add\" = \">=1.0\"\n",
+            minimal_body("xuepoo.reqqualified")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("qualified require must parse");
+        assert_eq!(
+            manifest.required_services,
+            vec![("xuepoo.calc:calc.add".to_string(), ">=1.0".to_string())]
+        );
+        let body = format!(
+            "{}\n[services.required]\n\"bitty.echo\" = \">=1.0\"\n",
+            minimal_body("xuepoo.reqreserved")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("reserved require must reject");
+        assert!(err.contains("Core-reserved"), "names the rule: {err}");
     }
 
     #[test]

@@ -385,6 +385,161 @@ fn cursor_occluded_by_floats(
     glyph_occluded_by_floats(dest, cell, occluders)
 }
 
+/// CTX-1181 (#2041): upper bound on occlusion pieces per image blit.
+///
+/// Each occluder splits every surviving piece into at most four, so pieces
+/// grow as 4^n. Float frames are bounded by the visible leaf set; past this
+/// cap the remaining pieces are dropped fail-closed (hidden, never leaked).
+const MAX_OCCLUSION_PIECES: usize = 64;
+
+/// CTX-1181 (#2041): saturate an `i64` edge back into `i32` pixels.
+///
+/// Subtraction pieces stay inside their source rect, so this only fires on
+/// hostile geometry; saturating keeps the piece empty instead of wrapping.
+fn saturate_px(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+}
+
+/// CTX-1181 (#2041): visible pieces of `rect` outside `occluder`.
+///
+/// Axis-aligned rect subtraction in window space. The left/right strips span
+/// the full height and the top/bottom strips span the intersection width, so
+/// the pieces partition the visible area without overlap. A missed
+/// intersection returns `rect` verbatim; full coverage returns no pieces.
+/// Overflow-free `i64` edges with saturating conversion throughout, so
+/// hostile geometry degrades to dropped pieces, never address wrap.
+/// Bounded to four pieces per call.
+fn subtract_float_occluder(
+    rect: bitty_render::geometry::RectPx,
+    occluder: bitty_render::geometry::RectPx,
+) -> Vec<bitty_render::geometry::RectPx> {
+    if rect.is_empty() {
+        return Vec::new();
+    }
+    if occluder.is_empty() {
+        return vec![rect];
+    }
+    let rx0 = i64::from(rect.x);
+    let ry0 = i64::from(rect.y);
+    let rx1 = rect.right_exclusive();
+    let ry1 = rect.bottom_exclusive();
+    let ix0 = rx0.max(i64::from(occluder.x));
+    let iy0 = ry0.max(i64::from(occluder.y));
+    let ix1 = rx1.min(occluder.right_exclusive());
+    let iy1 = ry1.min(occluder.bottom_exclusive());
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return vec![rect];
+    }
+    let span = |from: i64, to: i64| u32::try_from(to.saturating_sub(from)).unwrap_or(0);
+    let spans = [
+        (rect.x, rect.y, span(rx0, ix0), rect.height),
+        (saturate_px(ix1), rect.y, span(ix1, rx1), rect.height),
+        (saturate_px(ix0), rect.y, span(ix0, ix1), span(ry0, iy0)),
+        (
+            saturate_px(ix0),
+            saturate_px(iy1),
+            span(ix0, ix1),
+            span(iy1, ry1),
+        ),
+    ];
+    spans
+        .into_iter()
+        .map(|(x, y, width, height)| bitty_render::geometry::RectPx::new(x, y, width, height))
+        .filter(|piece| !piece.is_empty())
+        .collect()
+}
+
+/// CTX-1181 (#2041): copy the `rect` sub-window out of `blit`.
+///
+/// `rect` must lie inside `blit.dest`; anything else (including arithmetic
+/// overflow) returns `None` fail-closed so the caller drops the piece
+/// instead of leaking it. Row-major straight-alpha RGBA8, four bytes per
+/// pixel, checked math before every index.
+fn slice_blit_piece(
+    blit: &bitty_render::grid::ImageBlit,
+    rect: bitty_render::geometry::RectPx,
+) -> Option<bitty_render::grid::ImageBlit> {
+    if rect.is_empty() {
+        return None;
+    }
+    let mask = |value: i64| -> Option<u64> { u64::try_from(value).ok() };
+    let dx = mask(i64::from(rect.x).saturating_sub(i64::from(blit.dest.x)))?;
+    let dy = mask(i64::from(rect.y).saturating_sub(i64::from(blit.dest.y)))?;
+    let piece_w = u64::from(rect.width);
+    let piece_h = u64::from(rect.height);
+    if dx.saturating_add(piece_w) > u64::from(blit.dest.width) {
+        return None;
+    }
+    if dy.saturating_add(piece_h) > u64::from(blit.dest.height) {
+        return None;
+    }
+    let row_bytes = piece_w.checked_mul(4)?;
+    let stride = u64::from(blit.dest.width).checked_mul(4)?;
+    let stride = usize::try_from(stride).ok()?;
+    let row_len = usize::try_from(row_bytes).ok()?;
+    let dx_bytes = usize::try_from(dx.checked_mul(4)?).ok()?;
+    let mut rgba = Vec::new();
+    for row in 0..piece_h {
+        let row_start = dy.checked_add(row)?;
+        let row_start =
+            usize::try_from(row_start.checked_mul(u64::try_from(stride).ok()?)?).ok()?;
+        let start = row_start.checked_add(dx_bytes)?;
+        let end = start.checked_add(row_len)?;
+        rgba.extend_from_slice(blit.rgba.get(start..end)?);
+    }
+    bitty_render::grid::ImageBlit::try_new(rect, rgba).ok()
+}
+
+/// CTX-1181 (#2041): clip an image blit around higher float frames.
+///
+/// The combined draw list paints backgrounds above fills and kitty images
+/// topmost, so the CTX-1148 opaque fill covers neither layer: a lower blit
+/// sharing area with a higher float frame would otherwise paint over the
+/// upper float. Splitting the blit around each occluder keeps the visible
+/// part outside the float pixel-identical while the covered part is owned
+/// by the upper float alone. Bytes are sliced per piece from the source
+/// rows, so no piece ever allocates beyond its own extent. Empty occluders
+/// never clip; an empty result means full coverage. Bounded to
+/// [`MAX_OCCLUSION_PIECES`] pieces.
+fn clip_blit_around_floats(
+    blit: bitty_render::grid::ImageBlit,
+    occluders: &[bitty_render::geometry::RectPx],
+) -> Vec<bitty_render::grid::ImageBlit> {
+    if blit.dest.is_empty() {
+        return Vec::new();
+    }
+    let mut pieces = vec![blit];
+    for occluder in occluders {
+        if occluder.is_empty() {
+            continue;
+        }
+        let mut next = Vec::new();
+        for piece in pieces {
+            if piece.dest.intersection(occluder).is_none() {
+                next.push(piece);
+                continue;
+            }
+            for rect in subtract_float_occluder(piece.dest, *occluder) {
+                let Some(sliced) = slice_blit_piece(&piece, rect) else {
+                    continue;
+                };
+                next.push(sliced);
+                if next.len() >= MAX_OCCLUSION_PIECES {
+                    break;
+                }
+            }
+            if next.len() >= MAX_OCCLUSION_PIECES {
+                break;
+            }
+        }
+        pieces = next;
+        if pieces.is_empty() {
+            break;
+        }
+    }
+    pieces
+}
+
 /// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
 /// leaf allocation with erased cells. Cursor/modes/title ride along so the
 /// overlay gates (cursor paints on the focused view only) stay total.
@@ -1829,10 +1984,38 @@ impl Runtime {
                                             ),
                                             rgba,
                                         ) {
-                                            built.background_bytes =
-                                                built.background_bytes.saturating_add(bytes);
-                                            built.backgrounds.push(entry);
-                                            built.needs_draw = true;
+                                            // CTX-1181 (#2041): backgrounds
+                                            // paint above the CTX-1148 opaque
+                                            // fill, so a lower leaf image
+                                            // would otherwise show through a
+                                            // higher float. Split it around
+                                            // the higher float frames; the
+                                            // covered part is owned by the
+                                            // upper float alone while the
+                                            // visible part stays
+                                            // pixel-identical. Pieces share
+                                            // the admitted byte budget
+                                            // below, skip-and-continue past
+                                            // the caps like the kitty layer.
+                                            for piece in
+                                                clip_blit_around_floats(entry, &higher_floats)
+                                            {
+                                                let piece_bytes = piece.rgba.len();
+                                                if built.backgrounds.len()
+                                                    >= bitty_rich::BG_PRESENT_MAX_BLITS_PER_FRAME
+                                                    || built
+                                                        .background_bytes
+                                                        .saturating_add(piece_bytes)
+                                                        > bitty_rich::BG_PRESENT_MAX_BYTES_PER_FRAME
+                                                {
+                                                    continue;
+                                                }
+                                                built.background_bytes = built
+                                                    .background_bytes
+                                                    .saturating_add(piece_bytes);
+                                                built.backgrounds.push(piece);
+                                                built.needs_draw = true;
+                                            }
                                         }
                                     }
                                 }
@@ -2169,12 +2352,48 @@ impl Runtime {
                                                     positioned, rgba,
                                                 )
                                             {
-                                                built.background_bytes =
-                                                    built.background_bytes.saturating_add(bytes);
-                                                // Prepend behind the per-View
-                                                // blits admitted above.
-                                                built.backgrounds.insert(0, entry);
-                                                built.needs_draw = true;
+                                                // CTX-1181 (#2041): the
+                                                // window blit spans the whole
+                                                // window behind every leaf,
+                                                // including the gap bands and
+                                                // the float frames above the
+                                                // CTX-1148 opaque fill. Split
+                                                // it around every float frame
+                                                // so gaps under a float stay
+                                                // opaque while the visible
+                                                // window image is unchanged.
+                                                // Pieces prepend behind the
+                                                // per-View blits in order.
+                                                let window_occluders: Vec<
+                                                    bitty_render::geometry::RectPx,
+                                                > = float_occluders
+                                                    .iter()
+                                                    .map(|(_, rect)| *rect)
+                                                    .collect();
+                                                let mut insert_at = 0usize;
+                                                for piece in clip_blit_around_floats(
+                                                    entry,
+                                                    &window_occluders,
+                                                ) {
+                                                    let piece_bytes = piece.rgba.len();
+                                                    if built.backgrounds.len()
+                                                        >= bitty_rich::BG_PRESENT_MAX_BLITS_PER_FRAME
+                                                        || built
+                                                            .background_bytes
+                                                            .saturating_add(piece_bytes)
+                                                            > bitty_rich::BG_PRESENT_MAX_BYTES_PER_FRAME
+                                                    {
+                                                        continue;
+                                                    }
+                                                    built.background_bytes = built
+                                                        .background_bytes
+                                                        .saturating_add(piece_bytes);
+                                                    // Prepend behind the per-View
+                                                    // blits admitted above.
+                                                    built.backgrounds.insert(insert_at, piece);
+                                                    insert_at = insert_at.saturating_add(1);
+                                                    built.needs_draw = true;
+                                                }
                                             }
                                         }
                                     }
@@ -3387,7 +3606,33 @@ impl Runtime {
         let mut blits_this_frame = 0usize;
         let mut bytes_this_frame = 0usize;
 
-        for frame in allocations {
+        // CTX-1181 (#2041): float frames in window space, in paint order.
+        // Kitty blits composite topmost, above the CTX-1148 opaque fill, so
+        // a lower leaf image sharing area with a higher float frame is split
+        // around it below. Same table shape as the CTX-1165 glyph path in
+        // `build_leaf_primitives`; empty frames never occlude.
+        let float_occluders: Vec<(usize, bitty_render::geometry::RectPx)> = allocations
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| {
+                frame.tier == Some(OverlayTier::Float)
+                    && frame.frame.width > 0
+                    && frame.frame.height > 0
+            })
+            .map(|(index, frame)| {
+                (
+                    index,
+                    bitty_render::geometry::RectPx::new(
+                        px_add(basis.pad_px, frame.frame.x),
+                        px_add(basis.pad_px, frame.frame.y),
+                        frame.frame.width,
+                        frame.frame.height,
+                    ),
+                )
+            })
+            .collect();
+
+        for (leaf_index, frame) in allocations.iter().enumerate() {
             if frame.cols == 0 || frame.rows == 0 {
                 continue;
             }
@@ -3456,6 +3701,17 @@ impl Runtime {
             let scrollback = (scrollback_len.saturating_sub(scroll_offset))
                 + cursor_follow_window_start(cursor_row, rows, usize::from(frame.rows));
 
+            // CTX-1181 (#2041): floats painted after this leaf own the
+            // covered part of its images. Later allocations paint above, so
+            // only floats after this leaf matter; empty for the topmost
+            // leaf, keeping the common path allocation-free beyond the
+            // small table filter.
+            let higher_floats: Vec<bitty_render::geometry::RectPx> = float_occluders
+                .iter()
+                .filter(|(index, _)| *index > leaf_index)
+                .map(|(_, rect)| *rect)
+                .collect();
+
             for placement in self.kitty_images.placements_in_paint_order_for(pane_origin) {
                 // Dangling placements (image evicted under the store caps)
                 // fail closed here, as before.
@@ -3502,8 +3758,9 @@ impl Runtime {
                 if blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
                     continue;
                 }
-                let next = bytes_this_frame.saturating_add(need);
-                if next > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME {
+                if bytes_this_frame.saturating_add(need)
+                    > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+                {
                     continue;
                 }
                 // S6 (#1849): serve repeats from the bounded raster cache;
@@ -3543,10 +3800,32 @@ impl Runtime {
                 let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
                     continue;
                 };
-                blits_this_frame += 1;
-                bytes_this_frame = next;
-                layers.combined_images.push(blit);
-                layers.any_needs_draw = true;
+                // CTX-1181 (#2041): the upper float owns the covered part of
+                // a lower leaf image. Split the blit around the higher float
+                // frames so the visible part outside stays pixel-identical;
+                // the float's own images keep an empty occluder table and
+                // paint verbatim. Pieces share the admitted byte budget
+                // above, skip-and-continue past the caps.
+                let visible = if higher_floats.is_empty() {
+                    vec![blit]
+                } else {
+                    clip_blit_around_floats(blit, &higher_floats)
+                };
+                for piece in visible {
+                    if blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+                        continue;
+                    }
+                    let piece_need = piece.rgba.len();
+                    if bytes_this_frame.saturating_add(piece_need)
+                        > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+                    {
+                        continue;
+                    }
+                    blits_this_frame = blits_this_frame.saturating_add(1);
+                    bytes_this_frame = bytes_this_frame.saturating_add(piece_need);
+                    layers.combined_images.push(piece);
+                    layers.any_needs_draw = true;
+                }
             }
         }
         if !layers.combined_images.is_empty() {

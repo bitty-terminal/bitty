@@ -976,6 +976,17 @@ impl SpawnService {
         self.policy
     }
 
+    /// Tracked-outcome ceiling this service enforces.
+    ///
+    /// The policy's `tracked_cap`, clamped to at least one slot and at most
+    /// the registry ceiling (`MAX_TRACKED_EXECUTIONS`): the inner
+    /// [`ExecutionService`] registry still fails closed at its own ceiling,
+    /// so a tune above it clamps instead of silently never taking effect.
+    #[must_use]
+    pub fn effective_tracked_cap(&self) -> usize {
+        self.policy.tracked_cap.clamp(1, MAX_TRACKED_EXECUTIONS)
+    }
+
     /// Kill scope adopted for supervision on this host.
     ///
     /// [`SpawnKillScope::OwnedTree`] where the platform backend terminates a
@@ -1087,8 +1098,8 @@ impl SpawnService {
     ///   the id is already tracked, or the authorizer-resolved spawn violates
     ///   a bound.
     /// - `LimitExceeded` when the tracked-outcome registry is at capacity
-    ///   (the enforced policy's `tracked_cap`; rapid bursts fail closed) or
-    ///   any field exceeds budget.
+    ///   (the enforced policy's `tracked_cap`, clamped to the registry
+    ///   ceiling; rapid bursts fail closed) or any field exceeds budget.
     /// - `Denied[AllowlistDenied]` when the authorizer rejects the tool/args
     ///   (no process is contacted).
     /// - `ScopeDenied` when `granted` lacks `process.spawn`.
@@ -1123,7 +1134,7 @@ impl SpawnService {
                 actual: client_id.len(),
             });
         }
-        let cap = self.policy.tracked_cap.max(1);
+        let cap = self.effective_tracked_cap();
         if self.exec.len() >= cap {
             return Err(IpcError::LimitExceeded {
                 field: "spawn tracked outcomes".into(),
@@ -2836,6 +2847,36 @@ mod tests {
         assert_eq!(defaults.policy(), SpawnMechanicsPolicy::core_defaults());
         dispatch_ok(&mut defaults, &request, 61).expect("defaults serve first");
         dispatch_ok(&mut defaults, &request, 62).expect("defaults serve second");
+    }
+
+    #[test]
+    fn spawn_service_tracked_cap_clamps_to_the_registry_ceiling() {
+        // CodeRabbit follow-up on CTX-1184: the inner ExecutionService
+        // registry still fails closed at MAX_TRACKED_EXECUTIONS, so a tune
+        // above it must clamp instead of silently never taking effect —
+        // and a zero tune must clamp to one slot.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        assert_eq!(service.effective_tracked_cap(), MAX_TRACKED_EXECUTIONS);
+        for (tuned_cap, expected) in [
+            (0usize, 1usize),
+            (1, 1),
+            (2, 2),
+            (MAX_TRACKED_EXECUTIONS - 1, MAX_TRACKED_EXECUTIONS - 1),
+            (MAX_TRACKED_EXECUTIONS, MAX_TRACKED_EXECUTIONS),
+            (MAX_TRACKED_EXECUTIONS + 1, MAX_TRACKED_EXECUTIONS),
+            (usize::MAX, MAX_TRACKED_EXECUTIONS),
+        ] {
+            let mut policy = SpawnMechanicsPolicy::core_defaults();
+            policy.tracked_cap = tuned_cap;
+            let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+            let tuned = SpawnService::with_policy(Box::new(StubAuthorizer::allowing(seen)), policy);
+            assert_eq!(
+                tuned.effective_tracked_cap(),
+                expected,
+                "tuned cap {tuned_cap}"
+            );
+        }
     }
 
     #[test]

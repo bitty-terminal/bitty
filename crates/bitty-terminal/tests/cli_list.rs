@@ -521,7 +521,16 @@ impl ServicesFixture {
     }
 
     fn write_plugin(&self, id: &str, manifest_extra: &str, capabilities: &str) {
-        let plugin = self.root.join("plugins").join(id);
+        self.write_plugin_as(id, id, manifest_extra, capabilities);
+    }
+
+    /// Variant with an explicit on-disk directory name. Hostile-id fixtures
+    /// need this: Win32 rejects control characters in a path component
+    /// (`ERROR_INVALID_NAME`) before the discovery path under test runs, so the
+    /// manifest content — not the directory name — must carry the hostile value
+    /// on every OS.
+    fn write_plugin_as(&self, dir: &str, id: &str, manifest_extra: &str, capabilities: &str) {
+        let plugin = self.root.join("plugins").join(dir);
         std::fs::create_dir_all(plugin.join("lua")).unwrap();
         std::fs::write(
             plugin.join("bitty-plugin.toml"),
@@ -721,7 +730,11 @@ fn list_services_control_char_id_is_rejected_safely() {
     // cannot inject display text: discovery rejects it fail-closed and
     // the listing stays exit 0 without naming it.
     let fixture = ServicesFixture::new("hostile");
-    fixture.write_plugin(
+    // The hostile value lives in the manifest only: a control character in a
+    // directory name is itself invalid on Win32, which would fail the fixture
+    // before the discovery path under test is exercised.
+    fixture.write_plugin_as(
+        "xuepoo.evilcalc",
         "xuepoo.evil\x07calc",
         CALC_SERVICES,
         "runtime.inspect = true\n",

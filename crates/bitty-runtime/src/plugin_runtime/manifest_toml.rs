@@ -14,7 +14,7 @@
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
 //! non-negative integers are supported. Inline-table values are accepted for
 //! the declared shapes only: `[dependencies]` `{ version, prerelease }`,
-//! `[services.provided]` `{ version, args_schema, result_schema }`,
+//! `[services.provided]` `{ version, args_schema, result_schema, heads }`,
 //! `[services.required]` `{ version }`, and `[lazy].commands` elements
 //! `{ id, args_schema, result_schema }`. Schemas are bounded JSON documents
 //! (16 KiB per schema, depth at most 16, explicit `additionalProperties`).
@@ -22,8 +22,10 @@
 //! other numeric values, and duplicate keys fail closed.
 //!
 //! The string forms stay accepted everywhere (`"owner.name" = ">=2.0"`,
-//! `"iface" = "1.0.0"`, `commands = ["owner:cmd"]`) and carry no schemas and
-//! no prerelease opt-in.
+//! `"iface" = "1.0.0"`, `commands = ["owner:cmd"]`) and carry no schemas,
+//! no prerelease opt-in, and (for services) no backing heads: an unbacked
+//! provided string form is rejected by manifest validation with a naming
+//! diagnostic, never recorded.
 
 use std::collections::BTreeSet;
 
@@ -86,7 +88,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // `"owner.name" = { version = ">=2.0", prerelease = true }`.
     let mut dependencies: Vec<PluginDependency> = Vec::new();
     // `[services.provided]` entries: `"iface" = "1.0.0"` or
-    // `"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}" }`.
+    // `"iface" = { version = "1.0.0", args_schema = "{...}", result_schema = "{...}", heads = ["..."] }`.
     let mut provided_services: Vec<ProvidedService> = Vec::new();
     // `[services.required]` entries: `"iface" = ">=1.2"` or
     // `"iface" = { version = ">=1.2" }` (schemas are provider-side only).
@@ -737,7 +739,14 @@ fn parse_dependency_entry(key: &str, value: &str) -> Result<PluginDependency, St
 }
 
 /// Parse one `[services.provided]` value: string form or
-/// `{ version, args_schema, result_schema }`.
+/// `{ version, args_schema, result_schema, heads }`.
+///
+/// The string form carries no backing heads and is rejected later by manifest
+/// validation (unbacked provides never record); the table form must name the
+/// Core capability head(s) the interface projects in `heads = ["..."]`.
+/// Head identifiers are validated as closed capabilities at manifest
+/// validation; grant coverage is enforced at activation (provider) and
+/// resolution/call time (consumer).
 fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, String> {
     if value.trim_start().starts_with('{') {
         let fields = parse_inline_table(value)
@@ -746,9 +755,10 @@ fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, Strin
         let args_schema = inline_optional_string(&fields, "args_schema", "services.provided", key)?;
         let result_schema =
             inline_optional_string(&fields, "result_schema", "services.provided", key)?;
+        let heads = inline_optional_heads(&fields, "services.provided", key)?;
         reject_inline_keys(
             &fields,
-            &["version", "args_schema", "result_schema"],
+            &["version", "args_schema", "result_schema", "heads"],
             "services.provided",
             key,
         )?;
@@ -757,6 +767,7 @@ fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, Strin
             version,
             args_schema,
             result_schema,
+            heads,
         });
     }
     let version =
@@ -766,6 +777,7 @@ fn parse_provided_entry(key: &str, value: &str) -> Result<ProvidedService, Strin
         version,
         args_schema: None,
         result_schema: None,
+        heads: Vec::new(),
     })
 }
 
@@ -955,6 +967,27 @@ fn inline_optional_string(
             parse_string(value).map_err(|e| format!("'[{section}] {entry}' field '{name}': {e}"))
         })
         .transpose()
+}
+
+/// Optional backing-head array of a `[services.provided]` inline table
+/// (absent means unbacked, rejected later by manifest validation with a
+/// naming diagnostic).
+///
+/// Items are double-quoted closed capability ids (`heads = ["ui.rich"]`);
+/// bare or single-quoted items fail closed like every other array in this
+/// subset. Identifier shape and closed-set membership are validated by
+/// [`ProvidedService::validate`], not here.
+fn inline_optional_heads(
+    fields: &[(String, String)],
+    section: &str,
+    entry: &str,
+) -> Result<Vec<String>, String> {
+    match fields.iter().find(|(key, _)| key == "heads") {
+        None => Ok(Vec::new()),
+        Some((_, value)) => {
+            parse_array(value).map_err(|e| format!("'[{section}] {entry}' field 'heads': {e}"))
+        }
+    }
 }
 
 /// Optional boolean field of an inline table (absent means `false`).
@@ -1316,9 +1349,20 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_and_services_string_forms_parse() {
+    fn dependencies_string_form_parses_while_unbacked_service_string_form_rejects() {
+        // Dependencies keep their string form; an unbacked provided string
+        // form is rejected at install time with a naming diagnostic
+        // (dynapi gating, bitty#2005).
         let body = format!(
             "{}\n[dependencies]\n\"xuepoo.gitcore\" = \">=2.0\"\n[services.provided]\n\"markdown.render\" = \"1.0.0\"\n[services.required]\n\"git.status\" = \">=1.2\"\n",
+            minimal_body("xuepoo.depsvc")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("unbacked provide must reject");
+        assert!(err.contains("markdown.render"), "names the iface: {err}");
+        assert!(err.contains("heads"), "names the field: {err}");
+
+        let body = format!(
+            "{}\n[dependencies]\n\"xuepoo.gitcore\" = \">=2.0\"\n[services.required]\n\"git.status\" = \">=1.2\"\n",
             minimal_body("xuepoo.depsvc")
         );
         let manifest = parse_manifest(body.as_bytes()).expect("deps/services shape must parse");
@@ -1326,10 +1370,7 @@ mod tests {
         assert_eq!(manifest.dependencies[0].id.as_str(), "xuepoo.gitcore");
         assert_eq!(manifest.dependencies[0].req, ">=2.0");
         assert!(!manifest.dependencies[0].prerelease);
-        assert_eq!(manifest.provided_services.len(), 1);
-        assert_eq!(manifest.provided_services[0].iface, "markdown.render");
-        assert_eq!(manifest.provided_services[0].version, "1.0.0");
-        assert!(!manifest.provided_services[0].has_schemas());
+        assert!(manifest.provided_services.is_empty());
         assert_eq!(
             manifest.required_services,
             vec![("git.status".to_string(), ">=1.2".to_string())]
@@ -1357,11 +1398,11 @@ mod tests {
     }
 
     #[test]
-    fn provided_table_form_parses_with_schemas() {
+    fn provided_table_form_parses_with_schemas_and_heads() {
         let args = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
         let result = "{\"type\":\"object\",\"additionalProperties\":false}";
         let body = format!(
-            "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", args_schema = \"{args}\", result_schema = \"{result}\" }}\n",
+            "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", args_schema = \"{args}\", result_schema = \"{result}\", heads = [\"runtime.inspect\", \"workspace.read\"] }}\n",
             minimal_body("xuepoo.svctable")
         );
         let manifest = parse_manifest(body.as_bytes()).expect("table form must parse");
@@ -1371,6 +1412,47 @@ mod tests {
         assert_eq!(svc.version, "1.0.0");
         assert!(svc.has_schemas());
         assert_eq!(svc.args_schema.as_deref(), Some(args));
+        assert_eq!(
+            svc.heads,
+            vec!["runtime.inspect".to_string(), "workspace.read".to_string()]
+        );
+    }
+
+    #[test]
+    fn provided_table_form_without_heads_rejects_with_naming_diagnostic() {
+        let body = format!(
+            "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\" }}\n",
+            minimal_body("xuepoo.svcnoheads")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("heads-less provide must reject");
+        assert!(err.contains("markdown.render"), "names the iface: {err}");
+        assert!(err.contains("heads"), "names the field: {err}");
+    }
+
+    #[test]
+    fn provided_heads_reject_malformed_and_unknown() {
+        // Non-array heads fail closed at parse.
+        for fragment in [
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", heads = \"runtime.inspect\" }\n",
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", heads = [runtime.inspect] }\n",
+            "[services.provided]\n\"markdown.render\" = { version = \"1.0.0\", heads = [] }\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.svcbadheads"));
+            // The empty array parses but is rejected by validation; the
+            // malformed shapes fail at parse. Either way the manifest
+            // never records.
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+        // Unknown (non-Core) heads fail closed at validation.
+        let body = format!(
+            "{}\n[services.provided]\n\"markdown.render\" = {{ version = \"1.0.0\", heads = [\"telemetry.exfiltrate\"] }}\n",
+            minimal_body("xuepoo.svcbadhead")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("unknown head must reject");
+        assert!(err.contains("markdown.render"), "names the iface: {err}");
     }
 
     #[test]

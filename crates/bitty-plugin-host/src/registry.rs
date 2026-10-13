@@ -1054,6 +1054,7 @@ mod tests {
                 version: ver.to_string(),
                 args_schema: None,
                 result_schema: None,
+                heads: vec!["runtime.inspect".to_string()],
             })
             .collect();
         m.required_services = required
@@ -1233,6 +1234,7 @@ mod tests {
             version: "1.0.0".to_string(),
             args_schema: Some(TYPED_ARGS_SCHEMA.to_string()),
             result_schema: Some(TYPED_RESULT_SCHEMA.to_string()),
+            heads: vec!["runtime.inspect".to_string()],
         });
         m
     }

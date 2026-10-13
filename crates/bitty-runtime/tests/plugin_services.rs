@@ -86,10 +86,14 @@ fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
 }
 
 /// Write a plugin package with service sections under `root/<id>/`.
+///
+/// `capabilities_toml` holds the raw `[capabilities]` body (e.g.
+/// `runtime.inspect = true`); empty means no capabilities section.
 fn write_service_plugin(
     root: &Path,
     id: &str,
     services_toml: &str,
+    capabilities_toml: &str,
     commands: &[&str],
     init_src: &str,
 ) -> PathBuf {
@@ -100,6 +104,11 @@ fn write_service_plugin(
         .map(|command| format!("\"{command}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let capabilities_section = if capabilities_toml.is_empty() {
+        String::new()
+    } else {
+        format!("[capabilities]\n{capabilities_toml}\n")
+    };
     std::fs::write(
         plugin.join("bitty-plugin.toml"),
         format!(
@@ -113,7 +122,7 @@ description = "test"
 plugin-api = "^1.0"
 
 {services_toml}
-[lazy]
+{capabilities_section}[lazy]
 commands = [{commands_toml}]
 events = []
 "#
@@ -124,12 +133,22 @@ events = []
     plugin
 }
 
+/// Backing Core head for every test service (dynapi gating, bitty#2005).
+///
+/// The head is arbitrary — no test exercises `runtime.inspect` itself — but
+/// it must be a closed Core capability so manifests validate, and both the
+/// provider and any resolving consumer must hold its grant.
+const TEST_HEAD: &str = "runtime.inspect";
+
+/// `[capabilities]` body granting the test head.
+const TEST_GRANT: &str = "runtime.inspect = true";
+
 const CALC_ARGS_SCHEMA: &str = "{\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}, \"b\": {\"type\": \"integer\"}}, \"required\": [\"a\", \"b\"], \"additionalProperties\": false}";
 const CALC_RESULT_SCHEMA: &str = "{\"type\": \"object\", \"properties\": {\"sum\": {\"type\": \"integer\"}}, \"required\": [\"sum\"], \"additionalProperties\": false}";
 
 fn calc_manifest() -> String {
     format!(
-        "[services.provided]\n\"calc.add\" = {{ version = \"1.0.0\", args_schema = \"{args}\", result_schema = \"{result}\" }}\n",
+        "[services.provided]\n\"calc.add\" = {{ version = \"1.0.0\", args_schema = \"{args}\", result_schema = \"{result}\", heads = [\"{TEST_HEAD}\"] }}\n",
         args = CALC_ARGS_SCHEMA.replace('"', "\\\""),
         result = CALC_RESULT_SCHEMA.replace('"', "\\\""),
     )
@@ -152,7 +171,7 @@ return {}
 "#;
 
 const BROKEN_MANIFEST: &str = r#"[services.provided]
-"calc.broken" = { version = "1.0.0", result_schema = "{\"type\": \"object\", \"properties\": {\"sum\": {\"type\": \"integer\"}}, \"required\": [\"sum\"], \"additionalProperties\": false}" }
+"calc.broken" = { version = "1.0.0", heads = ["runtime.inspect"], result_schema = "{\"type\": \"object\", \"properties\": {\"sum\": {\"type\": \"integer\"}}, \"required\": [\"sum\"], \"additionalProperties\": false}" }
 "#;
 
 const BROKEN_INIT: &str = r#"
@@ -236,6 +255,7 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
         &third,
         "xuepoo.calc",
         &calc_manifest(),
+        TEST_GRANT,
         &["xuepoo.calc:ping"],
         CALC_INIT,
     );
@@ -243,6 +263,7 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
         &third,
         "xuepoo.broken",
         BROKEN_MANIFEST,
+        TEST_GRANT,
         &["xuepoo.broken:ping"],
         BROKEN_INIT,
     );
@@ -250,6 +271,7 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
         &third,
         "xuepoo.shop",
         SHOP_MANIFEST,
+        TEST_GRANT,
         &["xuepoo.shop:total"],
         SHOP_INIT,
     );
@@ -370,6 +392,7 @@ fn optional_missing_resolves_nil_while_provider_suspended() {
         &third,
         "xuepoo.calc",
         &calc_manifest(),
+        TEST_GRANT,
         &["xuepoo.calc:ping"],
         CALC_INIT,
     );
@@ -377,6 +400,7 @@ fn optional_missing_resolves_nil_while_provider_suspended() {
         &third,
         "xuepoo.opt",
         "[services.required]\n\"calc.add\" = \">=1.0\"\n",
+        TEST_GRANT,
         &["xuepoo.opt:probe"],
         r#"
 bitty.commands.register({
@@ -415,6 +439,7 @@ fn undeclared_provide_fails_activation() {
         &third,
         "xuepoo.rogue",
         "",
+        "",
         &["xuepoo.rogue:ping"],
         r#"
 bitty.commands.register({
@@ -449,6 +474,7 @@ fn unsatisfiable_requirement_resolves_to_error() {
         &third,
         "xuepoo.calc",
         &calc_manifest(),
+        TEST_GRANT,
         &["xuepoo.calc:ping"],
         CALC_INIT,
     );
@@ -456,6 +482,7 @@ fn unsatisfiable_requirement_resolves_to_error() {
         &third,
         "xuepoo.picky",
         "[services.required]\n\"calc.add\" = \">=9.0\"\n",
+        TEST_GRANT,
         &["xuepoo.picky:probe"],
         r#"
 bitty.commands.register({
@@ -586,6 +613,7 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
         &third,
         "xuepoo.calc",
         &calc_manifest(),
+        TEST_GRANT,
         &["xuepoo.calc:ping"],
         CALC_INIT,
     );
@@ -593,6 +621,7 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
         &third,
         "xuepoo.shop",
         SLOW_SHOP_MANIFEST,
+        TEST_GRANT,
         &["xuepoo.shop:total"],
         SLOW_SHOP_INIT,
     );
@@ -636,5 +665,205 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
     .expect("reload store");
     assert_eq!(reloaded.get("calls"), Some(LuaValue::Integer(2)));
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn unbacked_provide_rejected_at_install_with_naming_diagnostic() {
+    // bitty#2005: a provided interface without backing heads never records.
+    // The table form without `heads` is rejected at install (discover) time.
+    let root = temp_dir("unbacked");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.solo",
+        "[services.provided]\n\"calc.solo\" = { version = \"1.0.0\" }\n",
+        TEST_GRANT,
+        &["xuepoo.solo:ping"],
+        r#"
+bitty.commands.register({
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+})
+bitty.services.provide("calc.solo", { run = function(args) return args end })
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    let results = rt.discover();
+    assert_eq!(results.len(), 1);
+    let err = format!(
+        "{}",
+        results[0]
+            .1
+            .as_ref()
+            .expect_err("unbacked provide must reject at install")
+    );
+    assert!(err.contains("calc.solo"), "names the iface: {err}");
+    assert!(err.contains("heads"), "names the field: {err}");
+    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn head_spoofing_provide_naming_ungranted_head_rejected_at_record() {
+    // bitty#2005: naming a valid Core head the provider was never granted
+    // denies the provide with E_CAPABILITY_DENIED, so a listed extension can
+    // never widen its own authority through a provide. The denial is probed
+    // with pcall (an uncaught provide fails the whole activation instead);
+    // either way nothing is recorded.
+    let root = temp_dir("spoof");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.spoof",
+        "[services.provided]\n\"calc.spoof\" = { version = \"1.0.0\", heads = [\"workspace.read\"] }\n",
+        "",
+        &["xuepoo.spoof:ping"],
+        r#"
+bitty.commands.register({
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+})
+local ok, err = pcall(bitty.services.provide, "calc.spoof", { run = function(args) return args end })
+bitty.store.set("code", ok and "NONE" or err.code)
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    rt.discover();
+    let spoof_id = PluginId::new("xuepoo.spoof").expect("id");
+    rt.activate(&spoof_id).expect("probe activates");
+    assert_eq!(
+        store_string(&rt, &spoof_id, "code"),
+        Some("E_CAPABILITY_DENIED".to_string())
+    );
+    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn confused_deputy_consume_without_grant_fails_closed_indistinguishable_from_absent() {
+    // bitty#2005: A provides a backed interface; B declares the requirement
+    // but holds no grant for the backing head. B's consume fails closed with
+    // exactly the code an absent service yields, while a granted sibling
+    // resolves and calls through the same live record.
+    let root = temp_dir("deputy");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.calc",
+        &calc_manifest(),
+        TEST_GRANT,
+        &["xuepoo.calc:ping"],
+        CALC_INIT,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.deputy",
+        "[services.required]\n\"calc.add\" = \">=1.0\"\n",
+        "",
+        &["xuepoo.deputy:probe"],
+        r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local ok, err = pcall(bitty.services.get, "calc.add")
+bitty.store.set("code", ok and "NONE" or err.code)
+local opt = bitty.services.get("calc.add", { optional = true })
+bitty.store.set("opt_nil", opt == nil)
+return {}
+"#,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.friend",
+        "[services.required]\n\"calc.add\" = \">=1.0\"\n",
+        TEST_GRANT,
+        &["xuepoo.friend:probe"],
+        r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local calc = bitty.services.get("calc.add")
+local ok, result = pcall(calc.add, { a = 1, b = 2 })
+bitty.store.set("sum", ok and result.sum or -1)
+bitty.store.set("code", ok and "NONE" or result.code)
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    rt.discover();
+    rt.activate(&calc_id()).expect("provider activates");
+    let deputy_id = PluginId::new("xuepoo.deputy").expect("id");
+    rt.activate(&deputy_id).expect("deputy activates");
+    // Indistinguishable from absent: the same code the unsatisfiable-version
+    // consumer observes, nil when optional.
+    assert_eq!(
+        store_string(&rt, &deputy_id, "code"),
+        Some("E_SERVICE_RESOLUTION".to_string())
+    );
+    assert_eq!(
+        rt.services(&deputy_id)
+            .expect("services")
+            .with_store(|store| store.get("opt_nil")),
+        Some(LuaValue::Bool(true))
+    );
+    // The same record serves a granted consumer: only the grant differs.
+    let friend_id = PluginId::new("xuepoo.friend").expect("id");
+    rt.activate(&friend_id).expect("granted consumer activates");
+    assert_eq!(store_int(&rt, &friend_id, "sum"), Some(3));
+    assert_eq!(
+        store_string(&rt, &friend_id, "code"),
+        Some("NONE".to_string())
+    );
+    // The broker recorded only the granted call (owner + backing head).
+    let calls = rt.service_call_ledger().borrow().calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].provider, "xuepoo.calc");
+    assert_eq!(calls[0].heads, vec![TEST_HEAD.to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn granted_calls_record_provider_owner_and_backing_heads() {
+    // bitty#2005 broker observability: every dispatched call records the
+    // provider owner plus the backing heads projected by the call.
+    let (mut rt, root) = setup("ledger");
+    rt.discover();
+    rt.activate(&calc_id()).expect("provider activates");
+    rt.activate(&broken_id())
+        .expect("broken provider activates");
+    rt.activate(&shop_id()).expect("consumer activates");
+    // Init dispatched two calls (the valid calc.add and the result-invalid
+    // calc.broken, which still reached its provider); the schema-rejected
+    // args call never dispatched and records nothing. Budgets and the
+    // argv-first call shape are unchanged by the gating.
+    let calls = rt.service_call_ledger().borrow().calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].provider, "xuepoo.calc");
+    assert_eq!(calls[0].iface, "calc.add");
+    assert_eq!(calls[0].method, "add");
+    assert_eq!(calls[0].heads, vec![TEST_HEAD.to_string()]);
+    assert_eq!(calls[1].provider, "xuepoo.broken");
+    assert_eq!(calls[1].iface, "calc.broken");
+    assert_eq!(calls[1].heads, vec![TEST_HEAD.to_string()]);
+    // A pinned-handle dispatch records the same owner and heads.
+    assert_eq!(
+        rt.dispatch_command(&shop_id(), "total", &[])
+            .expect("dispatch"),
+        LuaValue::Integer(30)
+    );
+    let calls = rt.service_call_ledger().borrow().calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].provider, "xuepoo.calc");
+    assert_eq!(calls[2].method, "add");
+    assert_eq!(calls[2].heads, vec![TEST_HEAD.to_string()]);
     let _ = std::fs::remove_dir_all(&root);
 }

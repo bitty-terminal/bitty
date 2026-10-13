@@ -1840,25 +1840,6 @@ impl PluginRuntime {
     ///
     /// [`PluginRuntimeError`] when the plugin is unknown, bundled, or fails
     /// re-resolution/activation.
-    /// Reload one plugin: dispose the live generation and activate the
-    /// next one, re-resolving the install record first for store-backed
-    /// packages.
-    ///
-    /// Grant renewal (dynapi gating, bitty#2005): a narrowed recorded
-    /// grant takes effect here with no process restart for store-backed
-    /// packages — the record is re-resolved before re-activation, so the
-    /// new generation snapshots the narrowed set and the service gates
-    /// fail closed immediately. Dev-root (`LocalPath`) packages reuse the
-    /// discovered manifest (`reload` re-verifies the module tree but
-    /// snapshots the same grants), so a grant edit there needs fresh
-    /// discovery, not a reload. A still-live generation never observes a
-    /// revocation retroactively: snapshots are immutable until renewal.
-    ///
-    /// # Errors
-    ///
-    /// [`PluginRuntimeError`] for lifecycle, manifest, module-tree, host,
-    /// capture-validation, or VM failures. Failure leaves no partial
-    /// activation.
     pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let result = self.reload_inner(id);
         self.sync_debug_view();

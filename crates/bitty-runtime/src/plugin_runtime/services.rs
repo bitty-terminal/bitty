@@ -2229,15 +2229,9 @@ impl PluginServices {
     /// lookup and every call, so a generation renewed after revocation
     /// fails closed immediately with no restart beyond re-activation.
     ///
-    /// Where revocation takes effect (dynapi gating, bitty#2005): renewal
-    /// reads the recorded grant through the package source. Store-backed
-    /// packages re-resolve the install record at `reload`, so a narrowed
-    /// record applies with no process restart. Dev-root (`LocalPath`)
-    /// packages reuse the discovered manifest — `reload` re-verifies the
-    /// module tree but snapshots the same grants — so a grant edit there
-    /// needs fresh discovery (a new runtime), not a reload. A still-live
-    /// generation never observes a revocation retroactively: its snapshot
-    /// is immutable, and only renewal replaces it.
+    /// Narrowing the snapshot on a live generation takes effect at once:
+    /// `service_resolve`/`service_call` re-read it on the next lookup or
+    /// call, so no process restart is needed for the gate to close.
     pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
         capabilities.sort();
         capabilities.dedup();
@@ -5449,12 +5443,10 @@ mod tests {
     }
 
     #[test]
-    fn grant_narrowing_on_renewed_snapshot_fails_closed_without_restart() {
-        // Dynapi gating (bitty#2005): a generation renewed after a
-        // grant-store revocation snapshots the narrowed set and fails
-        // closed immediately — resolve and call alike — with no restart.
-        // The directory records persist; only the snapshot changes, which
-        // is exactly what re-activation installs.
+    fn narrowing_grant_snapshot_to_empty_fails_closed_without_restart() {
+        // A generation's granted-capability snapshot narrowed to empty
+        // makes the next lookup and call fail closed on the same live
+        // host: only the in-memory snapshot gates, no restart is needed.
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
         assert!(
@@ -5462,11 +5454,10 @@ mod tests {
                 .expect("granted resolves")
                 .is_some()
         );
-        // Revocation lands: the renewed generation snapshots the narrowed
-        // set (the store record minus the backing head).
+        // Narrow the snapshot to empty on the same live host.
         host.set_granted_capabilities(Vec::new());
         let error = HostServices::service_resolve(&host, "calc.add", None, false)
-            .expect_err("revoked consume must fail closed");
+            .expect_err("narrowed consume must fail closed");
         assert_eq!(error.code, "E_SERVICE_RESOLUTION");
         assert_eq!(error.class, "runtime");
         assert_eq!(
@@ -5474,18 +5465,18 @@ mod tests {
                 .expect("optional degrades to nil"),
             None
         );
-        // A handle pinned before revocation fails closed as gone: the
-        // denial is indistinguishable from the provider being gone, and no
-        // new authority is minted.
+        // A call against the still-published record fails closed as gone:
+        // the denial is indistinguishable from the provider being gone.
         let error =
             HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("revoked call must fail closed");
+                .expect_err("narrowed call must fail closed");
         assert_eq!(error.code, "E_SERVICE_GONE");
-        // Re-approval serves again with no restart: the records never moved.
+        // Re-widening the snapshot serves again with no restart: the
+        // directory records never moved, only the in-memory snapshot gates.
         host.set_granted_capabilities(vec![TEST_HEAD.to_string()]);
         assert!(
             HostServices::service_resolve(&host, "calc.add", None, false)
-                .expect("re-granted resolves")
+                .expect("re-widened resolves")
                 .is_some()
         );
     }

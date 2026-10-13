@@ -1367,19 +1367,60 @@ impl Runtime {
         // visible under the pointer. Tiled base frames never overlap, so this
         // only changes which frame wins under a float/popup overlay: the
         // visible overlay, not the base leaf painted beneath it.
-        let (frame, content) = frames.iter().rev().find_map(|frame| {
-            let rect = frame.frame;
-            if rect.width == 0 || rect.height == 0 {
-                return None;
+        //
+        // CTX-1164 (#1992): among stacked `Float`-tier frames the winner is
+        // topmost-painted-first per the present composite order — window-global
+        // pins in reverse pin order (pinned-above-float precedent), then
+        // workspace-detached floats in reverse detach order — not merely the
+        // last frame in the slice. The slice order already matches today, so
+        // this pins the invariant explicitly instead of relying on it; unknown
+        // ids fall back to slice order and empty frames never win (fail-closed,
+        // no new authority: only frames already containing the point compete).
+        let containing: Vec<&PresentFrame> = frames
+            .iter()
+            .rev()
+            .filter(|frame| {
+                let rect = frame.frame;
+                if rect.width == 0 || rect.height == 0 {
+                    return false;
+                }
+                let right = rect.x as f64 + f64::from(rect.width);
+                let bottom = rect.y as f64 + f64::from(rect.height);
+                x >= f64::from(rect.x) && x < right && y >= f64::from(rect.y) && y < bottom
+            })
+            .collect();
+        let first = containing.first().copied()?;
+        let frame = if first.tier == Some(OverlayTier::Float) {
+            let top_floats: Vec<&PresentFrame> = containing
+                .iter()
+                .copied()
+                .filter(|frame| frame.tier == Some(OverlayTier::Float))
+                .collect();
+            let pinned_order = self.pinned.ids();
+            let mut hit = None;
+            for id in pinned_order.iter().rev() {
+                if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
+                    hit = Some(*found);
+                    break;
+                }
             }
-            let right = rect.x as f64 + f64::from(rect.width);
-            let bottom = rect.y as f64 + f64::from(rect.height);
-            if x >= f64::from(rect.x) && x < right && y >= f64::from(rect.y) && y < bottom {
-                Some((frame, frame.content))
+            if let Some(pinned) = hit {
+                pinned
             } else {
-                None
+                let float_order = self.floats.ids();
+                let mut detached = None;
+                for id in float_order.iter().rev() {
+                    if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
+                        detached = Some(*found);
+                        break;
+                    }
+                }
+                detached.unwrap_or(first)
             }
-        })?;
+        } else {
+            first
+        };
+        let content = frame.content;
         let local_col = ((x - f64::from(content.x)) / cell_w).floor().max(0.0);
         let local_row = ((y - f64::from(content.y)) / cell_h).floor().max(0.0);
         if local_col > f64::from(u16::MAX) || local_row > f64::from(u16::MAX) {

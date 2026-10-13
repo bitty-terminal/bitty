@@ -781,3 +781,161 @@ fn detached_float_cascades_past_an_existing_pin() {
         "cascaded float keeps the same size as the pin"
     );
 }
+
+#[test]
+fn stacked_floats_hit_test_topmost_first() {
+    // CTX-1164 (#1992): stacked detached floats hit-test topmost-first.
+    // The newest detach paints last (present order follows detach order),
+    // so a click in the overlap must focus the upper float, while a click
+    // in the lower-only cascade strip must focus the lower one.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    assert!(rt.set_focus(ViewId::new(3)), "park focus on the base leaf");
+    // Paint order follows detach order: the second detach is topmost.
+    let frames = rt.present_frames();
+    let position_of = |view: ViewId| {
+        frames
+            .iter()
+            .position(|frame| frame.view == view)
+            .expect("detached leaf still presents")
+    };
+    assert!(
+        position_of(ViewId::new(1)) < position_of(ViewId::new(2)),
+        "paint order follows detach order"
+    );
+    // Overlap: the center of the upper float lies inside the lower one
+    // (the cascade step is far smaller than half a float frame).
+    let overlap = frame_point(&rt, ViewId::new(2), 0.5, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(overlap).map(|(view, _)| view),
+        Some(ViewId::new(2)),
+        "overlap must hit the upper float"
+    );
+    rt.handle_cursor_moved(overlap);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "clicking the upper float must focus it, not the lower one"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    // Lower-only: the top-left corner of the lower float sits outside the
+    // down-right-cascaded upper frame.
+    let lower_only = frame_point(&rt, ViewId::new(1), 0.01, 0.01);
+    assert_eq!(
+        rt.cursor_to_present_cell(lower_only).map(|(view, _)| view),
+        Some(ViewId::new(1)),
+        "the lower-only strip must hit the lower float"
+    );
+    rt.handle_cursor_moved(lower_only);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "clicking the lower-only region must focus the lower float"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    // Focus now sits on the lower float, but the stacking is unchanged:
+    // the overlap still hits the topmost float first.
+    assert_eq!(
+        rt.cursor_to_present_cell(overlap).map(|(view, _)| view),
+        Some(ViewId::new(2)),
+        "after focusing the lower float, overlap must still hit topmost first"
+    );
+    rt.handle_cursor_moved(overlap);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "clicking overlap again must refocus the upper float"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn stacked_floats_reversed_detach_order_stays_topmost_first() {
+    // CTX-1164 (#1992): reversing the detach order reverses which float is
+    // topmost, and hit-testing follows the new paint order.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    assert!(rt.set_focus(ViewId::new(3)), "park focus on the base leaf");
+    let frames = rt.present_frames();
+    let position_of = |view: ViewId| {
+        frames
+            .iter()
+            .position(|frame| frame.view == view)
+            .expect("detached leaf still presents")
+    };
+    assert!(
+        position_of(ViewId::new(2)) < position_of(ViewId::new(1)),
+        "reversed detach order reverses paint order"
+    );
+    let overlap = frame_point(&rt, ViewId::new(1), 0.5, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(overlap).map(|(view, _)| view),
+        Some(ViewId::new(1)),
+        "overlap must hit the new upper float"
+    );
+    rt.handle_cursor_moved(overlap);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "clicking the new upper float must focus it"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn stacked_floats_pin_stays_above_detached() {
+    // CTX-1164 (#1992) pinned precedent: window-global pins paint above
+    // workspace-detached floats, so an overlap shared by all three must hit
+    // the pin first, while a float-only strip still hits its float.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, four_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.float_detach(ViewId::new(2)).expect("detach must apply");
+    rt.pin_floating(ViewId::new(3)).expect("pin must apply");
+    let frames = rt.present_frames();
+    let order: Vec<ViewId> = frames.iter().map(|frame| frame.view).collect();
+    assert_eq!(
+        order,
+        vec![
+            ViewId::new(4),
+            ViewId::new(1),
+            ViewId::new(2),
+            ViewId::new(3)
+        ],
+        "tiled base, detached floats in detach order, pins last"
+    );
+    let shared = frame_point(&rt, ViewId::new(3), 0.5, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(shared).map(|(view, _)| view),
+        Some(ViewId::new(3)),
+        "shared overlap must hit the pin above the floats"
+    );
+    rt.handle_cursor_moved(shared);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(3)),
+        "clicking shared overlap must focus the pin"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}

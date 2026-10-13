@@ -364,6 +364,27 @@ fn glyph_occluded_by_floats(
     false
 }
 
+/// CTX-1173 (#2031): whether the focused cursor cell is occluded by a higher
+/// detached float.
+///
+/// Reuses the CTX-1165 occluder table and intersection test: the cursor cell
+/// shares the same window space as leaf glyph bounds, so a cell sharing
+/// positive area with a higher float frame must not leak through the upper
+/// opaque fill. The full cell rect is tested (not the shaped bar/underline
+/// strip) so partial coverage still hides fail-closed. Bounded to one
+/// intersection test per higher float.
+fn cursor_occluded_by_floats(
+    paint: &CursorPaint,
+    cell: [u32; 2],
+    occluders: &[bitty_render::geometry::RectPx],
+) -> bool {
+    let dest = [
+        px_offset_cells(paint.origin_x, paint.cursor.position.col, cell[0]),
+        px_offset_cells(paint.origin_y, paint.cursor.position.row, cell[1]),
+    ];
+    glyph_occluded_by_floats(dest, cell, occluders)
+}
+
 /// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
 /// leaf allocation with erased cells. Cursor/modes/title ride along so the
 /// overlay gates (cursor paints on the focused view only) stay total.
@@ -1851,6 +1872,28 @@ impl Runtime {
                             origin_px_x,
                             origin_px_y,
                         );
+                        // CTX-1173 (#2031): a focused lower cursor under a
+                        // higher float must not leak through the upper opaque
+                        // fill. Same occluder table and intersection test as
+                        // the CTX-1165 glyph path above; the IME caret stays
+                        // hidden with the cursor because it arms from the
+                        // drained paint below. Empty table skips the probe so
+                        // the common path pays nothing.
+                        let occluded = if higher_floats.is_empty() {
+                            false
+                        } else {
+                            built.cursor.as_ref().is_some_and(|paint| {
+                                let live = self.live_cell_metrics();
+                                cursor_occluded_by_floats(
+                                    paint,
+                                    [live.width, live.height],
+                                    &higher_floats,
+                                )
+                            })
+                        };
+                        if occluded {
+                            built.cursor = None;
+                        }
                     }
                     continue;
                 }
@@ -1957,7 +2000,7 @@ impl Runtime {
                             .get(idx)
                             .map(|c| c.spacer)
                             .unwrap_or(false);
-                        built.cursor = Some(CursorPaint {
+                        let paint = CursorPaint {
                             origin_x: origin_px_x,
                             origin_y: origin_px_y,
                             cursor: view_snapshot.cursor.clone(),
@@ -1965,7 +2008,27 @@ impl Runtime {
                             rows: view_snapshot.height,
                             cells_available: frame.cols.saturating_sub(cur.col).max(1),
                             on_spacer,
-                        });
+                        };
+                        // CTX-1173 (#2031): same higher-float occluder as the
+                        // reuse path and the CTX-1165 glyph filter. A cursor
+                        // cell covered by a higher float is skipped so the
+                        // focused lower cursor never paints over the upper
+                        // opaque fill. Fail-closed on partial coverage; the
+                        // retained store is unaffected because the cursor is
+                        // never retained.
+                        let occluded = if higher_floats.is_empty() {
+                            false
+                        } else {
+                            let live = self.live_cell_metrics();
+                            cursor_occluded_by_floats(
+                                &paint,
+                                [live.width, live.height],
+                                &higher_floats,
+                            )
+                        };
+                        if !occluded {
+                            built.cursor = Some(paint);
+                        }
                     }
                 }
 

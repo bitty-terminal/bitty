@@ -233,10 +233,10 @@ pub use manifest::{
     CMD_SCHEMA_MAX_BYTES, CMD_SCHEMA_MAX_DEPTH, CapabilityRequests, Compat, FilesystemRequest,
     FsAccess, LazyCommand, LazyTriggers, MANIFEST_MAX_BYTES, MAX_COMMANDS, MAX_DEPENDENCIES,
     MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND, MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES,
-    MAX_TOOLS, PluginDependency, PluginId, PluginIdentity, PluginManifest, ProvidedService,
-    QualifiedName, SchemaSummary, ToolDeclaration, is_hostile_fs_pattern,
-    service_version_satisfies, summarize_interface_schema, validate_interface_schema,
-    value_satisfies_schema,
+    MAX_SERVICE_BACKING_HEADS, MAX_TOOLS, PluginDependency, PluginId, PluginIdentity,
+    PluginManifest, ProvidedService, QualifiedName, SchemaSummary, ToolDeclaration,
+    is_hostile_fs_pattern, service_version_satisfies, summarize_interface_schema,
+    validate_interface_schema, value_satisfies_schema,
 };
 pub use origin::{
     DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,

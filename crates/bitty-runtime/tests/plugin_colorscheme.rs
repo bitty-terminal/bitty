@@ -181,6 +181,19 @@ bitty.commands.register({ id = "confirm", title = "Confirm", run = function()
 
 const PROBE_COMMANDS: &[&str] = &["read_wall", "read_outside", "preview", "confirm"];
 
+/// Render `path` for embedding in Lua source (CTX-1169 Windows fix).
+///
+/// Backslashes are Lua escape introducers, so a native Windows path
+/// (`C:\Temp\wall.png`) embeds as invalid escapes (`\T` fails the whole
+/// `init.lua` with a parse error). Forward slashes survive Lua strings
+/// verbatim and are accepted by Windows file APIs and the Core path trust
+/// chain alike, so the probe normalizes unconditionally (a no-op on Unix).
+fn lua_path(path: &Path) -> String {
+    path.to_str()
+        .expect("probe path is UTF-8")
+        .replace('\\', "/")
+}
+
 fn probe_runtime(
     tag: &str,
     id: &str,
@@ -190,8 +203,8 @@ fn probe_runtime(
 ) -> (PluginRuntime, PluginId, PathBuf) {
     let root = temp_dir(tag);
     let src = PROBE
-        .replace("WALL", wall.to_str().expect("wall path is UTF-8"))
-        .replace("OUTSIDE", outside.to_str().expect("outside path is UTF-8"));
+        .replace("WALL", &lua_path(wall))
+        .replace("OUTSIDE", &lua_path(outside));
     write_plugin(&root, id, capabilities, PROBE_COMMANDS, &src);
     let mut rt = runtime_with_roots(
         root.clone(),
@@ -310,4 +323,26 @@ fn colorscheme_verbs_denied_without_grants() {
     assert_eq!(run(&mut rt, &id, "confirm"), "ERR:E_CAPABILITY_DENIED");
     assert!(rt.drain_theme_requests().is_empty());
     assert_eq!(rt.theme_requests_dropped(), 0);
+}
+
+#[test]
+fn lua_probe_paths_embed_without_backslash_escapes() {
+    // CTX-1169 Windows fix: a native Windows path carries backslashes that
+    // Lua source parses as escapes (`\T` in `\Temp` fails the whole
+    // `init.lua` with a parse error, which surfaced as the Windows-only
+    // registration capture failure). The probe normalizes to forward
+    // slashes, so pin the property here with a literal Windows-style string:
+    // Linux CI guards the Windows path too.
+    let windows = Path::new(r"C:\Users\tester\Temp\wall paper.png");
+    let embedded = lua_path(windows);
+    assert_eq!(embedded, "C:/Users/tester/Temp/wall paper.png");
+    assert!(
+        !embedded.contains('\\'),
+        "no raw backslash may reach Lua source, got {embedded:?}"
+    );
+    let src = PROBE.replace("WALL", &embedded);
+    assert!(
+        !src.contains('\\'),
+        "the substituted probe must stay backslash-free"
+    );
 }

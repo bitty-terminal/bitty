@@ -1,19 +1,22 @@
-//! CTX-0754 (issue #1361) OS delivery for bells and notifications.
+//! CTX-0754 (issue #1361) OS delivery for bells plus CTX-1178 (issue
+//! #1998) single-path notification dispatch through the platform bridge.
 //!
 //! Headless and deterministic; `cargo test` on CI without a display server.
-//! Delivery goes through injectable sink seams with recording doubles, so no
-//! test ever spawns a real backend: these tests pin that admitted `BEL`
-//! rings the bell sink, admitted `OSC 9` / `OSC 777` reach the notification
-//! sink at admission time (not banner-rotation time), denied/rate-dropped
-//! events never reach a sink, and sink failures keep the in-grid surface
-//! intact while counting the miss.
+//! Bells go through the injectable bell-sink seam with a recording double.
+//! Notifications go through the platform bridge with recording backend
+//! doubles, so no test ever spawns a real backend: these tests pin that
+//! admitted `BEL` rings the bell sink, admitted `OSC 9` / `OSC 777` reach
+//! the bridge backend at admission time (not banner-rotation time),
+//! denied/rate-dropped events never reach a backend, and backend failures
+//! keep the in-grid surface intact while counting the miss.
 
 #![forbid(unsafe_code)]
 
 use std::sync::{Arc, Mutex};
 
-use bitty_platform::{
-    BellSink, DesktopNotification, NotificationSink, OsDeliveryOutcome, OsDeliverySkip,
+use bitty_platform::{BellSink, OsDeliveryOutcome};
+use bitty_platform_services::{
+    DeliveryOutcome, DesktopNotification, NotificationBackend, SkipReason, platform_backend,
 };
 use bitty_runtime::{BellMode, RC8_EVENTS_PER_WINDOW, Runtime};
 
@@ -56,11 +59,11 @@ impl BellSink for BellProbe {
     }
 }
 
-/// Recording [`NotificationSink`] double: captures sanitized payloads.
+/// Recording [`NotificationBackend`] double: captures sanitized payloads.
 #[derive(Clone)]
 struct NotificationProbe {
     received: Arc<Mutex<Vec<(String, String)>>>,
-    outcome: Arc<Mutex<OsDeliveryOutcome>>,
+    outcome: Arc<Mutex<DeliveryOutcome>>,
 }
 
 impl NotificationProbe {
@@ -80,13 +83,21 @@ impl Default for NotificationProbe {
     fn default() -> Self {
         Self {
             received: Arc::new(Mutex::new(Vec::new())),
-            outcome: Arc::new(Mutex::new(OsDeliveryOutcome::Delivered)),
+            outcome: Arc::new(Mutex::new(DeliveryOutcome::Delivered)),
         }
     }
 }
 
-impl NotificationSink for NotificationProbe {
-    fn deliver(&self, notification: &DesktopNotification) -> OsDeliveryOutcome {
+impl NotificationBackend for NotificationProbe {
+    fn name(&self) -> &'static str {
+        "notification-probe"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn deliver(&self, notification: &DesktopNotification) -> DeliveryOutcome {
         self.received
             .lock()
             .expect("probe mutex must not be poisoned")
@@ -98,6 +109,24 @@ impl NotificationSink for NotificationProbe {
             .lock()
             .expect("probe mutex must not be poisoned")
             .clone()
+    }
+}
+
+/// Backend double that always reports the defensive cap tripped: pins the
+/// single-path mapping of an over-ceiling OS hand-off without timing.
+struct RateLimitedBackend;
+
+impl NotificationBackend for RateLimitedBackend {
+    fn name(&self) -> &'static str {
+        "rate-limited-probe"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn deliver(&self, _notification: &DesktopNotification) -> DeliveryOutcome {
+        DeliveryOutcome::Skipped(SkipReason::RateLimited)
     }
 }
 
@@ -185,12 +214,12 @@ fn failing_bell_sink_is_counted_and_keeps_visual_flash() {
 }
 
 #[test]
-fn denied_notification_never_reaches_sink() {
+fn denied_notification_never_reaches_backend() {
     let mut rt = runtime();
     let probe = NotificationProbe::delivered();
-    rt.set_notification_sink(Some(Box::new(probe.clone())));
+    rt.set_notification_backend(Box::new(probe.clone()));
     // Default-deny: no consent, no delivery, no undelivered miss either
-    // (the request died at the consent gate, not at the sink).
+    // (the request died at the consent gate, not at the backend).
     rt.handle_pty_bytes(b"\x1b]9;build finished\x07");
     assert!(probe.received().is_empty());
     assert_eq!(rt.notifications_denied(), 1);
@@ -202,7 +231,7 @@ fn denied_notification_never_reaches_sink() {
 fn admitted_notifications_deliver_at_admission_not_banner_rotation() {
     let mut rt = runtime();
     let probe = NotificationProbe::delivered();
-    rt.set_notification_sink(Some(Box::new(probe.clone())));
+    rt.set_notification_backend(Box::new(probe.clone()));
     rt.set_osc_notification_allowed(true);
     rt.handle_pty_bytes(b"\x1b]9;first\x07");
     rt.handle_pty_bytes(b"\x1b]777;notify;Build;second\x07");
@@ -218,15 +247,15 @@ fn admitted_notifications_deliver_at_admission_not_banner_rotation() {
 }
 
 #[test]
-fn sink_failure_keeps_banner_and_counts_miss() {
+fn backend_failure_keeps_banner_and_counts_miss() {
     let mut rt = runtime();
     let failing = NotificationProbe {
         received: Arc::new(Mutex::new(Vec::new())),
-        outcome: Arc::new(Mutex::new(OsDeliveryOutcome::Failed(String::from(
+        outcome: Arc::new(Mutex::new(DeliveryOutcome::Failed(String::from(
             "probe backend down",
         )))),
     };
-    rt.set_notification_sink(Some(Box::new(failing)));
+    rt.set_notification_backend(Box::new(failing));
     rt.set_osc_notification_allowed(true);
     rt.handle_pty_bytes(b"\x1b]9;hello\x07");
     assert_eq!(rt.notification_banner().as_deref(), Some("hello"));
@@ -239,11 +268,11 @@ fn skipped_outcome_counts_undelivered() {
     let mut rt = runtime();
     let skipped = NotificationProbe {
         received: Arc::new(Mutex::new(Vec::new())),
-        outcome: Arc::new(Mutex::new(OsDeliveryOutcome::Skipped(
-            OsDeliverySkip::BackendMissing,
+        outcome: Arc::new(Mutex::new(DeliveryOutcome::Skipped(
+            SkipReason::BackendMissing,
         ))),
     };
-    rt.set_notification_sink(Some(Box::new(skipped)));
+    rt.set_notification_backend(Box::new(skipped));
     rt.set_osc_notification_allowed(true);
     rt.handle_pty_bytes(b"\x1b]9;hello\x07");
     assert_eq!(rt.notifications_os_delivered(), 0);
@@ -251,7 +280,9 @@ fn skipped_outcome_counts_undelivered() {
 }
 
 #[test]
-fn no_sink_counts_undelivered_but_banner_survives() {
+fn no_backend_counts_undelivered_but_banner_survives() {
+    // Fail-closed default: the bridge holds a backend that always skips, so
+    // an admitted notification paints the banner while the OS miss counts.
     let mut rt = runtime();
     rt.set_osc_notification_allowed(true);
     rt.handle_pty_bytes(b"\x1b]9;hello\x07");
@@ -261,10 +292,10 @@ fn no_sink_counts_undelivered_but_banner_survives() {
 }
 
 #[test]
-fn notification_payload_is_sanitized_before_sink() {
+fn notification_payload_is_sanitized_before_backend() {
     let mut rt = runtime();
     let probe = NotificationProbe::delivered();
-    rt.set_notification_sink(Some(Box::new(probe.clone())));
+    rt.set_notification_backend(Box::new(probe.clone()));
     rt.set_osc_notification_allowed(true);
     let oversized = "y".repeat(600);
     let seq = format!("\x1b]9;a\u{1}b\u{7}{oversized}\x07");
@@ -275,7 +306,38 @@ fn notification_payload_is_sanitized_before_sink() {
     assert!(!body.contains('\u{1}'));
     assert!(!body.contains('\u{7}'));
     assert!(
-        body.chars().count() <= bitty_platform::NOTIFICATION_BODY_MAX_CHARS,
-        "sink body must respect the OS bound"
+        body.chars().count() <= bitty_platform_services::BODY_MAX_CHARS,
+        "backend body must respect the OS bound"
     );
+}
+
+#[test]
+fn rate_limited_handoff_keeps_banner_and_counts_rate_drop() {
+    // Single-path parity: an over-ceiling OS hand-off refuses delivery and
+    // counts the rate drop, while the RC-8-admitted banner still paints.
+    let mut rt = runtime();
+    rt.set_notification_backend(Box::new(RateLimitedBackend));
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]9;hello\x07");
+    assert_eq!(rt.notification_banner().as_deref(), Some("hello"));
+    assert_eq!(rt.notifications_os_delivered(), 0);
+    assert_eq!(rt.notifications_os_undelivered(), 1);
+    assert_eq!(rt.bell_rate_dropped(), 1);
+}
+
+#[test]
+fn platform_backend_selection_names_fail_closed_target() {
+    // Selection only, never a delivery call: no test spawns a real backend
+    // on any platform. Windows stays the explicit fail-closed gap.
+    let backend = platform_backend();
+    let expected = if cfg!(target_os = "linux") {
+        "linux-dbus"
+    } else if cfg!(target_os = "macos") {
+        "macos-notification-center"
+    } else if cfg!(target_os = "windows") {
+        "windows-toast"
+    } else {
+        "noop"
+    };
+    assert_eq!(backend.name(), expected);
 }

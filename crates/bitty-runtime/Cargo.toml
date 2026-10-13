@@ -60,11 +60,14 @@ bitty-network-wire = { version = "0.0.1", git = "https://github.com/bitty-termin
 # OSC 8. No crates.io release yet, so the same git-rev pin convention as
 # `bitty-ipc` / `bitty-network-wire` applies (7-char short SHA).
 bitty-url-detector = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "d211490" }
-# CTX-1008 (#1763, OQ-076): Core consumes the platform notification bridge
-# for the defensive second rate cap. Same exact-rev pin pattern as
-# `bitty-ipc` / `bitty-network-wire`: the bridge receives an already-gated
-# `{title, body}` pair and re-caps over-ceiling callers fail-closed.
-bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "2fc794a" }
+# CTX-1008 (#1763, OQ-076) plus CTX-1178 (#1998): Core consumes the
+# platform notification bridge as its single OS-notification dispatch path.
+# Same exact-rev pin pattern as `bitty-ipc` / `bitty-network-wire`: the
+# bridge receives an already-gated `{title, body}` pair, applies the
+# defensive second rate cap, and delivers through the real per-platform
+# backend (`LinuxDbusBackend` / `MacosBackend`, fail-closed elsewhere).
+# Pinned to the real-backends commit; the bootstrap rev carried stubs only.
+bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "3a8a7ed" }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).

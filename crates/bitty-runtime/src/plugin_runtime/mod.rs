@@ -48,7 +48,9 @@ use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{LazyCommand, PluginId, PluginManifest};
-use bitty_plugin_host::{validate_interface_schema, value_satisfies_schema};
+use bitty_plugin_host::{
+    parse_service_reference, validate_interface_schema, value_satisfies_schema,
+};
 
 pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
 pub use bitty_lua::{
@@ -2820,6 +2822,29 @@ fn validate_capture(
     }
     let mut seen_services = BTreeSet::new();
     for provision in &capture.services {
+        // Dynapi arbitration (bitty#2003): provisions name the short
+        // interface only, never a Core-reserved spelling. A hand-built
+        // capture bypasses manifest validation, so the commit gate
+        // re-checks the reference grammar here; the owner stays implied
+        // (this plugin) and pinned by registry identity.
+        match parse_service_reference(&provision.iface, "services.provided") {
+            Ok((None, _)) => {}
+            Ok((Some(_), short)) => {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "service '{}' must name the short interface '{short}' (owner is implied)",
+                        provision.iface
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(PluginRuntimeError::Capture {
+                    plugin: id.to_string(),
+                    detail: format!("service '{}' is not valid ({error})", provision.iface),
+                });
+            }
+        }
         let declared = manifest
             .provided_services
             .iter()
@@ -3298,6 +3323,34 @@ mod tests {
             format!("{err}").contains("method count"),
             "granted heads pass the gate: {err}"
         );
+    }
+
+    #[test]
+    fn validate_capture_rejects_reserved_and_qualified_provisions() {
+        // Dynapi arbitration (bitty#2003): the commit gate re-checks the
+        // reference grammar because a hand-built capture bypasses manifest
+        // validation. Core-reserved and owner-qualified provisions fail
+        // activation with a naming diagnostic.
+        use bitty_lua::ServiceProvision;
+        let id = PluginId::new("xuepoo.test").expect("id");
+        let granted = parsed_grants(&["runtime.inspect"]);
+        for (iface, want) in [
+            ("bitty.echo", "Core-reserved"),
+            ("xuepoo.test:calc.add", "short interface"),
+        ] {
+            let mut capture = RegistrationCapture::new();
+            capture.services.push(ServiceProvision {
+                iface: iface.to_string(),
+                methods: Vec::new(),
+            });
+            let manifest =
+                service_test_manifest(vec![backed_service(iface, vec!["runtime.inspect"])]);
+            let err = validate_capture(&id, &manifest, &capture, &granted)
+                .expect_err("arbitration violation must fail");
+            let text = format!("{err}");
+            assert!(text.contains(iface), "names the iface: {text}");
+            assert!(text.contains(want), "names the rule: {text}");
+        }
     }
 
     #[test]

@@ -1430,6 +1430,43 @@ mod tests {
     }
 
     #[test]
+    fn provided_core_reserved_names_reject_at_parse() {
+        // Dynapi arbitration (bitty#2003): the `bitty.*` namespace stays
+        // frozen — a manifest claiming it fails closed at parse with a
+        // diagnostic naming the reservation.
+        for iface in ["bitty.echo", "bitty"] {
+            let body = format!(
+                "{}\n[services.provided]\n\"{iface}\" = {{ version = \"1.0.0\", heads = [\"runtime.inspect\"] }}\n",
+                minimal_body("xuepoo.svcreserved")
+            );
+            let err = parse_manifest(body.as_bytes()).expect_err("reserved provide must reject");
+            assert!(err.contains(iface), "names the iface: {err}");
+            assert!(err.contains("Core-reserved"), "names the rule: {err}");
+        }
+    }
+
+    #[test]
+    fn required_qualified_and_reserved_shapes_parse() {
+        // Owner-qualified requires parse for arbitration pinning; reserved
+        // shorts fail closed.
+        let body = format!(
+            "{}\n[services.required]\n\"xuepoo.calc:calc.add\" = \">=1.0\"\n",
+            minimal_body("xuepoo.reqqualified")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("qualified require must parse");
+        assert_eq!(
+            manifest.required_services,
+            vec![("xuepoo.calc:calc.add".to_string(), ">=1.0".to_string())]
+        );
+        let body = format!(
+            "{}\n[services.required]\n\"bitty.echo\" = \">=1.0\"\n",
+            minimal_body("xuepoo.reqreserved")
+        );
+        let err = parse_manifest(body.as_bytes()).expect_err("reserved require must reject");
+        assert!(err.contains("Core-reserved"), "names the rule: {err}");
+    }
+
+    #[test]
     fn provided_heads_reject_malformed_and_unknown() {
         // Non-array heads fail closed at parse.
         for fragment in [

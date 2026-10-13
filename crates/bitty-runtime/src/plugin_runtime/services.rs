@@ -37,7 +37,9 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
-use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
+use bitty_plugin_host::{
+    ProvidedService, parse_service_reference, service_version_satisfies, value_satisfies_schema,
+};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
 use super::overlay::{
@@ -2977,6 +2979,30 @@ impl HostServices for PluginServices {
         if self.service_directory.borrow().is_none() {
             return Err(BridgeError::not_implemented("bitty.services.provide"));
         }
+        // Dynapi arbitration (bitty#2003): provide-side names the short
+        // interface only (the owner is implied — the providing plugin),
+        // never a Core-reserved spelling. Manifest validation is primary;
+        // this re-check covers direct host callers with the same naming
+        // diagnostic.
+        match parse_service_reference(iface, "services.provide") {
+            Ok((None, _)) => {}
+            Ok((Some(_), short)) => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_UNDECLARED",
+                    format!(
+                        "service '{iface}' is not declared in services.provided (provide the short interface '{short}')"
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_UNDECLARED",
+                    format!("service '{iface}' is not declared in services.provided ({error})"),
+                ));
+            }
+        }
         let declared = self
             .service_provided
             .borrow()
@@ -3024,7 +3050,9 @@ impl HostServices for PluginServices {
         };
         // Declaration discipline: the caller manifest's `services.required`
         // entry is mandatory. `opts.version` overrides its requirement text
-        // but never substitutes for the declaration.
+        // but never substitutes for the declaration. An owner-qualified
+        // lookup requires the qualified entry (`owner:iface`); a short
+        // entry never authorizes a qualified lookup.
         let manifest_req = self
             .service_required
             .borrow()
@@ -3038,8 +3066,18 @@ impl HostServices for PluginServices {
             ));
         };
         let effective = req.unwrap_or(&manifest_req).to_string();
-        // Deterministic pick over the live directory: highest satisfying
-        // version wins, ties break by provider id. Unparseable requirements
+        // Dynapi arbitration (bitty#2003): references are short
+        // (`calc.add`) or owner-qualified (`xuepoo.calc:calc.add`).
+        // Malformed or Core-reserved references fail closed with the same
+        // resolution code. A qualified reference pins the owner; a short
+        // reference shared by two or more visible owners fails closed
+        // naming each owner (every claimant stays reachable through its
+        // qualified form), even when `optional` is set — ambiguity is a
+        // naming error, not absence.
+        //
+        // Deterministic pick over the visible records (one owner: the
+        // pinned one, or the single unambiguous claimant): highest
+        // satisfying version wins. Unparseable requirements
         // or versions satisfy nothing (fail-closed, same grammar as the
         // policy registry gate).
         //
@@ -3048,15 +3086,27 @@ impl HostServices for PluginServices {
         // ungranted consume is indistinguishable from no provider
         // (`E_SERVICE_RESOLUTION`, or nil when optional — the same posture
         // as `bitty.env`, whose ungranted reads share the backend-absent
-        // code). No new authority is minted anywhere on this path.
+        // code). Ambiguity is judged over visible records only, so the
+        // diagnostic never leaks an ungranted provider. No new authority is
+        // minted anywhere on this path.
+        let (owner, short) = parse_service_reference(iface, "services.get")
+            .map_err(|error| service_resolution_error(iface, error.to_string()))?;
         let mut best: Option<(Version, String, ServiceRecord)> = None;
-        for record in directory.borrow().active_for(iface) {
+        let mut visible_owners: BTreeSet<String> = BTreeSet::new();
+        for record in directory.borrow().active_for(&short) {
+            if owner
+                .as_deref()
+                .is_some_and(|wanted| wanted != record.provider)
+            {
+                continue;
+            }
             if !service_version_satisfies(&record.version, &effective) {
                 continue;
             }
             if !self.service_heads_covered(&record.heads) {
                 continue;
             }
+            visible_owners.insert(record.provider.clone());
             let Ok(version) = Version::parse(&record.version) else {
                 continue;
             };
@@ -3070,6 +3120,19 @@ impl HostServices for PluginServices {
             if replace {
                 best = Some((version, record.provider.clone(), record));
             }
+        }
+        if owner.is_none() && visible_owners.len() > 1 {
+            let owners = visible_owners
+                .into_iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(service_resolution_error(
+                iface,
+                format!(
+                    "interface '{short}' is claimed by multiple owners ({owners}): use an owner-qualified name ('<owner>:{short}')"
+                ),
+            ));
         }
         let Some((_, _, record)) = best else {
             if optional {
@@ -5565,40 +5628,126 @@ mod tests {
     }
 
     #[test]
-    fn resolve_picks_highest_satisfying_version() {
+    fn resolve_ambiguous_short_fails_closed_naming_owners() {
+        // Dynapi arbitration (bitty#2003): one short name claimed by two
+        // owners resolves through neither — the unqualified form fails
+        // closed naming both owners, while each qualified form keeps
+        // working. Ambiguity is a naming error, not absence, so `optional`
+        // still fails.
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
-        publish_record(&directory, "xuepoo.next", 1, "calc.add", "2.0.0", &["add"]);
-        let route = HostServices::service_resolve(&host, "calc.add", None, false)
-            .expect("resolution serves")
+        publish_record(&directory, "xuepoo.beta", 1, "calc.add", "1.5.0", &["add"]);
+        publish_record(&directory, "xuepoo.alpha", 1, "calc.add", "1.2.0", &["add"]);
+        for optional in [false, true] {
+            let error = HostServices::service_resolve(&host, "calc.add", None, optional)
+                .expect_err("ambiguous short must fail closed");
+            assert_eq!(error.code, "E_SERVICE_RESOLUTION", "optional={optional}");
+            assert_eq!(error.class, "runtime");
+            assert!(
+                error.message.contains("'xuepoo.alpha'"),
+                "names first owner: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("'xuepoo.beta'"),
+                "names second owner: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("owner-qualified"),
+                "points at the qualified form: {}",
+                error.message
+            );
+        }
+        host.set_service_manifest(
+            host.provided_services(),
+            vec![
+                ("calc.add".to_string(), ">=1.0".to_string()),
+                ("xuepoo.alpha:calc.add".to_string(), ">=1.0".to_string()),
+                ("xuepoo.beta:calc.add".to_string(), ">=1.0".to_string()),
+            ],
+        );
+        let route = HostServices::service_resolve(&host, "xuepoo.alpha:calc.add", None, false)
+            .expect("qualified alpha resolves")
             .expect("route present");
-        assert_eq!(route.provider, "xuepoo.next");
-        assert_eq!(route.version, "2.0.0");
-        assert_eq!(route.generation, 1);
-        assert_eq!(route.methods, vec!["add".to_string()]);
+        assert_eq!(route.provider, "xuepoo.alpha");
+        assert_eq!(route.version, "1.2.0");
+        let route = HostServices::service_resolve(&host, "xuepoo.beta:calc.add", None, false)
+            .expect("qualified beta resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.beta");
+        assert_eq!(route.version, "1.5.0");
     }
 
     #[test]
-    fn resolve_tie_breaks_by_provider_id() {
+    fn resolve_qualified_ignores_other_owners_versions() {
+        // A qualified lookup pins the owner even when another owner
+        // publishes a higher version: negotiation never crosses owners.
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.b", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.a", 1, "calc.add", "1.2.0", &["add"]);
-        let route = HostServices::service_resolve(&host, "calc.add", None, false)
-            .expect("resolution serves")
+        publish_record(&directory, "xuepoo.alpha", 1, "calc.add", "1.2.0", &["add"]);
+        publish_record(&directory, "xuepoo.beta", 1, "calc.add", "2.0.0", &["add"]);
+        host.set_service_manifest(
+            host.provided_services(),
+            vec![("xuepoo.alpha:calc.add".to_string(), ">=1.0".to_string())],
+        );
+        let route = HostServices::service_resolve(&host, "xuepoo.alpha:calc.add", None, false)
+            .expect("qualified alpha resolves")
             .expect("route present");
-        assert_eq!(route.provider, "xuepoo.a");
+        assert_eq!(route.provider, "xuepoo.alpha");
+        assert_eq!(route.version, "1.2.0");
+    }
+
+    #[test]
+    fn resolve_single_owner_short_still_resolves() {
+        // Backward-compatible spine: one owner per short name keeps the
+        // historic behavior (highest satisfying version wins).
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("single-owner short resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.calc");
+        assert_eq!(route.version, "1.2.0");
     }
 
     #[test]
     fn resolve_opts_version_overrides_manifest_req() {
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
         let route = HostServices::service_resolve(&host, "calc.add", Some(">=1.2,<1.5"), false)
             .expect("resolution serves")
             .expect("route present");
         assert_eq!(route.version, "1.2.0");
+    }
+
+    #[test]
+    fn provide_check_rejects_qualified_and_reserved_spellings() {
+        // Dynapi arbitration (bitty#2003): provide-side names the short
+        // interface only, never a Core-reserved spelling. Both fail closed
+        // with the undeclared code and a naming diagnostic.
+        let (_, host) = service_host();
+        let error = host
+            .service_provide_check("xuepoo.calc:calc.add")
+            .expect_err("qualified provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert!(
+            error.message.contains("calc.add"),
+            "names the short form: {}",
+            error.message
+        );
+        let error = host
+            .service_provide_check("bitty.echo")
+            .expect_err("Core-reserved provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert!(
+            error.message.contains("bitty.echo"),
+            "names the iface: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Core-reserved"),
+            "names the reservation: {}",
+            error.message
+        );
     }
 
     #[test]

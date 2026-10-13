@@ -773,16 +773,27 @@ impl Runtime {
     }
 
     /// Pushes the Core-owned glow halo for one leaf (CTX-1162 S3, DEC-0111
-    /// section 4).
+    /// section 4; CTX-1163 S4 pulse-reads-style).
     ///
     /// The halo is one `RoundedFill { border: 0 }` (same struct, same SDF
-    /// shader as the shadow and the ring) sized `frame + glow_width` per
-    /// side with a concentric radius (square frames stay square), painted
-    /// after the shadow and before the ring. Same factor chain as the ring
-    /// (open, workspace, motion, fx) plus the unfocused fade. Paint-only:
-    /// cell metrics, insets, and clip rects are untouched. Returns whether a
-    /// halo was pushed. An unset glow color or a zero width pushes nothing,
-    /// so unstyled configs present exactly as before.
+    /// shader as the shadow and the ring) sized `frame + width` per side
+    /// with a concentric radius (square frames stay square), painted after
+    /// the shadow and before the ring. Same factor chain as the ring (open,
+    /// workspace, motion, fx) plus the unfocused fade. Paint-only: cell
+    /// metrics, insets, and clip rects are untouched. Returns whether a
+    /// halo was pushed.
+    ///
+    /// CTX-1163 S4: the fx pulse reads the RESOLVED per-`View` style. A leaf
+    /// whose style carries a glow (color set with a nonzero width) pulses
+    /// its style halo: color, width, and intensity all come from
+    /// `frame.style`. A leaf with no steady-state halo that carries a live
+    /// fx pulse instead paints one ring-derived fallback halo (the leaf's
+    /// committed ring color and ring width resolved per `View` through
+    /// `view_outline_for`, never a hardcoded constant) under the same
+    /// envelope, so the default pulse envelope differs from the styled one
+    /// exactly by its style contribution. With no style halo and no live
+    /// pulse nothing is pushed, so unstyled steady-state configs present
+    /// exactly as before.
     fn push_leaf_glow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -792,16 +803,7 @@ impl Runtime {
         ctx: &RingFrameContext,
         combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
     ) -> bool {
-        let Some(glow_color) = frame.style.glow_color else {
-            return false;
-        };
-        if frame.style.glow_width == 0 || frame.frame.width == 0 || frame.frame.height == 0 {
-            return false;
-        }
-        // The halo width scales at the live DPI factor exactly like the ring
-        // width; `0` logical stays `0` (no halo from rounding).
-        let halo = self.outline_width_physical(frame.style.glow_width);
-        if halo == 0 {
+        if frame.frame.width == 0 || frame.frame.height == 0 {
             return false;
         }
         let mut motion_factor = 1.0f32;
@@ -816,12 +818,71 @@ impl Runtime {
                 motion_factor *= p.clamp(0.0, 1.0);
             }
         }
-        let fx_factor = self
+        let fx_progress = self
             .fx_progress(view_id, ctx.now)
-            .map(|p| p.clamp(0.0, 1.0))
-            .unwrap_or(1.0);
+            .map(|p| p.clamp(0.0, 1.0));
+        let fx_factor = fx_progress.unwrap_or(1.0);
+        // S4 styled source: the RESOLVED glow halo (color, width, and the
+        // alpha carried in the color all come from the per-`View` style).
+        // The halo width scales at the live DPI factor exactly like the
+        // ring width; `0` logical stays `0` (no halo from rounding).
+        let styled = frame.style.glow_color.and_then(|glow_color| {
+            if frame.style.glow_width == 0 {
+                return None;
+            }
+            let halo = self.outline_width_physical(frame.style.glow_width);
+            if halo == 0 {
+                None
+            } else {
+                Some((glow_color, halo))
+            }
+        });
+        // S4 fallback source: no steady-state halo but a live pulse on this
+        // leaf paints the leaf's committed ring color/width (resolved per
+        // `View`, mirroring `push_leaf_ring`, including the focus-transition
+        // color lerp). A borderless leaf (`ring_border == 0`) paints nothing.
+        let fallback = if styled.is_none() && fx_progress.is_some() {
+            let is_focused_view = ctx.focused_id == Some(view_id);
+            let view_outline = self.view_outline_for(view_id);
+            let ring_border = if is_focused_view {
+                view_outline
+                    .width_focused
+                    .map_or(frame.border, |w| self.outline_width_physical(w))
+            } else {
+                view_outline
+                    .width_idle
+                    .map_or(frame.border, |w| self.outline_width_physical(w))
+            };
+            if ring_border == 0 {
+                None
+            } else {
+                let base = if is_focused_view {
+                    view_outline.focused
+                } else {
+                    view_outline.idle
+                };
+                let ring_color = if is_focused_view {
+                    match self.animation_progress(AnimationKind::Focus, Some(view_id), ctx.now) {
+                        Some(p) => bitty_render::grid::lerp_rgba(
+                            view_outline.idle,
+                            view_outline.focused,
+                            p,
+                        ),
+                        None => base,
+                    }
+                } else {
+                    base
+                };
+                Some((ring_color, ring_border))
+            }
+        } else {
+            None
+        };
+        let Some((halo_color, halo)) = styled.or(fallback) else {
+            return false;
+        };
         let color = bitty_render::grid::scale_alpha(
-            glow_color,
+            halo_color,
             open_factor * ctx.workspace_factor * motion_factor * fx_factor * fade,
         );
         let pad = u32::from(halo);

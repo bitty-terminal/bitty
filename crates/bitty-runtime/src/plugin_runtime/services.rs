@@ -2230,6 +2230,10 @@ impl PluginServices {
     /// `service_resolve`/`service_call` re-check this snapshot on every
     /// lookup and every call, so a generation renewed after revocation
     /// fails closed immediately with no restart beyond re-activation.
+    ///
+    /// Narrowing the snapshot on a live generation takes effect at once:
+    /// `service_resolve`/`service_call` re-read it on the next lookup or
+    /// call, so no process restart is needed for the gate to close.
     pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
         capabilities.sort();
         capabilities.dedup();
@@ -5499,6 +5503,45 @@ mod tests {
                 .expect_err("ungranted call must fail closed");
         // Indistinguishable from a parked provider: same code, no head names.
         assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn narrowing_grant_snapshot_to_empty_fails_closed_without_restart() {
+        // A generation's granted-capability snapshot narrowed to empty
+        // makes the next lookup and call fail closed on the same live
+        // host: only the in-memory snapshot gates, no restart is needed.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("granted resolves")
+                .is_some()
+        );
+        // Narrow the snapshot to empty on the same live host.
+        host.set_granted_capabilities(Vec::new());
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("narrowed consume must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(error.class, "runtime");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", None, true)
+                .expect("optional degrades to nil"),
+            None
+        );
+        // A call against the still-published record fails closed as gone:
+        // the denial is indistinguishable from the provider being gone.
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("narrowed call must fail closed");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        // Re-widening the snapshot serves again with no restart: the
+        // directory records never moved, only the in-memory snapshot gates.
+        host.set_granted_capabilities(vec![TEST_HEAD.to_string()]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("re-widened resolves")
+                .is_some()
+        );
     }
 
     #[test]

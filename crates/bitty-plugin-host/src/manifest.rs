@@ -2211,13 +2211,23 @@ impl PluginManifest {
             .map(|svc| {
                 let mut heads = svc.heads.clone();
                 heads.sort_unstable();
+                // Escape `+` inside heads before joining: params may contain
+                // `+`, so `fs.read:foo+runtime.inspect` (one head) must not
+                // hash like `fs.read:foo` + `runtime.inspect` (two heads).
+                // Heads always start with `[a-z]`, so `++`-escaping keeps the
+                // encoding unambiguous and grants stay bound to the exact set.
+                let encoded_heads = heads
+                    .iter()
+                    .map(|head| head.replace('+', "++"))
+                    .collect::<Vec<_>>()
+                    .join("+");
                 format!(
                     "{}={}:{}:{}:{}",
                     svc.iface,
                     svc.version,
                     svc.args_schema.as_deref().unwrap_or(""),
                     svc.result_schema.as_deref().unwrap_or(""),
-                    heads.join("+")
+                    encoded_heads
                 )
             })
             .collect();
@@ -3278,6 +3288,22 @@ mod tests {
         m2.provided_services[0].heads = vec!["workspace.read".to_string()];
         assert_ne!(m1.manifest_hash(), m2.manifest_hash());
         assert_eq!(m1.manifest_hash(), m1.clone().manifest_hash());
+    }
+
+    #[test]
+    fn manifest_hash_distinguishes_plus_in_head_from_head_separator() {
+        // One head containing `+` must not hash like two heads split at it.
+        let mut m1 = minimal_manifest("xuepoo.test");
+        let mut svc1 = backed_service("markdown.render");
+        svc1.heads = vec!["fs.read:foo+runtime.inspect".to_string()];
+        m1.provided_services.push(svc1);
+        let mut m2 = minimal_manifest("xuepoo.test");
+        let mut svc2 = backed_service("markdown.render");
+        svc2.heads = vec!["fs.read:foo".to_string(), "runtime.inspect".to_string()];
+        m2.provided_services.push(svc2);
+        assert!(m1.validate().is_ok());
+        assert!(m2.validate().is_ok());
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
     }
 
     #[test]

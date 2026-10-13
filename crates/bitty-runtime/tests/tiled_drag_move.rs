@@ -883,3 +883,112 @@ fn overlay_covered_drop_is_noop_without_tier_flip() {
     assert!(tiers.get(&ViewId::new(3)).is_some_and(|t| t.is_some()));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
+
+#[test]
+fn long_drag_past_duration_keeps_ghost_visible_without_repulse() {
+    use std::time::{Duration, Instant};
+    // CodeRabbit 2026: a completed arm reads back None from the tracker,
+    // which the hold-live guard mistook for missing and re-triggered —
+    // re-pulsing the ghost on drags past the 150 ms duration. The
+    // gesture-scoped flags hold admitted arms instead: past completion
+    // the ring keeps its final visible state and motion never re-arms it.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let source = ViewId::new(1);
+    let target = ViewId::new(2);
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    let t0 = Instant::now();
+    assert!(rt.begin_tiled_drag_at(t0));
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0 + Duration::from_millis(20));
+    assert_eq!(rt.tiled_drag_preview(), Some(target));
+    // Past both completions (source 150 ms, target armed 20 ms later),
+    // with continued motion: no re-pulse.
+    for ms in [180, 220, 300] {
+        let at = t0 + Duration::from_millis(ms);
+        rt.handle_cursor_moved_at(cell_pixels(60, 12), at);
+        assert_eq!(
+            rt.tiled_drag_preview(),
+            Some(target),
+            "preview must keep tracking at {ms} ms"
+        );
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(source), at)
+                .is_none(),
+            "completed ghost must hold its final state at {ms} ms, never re-arm"
+        );
+        assert!(
+            rt.animation_progress(AnimationKind::Drag, Some(target), at)
+                .is_none(),
+            "completed highlight must hold its final state at {ms} ms, never re-arm"
+        );
+    }
+    // The gesture still settles on release.
+    let end = t0 + Duration::from_millis(320);
+    rt.handle_cursor_moved_at(cell_pixels(70, 12), end);
+    assert!(rt.end_tiled_drag_at(end));
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Move, Some(source), end),
+        Some(0.0),
+        "committed drop must settle, not snap"
+    );
+    assert!(!rt.tiled_drag_active());
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn capacity_refused_arm_retries_on_later_motion() {
+    use std::time::{Duration, Instant};
+    // A grab refused at the 8-surface budget must retry on later motion:
+    // once the blocking arms complete, the next motion admits the ghost
+    // and the gesture accumulates from there.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let source = ViewId::new(1);
+    let target = ViewId::new(2);
+    let t0 = Instant::now();
+    for i in 0..8 {
+        assert!(rt.trigger_animation(AnimationKind::Open, Some(ViewId::new(10 + i)), t0));
+    }
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    assert!(rt.begin_tiled_drag_at(t0));
+    assert!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), t0)
+            .is_none(),
+        "grab refused at capacity must arm nothing"
+    );
+    // Motion under a full budget still tracks but arms nothing.
+    let t1 = t0 + Duration::from_millis(10);
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t1);
+    assert_eq!(rt.tiled_drag_preview(), Some(target));
+    assert!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), t1)
+            .is_none(),
+        "motion refused at capacity must arm nothing"
+    );
+    // Past the 150 ms open duration the budget frees: the next motion
+    // admits the ghost at its gesture time and holds it after.
+    let t2 = t0 + Duration::from_millis(200);
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t2);
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(source), t2),
+        Some(0.0),
+        "freed budget must admit the ghost on retry"
+    );
+    assert_eq!(
+        rt.animation_progress(AnimationKind::Drag, Some(target), t2),
+        Some(0.0),
+        "freed budget must admit the highlight on retry"
+    );
+    let t3 = t2 + Duration::from_millis(20);
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t3);
+    let p = rt
+        .animation_progress(AnimationKind::Drag, Some(source), t3)
+        .expect("retried ghost must stay live");
+    assert!(
+        (0.0..1.0).contains(&p),
+        "retried ghost must accumulate, got {p}"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}

@@ -19,9 +19,13 @@
 //!
 //! Issue #1811 (CTX-1070): the tiled move shows continuous feedback — the
 //! grab arms the drag transition on the dragged frame (ghost outline) and
-//! every motion re-arms it on the dragged frame plus the hovered drop
-//! target (drop-target highlight), all through the existing Core-owned
-//! chrome-ring fade (geometry and terminal content are never interpolated).
+//! the first hover arms it on the hovered drop target (drop-target
+//! highlight), all through the existing Core-owned chrome-ring fade
+//! (geometry and terminal content are never interpolated). CTX-1167:
+//! motion holds those arms so progress accumulates toward full visibility
+//! instead of restarting near 0 on every motion. Gesture-scoped flags
+//! hold admitted arms past completion (no re-pulse on long drags); only
+//! refused arms retry.
 //! A committed drop arms the move transition on the moved panel so the
 //! result settles instead of snapping, and `Esc` cancels mid-drag with the
 //! tree untouched (the preview never mutates, so cancel restores the
@@ -134,6 +138,18 @@ pub struct FloatResizeState {
 pub struct TiledDragState {
     /// Headless move session (source + advisory preview target).
     pub session: DragMoveSession,
+    /// Gesture-scoped admission: the source ghost was admitted by the
+    /// tracker (grab or a capacity retry). A completed arm holds its final
+    /// visible state, so motion never re-triggers it (CodeRabbit 2026:
+    /// re-triggering a completed arm re-pulsed the ghost on long drags).
+    /// Set only when [`Runtime::trigger_animation`] admits; a refused arm
+    /// (instant policy, full capacity) retries on later motion.
+    source_armed: bool,
+    /// Last hover target admitted this gesture (`None` for no hover yet or
+    /// background). The highlight arms only on hover change; a completed
+    /// arm holds its final visible state until release. Same retry rule as
+    /// the source: refused arms stay unrecorded and retry.
+    armed_target: Option<ViewId>,
 }
 
 /// Active border-drag resize: which split divider(s) are grabbed plus the
@@ -732,14 +748,24 @@ impl Runtime {
         let Ok(session) = DragMoveSession::start(leaf, true) else {
             return false;
         };
-        self.tiled_drag = Some(TiledDragState { session });
+        self.tiled_drag = Some(TiledDragState {
+            session,
+            source_armed: false,
+            armed_target: None,
+        });
         self.set_focus(leaf);
         self.clear_hover_pending();
         // CTX-1070 (issue #1811): the grab arms the drag transition on the
         // dragged frame (ghost outline). The layout is untouched — only the
-        // leaf's chrome ring fades — and repeat motion restarts the bounded
-        // transition instead of accumulating (see `update_tiled_drag_at`).
-        self.trigger_animation(AnimationKind::Drag, Some(leaf), now);
+        // leaf's chrome ring fades — and the gesture holds the arm so
+        // progress accumulates toward full visibility instead of
+        // restarting (CTX-1167, see `update_tiled_drag_at`). Admission is
+        // recorded so motion never re-triggers a completed arm; a refused
+        // grab (instant policy, full capacity) retries on later motion.
+        let admitted = self.trigger_animation(AnimationKind::Drag, Some(leaf), now);
+        if let Some(drag) = self.tiled_drag.as_mut() {
+            drag.source_armed = admitted;
+        }
         true
     }
 
@@ -778,17 +804,51 @@ impl Runtime {
         if drag.session.preview_target() != before {
             self.pending_full_redraw = true;
         }
-        // CTX-1070 (issue #1811): live preview transitions. The dragged
-        // frame keeps its ghost outline while moving and the hovered drop
-        // target highlights under the cursor; both ride the existing
-        // Core-owned chrome-ring fade (geometry and terminal content are
-        // never interpolated). Repeat motion restarts the bounded
-        // transitions instead of accumulating, mirroring the Alt+drag path.
+        // CTX-1167 (issue #1981): accumulate, never restart. The grab
+        // admitted the source ghost and the first hover admits the target
+        // highlight; gesture-scoped flags hold those admissions so the
+        // eased ring progress climbs once to full visibility and stays
+        // there. A completed arm reads back `None` from the tracker but
+        // already holds its final visible state, so motion must not
+        // re-trigger it (CodeRabbit 2026: re-triggering re-pulsed the
+        // ghost on drags past the animation duration). Only a refused arm
+        // retries: instant-cut policies refuse every motion and still arm
+        // nothing, exactly as before, and a capacity refusal re-arms on a
+        // later motion once budget frees.
         let source = drag.session.source();
         let target = drag.session.preview_target();
-        self.trigger_animation(AnimationKind::Drag, Some(source), now);
-        if let Some(hovered) = target {
-            self.trigger_animation(AnimationKind::Drag, Some(hovered), now);
+        let source_held = drag.source_armed;
+        let target_held = drag.armed_target;
+        if !source_held
+            && self
+                .animation_progress(AnimationKind::Drag, Some(source), now)
+                .is_none()
+            && self.trigger_animation(AnimationKind::Drag, Some(source), now)
+        {
+            if let Some(drag) = self.tiled_drag.as_mut() {
+                drag.source_armed = true;
+            }
+        }
+        match target {
+            Some(hovered) if target_held != Some(hovered) => {
+                if self
+                    .animation_progress(AnimationKind::Drag, Some(hovered), now)
+                    .is_none()
+                    && self.trigger_animation(AnimationKind::Drag, Some(hovered), now)
+                {
+                    if let Some(drag) = self.tiled_drag.as_mut() {
+                        drag.armed_target = Some(hovered);
+                    }
+                }
+            }
+            None if target_held.is_some() => {
+                // Hover left for the background: forget the last highlight
+                // so a later re-hover re-arms per the hover-change rule.
+                if let Some(drag) = self.tiled_drag.as_mut() {
+                    drag.armed_target = None;
+                }
+            }
+            _ => {}
         }
         true
     }

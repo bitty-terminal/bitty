@@ -2228,6 +2228,16 @@ impl PluginServices {
     /// `service_resolve`/`service_call` re-check this snapshot on every
     /// lookup and every call, so a generation renewed after revocation
     /// fails closed immediately with no restart beyond re-activation.
+    ///
+    /// Where revocation takes effect (dynapi gating, bitty#2005): renewal
+    /// reads the recorded grant through the package source. Store-backed
+    /// packages re-resolve the install record at `reload`, so a narrowed
+    /// record applies with no process restart. Dev-root (`LocalPath`)
+    /// packages reuse the discovered manifest — `reload` re-verifies the
+    /// module tree but snapshots the same grants — so a grant edit there
+    /// needs fresh discovery (a new runtime), not a reload. A still-live
+    /// generation never observes a revocation retroactively: its snapshot
+    /// is immutable, and only renewal replaces it.
     pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
         capabilities.sort();
         capabilities.dedup();
@@ -5436,6 +5446,48 @@ mod tests {
                 .expect_err("ungranted call must fail closed");
         // Indistinguishable from a parked provider: same code, no head names.
         assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn grant_narrowing_on_renewed_snapshot_fails_closed_without_restart() {
+        // Dynapi gating (bitty#2005): a generation renewed after a
+        // grant-store revocation snapshots the narrowed set and fails
+        // closed immediately — resolve and call alike — with no restart.
+        // The directory records persist; only the snapshot changes, which
+        // is exactly what re-activation installs.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("granted resolves")
+                .is_some()
+        );
+        // Revocation lands: the renewed generation snapshots the narrowed
+        // set (the store record minus the backing head).
+        host.set_granted_capabilities(Vec::new());
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("revoked consume must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(error.class, "runtime");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", None, true)
+                .expect("optional degrades to nil"),
+            None
+        );
+        // A handle pinned before revocation fails closed as gone: the
+        // denial is indistinguishable from the provider being gone, and no
+        // new authority is minted.
+        let error =
+            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
+                .expect_err("revoked call must fail closed");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        // Re-approval serves again with no restart: the records never moved.
+        host.set_granted_capabilities(vec![TEST_HEAD.to_string()]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("re-granted resolves")
+                .is_some()
+        );
     }
 
     #[test]

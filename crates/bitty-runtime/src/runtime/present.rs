@@ -1652,14 +1652,14 @@ impl Runtime {
                                         // tint RGB, coverage preserved). A
                                         // tint without an image stays inert:
                                         // this is the only tint consumer.
-                                        if let Some(tint) = frame.style.background_tint
-                                            && frame.style.background_tint_strength > 0.0
-                                        {
-                                            bitty_render::grid::tint_rgba(
-                                                &mut rgba,
-                                                tint,
-                                                frame.style.background_tint_strength,
-                                            );
+                                        if let Some(tint) = frame.style.background_tint {
+                                            if frame.style.background_tint_strength > 0.0 {
+                                                bitty_render::grid::tint_rgba(
+                                                    &mut rgba,
+                                                    tint,
+                                                    frame.style.background_tint_strength,
+                                                );
+                                            }
                                         }
                                         // CTX-1162 S3: unfocused leaves fade
                                         // the blit exactly like their

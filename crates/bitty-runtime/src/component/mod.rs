@@ -103,7 +103,7 @@ pub use inventory::{
     incompatible_component_hint, missing_component_hint, resolve_search,
     system_components_root_for, version_satisfies_caret,
 };
-pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate};
+pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate, SupervisionPolicy};
 pub use stderr::{StderrRing, stderr_log_tail};
 pub use wsl::{
     WSL_DISTRO_ENV, WSL_DISTRO_FILE, WSL_DISTRO_FILE_MAX_BYTES, WSL_DISTRO_MAX_BYTES, WSL_EXE,

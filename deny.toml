@@ -122,6 +122,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # fail-closed. Recorded 2026-10-07; a dated ADR-0004/ADR-0012 revision
 # recording this source is tracked as a CTX-1008 follow-up. Falls under the
 # same 2027-03-31 re-audit bound above.
+# bitty-a11y is a first-party extraction target: the SnapshotHost accessibility
+# seam retired from bitty-ui (CTX-1176, bitty#1996). Linked ONLY by the ui crate
+# (bitty-ui) at an exact rev (206b3bc, v0.0.1, MIT OR Apache-2.0).
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
@@ -131,4 +134,5 @@ allow-git = [
     "https://github.com/bitty-terminal/bitty-observability",
     "https://github.com/bitty-terminal/bitty-url-detector",
     "https://github.com/bitty-terminal/bitty-platform-services",
+    "https://github.com/bitty-terminal/bitty-a11y",
 ]

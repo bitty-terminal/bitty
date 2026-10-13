@@ -1258,6 +1258,9 @@ fn services_get_rejects_malformed_shape() {
         ("empty", "bitty.services.get(\"\")"),
         ("space", "bitty.services.get(\"has space\")"),
         ("empty-segment", "bitty.services.get(\"calc..add\")"),
+        ("empty-owner", "bitty.services.get(\":calc.add\")"),
+        ("empty-short", "bitty.services.get(\"xuepoo.calc:\")"),
+        ("two-colons", "bitty.services.get(\"a:b:c\")"),
         ("non-table-opts", "bitty.services.get(\"calc.add\", 42)"),
         (
             "unknown-opt",
@@ -1328,6 +1331,67 @@ fn services_provide_captures_impl_functions() {
         .collect::<Vec<_>>();
     methods.sort();
     assert_eq!(methods, vec!["add".to_string(), "sub".to_string()]);
+}
+
+#[test]
+fn services_get_qualified_reference_reaches_host() {
+    // Dynapi arbitration (bitty#2003): the bridge admits the
+    // owner-qualified shape and hands the full reference to the host; the
+    // host (stubbed here) resolves it as keyed.
+    let services = Rc::new(ServiceStub::default());
+    services.routes.borrow_mut().insert(
+        "xuepoo.calc:calc.add".to_string(),
+        ServiceRoute {
+            provider: "xuepoo.calc".to_string(),
+            generation: 7,
+            iface: "calc.add".to_string(),
+            version: "1.0.0".to_string(),
+            methods: vec!["add".to_string()],
+        },
+    );
+    *services.call_result.borrow_mut() = LuaValue::Integer(3);
+    let mut vm = gate_vm("svc-get-qualified");
+    install_services(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local calc = bitty.services.get("xuepoo.calc:calc.add")
+            bitty.store.set("kind", type(calc.add))
+            bitty.store.set("out", calc.add({ a = 1 }))
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("kind"),
+        Some(&LuaValue::String("function".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("out"),
+        Some(&LuaValue::Integer(3))
+    );
+}
+
+#[test]
+fn services_provide_qualified_reference_is_captured_for_host_gate() {
+    // The bridge admits the qualified shape on provide too; the host gate
+    // (stubbed to accept here, arbitration-checked in the runtime) owns
+    // the verdict.
+    let services = Rc::new(ServiceStub::default());
+    let mut vm = gate_vm("svc-provide-qualified");
+    install_services(&mut vm, services.clone());
+    assert_service_code(
+        &mut vm,
+        &services,
+        "bitty.services.provide(\"xuepoo.calc:calc.add\", { add = function(a) return a end })",
+        "NONE",
+    );
+    let capture = vm.take_registrations();
+    assert_eq!(capture.services.len(), 1);
+    assert_eq!(capture.services[0].iface, "xuepoo.calc:calc.add");
 }
 
 #[test]

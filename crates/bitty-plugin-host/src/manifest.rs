@@ -1154,26 +1154,127 @@ impl LazyTriggers {
     }
 }
 
-/// Validate one service interface name (shared provides/requires grammar).
+/// Maximum bytes of one service reference (`iface` or `owner:iface`).
 ///
-/// Dot-separated segments (e.g. `markdown.render`), 1..128 bytes total,
-/// 1..64 bytes per segment, no NUL or space. The manifest is
-/// attacker-controlled input so every interface string is bounded before use.
-fn validate_service_iface(iface: &str, field: &str) -> Result<(), PluginError> {
-    if iface.is_empty() || iface.len() > 128 {
+/// Precedent: the manifest `services.provided` ceiling (1..128 bytes); the
+/// owner qualifier shares the same ceiling so a qualified reference stays
+/// within the bounds every bridge and directory call site already enforces.
+pub const MAX_SERVICE_REFERENCE_BYTES: usize = 128;
+
+/// Top-level Core-owned service namespace (dynapi arbitration, bitty#2003).
+///
+/// The `bitty.*` namespace stays frozen as Core-owned spellings forever:
+/// no extension may dynamically allocate a short interface under it, and no
+/// extension may require one (a Core spelling can never resolve through the
+/// dynamic broker). Trust model ADR-0003 applies throughout: this
+/// reservation authorizes participation only and exempts nothing — every
+/// provided API still declares backing heads and every consumption still
+/// passes grant + consent.
+pub const CORE_RESERVED_SERVICE_NAMESPACE: &str = "bitty";
+
+/// Whether a short service interface falls under the Core reservation.
+///
+/// Matches the top-level name itself (`bitty`) and everything beneath it
+/// (`bitty.anything`); qualified references (`owner:iface`) never collide
+/// with Core spellings (Core APIs carry no `:`) so only the short part is
+/// ever tested here.
+#[must_use]
+pub fn short_service_iface_is_core_reserved(short: &str) -> bool {
+    short == CORE_RESERVED_SERVICE_NAMESPACE || short.starts_with("bitty.")
+}
+
+/// Split an owner-qualified service reference into `(owner, short)`.
+///
+/// Returns `(None, reference)` for short references. Structural only:
+/// more than one `:`, an empty owner, or an empty short fails closed.
+/// Bounds, charset, and the Core reservation stay with
+/// [`parse_service_reference`]; the Lua bridge mirrors this structural
+/// shape so malformed references never reach the host.
+pub fn split_service_reference(reference: &str) -> Result<(Option<&str>, &str), &'static str> {
+    match reference.split_once(':') {
+        None => Ok((None, reference)),
+        Some((owner, short)) => {
+            if owner.is_empty() || short.is_empty() || short.contains(':') {
+                return Err("service reference must be 'iface' or 'owner:iface'");
+            }
+            Ok((Some(owner), short))
+        }
+    }
+}
+
+/// Parse and fully validate one service reference (dynapi arbitration).
+///
+/// Accepts short (`calc.add`) and owner-qualified (`xuepoo.calc:calc.add`)
+/// references; the owner pins identity by registry (the provider's manifest
+/// plugin id — exact-rev discipline, no static Core list), the short part
+/// keeps the dot grammar, and Core-reserved shorts fail closed either way.
+/// The `@version` position of the `owner:iface@version` grammar maps to the
+/// existing version-requirement channel (`services.required` entry /
+/// `services.get` `opts.version`), never to inline syntax.
+///
+/// Returns `(owner, short)` for the broker and the graph gate.
+pub fn parse_service_reference(
+    reference: &str,
+    field: &str,
+) -> Result<(Option<String>, String), PluginError> {
+    if reference.is_empty() || reference.len() > MAX_SERVICE_REFERENCE_BYTES {
         return Err(PluginError::manifest(
             field,
-            "interface name must be 1..128 bytes",
+            format!("service reference must be 1..{MAX_SERVICE_REFERENCE_BYTES} bytes"),
         ));
     }
-    if iface.contains('\0') || iface.contains(' ') {
+    if reference.contains('\0') || reference.contains(' ') {
+        return Err(PluginError::manifest(
+            field,
+            "service reference must not contain NUL or space",
+        ));
+    }
+    let (owner, short) = split_service_reference(reference).map_err(|detail| {
+        PluginError::manifest(
+            field,
+            format!("service '{reference}' is not valid ({detail})"),
+        )
+    })?;
+    if let Some(owner) = owner {
+        validate_plugin_id(owner).map_err(|_| {
+            PluginError::manifest(
+                field,
+                format!("invalid service owner '{owner}' in '{reference}'"),
+            )
+        })?;
+    }
+    validate_short_service_grammar(short, field)?;
+    if short_service_iface_is_core_reserved(short) {
+        return Err(PluginError::manifest(
+            field,
+            format!(
+                "service '{short}' is Core-reserved ('bitty.*' is never dynamically allocatable)"
+            ),
+        ));
+    }
+    Ok((owner.map(str::to_string), short.to_string()))
+}
+
+/// Validate one short service interface name (dot grammar, no reservation).
+///
+/// Dot-separated segments (e.g. `markdown.render`), 1..64 bytes per
+/// segment, no NUL or space. The manifest is attacker-controlled input so
+/// every interface string is bounded before use.
+fn validate_short_service_grammar(short: &str, field: &str) -> Result<(), PluginError> {
+    if short.is_empty() || short.len() > MAX_SERVICE_REFERENCE_BYTES {
+        return Err(PluginError::manifest(
+            field,
+            format!("interface name must be 1..{MAX_SERVICE_REFERENCE_BYTES} bytes"),
+        ));
+    }
+    if short.contains('\0') || short.contains(' ') {
         return Err(PluginError::manifest(
             field,
             "interface name must not contain NUL or space",
         ));
     }
     // Interface naming: allow dot-separated lowercase (e.g. `markdown.render`).
-    for seg in iface.split('.') {
+    for seg in short.split('.') {
         if seg.is_empty() || seg.len() > 64 {
             return Err(PluginError::manifest(
                 field,
@@ -1271,7 +1372,10 @@ impl PluginDependency {
 /// through a grant and never mints authority (dynapi gating, bitty#2005).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvidedService {
-    /// Service interface name (dot-separated grammar).
+    /// Service interface name: short form only (dot-separated grammar, e.g.
+    /// `markdown.render`). The owner is implied — the providing plugin, pinned
+    /// by registry identity — and Core-reserved shorts (`bitty.*`) are
+    /// rejected (dynapi arbitration, bitty#2003).
     pub iface: String,
     /// Provided interface version (exact SemVer).
     pub version: String,
@@ -1292,7 +1396,20 @@ pub struct ProvidedService {
 impl ProvidedService {
     /// Validate interface name, version, any declared schemas, and backing heads.
     pub fn validate(&self) -> Result<(), PluginError> {
-        validate_service_iface(&self.iface, "services.provided")?;
+        // Dynapi arbitration (bitty#2003): provide-side names the short
+        // interface only — the owner is implied (the providing plugin) and
+        // pinned by registry identity. A qualified spelling here fails
+        // closed naming the short form to declare.
+        let (owner, short) = parse_service_reference(&self.iface, "services.provided")?;
+        if owner.is_some() {
+            return Err(PluginError::manifest(
+                "services.provided",
+                format!(
+                    "provided service '{}' must name the short interface '{short}' (owner is implied; consumers qualify)",
+                    self.iface
+                ),
+            ));
+        }
         validate_semver(&self.version, "services.provided")?;
         if let Some(schema) = &self.args_schema {
             validate_interface_schema(schema, "services.provided.args_schema")?;
@@ -2420,7 +2537,11 @@ impl PluginManifest {
             });
         }
         for (iface, req) in &self.required_services {
-            validate_service_iface(iface, "services.required")?;
+            // Dynapi arbitration (bitty#2003): require-side accepts short
+            // (`calc.add`) and owner-qualified (`xuepoo.calc:calc.add`)
+            // references; the Core reservation holds for the short part
+            // either way.
+            parse_service_reference(iface, "services.required")?;
             validate_version_req(req, "services.required")?;
         }
         // Duplicate required interfaces rejected (would be silent shadowing otherwise).
@@ -3213,6 +3334,100 @@ mod tests {
         m.required_services
             .push(("markdown.render".to_string(), "^1.0".to_string()));
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn service_reference_parses_short_and_qualified() {
+        assert_eq!(
+            parse_service_reference("calc.add", "services.required").expect("short parses"),
+            (None, "calc.add".to_string())
+        );
+        assert_eq!(
+            parse_service_reference("xuepoo.calc:calc.add", "services.required")
+                .expect("qualified parses"),
+            (Some("xuepoo.calc".to_string()), "calc.add".to_string())
+        );
+    }
+
+    #[test]
+    fn service_reference_rejects_malformed_shapes() {
+        for raw in [
+            "",
+            ":calc.add",
+            "xuepoo.calc:",
+            "a:b:c",
+            "has space",
+            "calc..add",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                parse_service_reference(raw, "services.required").is_err(),
+                "must reject {raw:?}"
+            );
+        }
+        // NUL and over-long owners fail closed.
+        assert!(parse_service_reference("a\0b", "services.required").is_err());
+        assert!(
+            parse_service_reference(
+                &format!("{}:calc.add", "o".repeat(120)),
+                "services.required"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn core_reservation_matches_top_level_only() {
+        assert!(short_service_iface_is_core_reserved("bitty"));
+        assert!(short_service_iface_is_core_reserved("bitty.echo"));
+        assert!(short_service_iface_is_core_reserved("bitty.deep.nested"));
+        assert!(!short_service_iface_is_core_reserved("bittyx.echo"));
+        assert!(!short_service_iface_is_core_reserved("mybitty.echo"));
+        assert!(!short_service_iface_is_core_reserved("calc.add"));
+    }
+
+    #[test]
+    fn provided_services_reject_reserved_and_qualified_names() {
+        // Dynapi arbitration (bitty#2003): the `bitty.*` namespace stays
+        // frozen — an extension claiming it fails closed with a diagnostic
+        // naming the reservation.
+        for iface in ["bitty.echo", "bitty"] {
+            let mut m = minimal_manifest("xuepoo.test");
+            m.provided_services.push(backed_service(iface));
+            let err = m.validate().expect_err("reserved provide must fail");
+            let text = format!("{err}");
+            assert!(text.contains(iface), "names the iface: {text}");
+            assert!(text.contains("Core-reserved"), "names the rule: {text}");
+        }
+        // Provide-side names the short interface only: a qualified
+        // spelling fails closed naming the short form to declare.
+        let mut m = minimal_manifest("xuepoo.test");
+        m.provided_services
+            .push(backed_service("xuepoo.test:calc.add"));
+        let err = m.validate().expect_err("qualified provide must fail");
+        let text = format!("{err}");
+        assert!(text.contains("calc.add"), "names the short form: {text}");
+    }
+
+    #[test]
+    fn required_services_accept_qualified_reject_reserved() {
+        // Owner-qualified requires pin arbitration without a Core change.
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("xuepoo.calc:calc.add".to_string(), ">=1.0".to_string()));
+        assert!(m.validate().is_ok());
+        // Core-reserved shorts fail closed on the require side too: a
+        // Core spelling can never resolve through the dynamic broker.
+        for iface in ["bitty.echo", "xuepoo.calc:bitty.echo"] {
+            let mut m = minimal_manifest("xuepoo.test");
+            m.required_services
+                .push((iface.to_string(), ">=1.0".to_string()));
+            let err = m.validate().expect_err("reserved require must fail");
+            assert!(
+                format!("{err}").contains("Core-reserved"),
+                "names the rule: {err}"
+            );
+        }
     }
 
     fn backed_service(iface: &str) -> ProvidedService {

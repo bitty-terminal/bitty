@@ -230,6 +230,24 @@ pub const FS_LIST_MAX_ENTRIES: usize = 1024;
 /// Precedent: `DEFAULT_MAX_VALUE_BYTES` (`8 KiB`); exact caps stay parked to
 /// the Core bridge (`FsCaps`).
 pub const FS_LIST_MAX_BYTES: usize = 8 * 1024;
+/// Maximum bytes of one `bitty.image.read` path (CTX-1169, issue #1976).
+///
+/// Reuses the accepted path bound (`FS_PATH_MAX_BYTES`, `4096`): over-bound
+/// paths fail closed with `E_DEF_LIMIT` before any grant check, so oversize
+/// input never reaches the roots matcher.
+pub const IMAGE_PATH_MAX_BYTES: usize = 4096;
+/// Maximum bytes of one `bitty.theme` color leaf (CTX-1169, issue #1976).
+///
+/// Shape only: the canonical `#RRGGBB` grammar is enforced once, downstream,
+/// by `CustomPalette::from_hex` in `bitty-config`. The cap keeps a hostile
+/// table from stuffing an unbounded string into the queued request.
+pub const THEME_COLOR_MAX_BYTES: usize = 64;
+/// Expected `ansi` entries in one `bitty.theme` table (CTX-1169, issue #1976).
+///
+/// Mirrors `CUSTOM_PALETTE_ANSI_COUNT` (`16`) in `bitty-config` without naming
+/// it, so this bridge seam stays decoupled from the config crate's type
+/// surface; equality is pinned by the bridge tests below.
+pub const THEME_ANSI_COUNT: usize = 16;
 /// Maximum bytes of one source module file accepted by `require`.
 pub const MODULE_FILE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -1725,6 +1743,43 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.workspace_request(request)
+    }
+
+    /// Read one wallpaper image under the approved roots for
+    /// `bitty.image.read` (CTX-1169, issue #1976).
+    ///
+    /// Grant-gated on `platform.image-file`; returns a bounded descriptor
+    /// table (`path`, `format`, `width`, `height`, `size`). Raw bytes stay
+    /// host-side: bridge strings are valid-UTF-8 lossy and budgeted, so
+    /// binary can never cross intact; Lua feeds the validated canonical path
+    /// to its spawned tool argv instead. The default denies: a host without
+    /// an image backend never grants ambient file reads.
+    fn image_read(&self, path: &str) -> Result<LuaValue, BridgeError> {
+        let _ = path;
+        Err(BridgeError::capability_denied("platform.image-file"))
+    }
+
+    /// Preview one theme table for `bitty.theme.preview` (CTX-1169, issue
+    /// #1976).
+    ///
+    /// Grant-gated on `runtime.configure`; validates the table shape and
+    /// enqueues a non-persisting live-apply intent. Returns whether the
+    /// bounded queue accepted the intent (queued, not applied, never
+    /// persisted). The default denies.
+    fn theme_preview(&self, theme: &ThemeTable) -> Result<bool, BridgeError> {
+        let _ = theme;
+        Err(BridgeError::capability_denied("runtime.configure"))
+    }
+
+    /// Confirm one theme table for `bitty.theme.confirm` (CTX-1169, issue
+    /// #1976).
+    ///
+    /// Grant-gated on `runtime.configure`; validates the table shape and
+    /// enqueues a persisting apply intent. Returns whether the bounded queue
+    /// accepted the intent (queued, not applied). The default denies.
+    fn theme_confirm(&self, theme: &ThemeTable) -> Result<bool, BridgeError> {
+        let _ = theme;
+        Err(BridgeError::capability_denied("runtime.configure"))
     }
 }
 
@@ -4295,6 +4350,90 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("fx table accepts 'pulse'");
 
+    // CTX-1169 (issue #1976): `bitty.image.*` colorscheme read beside
+    // `bitty.fs` (never under it). The decided verb is `read` only: the host
+    // validates the path against the approved `background_image_roots`, reads
+    // the bytes bounded, sniffs the header, and returns a descriptor table
+    // (`path`, `format`, `width`, `height`, `size`). Raw bytes stay
+    // host-side (bridge strings are valid-UTF-8 lossy and budgeted), so Lua
+    // feeds the validated canonical path to its spawned tool argv. Paths
+    // validate `1..=IMAGE_PATH_MAX_BYTES` with `E_DEF_INVALID`/`E_DEF_LIMIT`
+    // before the grant gate; roots, readability, size, and format denials are
+    // typed `E_IMAGE_*` from the host. Hosts without an image backend fail
+    // closed with `E_CAPABILITY_DENIED` (default) or `E_NOT_IMPLEMENTED`
+    // (granted but unwired), so the spelling stays present and
+    // misconfiguration is observable.
+    let image = Table::new(&ctx);
+    image
+        .set(
+            ctx,
+            "read",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let path = fs_text_arg(stack.get(0), "image.read path")
+                        .map_err(|e| e.to_error(ctx))?;
+                    validate_image_path(&path).map_err(|e| e.to_error(ctx))?;
+                    let result = state
+                        .bounded(|_expiry| state.services.image_read(&path))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("image table accepts 'read'");
+
+    // CTX-1169 (issue #1976): `bitty.theme.*` preview-then-confirm beside
+    // `bitty.workspace` (never under it). `preview` enqueues a non-persisting
+    // live-apply intent, `confirm` a persisting one; both shape-check the
+    // table here (`parse_theme_table`) and enforce the color grammar
+    // downstream (`CustomPalette::from_hex`), and both go through the
+    // mutation guard because enqueueing commits to the shared queue. Never a
+    // silent rewrite: a preview intent carries `persist = false` and the
+    // drain never writes files for it.
+    let theme = Table::new(&ctx);
+    theme
+        .set(
+            ctx,
+            "preview",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let raw = stack.get(0);
+                    let value =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let table = parse_theme_table(&value).map_err(|e| e.to_error(ctx))?;
+                    let accepted = state
+                        .bounded_mutation(|_expiry| state.services.theme_preview(&table))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(accepted));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("theme table accepts 'preview'");
+    theme
+        .set(
+            ctx,
+            "confirm",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let raw = stack.get(0);
+                    let value =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let table = parse_theme_table(&value).map_err(|e| e.to_error(ctx))?;
+                    let accepted = state
+                        .bounded_mutation(|_expiry| state.services.theme_confirm(&table))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(accepted));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("theme table accepts 'confirm'");
+
     // CTX-0889 (ADR-0014): `bitty.workspace.*` L1 domain. `list` is a
     // `workspace.read` read (`bounded`); every mutation is gated on
     // `workspace.control` and only enqueues a bounded request (mutation
@@ -4947,6 +5086,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts panel");
     root.set(ctx, "fx", readonly_table(ctx, fx))
         .expect("root accepts fx");
+    root.set(ctx, "image", readonly_table(ctx, image))
+        .expect("root accepts image");
+    root.set(ctx, "theme", readonly_table(ctx, theme))
+        .expect("root accepts theme");
     root.set(ctx, "workspace", readonly_table(ctx, workspace))
         .expect("root accepts workspace");
     Value::Table(readonly_table(ctx, root))
@@ -5263,6 +5406,157 @@ pub fn validate_fs_path(path: &str) -> Result<(), BridgeError> {
         ));
     }
     Ok(())
+}
+
+/// Validate a `bitty.image.read` path shape (CTX-1169, issue #1976).
+///
+/// Paths are `1..=IMAGE_PATH_MAX_BYTES` bytes with no NUL or control
+/// characters, the same shape as `bitty.fs` paths. Approved-roots,
+/// readability, size, and format checks run host-side; denials are typed
+/// `E_IMAGE_*` from the host. Diagnostics quote the bounded path only, never
+/// file bytes.
+pub fn validate_image_path(path: &str) -> Result<(), BridgeError> {
+    if path.is_empty() {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "image path must not be empty",
+        ));
+    }
+    if path.len() > IMAGE_PATH_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("image path exceeds {IMAGE_PATH_MAX_BYTES} bytes"),
+        ));
+    }
+    if path.contains('\0') || path.chars().any(|c| c.is_control()) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!(
+                "image path '{}' must not contain NUL or control characters",
+                bounded_token(path)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// One shape-checked `bitty.theme` table (CTX-1169, issue #1976).
+///
+/// Plain validated strings: `background`, `foreground`, `cursor`,
+/// `selection`, plus a dense 1-based `ansi` array of exactly
+/// [`THEME_ANSI_COUNT`] entries. Shape and per-leaf byte bounds only; the
+/// canonical `#RRGGBB` grammar is enforced once, downstream, by
+/// `CustomPalette::from_hex` in `bitty-config`, so this bridge never
+/// re-spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeTable {
+    /// Background color leaf as supplied.
+    pub background: String,
+    /// Foreground color leaf as supplied.
+    pub foreground: String,
+    /// Cursor color leaf as supplied.
+    pub cursor: String,
+    /// Selection color leaf as supplied.
+    pub selection: String,
+    /// ANSI leaves in order as supplied.
+    pub ansi: Vec<String>,
+}
+
+/// Shape-check one `bitty.theme` table value (CTX-1169, issue #1976).
+///
+/// Fails closed with `E_DEF_INVALID` for a non-table value, a missing or
+/// non-string chrome leaf, or a non-dense `ansi` array, and with
+/// `E_DEF_LIMIT` for an over-bound leaf or a wrong-length `ansi` array.
+/// Unknown table fields are ignored.
+pub fn parse_theme_table(value: &LuaValue) -> Result<ThemeTable, BridgeError> {
+    let LuaValue::Table(_) = value else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "theme must be a table",
+        ));
+    };
+    let leaf = |key: &str| -> Result<String, BridgeError> {
+        match value.get(key) {
+            Some(LuaValue::String(text)) if !text.is_empty() => {
+                if text.len() > THEME_COLOR_MAX_BYTES {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_LIMIT",
+                        format!("theme '{key}' exceeds {THEME_COLOR_MAX_BYTES} bytes"),
+                    ));
+                }
+                Ok(text.clone())
+            }
+            _ => Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!("theme '{key}' must be a non-empty string"),
+            )),
+        }
+    };
+    let ansi = match value.get("ansi") {
+        Some(LuaValue::Table(pairs)) => {
+            if pairs.len() != THEME_ANSI_COUNT {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_LIMIT",
+                    format!("theme 'ansi' must carry exactly {THEME_ANSI_COUNT} entries"),
+                ));
+            }
+            let mut entries = Vec::with_capacity(pairs.len());
+            for (index, (key, item)) in pairs.iter().enumerate() {
+                let want = index as i64 + 1;
+                if *key != LuaValue::Integer(want) {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "theme 'ansi' must be a dense 1-based array",
+                    ));
+                }
+                let LuaValue::String(text) = item else {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "theme 'ansi' entries must be strings",
+                    ));
+                };
+                if text.is_empty() {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "theme 'ansi' entries must not be empty",
+                    ));
+                }
+                if text.len() > THEME_COLOR_MAX_BYTES {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_LIMIT",
+                        format!("theme 'ansi' entry exceeds {THEME_COLOR_MAX_BYTES} bytes"),
+                    ));
+                }
+                entries.push(text.clone());
+            }
+            entries
+        }
+        _ => {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "theme 'ansi' must be a table",
+            ));
+        }
+    };
+    Ok(ThemeTable {
+        background: leaf("background")?,
+        foreground: leaf("foreground")?,
+        cursor: leaf("cursor")?,
+        selection: leaf("selection")?,
+        ansi,
+    })
 }
 
 /// Validate `bitty.fs.write` content shape (RFC-0005, CTX-0984).
@@ -5995,5 +6289,99 @@ mod tests {
             occupied.get("scratchpad_occupied"),
             Some(&LuaValue::Bool(true))
         );
+    }
+
+    fn theme_value() -> LuaValue {
+        let ansi: Vec<(LuaValue, LuaValue)> = (1..=THEME_ANSI_COUNT as i64)
+            .map(|index| {
+                (
+                    LuaValue::Integer(index),
+                    LuaValue::String("#112233".to_string()),
+                )
+            })
+            .collect();
+        LuaValue::table([
+            ("background", LuaValue::String("#1e1e2e".to_string())),
+            ("foreground", LuaValue::String("#cdd6f4".to_string())),
+            ("cursor", LuaValue::String("#f5e0dc".to_string())),
+            ("selection", LuaValue::String("#313244".to_string())),
+            ("ansi", LuaValue::Table(ansi)),
+        ])
+    }
+
+    #[test]
+    fn image_path_shape_rejects_empty_overlong_and_controls() {
+        assert!(validate_image_path("/wall/paper.png").is_ok());
+        assert!(validate_image_path("~/Pictures/wall.jpg").is_ok());
+        let err = validate_image_path("").expect_err("empty denied");
+        assert_eq!(err.code, "E_DEF_INVALID");
+        let long = "a".repeat(IMAGE_PATH_MAX_BYTES + 1);
+        let err = validate_image_path(&long).expect_err("overlong denied");
+        assert_eq!(err.code, "E_DEF_LIMIT");
+        let err = validate_image_path("/wall/pa\0per.png").expect_err("NUL denied");
+        assert_eq!(err.code, "E_DEF_INVALID");
+        let err = validate_image_path("/wall/pa\x07per.png").expect_err("control denied");
+        assert_eq!(err.code, "E_DEF_INVALID");
+    }
+
+    #[test]
+    fn theme_table_shape_accepts_full_table() {
+        let table = parse_theme_table(&theme_value()).expect("full table parses");
+        assert_eq!(table.background, "#1e1e2e");
+        assert_eq!(table.foreground, "#cdd6f4");
+        assert_eq!(table.cursor, "#f5e0dc");
+        assert_eq!(table.selection, "#313244");
+        assert_eq!(table.ansi.len(), THEME_ANSI_COUNT);
+    }
+
+    #[test]
+    fn theme_ansi_count_pins_config_parity() {
+        // CTX-1169: `THEME_ANSI_COUNT` mirrors `CUSTOM_PALETTE_ANSI_COUNT`
+        // without naming it; a drifted mirror would accept a table the
+        // downstream grammar rejects (or reject one it accepts).
+        assert_eq!(
+            THEME_ANSI_COUNT, 16,
+            "theme ansi count must stay 16 like the custom palette"
+        );
+    }
+
+    #[test]
+    fn theme_table_shape_rejects_missing_leaves_and_ragged_ansi() {
+        let err = parse_theme_table(&LuaValue::Nil).expect_err("non-table denied");
+        assert_eq!(err.code, "E_DEF_INVALID");
+        let mut missing = theme_value();
+        if let LuaValue::Table(pairs) = &mut missing {
+            pairs.retain(|(key, _)| key != &LuaValue::String("cursor".to_string()));
+        }
+        let err = parse_theme_table(&missing).expect_err("missing leaf denied");
+        assert_eq!(err.code, "E_DEF_INVALID");
+        let short_ansi: Vec<(LuaValue, LuaValue)> = (1..=15_i64)
+            .map(|index| {
+                (
+                    LuaValue::Integer(index),
+                    LuaValue::String("#112233".to_string()),
+                )
+            })
+            .collect();
+        let short = LuaValue::table([
+            ("background", LuaValue::String("#1e1e2e".to_string())),
+            ("foreground", LuaValue::String("#cdd6f4".to_string())),
+            ("cursor", LuaValue::String("#f5e0dc".to_string())),
+            ("selection", LuaValue::String("#313244".to_string())),
+            ("ansi", LuaValue::Table(short_ansi)),
+        ]);
+        let err = parse_theme_table(&short).expect_err("short ansi denied");
+        assert_eq!(err.code, "E_DEF_LIMIT");
+        let over = "x".repeat(THEME_COLOR_MAX_BYTES + 1);
+        let mut big = theme_value();
+        if let LuaValue::Table(pairs) = &mut big {
+            for (key, item) in pairs.iter_mut() {
+                if key == &LuaValue::String("background".to_string()) {
+                    *item = LuaValue::String(over.clone());
+                }
+            }
+        }
+        let err = parse_theme_table(&big).expect_err("overlong leaf denied");
+        assert_eq!(err.code, "E_DEF_LIMIT");
     }
 }

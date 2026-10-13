@@ -369,6 +369,8 @@ pub(crate) struct StartupSeed<'a> {
     pub(crate) leaves: &'a [ViewId],
     /// Window-global pinned ids for the pin-target snapshot.
     pub(crate) pinned: &'a [ViewId],
+    /// Approved wallpaper roots for `bitty.image.read` (CTX-1169).
+    pub(crate) image_roots: &'a [String],
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -442,6 +444,14 @@ pub(crate) fn discover_with_roots(
         Rc::clone(runtime.panel_pin_queue()),
         Rc::clone(&pin_state),
     )));
+    // CTX-1169 (issue #1976): seed the approved wallpaper roots before
+    // activation so `init.lua` already observes a working
+    // `bitty.image.read`. Activation captures the roots into
+    // `platform.image-file` generations only; the call-time grant gate stays
+    // as the second layer. No theme persist backend is installed in this
+    // slice: confirms drain to a warning with state untouched until the
+    // config-file write path lands with its consent design.
+    runtime.set_image_roots(seed.image_roots.iter().map(PathBuf::from).collect());
     let _ = runtime.discover();
     for (id, result) in runtime.activate_discovered() {
         match result {
@@ -689,6 +699,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             workspaces: &summaries,
             leaves: &leaves,
             pinned: &pinned,
+            image_roots: &[],
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
             .expect("dev root must yield a session");
@@ -922,6 +933,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             workspaces: &summaries,
             leaves: &leaves,
             pinned: &pinned,
+            image_roots: &[],
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
             .expect("dev root must yield a session");

@@ -1237,6 +1237,11 @@ impl TerminalApp {
         // CTX-1139: arm queued `bitty.fx.pulse` intents before present, so
         // the presented frame reflects the pulse.
         self.apply_plugin_fx_requests();
+        // CTX-1169 (issue #1976): apply queued `bitty.theme.preview` /
+        // `confirm` intents before present, so the presented frame reflects
+        // the colorscheme. Previews live-apply with no durable write;
+        // confirms commit through the persist backend first.
+        self.apply_plugin_theme_requests();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -2062,6 +2067,30 @@ impl TerminalApp {
                         queued.view
                     )
                 });
+            }
+        }
+    }
+
+    /// Applies queued `bitty.theme.preview`/`confirm` intents (CTX-1169,
+    /// issue #1976).
+    ///
+    /// Bounded by the plugin runtime's theme queue capacity. Each intent runs
+    /// through `Runtime::apply_theme_request`: previews live-apply through
+    /// the same `set_theme_palette` path config reload uses, with no durable
+    /// write; confirms commit through the persist backend first and
+    /// live-apply only on success. Fail-closed rules:
+    /// - a confirm with no persist backend, or a refused commit, drops with
+    ///   a warning and state untouched (never a silent rewrite, never a
+    ///   screen/file divergence).
+    pub(crate) fn apply_plugin_theme_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let backend = plugin_runtime.theme_persist_backend();
+        let requests = plugin_runtime.drain_theme_requests();
+        for queued in requests {
+            if let Err(error) = self.runtime.apply_theme_request(&queued, &backend) {
+                crate::logging::warn(|| format!("bitty: plugin theme request dropped ({error})"));
             }
         }
     }

@@ -24,6 +24,8 @@
 use super::*;
 use bitty_render::ThemePalette;
 
+use crate::plugin_runtime::{QueuedThemeRequest, ThemePersistHandler};
+
 /// Upper bound on a live-adopted base cell dimension in logical pixels
 /// (CTX-0898).
 ///
@@ -118,6 +120,37 @@ impl Runtime {
         let before = self.config.theme;
         self.set_theme_palette(ThemePalette::from_theme(&theme));
         before != self.config.theme
+    }
+
+    /// Applies one drained colorscheme intent (CTX-1169, issue #1976).
+    ///
+    /// Previews (`persist = false`) live-apply through
+    /// [`Self::set_theme_palette`] with no durable write, so a preview can
+    /// never persist. Confirms (`persist = true`) durably commit through
+    /// `persist` first and live-apply only on commit success, so a failed or
+    /// absent commit leaves both the file and the screen untouched (never a
+    /// silent rewrite, never a screen/file divergence). OSC overrides the
+    /// running applications set survive either path via the `set_theme_palette`
+    /// contract. Returns whether the live palette changed.
+    ///
+    /// # Errors
+    ///
+    /// The persist backend's error for a refused commit; nothing is applied.
+    /// A missing backend (`None`) is a refused commit with state untouched.
+    pub fn apply_theme_request(
+        &mut self,
+        request: &QueuedThemeRequest,
+        persist: &Option<ThemePersistHandler>,
+    ) -> Result<bool, bitty_lua::BridgeError> {
+        if request.persist {
+            let backend = persist
+                .clone()
+                .ok_or_else(|| bitty_lua::BridgeError::not_implemented("bitty.theme.confirm"))?;
+            backend(&request.palette)?;
+        }
+        let before = self.config.theme;
+        self.set_theme_palette(ThemePalette::from_custom(&request.palette));
+        Ok(before != self.config.theme)
     }
 
     /// Live-adopts a font family, point size, and base cell without restart
@@ -550,5 +583,109 @@ mod tests {
         // Non-finite input degrades to opaque instead of poisoning output.
         assert!(rt.set_window_opacity(f32::NAN).expect("sanitized"));
         assert!((rt.window_opacity() - 1.0).abs() < f32::EPSILON);
+    }
+
+    fn custom_palette() -> bitty_config::theme::CustomPalette {
+        let ansi = vec!["#45475a".to_string(); 16];
+        bitty_config::theme::CustomPalette::from_hex(
+            "#1e1e2e", "#cdd6f4", "#f5e0dc", "#313244", &ansi,
+        )
+        .expect("test palette parses")
+    }
+
+    fn theme_request(persist: bool) -> crate::plugin_runtime::QueuedThemeRequest {
+        crate::plugin_runtime::QueuedThemeRequest {
+            palette: custom_palette(),
+            persist,
+        }
+    }
+
+    #[test]
+    fn theme_preview_applies_live_without_persist() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // CTX-1169: a preview live-applies through `set_theme_palette` and
+        // never touches the persist backend, even when one is wired.
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let calls = Rc::new(RefCell::new(0u32));
+        let counting_calls = Rc::clone(&calls);
+        let backend: crate::plugin_runtime::ThemePersistHandler = Rc::new(move |_| {
+            *counting_calls.borrow_mut() += 1;
+            Ok(())
+        });
+        let changed = rt
+            .apply_theme_request(&theme_request(false), &Some(backend))
+            .expect("preview applies");
+        assert!(changed, "a new palette repaints");
+        assert_eq!(
+            rt.config().theme,
+            crate::ThemePalette::from_custom(&custom_palette()),
+            "preview installs the palette live"
+        );
+        assert_eq!(*calls.borrow(), 0, "preview never persists");
+        assert!(rt.tick().is_some(), "a preview repaints");
+        // Repeating the preview is a no-op through the set_palette dedup.
+        let changed = rt
+            .apply_theme_request(&theme_request(false), &None)
+            .expect("repeat previews");
+        assert!(!changed, "an identical preview changes nothing");
+    }
+
+    #[test]
+    fn theme_confirm_persists_before_applying() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // CTX-1169: a confirm commits through the backend first; the recorded
+        // palette is the applied one, so screen and file cannot diverge.
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let committed = Rc::new(RefCell::new(Vec::new()));
+        let recording = Rc::clone(&committed);
+        let backend: crate::plugin_runtime::ThemePersistHandler = Rc::new(move |palette| {
+            recording.borrow_mut().push(*palette);
+            Ok(())
+        });
+        let changed = rt
+            .apply_theme_request(&theme_request(true), &Some(backend))
+            .expect("confirm applies");
+        assert!(changed, "a new palette repaints");
+        assert_eq!(committed.borrow().len(), 1, "confirm persists once");
+        assert_eq!(committed.borrow()[0], custom_palette());
+        assert_eq!(
+            rt.config().theme,
+            crate::ThemePalette::from_custom(&custom_palette())
+        );
+    }
+
+    #[test]
+    fn theme_confirm_without_backend_leaves_state_untouched() {
+        // CTX-1169: a confirm with no persist backend fails closed with
+        // state untouched (never a silent live-only rewrite).
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let _ = rt.tick();
+        let before = rt.config().theme;
+        let error = rt
+            .apply_theme_request(&theme_request(true), &None)
+            .expect_err("missing backend refuses");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        assert_eq!(rt.config().theme, before, "state untouched");
+        assert!(rt.tick().is_none(), "no repaint for a refused confirm");
+    }
+
+    #[test]
+    fn theme_confirm_with_failing_backend_leaves_state_untouched() {
+        use std::rc::Rc;
+        // CTX-1169: a refused durable commit blocks the live-apply, so a
+        // failed confirm leaves both the file and the screen untouched.
+        let mut rt = Runtime::with_defaults().expect("runtime");
+        let _ = rt.tick();
+        let before = rt.config().theme;
+        let backend: crate::plugin_runtime::ThemePersistHandler =
+            Rc::new(|_| Err(bitty_lua::BridgeError::new("io", "E_IO", "disk refused")));
+        let error = rt
+            .apply_theme_request(&theme_request(true), &Some(backend))
+            .expect_err("failed commit refuses");
+        assert_eq!(error.code, "E_IO");
+        assert_eq!(rt.config().theme, before, "state untouched");
+        assert!(rt.tick().is_none(), "no repaint for a refused confirm");
     }
 }

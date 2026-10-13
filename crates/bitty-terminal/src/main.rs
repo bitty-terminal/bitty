@@ -1055,6 +1055,7 @@ fn main() {
             workspaces: &runtime.workspace_summaries(),
             leaves: &runtime.layout().leaf_ids(),
             pinned: &runtime.pinned_views(),
+            image_roots: &runtime.config().background_image_roots,
         },
     );
     let live_snapshot = plugin_session

@@ -8,19 +8,25 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
+use bitty_config::theme::CustomPalette;
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
     BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue,
     LuaVm, OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES,
     OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute,
-    StashedFunction, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok,
-    validate_env_key,
+    StashedFunction, ThemeTable, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest,
+    env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
+use bitty_rich::{
+    BG_MAX_ENCODED_BYTES, BG_MAX_ROOTS, BackgroundFormat, ResourcePolicy, check_header_bounds,
+    expand_background_path, sniff_image, validate_resource_path,
+};
 use bitty_ui::{
     CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, LabelAllocator,
     LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget, QualifiedCommand, Rect,
@@ -258,6 +264,141 @@ impl PanelPinQueue {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+}
+
+/// One queued colorscheme intent (CTX-1169, issue #1976).
+///
+/// Carries the validated palette plus its durability: `persist = false` is a
+/// preview (live-apply only, never a file write), `persist = true` is a
+/// confirm (live-apply after the durable commit lands). Authority was checked
+/// at enqueue time against the generation's `runtime.configure` grant, and
+/// the palette grammar was enforced by `CustomPalette::from_hex` before
+/// queueing, so the drain trusts the shape and revalidates only liveness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedThemeRequest {
+    /// Validated custom palette (canonical `#RRGGBB` leaves, 16 ANSI slots).
+    pub palette: CustomPalette,
+    /// Whether the drain must durably commit before live-applying.
+    pub persist: bool,
+}
+
+/// Bounded runtime-shared theme intent queue (CTX-1169, issue #1976).
+///
+/// Same governance as [`PanelPinQueue`]: overflow drops the newest intent and
+/// counts it, and the application drains it once per tick. Preview and
+/// confirm intents share one FIFO so a confirm always lands after the preview
+/// that preceded it.
+#[derive(Debug)]
+pub struct ThemeRequestQueue {
+    items: VecDeque<QueuedThemeRequest>,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl ThemeRequestQueue {
+    /// Create a bounded queue (capacity at least 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Push an intent; returns whether it was accepted.
+    pub fn push(&mut self, request: QueuedThemeRequest) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(request);
+        true
+    }
+
+    /// Drain all queued intents in FIFO order.
+    pub fn drain(&mut self) -> Vec<QueuedThemeRequest> {
+        self.items.drain(..).collect()
+    }
+
+    /// Number of queued intents.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+/// Durable-commit backend for one confirmed colorscheme (CTX-1169, issue
+/// #1976).
+///
+/// Receives the validated palette a `bitty.theme.confirm` intent carries and
+/// durably commits it (the application's config-file write); the drain
+/// live-applies only after this returns success, so a failed commit leaves
+/// both the file and the screen untouched. The production backend is wired at
+/// activation by the application; tests inject canned closures. `None` (no
+/// backend) leaves granted confirms failing closed at drain time with state
+/// untouched, mirroring the pin-backend pattern.
+pub type ThemePersistHandler = Rc<dyn Fn(&CustomPalette) -> Result<(), BridgeError>>;
+
+/// Reads at most BG-1 plus one probe byte from `canonical` (CTX-1169, issue
+/// #1976).
+///
+/// The cap is enforced on the actual bytes, so allocation stays bounded even
+/// when pre-read metadata was stale (same probe discipline as the background
+/// store's fd-pinned read, without the decode). Over-bound files fail closed
+/// with `E_DEF_LIMIT`; unreadable files with `E_IMAGE_UNREADABLE`.
+fn read_image_bytes_bounded(canonical: &Path) -> Result<Vec<u8>, BridgeError> {
+    use std::io::Read;
+    let shown = canonical.display().to_string();
+    let file = std::fs::File::open(canonical).map_err(|err| {
+        BridgeError::new(
+            "io",
+            "E_IMAGE_UNREADABLE",
+            format!("image read failed for {shown}: {err}"),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(BG_MAX_ENCODED_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            BridgeError::new(
+                "io",
+                "E_IMAGE_UNREADABLE",
+                format!("image read failed for {shown}: {err}"),
+            )
+        })?;
+    if bytes.len() > BG_MAX_ENCODED_BYTES {
+        return Err(BridgeError::new(
+            "budget",
+            "E_DEF_LIMIT",
+            format!(
+                "image is {} encoded bytes; at most {BG_MAX_ENCODED_BYTES} allowed",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Canonical format label for one sniffed header (CTX-1169, issue #1976).
+fn background_format_name(format: BackgroundFormat) -> &'static str {
+    match format {
+        BackgroundFormat::Png => "png",
+        BackgroundFormat::Jpeg => "jpeg",
+        BackgroundFormat::WebP => "webp",
     }
 }
 
@@ -1183,6 +1324,20 @@ pub struct PluginServices {
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
     panel_pin_backend: RefCell<Option<PanelPinHandler>>,
+    /// Whether this generation holds `platform.image-file` (CTX-1169).
+    image_read_granted: Cell<bool>,
+    /// Approved wallpaper roots for `bitty.image.read` (CTX-1169).
+    ///
+    /// Shared at activation only with `platform.image-file` generations from
+    /// the live `background_image_roots`; `None` leaves granted reads failing
+    /// closed with `E_NOT_IMPLEMENTED`, like every other verb without a host.
+    image_roots: RefCell<Option<Vec<PathBuf>>>,
+    /// Whether this generation holds `runtime.configure` (CTX-1169).
+    theme_configure_granted: Cell<bool>,
+    /// Runtime-shared `bitty.theme.preview`/`confirm` intent queue (CTX-1169).
+    /// Shared at activation only with `runtime.configure` generations; `None`
+    /// leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
+    theme_requests: RefCell<Option<Rc<RefCell<ThemeRequestQueue>>>>,
     /// Runtime-shared `bitty.fx.pulse` intent queue (CTX-1139). Shared at
     /// activation only with `panel.focus` generations; `None` leaves granted
     /// calls failing closed with `E_NOT_IMPLEMENTED`.
@@ -1241,6 +1396,10 @@ impl PluginServices {
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
             panel_pin_backend: RefCell::new(None),
+            image_read_granted: Cell::new(false),
+            image_roots: RefCell::new(None),
+            theme_configure_granted: Cell::new(false),
+            theme_requests: RefCell::new(None),
             fx_requests: RefCell::new(None),
         }
     }
@@ -1259,6 +1418,75 @@ impl PluginServices {
     /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
     pub fn set_panel_pin_backend(&self, backend: Option<PanelPinHandler>) {
         *self.panel_pin_backend.borrow_mut() = backend;
+    }
+
+    /// Grant `platform.image-file` from the activation snapshot (CTX-1169,
+    /// issue #1976). Absent grants fail closed with `E_CAPABILITY_DENIED`.
+    pub fn set_image_access(&self, granted: bool) {
+        self.image_read_granted.set(granted);
+    }
+
+    /// Attach the approved wallpaper roots for `bitty.image.read` (CTX-1169,
+    /// issue #1976). Without roots a granted read fails closed with
+    /// `E_NOT_IMPLEMENTED`, like every other verb without a host.
+    pub fn set_image_roots(&self, roots: Option<Vec<PathBuf>>) {
+        *self.image_roots.borrow_mut() = roots;
+    }
+
+    /// Grant `runtime.configure` from the activation snapshot (CTX-1169, issue
+    /// #1976). Preview and confirm share the grant: both change runtime
+    /// configuration, only their durability differs. Absent grants fail
+    /// closed with `E_CAPABILITY_DENIED`.
+    pub fn set_theme_access(&self, granted: bool) {
+        self.theme_configure_granted.set(granted);
+    }
+
+    /// Attach the runtime-shared theme intent queue for
+    /// `bitty.theme.preview`/`confirm` (CTX-1169, issue #1976). Without it a
+    /// granted call fails closed with `E_NOT_IMPLEMENTED`, like every other
+    /// verb without a host.
+    pub fn set_theme_queue(&self, queue: Option<Rc<RefCell<ThemeRequestQueue>>>) {
+        *self.theme_requests.borrow_mut() = queue;
+    }
+
+    /// Shared enqueue core behind `theme_preview`/`theme_confirm` (CTX-1169,
+    /// issue #1976).
+    ///
+    /// Grant gate first, then the pure grammar check (`CustomPalette`
+    /// fail-closed, so malformed input never reaches shared state), then the
+    /// bounded queue. `verb` names the calling verb for the unwired-host
+    /// diagnostic only.
+    fn enqueue_theme(
+        &self,
+        theme: &ThemeTable,
+        persist: bool,
+        verb: &'static str,
+    ) -> Result<bool, BridgeError> {
+        if !self.theme_configure_granted.get() {
+            return Err(BridgeError::capability_denied("runtime.configure"));
+        }
+        let palette = CustomPalette::from_hex(
+            &theme.background,
+            &theme.foreground,
+            &theme.cursor,
+            &theme.selection,
+            &theme.ansi,
+        )
+        .ok_or_else(|| {
+            BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "theme colors must be canonical #RRGGBB with exactly 16 ansi entries",
+            )
+        })?;
+        let queue = self
+            .theme_requests
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented(verb))?;
+        Ok(queue
+            .borrow_mut()
+            .push(QueuedThemeRequest { palette, persist }))
     }
 
     /// Attach the runtime-shared fx intent queue for `bitty.fx.pulse`
@@ -2955,6 +3183,106 @@ impl HostServices for PluginServices {
         Ok(queue.borrow_mut().push(QueuedFxPulse { view: view_id }))
     }
 
+    /// Read one wallpaper image under the approved roots for
+    /// `bitty.image.read` (CTX-1169, issue #1976).
+    ///
+    /// Grant-gated on `platform.image-file` (`E_CAPABILITY_DENIED`
+    /// otherwise). Runs the accepted background trust chain — `~`/absolute
+    /// expansion, approved-root policy, regular-file check, BG-1-bounded
+    /// read, header sniff — and returns a bounded descriptor table (`path`,
+    /// `format`, `width`, `height`, `size`). Raw bytes stay host-side: the
+    /// bridge cannot carry binary intact. Roots, readability, and trust
+    /// failures are `E_IMAGE_DENIED`; post-validation I/O failures are
+    /// `E_IMAGE_UNREADABLE`; over-bound files are `E_DEF_LIMIT`. Without
+    /// shared roots a granted read fails closed with `E_NOT_IMPLEMENTED`.
+    fn image_read(&self, path: &str) -> Result<LuaValue, BridgeError> {
+        if !self.image_read_granted.get() {
+            return Err(BridgeError::capability_denied("platform.image-file"));
+        }
+        let roots = self
+            .image_roots
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.image.read"))?;
+        let policy = ResourcePolicy::with_max_roots(roots, BG_MAX_ROOTS).map_err(|err| {
+            BridgeError::new(
+                "trust",
+                "E_IMAGE_DENIED",
+                format!("image roots refused: {err}"),
+            )
+        })?;
+        let expanded = expand_background_path(path, None).map_err(|err| {
+            BridgeError::new(
+                "trust",
+                "E_IMAGE_DENIED",
+                format!("image path denied: {err}"),
+            )
+        })?;
+        let canonical = validate_resource_path(&expanded, &policy).map_err(|err| {
+            BridgeError::new(
+                "trust",
+                "E_IMAGE_DENIED",
+                format!("image path denied: {err}"),
+            )
+        })?;
+        let bytes = read_image_bytes_bounded(&canonical)?;
+        let (format, width, height) = match sniff_image(&bytes) {
+            Ok(header) => {
+                // Bounds without decode: a lying header (gigapixel dims) must
+                // not reach Lua as budgeting metadata.
+                check_header_bounds(&header).map_err(|err| {
+                    BridgeError::new(
+                        "budget",
+                        "E_DEF_LIMIT",
+                        format!("image header refused: {err}"),
+                    )
+                })?;
+                (
+                    background_format_name(header.format).to_string(),
+                    LuaValue::Integer(i64::from(header.width)),
+                    LuaValue::Integer(i64::from(header.height)),
+                )
+            }
+            Err(_) => ("unknown".to_string(), LuaValue::Nil, LuaValue::Nil),
+        };
+        Ok(LuaValue::table([
+            ("path", LuaValue::String(canonical.display().to_string())),
+            ("format", LuaValue::String(format)),
+            ("width", width),
+            ("height", height),
+            (
+                "size",
+                LuaValue::Integer(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+            ),
+        ]))
+    }
+
+    /// Preview one theme table for `bitty.theme.preview` (CTX-1169, issue
+    /// #1976).
+    ///
+    /// Grant-gated on `runtime.configure` (`E_CAPABILITY_DENIED` otherwise):
+    /// the table grammar is enforced by `CustomPalette::from_hex`
+    /// (`E_DEF_INVALID` for a non-canonical leaf) before queueing, and the
+    /// intent carries `persist = false`, so the drain live-applies without
+    /// ever writing a file. Returns whether the bounded queue accepted the
+    /// intent; a full queue returns `false`. Without a shared queue a granted
+    /// call fails closed with `E_NOT_IMPLEMENTED`.
+    fn theme_preview(&self, theme: &ThemeTable) -> Result<bool, BridgeError> {
+        self.enqueue_theme(theme, false, "bitty.theme.preview")
+    }
+
+    /// Confirm one theme table for `bitty.theme.confirm` (CTX-1169, issue
+    /// #1976).
+    ///
+    /// Same grant and grammar gates as [`Self::theme_preview`], but the
+    /// intent carries `persist = true`: the drain durably commits through
+    /// the persist backend first and live-applies only on success, so a
+    /// confirm is never a silent rewrite. Returns whether the bounded queue
+    /// accepted the intent; a full queue returns `false`.
+    fn theme_confirm(&self, theme: &ThemeTable) -> Result<bool, BridgeError> {
+        self.enqueue_theme(theme, true, "bitty.theme.confirm")
+    }
+
     fn panel_get_state(&self, panel_id: u64) -> Result<Option<LuaValue>, BridgeError> {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
@@ -3243,6 +3571,279 @@ mod tests {
             vec![QueuedFxPulse { view: 1 }, QueuedFxPulse { view: 404 }]
         );
         assert_eq!(FX_PULSE_QUEUE_CAPACITY, 16);
+    }
+
+    fn theme_table() -> ThemeTable {
+        ThemeTable {
+            background: "#1e1e2e".to_string(),
+            foreground: "#cdd6f4".to_string(),
+            cursor: "#f5e0dc".to_string(),
+            selection: "#313244".to_string(),
+            ansi: vec!["#45475a".to_string(); 16],
+        }
+    }
+
+    fn image_test_root(tag: &str) -> PathBuf {
+        // Per-test unique roots: parallel tests share the process id, so the
+        // tag alone cannot isolate them; the counter closes the gap while the
+        // pre-remove keeps reruns hermetic. Virtual-clock only: no sleeps,
+        // no wall waits.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static IMAGE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = IMAGE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1169-image-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create image test root");
+        dir
+    }
+
+    /// Minimal PNG carrying only signature, IHDR, and IEND (CTX-1169).
+    ///
+    /// The image hook sniffs headers without decoding, so no IDAT is needed;
+    /// the sniff ignores CRC bytes, which stay zero here.
+    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut chunk = |ctype: &[u8; 4], data: &[u8]| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(ctype);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&[0u8; 4]);
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IEND", &[]);
+        out
+    }
+
+    fn image_services_with_roots(roots: Vec<PathBuf>) -> PluginServices {
+        let granted = services();
+        granted.set_image_access(true);
+        granted.set_image_roots(Some(roots));
+        granted
+    }
+
+    fn descriptor_field(value: &LuaValue, key: &str) -> LuaValue {
+        value
+            .get(key)
+            .unwrap_or_else(|| panic!("descriptor carries '{key}'"))
+            .clone()
+    }
+
+    #[test]
+    fn image_read_denies_without_grant() {
+        // CTX-1169: `bitty.image.read` is deny-by-default on
+        // `platform.image-file`, naming the capability exactly.
+        let denied = services();
+        let error = denied.image_read("/wall/paper.png").expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'platform.image-file' is not granted"
+        );
+    }
+
+    #[test]
+    fn image_read_granted_without_roots_is_not_implemented() {
+        // CTX-1169: a granted read without shared roots fails closed with
+        // `E_NOT_IMPLEMENTED`, like every other verb without a host.
+        let granted = services();
+        granted.set_image_access(true);
+        let error = granted
+            .image_read("/wall/paper.png")
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn image_read_serves_a_valid_png_descriptor() {
+        // CTX-1169: an approved-root PNG reads bounded and reports its
+        // canonical path, sniffed format, header dims, and byte size. Raw
+        // bytes stay host-side by design (the bridge cannot carry binary).
+        let root = image_test_root("valid");
+        let file = root.join("paper.png");
+        let bytes = tiny_png(3, 2);
+        std::fs::write(&file, &bytes).expect("write png");
+        let granted = image_services_with_roots(vec![root.clone()]);
+        let value = granted
+            .image_read(file.to_str().expect("utf-8 path"))
+            .expect("approved png reads");
+        assert_eq!(
+            descriptor_field(&value, "format"),
+            LuaValue::String("png".to_string())
+        );
+        assert_eq!(descriptor_field(&value, "width"), LuaValue::Integer(3));
+        assert_eq!(descriptor_field(&value, "height"), LuaValue::Integer(2));
+        assert_eq!(
+            descriptor_field(&value, "size"),
+            LuaValue::Integer(bytes.len() as i64)
+        );
+        let canonical = file
+            .canonicalize()
+            .expect("canonicalize")
+            .display()
+            .to_string();
+        assert_eq!(
+            descriptor_field(&value, "path"),
+            LuaValue::String(canonical)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_read_rejects_outside_roots_and_missing_files() {
+        // CTX-1169: outside-root paths and absent files both fail closed
+        // without touching state (missing files surface at the trust layer,
+        // so absence is indistinguishable from denial).
+        let approved = image_test_root("approved");
+        let outside = image_test_root("outside");
+        let secret = outside.join("secret.png");
+        std::fs::write(&secret, tiny_png(1, 1)).expect("write outside");
+        let granted = image_services_with_roots(vec![approved.clone()]);
+        let error = granted
+            .image_read(secret.to_str().expect("utf-8 path"))
+            .expect_err("outside denied");
+        assert_eq!(error.code, "E_IMAGE_DENIED");
+        let missing = approved.join("gone.png");
+        let error = granted
+            .image_read(missing.to_str().expect("utf-8 path"))
+            .expect_err("missing denied");
+        assert_eq!(error.code, "E_IMAGE_DENIED");
+        let _ = std::fs::remove_dir_all(&approved);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn image_read_rejects_oversize_files() {
+        // CTX-1169: files over BG-1 fail closed with `E_DEF_LIMIT` on the
+        // actual bytes, so a sparse or swapped length cannot smuggle a larger
+        // allocation through.
+        let root = image_test_root("oversize");
+        let file = root.join("huge.png");
+        let big = vec![0u8; BG_MAX_ENCODED_BYTES + 1];
+        std::fs::write(&file, &big).expect("write oversize");
+        let granted = image_services_with_roots(vec![root.clone()]);
+        let error = granted
+            .image_read(file.to_str().expect("utf-8 path"))
+            .expect_err("oversize denied");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn image_read_rejects_symlink_escape() {
+        // CTX-1169 (unix-gated: symlink live test): a link inside the
+        // approved root pointing outside fails closed after canonicalization.
+        let approved = image_test_root("link-approved");
+        let outside = image_test_root("link-outside");
+        let secret = outside.join("secret.png");
+        std::fs::write(&secret, tiny_png(1, 1)).expect("write outside");
+        let link = approved.join("escape.png");
+        std::os::unix::fs::symlink(&secret, &link).expect("symlink");
+        let granted = image_services_with_roots(vec![approved.clone()]);
+        let error = granted
+            .image_read(link.to_str().expect("utf-8 path"))
+            .expect_err("escape denied");
+        assert_eq!(error.code, "E_IMAGE_DENIED");
+        let _ = std::fs::remove_dir_all(&approved);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn theme_verbs_deny_without_grant() {
+        // CTX-1169: preview and confirm share the `runtime.configure` grant
+        // and name it exactly when absent.
+        let denied = services();
+        let error = denied
+            .theme_preview(&theme_table())
+            .expect_err("preview denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'runtime.configure' is not granted"
+        );
+        let error = denied
+            .theme_confirm(&theme_table())
+            .expect_err("confirm denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'runtime.configure' is not granted"
+        );
+    }
+
+    #[test]
+    fn theme_verbs_granted_without_queue_are_not_implemented() {
+        // CTX-1169: granted calls without a shared queue fail closed with
+        // `E_NOT_IMPLEMENTED`, like every other verb without a host.
+        let granted = services();
+        granted.set_theme_access(true);
+        let error = granted
+            .theme_preview(&theme_table())
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        let error = granted
+            .theme_confirm(&theme_table())
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn theme_verbs_reject_malformed_palettes_without_queueing() {
+        // CTX-1169: the `CustomPalette` grammar runs before queueing, so a
+        // malformed leaf fails closed with `E_DEF_INVALID` and lodges
+        // nothing for the drain.
+        let granted = services();
+        granted.set_theme_access(true);
+        let queue = Rc::new(RefCell::new(ThemeRequestQueue::new(8)));
+        granted.set_theme_queue(Some(Rc::clone(&queue)));
+        let mut bad = theme_table();
+        bad.foreground = "not-a-color".to_string();
+        let error = granted.theme_preview(&bad).expect_err("preview refused");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        let error = granted.theme_confirm(&bad).expect_err("confirm refused");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        assert!(queue.borrow().is_empty(), "malformed palettes never queue");
+    }
+
+    #[test]
+    fn theme_preview_and_confirm_enqueue_with_persist_flags_fifo() {
+        // CTX-1169: preview enqueues `persist = false` and confirm
+        // `persist = true` in FIFO order; overflow drops the newest, counts
+        // it, and reports `false`. The drain (not enqueue) owns durability,
+        // so a preview intent can never persist.
+        let granted = services();
+        granted.set_theme_access(true);
+        granted.set_theme_queue(Some(Rc::new(RefCell::new(ThemeRequestQueue::new(2)))));
+        assert!(
+            granted
+                .theme_preview(&theme_table())
+                .expect("preview queues")
+        );
+        assert!(
+            granted
+                .theme_confirm(&theme_table())
+                .expect("confirm queues")
+        );
+        assert!(
+            !granted
+                .theme_preview(&theme_table())
+                .expect("overflow reports false"),
+            "a full queue refuses the newest intent"
+        );
+        let queue = granted.theme_requests.borrow().clone().expect("queue");
+        assert_eq!(queue.borrow().dropped(), 1);
+        let drained = queue.borrow_mut().drain();
+        assert_eq!(drained.len(), 2);
+        assert!(!drained[0].persist, "preview never persists");
+        assert!(drained[1].persist, "confirm persists");
+        assert_eq!(drained[0].palette, drained[1].palette);
     }
 
     #[test]

@@ -333,6 +333,37 @@ pub(super) fn px_side(value: u32) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
+/// CTX-1165 (#1993): whether a leaf glyph is occluded by a higher detached float.
+///
+/// The combined draw list paints all fills before all glyphs, so the CTX-1148
+/// opaque float fill already covers lower fills but not lower glyphs. A lower
+/// glyph whose bitmap bounds share positive area with a higher float frame
+/// would otherwise paint over the upper float. Dropping it extends the same
+/// opaque mechanism to text rows. Empty bounds never occlude: an unmeasurable
+/// glyph stays visible. Bounded to one intersection test per higher float.
+fn glyph_occluded_by_floats(
+    dest: [i32; 2],
+    size: [u32; 2],
+    occluders: &[bitty_render::geometry::RectPx],
+) -> bool {
+    if size[0] == 0 || size[1] == 0 {
+        return false;
+    }
+    let bounds = bitty_render::geometry::RectPx::new(dest[0], dest[1], size[0], size[1]);
+    if bounds.is_empty() {
+        return false;
+    }
+    for occluder in occluders {
+        if occluder.is_empty() {
+            continue;
+        }
+        if bounds.intersection(occluder).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
 /// leaf allocation with erased cells. Cursor/modes/title ride along so the
 /// overlay gates (cursor paints on the focused view only) stay total.
@@ -1537,6 +1568,33 @@ impl Runtime {
         // the same pass), so the whole leaf set is rebuilt when a reset is
         // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
         let mut attempt = 0u8;
+        // CTX-1165 (#1993): higher detached-float frames in window space, in
+        // paint order. A lower leaf glyph sharing positive area with any of
+        // these is dropped so the upper float fully occludes lower text, the
+        // same opaque boundary the CTX-1148 fill already gives lower fills.
+        // Float tier only, so the tiled baseline and higher tiers are
+        // unchanged. Empty frames never occlude. Bounded to the visible leaf
+        // set.
+        let float_occluders: Vec<(usize, bitty_render::geometry::RectPx)> = allocations
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| {
+                frame.tier == Some(OverlayTier::Float)
+                    && frame.frame.width > 0
+                    && frame.frame.height > 0
+            })
+            .map(|(index, frame)| {
+                (
+                    index,
+                    bitty_render::geometry::RectPx::new(
+                        px_add(pad_px, frame.frame.x),
+                        px_add(pad_px, frame.frame.y),
+                        frame.frame.width,
+                        frame.frame.height,
+                    ),
+                )
+            })
+            .collect();
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
@@ -1545,7 +1603,7 @@ impl Runtime {
             // atlas epoch than the slots already collected in this attempt.
             let mut stale_epoch = false;
 
-            for frame in allocations {
+            for (leaf_index, frame) in allocations.iter().enumerate() {
                 if frame.content.width == 0 || frame.content.height == 0 {
                     continue;
                 }
@@ -1596,6 +1654,18 @@ impl Runtime {
                 // set. The factor is computed once here so the gate, the
                 // stored alpha, and the chrome below agree bit-for-bit.
                 let fade = self.leaf_fade_factor(ring_ctx.focused_id == Some(view_id), now);
+                // CTX-1165 (#1993): higher detached-float frames occlude this
+                // leaf glyphs. Later allocations paint above, so only floats
+                // after this leaf matter. The slice is rebuilt per leaf from
+                // the frame-sized occluder table, so retained reuse and fresh
+                // renders agree bit-for-bit. Empty when no higher float
+                // exists, keeping the common tiled path allocation-free
+                // beyond the small table filter.
+                let higher_floats: Vec<bitty_render::geometry::RectPx> = float_occluders
+                    .iter()
+                    .filter(|(index, _)| *index > leaf_index)
+                    .map(|(_, rect)| *rect)
+                    .collect();
                 let reuse = !full_frame
                     && !leaf_damaged
                     && self
@@ -1757,7 +1827,22 @@ impl Runtime {
                         .expect("reuse requires a retained leaf");
                     built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
                     built.fills.extend(leaf.fills.iter().cloned());
-                    built.glyphs.extend(leaf.glyphs.iter().cloned());
+                    // CTX-1165 (#1993): a retained lower leaf still occludes
+                    // under a higher float. The stored list is reused verbatim
+                    // except for glyphs sharing area with a higher float
+                    // frame, which the upper opaque fill must own alone.
+                    // Fills stay: the upper opaque fill already covers them in
+                    // paint order.
+                    if higher_floats.is_empty() {
+                        built.glyphs.extend(leaf.glyphs.iter().cloned());
+                    } else {
+                        for glyph in &leaf.glyphs {
+                            if glyph_occluded_by_floats(glyph.dest, glyph.size, &higher_floats) {
+                                continue;
+                            }
+                            built.glyphs.push(glyph.clone());
+                        }
+                    }
                     if is_focused_view && !scrolled {
                         built.cursor = self.reused_cursor_paint(
                             frame,
@@ -1911,6 +1996,9 @@ impl Runtime {
                     }
                 }
                 built.needs_draw |= leaf_painted || !fills.is_empty() || !glyphs.is_empty();
+                // CTX-1165 (#1993): the retained store keeps the full leaf so
+                // a moved upper float never strands a filtered reuse. Only the
+                // combined frame drops glyphs under higher floats.
                 self.presented_leaf_frames.insert(
                     view_id,
                     PresentedLeaf {
@@ -1922,7 +2010,16 @@ impl Runtime {
                     },
                 );
                 built.fills.extend(fills);
-                built.glyphs.extend(glyphs);
+                if higher_floats.is_empty() {
+                    built.glyphs.extend(glyphs);
+                } else {
+                    for glyph in glyphs {
+                        if glyph_occluded_by_floats(glyph.dest, glyph.size, &higher_floats) {
+                            continue;
+                        }
+                        built.glyphs.push(glyph);
+                    }
+                }
             }
 
             // CTX-1076 (issue #1815): the window background image paints

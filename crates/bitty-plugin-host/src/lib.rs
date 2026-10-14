@@ -140,6 +140,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod bundled;
 pub mod capability;
 pub mod credential_ref;
@@ -163,6 +164,20 @@ pub mod secrets;
 pub mod tools;
 pub mod trust_levels;
 
+pub use audio::{
+    AUDIO_CONTRACT_VERSION, AUDIO_FAMILY, AUDIO_MAX_PORT_BYTES, AUDIO_MAX_SINK_BYTES, AudioError,
+    AudioErrorKind, AudioState, CONTROL_IFACE, CONTROL_MAX_ARGV_BYTES, CONTROL_METHOD_SET_VOLUME,
+    CONTROL_METHOD_TOGGLE_MUTE, CONTROL_MIN_INTERVAL_MS, CONTROL_VERSION, ControlGate,
+    DEFAULT_SINK, MONITOR_OUTPUT_MAX_BYTES, MONITOR_PROGRAM, SPECTRUM_HEAD, SPECTRUM_IFACE,
+    SPECTRUM_MAX_BUCKETS, SPECTRUM_MAX_RESPONSE_BYTES, SPECTRUM_MAX_TAPS, SPECTRUM_METHOD,
+    SPECTRUM_MIN_INTERVAL_MS, SPECTRUM_STALE_HIDE_MS, SPECTRUM_VERSION, STATE_CONTROL_HEAD,
+    STATE_IFACE, STATE_METHOD_GET, STATE_MIN_INTERVAL_MS, STATE_READ_HEAD, STATE_STALE_HIDE_MS,
+    STATE_VERSION, SpectrumGate, SpectrumPoll, StateGate, StatePoll, VOLUME_MAX_PCT,
+    VOLUME_MIN_PCT, VOLUME_STEP_MAX_PCT, VolumeTarget, argv_bytes, check_argv, list_sinks_argv,
+    parse_active_port, parse_default_sink, parse_sink_mute, parse_sink_volume,
+    read_default_sink_argv, read_mute_argv, read_volume_argv, resample_levels, set_volume_argv,
+    spectrum_poll_value_count, spectrum_response_bytes, toggle_mute_argv,
+};
 pub use capability::{
     CapabilityCatalog, CapabilityFamily, CapabilityId, effect_statement, effect_statement_with,
     validate_closed_capability, validate_closed_capability_with,

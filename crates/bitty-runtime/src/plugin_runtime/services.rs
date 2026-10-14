@@ -5730,6 +5730,144 @@ mod tests {
         assert_eq!(error.code, "E_SERVICE_GONE");
     }
 
+    /// Backing heads for the audio provider fixtures (CTX-1196,
+    /// bitty#2009/#2013): read and control are different heads so read
+    /// works ungranted-control.
+    const AUDIO_STATE_HEAD: &str = "audio.state.read";
+    const AUDIO_CONTROL_HEAD: &str = "audio.state.control";
+    const AUDIO_SPECTRUM_HEAD: &str = "audio.spectrum";
+
+    fn audio_host(granted: &[&str]) -> (Rc<RefCell<ServiceDirectory>>, PluginServices) {
+        let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
+        let host = services();
+        host.set_service_directory(directory.clone());
+        host.set_service_manifest(
+            vec![
+                ProvidedService {
+                    iface: "audio.state".to_string(),
+                    version: "1.0.0".to_string(),
+                    args_schema: None,
+                    result_schema: None,
+                    heads: vec![AUDIO_STATE_HEAD.to_string()],
+                },
+                ProvidedService {
+                    iface: "audio.control".to_string(),
+                    version: "1.0.0".to_string(),
+                    args_schema: None,
+                    result_schema: None,
+                    heads: vec![AUDIO_CONTROL_HEAD.to_string()],
+                },
+                ProvidedService {
+                    iface: "audio.spectrum".to_string(),
+                    version: "1.0.0".to_string(),
+                    args_schema: None,
+                    result_schema: None,
+                    heads: vec![AUDIO_SPECTRUM_HEAD.to_string()],
+                },
+            ],
+            vec![
+                ("audio.state".to_string(), ">=1.0".to_string()),
+                ("audio.control".to_string(), ">=1.0".to_string()),
+                ("audio.spectrum".to_string(), ">=1.0".to_string()),
+            ],
+        );
+        host.set_granted_capabilities(granted.iter().map(|head| (*head).to_string()).collect());
+        publish_backed_record(
+            &directory,
+            "xuepoo.audio",
+            1,
+            "audio.state",
+            "1.0.0",
+            &["get"],
+            &[AUDIO_STATE_HEAD],
+        );
+        publish_backed_record(
+            &directory,
+            "xuepoo.audio",
+            1,
+            "audio.control",
+            "1.0.0",
+            &["set_volume", "toggle_mute"],
+            &[AUDIO_CONTROL_HEAD],
+        );
+        publish_backed_record(
+            &directory,
+            "xuepoo.audio",
+            1,
+            "audio.spectrum",
+            "1.0.0",
+            &["spectrum"],
+            &[AUDIO_SPECTRUM_HEAD],
+        );
+        (directory, host)
+    }
+
+    #[test]
+    fn audio_read_resolves_while_control_stays_absent() {
+        // bitty#2013 acceptance: read works ungranted-control. The
+        // consumer holds the read and spectrum heads only.
+        let (_, host) = audio_host(&[AUDIO_STATE_HEAD, AUDIO_SPECTRUM_HEAD]);
+        let route = HostServices::service_resolve(&host, "audio.state", None, false)
+            .expect("read resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.audio");
+        let route = HostServices::service_resolve(&host, "audio.spectrum", None, false)
+            .expect("spectrum resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.audio");
+        // Control without its head fails closed exactly like an absent
+        // service: same code, nil when optional, no head names leaked.
+        let error = HostServices::service_resolve(&host, "audio.control", None, false)
+            .expect_err("ungranted control must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert!(
+            !error.message.contains(AUDIO_CONTROL_HEAD),
+            "denial names no head"
+        );
+        assert_eq!(
+            HostServices::service_resolve(&host, "audio.control", None, true)
+                .expect("optional degrades to nil"),
+            None,
+            "ungranted control resolves nil like an absent service"
+        );
+    }
+
+    #[test]
+    fn audio_control_call_without_head_fails_closed_as_gone() {
+        // bitty#2013 acceptance: control without its head fails closed
+        // (negative test). A pinned-handle call reports `E_SERVICE_GONE`,
+        // indistinguishable from a parked provider.
+        let (_, host) = audio_host(&[AUDIO_STATE_HEAD]);
+        for method in ["set_volume", "toggle_mute"] {
+            let error = HostServices::service_call(
+                &host,
+                "xuepoo.audio",
+                1,
+                "audio.control",
+                "1.0.0",
+                method,
+                &LuaValue::Nil,
+            )
+            .expect_err("ungranted control call must fail closed");
+            assert_eq!(error.code, "E_SERVICE_GONE");
+        }
+    }
+
+    #[test]
+    fn audio_spectrum_ungranted_consume_matches_absent() {
+        // bitty#2009 acceptance: ungranted consume is indistinguishable
+        // from absent (same posture as `bitty.env`).
+        let (_, host) = audio_host(&[]);
+        let error = HostServices::service_resolve(&host, "audio.spectrum", None, false)
+            .expect_err("ungranted spectrum must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(
+            HostServices::service_resolve(&host, "audio.spectrum", None, true)
+                .expect("optional degrades to nil"),
+            None
+        );
+    }
+
     #[test]
     fn narrowing_grant_snapshot_to_empty_fails_closed_without_restart() {
         // A generation's granted-capability snapshot narrowed to empty

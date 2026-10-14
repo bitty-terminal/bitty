@@ -20,6 +20,19 @@
 //! Budgets are deliberately headroom-tight (not exact): a legitimate new
 //! cache must update the named constant AND this gate together, which is
 //! the review tripwire.
+//!
+//! CTX-1216 (issue #2087) attribution note: headed idle RSS also carries
+//! NVIDIA/Vulkan driver-resident pages that no cache cap controls. A
+//! driver upgrade alone (615.71.09 -> 615.78.08) moves ~+35 MB of
+//! driver-resident RSS for the same binary, and the driver's post-device
+//! faulting varies ~50 MB run to run for identical launches (a trivial
+//! headless wgpu device reaches the same resident set as the full
+//! terminal). Headed samples therefore compare ONLY at equal driver
+//! version and equal settle seconds (pinned by `scripts/mem-measure.sh`
+//! into `driver.txt` plus the `DRIVER/ANON/OWNED` split in `summary.txt`);
+//! a genuine bitty regression moves `OWNED_OTHER_KB` or the heap slice of
+//! `ANON_RSS_KB`, never the driver line. The caps below pin exactly the
+//! bitty-owned worst case.
 
 use std::collections::HashMap;
 

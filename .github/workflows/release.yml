@@ -1610,13 +1610,16 @@ jobs:
           fi
           echo "All R2 objects verified against SHA256SUMS"
 
-  # CTX-1056 (#1794): publish the mutable stable version pointer after the
+  # CTX-1056 (#1794): publish the mutable stable install pointers after the
   # immutable mirror verifies. latest.txt holds TAG (for example v0.0.23) with
   # a trailing newline; install.sh/install.ps1 resolve TAG here, then derive
   # VERSION by stripping the leading v. Short cache-control bounds staleness;
-  # scripts re-fetch every run. install.sh/install.ps1 uploads join this job
-  # when CTX-1047 Phase 2 lands the scripts; their keys and cache policy are
-  # reserved in packaging/README.md so Phase 2 changes no convention.
+  # scripts re-fetch every run. install.sh/install.ps1 upload in this job too
+  # (CTX-1210 #1847): the scripts landed in CTX-1047 Phase 2 and their keys
+  # and cache policy were reserved in packaging/README.md; this wires the two
+  # puts plus read-back verify with no convention change. The monotonic guard
+  # covers the scripts as well: an older tag finishing later must not regress
+  # the stable scripts, so the skip path leaves them untouched.
   r2-stable:
     name: Publish R2 stable pointers
     needs: r2-mirror
@@ -1678,6 +1681,40 @@ jobs:
           wrangler r2 object put "bitty/install/latest.txt" \
             --file latest.txt --remote \
             --cache-control "public, max-age=300, must-revalidate"
+      # CTX-1210 (#1847): publish the stable bootstrap scripts alongside
+      # latest.txt. Keys and cache policy are the ones reserved in
+      # packaging/README.md (mutable stable class, 5-minute bound). The
+      # sources are the tag's own scripts/install.sh + scripts/install.ps1
+      # (this job checks out the tag), so the stable scripts always match a
+      # TAG that latest.txt can point at. The skip path leaves both keys
+      # untouched: an older tag finishing later must not regress them.
+      - name: Publish install scripts to R2
+        run: |
+          set -euo pipefail
+          if [ -f stable.skip ]; then
+            echo "candidate older than stored pointer; skipping install-script upload"
+            exit 0
+          fi
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN is not set; cannot publish install scripts" >&2
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID is not set; cannot publish install scripts" >&2
+            exit 1
+          fi
+          for SCRIPT in install.sh install.ps1; do
+            if [ ! -f "scripts/${SCRIPT}" ]; then
+              echo "::error::missing install script: scripts/${SCRIPT}" >&2
+              exit 1
+            fi
+          done
+          wrangler r2 object put "bitty/install/install.sh" \
+            --file scripts/install.sh --remote \
+            --cache-control "public, max-age=300, must-revalidate"
+          wrangler r2 object put "bitty/install/install.ps1" \
+            --file scripts/install.ps1 --remote \
+            --cache-control "public, max-age=300, must-revalidate"
       - name: Verify latest.txt read-back
         run: |
           set -euo pipefail
@@ -1692,5 +1729,28 @@ jobs:
             echo "verified latest.txt (byte-identical)"
           else
             echo "::error::R2 content mismatch for latest.txt"
+            exit 1
+          fi
+      # CTX-1210 (#1847): read-back-verify the stable scripts byte-identical
+      # to the tag's sources, mirroring the latest.txt verify above. The skip
+      # path verifies nothing: the retained scripts are not in this tree, and
+      # the publish step left the keys untouched.
+      - name: Verify install scripts read-back
+        run: |
+          set -euo pipefail
+          if [ -f stable.skip ]; then
+            echo "stable pointer retained; install scripts untouched, nothing to verify"
+            exit 0
+          fi
+          if wrangler r2 object get "bitty/install/install.sh" --remote --pipe | cmp - scripts/install.sh; then
+            echo "verified install.sh (byte-identical)"
+          else
+            echo "::error::R2 content mismatch for install.sh"
+            exit 1
+          fi
+          if wrangler r2 object get "bitty/install/install.ps1" --remote --pipe | cmp - scripts/install.ps1; then
+            echo "verified install.ps1 (byte-identical)"
+          else
+            echo "::error::R2 content mismatch for install.ps1"
             exit 1
           fi

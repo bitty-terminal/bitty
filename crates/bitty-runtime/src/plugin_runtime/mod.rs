@@ -21,6 +21,7 @@
 //! development packages are read-only, re-digested, and visibly unverified.
 //! The numeric bounds below are the RFC's ratified defaults.
 
+pub mod audio;
 pub mod debug;
 pub mod device_providers;
 pub mod fs;

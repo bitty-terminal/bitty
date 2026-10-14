@@ -152,6 +152,22 @@ pub const UI_CLICK_MAX_ARG_BYTES: usize = 256;
 /// Maximum theme token name length (CTX-0890).
 pub const UI_MAX_THEME_TOKEN_BYTES: usize = 32;
 
+/// Argument name the host injects beside the declared scroll args at
+/// dispatch (CTX-1190, issue #2008).
+///
+/// A wheel over an `on_scroll` node invokes the declared command with the
+/// declared args plus `delta`: the host-computed signed line step
+/// (direction x lines, positive for wheel-up), so the plugin only ever sees
+/// a bounded number. A declared `delta` entry is overwritten, never merged.
+pub const UI_SCROLL_DELTA_ARG: &str = "delta";
+
+/// Saturation bound for a coalesced host-computed scroll delta (CTX-1190).
+///
+/// Wheel bursts sum relative ticks; the sum saturates here so a burst that
+/// outlives one poll window can never bank unbounded drift into a single
+/// dispatch. Large enough to never clip legitimate gestures.
+pub const UI_SCROLL_DELTA_SATURATE: f64 = 4096.0;
+
 /// Marshalling bounds for one raw component value, evaluated before shape
 /// validation. Generous enough for the v1 vocabulary (the scene-node walk
 /// enforces the exact `SCN-1`/`SCN-3` numbers) and tight enough that a
@@ -200,6 +216,15 @@ pub enum UiNode {
         bold: Option<bool>,
         /// Click command binding.
         on_click: Option<ClickCommand>,
+        /// Scroll command binding (CTX-1190, issue #2008).
+        ///
+        /// Same [`ClickCommand`] shape as `on_click`: at dispatch the host
+        /// merges the declared args with the computed
+        /// [`UI_SCROLL_DELTA_ARG`] number (signed lines, positive for
+        /// wheel-up), overwriting a declared entry of the same name. No new
+        /// authority: the binding invokes a registered command through the
+        /// normal dispatch path.
+        on_scroll: Option<ClickCommand>,
     },
     /// Horizontal composition of children.
     Row {
@@ -213,6 +238,8 @@ pub enum UiNode {
         bold: Option<bool>,
         /// Click command binding.
         on_click: Option<ClickCommand>,
+        /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
+        on_scroll: Option<ClickCommand>,
     },
     /// Vertical composition of children.
     Column {
@@ -226,6 +253,8 @@ pub enum UiNode {
         bold: Option<bool>,
         /// Click command binding.
         on_click: Option<ClickCommand>,
+        /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
+        on_scroll: Option<ClickCommand>,
     },
     /// List composition of children.
     List {
@@ -239,6 +268,8 @@ pub enum UiNode {
         bold: Option<bool>,
         /// Click command binding.
         on_click: Option<ClickCommand>,
+        /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
+        on_scroll: Option<ClickCommand>,
     },
 }
 
@@ -252,6 +283,7 @@ impl UiNode {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         }
     }
 
@@ -264,6 +296,7 @@ impl UiNode {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         }
     }
 
@@ -276,6 +309,7 @@ impl UiNode {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         }
     }
 
@@ -288,6 +322,7 @@ impl UiNode {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         }
     }
 
@@ -392,6 +427,7 @@ impl UiNode {
         let bg = extract_theme_token(value, "bg")?;
         let bold = extract_bool_opt(value, "bold")?;
         let on_click = extract_click_command(value)?;
+        let on_scroll = extract_scroll_command(value)?;
 
         match kind {
             "Text" => match value.get("text") {
@@ -401,6 +437,7 @@ impl UiNode {
                     bg,
                     bold,
                     on_click,
+                    on_scroll,
                 }),
                 _ => Err(component_invalid(
                     "Text components require a string text field",
@@ -420,6 +457,7 @@ impl UiNode {
                         bg,
                         bold,
                         on_click,
+                        on_scroll,
                     },
                     "Column" => Self::Column {
                         children: nodes,
@@ -427,6 +465,7 @@ impl UiNode {
                         bg,
                         bold,
                         on_click,
+                        on_scroll,
                     },
                     _ => Self::List {
                         children: nodes,
@@ -434,6 +473,7 @@ impl UiNode {
                         bg,
                         bold,
                         on_click,
+                        on_scroll,
                     },
                 })
             }
@@ -530,47 +570,80 @@ fn extract_bool_opt(value: &LuaValue, key: &str) -> Result<Option<bool>, BridgeE
 
 /// Extract optional click command from a Lua table (CTX-0890).
 fn extract_click_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
-    let Some(on_click) = value.get("on_click") else {
+    extract_command_binding(value, "on_click", false)
+}
+
+/// Extract optional scroll command from a Lua table (CTX-1190, issue #2008).
+///
+/// Same [`ClickCommand`] shape as `on_click`. The declared args reserve one
+/// slot for the host-computed [`UI_SCROLL_DELTA_ARG`] merged at dispatch:
+/// a table that is already full without naming `delta` fails closed here so
+/// dispatch can never exceed [`UI_CLICK_MAX_ARGS`].
+fn extract_scroll_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
+    extract_command_binding(value, "on_scroll", true)
+}
+
+/// Extract an optional `{ command, args }` command binding under `key`.
+///
+/// `reserve_delta_slot` caps the declared args one below
+/// [`UI_CLICK_MAX_ARGS`] unless the table already names
+/// [`UI_SCROLL_DELTA_ARG`] (overwritten at dispatch, so no extra slot is
+/// needed). Malformed bindings fail closed with `E_UI_COMPONENT_INVALID`.
+fn extract_command_binding(
+    value: &LuaValue,
+    key: &str,
+    reserve_delta_slot: bool,
+) -> Result<Option<ClickCommand>, BridgeError> {
+    let Some(binding) = value.get(key) else {
         return Ok(None);
     };
-    let LuaValue::Table(_) = on_click else {
-        return Err(component_invalid("on_click must be a table"));
+    let LuaValue::Table(_) = binding else {
+        return Err(component_invalid(format!("{key} must be a table")));
     };
 
-    let command = match on_click.get("command") {
+    let command = match binding.get("command") {
         Some(LuaValue::String(cmd)) => {
             if cmd.is_empty() || cmd.len() > UI_CLICK_MAX_COMMAND_BYTES {
                 return Err(component_invalid(format!(
-                    "on_click.command must be 1-{} bytes",
-                    UI_CLICK_MAX_COMMAND_BYTES
+                    "{key}.command must be 1-{UI_CLICK_MAX_COMMAND_BYTES} bytes",
                 )));
             }
             cmd.clone()
         }
-        Some(_) => return Err(component_invalid("on_click.command must be a string")),
-        None => return Err(component_invalid("on_click.command is required")),
+        Some(_) => return Err(component_invalid(format!("{key}.command must be a string"))),
+        None => return Err(component_invalid(format!("{key}.command is required"))),
     };
 
-    let args = match on_click.get("args") {
+    let args = match binding.get("args") {
         Some(LuaValue::Table(pairs)) => {
-            if pairs.len() > UI_CLICK_MAX_ARGS {
+            let max_args = if reserve_delta_slot
+                && !pairs.iter().any(|(arg_key, _)| {
+                    matches!(arg_key, LuaValue::String(name) if name == UI_SCROLL_DELTA_ARG)
+                }) {
+                UI_CLICK_MAX_ARGS - 1
+            } else {
+                UI_CLICK_MAX_ARGS
+            };
+            if pairs.len() > max_args {
                 return Err(component_invalid(format!(
-                    "on_click.args must have at most {} entries",
-                    UI_CLICK_MAX_ARGS
+                    "{key}.args must have at most {max_args} entries",
                 )));
             }
             let mut result = Vec::with_capacity(pairs.len());
-            for (key, val) in pairs {
-                let key_str = match key {
+            for (arg_key, val) in pairs {
+                let key_str = match arg_key {
                     LuaValue::String(s) => s.clone(),
-                    _ => return Err(component_invalid("on_click.args keys must be strings")),
+                    _ => {
+                        return Err(component_invalid(format!(
+                            "{key}.args keys must be strings"
+                        )));
+                    }
                 };
                 let arg = match val {
                     LuaValue::String(s) => {
                         if s.len() > UI_CLICK_MAX_ARG_BYTES {
                             return Err(component_invalid(format!(
-                                "on_click.args string values must be at most {} bytes",
-                                UI_CLICK_MAX_ARG_BYTES
+                                "{key}.args string values must be at most {UI_CLICK_MAX_ARG_BYTES} bytes",
                             )));
                         }
                         ClickArg::String(s.clone())
@@ -579,16 +652,16 @@ fn extract_click_command(value: &LuaValue) -> Result<Option<ClickCommand>, Bridg
                     LuaValue::Number(n) => ClickArg::Number(*n),
                     LuaValue::Bool(b) => ClickArg::Bool(*b),
                     _ => {
-                        return Err(component_invalid(
-                            "on_click.args values must be string, number, or boolean",
-                        ));
+                        return Err(component_invalid(format!(
+                            "{key}.args values must be string, number, or boolean",
+                        )));
                     }
                 };
                 result.push((key_str, arg));
             }
             result
         }
-        Some(_) => return Err(component_invalid("on_click.args must be a table")),
+        Some(_) => return Err(component_invalid(format!("{key}.args must be a table"))),
         None => Vec::new(),
     };
 
@@ -924,5 +997,195 @@ mod tests {
                 .code,
             "E_UI_COMPONENT_INVALID"
         );
+    }
+
+    fn scroll_table(command: &str) -> LuaValue {
+        LuaValue::table([("command", LuaValue::String(command.to_string()))])
+    }
+
+    #[test]
+    fn scroll_binding_parsed_alongside_click() {
+        // CTX-1190 (#2008): on_scroll mirrors on_click with the same
+        // ClickCommand shape. The repeated-click workaround (on_click
+        // stepping state) keeps parsing unchanged beside it.
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("volume".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("volume.step".to_string())),
+                    ("args", LuaValue::table([("step", LuaValue::Integer(2))])),
+                ]),
+            ),
+            (
+                "on_scroll",
+                LuaValue::table([
+                    ("command", LuaValue::String("volume.scroll".to_string())),
+                    ("args", LuaValue::table([("step", LuaValue::Integer(2))])),
+                ]),
+            ),
+        ]);
+        let node = UiNode::from_lua_value(&value).expect("click and scroll bindings parse");
+        match node {
+            UiNode::Text {
+                on_click,
+                on_scroll,
+                ..
+            } => {
+                let click = on_click.expect("on_click present");
+                assert_eq!(click.command, "volume.step");
+                let scroll = on_scroll.expect("on_scroll present");
+                assert_eq!(scroll.command, "volume.scroll");
+                assert!(scroll.args.iter().any(|(key, value)| key == "step"
+                    && matches!(value, ClickArg::Number(n) if (*n - 2.0).abs() < 0.01)));
+            }
+            _ => panic!("expected Text node"),
+        }
+    }
+
+    #[test]
+    fn scroll_binding_parsed_on_every_container_kind() {
+        for kind in ["Row", "Column", "List"] {
+            let value = LuaValue::table([
+                ("kind", LuaValue::String(kind.to_string())),
+                ("children", LuaValue::array(vec![text("x")])),
+                ("on_scroll", scroll_table("bar.scroll")),
+            ]);
+            let node = UiNode::from_lua_value(&value).expect("container scroll binding parses");
+            let scroll = match &node {
+                UiNode::Row { on_scroll, .. }
+                | UiNode::Column { on_scroll, .. }
+                | UiNode::List { on_scroll, .. } => on_scroll.clone(),
+                UiNode::Text { .. } => panic!("expected container node"),
+            };
+            assert_eq!(
+                scroll.expect("on_scroll present").command,
+                "bar.scroll",
+                "kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_binding_validation_fails_closed() {
+        let text_with = |scroll: LuaValue| {
+            LuaValue::table([
+                ("kind", LuaValue::String("Text".to_string())),
+                ("text", LuaValue::String("text".to_string())),
+                ("on_scroll", scroll),
+            ])
+        };
+        // Non-table binding.
+        assert_eq!(
+            UiNode::from_lua_value(&text_with(LuaValue::String("nope".to_string())))
+                .expect_err("non-table scroll")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // Missing command.
+        assert_eq!(
+            UiNode::from_lua_value(&text_with(LuaValue::table([])))
+                .expect_err("missing command")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // Over-long command.
+        let long_cmd = "a".repeat(UI_CLICK_MAX_COMMAND_BYTES + 1);
+        assert_eq!(
+            UiNode::from_lua_value(&text_with(scroll_table(&long_cmd)))
+                .expect_err("command too long")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // Non-scalar arg value.
+        assert_eq!(
+            UiNode::from_lua_value(&text_with(LuaValue::table([
+                ("command", LuaValue::String("cmd".to_string())),
+                (
+                    "args",
+                    LuaValue::table([("key", LuaValue::array(vec![text("nested")]),)]),
+                ),
+            ])))
+            .expect_err("table arg value")
+            .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // Oversize string arg.
+        let long_val = "a".repeat(UI_CLICK_MAX_ARG_BYTES + 1);
+        assert_eq!(
+            UiNode::from_lua_value(&text_with(LuaValue::table([
+                ("command", LuaValue::String("cmd".to_string())),
+                (
+                    "args",
+                    LuaValue::table([("key", LuaValue::String(long_val))]),
+                ),
+            ])))
+            .expect_err("arg too long")
+            .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+    }
+
+    #[test]
+    fn scroll_args_reserve_one_slot_for_the_host_delta() {
+        // CTX-1190 (#2008): dispatch merges the host-computed delta beside
+        // the declared args, so a full table without a delta key fails at
+        // parse; one that already names delta fits exactly.
+        let full_args: Vec<(LuaValue, LuaValue)> = (0..UI_CLICK_MAX_ARGS)
+            .map(|index| {
+                (
+                    LuaValue::String(format!("arg{index}")),
+                    LuaValue::String("val".to_string()),
+                )
+            })
+            .collect();
+        let full = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            (
+                "on_scroll",
+                LuaValue::table([
+                    ("command", LuaValue::String("cmd".to_string())),
+                    ("args", LuaValue::Table(full_args)),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&full)
+                .expect_err("full args without delta key")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        let mut with_delta: Vec<(LuaValue, LuaValue)> = (0..UI_CLICK_MAX_ARGS - 1)
+            .map(|index| {
+                (
+                    LuaValue::String(format!("arg{index}")),
+                    LuaValue::String("val".to_string()),
+                )
+            })
+            .collect();
+        with_delta.push((LuaValue::String("delta".to_string()), LuaValue::Integer(1)));
+        let fitting = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("text".to_string())),
+            (
+                "on_scroll",
+                LuaValue::table([
+                    ("command", LuaValue::String("cmd".to_string())),
+                    ("args", LuaValue::Table(with_delta)),
+                ]),
+            ),
+        ]);
+        let node = UiNode::from_lua_value(&fitting).expect("delta-named full table fits");
+        match node {
+            UiNode::Text { on_scroll, .. } => {
+                assert_eq!(
+                    on_scroll.expect("on_scroll present").args.len(),
+                    UI_CLICK_MAX_ARGS
+                );
+            }
+            _ => panic!("expected Text node"),
+        }
     }
 }

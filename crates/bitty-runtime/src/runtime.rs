@@ -875,6 +875,11 @@ pub struct Runtime {
     /// (CTX-0946 C1). Bounded by
     /// [`BAND_CLICK_QUEUE_MAX`](self::band_host::BAND_CLICK_QUEUE_MAX).
     band_click_queue: Vec<band_host::BandClickRequest>,
+    /// Queued Core-routed band scrolls awaiting application dispatch
+    /// (CTX-1190, issue #2008). Bounded by
+    /// [`BAND_SCROLL_QUEUE_MAX`](self::band_host::BAND_SCROLL_QUEUE_MAX);
+    /// consecutive ticks for one target coalesce into one slot.
+    band_scroll_queue: Vec<band_host::BandScrollRequest>,
     /// Press-side band target armed by the last consumed band press
     /// (CTX-0946 C1 review: standard button semantics — the paired release
     /// routes only onto the same band run). `None` when no band press owns
@@ -1636,6 +1641,7 @@ impl Runtime {
             last_cursor: None,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
+            band_scroll_queue: Vec::new(),
             band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
@@ -1897,6 +1903,7 @@ impl Runtime {
             last_cursor: None,
             band_release_swallow: false,
             band_click_queue: Vec::new(),
+            band_scroll_queue: Vec::new(),
             band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),

@@ -646,7 +646,7 @@ const UI_LABELS_ASSIGN_MAX: usize = 1024;
 pub struct OverlayInput {
     /// Monotonic per-capture sequence number (diagnostics for dropped gaps).
     pub sequence: u64,
-    /// Event class: `key`, `text`, `ime`, or `pointer`.
+    /// Event class: `key`, `text`, `ime`, `pointer`, or `wheel` (CTX-1190).
     pub kind: String,
     /// Bounded UTF-8 payload.
     pub text: String,
@@ -1839,9 +1839,9 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
 
 /// Marshal captured overlay input events into the bounded Lua array shape
 /// (CTX-0941, accepted W-01 envelope). Each event is `{ seq, type, text }`
-/// with the decided `key`, `text`, `pointer`, and `paste` tags (plus the
-/// mechanism-internal `ime` class, observed as committed text). The host
-/// already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and bounded
+/// with the decided `key`, `text`, `pointer`, `wheel` (CTX-1190), and
+/// `paste` tags (plus the mechanism-internal `ime` class, observed as
+/// committed text). The host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and bounded
 /// each text payload.
 fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
     LuaValue::array(

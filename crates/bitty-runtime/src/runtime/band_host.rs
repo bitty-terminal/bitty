@@ -47,7 +47,7 @@
 use super::band_slots::BandEdge;
 use super::{BandContent, Runtime};
 use bitty_lua::host::LuaValue;
-use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiSlot};
+use bitty_lua::ui::{ClickArg, ClickCommand, UI_SCROLL_DELTA_ARG, UiNode, UiSlot};
 use bitty_platform::CursorPosition;
 use bitty_render::grid::{Rgba8, ThemePalette};
 
@@ -57,6 +57,15 @@ use bitty_render::grid::{Rgba8, ThemePalette};
 /// the application has not drained yet. Overflow drops the newest request
 /// fail-closed and counts [`BandHostStats::queue_drops`].
 pub const BAND_CLICK_QUEUE_MAX: usize = 8;
+
+/// Maximum queued band scroll requests (CTX-1190, issue #2008).
+///
+/// Wheel ticks are user-paced but burst harder than clicks; consecutive
+/// ticks for one target coalesce into a single slot (see
+/// [`Runtime::queue_band_scroll`]), so the queue holds one frame of scrolls
+/// the application has not drained yet. Overflow drops the newest request
+/// fail-closed and counts [`BandHostStats::scroll_queue_drops`].
+pub const BAND_SCROLL_QUEUE_MAX: usize = 8;
 
 /// ANSI index resolving the `accent` band token (CTX-0946 C2).
 ///
@@ -72,10 +81,10 @@ pub const BAND_ACCENT_ANSI_INDEX: u8 = 12;
 ///
 /// Columns count display cells ([`char_cell_width`](bitty_term_state::char_cell_width)),
 /// so the hit-test and the paint path agree on which span owns a pointer
-/// column. A container's (`Row`/`Column`/`List`) `fg`/`bg`/`bold`/`on_click`
-/// applies to descendant spans that do not declare their own (nearest
-/// declaration wins); a `Text` leaf's own declaration always wins for its
-/// span.
+/// column. A container's (`Row`/`Column`/`List`) `fg`/`bg`/`bold`/`on_click`/
+/// `on_scroll` applies to descendant spans that do not declare their own
+/// (nearest declaration wins); a `Text` leaf's own declaration always wins
+/// for its span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BandRun {
     /// First display-cell column of the span (inclusive).
@@ -94,6 +103,8 @@ pub struct BandRun {
     pub bold: bool,
     /// Click binding effective for the span, if any.
     pub on_click: Option<ClickCommand>,
+    /// Scroll binding effective for the span, if any (CTX-1190, #2008).
+    pub on_scroll: Option<ClickCommand>,
 }
 
 /// Flattens a band tree into its full text plus styled runs (CTX-0946).
@@ -106,7 +117,7 @@ pub struct BandRun {
 pub fn flatten_band_runs(root: &UiNode) -> (String, Vec<BandRun>) {
     let mut text = String::new();
     let mut runs = Vec::new();
-    flatten_into(root, &mut text, &mut runs, None, None, None, false);
+    flatten_into(root, &mut text, &mut runs, None, None, None, None, false);
     (text, runs)
 }
 
@@ -118,6 +129,7 @@ fn flatten_into(
     fg: Option<String>,
     bg: Option<String>,
     on_click: Option<ClickCommand>,
+    on_scroll: Option<ClickCommand>,
     bold: bool,
 ) {
     match node {
@@ -127,6 +139,7 @@ fn flatten_into(
             bg: leaf_bg,
             bold: leaf_bold,
             on_click: leaf_click,
+            on_scroll: leaf_scroll,
         } => {
             let start = display_cells(text);
             let start_char = text.chars().count();
@@ -140,6 +153,7 @@ fn flatten_into(
                 bg: leaf_bg.clone().or(bg),
                 bold: leaf_bold.unwrap_or(bold),
                 on_click: leaf_click.clone().or(on_click),
+                on_scroll: leaf_scroll.clone().or(on_scroll),
             });
         }
         UiNode::Row {
@@ -148,6 +162,7 @@ fn flatten_into(
             bg: row_bg,
             bold: row_bold,
             on_click: row_click,
+            on_scroll: row_scroll,
         }
         | UiNode::Column {
             children,
@@ -155,6 +170,7 @@ fn flatten_into(
             bg: row_bg,
             bold: row_bold,
             on_click: row_click,
+            on_scroll: row_scroll,
         }
         | UiNode::List {
             children,
@@ -162,11 +178,13 @@ fn flatten_into(
             bg: row_bg,
             bold: row_bold,
             on_click: row_click,
+            on_scroll: row_scroll,
         } => {
             let fg = row_fg.clone().or(fg);
             let bg = row_bg.clone().or(bg);
             let bold = row_bold.unwrap_or(bold);
             let on_click = row_click.clone().or(on_click);
+            let on_scroll = row_scroll.clone().or(on_scroll);
             for child in children {
                 flatten_into(
                     child,
@@ -175,6 +193,7 @@ fn flatten_into(
                     fg.clone(),
                     bg.clone(),
                     on_click.clone(),
+                    on_scroll.clone(),
                     bold,
                 );
             }
@@ -324,6 +343,106 @@ pub fn find_run_index(runs: &[BandRun], char_idx: usize) -> Option<usize> {
         .position(|run| char_idx >= run.start_col && char_idx < run.end_col)
 }
 
+/// One Core-routed band scroll: owner, verb, declared args, and the
+/// host-computed line step (CTX-1190, issue #2008).
+///
+/// Like [`BandClickRequest`] the plugin never sees pointer coordinates —
+/// only this declared triple plus `delta`, dispatched by the application
+/// through `PluginRuntime::dispatch_command`, whose registration and
+/// capability gates fail closed as usual. `delta` is the signed wheel step
+/// (direction x lines, positive for wheel-up); the dispatch table carries it
+/// under [`UI_SCROLL_DELTA_ARG`](bitty_lua::ui::UI_SCROLL_DELTA_ARG),
+/// overwriting a declared entry of the same name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandScrollRequest {
+    /// Owning plugin id (the band that was hit).
+    pub plugin_id: String,
+    /// Command verb, unqualified (`scroll`, never `other-plugin:verb`).
+    pub command: String,
+    /// Declared `on_scroll.args` in declaration order.
+    pub args: Vec<(String, ClickArg)>,
+    /// Host-computed signed line step for this request.
+    pub delta: i32,
+}
+
+/// Converts declared scroll args plus the host-computed delta to the single
+/// Lua table arg (CTX-1190, issue #2008).
+///
+/// Mirrors [`band_click_args_table`]: `dispatch_command` takes positional
+/// args; a scroll carries one named table (`run({id = 3, delta = 1})`),
+/// preserving declaration order with `delta` merged last. A declared
+/// `delta` entry is overwritten by the host value, never duplicated.
+#[must_use]
+pub fn band_scroll_args_table(args: &[(String, ClickArg)], delta: i32) -> LuaValue {
+    let mut table: Vec<(LuaValue, LuaValue)> = args
+        .iter()
+        .filter(|(key, _)| key != UI_SCROLL_DELTA_ARG)
+        .map(|(key, value)| {
+            let value = match value {
+                ClickArg::String(text) => LuaValue::String(text.clone()),
+                ClickArg::Number(number) => LuaValue::Number(*number),
+                ClickArg::Bool(flag) => LuaValue::Bool(*flag),
+            };
+            (LuaValue::String(key.clone()), value)
+        })
+        .collect();
+    table.push((
+        LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
+        LuaValue::Number(f64::from(delta)),
+    ));
+    LuaValue::Table(table)
+}
+
+/// Outcome of resolving a wheel column inside one band (CTX-1190, #2008).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BandScrollOutcome {
+    /// A scroll-bound span: queue the owner's declared command.
+    Hit(BandScrollTarget),
+    /// No span binds scroll at the column: route nothing.
+    NoClaim,
+    /// The binding is unroutable (foreign qualifier, empty verb): deny loudly.
+    Denied,
+}
+
+/// A resolved scroll target: owner, verb, and declared args (CTX-1190).
+///
+/// The host-computed `delta` joins at queue time, so resolution stays pure
+/// over one band and headless tests need no wheel state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandScrollTarget {
+    /// Owning plugin id (the band that was hit).
+    pub plugin_id: String,
+    /// Command verb, unqualified.
+    pub command: String,
+    /// Declared `on_scroll.args` in declaration order.
+    pub args: Vec<(String, ClickArg)>,
+}
+
+/// Resolves a flattened-text column into its scroll outcome (CTX-1190).
+///
+/// Pure over one band: finds the run owning `char_idx` (display-cell
+/// column) and splits its `on_scroll` command against `owner`, mirroring
+/// [`resolve_click_in_band`]. Geometry (which band owns the row) lives on
+/// [`Runtime::plugin_band_hit`]; the wheel step joins in
+/// [`Runtime::band_scroll`].
+#[must_use]
+pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> BandScrollOutcome {
+    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
+        return BandScrollOutcome::NoClaim;
+    };
+    let Some(scroll) = run.on_scroll.as_ref() else {
+        return BandScrollOutcome::NoClaim;
+    };
+    let Some(verb) = split_band_command(&scroll.command, owner) else {
+        return BandScrollOutcome::Denied;
+    };
+    BandScrollOutcome::Hit(BandScrollTarget {
+        plugin_id: owner.to_string(),
+        command: verb,
+        args: scroll.args.clone(),
+    })
+}
+
 /// Press-side band target stored by [`Runtime::band_press`] (CTX-0946 C1).
 ///
 /// Standard button semantics: a release routes only onto the same target
@@ -343,6 +462,24 @@ pub(super) enum PressedBandTarget {
     /// The press landed on an unclaimed span or past the text.
     NoClaim,
     /// The press landed on an unroutable claim (foreign qualifier, ...).
+    Denied,
+}
+
+/// Cursor-side band scroll classification behind [`Runtime::band_scroll`]
+/// (CTX-1190, issue #2008).
+///
+/// A wheel is a single event (no press arming), so resolution maps straight
+/// onto the consume/fall-through decision: only `Hit` consumes the tick.
+#[derive(Debug, Clone, PartialEq)]
+enum ScrollTargetOutcome {
+    /// A scroll-bound span: queue the target with the tick's delta.
+    Hit(BandScrollTarget),
+    /// Off every band row (or no cursor): fall through silently.
+    OffBand,
+    /// On a band row but past the text or on a span without `on_scroll`:
+    /// fall through, counted.
+    Unclaimed,
+    /// On a span with an unroutable scroll binding: fall through, counted.
     Denied,
 }
 
@@ -379,6 +516,16 @@ pub struct BandHostStats {
     pub unknown_tokens: u64,
     /// Click requests dropped on a full drain queue.
     pub queue_drops: u64,
+    /// Scrolls routed to the drain queue (CTX-1190, issue #2008).
+    pub scrolls_routed: u64,
+    /// Wheel ticks merged into the trailing queued scroll (CTX-1190).
+    pub scrolls_coalesced: u64,
+    /// Scrolls denied (foreign qualifier, malformed command) (CTX-1190).
+    pub scrolls_denied: u64,
+    /// Wheels on band rows with no scroll binding (CTX-1190).
+    pub scrolls_unclaimed: u64,
+    /// Scroll requests dropped on a full drain queue (CTX-1190).
+    pub scroll_queue_drops: u64,
 }
 
 /// A resolved band hit: which visible band, and which text column.
@@ -782,6 +929,120 @@ impl Runtime {
         std::mem::take(&mut self.band_click_queue)
     }
 
+    /// Routes a wheel tick over a plugin band row into the scroll drain
+    /// queue (CTX-1190, issue #2008).
+    ///
+    /// Returns `true` (consume the tick: no viewport scroll, no mouse
+    /// report, no alt-scroll keys) when the last-known cursor sits on a
+    /// painted band row whose resolved span carries `on_scroll`. The queued
+    /// request carries the host-computed `delta` (signed lines, positive for
+    /// wheel-up); consecutive ticks for one target coalesce into a single
+    /// slot with saturating math, so a burst costs one dispatch.
+    ///
+    /// Returns `false` (fall through to the viewport/capture/alt paths
+    /// unchanged) for a zero step, an unknown cursor, an off-band cursor,
+    /// or a row/span without a routable scroll binding — unbound nodes keep
+    /// today's behavior with no regression. Denied and unclaimed wheels are
+    /// counted in [`BandHostStats`] either way.
+    pub(super) fn band_scroll(&mut self, delta: i32) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let outcome = self.scroll_target_at_cursor();
+        match outcome {
+            ScrollTargetOutcome::Hit(target) => {
+                self.queue_band_scroll(BandScrollRequest {
+                    plugin_id: target.plugin_id,
+                    command: target.command,
+                    args: target.args,
+                    delta,
+                });
+                true
+            }
+            ScrollTargetOutcome::Denied => {
+                self.band_stats.scrolls_denied = self.band_stats.scrolls_denied.saturating_add(1);
+                false
+            }
+            ScrollTargetOutcome::Unclaimed => {
+                self.band_stats.scrolls_unclaimed =
+                    self.band_stats.scrolls_unclaimed.saturating_add(1);
+                false
+            }
+            ScrollTargetOutcome::OffBand => false,
+        }
+    }
+
+    /// Resolves the cursor's band scroll target without mutating state.
+    ///
+    /// Pure classification behind [`Self::band_scroll`]: off-band (fall
+    /// through silently), unclaimed (fall through, counted), denied (fall
+    /// through, counted), or a resolved hit.
+    fn scroll_target_at_cursor(&self) -> ScrollTargetOutcome {
+        let Some(pos) = self.last_cursor else {
+            return ScrollTargetOutcome::OffBand;
+        };
+        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+            return ScrollTargetOutcome::OffBand;
+        };
+        let bands = self.visible_edge_bands(row_hit.edge);
+        let Some(band) = bands.get(row_hit.visible_index) else {
+            return ScrollTargetOutcome::Unclaimed;
+        };
+        let owner = band.plugin_id.clone();
+        let (_, runs) = flatten_band_runs(&band.root);
+        let Some(hit) = self.plugin_band_hit(pos) else {
+            return ScrollTargetOutcome::Unclaimed;
+        };
+        match resolve_scroll_in_band(&owner, &runs, hit.char_idx) {
+            BandScrollOutcome::Hit(target) => ScrollTargetOutcome::Hit(target),
+            BandScrollOutcome::Denied => ScrollTargetOutcome::Denied,
+            BandScrollOutcome::NoClaim => ScrollTargetOutcome::Unclaimed,
+        }
+    }
+
+    /// Queues one resolved band scroll for application dispatch (CTX-1190).
+    ///
+    /// Consecutive requests for one target (same plugin, verb, and declared
+    /// args) coalesce: the deltas sum with saturating math into the trailing
+    /// slot and count [`BandHostStats::scrolls_coalesced`], so a 100-tick
+    /// frame drains as one dispatch with a bounded step — never a VM-budget
+    /// overrun. A full queue drops the newest request fail-closed and counts
+    /// [`BandHostStats::scroll_queue_drops`].
+    pub(super) fn queue_band_scroll(&mut self, request: BandScrollRequest) {
+        if request.delta == 0 {
+            return;
+        }
+        if let Some(back) = self.band_scroll_queue.last_mut() {
+            if back.plugin_id == request.plugin_id
+                && back.command == request.command
+                && back.args == request.args
+            {
+                back.delta = back.delta.saturating_add(request.delta);
+                self.band_stats.scrolls_coalesced =
+                    self.band_stats.scrolls_coalesced.saturating_add(1);
+                return;
+            }
+        }
+        if self.band_scroll_queue.len() >= BAND_SCROLL_QUEUE_MAX {
+            self.band_stats.scroll_queue_drops =
+                self.band_stats.scroll_queue_drops.saturating_add(1);
+        } else {
+            self.band_scroll_queue.push(request);
+            self.band_stats.scrolls_routed = self.band_stats.scrolls_routed.saturating_add(1);
+        }
+    }
+
+    /// Drains queued band scroll requests for application dispatch (CTX-1190).
+    ///
+    /// The application dispatches each through
+    /// `PluginRuntime::dispatch_command` with the declared args plus the
+    /// host-computed `delta` (see [`band_scroll_args_table`]); the runtime
+    /// never touches a VM. Order is tick order modulo coalescing; the queue
+    /// is empty in the common case.
+    pub fn drain_band_scrolls(&mut self) -> Vec<BandScrollRequest> {
+        std::mem::take(&mut self.band_scroll_queue)
+    }
+
     /// Whether a band-consumed press still owns its release.
     #[must_use]
     pub fn band_release_armed(&self) -> bool {
@@ -847,6 +1108,7 @@ mod tests {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         }
     }
 
@@ -859,6 +1121,21 @@ mod tests {
             on_click: Some(ClickCommand {
                 command: command.to_string(),
                 args: vec![("id".to_string(), ClickArg::Number(3.0))],
+            }),
+            on_scroll: None,
+        }
+    }
+
+    fn scroll_node(text: &str, command: &str) -> UiNode {
+        UiNode::Text {
+            text: text.to_string(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: Some(ClickCommand {
+                command: command.to_string(),
+                args: vec![("step".to_string(), ClickArg::Number(2.0))],
             }),
         }
     }
@@ -888,6 +1165,7 @@ mod tests {
             bg: None,
             bold: Some(true),
             on_click: Some(click.clone()),
+            on_scroll: None,
         };
         let (_, runs) = flatten_band_runs(&root);
         assert_eq!(runs.len(), 1);
@@ -905,15 +1183,185 @@ mod tests {
                 bg: None,
                 bold: Some(false),
                 on_click: None,
+                on_scroll: None,
             }],
             fg: Some("accent".to_string()),
             bg: None,
             bold: Some(true),
             on_click: None,
+            on_scroll: None,
         };
         let (_, runs) = flatten_band_runs(&root);
         assert_eq!(runs[0].fg.as_deref(), Some("foreground"));
         assert!(!runs[0].bold);
+    }
+
+    #[test]
+    fn flatten_carries_scroll_with_nearest_wins() {
+        // CTX-1190 (#2008): on_scroll inherits exactly like on_click —
+        // container bindings cover bare descendants, leaf bindings win.
+        let scroll = ClickCommand {
+            command: "owner:scroll".to_string(),
+            args: Vec::new(),
+        };
+        let root = UiNode::Row {
+            children: vec![text_node("x"), scroll_node("y", "owner:leaf")],
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: Some(scroll.clone()),
+        };
+        let (_, runs) = flatten_band_runs(&root);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].on_scroll, Some(scroll));
+        assert_eq!(
+            runs[1].on_scroll.as_ref().expect("leaf scroll").command,
+            "owner:leaf"
+        );
+        // Click bindings are untouched by the scroll inheritance.
+        assert_eq!(runs[0].on_click, None);
+        assert_eq!(runs[1].on_click, None);
+    }
+
+    #[test]
+    fn resolve_scroll_hit_no_claim_denied() {
+        // CTX-1190 (#2008): scroll resolution mirrors click resolution —
+        // bound spans hit, bare spans claim nothing, foreign qualifiers deny.
+        let (_, runs) = flatten_band_runs(&UiNode::row(vec![
+            text_node("ab"),
+            scroll_node("cd", "test-bar:scroll"),
+            UiNode::Text {
+                text: "ef".to_string(),
+                fg: None,
+                bg: None,
+                bold: None,
+                on_click: None,
+                on_scroll: Some(ClickCommand {
+                    command: "other-plugin:scroll".to_string(),
+                    args: Vec::new(),
+                }),
+            },
+        ]));
+        assert!(matches!(
+            resolve_scroll_in_band("test-bar", &runs, 0),
+            BandScrollOutcome::NoClaim
+        ));
+        match resolve_scroll_in_band("test-bar", &runs, 2) {
+            BandScrollOutcome::Hit(target) => {
+                assert_eq!(target.plugin_id, "test-bar");
+                assert_eq!(target.command, "scroll");
+                assert_eq!(
+                    target.args,
+                    vec![("step".to_string(), ClickArg::Number(2.0))]
+                );
+            }
+            outcome => panic!("expected scroll hit, got {outcome:?}"),
+        }
+        assert!(matches!(
+            resolve_scroll_in_band("test-bar", &runs, 4),
+            BandScrollOutcome::Denied
+        ));
+        assert!(matches!(
+            resolve_scroll_in_band("test-bar", &runs, 99),
+            BandScrollOutcome::NoClaim
+        ));
+    }
+
+    #[test]
+    fn scroll_args_table_merges_delta_last() {
+        // CTX-1190 (#2008): dispatch carries declared args in order plus
+        // the host delta; a declared delta is overwritten, never duplicated.
+        let table = band_scroll_args_table(
+            &[
+                ("id".to_string(), ClickArg::String("vol".to_string())),
+                ("delta".to_string(), ClickArg::Number(99.0)),
+            ],
+            -3,
+        );
+        let LuaValue::Table(pairs) = table else {
+            panic!("scroll args must marshal as a table");
+        };
+        assert_eq!(pairs.len(), 2, "declared delta is replaced, not doubled");
+        assert_eq!(
+            pairs[0],
+            (
+                LuaValue::String("id".to_string()),
+                LuaValue::String("vol".to_string())
+            )
+        );
+        assert_eq!(
+            pairs[1],
+            (
+                LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
+                LuaValue::Number(-3.0)
+            )
+        );
+    }
+
+    #[test]
+    fn scroll_queue_coalesces_bursts_and_drops_overflow() {
+        // CTX-1190 (#2008) burst acceptance at the queue level: consecutive
+        // ticks for one target merge with saturating math; distinct targets
+        // queue apart; overflow drops the newest and counts it.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let target = || BandScrollRequest {
+            plugin_id: "test-bar".to_string(),
+            command: "scroll".to_string(),
+            args: vec![("step".to_string(), ClickArg::Number(2.0))],
+            delta: 3,
+        };
+        for _ in 0..100 {
+            rt.queue_band_scroll(target());
+        }
+        assert_eq!(
+            rt.drain_band_scrolls().len(),
+            1,
+            "a 100-tick burst drains as one request"
+        );
+        let stats = rt.band_host_stats();
+        assert_eq!(stats.scrolls_coalesced, 99);
+        assert_eq!(stats.scrolls_routed, 1);
+        assert_eq!(stats.scroll_queue_drops, 0);
+        // Saturating math: no burst can overflow the step.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        rt.queue_band_scroll(BandScrollRequest {
+            delta: i32::MAX,
+            ..target()
+        });
+        rt.queue_band_scroll(target());
+        let drained = rt.drain_band_scrolls();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].delta, i32::MAX, "delta saturates, never wraps");
+        // Distinct targets queue apart; overflow drops the newest.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        for index in 0..BAND_SCROLL_QUEUE_MAX {
+            rt.queue_band_scroll(BandScrollRequest {
+                command: format!("scroll-{index}"),
+                ..target()
+            });
+        }
+        rt.queue_band_scroll(BandScrollRequest {
+            command: "scroll-overflow".to_string(),
+            ..target()
+        });
+        let drained = rt.drain_band_scrolls();
+        assert_eq!(drained.len(), BAND_SCROLL_QUEUE_MAX);
+        assert!(
+            drained
+                .iter()
+                .all(|request| request.command != "scroll-overflow"),
+            "overflow drops the newest request"
+        );
+        assert_eq!(rt.band_host_stats().scroll_queue_drops, 1);
+        // A zero step never queues.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        rt.queue_band_scroll(BandScrollRequest {
+            delta: 0,
+            ..target()
+        });
+        assert!(rt.drain_band_scrolls().is_empty());
+        assert_eq!(rt.band_host_stats().scrolls_routed, 0);
     }
 
     #[test]

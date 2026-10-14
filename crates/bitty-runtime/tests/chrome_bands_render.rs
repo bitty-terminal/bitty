@@ -33,6 +33,7 @@ fn single_top_band_with_text_node() {
         bg: Some("background".to_string()),
         bold: Some(false),
         on_click: None,
+        on_scroll: None,
     };
 
     let band = BandContent {
@@ -67,6 +68,7 @@ fn multiple_top_bands_stack_vertically() {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     };
@@ -80,6 +82,7 @@ fn multiple_top_bands_stack_vertically() {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     };
@@ -108,6 +111,7 @@ fn bottom_band_renders_at_window_bottom() {
             bg: Some("background".to_string()),
             bold: Some(false),
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     };
@@ -135,6 +139,7 @@ fn row_node_concatenates_children() {
                 bg: None,
                 bold: None,
                 on_click: None,
+                on_scroll: None,
             },
             UiNode::Text {
                 text: "Part 2".to_string(),
@@ -142,12 +147,14 @@ fn row_node_concatenates_children() {
                 bg: None,
                 bold: None,
                 on_click: None,
+                on_scroll: None,
             },
         ],
         fg: None,
         bg: None,
         bold: None,
         on_click: None,
+        on_scroll: None,
     };
 
     let band = BandContent {
@@ -180,6 +187,7 @@ fn list_node_children_concatenate() {
                 bg: None,
                 bold: None,
                 on_click: None,
+                on_scroll: None,
             },
             UiNode::Text {
                 text: "Item 2".to_string(),
@@ -187,12 +195,14 @@ fn list_node_children_concatenate() {
                 bg: None,
                 bold: None,
                 on_click: None,
+                on_scroll: None,
             },
         ],
         fg: None,
         bg: None,
         bold: None,
         on_click: None,
+        on_scroll: None,
     };
 
     let band = BandContent {
@@ -226,6 +236,7 @@ fn band_version_increments_on_remount() {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     };
@@ -252,6 +263,7 @@ fn band_version_increments_on_remount() {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 2,
     };
@@ -288,6 +300,7 @@ fn no_mount_produces_empty_bands() {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     };
@@ -326,6 +339,7 @@ fn text_band(plugin: &str, slot: UiSlot, text: &str) -> BandContent {
             bg: None,
             bold: None,
             on_click: None,
+            on_scroll: None,
         },
         version: 1,
     }

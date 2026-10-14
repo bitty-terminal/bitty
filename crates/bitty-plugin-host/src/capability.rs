@@ -169,6 +169,23 @@ impl CapabilityFamily {
                 "platform.cpu-read",
                 "platform.memory-read",
                 "platform.battery-read",
+                // CTX-1201 (bitty#2012/#2017/#2020): privilege-sensitive
+                // Phase B device heads for bar modules (network, bluetooth,
+                // backlight, idle). Read vs control never share an
+                // interface; ESSID carries its own head (location-adjacent)
+                // and ungranted ESSID is indistinguishable from NM-less.
+                // The ESSID broker head is `platform.essid.read` (the
+                // `#2056` registry spelling `platform.network.essid.read`
+                // carries four dot segments and cannot enter the closed
+                // `family.resource[.scope]` set; the bridge maps it).
+                "platform.network.read",
+                "platform.essid.read",
+                "platform.bluetooth.read",
+                "platform.bluetooth.control",
+                "platform.backlight.read",
+                "platform.backlight.control",
+                "platform.idle.read",
+                "platform.idle.control",
             ],
             Self::Protocol => &["protocol.register"],
             Self::Panel => &[
@@ -456,6 +473,24 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "platform.cpu-read" => "Read CPU utilization for status modules (read-only)",
         "platform.memory-read" => "Read memory and swap usage for status modules (read-only)",
         "platform.battery-read" => "Read battery capacity and state for status modules (read-only)",
+        "platform.network.read" => {
+            "Read link state and bandwidth counters for status modules (read-only)"
+        }
+        "platform.essid.read" => {
+            "Read Wi-Fi identity for status modules (separately granted, location-adjacent)"
+        }
+        "platform.bluetooth.read" => {
+            "Read Bluetooth radio and bonded devices for status modules (bounded, read-only)"
+        }
+        "platform.bluetooth.control" => "Set Bluetooth radio power (separate control head)",
+        "platform.backlight.read" => "Read backlight brightness for status modules (read-only)",
+        "platform.backlight.control" => {
+            "Step backlight brightness when permitted (never escalates)"
+        }
+        "platform.idle.read" => "Read idle-inhibit state for status modules (read-only)",
+        "platform.idle.control" => {
+            "Toggle idle inhibition through the compositor (separate control head)"
+        }
         "protocol.register" => "Register a protocol handler",
         "panel.provider" => "Provide panel types for the workspace",
         "panel.create" => "Create and manage panels",
@@ -572,6 +607,14 @@ mod tests {
             "platform.cpu-read",
             "platform.memory-read",
             "platform.battery-read",
+            "platform.network.read",
+            "platform.essid.read",
+            "platform.bluetooth.read",
+            "platform.bluetooth.control",
+            "platform.backlight.read",
+            "platform.backlight.control",
+            "platform.idle.read",
+            "platform.idle.control",
             "protocol.register",
             "layout.provider",
             "workspace.read",

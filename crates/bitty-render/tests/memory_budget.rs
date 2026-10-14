@@ -140,8 +140,17 @@ fn startup_maps_exactly_one_face_until_first_miss() {
 
 #[test]
 fn cache_caps_hold_named_byte_lines() {
+    // CTX-1206 cap review (issue #2076): every cap below is retained. The
+    // steady-state cut lands elsewhere (the atlas growth gate keeps the
+    // 512 px lazy texture through transient bursts instead of ratcheting
+    // to the 2048 px maximum), so the worst-case ceiling is unchanged and
+    // still pinned here.
     // Glyph bitmap worst case: a 64x64 Rgb strike (large for a terminal
     // cell at sane point sizes; emoji CBDT strikes stay near this order).
+    // The 3 B/px triplet is the upstream retention cost the grayscale
+    // policy flattens to 1 B/px at atlas upload (see
+    // `atlas::coverage_policy_for`): the cache holds triplets, the atlas
+    // holds luminance.
     const WORST_STRIKE_BYTES: usize = 64 * 64 * 3;
     let glyph_line = DEFAULT_GLYPH_CACHE_CAPACITY * WORST_STRIKE_BYTES;
     assert_eq!(DEFAULT_GLYPH_CACHE_CAPACITY, 2048);
@@ -165,10 +174,19 @@ fn cache_caps_hold_named_byte_lines() {
         "dynamic outcome cache line must stay under 256 KiB, is {dynamic_line}"
     );
     // Atlas: lazy start 512x512 R8, absolute max 2048x2048 R8 (upload cap
-    // 4096 keeps one R8 texture at 16 MiB worst case).
+    // 4096 keeps one R8 texture at 16 MiB worst case). CTX-1206 growth
+    // gate: exhaustion below half occupancy evicts and rebuilds instead of
+    // growing, so the steady state holds the 256 KiB texture through
+    // transient bursts; only sustained pressure reaches the 4 MiB maximum
+    // pinned below.
     assert_eq!(INITIAL_ATLAS_DIMENSION, 512);
     assert_eq!(DEFAULT_ATLAS_DIMENSION, 2048);
     assert_eq!(MAX_ATLAS_DIMENSION, 4096);
+    assert_eq!(
+        bitty_render::grid::ATLAS_GROW_OCCUPANCY_THRESHOLD,
+        0.5,
+        "growth gate must stay at half occupancy"
+    );
     let initial_texels =
         usize::from(INITIAL_ATLAS_DIMENSION) * usize::from(INITIAL_ATLAS_DIMENSION);
     assert_eq!(

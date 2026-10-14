@@ -23,6 +23,56 @@ pub const DEFAULT_ATLAS_DIMENSION: u16 = 2048;
 /// The atlas grows on demand up to DEFAULT_ATLAS_DIMENSION.
 pub const INITIAL_ATLAS_DIMENSION: u16 = 512;
 
+/// Coverage bytes per atlas texel under the grayscale policy: one
+/// luminance byte per pixel (the `R8` texture the pipeline uploads).
+pub const GRAYSCALE_BYTES_PER_TEXEL: usize = 1;
+
+/// Coverage bytes per atlas texel a subpixel policy would need: one byte
+/// per LCD stripe (an R/G/B triplet instead of one luminance byte).
+pub const SUBPIXEL_BYTES_PER_TEXEL: usize = 3;
+
+/// Which coverage encoding an atlas texture uses (CTX-1206, issue #2076).
+///
+/// This is the policy gate for the deferred subpixel renderer: every
+/// serving path in this crate (`coverage_mask` averaging in `grid`,
+/// `blend_glyph`/`blend_coverage_mask` in `software`, the `R8` pipeline
+/// texture) implements [`CoveragePolicy::Grayscale`] today. A future
+/// subpixel path must pass [`coverage_policy_for`] first — it earns its
+/// 3x texel cost (plus the shader/sample cost of triplet filtering) only
+/// where the stripes resolve visibly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoveragePolicy {
+    /// One luminance byte per texel (current serving behavior everywhere).
+    Grayscale,
+    /// One RGB-triplet byte triple per texel (not served yet; gated by
+    /// [`coverage_policy_for`]).
+    Subpixel,
+}
+
+/// Decides the coverage policy for an output (CTX-1206, issue #2076).
+///
+/// Subpixel RGBA earns its 3x texel cost
+/// ([`SUBPIXEL_BYTES_PER_TEXEL`] vs [`GRAYSCALE_BYTES_PER_TEXEL`]) only on
+/// an LCD-stripe output at a non-HiDPI scale: stripes at 1x (or downscaled,
+/// or an invalid scale sanitized to 1x) are wide enough to resolve, while
+/// HiDPI physical pixels are already small enough that grayscale
+/// antialiasing is visually equivalent (the same reason high-density
+/// platforms retired subpixel antialiasing). Non-LCD outputs (OLED
+/// PenTile, rotated panels, projectors, unknown) always stay grayscale:
+/// triplets tuned for RGB stripes fringe there.
+///
+/// `dpi_scale` is sanitized exactly like the raster path
+/// ([`crate::hidpi::sanitize_dpi_scale`]), so callers pass the raw window
+/// scale with no pre-validation.
+#[must_use]
+pub fn coverage_policy_for(lcd_subpixel_output: bool, dpi_scale: f64) -> CoveragePolicy {
+    if lcd_subpixel_output && crate::hidpi::sanitize_dpi_scale(dpi_scale) <= 1.0 {
+        CoveragePolicy::Subpixel
+    } else {
+        CoveragePolicy::Grayscale
+    }
+}
+
 /// Fixed dimensions of an atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AtlasDims {
@@ -718,5 +768,52 @@ mod tests {
             h: 10,
         };
         assert_eq!(right.intersect(viewport()), None);
+    }
+
+    // -- CTX-1206 (issue #2076): grayscale-vs-subpixel coverage policy.
+
+    #[test]
+    fn subpixel_costs_3x_grayscale_per_texel() {
+        assert_eq!(
+            GRAYSCALE_BYTES_PER_TEXEL, 1,
+            "the R8 atlas texture is one byte per texel"
+        );
+        assert_eq!(
+            SUBPIXEL_BYTES_PER_TEXEL,
+            3 * GRAYSCALE_BYTES_PER_TEXEL,
+            "an RGB-triplet texel costs 3x one luminance byte"
+        );
+    }
+
+    #[test]
+    fn coverage_policy_earns_subpixel_only_on_lcd_without_hidpi() {
+        // No LCD stripes (OLED, rotated, unknown output): grayscale always,
+        // at every scale including invalid ones (sanitized to 1.0, still
+        // not LCD).
+        for scale in [0.25, 1.0, 1.6, 2.0, 4.0, f64::NAN, 0.0, -1.0] {
+            assert_eq!(
+                coverage_policy_for(false, scale),
+                CoveragePolicy::Grayscale,
+                "non-LCD scale {scale} must stay grayscale"
+            );
+        }
+        // LCD at 1x or below (or invalid, sanitized to 1x): subpixel earns
+        // its 3x — stripes are wide enough to resolve.
+        for scale in [1.0, 0.5, 0.25, f64::NAN, 0.0] {
+            assert_eq!(
+                coverage_policy_for(true, scale),
+                CoveragePolicy::Subpixel,
+                "LCD scale {scale} must earn subpixel"
+            );
+        }
+        // LCD + HiDPI: physical pixels are too small for subpixel to pay
+        // off, so grayscale wins back the 3x.
+        for scale in [1.000_001, 1.6, 2.0, 4.0, 100.0] {
+            assert_eq!(
+                coverage_policy_for(true, scale),
+                CoveragePolicy::Grayscale,
+                "HiDPI LCD scale {scale} must stay grayscale"
+            );
+        }
     }
 }

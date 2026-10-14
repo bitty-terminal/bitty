@@ -2597,3 +2597,174 @@ fn tint_rgba_washes_rgb_and_preserves_alpha() {
     tint_rgba(&mut px, [255, 0, 0, 255], 2.0);
     assert_eq!(px, vec![255, 0, 0, 255]);
 }
+
+// -- CTX-1206 (issue #2076): occupancy-gated atlas growth.
+//
+// The atlas starts at the 512 px lazy dimension and used to grow on the
+// first exhaustion, permanently ratcheting to 1024/2048 after one
+// fragmented burst. Growth is now earned: exhaustion below
+// `ATLAS_GROW_OCCUPANCY_THRESHOLD` takes the evict-and-rebuild path
+// (fragmentation or stale working set), while exhaustion at/above it
+// grows (genuine pressure). All fixtures below drive `GlyphAtlas`
+// directly with exact-size bitmaps so shelf geometry is deterministic.
+
+/// Builds an exact `width x height` Rgb bitmap for atlas-gate fixtures.
+fn gate_bitmap(width: i32, height: i32) -> GlyphBitmap {
+    GlyphBitmap::try_new(
+        GlyphMetrics {
+            left: 0,
+            top: height,
+            width,
+            height,
+            advance: [width, 0],
+        },
+        BitmapFormat::Rgb,
+        vec![0xAA; width as usize * height as usize * 3],
+    )
+    .unwrap()
+}
+
+#[test]
+fn atlas_growth_refused_when_fragmented_evicts_instead() {
+    // A 64x500 placement strands the 512-px shelf (open height 500); a
+    // 500x64 request then fails at ~12% occupancy — fragmentation, not
+    // pressure — so the atlas must flag exhaustion (caller evicts and
+    // rebuilds) instead of permanently ratcheting 512 -> 1024.
+    let mut atlas = super::GlyphAtlas::new(2048).unwrap();
+    assert_eq!(
+        atlas.dims(),
+        crate::atlas::AtlasDims {
+            width: 512,
+            height: 512
+        },
+        "growth-gate fixtures start at the lazy dimension"
+    );
+    let font = FontId::next(&mut 0u64);
+    let tall = RasterKey::new('A', font, 12.0).unwrap();
+    assert!(matches!(
+        atlas.ensure(tall, &gate_bitmap(64, 500)),
+        GlyphSource::Atlas { .. }
+    ));
+    assert!(
+        atlas.occupancy() < super::ATLAS_GROW_OCCUPANCY_THRESHOLD,
+        "fixture must fail fragmented, occupancy {}",
+        atlas.occupancy()
+    );
+    let wide = RasterKey::new('B', font, 12.0).unwrap();
+    assert!(
+        matches!(
+            atlas.ensure(wide, &gate_bitmap(500, 64)),
+            GlyphSource::Inline { .. }
+        ),
+        "fragmented overflow must degrade inline, not grow"
+    );
+    assert!(
+        atlas.is_exhausted(),
+        "fragmented failure must take the evict path"
+    );
+    assert_eq!(
+        atlas.dims().width,
+        512,
+        "no growth ratchet on fragmentation"
+    );
+    assert_eq!(
+        atlas.evictions(),
+        0,
+        "ensure never resets mid-pass; the frame pipeline evicts"
+    );
+}
+
+#[test]
+fn atlas_grows_when_genuinely_full() {
+    // Sixty-four 64x64 glyphs pack the 512 atlas to exactly 100%; the
+    // 65th fails at full occupancy — genuine pressure — so growth to
+    // 1024 must proceed and the retry must place.
+    let mut atlas = super::GlyphAtlas::new(2048).unwrap();
+    let font = FontId::next(&mut 7u64);
+    for i in 0..64u32 {
+        let ch = char::from_u32(0x41 + i).unwrap();
+        let key = RasterKey::new(ch, font, 12.0).unwrap();
+        assert!(
+            matches!(
+                atlas.ensure(key, &gate_bitmap(64, 64)),
+                GlyphSource::Atlas { .. }
+            ),
+            "glyph {i} must pack the fresh atlas"
+        );
+    }
+    assert!(
+        atlas.occupancy() >= super::ATLAS_GROW_OCCUPANCY_THRESHOLD,
+        "fixture must fail full, occupancy {}",
+        atlas.occupancy()
+    );
+    let key = RasterKey::new(char::from_u32(0xE000).unwrap(), font, 12.0).unwrap();
+    assert!(
+        matches!(
+            atlas.ensure(key, &gate_bitmap(64, 64)),
+            GlyphSource::Atlas { .. }
+        ),
+        "genuine overflow must grow and place"
+    );
+    assert_eq!(atlas.dims().width, 1024);
+    assert!(!atlas.is_exhausted());
+}
+
+#[test]
+fn atlas_growth_gate_boundary_is_grow_at_half() {
+    // Exactly 50% occupancy (512x256 on the 512 atlas) earns growth; just
+    // under (512x255) takes the evict path. Both halves fail the same
+    // 500x300 request, so only the occupancy differs.
+    let font = FontId::next(&mut 11u64);
+    let mut full_half = super::GlyphAtlas::new(2048).unwrap();
+    let key = RasterKey::new('A', font, 12.0).unwrap();
+    assert!(matches!(
+        full_half.ensure(key, &gate_bitmap(512, 256)),
+        GlyphSource::Atlas { .. }
+    ));
+    assert_eq!(full_half.occupancy(), 0.5);
+    let key = RasterKey::new('B', font, 12.0).unwrap();
+    assert!(matches!(
+        full_half.ensure(key, &gate_bitmap(500, 300)),
+        GlyphSource::Atlas { .. }
+    ));
+    assert_eq!(full_half.dims().width, 1024, "50% occupancy earns growth");
+
+    let mut under_half = super::GlyphAtlas::new(2048).unwrap();
+    let key = RasterKey::new('A', font, 12.0).unwrap();
+    assert!(matches!(
+        under_half.ensure(key, &gate_bitmap(512, 255)),
+        GlyphSource::Atlas { .. }
+    ));
+    assert!(under_half.occupancy() < super::ATLAS_GROW_OCCUPANCY_THRESHOLD);
+    let key = RasterKey::new('B', font, 12.0).unwrap();
+    assert!(matches!(
+        under_half.ensure(key, &gate_bitmap(512 - 256, 300)),
+        GlyphSource::Inline { .. }
+    ));
+    assert!(under_half.is_exhausted());
+    assert_eq!(
+        under_half.dims().width,
+        512,
+        "just under half occupancy must not grow"
+    );
+}
+
+#[test]
+fn shaped_atlas_growth_gate_mirrors_char_path() {
+    use crate::shaped::ShapedGlyphKey;
+    let features: &[bitty_config::types::OpenTypeFeature] = &[];
+    let mut atlas = super::GlyphAtlas::new(2048).unwrap();
+    let face = FontId::next(&mut 0u64);
+    let tall = ShapedGlyphKey::new(face, 1, 12.0, features);
+    assert!(matches!(
+        atlas.ensure_shaped(tall, &gate_bitmap(64, 500)),
+        GlyphSource::Atlas { .. }
+    ));
+    let wide = ShapedGlyphKey::new(face, 2, 12.0, features);
+    assert!(matches!(
+        atlas.ensure_shaped(wide, &gate_bitmap(500, 64)),
+        GlyphSource::Inline { .. }
+    ));
+    assert!(atlas.is_exhausted());
+    assert_eq!(atlas.dims().width, 512);
+}

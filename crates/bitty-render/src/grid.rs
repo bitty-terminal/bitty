@@ -62,7 +62,10 @@
 //!   placed on a metric-aware baseline with a fixed-rule fallback (see
 //!   [`BASELINE_NUMERATOR`] and [`resolve_baseline_offset`]).
 //! - **Subpixel RGB antialiasing policy**: upstream coverage is averaged to
-//!   luminance exactly like [`crate::software::SurfaceRgba::blend_glyph`].
+//!   luminance exactly like [`crate::software::SurfaceRgba::blend_glyph`]
+//!   (the grayscale application of
+//!   [`crate::atlas::coverage_policy_for`], which earns subpixel only on
+//!   LCD + non-HiDPI outputs).
 //!
 //! # Performance instrumentation vs budgets
 //!
@@ -1687,6 +1690,20 @@ pub struct RenderCounters {
     pub shaping_misaligned: u64,
 }
 
+/// Occupancy fraction at which an exhausted atlas earns growth (CTX-1206,
+/// issue #2076: aggressive eviction).
+///
+/// Exhaustion below this threshold takes the evict-and-rebuild path: the
+/// shelf packer fragments on mixed heights and the slot map accumulates
+/// stale glyphs from previous frames, so a low-occupancy failure means the
+/// working set repacks densely (dropping the stale entries) rather than
+/// needing more room. Exhaustion at or above it means the live set
+/// genuinely exceeds the atlas, so growth proceeds. The steady-state
+/// effect: transient bursts (one CJK screen, an overlay line) no longer
+/// ratchet the lazy 512 px atlas (256 KiB) to 1024/2048 (1/4 MiB)
+/// permanently; sustained pressure still grows exactly as before.
+pub const ATLAS_GROW_OCCUPANCY_THRESHOLD: f64 = 0.5;
+
 /// One queued texture upload: coverage bytes for a freshly allocated slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtlasUpload {
@@ -1704,6 +1721,10 @@ pub struct AtlasUpload {
 /// When an allocation no longer fits it records exhaustion and returns
 /// [`GlyphSource::Inline`]; the caller rebuilds the whole pass against a
 /// wholesale-reset atlas ([`GlyphAtlas::evict_now`], one counted eviction).
+/// Growth is earned, not automatic (CTX-1206): exhaustion below
+/// [`ATLAS_GROW_OCCUPANCY_THRESHOLD`] skips the grow-then-retry and goes
+/// straight to exhaustion (fragmentation or stale working set repacks on
+/// rebuild), while exhaustion at/above it grows first (genuine pressure).
 /// That way a returned [`DrawList`] never mixes slots from two
 /// [`GlyphAtlas::epoch`]s: every emitted atlas slot resolves to the texels
 /// of exactly one generation, and anything that still cannot fit degrades
@@ -1927,8 +1948,11 @@ impl GlyphAtlas {
     /// Attempts to grow the atlas to the next power-of-two dimension.
     /// Returns `true` if growth succeeded, `false` if already at max.
     ///
-    /// Growth preserves existing placements by reallocating the texture
-    /// buffer and copying slot data to the new layout.
+    /// Called only through [`Self::place_or_grow`] (the CTX-1206 occupancy
+    /// gate): direct callers would bypass the evict-first policy and
+    /// ratchet the texture on fragmentation. Growth preserves existing
+    /// placements by reallocating the texture buffer and copying slot data
+    /// to the new layout.
     pub fn try_grow(&mut self) -> bool {
         let current = self.layout.dimensions().width;
         if current >= self.max_dimension {
@@ -1985,6 +2009,25 @@ impl GlyphAtlas {
         true
     }
 
+    /// Places `width x height` under the CTX-1206 growth gate: a direct
+    /// allocation first; on failure, growth-then-retry only when the live
+    /// set genuinely exceeds the atlas
+    /// ([`ATLAS_GROW_OCCUPANCY_THRESHOLD`]), otherwise `None` so the
+    /// caller takes the exhaustion path (evict + rebuild, which repacks
+    /// the fragmented shelves and drops stale frames' glyphs instead of
+    /// ratcheting the texture permanently).
+    fn place_or_grow(&mut self, width: u16, height: u16) -> Option<AtlasSlot> {
+        if let Some(slot) = self.layout.allocate(width, height) {
+            return Some(slot);
+        }
+        // Exhaustion (not oversize — callers check that first): grow only
+        // when earned; a fragmented atlas rebuilds instead.
+        if self.layout.occupancy() >= ATLAS_GROW_OCCUPANCY_THRESHOLD && self.try_grow() {
+            return self.layout.allocate(width, height);
+        }
+        None
+    }
+
     /// Ensures `bitmap` is placed for `key`, queueing an upload when newly
     /// placed. Blank bitmaps are refused by callers before reaching the
     /// atlas.
@@ -2013,22 +2056,9 @@ impl GlyphAtlas {
             return self.fallback_inline(bitmap);
         }
 
-        let Some(slot) = self.layout.allocate(width, height) else {
-            // Exhaustion (not oversize): try to grow before falling back.
-            if self.try_grow() {
-                // Growth succeeded, retry allocation.
-                if let Some(slot) = self.layout.allocate(width, height) {
-                    let coverage = coverage_mask(bitmap);
-                    write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
-                    self.pending.push(AtlasUpload {
-                        slot,
-                        data: coverage,
-                    });
-                    self.slots.insert(key, slot);
-                    return GlyphSource::Atlas { slot };
-                }
-            }
-            // Growth failed or retry failed: flag exhaustion and use inline fallback.
+        let Some(slot) = self.place_or_grow(width, height) else {
+            // Growth unearned or retry failed: flag exhaustion and use
+            // inline fallback (the frame pipeline evicts and rebuilds).
             self.exhausted = true;
             return self.fallback_inline(bitmap);
         };
@@ -2073,19 +2103,7 @@ impl GlyphAtlas {
             return self.fallback_inline(bitmap);
         }
 
-        let Some(slot) = self.layout.allocate(width, height) else {
-            if self.try_grow() {
-                if let Some(slot) = self.layout.allocate(width, height) {
-                    let coverage = coverage_mask(bitmap);
-                    write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
-                    self.pending.push(AtlasUpload {
-                        slot,
-                        data: coverage,
-                    });
-                    self.shaped_slots.insert(key, slot);
-                    return GlyphSource::Atlas { slot };
-                }
-            }
+        let Some(slot) = self.place_or_grow(width, height) else {
             self.exhausted = true;
             return self.fallback_inline(bitmap);
         };
@@ -2112,10 +2130,16 @@ impl GlyphAtlas {
 
 /// Flattens any supported bitmap format to one coverage byte per texel.
 ///
-/// RGB coverage is averaged to luminance (identical rule to
+/// This is the grayscale-policy application point
+/// ([`crate::atlas::CoveragePolicy::Grayscale`], decided by
+/// [`crate::atlas::coverage_policy_for`]): RGB coverage — including LCD
+/// subpixel triplets from fontconfig-driven FreeType modes — is averaged
+/// to luminance (identical rule to
 /// [`crate::software::SurfaceRgba::blend_glyph`]); RGBA sources contribute
 /// their alpha channel (upstream RGBA is premultiplied, so alpha *is*
-/// coverage).
+/// coverage). A future subpixel path that passes the policy gate would
+/// preserve the triplets here instead; until then every serving path
+/// flattens to `R8`.
 fn coverage_mask(bitmap: &GlyphBitmap) -> Vec<u8> {
     let GlyphMetrics { width, height, .. } = bitmap.metrics;
     let mut mask = Vec::with_capacity(width.max(0) as usize * height.max(0) as usize);

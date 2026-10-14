@@ -1143,17 +1143,15 @@ mod tests {
 
     /// Encodes an image as PNG for the byte-level entry points.
     fn encode_png(source: &BackgroundImage) -> Vec<u8> {
-        use image::ImageEncoder;
         let (width, height) = source.dimensions();
         let mut bytes = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut bytes)
-            .write_image(
-                source.rgba(),
-                width,
-                height,
-                image::ExtendedColorType::Rgba8,
-            )
-            .expect("png encode");
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(source.rgba()).expect("png encode");
+        }
         bytes
     }
 }

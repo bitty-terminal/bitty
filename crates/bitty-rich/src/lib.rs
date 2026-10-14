@@ -76,11 +76,11 @@
 //!
 //! No window system, no adapter, no clipboard I/O, no GPU presentation,
 //! and no filesystem are touched here. Bounded Kitty payload decode
-//! (PNG via the `image` codec edge, raw RGB/RGBA inline) lives in
+//! (PNG via the shared minimal `png` codec, raw RGB/RGBA inline) lives in
 //! [`kitty_decode`] and nearest-neighbor raster mechanics in
-//! [`kitty_raster`] (both Core-owned; the `bitty-graphics` extension
-//! crate holds its own copies plus a raster cache, and Core never depends
-//! on extension internals). Core retains the declared-size pre-check
+//! [`kitty_raster`] (both Core-owned behind the [`kitty_seam`] traits; the
+//! `bitty-graphics` extension crate implements the same traits on its own
+//! side, and Core never depends on extension internals). Core retains the declared-size pre-check
 //! ([`kitty_place`]) and the pre-upload re-validation on decoded bitmaps. All tests run on
 //! GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the host external-editor round-trip
@@ -104,6 +104,7 @@ pub mod kitty;
 pub mod kitty_decode;
 pub mod kitty_place;
 pub mod kitty_raster;
+pub mod kitty_seam;
 pub mod kitty_unicode;
 pub mod loader;
 pub mod presentation;
@@ -170,6 +171,9 @@ pub use kitty_place::{
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,
     rasterize_kitty, rasterize_kitty_clipped, rasterize_rgba_clipped,
+};
+pub use kitty_seam::{
+    CoreKittyBackend, KittyDecodeBackend, KittyRasterBackend, KittyTransmitFormat,
 };
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,

@@ -1,10 +1,11 @@
 //! Bounded Kitty payload decode (Core-owned, issue #1802).
 //!
-//! The `bitty-graphics` extension crate owns its own copy of this decoder
-//! (W-141 extraction); Core retains no dependency on extension internals
-//! (one-way only), so this module is the Core-owned decode step the
-//! `Runtime` transmit seam calls. Bounds mirror the extension exactly:
-//! 8192 px/side, 4096 x 4096 px area, 64 MiB RGBA.
+//! The `bitty-graphics` extension crate implements the same decode behind
+//! the Core-owned [`crate::kitty_seam`] traits (W-141 extraction); Core
+//! never depends on extension internals (one-way only), so this module is
+//! the Core-owned decode step the `Runtime` transmit seam calls. Bounds
+//! mirror the extension exactly: 8192 px/side, 4096 x 4096 px area,
+//! 64 MiB RGBA.
 //!
 //! # Formats (`f=`)
 //!
@@ -17,12 +18,14 @@
 //! Any other `f` value never reaches this module: the caller maps it to
 //! `UnknownFormat` first (never guessed).
 //!
-//! # PNG path (no new codec edge)
+//! # PNG path (shared minimal codec)
 //!
-//! PNG decodes through the `image` crate already in the Core tree
-//! (background-image decode, CTX-0347). The `IHDR` dimensions are sniffed
-//! and validated **before** the decoder runs, so a hostile header is
-//! refused without allocating pixels; the decoded output dimensions are
+//! PNG decodes through the minimal `png` codec (CTX-1186): the same crate
+//! and pin the `bitty-graphics` extension seam uses, never the full
+//! `image` facade (no format autodetect, no codecs beyond PNG, no
+//! color-management stack). The `IHDR` dimensions are sniffed and
+//! validated **before** the decoder runs, so a hostile header is refused
+//! without allocating pixels; the decoded output dimensions are
 //! re-validated against the sniffed header before admission. Animated PNG
 //! yields its first frame (same as the extension); animation stays
 //! deferred with virtual placements.
@@ -376,6 +379,14 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
 /// output dimensions are re-checked against the sniffed header before
 /// admission, and the output byte length is checked against
 /// [`KITTY_DECODE_MAX_BYTES`] before it is accepted.
+///
+/// PNG decodes through the shared minimal `png` codec (same crate and pin
+/// as the `bitty-graphics` extension seam, never the full `image`
+/// facade): `normalize_to_color8 | ALPHA` folds every PNG color type
+/// (palette, gray, gray-alpha, RGB, RGBA, 16-bit, interlaced) to 8-bit
+/// channels before the local expansion to RGBA8, text chunks are skipped,
+/// and the decoder's own accounting enforces the same byte ceiling.
+/// Animated PNG yields its first frame.
 fn decode_png(payload: &[u8]) -> Result<KittyDecodedImage, KittyDecodeError> {
     let (width, height) = sniff_png_ihdr(payload)?;
     let pixels = checked_dimensions(width, height)?;
@@ -388,32 +399,119 @@ fn decode_png(payload: &[u8]) -> Result<KittyDecodedImage, KittyDecodeError> {
             bytes: usize::MAX,
             cap: KITTY_DECODE_MAX_BYTES,
         })?;
-    let malformed = |detail: String| KittyDecodeError::MalformedPng(detail);
-    let image = image::load_from_memory_with_format(payload, image::ImageFormat::Png)
-        .map_err(|err| malformed(format!("decode refused: {err}")))?;
-    let rgba = image.to_rgba8();
-    if rgba.width() != width || rgba.height() != height {
-        return Err(malformed(
+    let malformed = |err: png::DecodingError| KittyDecodeError::MalformedPng(err.to_string());
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(payload));
+    // Text chunks are metadata, never pixels; skipping them keeps hostile
+    // zTXt/iTXt payloads out of decoder-internal buffers.
+    decoder.set_ignore_text_chunk(true);
+    // Defense in depth: the decoder's own accounting refuses internal
+    // buffers past the same byte ceiling the explicit checks enforce.
+    decoder.set_limits(png::Limits {
+        bytes: KITTY_DECODE_MAX_BYTES,
+    });
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().map_err(malformed)?;
+    let mut buf = vec![
+        0_u8;
+        reader
+            .output_buffer_size()
+            .filter(|&n| n <= KITTY_DECODE_MAX_BYTES)
+            .ok_or(KittyDecodeError::DecodedTooLarge {
+                bytes: usize::MAX,
+                cap: KITTY_DECODE_MAX_BYTES,
+            })?
+    ];
+    let output = reader
+        .next_frame(&mut buf)
+        .map_err(|err| KittyDecodeError::MalformedPng(err.to_string()))?;
+    if output.width != width || output.height != height {
+        return Err(KittyDecodeError::MalformedPng(
             "decoded dimensions disagree with the PNG header".to_owned(),
         ));
     }
-    let (rgba_bytes, w, h) = (rgba.into_raw(), width, height);
-    // The codec normalizes every color type to RGBA8; re-check the exact
-    // byte length so a disagreeing decoder fails closed.
+    buf.truncate(output.buffer_size().min(buf.len()));
+    expand_png_output(&buf, width, height, pixels, reader.output_color_type())
+}
+
+/// Expands one normalized PNG frame to RGBA8.
+///
+/// After `normalize_to_color8 | ALPHA` the decoder only emits 8-bit
+/// grayscale, gray-alpha, RGB, or RGBA. Anything else (including a
+/// surviving palette) fails closed instead of being guessed.
+fn expand_png_output(
+    buf: &[u8],
+    width: u32,
+    height: u32,
+    pixels: u64,
+    color_type: (png::ColorType, png::BitDepth),
+) -> Result<KittyDecodedImage, KittyDecodeError> {
+    use png::{BitDepth::Eight, ColorType as Ct};
+    let (color, depth) = color_type;
+    if depth != Eight {
+        return Err(KittyDecodeError::MalformedPng(format!(
+            "unexpected PNG output bit depth: {depth:?}"
+        )));
+    }
+    let channels = match color {
+        Ct::Grayscale => 1,
+        Ct::GrayscaleAlpha => 2,
+        Ct::Rgb => 3,
+        Ct::Rgba => 4,
+        Ct::Indexed => {
+            return Err(KittyDecodeError::MalformedPng(
+                "unexpected PNG palette output after expansion".to_owned(),
+            ));
+        }
+    };
     let expected = (pixels as usize)
-        .checked_mul(4)
-        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES && n == rgba_bytes.len())
+        .checked_mul(channels)
+        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES && n == buf.len())
         .ok_or_else(|| {
-            malformed(format!(
-                "PNG frame of {} bytes does not match {pixels} pixels",
-                rgba_bytes.len()
+            KittyDecodeError::MalformedPng(format!(
+                "PNG frame of {} bytes does not match {pixels} {color:?} pixels",
+                buf.len()
             ))
         })?;
-    debug_assert_eq!(expected, rgba_bytes.len());
+    debug_assert_eq!(expected, buf.len());
+    // `pixels <= KITTY_DECODE_MAX_PIXELS` bounds every expansion below at
+    // the byte cap, so these capacities cannot overflow `usize`.
+    let capacity = pixels as usize * 4;
+    let rgba = match color {
+        Ct::Rgba => buf.to_vec(),
+        Ct::Rgb => {
+            let mut out = Vec::with_capacity(capacity);
+            for px in buf.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            }
+            out
+        }
+        Ct::Grayscale => {
+            let mut out = Vec::with_capacity(capacity);
+            for &g in buf {
+                out.extend_from_slice(&[g, g, g, 0xFF]);
+            }
+            out
+        }
+        Ct::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity(capacity);
+            for px in buf.chunks_exact(2) {
+                out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+            out
+        }
+        Ct::Indexed => {
+            return Err(KittyDecodeError::MalformedPng(
+                "unexpected PNG palette output after expansion".to_owned(),
+            ));
+        }
+    };
+    debug_assert_eq!(rgba.len(), capacity);
     Ok(KittyDecodedImage {
-        width: w,
-        height: h,
-        rgba: rgba_bytes,
+        width,
+        height,
+        rgba,
     })
 }
 

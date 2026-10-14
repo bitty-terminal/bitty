@@ -321,6 +321,7 @@ dependencies = [
  "bitty-vt",
  "getrandom 0.4.3",
  "image",
+ "png",
 ]
 
 [[package]]
@@ -1281,7 +1282,6 @@ dependencies = [
  "image-webp",
  "moxcms",
  "num-traits",
- "png",
  "zune-core",
  "zune-jpeg",
 ]

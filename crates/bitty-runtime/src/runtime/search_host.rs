@@ -1106,6 +1106,7 @@ mod tests {
                 events: Vec::new(),
                 claims: Vec::new(),
             },
+            settings: Vec::new(),
             raw_bytes_len: 256,
         };
         rt.register_plugin(manifest).expect("fixture registers");

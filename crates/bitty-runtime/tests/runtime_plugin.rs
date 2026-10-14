@@ -57,6 +57,7 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
             events: events.into_iter().map(|s| s.to_string()).collect(),
             claims: Vec::new(),
         },
+        settings: Vec::new(),
         raw_bytes_len: 256,
     }
 }

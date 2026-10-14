@@ -8,14 +8,17 @@
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
-//! `[limits]`, `[dependencies]`, `[services.provided]`, `[services.required]`,
-//! `[tools.git]` (accepted Layer-2 v1, CTX-0425),
+//! `[limits]`, `[dependencies]`, `[settings]`, `[services.provided]`,
+//! `[services.required]`, `[tools.git]` (accepted Layer-2 v1, CTX-0425),
 //! `[[capabilities.filesystem]]` and `[[network.egress]]` (array-of-tables).
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
 //! non-negative integers are supported. Inline-table values are accepted for
 //! the declared shapes only: `[dependencies]` `{ version, prerelease }`,
 //! `[services.provided]` `{ version, args_schema, result_schema, heads }`,
-//! `[services.required]` `{ version }`, and `[lazy].commands` elements
+//! `[services.required]` `{ version }`, `[settings]`
+//! `{ type, default }` (CTX-1195: `type` is one of `bool` / `int` /
+//! `string` / `string-array` and `default` is the shipped built-in default
+//! of that type), and `[lazy].commands` elements
 //! `{ id, args_schema, result_schema }`. Schemas are bounded JSON documents
 //! (16 KiB per schema, depth at most 16, explicit `additionalProperties`).
 //! Unknown sections, sub-tables, other table keys,
@@ -33,7 +36,8 @@ use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::{
     ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand,
     LazyTriggers, MAX_PROVIDED_SERVICES, NetworkEgress, PluginDependency, PluginIdentity,
-    PluginLimits, PluginManifest, ProvidedService, QualifiedName, ToolDeclaration,
+    PluginLimits, PluginManifest, ProvidedService, QualifiedName, SettingDecl, SettingDefault,
+    SettingKind, ToolDeclaration,
 };
 
 /// Parse a bounded `bitty-plugin.toml` body.
@@ -93,6 +97,9 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // `[services.required]` entries: `"iface" = ">=1.2"` or
     // `"iface" = { version = ">=1.2" }` (schemas are provider-side only).
     let mut required_services: Vec<(String, String)> = Vec::new();
+    // `[settings]` entries: `"key" = { type = "...", default = ... }`
+    // (CTX-1195: declared settings keys with quota, types, shipped defaults).
+    let mut settings: Vec<SettingDecl> = Vec::new();
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
@@ -225,7 +232,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             }
             match inner.as_str() {
                 "plugin" | "compat" | "capabilities" | "lazy" | "limits" | "dependencies"
-                | "services.provided" | "services.required" => {
+                | "services.provided" | "services.required" | "settings" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
@@ -408,7 +415,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                         .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?,
                 );
             }
-            "dependencies" | "services.provided" | "services.required" => {
+            "dependencies" | "services.provided" | "services.required" | "settings" => {
                 if !seen_keys.insert(section_key) {
                     return Err(format!("duplicate key '{key}' in [{section}]"));
                 }
@@ -418,6 +425,12 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     }
                     "services.provided" => {
                         provided_services.extend(parse_provided_entry(&key, &value)?);
+                    }
+                    "settings" => {
+                        settings.push(
+                            parse_setting_entry(&key, &value)
+                                .map_err(|e| format!("invalid '[settings] {key}': {e}"))?,
+                        );
                     }
                     _ => {
                         let req = parse_required_entry(&key, &value)?;
@@ -522,6 +535,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             events: lazy_events,
             claims: lazy_claims,
         },
+        settings,
         raw_bytes_len: bytes.len(),
     };
     manifest
@@ -836,6 +850,86 @@ fn inline_required_versions(
         .map_err(|e| format!("'[{section}] {entry}' field 'version': {e}"))
 }
 
+/// Parse one `[settings]` value: `{ type = "...", default = ... }`
+/// (CTX-1195, issue #2010).
+///
+/// `type` is one of `bool` / `int` / `string` / `string-array`; `default`
+/// is the shipped built-in default of exactly that type (bool literal, bare
+/// integer, quoted string, or string array). Any other shape — a bare value
+/// instead of an inline table, an unknown `type`, a type/default mismatch,
+/// or an extra key — fails closed. Bounds live in
+/// [`SettingDecl::validate`](bitty_plugin_host::manifest::SettingDecl::validate),
+/// applied here through [`SettingDecl::new`](bitty_plugin_host::manifest::SettingDecl::new).
+fn parse_setting_entry(key: &str, value: &str) -> Result<SettingDecl, String> {
+    if !value.trim_start().starts_with('{') {
+        return Err(format!(
+            "'[settings] {key}' must be an inline table '{{ type = \"...\", default = ... }}'"
+        ));
+    }
+    let fields =
+        parse_inline_table(value).map_err(|e| format!("invalid '[settings] {key}': {e}"))?;
+    let type_raw = inline_required_string(&fields, "type", "settings", key)?;
+    let kind =
+        SettingKind::parse(&type_raw).map_err(|e| format!("invalid '[settings] {key}': {e}"))?;
+    let default_raw = fields
+        .iter()
+        .find(|(name, _)| name == "default")
+        .map(|(_, raw)| raw.as_str())
+        .ok_or_else(|| format!("'[settings] {key}' is missing 'default = ...'"))?;
+    reject_inline_keys(&fields, &["type", "default"], "settings", key)?;
+    let default = match kind {
+        SettingKind::Bool => match parse_bool(default_raw) {
+            Some(value) => SettingDefault::Bool(value),
+            None => {
+                return Err(format!(
+                    "'[settings] {key}' field 'default' must be 'true' or 'false' for type 'bool', found '{default_raw}'"
+                ));
+            }
+        },
+        SettingKind::Int => SettingDefault::Int(parse_setting_int(default_raw, key)?),
+        SettingKind::String => {
+            if default_raw.trim_start().starts_with('{') {
+                return Err(format!(
+                    "'[settings] {key}' field 'default' must be a string (nested tables are not supported)"
+                ));
+            }
+            SettingDefault::String(
+                parse_string(default_raw)
+                    .map_err(|e| format!("'[settings] {key}' field 'default': {e}"))?,
+            )
+        }
+        SettingKind::StringArray => SettingDefault::Strings(
+            parse_array(default_raw)
+                .map_err(|e| format!("'[settings] {key}' field 'default': {e}"))?,
+        ),
+    };
+    SettingDecl::new(key.to_string(), kind, default)
+        .map_err(|e| format!("invalid '[settings] {key}': {e}"))
+}
+
+/// Parse a `[settings]` integer default: optional leading `-` plus ASCII
+/// digits (fail-closed).
+///
+/// Quoted strings, `+` signs, hex, floats, and empty values are rejected:
+/// integers are bare in real TOML and the subset keeps that shape. Overflow
+/// fails closed.
+fn parse_setting_int(value: &str, key: &str) -> Result<i64, String> {
+    let value = value.trim();
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "'[settings] {key}' field 'default' must be a bare integer for type 'int', found '{value}'"
+        ));
+    }
+    if digits.len() > 19 {
+        return Err(format!(
+            "'[settings] {key}' field 'default' integer is too large"
+        ));
+    }
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("'[settings] {key}' field 'default' integer is too large"))
+}
 /// Parse one `[services.required]` value: string form or `{ version }`.
 ///
 /// Schemas are provider-side only: `args_schema` / `result_schema` keys fail
@@ -1220,6 +1314,121 @@ mod tests {
             minimal_body("xuepoo.ncap")
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn settings_bar_shape_parses() {
+        // Bar-fidelity `[settings]` (CTX-1195): four scalars plus the
+        // `modules` string array, matching the declaration set the manifest
+        // unit tests pin.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"bool\", default = true }}\nedge = {{ type = \"string\", default = \"bottom\" }}\nshow_single = {{ type = \"bool\", default = false }}\nname_max_chars = {{ type = \"int\", default = 32 }}\nmodules = {{ type = \"string-array\", default = [\"workspaces\", \"clock\"] }}\n",
+            minimal_body("bitty-terminal.bar")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("bar settings must parse");
+        assert_eq!(manifest.settings.len(), 5);
+        let by_key = |key: &str| {
+            manifest
+                .settings
+                .iter()
+                .find(|decl| decl.key == key)
+                .unwrap_or_else(|| panic!("missing settings key '{key}'"))
+        };
+        assert_eq!(by_key("show").default, SettingDefault::Bool(true));
+        assert_eq!(
+            by_key("edge").default,
+            SettingDefault::String("bottom".to_string())
+        );
+        assert_eq!(by_key("name_max_chars").default, SettingDefault::Int(32));
+        assert_eq!(
+            by_key("modules").default,
+            SettingDefault::Strings(vec!["workspaces".to_string(), "clock".to_string()])
+        );
+    }
+
+    #[test]
+    fn settings_absent_means_no_declarations() {
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n",
+            minimal_body("xuepoo.plain")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("plain manifest must parse");
+        assert!(manifest.settings.is_empty());
+    }
+
+    #[test]
+    fn settings_hostile_shapes_fail_closed() {
+        // Bare value instead of an inline table.
+        let body = format!("{}\n[settings]\nshow = true\n", minimal_body("xuepoo.bare"));
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Unknown type.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"boolean\", default = true }}\n",
+            minimal_body("xuepoo.badtype")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Missing default.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"bool\" }}\n",
+            minimal_body("xuepoo.nodefault")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Missing type.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ default = true }}\n",
+            minimal_body("xuepoo.notype")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Extra key is field smuggling.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"bool\", default = true, exec = \"evil\" }}\n",
+            minimal_body("xuepoo.extra")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Type/default mismatch.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"bool\", default = \"yes\" }}\n",
+            minimal_body("xuepoo.mismatch")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Int default as a quoted string.
+        let body = format!(
+            "{}\n[settings]\nname_max_chars = {{ type = \"int\", default = \"32\" }}\n",
+            minimal_body("xuepoo.intstr")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Int default as a float.
+        let body = format!(
+            "{}\n[settings]\nname_max_chars = {{ type = \"int\", default = 3.5 }}\n",
+            minimal_body("xuepoo.intfloat")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Array default with a non-string item.
+        let body = format!(
+            "{}\n[settings]\nmodules = {{ type = \"string-array\", default = [\"a\", 7] }}\n",
+            minimal_body("xuepoo.mixarr")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Duplicate keys.
+        let body = format!(
+            "{}\n[settings]\nshow = {{ type = \"bool\", default = true }}\nshow = {{ type = \"bool\", default = false }}\n",
+            minimal_body("xuepoo.dupe")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Invalid key spelling.
+        let body = format!(
+            "{}\n[settings]\nShow = {{ type = \"bool\", default = true }}\n",
+            minimal_body("xuepoo.badkey")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+        // Negative integers are accepted (signed type).
+        let body = format!(
+            "{}\n[settings]\noffset = {{ type = \"int\", default = -12 }}\n",
+            minimal_body("xuepoo.negint")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("negative int must parse");
+        assert_eq!(manifest.settings.len(), 1);
+        assert_eq!(manifest.settings[0].default, SettingDefault::Int(-12));
     }
 
     #[test]

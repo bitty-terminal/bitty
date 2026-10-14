@@ -43,6 +43,7 @@ fn minimal_manifest(id: &str, events: Vec<&str>) -> bitty_plugin_host::PluginMan
             events: events.into_iter().map(|s| s.to_string()).collect(),
             claims: Vec::new(),
         },
+        settings: Vec::new(),
         raw_bytes_len: 256,
     }
 }

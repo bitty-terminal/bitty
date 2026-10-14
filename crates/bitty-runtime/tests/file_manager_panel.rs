@@ -140,6 +140,7 @@ fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
             events: FILE_MANAGER_EVENTS.iter().map(|e| e.to_string()).collect(),
             claims: Vec::new(),
         },
+        settings: Vec::new(),
         raw_bytes_len: 512,
     }
 }

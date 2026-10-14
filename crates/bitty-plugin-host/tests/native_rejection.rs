@@ -52,6 +52,7 @@ fn minimal_manifest(id: &str) -> PluginManifest {
             events: Vec::new(),
             claims: Vec::new(),
         },
+        settings: Vec::new(),
         raw_bytes_len: 256,
     }
 }

@@ -428,18 +428,18 @@ impl OverlayCapture {
             return false;
         }
         if let Some(back) = self.queue.back_mut() {
-            if back.kind == "wheel"
-                && let Some(merged) = coalesce_wheel_text(&back.text, text)
-            {
-                self.next_sequence = self.next_sequence.saturating_add(1);
-                back.sequence = self.next_sequence;
-                back.text = merged;
-                self.wheel_coalesced = self.wheel_coalesced.saturating_add(1);
-                if let Some(owner) = self.owner.as_mut() {
-                    owner.expires_at =
-                        Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+            if back.kind == "wheel" {
+                if let Some(merged) = coalesce_wheel_text(&back.text, text) {
+                    self.next_sequence = self.next_sequence.saturating_add(1);
+                    back.sequence = self.next_sequence;
+                    back.text = merged;
+                    self.wheel_coalesced = self.wheel_coalesced.saturating_add(1);
+                    if let Some(owner) = self.owner.as_mut() {
+                        owner.expires_at =
+                            Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+                    }
+                    return true;
                 }
-                return true;
             }
         }
         self.enqueue("wheel", text)

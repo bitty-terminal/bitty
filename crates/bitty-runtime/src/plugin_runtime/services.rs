@@ -1517,6 +1517,13 @@ pub struct PluginServices {
     /// activation only with `panel.focus` generations; `None` leaves granted
     /// calls failing closed with `E_NOT_IMPLEMENTED`.
     fx_requests: RefCell<Option<Rc<RefCell<FxPulseQueue>>>>,
+    /// Runtime-shared native sensor host (CTX-1199, bitty#2019/#2011/#2016).
+    ///
+    /// Shared at activation with every generation; the broker dispatches
+    /// `bitty-terminal.sensors:system.*.get()` through it host-side (no VM).
+    /// `None` leaves native sensor calls failing closed with
+    /// `E_SERVICE_GONE`, like a parked provider.
+    sensor_host: RefCell<Option<Rc<RefCell<super::system_sensors::host::SensorHost>>>>,
 }
 
 impl PluginServices {
@@ -1578,7 +1585,19 @@ impl PluginServices {
             theme_configure_granted: Cell::new(false),
             theme_requests: RefCell::new(None),
             fx_requests: RefCell::new(None),
+            sensor_host: RefCell::new(None),
         }
+    }
+
+    /// Attach the runtime-shared native sensor host (CTX-1199).
+    ///
+    /// Wired once at activation with every generation; without it native
+    /// `bitty-terminal.sensors` calls fail closed with `E_SERVICE_GONE`.
+    pub fn set_sensor_host(
+        &self,
+        host: Option<Rc<RefCell<super::system_sensors::host::SensorHost>>>,
+    ) {
+        *self.sensor_host.borrow_mut() = host;
     }
 
     /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
@@ -3329,6 +3348,24 @@ impl HostServices for PluginServices {
                 method: method.to_string(),
                 heads: record.heads.clone(),
             });
+        }
+        // CTX-1199: native sensor dispatch (bitty#2019/#2011/#2016). Records
+        // published by the runtime-owned `bitty-terminal.sensors` component
+        // carry no VM: `get()` runs host-side through the shared sensor
+        // host (ceilings and `stale_age_ms` preserved, hide as nil). The
+        // grant gate above already passed, so `granted` is true here; the
+        // host re-checks it for defense in depth. Unwired hosts fail closed
+        // with `E_SERVICE_GONE`, like a parked provider. No new error code,
+        // no control method (read-only by construction).
+        if super::system_sensors::host::SensorHost::is_sensor_provider(&record.provider) {
+            let host = self.sensor_host.borrow().clone();
+            let Some(host) = host else {
+                return Err(service_gone_error(format!(
+                    "service '{iface}' is unavailable"
+                )));
+            };
+            let granted = self.service_heads_covered(&record.heads);
+            return host.borrow_mut().call(&record.iface, method, granted);
         }
         let vm = record
             .vm
@@ -5866,6 +5903,391 @@ mod tests {
                 .expect("optional degrades to nil"),
             None
         );
+    }
+
+    /// Native sensor fixtures (CTX-1199, bitty#2019/#2011/#2016).
+    const SENSOR_CPU_HEAD: &str = "platform.cpu-read";
+    const SENSOR_MEMORY_HEAD: &str = "platform.memory-read";
+    const SENSOR_BATTERY_HEAD: &str = "platform.battery-read";
+
+    #[allow(clippy::type_complexity)]
+    fn sensor_host_with_fixtures(
+        granted: &[&str],
+        cpu_texts: Vec<Option<String>>,
+        mem_texts: Vec<Option<String>>,
+        battery_capacity: Option<&str>,
+        now_ms: u64,
+    ) -> (
+        Rc<RefCell<ServiceDirectory>>,
+        PluginServices,
+        Rc<std::cell::Cell<usize>>,
+        Rc<std::cell::Cell<usize>>,
+        PathBuf,
+    ) {
+        use crate::plugin_runtime::system_sensors::host::{SENSOR_GENERATION, SensorHost};
+        use crate::plugin_runtime::system_sensors::{
+            BATTERY_BACKING_HEAD, CPU_BACKING_HEAD, MEMORY_BACKING_HEAD, SENSOR_PROVIDER,
+            SYSTEM_BATTERY_IFACE, SYSTEM_CPU_IFACE, SYSTEM_MEMORY_IFACE,
+        };
+        let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
+        let host = services();
+        host.set_service_directory(directory.clone());
+        host.set_service_manifest(
+            Vec::new(),
+            vec![
+                (SYSTEM_CPU_IFACE.to_string(), "^1.0".to_string()),
+                (SYSTEM_MEMORY_IFACE.to_string(), "^1.0".to_string()),
+                (SYSTEM_BATTERY_IFACE.to_string(), "^1.0".to_string()),
+            ],
+        );
+        host.set_granted_capabilities(granted.iter().map(|head| (*head).to_string()).collect());
+        for (iface, head) in [
+            (SYSTEM_CPU_IFACE, CPU_BACKING_HEAD),
+            (SYSTEM_MEMORY_IFACE, MEMORY_BACKING_HEAD),
+            (SYSTEM_BATTERY_IFACE, BATTERY_BACKING_HEAD),
+        ] {
+            publish_backed_record(
+                &directory,
+                SENSOR_PROVIDER,
+                SENSOR_GENERATION,
+                iface,
+                "1.0.0",
+                &["get"],
+                &[head],
+            );
+        }
+        let cpu_calls = Rc::new(std::cell::Cell::new(0));
+        let mem_calls = Rc::new(std::cell::Cell::new(0));
+        let cpu_remaining = Rc::new(RefCell::new(cpu_texts.into_iter()));
+        let mem_remaining = Rc::new(RefCell::new(mem_texts.into_iter()));
+        let cpu_probed = Rc::clone(&cpu_calls);
+        let mem_probed = Rc::clone(&mem_calls);
+        let cpu_source: Rc<dyn Fn() -> Option<String>> = Rc::new(move || {
+            cpu_probed.set(cpu_probed.get() + 1);
+            cpu_remaining.borrow_mut().next().unwrap_or(None)
+        });
+        let mem_source: Rc<dyn Fn() -> Option<String>> = Rc::new(move || {
+            mem_probed.set(mem_probed.get() + 1);
+            mem_remaining.borrow_mut().next().unwrap_or(None)
+        });
+        let sysfs_root = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "bitty-sensor-bridge-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp sysfs");
+            if let Some(capacity) = battery_capacity {
+                let bat = dir.join("BAT0");
+                std::fs::create_dir_all(&bat).expect("bat dir");
+                std::fs::write(bat.join("type"), "Battery\n").expect("type");
+                std::fs::write(bat.join("capacity"), format!("{capacity}\n")).expect("capacity");
+                std::fs::write(bat.join("status"), "Discharging\n").expect("status");
+                std::fs::write(bat.join("power_now"), "5000000\n").expect("power");
+            }
+            dir
+        };
+        let sensor = Rc::new(RefCell::new(SensorHost::for_test(
+            cpu_source,
+            mem_source,
+            sysfs_root.clone(),
+            now_ms,
+        )));
+        host.set_sensor_host(Some(sensor));
+        (directory, host, cpu_calls, mem_calls, sysfs_root)
+    }
+
+    #[test]
+    fn sensors_granted_resolve_and_call_serve_live_tables() {
+        use crate::plugin_runtime::system_sensors::{
+            SENSOR_PROVIDER, SYSTEM_BATTERY_IFACE, SYSTEM_CPU_IFACE,
+        };
+        use crate::plugin_runtime::system_sensors::{SYSTEM_MEMORY_IFACE, host::SENSOR_GENERATION};
+        const CPU_A: &str = "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0  50 0 50 400 0 0 0 0 0 0\n";
+        const CPU_B: &str = "cpu  150 0 150 900 0 0 0 0 0 0\ncpu0  100 0 100 400 0 0 0 0 0 0\n";
+        const MEMINFO: &str = "MemTotal:        2097152 kB\nMemAvailable:    1048576 kB\n";
+        let (_, host, _, _, root) = sensor_host_with_fixtures(
+            &[SENSOR_CPU_HEAD, SENSOR_MEMORY_HEAD, SENSOR_BATTERY_HEAD],
+            vec![Some(CPU_A.to_string()), Some(CPU_B.to_string())],
+            vec![Some(MEMINFO.to_string())],
+            Some("63"),
+            0,
+        );
+        for iface in [SYSTEM_CPU_IFACE, SYSTEM_MEMORY_IFACE, SYSTEM_BATTERY_IFACE] {
+            let route = HostServices::service_resolve(&host, iface, None, false)
+                .expect("granted resolves")
+                .expect("route");
+            assert_eq!(route.provider, SENSOR_PROVIDER);
+            assert_eq!(route.generation, SENSOR_GENERATION);
+            assert_eq!(route.methods, vec!["get".to_string()]);
+        }
+        // Memory serves immediately (single-shot); battery serves the sysfs
+        // fallback live; cpu hides on its first poll (baseline, never zero).
+        let memory = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_MEMORY_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("memory serves");
+        assert!(matches!(memory, LuaValue::Table(_)));
+        let battery = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_BATTERY_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("battery serves");
+        match &battery {
+            LuaValue::Table(pairs) => {
+                let state = pairs
+                    .iter()
+                    .find_map(|(k, v)| match (k, v) {
+                        (LuaValue::String(key), LuaValue::String(value)) if key == "state" => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("battery carries state");
+                assert_eq!(state, "discharging");
+            }
+            other => panic!("battery serves a table, got {other:?}"),
+        }
+        let cpu_first = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_CPU_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("cpu first hides as nil");
+        assert_eq!(cpu_first, LuaValue::Nil);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sensors_ungranted_consume_matches_absent() {
+        use crate::plugin_runtime::system_sensors::{SENSOR_PROVIDER, host::SENSOR_GENERATION};
+        use crate::plugin_runtime::system_sensors::{
+            SYSTEM_BATTERY_IFACE, SYSTEM_CPU_IFACE, SYSTEM_MEMORY_IFACE,
+        };
+        let (_, host, cpu_calls, mem_calls, root) = sensor_host_with_fixtures(
+            &[],
+            vec![Some("cpu  1 2 3 4\n".to_string())],
+            vec![Some(
+                "MemTotal: 1024 kB\nMemAvailable: 512 kB\n".to_string(),
+            )],
+            Some("50"),
+            0,
+        );
+        for iface in [SYSTEM_CPU_IFACE, SYSTEM_MEMORY_IFACE, SYSTEM_BATTERY_IFACE] {
+            let error = HostServices::service_resolve(&host, iface, None, false)
+                .expect_err("ungranted must fail closed");
+            assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+            assert_eq!(
+                HostServices::service_resolve(&host, iface, None, true)
+                    .expect("optional degrades to nil"),
+                None,
+                "ungranted resolves nil like an absent service"
+            );
+            let error = HostServices::service_call(
+                &host,
+                SENSOR_PROVIDER,
+                SENSOR_GENERATION,
+                iface,
+                "1.0.0",
+                "get",
+                &LuaValue::Nil,
+            )
+            .expect_err("ungranted call must fail closed as gone");
+            assert_eq!(error.code, "E_SERVICE_GONE");
+        }
+        assert_eq!(cpu_calls.get(), 0, "ungranted never touches cpu source");
+        assert_eq!(mem_calls.get(), 0, "ungranted never touches memory source");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sensors_burst_coalesces_and_stale_hides_as_nil() {
+        use crate::plugin_runtime::system_sensors::{
+            SENSOR_PROVIDER, SYSTEM_MEMORY_IFACE, host::SENSOR_GENERATION,
+        };
+        const MEMINFO: &str = "MemTotal:        2097152 kB\nMemAvailable:    1048576 kB\n";
+        let (_, host, _, mem_calls, root) = sensor_host_with_fixtures(
+            &[SENSOR_MEMORY_HEAD],
+            Vec::new(),
+            vec![Some(MEMINFO.to_string())],
+            None,
+            0,
+        );
+        let first = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_MEMORY_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("serves");
+        assert!(matches!(first, LuaValue::Table(_)));
+        assert_eq!(mem_calls.get(), 1);
+        // Burst inside the 2 s ceiling serves cached without re-reading.
+        for _ in 0..10 {
+            let cached = HostServices::service_call(
+                &host,
+                SENSOR_PROVIDER,
+                SENSOR_GENERATION,
+                SYSTEM_MEMORY_IFACE,
+                "1.0.0",
+                "get",
+                &LuaValue::Nil,
+            )
+            .expect("burst serves cached");
+            assert!(matches!(cached, LuaValue::Table(_)));
+        }
+        assert_eq!(mem_calls.get(), 1, "burst coalesces onto one attempt");
+        // Drive the clock past the three-window horizon: the source now
+        // fails every window (fixture exhausted to None), so last-good
+        // serves stale once, then hides as nil (never zeros).
+        {
+            let sensor = host.sensor_host.borrow().clone().expect("wired");
+            sensor.borrow_mut().set_manual_now_ms(Some(2000));
+        }
+        let stale = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_MEMORY_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("stale serves");
+        match &stale {
+            LuaValue::Table(pairs) => {
+                let age = pairs
+                    .iter()
+                    .find_map(|(k, v)| match (k, v) {
+                        (LuaValue::String(key), LuaValue::Integer(age))
+                            if key == "stale_age_ms" =>
+                        {
+                            Some(*age)
+                        }
+                        _ => None,
+                    })
+                    .expect("stale carries age");
+                assert_eq!(age, 2000);
+            }
+            other => panic!("stale serves a table, got {other:?}"),
+        }
+        {
+            let sensor = host.sensor_host.borrow().clone().expect("wired");
+            sensor.borrow_mut().set_manual_now_ms(Some(6001));
+        }
+        // Advance once more past the window so the gate re-attempts (and
+        // fails) before hiding.
+        {
+            let sensor = host.sensor_host.borrow().clone().expect("wired");
+            sensor.borrow_mut().set_manual_now_ms(Some(8000));
+        }
+        let hidden = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_MEMORY_IFACE,
+            "1.0.0",
+            "get",
+            &LuaValue::Nil,
+        )
+        .expect("hide surfaces as nil");
+        assert_eq!(hidden, LuaValue::Nil);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sensors_carry_no_policy_strings_and_record_calls() {
+        use crate::plugin_runtime::system_sensors::{SENSOR_PROVIDER, SYSTEM_BATTERY_IFACE};
+        use crate::plugin_runtime::system_sensors::{SYSTEM_MEMORY_IFACE, host::SENSOR_GENERATION};
+        const MEMINFO: &str = "MemTotal:        2097152 kB\nMemAvailable:    1048576 kB\n";
+        let (_, host, _, _, root) = sensor_host_with_fixtures(
+            &[SENSOR_MEMORY_HEAD, SENSOR_BATTERY_HEAD],
+            Vec::new(),
+            vec![Some(MEMINFO.to_string())],
+            Some("80"),
+            0,
+        );
+        let ledger = Rc::new(RefCell::new(ServiceCallLedger::new(8)));
+        host.set_service_call_ledger(ledger.clone());
+        for iface in [SYSTEM_MEMORY_IFACE, SYSTEM_BATTERY_IFACE] {
+            let value = HostServices::service_call(
+                &host,
+                SENSOR_PROVIDER,
+                SENSOR_GENERATION,
+                iface,
+                "1.0.0",
+                "get",
+                &LuaValue::Nil,
+            )
+            .expect("serves");
+            let rendered = format!("{value:?}").to_lowercase();
+            for forbidden in [
+                "warning",
+                "critical",
+                "threshold",
+                "alert",
+                "icon",
+                "glyph",
+                "bucket",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "sensor {iface} must not carry '{forbidden}': {rendered}"
+                );
+            }
+        }
+        let calls = ledger.borrow().calls();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(call.provider, SENSOR_PROVIDER);
+            assert!(call.method == "get");
+        }
+        let heads: Vec<Vec<String>> = calls.iter().map(|call| call.heads.clone()).collect();
+        assert!(
+            heads
+                .iter()
+                .any(|heads| heads.contains(&SENSOR_MEMORY_HEAD.to_string()))
+        );
+        assert!(
+            heads
+                .iter()
+                .any(|heads| heads.contains(&SENSOR_BATTERY_HEAD.to_string()))
+        );
+        // Read-only by construction: no control method is published, so any
+        // control spelling fails closed as gone (never smuggled).
+        let error = HostServices::service_call(
+            &host,
+            SENSOR_PROVIDER,
+            SENSOR_GENERATION,
+            SYSTEM_MEMORY_IFACE,
+            "1.0.0",
+            "set",
+            &LuaValue::Nil,
+        )
+        .expect_err("control spelling must fail closed");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -7,6 +7,10 @@
 //! `E_SERVICE_GONE`, `E_SERVICE_INVALID`, `E_SERVICE_UNDECLARED`) through
 //! suspend/resume/dispose and declaration violations. Headless and
 //! Windows-safe (temp dirs only, no processes or sockets).
+//!
+//! CTX-1199: every count includes the three runtime-owned native sensor
+//! records (`system.cpu`/`system.memory`/`system.battery` from
+//! `bitty-terminal.sensors`), so Lua-only expectations shift by three.
 
 mod common;
 
@@ -285,10 +289,10 @@ fn provide_resolve_call_round_trip_with_schemas() {
     assert_eq!(rt.discover().len(), 3);
 
     rt.activate(&calc_id()).expect("provider activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 1);
+    assert_eq!(rt.service_directory().borrow().published_count(), 4);
     rt.activate(&broken_id())
         .expect("broken provider activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    assert_eq!(rt.service_directory().borrow().published_count(), 5);
     rt.activate(&shop_id()).expect("consumer activates");
 
     // Consumer init resolved and called across VMs with schema validation.
@@ -337,7 +341,7 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
     rt.activate(&shop_id()).expect("consumer activates");
 
     rt.suspend(&calc_id()).expect("suspend");
-    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    assert_eq!(rt.service_directory().borrow().published_count(), 5);
     assert_eq!(
         rt.dispatch_command(&shop_id(), "total", &[])
             .expect("dispatch"),
@@ -356,7 +360,7 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
     );
 
     rt.dispose(&calc_id()).expect("dispose");
-    assert_eq!(rt.service_directory().borrow().published_count(), 1);
+    assert_eq!(rt.service_directory().borrow().published_count(), 4);
     assert_eq!(
         rt.dispatch_command(&shop_id(), "total", &[])
             .expect("dispatch"),
@@ -370,7 +374,7 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
     // Reload publishes a new generation: the pre-dispose pinned handle is
     // stale and never hijacked by the replacement.
     rt.activate(&calc_id()).expect("re-activate after dispose");
-    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    assert_eq!(rt.service_directory().borrow().published_count(), 5);
     assert_eq!(
         rt.dispatch_command(&shop_id(), "total", &[])
             .expect("dispatch"),
@@ -462,7 +466,7 @@ return {}
         rt.state(&rogue_id),
         Some(LifecycleState::Failed(_))
     ));
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -702,7 +706,7 @@ return {}
     );
     assert!(err.contains("calc.solo"), "names the iface: {err}");
     assert!(err.contains("heads"), "names the field: {err}");
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -740,7 +744,7 @@ return {}
         store_string(&rt, &spoof_id, "code"),
         Some("E_CAPABILITY_DENIED".to_string())
     );
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1017,7 +1021,7 @@ return {}
     let duet_id = PluginId::new("xuepoo.duet").expect("id");
     let fan_id = PluginId::new("xuepoo.duetfan").expect("id");
     rt.activate(&duet_id).expect("provider activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    assert_eq!(rt.service_directory().borrow().published_count(), 5);
     rt.activate(&fan_id).expect("consumer activates");
     assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
     assert_eq!(store_string(&rt, &fan_id, "pinned"), Some("v1".to_string()));
@@ -1039,7 +1043,7 @@ return {}
     // pin on its release instead of rebinding or breaking.
     rt.dispose(&duet_id).expect("dispose");
     rt.dispose(&fan_id).expect("consumer dispose");
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     rt.activate(&duet_id).expect("re-activate after dispose");
     rt.activate(&fan_id).expect("consumer re-activates");
     assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
@@ -1081,6 +1085,6 @@ return {}
     );
     assert!(err.contains("bitty.echo"), "names the iface: {err}");
     assert!(err.contains("Core-reserved"), "names the rule: {err}");
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     let _ = std::fs::remove_dir_all(&root);
 }

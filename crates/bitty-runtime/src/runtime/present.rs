@@ -774,7 +774,11 @@ impl Runtime {
     /// viewports, float occluders, glyph-clip mismatch (decorated frames
     /// clip glyphs; the retained clip must equal the live one),
     /// per-view background images, viewport/grid dimension mismatch,
-    /// out-of-range or degenerate motions, and multi-region motions.
+    /// out-of-range or degenerate motions, multi-region motions, and
+    /// companion print damage outside the exposed band and margin row
+    /// (a translated companion rect repaints fresh but never drops the
+    /// retained pre-print primitives at those cells, so a stale glyph
+    /// would paint over the fresh fill).
     /// Same-region motions from the tick's batches sum (per-action
     /// batching would otherwise decline every real scroll frame);
     /// cross-tick accumulation merges are the frame-merge follow-up, not
@@ -974,14 +978,28 @@ impl Runtime {
                 _ => {}
             }
         }
+        // Retained primitives inside a companion rect show pre-print
+        // content and are never dropped by the full-width `covered`
+        // rule below, so a stale glyph would paint over the fresh
+        // fill. Only companion damage the band or margin row already
+        // owns may ride the fast path; anything else declines.
+        for rect in &translated {
+            let in_band = rect.top >= exposed_top && rect.bottom <= exposed_bottom;
+            let on_margin = rect.top == margin_row && rect.bottom == margin_row;
+            if !in_band && !on_margin {
+                return None;
+            }
+        }
         regions.extend(translated);
         // Full-width repaint rows in window pixels: the band plus the
         // margin row. A shifted primitive fully inside one of these is
         // dropped (the fresh render owns those pixels); anything else is
         // kept unless it is provably stale (see below). Kept primitives
-        // always carry correct post-scroll values — shifting preserves
-        // content adjacency — so kept/fresh overlaps agree and paint
-        // order between them is irrelevant.
+        // always carry correct post-scroll values: the guard above
+        // declined every companion overwrite outside these rows, so no
+        // kept cell was modified by the tick — shifting preserves
+        // content adjacency — and kept/fresh overlaps agree, making
+        // paint order between them irrelevant.
         let cell = self.live_cell_metrics();
         let fullwidth_repaint: Vec<bitty_render::geometry::RectPx> = (exposed_top..=exposed_bottom)
             .chain(std::iter::once(margin_row))
@@ -5173,7 +5191,14 @@ mod scroll_region_copy_tests {
     /// rows, settle the retained leaf, hide the cursor (no blink-phase
     /// overlay divergence), then scroll with trailing prints — the
     /// scroll-storm shape of motion plus companion print damage plus
-    /// scrollback ranges.
+    /// scrollback ranges. The scrolls run first as bare line feeds and
+    /// the prints land after them via cursor-relative moves, so every
+    /// companion addresses the exposed band directly (suffix zero) and
+    /// the fast path stays engaged: print-then-scroll companions ride
+    /// upward out of the band and fail closed (pinned by the decline
+    /// test below). No grid height is assumed (the bottom address
+    /// clamps, the rest is relative), and the tick stays inside the
+    /// damage-history window.
     fn drive(rt: &mut Runtime) {
         for row in 0..24u8 {
             let line = format!("row-{row:02} ABCDEFGH\r\n");
@@ -5182,10 +5207,13 @@ mod scroll_region_copy_tests {
         rt.tick();
         rt.handle_pty_bytes(b"\x1b[?25l");
         rt.tick();
-        for row in 0..3u8 {
-            let line = format!("new-{row:02} 01234567\r\n");
-            rt.handle_pty_bytes(line.as_bytes());
-        }
+        rt.handle_pty_bytes(b"\x1b[99;1H");
+        rt.handle_pty_bytes(b"\n\n\n");
+        rt.handle_pty_bytes(b"new-00 01234567");
+        rt.handle_pty_bytes(b"\x1b[1A");
+        rt.handle_pty_bytes(b"new-01 01234567");
+        rt.handle_pty_bytes(b"\x1b[1A");
+        rt.handle_pty_bytes(b"new-02 01234567");
     }
 
     #[test]
@@ -5236,6 +5264,69 @@ mod scroll_region_copy_tests {
             "fast path must examine fewer cells (fast {} vs full {})",
             fast_stats.cells_examined,
             full_stats.cells_examined
+        );
+    }
+
+    /// Identical settle, then a mid-screen rewrite in the same tick as
+    /// the scroll: the rewritten row rides the scroll to a post-tick
+    /// row outside the exposed band and the margin row. Deliberately
+    /// small (a 4-cell overwrite, bare-LF scrolls): the tick must stay
+    /// inside the damage-history window or `damage_since` falls back
+    /// to a full-grid rectangle and the fast path never engages.
+    fn drive_with_mid_screen_rewrite(rt: &mut Runtime) {
+        for row in 0..24u8 {
+            let line = format!("row-{row:02} ABCDEFGH\r\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        rt.tick();
+        rt.handle_pty_bytes(b"\x1b[?25l");
+        rt.tick();
+        // Overwrite four mid-screen cells (pre-shift row 10), then
+        // scroll the grid three lines in the same tick. The bottom
+        // address clamps, so no grid height is assumed.
+        rt.handle_pty_bytes(b"\x1b[11;1H");
+        rt.handle_pty_bytes(b"ZZZZ");
+        rt.handle_pty_bytes(b"\x1b[99;1H");
+        rt.handle_pty_bytes(b"\n\n\n");
+    }
+
+    #[test]
+    fn scroll_fast_path_declines_out_of_band_companion_rewrite() {
+        // PX-6182 (CodeRabbit PR #2080 inline Major): a translated
+        // companion rect outside band+margin repaints fresh but never
+        // drops the retained pre-print glyph, which paints over the
+        // fresh fill. Fail-closed: decline to a full render, so the
+        // frame still matches a forced full render with no work saved.
+        let mut fast = runtime();
+        drive_with_mid_screen_rewrite(&mut fast);
+        let mut full = runtime();
+        drive_with_mid_screen_rewrite(&mut full);
+        full.pending_full_redraw = true;
+        let fast_stats = fast.tick().expect("scroll tick must present");
+        let full_stats = full.tick().expect("scroll tick must present");
+        let (fast_rgba, full_rgba) = (fast.headless_rgba(), full.headless_rgba());
+        if fast_rgba != full_rgba {
+            if let (Some(a), Some(b)) = (fast_rgba.as_ref(), full_rgba.as_ref()) {
+                let w = fast.present_plan_extent().width as usize;
+                let first = a
+                    .iter()
+                    .zip(b.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(usize::MAX);
+                panic!(
+                    "first diff byte {} (px {},{}); fast cells {} full cells {}",
+                    first,
+                    (first / 4) % w,
+                    (first / 4) / w,
+                    fast_stats.cells_examined,
+                    full_stats.cells_examined,
+                );
+            }
+            panic!("frame mismatch with no rgba on one side");
+        }
+        assert_eq!(
+            fast_stats.cells_examined, full_stats.cells_examined,
+            "out-of-band companion must decline the fast path (fail-closed full render)"
         );
     }
 }

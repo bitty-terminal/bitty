@@ -272,6 +272,12 @@ pub struct State {
     damage_history: VecDeque<Damage>,
     batch_rects: Vec<DamageRect>,
     batch_scroll_events: Vec<(u64, u64)>,
+    /// Scroll-region line motions accumulated in the current batch as
+    /// `(top, bottom, lines)` (foot `scroll_damage` pattern, CTX-1207):
+    /// rows `[top..=bottom]` moved by `lines` (positive: content moved
+    /// up). Merged per region at batch close; the exposed rows repaint
+    /// while the retained span is copied downstream.
+    batch_scroll_moves: Vec<(u16, u16, i32)>,
     telemetry: TelemetryCounters,
     images: ImageStore,
     /// Kitty graphics placements + animation descriptors (CTX-0950).
@@ -332,6 +338,7 @@ impl State {
             damage_history: VecDeque::new(),
             batch_rects: Vec::new(),
             batch_scroll_events: Vec::new(),
+            batch_scroll_moves: Vec::new(),
             telemetry: TelemetryCounters::default(),
             images: ImageStore::new(),
             kitty_placements: PlacementStore::new(),
@@ -614,6 +621,7 @@ impl State {
         self.damage_history.push_back(damage.clone());
         self.batch_rects.clear();
         self.batch_scroll_events.clear();
+        self.batch_scroll_moves.clear();
         debug_assert!(
             self.check_invariants().is_ok(),
             "RFC invariants violated after resize: {:?}",
@@ -867,6 +875,8 @@ impl State {
             .sum();
         let batch_rects = self.batch_rects.capacity() * std::mem::size_of::<DamageRect>();
         let batch_scrolls = self.batch_scroll_events.capacity() * std::mem::size_of::<(u64, u64)>();
+        let batch_moves =
+            self.batch_scroll_moves.capacity() * std::mem::size_of::<(u16, u16, i32)>();
         screens
             + scrollback
             + tabs
@@ -882,6 +892,7 @@ impl State {
             + damage_regions
             + batch_rects
             + batch_scrolls
+            + batch_moves
     }
 
     /// Rehydrates scrollback history from plain-text lines (CTX-0393 session
@@ -1574,8 +1585,9 @@ impl State {
     fn finalize_batch(&mut self) -> Damage {
         let rects = std::mem::take(&mut self.batch_rects);
         let scroll_events = std::mem::take(&mut self.batch_scroll_events);
+        let scroll_moves = std::mem::take(&mut self.batch_scroll_moves);
         let (rows, cols) = (self.height as u16, self.width as u16);
-        let regions = coalesce(rects, scroll_events, rows, cols);
+        let regions = coalesce(rects, scroll_events, scroll_moves, rows, cols);
         self.generation += 1;
         let damage = Damage {
             generation: self.generation,
@@ -2200,7 +2212,10 @@ impl State {
     /// scroll regions (animation ticks never scroll); collapsing to one
     /// bump only drops duplicate history batches.
     pub fn finalize_pending_damage(&mut self) -> bool {
-        if self.batch_rects.is_empty() && self.batch_scroll_events.is_empty() {
+        if self.batch_rects.is_empty()
+            && self.batch_scroll_events.is_empty()
+            && self.batch_scroll_moves.is_empty()
+        {
             return false;
         }
         let _ = self.finalize_batch();
@@ -2899,7 +2914,9 @@ impl State {
             n as usize,
             &erase,
         );
-        self.damage_grid_rect(row, 0, self.scroll_region_bottom, self.width as u16 - 1);
+        // Inserted blanks push region rows down: a scroll motion with the
+        // exposed rows at the top (CTX-1207 region-copy).
+        self.damage_scroll_move(row, self.scroll_region_bottom, -(n as i32));
     }
 
     fn delete_lines(&mut self, n: u16) {
@@ -2917,7 +2934,9 @@ impl State {
             n as usize,
             &erase,
         );
-        self.damage_grid_rect(row, 0, self.scroll_region_bottom, self.width as u16 - 1);
+        // Removed rows pull region rows up: a scroll motion with the
+        // exposed rows at the bottom (CTX-1207 region-copy).
+        self.damage_scroll_move(row, self.scroll_region_bottom, n as i32);
     }
 
     fn scroll_up_region(&mut self, n: u16) {
@@ -2939,19 +2958,15 @@ impl State {
         }
         // Kitty placements scroll with their rows (CTX-0950): only rows
         // entirely inside the region move; rows pushed out clip away.
-        // The region damage below covers moved and removed spans.
+        // The scroll motion below covers the copy; the exposed rows
+        // repaint from the batch's coalesced damage.
         self.kitty_placements.scroll_up(
             u32::from(self.scroll_region_top),
             u32::from(self.scroll_region_bottom),
             u32::from(n),
             self.alt_screen_active(),
         );
-        self.damage_grid_rect(
-            self.scroll_region_top,
-            0,
-            self.scroll_region_bottom,
-            self.width as u16 - 1,
-        );
+        self.damage_scroll_move(self.scroll_region_top, self.scroll_region_bottom, n as i32);
     }
 
     fn scroll_down_region(&mut self, n: u16) {
@@ -2974,12 +2989,10 @@ impl State {
             u32::from(n),
             self.alt_screen_active(),
         );
-        let last_col = self.width as u16 - 1;
-        self.damage_grid_rect(
+        self.damage_scroll_move(
             self.scroll_region_top,
-            0,
             self.scroll_region_bottom,
-            last_col,
+            -(n as i32),
         );
     }
 
@@ -3458,6 +3471,21 @@ impl State {
             bottom,
             right,
         });
+    }
+
+    /// Records scroll-region line motion for the batch (foot
+    /// `scroll_damage` pattern, CTX-1207): rows `[top..=bottom]` moved by
+    /// `lines` (positive: content moved up, exposed rows at the bottom;
+    /// negative: moved down, exposed at the top). Downstream copies the
+    /// retained span and repaints only the exposed rows. Zero-line and
+    /// inverted motions record nothing: the grid calls are already exact
+    /// no-ops for `n == 0`, and emitting damage for them would wake the
+    /// frame-on-demand present for an unchanged grid.
+    fn damage_scroll_move(&mut self, top: u16, bottom: u16, lines: i32) {
+        if lines == 0 || top > bottom {
+            return;
+        }
+        self.batch_scroll_moves.push((top, bottom, lines));
     }
 
     fn damage_row_tail(&mut self, row: u16, from_col: u16) {

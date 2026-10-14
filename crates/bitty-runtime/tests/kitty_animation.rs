@@ -789,6 +789,9 @@ fn tick_damages_single_animating_image_exactly_once() {
             bitty_term_state::DamagedRegion::Scrollback { .. } => {
                 panic!("advance must not scroll, got {region:?}")
             }
+            bitty_term_state::DamagedRegion::Scroll { .. } => {
+                panic!("advance must not scroll, got {region:?}")
+            }
         }
     }
 }
@@ -818,6 +821,9 @@ fn damage_scopes_to_animating_placements_only() {
                 "damage must stay inside the animating rows 0..1, got {rect:?}"
             ),
             bitty_term_state::DamagedRegion::Scrollback { .. } => {
+                panic!("advance must not scroll, got {region:?}")
+            }
+            bitty_term_state::DamagedRegion::Scroll { .. } => {
                 panic!("advance must not scroll, got {region:?}")
             }
         }

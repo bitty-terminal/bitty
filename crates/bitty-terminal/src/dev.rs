@@ -1458,6 +1458,9 @@ fn format_region(region: &bitty_term_state::DamagedRegion) -> String {
         } => {
             format!("scrollback first_line_id={first_line_id} count={count}")
         }
+        bitty_term_state::DamagedRegion::Scroll { top, bottom, lines } => {
+            format!("scroll {top}..={bottom} lines={lines}")
+        }
     }
 }
 

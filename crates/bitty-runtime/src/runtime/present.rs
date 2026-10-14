@@ -308,6 +308,58 @@ struct RingFrameContext {
 // Every helper below is total: products accumulate in `u64`, sums in
 // `i64`, results clamp to the `i32`/`u32` ranges.
 
+/// Leaf-loop inputs for the CTX-1207 scroll fast path. Bundled so the
+/// helper stays under clippy's argument limit (same pattern as the
+/// state-side `KittyCommand` bundle).
+struct ScrollShiftInput<'a> {
+    view_id: ViewId,
+    frame: &'a layout_focus::PresentFrame,
+    leaf_damage: &'a [DamagedRegion],
+    view_snapshot: &'a Snapshot,
+    base_snap: &'a Snapshot,
+    view_scroll_offset: usize,
+    origin_px: (i32, i32),
+    fade: f32,
+    frame_clip: Option<bitty_render::grid::RoundedClip>,
+    higher_floats: &'a [bitty_render::geometry::RectPx],
+    scrolled_viewport: bool,
+    full_frame: bool,
+}
+
+/// Shifted retained primitives for one scrolled leaf (CTX-1207
+/// region-copy): the retained span moved by the scroll delta, plus the
+/// fresh repaint regions (exposed band + companion print damage from the
+/// same tick). Shifting primitives — not pixels — keeps glyph overhang
+/// byte-exact, because each glyph carries its geometry across the move.
+struct ScrollShift {
+    /// Fresh repaint regions in leaf-local grid coordinates.
+    regions: Vec<DamageRect>,
+    /// Retained fills shifted by the scroll delta (window px, translated).
+    fills: Vec<bitty_render::grid::FillRect>,
+    /// Retained glyphs shifted by the scroll delta (window px, translated).
+    glyphs: Vec<bitty_render::grid::GlyphInstance>,
+}
+
+/// Leaf-local grid damage rectangle to window-pixel rectangle (CTX-1207).
+/// Total like the CTX-0253 helpers: `i64` intermediates, clamped into
+/// `i32`/`u32` ranges, so hostile cell metrics cannot wrap.
+fn damage_rect_to_window_px(
+    rect: &DamageRect,
+    origin: (i32, i32),
+    cell: CellMetrics,
+) -> bitty_render::geometry::RectPx {
+    let x = i64::from(origin.0) + i64::from(rect.left) * i64::from(cell.width);
+    let y = i64::from(origin.1) + i64::from(rect.top) * i64::from(cell.height);
+    let w = (i64::from(rect.right) - i64::from(rect.left) + 1) * i64::from(cell.width);
+    let h = (i64::from(rect.bottom) - i64::from(rect.top) + 1) * i64::from(cell.height);
+    bitty_render::geometry::RectPx::new(
+        x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        u32::try_from(w.max(0)).unwrap_or(u32::MAX),
+        u32::try_from(h.max(0)).unwrap_or(u32::MAX),
+    )
+}
+
 /// Saturating `i32` add for translated rect/glyph destinations.
 pub(super) fn px_add(a: i32, b: i32) -> i32 {
     a.saturating_add(b)
@@ -704,6 +756,307 @@ pub(super) fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Sn
 }
 
 impl Runtime {
+    /// CTX-1207 scroll fast path: shift the retained leaf primitives by a
+    /// scroll-region motion (region-copy) and repaint only the exposed band
+    /// plus companion print damage (damage-only repaint).
+    ///
+    /// Soundness: [`GridRenderer::render`] places every glyph as a pure
+    /// function of its row, column, cell content, and font metrics (no
+    /// cursor- or neighbour-dependent shaping on this path), so a shifted
+    /// retained primitive is bit-identical to a freshly placed one —
+    /// including glyph overhang, which travels with its glyph instead of
+    /// being clipped at a pixel-copy boundary. Fresh repaints are always
+    /// correct (they render the post-scroll snapshot); stale-coordinate
+    /// companion rects can only over-damage, never under-damage.
+    ///
+    /// Every condition is fail-closed to `None` (the caller re-renders the
+    /// leaf in full): full-frame invalidation, scrollback-composited
+    /// viewports, float occluders, glyph-clip mismatch (decorated frames
+    /// clip glyphs; the retained clip must equal the live one),
+    /// per-view background images, viewport/grid dimension mismatch,
+    /// out-of-range or degenerate motions, and multi-region motions.
+    /// Same-region motions from the tick's batches sum (per-action
+    /// batching would otherwise decline every real scroll frame);
+    /// cross-tick accumulation merges are the frame-merge follow-up, not
+    /// smuggled here. Atlas growth mid-render is detected by the caller
+    /// via the epoch check and falls back the same way (kept UVs would be
+    /// stale).
+    fn scroll_retained_shift(&self, input: ScrollShiftInput<'_>) -> Option<ScrollShift> {
+        let ScrollShiftInput {
+            view_id,
+            frame,
+            leaf_damage,
+            view_snapshot,
+            base_snap,
+            view_scroll_offset,
+            origin_px,
+            fade,
+            frame_clip,
+            higher_floats,
+            scrolled_viewport,
+            full_frame,
+        } = input;
+        if full_frame || scrolled_viewport || !higher_floats.is_empty() {
+            return None;
+        }
+        // Scroll motions merged across the tick's batches: every action
+        // finalizes its own batch, so one tick's damage carries one motion
+        // per scroll action. Same-region motions sum (the foot
+        // `term_damage_scroll` pattern applied at consumption); companion
+        // grid rectangles (prints from the same tick) repaint alongside
+        // the band, and scrollback ranges ride along (viewport paint
+        // ignores them). Different regions, a zero net motion, or a net
+        // motion reaching the region height decline to the full path;
+        // cross-tick accumulation merges are the frame-merge follow-up,
+        // not smuggled here.
+        let mut region: Option<(u16, u16)> = None;
+        let mut net_lines: i32 = 0;
+        for region_damage in leaf_damage.iter() {
+            if let DamagedRegion::Scroll { top, bottom, lines } = region_damage {
+                let (top, bottom) = (top.min(bottom), top.max(bottom));
+                let (top, bottom) = (*top, *bottom);
+                match region {
+                    Some((known_top, known_bottom))
+                        if known_top == top && known_bottom == bottom =>
+                    {
+                        net_lines = net_lines.saturating_add(*lines);
+                    }
+                    Some(_) => return None,
+                    None => {
+                        region = Some((top, bottom));
+                        net_lines = *lines;
+                    }
+                }
+            }
+        }
+        let (top, bottom) = region?;
+        let lines = net_lines;
+        let height = u32::from(bottom) - u32::from(top) + 1;
+        let moved = lines.unsigned_abs();
+        if moved == 0 || moved >= height {
+            return None;
+        }
+        if view_scroll_offset != 0 {
+            return None;
+        }
+        // The motion addresses origin-grid coordinates, so the viewport
+        // must be the whole origin grid (no scrollback-composited viewport,
+        // no crop/pad) and the allocation must match it.
+        if view_snapshot.width != base_snap.width || view_snapshot.height != base_snap.height {
+            return None;
+        }
+        if usize::from(frame.cols) != base_snap.width || usize::from(frame.rows) != base_snap.height
+        {
+            return None;
+        }
+        if bottom as usize >= view_snapshot.height || view_snapshot.height == 0 {
+            return None;
+        }
+        // Full-grid-height motions only. Sub-region scrolls (IL/DL,
+        // DECSTBM) keep rows outside the region stationary, and a retained
+        // primitive records no cell row — only its destination — so a
+        // glyph overhanging the region boundary cannot be attributed to
+        // the moving or the stationary side. Full-height motion has no
+        // stationary rows, which removes the ambiguity; sub-region support
+        // is follow-up work alongside frame-merge.
+        if top != 0 || bottom as usize != view_snapshot.height - 1 {
+            return None;
+        }
+        let retained = self.presented_leaf_frames.get(&view_id)?;
+        if retained.origin != (frame.content.x, frame.content.y) {
+            return None;
+        }
+        if retained.scroll_offset != view_scroll_offset || retained.fade_factor != fade {
+            return None;
+        }
+        // Decorated frames clip glyphs to the content ring; a retained
+        // clip from an older geometry must never ride a copy, so every
+        // kept glyph must already carry the live clip (square frames
+        // carry none on either side).
+        if retained.glyphs.iter().any(|glyph| glyph.clip != frame_clip) {
+            return None;
+        }
+        // A per-view background image paints the full content rect every
+        // frame and does not scroll with the grid; leave those leaves on
+        // the full path. (The window image paints behind the grid and is
+        // unaffected.)
+        if self.config.has_background_images() && self.view_background_for(view_id).image.is_some()
+        {
+            return None;
+        }
+        // Exposed band plus one margin row on the scrolled-out side, all
+        // full width, plus companion print damage translated to
+        // post-tick coordinates — in leaf-local grid coordinates for one
+        // partial render call. Translation matters: every action finalizes
+        // its own batch, so a print recorded before a same-tick scroll
+        // addresses pre-shift rows (the print rides the scroll to its post
+        // position, which the retained pre-tick primitives cannot carry).
+        // A backward pass accumulates the suffix scroll delta and shifts
+        // each grid rectangle into post coordinates; clamped to the grid
+        // (clamping only over-damages — fresh renders are always correct —
+        // and fully departed rectangles are dropped). The margin row
+        // repaints the boundary the copy cannot prove: scrolled-out glyph
+        // overhang and surviving cells whose bitmap starts in the vacated
+        // rows. Companion rectangles repaint alongside (partial width is
+        // fine for painting; only full-width rows gate the drop rule
+        // below).
+        let (exposed_top, exposed_bottom) = ScrollCopy { top, bottom, lines }.exposed_rows();
+        let grid_h = view_snapshot.height;
+        // Full-height motion (gated above), so `grid_h >= 1` and the margin
+        // row below always exists inside the grid.
+        let margin_row: u16 = if lines > 0 {
+            0
+        } else {
+            (grid_h - 1).min(usize::from(u16::MAX)) as u16
+        };
+        let last_col = view_snapshot
+            .width
+            .saturating_sub(1)
+            .min(usize::from(u16::MAX)) as u16;
+        let grid_last_row = (grid_h - 1).min(usize::from(u16::MAX)) as u16;
+        let mut regions = vec![
+            DamageRect {
+                top: exposed_top,
+                left: 0,
+                bottom: exposed_bottom,
+                right: last_col,
+            },
+            DamageRect {
+                top: margin_row,
+                left: 0,
+                bottom: margin_row,
+                right: last_col,
+            },
+        ];
+        // Suffix scroll delta in lines (post = pre - suffix for motion in
+        // the merged region; every motion here shares it by construction).
+        let mut suffix: i32 = 0;
+        let mut translated: Vec<DamageRect> = Vec::new();
+        for region_damage in leaf_damage.iter().rev() {
+            match region_damage {
+                DamagedRegion::Scroll { lines, .. } => {
+                    suffix = suffix.saturating_add(*lines);
+                }
+                DamagedRegion::Grid(rect) => {
+                    let shift_row = |row: u16| -> Option<u16> {
+                        let post = i64::from(row) - i64::from(suffix);
+                        if post < 0 || post > i64::from(grid_last_row) {
+                            None
+                        } else {
+                            Some(post as u16)
+                        }
+                    };
+                    match (shift_row(rect.top), shift_row(rect.bottom)) {
+                        (Some(top), Some(bottom)) => translated.push(DamageRect {
+                            top: top.min(bottom),
+                            left: rect.left,
+                            bottom: top.max(bottom),
+                            right: rect.right,
+                        }),
+                        // Partially departed rectangles clamp to the grid:
+                        // over-damage only, never under-damage.
+                        (Some(top), None) => translated.push(DamageRect {
+                            top,
+                            left: rect.left,
+                            bottom: grid_last_row,
+                            right: rect.right,
+                        }),
+                        (None, Some(bottom)) => translated.push(DamageRect {
+                            top: 0,
+                            left: rect.left,
+                            bottom,
+                            right: rect.right,
+                        }),
+                        // Fully departed: its content left the viewport.
+                        (None, None) => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        regions.extend(translated);
+        // Full-width repaint rows in window pixels: the band plus the
+        // margin row. A shifted primitive fully inside one of these is
+        // dropped (the fresh render owns those pixels); anything else is
+        // kept unless it is provably stale (see below). Kept primitives
+        // always carry correct post-scroll values — shifting preserves
+        // content adjacency — so kept/fresh overlaps agree and paint
+        // order between them is irrelevant.
+        let cell = self.live_cell_metrics();
+        let fullwidth_repaint: Vec<bitty_render::geometry::RectPx> = (exposed_top..=exposed_bottom)
+            .chain(std::iter::once(margin_row))
+            .map(|row| {
+                damage_rect_to_window_px(
+                    &DamageRect {
+                        top: row,
+                        left: 0,
+                        bottom: row,
+                        right: last_col,
+                    },
+                    origin_px,
+                    cell,
+                )
+            })
+            .collect();
+        let covered = |rect: &bitty_render::geometry::RectPx| {
+            fullwidth_repaint
+                .iter()
+                .any(|fresh| fresh.contains_rect(rect))
+        };
+        let dy = -(i64::from(lines)) * i64::from(cell.height);
+        let shift_y = |y: i32| -> i32 {
+            (i64::from(y) + dy).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        // Pre-shift destination row in content coordinates (Euclidean, so
+        // above-content destinations classify stale, never surviving).
+        // Fills sit exactly on their cell row; glyph bitmaps may start up
+        // to one row off their cell (bearings/overhang), so glyphs carry
+        // a one-row margin. Anything beyond one row is pathological and
+        // documented as out of scope.
+        let dest_row = |y: i32| -> i64 {
+            (i64::from(y) - i64::from(origin_px.1)).div_euclid(i64::from(cell.height).max(1))
+        };
+        let grid_h_i64 = grid_h as i64;
+        let stale = |pre_row: i64, is_glyph: bool| -> bool {
+            if lines > 0 {
+                pre_row < i64::from(moved) + (is_glyph as i64)
+            } else {
+                pre_row > grid_h_i64 - 1 - i64::from(moved) - (is_glyph as i64)
+            }
+        };
+        let mut fills = Vec::with_capacity(retained.fills.len());
+        for fill in &retained.fills {
+            let mut kept = fill.clone();
+            kept.rect.y = shift_y(kept.rect.y);
+            // Covered rows repaint fresh; provably scrolled-out rows are
+            // gone. Anything else shifts with its content row.
+            if covered(&kept.rect) || stale(dest_row(fill.rect.y), false) {
+                continue;
+            }
+            fills.push(kept);
+        }
+        let mut glyphs = Vec::with_capacity(retained.glyphs.len());
+        for glyph in &retained.glyphs {
+            let mut kept = glyph.clone();
+            kept.dest[1] = shift_y(kept.dest[1]);
+            let bounds = bitty_render::geometry::RectPx::new(
+                kept.dest[0],
+                kept.dest[1],
+                kept.size[0],
+                kept.size[1],
+            );
+            if covered(&bounds) || stale(dest_row(glyph.dest[1]), true) {
+                continue;
+            }
+            glyphs.push(kept);
+        }
+        Some(ScrollShift {
+            regions,
+            fills,
+            glyphs,
+        })
+    }
+
     /// Returns the in-memory RGBA buffer of the last presented headless frame,
     /// if any (premultiplied, `width*height*4` bytes, row-major RGBA).
     #[must_use]
@@ -2139,24 +2492,75 @@ impl Runtime {
                     viewport_snapshot(base_snap, frame.cols, frame.rows)
                 };
 
-                // A re-rendered leaf is redrawn in full. Sub-pane partial
-                // merges are deliberately not attempted: retained glyphs can
-                // paint outside their cell (metric overhang), so intersecting
-                // them with sub-cell damage would under-damage neighbouring
-                // cells. Pane granularity is the containment unit and
+                // A re-rendered leaf is redrawn in full, except for the
+                // CTX-1207 scroll fast path: a single scroll-region motion
+                // shifts the retained primitives (region-copy) and repaints
+                // only the exposed band plus companion print damage
+                // (damage-only repaint). Arbitrary sub-pane partial merges
+                // stay off: retained glyphs can paint outside their cell
+                // (metric overhang), so intersecting them with sub-cell
+                // damage would under-damage neighbouring cells — the scroll
+                // motion is the proven exception (shifted primitives are
+                // bit-identical to fresh placement, overhang included).
+                // Pane granularity stays the containment unit otherwise and
                 // over-damage stays the only failure direction.
-                let damage = Damage {
-                    generation: current_gen,
-                    regions: vec![DamagedRegion::Grid(DamageRect::full(
-                        view_snapshot.height as u16,
-                        view_snapshot.width as u16,
-                    ))]
-                    .into_boxed_slice(),
+                let mut shift = self.scroll_retained_shift(ScrollShiftInput {
+                    view_id,
+                    frame,
+                    leaf_damage: &leaf_damage,
+                    view_snapshot: &view_snapshot,
+                    base_snap,
+                    view_scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
+                    origin_px: (origin_px_x, origin_px_y),
+                    fade,
+                    frame_clip,
+                    higher_floats: &higher_floats,
+                    scrolled_viewport: scrolled,
+                    full_frame,
+                });
+                let mut damage = match &shift {
+                    Some(shift) => Damage {
+                        generation: current_gen,
+                        regions: shift
+                            .regions
+                            .iter()
+                            .map(|rect| DamagedRegion::Grid(*rect))
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    },
+                    None => Damage {
+                        generation: current_gen,
+                        regions: vec![DamagedRegion::Grid(DamageRect::full(
+                            view_snapshot.height as u16,
+                            view_snapshot.width as u16,
+                        ))]
+                        .into_boxed_slice(),
+                    },
                 };
-                let list = match self.renderer.render(&view_snapshot, &damage) {
+                let epoch_before = self.renderer.atlas_epoch();
+                let mut list = match self.renderer.render(&view_snapshot, &damage) {
                     Ok(list) => list,
                     Err(_) => continue,
                 };
+                if shift.is_some() && self.renderer.atlas_epoch() != epoch_before {
+                    // Atlas growth (or reset) mid-render leaves the shifted
+                    // UVs stale while the fresh list is already healed; a
+                    // full re-render heals the leaf the same way. Rare and
+                    // bounded: at most two renders for this leaf.
+                    shift = None;
+                    damage = Damage {
+                        generation: current_gen,
+                        regions: vec![DamagedRegion::Grid(DamageRect::full(
+                            view_snapshot.height as u16,
+                            view_snapshot.width as u16,
+                        ))]
+                        .into_boxed_slice(),
+                    };
+                    list = match self.renderer.render(&view_snapshot, &damage) {
+                        Ok(list) => list,
+                        Err(_) => continue,
+                    };
+                }
                 // Issue #1409 (CTX-0797): the first leaf of this attempt fixes
                 // the atlas epoch every glyph slot in the frame must resolve
                 // against. `render` is internally frame-consistent, but a later
@@ -2243,6 +2647,14 @@ impl Runtime {
                     }
                 }
                 built.needs_draw |= leaf_painted || !fills.is_empty() || !glyphs.is_empty();
+                // CTX-1207: the shifted retained primitives paint beneath
+                // the fresh partial list, which owns every repaint pixel
+                // (dropped intersections guarantee no double-paint).
+                if let Some(shift) = shift {
+                    fills = shift.fills.into_iter().chain(fills).collect();
+                    glyphs = shift.glyphs.into_iter().chain(glyphs).collect();
+                }
+                built.needs_draw |= !fills.is_empty() || !glyphs.is_empty();
                 // CTX-1165 (#1993): the retained store keeps the full leaf so
                 // a moved upper float never strands a filtered reuse. Only the
                 // combined frame drops glyphs under higher floats.
@@ -4731,6 +5143,103 @@ mod content_padding_tests {
 
 // CTX-0979: Core workspace bar overlay tests deleted with
 // `overlay_status_bar` (Core draws no workspace display).
+#[cfg(test)]
+mod scroll_region_copy_tests {
+    //! CTX-1207 (#2077): scroll region-copy + damage-only repaint.
+    //!
+    //! A scrolled leaf shifts its retained primitives by the motion and
+    //! repaints only the exposed band instead of re-rendering the full
+    //! leaf. Byte equality of the headless frame against a forced
+    //! full-render tick proves no tearing; the `cells_examined` delta
+    //! proves the saved placement work.
+    use super::*;
+    use crate::runtime::AnimationKind;
+
+    /// Deterministic single-pane runtime: 80x24 leaf, animations instant
+    /// (no time-varying alpha between the two compared ticks).
+    fn runtime() -> Runtime {
+        let mut config = RuntimeConfig::default();
+        config.animations.duration_ms = [0; AnimationKind::COUNT];
+        let mut rt = Runtime::with_deterministic_rasterizer(config)
+            .expect("deterministic runtime must build");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.handle_resize(PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        rt
+    }
+
+    /// Identical workload on both runtimes: fill the grid with distinct
+    /// rows, settle the retained leaf, hide the cursor (no blink-phase
+    /// overlay divergence), then scroll with trailing prints — the
+    /// scroll-storm shape of motion plus companion print damage plus
+    /// scrollback ranges.
+    fn drive(rt: &mut Runtime) {
+        for row in 0..24u8 {
+            let line = format!("row-{row:02} ABCDEFGH\r\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        rt.tick();
+        rt.handle_pty_bytes(b"\x1b[?25l");
+        rt.tick();
+        for row in 0..3u8 {
+            let line = format!("new-{row:02} 01234567\r\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+    }
+
+    #[test]
+    fn scroll_fast_path_matches_full_render_and_saves_work() {
+        let mut fast = runtime();
+        drive(&mut fast);
+        let mut full = runtime();
+        drive(&mut full);
+        // Force the full path on the reference tick: full-frame
+        // invalidation declines the fast path and re-renders the leaf.
+        full.pending_full_redraw = true;
+        let fast_stats = fast.tick().expect("scroll tick must present");
+        let full_stats = full.tick().expect("scroll tick must present");
+        let (fast_rgba, full_rgba) = (fast.headless_rgba(), full.headless_rgba());
+        if fast_rgba != full_rgba {
+            // Compact locator (not a dump): first differing pixel in
+            // window coordinates plus both frames' work counters.
+            if let (Some(a), Some(b)) = (fast_rgba.as_ref(), full_rgba.as_ref()) {
+                let w = fast.present_plan_extent().width as usize;
+                let first = a
+                    .iter()
+                    .zip(b.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(usize::MAX);
+                panic!(
+                    "first diff byte {} (px {},{}); fast cells {} full cells {}; fast={:?} full={:?}",
+                    first,
+                    (first / 4) % w,
+                    (first / 4) / w,
+                    fast_stats.cells_examined,
+                    full_stats.cells_examined,
+                    &a[first..first + 4],
+                    &b[first..first + 4],
+                );
+            }
+        }
+        assert_eq!(
+            fast_rgba, full_rgba,
+            "region-copy + exposed repaint must equal a full repaint"
+        );
+        assert!(
+            full_stats.cells_examined > 1000,
+            "reference must place a leaf-sized frame, got {}",
+            full_stats.cells_examined
+        );
+        assert!(
+            fast_stats.cells_examined < full_stats.cells_examined,
+            "fast path must examine fewer cells (fast {} vs full {})",
+            fast_stats.cells_examined,
+            full_stats.cells_examined
+        );
+    }
+}
+
 #[cfg(test)]
 mod selection_window_clip_tests {
     //! CTX-0803: the selection paint's frame-window clip is the inverse of

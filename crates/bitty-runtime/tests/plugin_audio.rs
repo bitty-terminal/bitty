@@ -8,6 +8,9 @@
 //! indistinguishable from absent, and a control-granted consumer calls
 //! through. Headless and Windows-safe (temp dirs only, no processes or
 //! sockets; the monitor seam stays injected — no `pactl` runs here).
+//!
+//! CTX-1199: counts include the three runtime-owned native sensor records,
+//! so audio-only expectations shift by three.
 
 mod common;
 
@@ -269,7 +272,7 @@ fn audio_read_and_spectrum_serve_while_control_stays_absent() {
     assert_eq!(rt.discover().len(), 3);
 
     rt.activate(&audio_id()).expect("provider activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 6);
     rt.activate(&bar_id()).expect("bar activates");
 
     assert_eq!(store_int(&rt, &bar_id(), "volume"), Some(50));
@@ -353,6 +356,6 @@ return {}
     );
     assert!(err.contains("audio.state"), "names the iface: {err}");
     assert!(err.contains("heads"), "names the field: {err}");
-    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    assert_eq!(rt.service_directory().borrow().published_count(), 3);
     let _ = std::fs::remove_dir_all(&root);
 }

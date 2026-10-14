@@ -2,8 +2,9 @@
 //!
 //! Nearest-neighbor scaling of stored RGBA bitmaps to placement rects,
 //! plus the bounded scaled-blit cache (S6, #1849). The `bitty-graphics`
-//! extension crate owns its own copy plus its own cache (W-141); Core
-//! keeps this copy so the present layer can composite without a
+//! extension crate implements the same raster behind the Core-owned
+//! [`crate::kitty_seam`] traits (W-141); Core keeps this copy as the
+//! in-repo backend so the present layer composites without a
 //! Core-to-extension call shape. The per-frame budget caps stay Core-owned
 //! policy ([`super::kitty_place`]).
 //!

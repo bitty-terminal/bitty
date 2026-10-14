@@ -1107,7 +1107,9 @@ pub fn decode_background(bytes: &[u8]) -> Result<BackgroundImage, BackgroundErro
     BackgroundImage::try_new(header.width, header.height, rgba)
 }
 
-/// Native channel width for the accepted 8-bit decoder color types.
+/// Native channel width for the accepted 8-bit facade decoder color types
+/// (JPEG/WebP path; PNG maps its own native types in
+/// [`decode_png_rgba8_bounded`]).
 fn native_bytes_per_pixel(color: image::ColorType) -> Option<usize> {
     match color {
         image::ColorType::L8 => Some(1),
@@ -1125,6 +1127,13 @@ fn native_bytes_per_pixel(color: image::ColorType) -> Option<usize> {
 /// is allocated once at that size; the decoder writes its native channels into
 /// the prefix and the conversion runs in place.
 fn decode_rgba8_bounded(bytes: &[u8], header: &ImageHeader) -> Result<Vec<u8>, BackgroundError> {
+    // PNG travels the shared minimal codec directly (CTX-1186): the same
+    // `EXPAND` recipe the `image` facade applied internally, so decoded
+    // bytes are unchanged while the `image` `png` feature edge drops away.
+    // JPEG/WebP stay on the facade decoders below.
+    if header.format == BackgroundFormat::Png {
+        return decode_png_rgba8_bounded(bytes, header);
+    }
     use image::ImageDecoder;
 
     let malformed = |err: image::ImageError| BackgroundError::Malformed {
@@ -1133,7 +1142,7 @@ fn decode_rgba8_bounded(bytes: &[u8], header: &ImageHeader) -> Result<Vec<u8>, B
     let reader = std::io::Cursor::new(bytes);
     let decoder: Box<dyn ImageDecoder> = match header.format {
         BackgroundFormat::Png => {
-            Box::new(image::codecs::png::PngDecoder::new(reader).map_err(malformed)?)
+            unreachable!("PNG decodes through the shared minimal codec above")
         }
         BackgroundFormat::Jpeg => {
             Box::new(image::codecs::jpeg::JpegDecoder::new(reader).map_err(malformed)?)
@@ -1178,6 +1187,76 @@ fn decode_rgba8_bounded(bytes: &[u8], header: &ImageHeader) -> Result<Vec<u8>, B
     let mut buf = vec![0u8; rgba_len];
     decoder
         .read_image(&mut buf[..native_len])
+        .map_err(malformed)?;
+    expand_in_place(&mut buf, pixels, native_bpp);
+    Ok(buf)
+}
+
+/// Decodes one sniffed PNG buffer into a single bounded RGBA8 allocation.
+///
+/// Same `EXPAND` recipe the `image` facade applied internally: palette,
+/// tRNS, and sub-8-bit samples expand to 8-bit channels, so the decoder
+/// only ever reports the four accepted native types (the header sniff
+/// already refused 16-bit and animated PNGs before this runs). The output
+/// buffer is allocated once at `width * height * 4` (at most
+/// [`BG_MAX_DECODED_BYTES`]); the decoder writes its native channels into
+/// the prefix and the conversion runs in place via [`expand_in_place`].
+fn decode_png_rgba8_bounded(
+    bytes: &[u8],
+    header: &ImageHeader,
+) -> Result<Vec<u8>, BackgroundError> {
+    let malformed = |err: png::DecodingError| BackgroundError::Malformed {
+        detail: format!("decode refused: {err}"),
+    };
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // Facade parity: the `image` PNG decoder kept text chunks and applied
+    // `EXPAND` with no decoder-level limits (the header pre-check owns the
+    // bounds, before and after this change).
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(&malformed)?;
+    let (width, height) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if width != header.width || height != header.height {
+        return Err(BackgroundError::Malformed {
+            detail: "decoded dimensions disagree with the header".to_string(),
+        });
+    }
+    let native_bpp = match reader.output_color_type() {
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => 1,
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => 2,
+        (png::ColorType::Rgb, png::BitDepth::Eight) => 3,
+        (png::ColorType::Rgba, png::BitDepth::Eight) => 4,
+        (color, depth) => {
+            return Err(BackgroundError::UnsupportedFormat {
+                detail: format!("decoder produced unsupported color type {color:?}/{depth:?}"),
+            });
+        }
+    };
+    let pixels =
+        (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(BackgroundError::DecodedTooLarge {
+                bytes: u64::MAX,
+                cap: BG_MAX_DECODED_BYTES as u64,
+            })?;
+    let rgba_len = pixels
+        .checked_mul(4)
+        .ok_or(BackgroundError::DecodedTooLarge {
+            bytes: u64::MAX,
+            cap: BG_MAX_DECODED_BYTES as u64,
+        })?;
+    // `pixels` is header-bounded, so this multiplication cannot overflow.
+    let native_len = pixels * native_bpp;
+    if reader.output_buffer_size() != Some(native_len) {
+        return Err(BackgroundError::Malformed {
+            detail: "decoder reported an inconsistent decoded size".to_string(),
+        });
+    }
+    let mut buf = vec![0u8; rgba_len];
+    reader
+        .next_frame(&mut buf[..native_len])
         .map_err(malformed)?;
     expand_in_place(&mut buf, pixels, native_bpp);
     Ok(buf)
@@ -1613,15 +1692,13 @@ mod tests {
             pixels.extend_from_slice(&color);
         }
         let mut out = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut out);
-        image::ImageEncoder::write_image(
-            encoder,
-            &pixels,
-            width,
-            height,
-            image::ExtendedColorType::Rgba8,
-        )
-        .expect("png encode");
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&pixels).expect("png encode");
+        }
         out
     }
 
@@ -1629,19 +1706,18 @@ mod tests {
         let mut pixels = Vec::with_capacity((width * height * 4 * 2) as usize);
         for _ in 0..(width * height) {
             for channel in color {
-                pixels.extend_from_slice(&channel.to_ne_bytes());
+                // PNG samples are big-endian on the wire.
+                pixels.extend_from_slice(&channel.to_be_bytes());
             }
         }
         let mut out = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut out);
-        image::ImageEncoder::write_image(
-            encoder,
-            &pixels,
-            width,
-            height,
-            image::ExtendedColorType::Rgba16,
-        )
-        .expect("png16 encode");
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&pixels).expect("png16 encode");
+        }
         out
     }
 
@@ -1674,42 +1750,41 @@ mod tests {
     fn encode_png_rgb(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
         let pixels = solid(width, height, 3, &color);
         let mut out = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut out),
-            &pixels,
-            width,
-            height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .expect("png rgb encode");
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&pixels).expect("png rgb encode");
+        }
         out
     }
 
     fn encode_png_gray(width: u32, height: u32, luma: u8) -> Vec<u8> {
         let pixels = solid(width, height, 1, &[luma]);
         let mut out = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut out),
-            &pixels,
-            width,
-            height,
-            image::ExtendedColorType::L8,
-        )
-        .expect("png gray encode");
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&pixels).expect("png gray encode");
+        }
         out
     }
 
     fn encode_png_gray_alpha(width: u32, height: u32, color: [u8; 2]) -> Vec<u8> {
         let pixels = solid(width, height, 2, &color);
         let mut out = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut out),
-            &pixels,
-            width,
-            height,
-            image::ExtendedColorType::La8,
-        )
-        .expect("png gray-alpha encode");
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::GrayscaleAlpha);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer
+                .write_image_data(&pixels)
+                .expect("png gray-alpha encode");
+        }
         out
     }
 

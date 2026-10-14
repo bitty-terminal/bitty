@@ -5,6 +5,7 @@
 use super::band_slots::BandEdge;
 use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
+use bitty_rich::KittyRasterBackend as _;
 
 /// Deterministic headless rasterizer: no font stack required, bit-identical
 /// on every platform and on both Linux and Windows CI.
@@ -3221,9 +3222,9 @@ impl Runtime {
     /// the cursor wins regardless of image z. The 32-blit / 64-MiB budget
     /// counts kitty blits only; the cursor overlay is never counted.
     ///
-    /// Raster is the Core-owned nearest-neighbor step
-    /// ([`bitty_rich::rasterize_kitty_clipped`]; the extension holds its own
-    /// copy plus its own cache): the image scales into the unclamped placement
+    /// Raster is the Core-owned nearest-neighbor step behind the
+    /// [`bitty_rich::kitty_seam`] traits (the extension implements the same
+    /// traits on its side): the image scales into the unclamped placement
     /// extent and only the viewport-visible window is allocated, so a
     /// partially visible placement paints at true scale instead of
     /// squeezing into its clip. S6 (#1849) serves repeats from the bounded
@@ -3517,7 +3518,7 @@ impl Runtime {
                 let rgba = if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
                     hit
                 } else {
-                    let Some(fresh) = bitty_rich::rasterize_rgba_clipped(
+                    let Some(fresh) = self.kitty_graphics.rasterize_frame(
                         frame_width,
                         frame_height,
                         frame_bytes,

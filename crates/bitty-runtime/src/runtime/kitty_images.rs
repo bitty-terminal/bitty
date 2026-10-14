@@ -7,11 +7,13 @@
 //! actions, a cursor-anchored placement.
 //!
 //! Core owns the bounded decode ([`bitty_rich::kitty_decode`]: PNG via the
-//! `image` codec edge, raw RGB/RGBA inline; 8192 px/side, 4096 x 4096 px
-//! area, 64 MiB RGBA) and the raster step ([`bitty_rich::kitty_raster`]:
-//! nearest-neighbor plus the Core-owned bounded raster cache, S6 #1849;
-//! the `bitty-graphics` extension holds its own copies plus its own cache,
-//! and Core never depends on extension internals). Placement policy (admission, per-origin quotas, origin
+//! shared minimal `png` codec, raw RGB/RGBA inline; 8192 px/side,
+//! 4096 x 4096 px area, 64 MiB RGBA) and the raster step
+//! ([`bitty_rich::kitty_raster`]: nearest-neighbor plus the Core-owned
+//! bounded raster cache, S6 #1849), both consumed behind the Core-owned
+//! [`bitty_rich::kitty_seam`] traits; the `bitty-graphics` extension
+//! implements the same traits on its side, and Core never depends on
+//! extension internals. Placement policy (admission, per-origin quotas, origin
 //! tagging, alternate-screen suppression) is unchanged and unit-tested in
 //! `bitty-rich`.
 //!
@@ -91,6 +93,7 @@
 //! has deterministic two-layer semantics.
 
 use super::*;
+use bitty_rich::KittyDecodeBackend as _;
 
 /// Typed Kitty display-routing rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,8 +287,10 @@ impl Runtime {
         payload: &[u8],
         _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
-        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
-        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, payload)
+        let format = Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+        let decoded = self
+            .kitty_graphics
+            .decode_transmit(format, width_s, height_v, payload)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let compressed_len = payload.len();
         let origin = self.kitty_origin;
@@ -320,11 +325,11 @@ impl Runtime {
         _compressed_len: usize,
     ) -> Result<bitty_rich::KittyImageId, KittyImageError> {
         let wire_len = payload.len();
-        Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
-        let decoded = bitty_rich::kitty_decode::decode_kitty_payload_owned(
-            format_f, width_s, height_v, payload,
-        )
-        .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
+        let format = Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
+        let decoded = self
+            .kitty_graphics
+            .decode_transmit_owned(format, width_s, height_v, payload)
+            .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let origin = self.kitty_origin;
         let id = self
             .kitty_images
@@ -344,22 +349,21 @@ impl Runtime {
 
     /// Shared wire-format admission + declared-size pre-check.
     ///
-    /// Maps `f=` without guessing, then runs the Core-retained
-    /// pre-allocation validator. No pixel buffer exists at any point.
+    /// Maps `f=` without guessing through the seam vocabulary, then runs
+    /// the Core-retained pre-allocation validator. No pixel buffer exists
+    /// at any point. The mapped format threads into the seam backend, so
+    /// unknown values can never reach a decode entry point.
     fn precheck_transmit(
         format_f: u32,
         width_s: Option<u32>,
         height_v: Option<u32>,
         payload_len: usize,
-    ) -> Result<(), KittyImageError> {
-        let channels = match format_f {
-            bitty_rich::KITTY_FORMAT_PNG => None,
-            bitty_rich::KITTY_FORMAT_RGB => Some(3),
-            bitty_rich::KITTY_FORMAT_RGBA => Some(4),
-            _ => return Err(KittyImageError::UnknownFormat(format_f)),
-        };
-        bitty_rich::precheck_declared_image(channels, width_s, height_v, payload_len)
-            .map_err(KittyImageError::Decode)
+    ) -> Result<bitty_rich::KittyTransmitFormat, KittyImageError> {
+        let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
+            .ok_or(KittyImageError::UnknownFormat(format_f))?;
+        bitty_rich::precheck_declared_image(format.raw_channels(), width_s, height_v, payload_len)
+            .map_err(KittyImageError::Decode)?;
+        Ok(format)
     }
 
     /// Decodes, stores and — for display actions outside the alternate
@@ -1051,7 +1055,7 @@ impl Runtime {
             .kitty_images
             .find_root_for_origin(self.kitty_origin, wire_image)
             .ok_or(KittyImageError::NoAnimationTarget(wire_image))?;
-        let decoded = Self::decode_frame_owned(format_f, width_s, height_v, payload)?;
+        let decoded = self.decode_frame_owned(format_f, width_s, height_v, payload)?;
         let frame_no = self
             .kitty_images
             .append_frame(root, decoded.width, decoded.height, decoded.rgba)
@@ -1063,19 +1067,21 @@ impl Runtime {
         Ok(frame_no)
     }
 
-    /// Shared wire-format admission plus Core-owned decode for one owned
+    /// Shared wire-format admission plus seam-backend decode for one owned
     /// frame payload (S1, #1849): maps `f=` without guessing, runs the
     /// pre-allocation validator, then decodes. No pixel buffer exists
     /// before the pre-check passes.
     fn decode_frame_owned(
+        &self,
         format_f: u32,
         width_s: Option<u32>,
         height_v: Option<u32>,
         payload: Box<[u8]>,
     ) -> Result<bitty_rich::KittyDecodedImage, KittyImageError> {
         let wire_len = payload.len();
-        Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
-        bitty_rich::kitty_decode::decode_kitty_payload_owned(format_f, width_s, height_v, payload)
+        let format = Self::precheck_transmit(format_f, width_s, height_v, wire_len)?;
+        self.kitty_graphics
+            .decode_transmit_owned(format, width_s, height_v, payload)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))
     }
 
@@ -1245,8 +1251,10 @@ impl Runtime {
         // Borrowed decode (the caller keeps the wire bytes): admission is
         // for frame arrivals (rare control-plane events), not the hot
         // display path, so the owned zero-copy seam stays display-only.
-        Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
-        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
+        let format = Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
+        let decoded = self
+            .kitty_graphics
+            .decode_transmit(format, width_s, height_v, bytes)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         // Frame creation canvas (kitty protocol): full-extent frames with
         // no offset, base, or background append directly; anything partial
@@ -1344,8 +1352,10 @@ impl Runtime {
         // Borrowed decode (the caller keeps the wire bytes): admission is
         // for frame arrivals (rare control-plane events), not the hot
         // display path, so the owned zero-copy seam stays display-only.
-        Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
-        let decoded = bitty_rich::decode_kitty_payload(format_f, width_s, height_v, bytes)
+        let format = Self::precheck_transmit(format_f, width_s, height_v, bytes.len())?;
+        let decoded = self
+            .kitty_graphics
+            .decode_transmit(format, width_s, height_v, bytes)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         // Fail-closed preflight (CTX-1123 fix): a `z` retarget needs a
         // pre-existing truth descriptor holding frame `r`. Transmit-only
@@ -1731,17 +1741,13 @@ impl Runtime {
             // Support probe, spec (`i=` plus payload): test-load without
             // storing; `p=` (if any) is ignored per kitty `:2549`.
             let image_id = control.image_id;
-            let channels = match format_f {
-                bitty_rich::KITTY_FORMAT_PNG => None,
-                bitty_rich::KITTY_FORMAT_RGB => Some(3),
-                bitty_rich::KITTY_FORMAT_RGBA => Some(4),
-                _ => {
-                    return Some((
-                        crate::queries::kitty_probe_einval_reply(image_id, "unknown format"),
-                        false,
-                    ));
-                }
+            let Some(format) = bitty_rich::KittyTransmitFormat::from_f(format_f) else {
+                return Some((
+                    crate::queries::kitty_probe_einval_reply(image_id, "unknown format"),
+                    false,
+                ));
             };
+            let channels = format.raw_channels();
             if bitty_rich::precheck_declared_image(channels, width_s, height_v, payload.len())
                 .is_err()
             {

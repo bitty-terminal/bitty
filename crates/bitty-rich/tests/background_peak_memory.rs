@@ -18,8 +18,8 @@
 //! is `#![forbid(unsafe_code)]` and a `GlobalAlloc` implementation requires
 //! `unsafe`; the integration test crate does not inherit that lint.
 //!
-//! The `image` crate can encode PNG, baseline JPEG, and lossless WebP
-//! in-process, so those fixtures are built at runtime. Progressive JPEG and
+//! The `png` crate and the `image` crate can encode PNG, baseline JPEG,
+//! and lossless WebP in-process, so those fixtures are built at runtime. Progressive JPEG and
 //! lossy WebP have no pure-Rust encoder in the dependency tree; those
 //! fixtures are committed and were generated once with libjpeg-turbo and
 //! ffmpeg/libwebp from solid-color inputs:
@@ -164,56 +164,54 @@ fn solid(width: u32, height: u32, bpp: usize, color: &[u8]) -> Vec<u8> {
 fn encode_png_rgba(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
     let pixels = solid(width, height, 4, &color);
     let mut out = Vec::new();
-    image::ImageEncoder::write_image(
-        image::codecs::png::PngEncoder::new(&mut out),
-        &pixels,
-        width,
-        height,
-        image::ExtendedColorType::Rgba8,
-    )
-    .expect("png rgba encode");
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(&pixels).expect("png rgba encode");
+    }
     out
 }
 
 fn encode_png_rgb(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
     let pixels = solid(width, height, 3, &color);
     let mut out = Vec::new();
-    image::ImageEncoder::write_image(
-        image::codecs::png::PngEncoder::new(&mut out),
-        &pixels,
-        width,
-        height,
-        image::ExtendedColorType::Rgb8,
-    )
-    .expect("png rgb encode");
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(&pixels).expect("png rgb encode");
+    }
     out
 }
 
 fn encode_png_gray(width: u32, height: u32, luma: u8) -> Vec<u8> {
     let pixels = solid(width, height, 1, &[luma]);
     let mut out = Vec::new();
-    image::ImageEncoder::write_image(
-        image::codecs::png::PngEncoder::new(&mut out),
-        &pixels,
-        width,
-        height,
-        image::ExtendedColorType::L8,
-    )
-    .expect("png gray encode");
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(&pixels).expect("png gray encode");
+    }
     out
 }
 
 fn encode_png_gray_alpha(width: u32, height: u32, color: [u8; 2]) -> Vec<u8> {
     let pixels = solid(width, height, 2, &color);
     let mut out = Vec::new();
-    image::ImageEncoder::write_image(
-        image::codecs::png::PngEncoder::new(&mut out),
-        &pixels,
-        width,
-        height,
-        image::ExtendedColorType::La8,
-    )
-    .expect("png gray-alpha encode");
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::GrayscaleAlpha);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer
+            .write_image_data(&pixels)
+            .expect("png gray-alpha encode");
+    }
     out
 }
 

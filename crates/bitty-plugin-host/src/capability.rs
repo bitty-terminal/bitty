@@ -150,6 +150,13 @@ impl CapabilityFamily {
                 "platform.notify",
                 "platform.open-url",
                 "platform.image-file",
+                // CTX-1193 (bitty#2019/#2011/#2016): read-only Phase B
+                // sensor heads for bar modules (cpu/memory/battery). No
+                // parameter, never high-risk; ungranted consumption is
+                // indistinguishable from an absent source.
+                "platform.cpu-read",
+                "platform.memory-read",
+                "platform.battery-read",
             ],
             Self::Protocol => &["protocol.register"],
             Self::Panel => &[
@@ -430,6 +437,9 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "platform.notify" => "Show system notifications",
         "platform.open-url" => "Open URLs in the default handler",
         "platform.image-file" => "Access image files at approved locations",
+        "platform.cpu-read" => "Read CPU utilization for status modules (read-only)",
+        "platform.memory-read" => "Read memory and swap usage for status modules (read-only)",
+        "platform.battery-read" => "Read battery capacity and state for status modules (read-only)",
         "protocol.register" => "Register a protocol handler",
         "panel.provider" => "Provide panel types for the workspace",
         "panel.create" => "Create and manage panels",
@@ -540,6 +550,9 @@ mod tests {
             "runtime.inspect",
             "debug.trace",
             "platform.notify",
+            "platform.cpu-read",
+            "platform.memory-read",
+            "platform.battery-read",
             "protocol.register",
             "layout.provider",
             "workspace.read",

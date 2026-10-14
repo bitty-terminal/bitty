@@ -31,6 +31,7 @@ pub mod resolution;
 pub mod services;
 pub mod spawn;
 pub mod store;
+pub mod system_sensors;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

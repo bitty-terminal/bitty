@@ -16,8 +16,10 @@
 //! - blending follows premultiplied src-over exactly, verified by unit
 //!   tests;
 //! - `Rgb` coverage bitmaps are treated as grayscale antialiasing (channels
-//!   averaged). Subpixel RGB policy is a later decision and deliberately not
-//!   guessed here.
+//!   averaged): the grayscale application of
+//!   [`crate::atlas::coverage_policy_for`]. A subpixel path that passes the
+//!   policy gate would keep the triplets here instead; until then grayscale
+//!   is deliberate, not guessed.
 //!
 //! CI note: this feature is off by default, so the default CI matrix neither
 //! compiles nor tests it. Verify locally with

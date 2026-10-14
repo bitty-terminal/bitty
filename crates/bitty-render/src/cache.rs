@@ -34,6 +34,13 @@ use crate::glyph::{FontId, FontQuery, GlyphBitmap, GlyphRasterizer, RasterKey};
 
 /// Default entry cap used by [`GlyphCache::new`] callers that do not need a
 /// custom bound.
+///
+/// CTX-1206 cap review (issue #2076): retained at 2048. One full screen of
+/// all-distinct glyphs (80x24 = 1920 cells) plus margin fits without churn;
+/// the worst-case byte line is 2048 x 64x64x3 B strikes = 24 MiB (pinned by
+/// the `memory_budget` gate). Steady-state pressure is relieved by the
+/// atlas growth gate instead: transient bursts evict rather than accumulate,
+/// so the count cap only binds pathological distinct-glyph floods.
 pub const DEFAULT_GLYPH_CACHE_CAPACITY: usize = 2048;
 
 /// A cached glyph lookup result: either a bitmap reference or a cached blank.

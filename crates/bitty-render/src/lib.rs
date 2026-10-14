@@ -86,7 +86,10 @@
 //! and scrollback viewport rendering (deferred inside [`grid`]), grid run
 //! shaping with ligature spans (Phase B extends the [`shaped`] skeleton:
 //! run caches, cluster-to-cell emission, cursor-policy un-shaping), and
-//! subpixel RGB rendering policy. Presentation pipelines and WGSL shaders
+//! subpixel RGB rendering (the *policy* is decided:
+//! [`atlas::coverage_policy_for`] earns subpixel only on LCD + non-HiDPI
+//! outputs, and every serving path implements the grayscale side; the
+//! triplet-preserving renderer itself is still deferred). Presentation pipelines and WGSL shaders
 //! **are** implemented: [`batch`] translates an owned [`DrawList`] into
 //! bounded vertex batches plus atlas-upload bookkeeping on any CPU, and the
 //! crate-private [`pipeline`](crate::pipeline) module owns the `wgpu` fill +

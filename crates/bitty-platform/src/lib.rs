@@ -98,6 +98,8 @@
 
 pub mod app;
 pub mod appearance;
+pub mod backlight_state;
+pub mod bluetooth_state;
 mod blur;
 pub mod clipboard;
 pub mod cursor;
@@ -106,7 +108,9 @@ pub mod error;
 pub mod event;
 pub mod keyboard;
 pub mod metrics;
+pub mod network_state;
 pub mod notification;
+pub mod providers;
 pub mod surface;
 pub mod url;
 

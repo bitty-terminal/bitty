@@ -26,6 +26,7 @@ pub mod fs;
 pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
+pub mod plugin_settings;
 pub mod redaction;
 pub mod resolution;
 pub mod services;
@@ -73,12 +74,12 @@ pub use resolution::{
 };
 pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
-    MAX_ENV_VALUE_BYTES, MapEnv, Notification, NotificationQueue, OverlayPeers, PanelPinHandler,
-    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedThemeRequest,
-    QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord,
-    ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource, ThemePersistHandler,
-    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableWorkspaces,
-    WorkspaceRequestQueue, WorkspaceSource,
+    MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue, OverlayPeers,
+    PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest,
+    QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger,
+    ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource,
+    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
+    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -546,6 +547,17 @@ pub struct PluginRuntime {
     store_root: Option<PathBuf>,
     host: PluginHost,
     settings: Rc<dyn SettingsSource>,
+    /// Config directory (`<root>/bitty`) for per-plugin user files
+    /// (CTX-1195, issue #2010).
+    ///
+    /// `None` by default (no file layer): activation resolves every plugin
+    /// from the shipped manifest defaults plus the shared [`settings`]
+    /// source (the old home). Replaceable through
+    /// [`PluginRuntime::set_settings_dir`] — the application seeds it from
+    /// the environment-derived config root, tests from temp dirs.
+    ///
+    /// [`settings`]: PluginRuntime::settings
+    settings_dir: Option<PathBuf>,
     snapshot: Rc<dyn SnapshotSource>,
     notifications: Rc<RefCell<NotificationQueue>>,
     bundled_roots: Vec<PathBuf>,
@@ -675,6 +687,7 @@ impl PluginRuntime {
             store_root: config.store_root,
             host: PluginHost::new(DropPolicy::DropOldest, crate::DEFAULT_PLUGIN_SIDE_CAPACITY),
             settings: config.settings,
+            settings_dir: None,
             snapshot: config.snapshot,
             notifications: Rc::new(RefCell::new(NotificationQueue::new(
                 NOTIFICATION_QUEUE_CAPACITY,
@@ -827,6 +840,16 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Seed the config directory for per-plugin user files (CTX-1195, issue
+    /// #2010). Call before activation with the environment-derived
+    /// `<root>/bitty` directory: each generation resolves its
+    /// `plugins/<owner>.<name>.toml` file when its services are built
+    /// (absent file or `None` serves shipped defaults plus the old home).
+    /// Paths always derive from the environment; never pass a literal home.
+    pub fn set_settings_dir(&mut self, dir: Option<PathBuf>) {
+        self.settings_dir = dir;
     }
 
     /// Install the synchronous pinned-float backend for
@@ -1404,15 +1427,32 @@ impl PluginRuntime {
                 return Err(error);
             }
         }
-        let plugin_services = Rc::new(PluginServices::new(
-            id.as_str(),
-            store,
-            self.settings.clone(),
-            self.snapshot.clone(),
-            self.notifications.clone(),
-            terminal_read,
-            platform_notify,
-        ));
+        let plugin_services = {
+            // CTX-1195 (issue #2010): per-generation settings — manifest
+            // shipped defaults, then the old home (the shared host source),
+            // then the per-plugin user file. Each generation holds its own
+            // resolved map plus its declared key set, so a cross-plugin read
+            // fails closed structurally and at the gate. A malformed file
+            // resolves to lower layers (never aborts activation); grants are
+            // untouched by construction (this path names no capability).
+            let loaded = plugin_settings::load_plugin_settings(
+                self.settings_dir.as_deref(),
+                id.as_str(),
+                &manifest.settings,
+                Some(&*self.settings),
+            );
+            let services = Rc::new(PluginServices::new(
+                id.as_str(),
+                store,
+                Rc::new(loaded.source),
+                self.snapshot.clone(),
+                self.notifications.clone(),
+                terminal_read,
+                platform_notify,
+            ));
+            services.set_declared_settings(plugin_settings::declared_keys(&manifest.settings));
+            services
+        };
         // CTX-0428: accepted Plugin API v1 `ui.mount`/`ui.update` gates. The
         // grant snapshot decides `ui.rich`/`ui.overlay`; the manifest's
         // `[lazy].claims` list decides the exclusive `tabline` slot. Defaults
@@ -3322,6 +3362,7 @@ mod tests {
                 events: Vec::new(),
                 claims: Vec::new(),
             },
+            settings: Vec::new(),
             raw_bytes_len: 512,
         }
     }

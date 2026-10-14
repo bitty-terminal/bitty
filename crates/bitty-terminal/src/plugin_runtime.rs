@@ -396,7 +396,19 @@ pub(crate) fn discover_and_activate(
     rows: usize,
     seed: &StartupSeed<'_>,
 ) -> Option<PluginSession> {
-    discover_with_roots(safe_mode, cols, rows, seed, store_root(), dev_roots())
+    discover_with_roots(
+        safe_mode,
+        cols,
+        rows,
+        seed,
+        store_root(),
+        dev_roots(),
+        // CTX-1195: per-plugin user files resolve under the live
+        // environment-derived config root (`$XDG_CONFIG_HOME/bitty`, …) —
+        // never a literal home. `None` (no usable root) serves shipped
+        // defaults plus the old home.
+        bitty_config::file::config_dir(),
+    )
 }
 
 /// Env-free startup wiring behind [`discover_and_activate`] (CTX-1115 test seam).
@@ -412,6 +424,7 @@ pub(crate) fn discover_with_roots(
     seed: &StartupSeed<'_>,
     store_root: Option<PathBuf>,
     dev_roots: Vec<PathBuf>,
+    settings_dir: Option<PathBuf>,
 ) -> Option<PluginSession> {
     let store_present = store_root.as_deref().is_some_and(Path::is_dir);
     if !store_present && dev_roots.is_empty() {
@@ -431,6 +444,11 @@ pub(crate) fn discover_with_roots(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
+    // CTX-1195 (issue #2010): seed the per-plugin user-file root before
+    // activation so every generation resolves its
+    // `plugins/<owner>.<name>.toml` file when its services are built
+    // (absent file serves shipped defaults plus the old home).
+    runtime.set_settings_dir(settings_dir);
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the
     // RC-1 accounting; only the atomic-commit bytes flow through here.
@@ -709,7 +727,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             pinned: &pinned,
             image_roots: &[],
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session");
         let pin_state = Rc::clone(&session.pin_state);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
@@ -943,7 +961,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             pinned: &pinned,
             image_roots: &[],
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root])
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session");
         let pin_state = Rc::clone(&session.pin_state);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())

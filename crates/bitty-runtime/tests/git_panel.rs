@@ -176,6 +176,7 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
             events: GIT_PANEL_EVENTS.iter().map(|e| e.to_string()).collect(),
             claims: Vec::new(),
         },
+        settings: Vec::new(),
         raw_bytes_len: 512,
     }
 }

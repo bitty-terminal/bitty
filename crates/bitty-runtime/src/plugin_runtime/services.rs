@@ -426,6 +426,31 @@ impl SettingsSource for EmptySettings {
     }
 }
 
+/// Fixed-map settings source (tests, embedding).
+///
+/// Serves owned values verbatim with no type checks: the caller (usually the
+/// `plugin_settings` merge) is responsible for declaration agreement. The [`PluginServices`] declaration gate still
+/// applies on top — a key outside the generation's declared set never
+/// reaches this source.
+#[derive(Debug, Default, Clone)]
+pub struct MapSettings {
+    values: BTreeMap<String, LuaValue>,
+}
+
+impl MapSettings {
+    /// Build a source from owned pairs.
+    #[must_use]
+    pub fn new(values: BTreeMap<String, LuaValue>) -> Self {
+        Self { values }
+    }
+}
+
+impl SettingsSource for MapSettings {
+    fn get(&self, key: &str) -> Option<LuaValue> {
+        self.values.get(key).cloned()
+    }
+}
+
 /// Snapshot source that fails closed with `E_SNAPSHOT_UNAVAILABLE`.
 #[derive(Debug, Default)]
 pub struct UnavailableSnapshot;
@@ -1389,6 +1414,13 @@ pub struct PluginServices {
     plugin_id: String,
     store: RefCell<PluginStore>,
     settings: Rc<dyn SettingsSource>,
+    /// Manifest-declared settings keys for this generation (CTX-1195).
+    ///
+    /// `bitty.settings.get` serves only these keys; any other key fails
+    /// closed with `E_SETTINGS_UNDECLARED`, so settings are never a side
+    /// channel between plugins. Empty by default (deny-by-default: a
+    /// generation with no `[settings]` declaration reads nothing).
+    declared_settings: RefCell<BTreeSet<String>>,
     snapshot: Rc<dyn SnapshotSource>,
     notifications: Rc<RefCell<NotificationQueue>>,
     terminal_read: bool,
@@ -1503,6 +1535,7 @@ impl PluginServices {
             plugin_id: plugin_id.into(),
             store: RefCell::new(store),
             settings,
+            declared_settings: RefCell::new(BTreeSet::new()),
             snapshot,
             notifications,
             terminal_read,
@@ -2304,6 +2337,16 @@ impl PluginServices {
         *self.declared_events.borrow_mut() = kinds;
     }
 
+    /// Record this generation's manifest `[settings]` keys (CTX-1195,
+    /// activation snapshot).
+    ///
+    /// `bitty.settings.get` serves exactly this set; any other key fails
+    /// closed with `E_SETTINGS_UNDECLARED`. An empty set (the default) reads
+    /// nothing — deny-by-default, matching every other generation gate.
+    pub fn set_declared_settings(&self, keys: BTreeSet<String>) {
+        *self.declared_settings.borrow_mut() = keys;
+    }
+
     /// Attach the runtime-shared sanitized debug view (`bitty.debug.inspect`).
     ///
     /// Without it the `plugins`/`commands`/`events` targets fail closed with
@@ -2342,6 +2385,18 @@ impl HostServices for PluginServices {
                 "validation",
                 "E_SETTINGS_KEY_INVALID",
                 "settings key must be 1..128 bytes",
+            ));
+        }
+        // CTX-1195: the manifest declares exactly the keys this generation
+        // reads. An undeclared key fails closed here — settings are never a
+        // side channel between plugins, and no config value grants anything.
+        if !self.declared_settings.borrow().contains(key) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_SETTINGS_UNDECLARED",
+                format!(
+                    "settings key '{key}' is not declared in this plugin's manifest [settings]"
+                ),
             ));
         }
         Ok(self.settings.get(key))
@@ -4374,6 +4429,112 @@ mod tests {
             ]))
         );
         assert!(!store::encode_json(&value).contains("clipboard.read"));
+    }
+
+    #[test]
+    fn settings_get_serves_only_declared_keys() {
+        // CTX-1195: the generation reads exactly its manifest `[settings]`
+        // set; anything else fails closed, even when the shared source holds
+        // a value for it.
+        let services = PluginServices::new(
+            "xuepoo.gated",
+            PluginStore::in_memory(),
+            Rc::new(MapSettings::new(BTreeMap::from([
+                ("show".to_string(), LuaValue::Bool(false)),
+                ("other".to_string(), LuaValue::Bool(true)),
+            ]))),
+            Rc::new(UnavailableSnapshot),
+            Rc::new(RefCell::new(NotificationQueue::new(8))),
+            false,
+            false,
+        );
+        // No declarations yet: deny-by-default reads nothing.
+        let error = services.settings_get("show").expect_err("undeclared");
+        assert_eq!(error.code, "E_SETTINGS_UNDECLARED");
+        services.set_declared_settings(BTreeSet::from(["show".to_string()]));
+        assert_eq!(
+            services.settings_get("show").expect("declared"),
+            Some(LuaValue::Bool(false))
+        );
+        // Declared but absent serves None (the merge guarantees a default in
+        // production; the gate only polices the key set).
+        services.set_declared_settings(BTreeSet::from(["show".to_string(), "missing".to_string()]));
+        assert_eq!(services.settings_get("missing").expect("declared"), None);
+        // Present in the source but undeclared: fail closed.
+        let error = services.settings_get("other").expect_err("undeclared");
+        assert_eq!(error.code, "E_SETTINGS_UNDECLARED");
+        // Key-shape errors keep their own code, before the gate.
+        let error = services.settings_get("").expect_err("empty");
+        assert_eq!(error.code, "E_SETTINGS_KEY_INVALID");
+    }
+
+    #[test]
+    fn settings_cross_plugin_read_fails_closed() {
+        // CTX-1195 negative test: two generations with disjoint declarations
+        // and disjoint sources. Neither can observe the other's keys — the
+        // gate denies (the sources do not even hold the foreign keys).
+        fn generation(
+            id: &str,
+            declared: &[&str],
+            values: Vec<(&str, LuaValue)>,
+        ) -> PluginServices {
+            let services = PluginServices::new(
+                id,
+                PluginStore::in_memory(),
+                Rc::new(MapSettings::new(
+                    values
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect(),
+                )),
+                Rc::new(UnavailableSnapshot),
+                Rc::new(RefCell::new(NotificationQueue::new(8))),
+                false,
+                false,
+            );
+            services.set_declared_settings(declared.iter().map(|key| key.to_string()).collect());
+            services
+        }
+        let bar = generation(
+            "bitty-terminal.bar",
+            &["show", "modules"],
+            vec![
+                ("show", LuaValue::Bool(false)),
+                (
+                    "modules",
+                    LuaValue::array(vec![LuaValue::String("clock".to_string())]),
+                ),
+            ],
+        );
+        let other = generation(
+            "xuepoo.other",
+            &["theme"],
+            vec![("theme", LuaValue::String("dark".to_string()))],
+        );
+        // Own keys serve.
+        assert_eq!(
+            bar.settings_get("show").expect("own"),
+            Some(LuaValue::Bool(false))
+        );
+        assert_eq!(
+            other.settings_get("theme").expect("own"),
+            Some(LuaValue::String("dark".to_string()))
+        );
+        // Foreign keys fail closed in both directions.
+        for key in ["theme", "grants", "capabilities"] {
+            assert_eq!(
+                bar.settings_get(key).expect_err("foreign").code,
+                "E_SETTINGS_UNDECLARED",
+                "bar must not read '{key}'"
+            );
+        }
+        for key in ["show", "modules", "grants", "capabilities"] {
+            assert_eq!(
+                other.settings_get(key).expect_err("foreign").code,
+                "E_SETTINGS_UNDECLARED",
+                "other must not read '{key}'"
+            );
+        }
     }
 
     #[test]

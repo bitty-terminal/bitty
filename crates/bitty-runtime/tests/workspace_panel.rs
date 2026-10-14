@@ -81,6 +81,7 @@ fn test_workspace_manifest() -> PluginManifest {
             ],
             claims: vec!["workspaceline".to_string()],
         },
+        settings: Vec::new(),
         raw_bytes_len: 512,
     }
 }

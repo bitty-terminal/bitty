@@ -1154,6 +1154,216 @@ impl LazyTriggers {
     }
 }
 
+/// Maximum declared settings keys per manifest (`[settings]`, CTX-1195).
+pub const MAX_SETTINGS_KEYS: usize = 32;
+/// Maximum bytes of one declared settings key.
+pub const MAX_SETTING_KEY_LEN: usize = 64;
+/// Maximum bytes of one string-typed shipped default value.
+pub const MAX_SETTING_STRING_BYTES: usize = 512;
+/// Maximum default items of a string-array setting.
+pub const MAX_SETTING_ARRAY_ITEMS: usize = 32;
+/// Maximum bytes of one string-array default item.
+pub const MAX_SETTING_ARRAY_ITEM_BYTES: usize = 128;
+
+/// Value type of one declared plugin setting (CTX-1195, issue #2010).
+///
+/// The closed set mirrors the per-plugin user-config file grammar: scalars
+/// (`bool`, `int`, `string`) plus string arrays (bar's `modules` is the
+/// first customer). Tables are not declared in v1: a table value in a user
+/// file fails to the default for that key, never aborts the plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Boolean (`true` / `false`).
+    Bool,
+    /// Bare integer (`-12`, `34`).
+    Int,
+    /// Double-quoted string.
+    String,
+    /// Array of double-quoted strings (`modules = ["a", "b"]`).
+    StringArray,
+}
+
+impl SettingKind {
+    /// Parse the manifest `type` spelling (`bool` / `int` / `string` /
+    /// `string-array`); anything else fails closed.
+    pub fn parse(raw: &str) -> Result<Self, PluginError> {
+        match raw {
+            "bool" => Ok(Self::Bool),
+            "int" => Ok(Self::Int),
+            "string" => Ok(Self::String),
+            "string-array" => Ok(Self::StringArray),
+            other => Err(PluginError::manifest(
+                "settings",
+                format!(
+                    "unknown settings type '{other}' (expected bool, int, string, or string-array)"
+                ),
+            )),
+        }
+    }
+
+    /// Canonical spelling of this kind.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::Int => "int",
+            Self::String => "string",
+            Self::StringArray => "string-array",
+        }
+    }
+}
+
+/// Shipped built-in default of one declared setting (CTX-1195).
+///
+/// The default is values-plane data: it never grants authority, it never
+/// enters the grant-binding manifest hash, and adding or changing one never
+/// invalidates consent. The user file overrides it per key; a wrong-typed
+/// user value falls back to it (garbage in, fail-to-default out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingDefault {
+    /// Boolean default.
+    Bool(bool),
+    /// Integer default.
+    Int(i64),
+    /// String default.
+    String(String),
+    /// String-array default (possibly empty).
+    Strings(Vec<String>),
+}
+
+impl SettingDefault {
+    /// The kind this default carries.
+    #[must_use]
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            Self::Bool(_) => SettingKind::Bool,
+            Self::Int(_) => SettingKind::Int,
+            Self::String(_) => SettingKind::String,
+            Self::Strings(_) => SettingKind::StringArray,
+        }
+    }
+}
+
+/// One declared settings key: quota + type + shipped default (CTX-1195).
+///
+/// The manifest declares exactly the settings keys the plugin reads through
+/// `bitty.settings.get`. Reading an undeclared key fails closed
+/// (`E_SETTINGS_UNDECLARED`): settings are never a side channel between
+/// plugins, and no config value, however explicit, grants authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingDecl {
+    /// Declared key (`^[a-z][a-z0-9_]*$`, 1..=[`MAX_SETTING_KEY_LEN`] bytes).
+    pub key: String,
+    /// Declared value type.
+    pub kind: SettingKind,
+    /// Shipped built-in default (must agree with `kind`).
+    pub default: SettingDefault,
+}
+
+impl SettingDecl {
+    /// Build a declaration, checking the key grammar and the kind/default
+    /// agreement fail-closed.
+    pub fn new(
+        key: String,
+        kind: SettingKind,
+        default: SettingDefault,
+    ) -> Result<Self, PluginError> {
+        let decl = Self { key, kind, default };
+        decl.validate()?;
+        Ok(decl)
+    }
+
+    /// Validate the key grammar, the kind/default agreement, and the default
+    /// bounds (all headless, no I/O).
+    pub fn validate(&self) -> Result<(), PluginError> {
+        validate_setting_key(&self.key)?;
+        if self.default.kind() != self.kind {
+            return Err(PluginError::manifest(
+                "settings",
+                format!(
+                    "declaration for '{}' disagrees: type '{}' with a '{}' default",
+                    self.key,
+                    self.kind.as_str(),
+                    self.default.kind().as_str()
+                ),
+            ));
+        }
+        match &self.default {
+            SettingDefault::Bool(_) | SettingDefault::Int(_) => {}
+            SettingDefault::String(value) => {
+                if value.len() > MAX_SETTING_STRING_BYTES {
+                    return Err(PluginError::LimitExceeded {
+                        field: format!("settings.{}.default", self.key),
+                        limit: MAX_SETTING_STRING_BYTES,
+                        actual: value.len(),
+                    });
+                }
+                if value.contains('\0') {
+                    return Err(PluginError::manifest(
+                        "settings",
+                        format!("default for '{}' must not contain NUL", self.key),
+                    ));
+                }
+            }
+            SettingDefault::Strings(items) => {
+                if items.len() > MAX_SETTING_ARRAY_ITEMS {
+                    return Err(PluginError::LimitExceeded {
+                        field: format!("settings.{}.default", self.key),
+                        limit: MAX_SETTING_ARRAY_ITEMS,
+                        actual: items.len(),
+                    });
+                }
+                for item in items {
+                    if item.is_empty() || item.len() > MAX_SETTING_ARRAY_ITEM_BYTES {
+                        return Err(PluginError::manifest(
+                            "settings",
+                            format!(
+                                "default item for '{}' must be 1..={} bytes",
+                                self.key, MAX_SETTING_ARRAY_ITEM_BYTES
+                            ),
+                        ));
+                    }
+                    if item.contains('\0') {
+                        return Err(PluginError::manifest(
+                            "settings",
+                            format!("default item for '{}' must not contain NUL", self.key),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate one settings key spelling: `^[a-z][a-z0-9_]*$`,
+/// 1..=[`MAX_SETTING_KEY_LEN`] bytes (fail-closed).
+pub fn validate_setting_key(key: &str) -> Result<(), PluginError> {
+    if key.is_empty() || key.len() > MAX_SETTING_KEY_LEN {
+        return Err(PluginError::manifest(
+            "settings",
+            format!("settings key must be 1..={MAX_SETTING_KEY_LEN} bytes"),
+        ));
+    }
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => {
+            return Err(PluginError::manifest(
+                "settings",
+                format!("invalid settings key '{key}' (must match ^[a-z][a-z0-9_]*$)"),
+            ));
+        }
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        return Err(PluginError::manifest(
+            "settings",
+            format!("invalid settings key '{key}' (must match ^[a-z][a-z0-9_]*$)"),
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum bytes of one service reference (`iface` or `owner:iface`).
 ///
 /// Precedent: the manifest `services.provided` ceiling (1..128 bytes); the
@@ -2256,6 +2466,15 @@ pub struct PluginManifest {
     pub limits: PluginLimits,
     /// Lazy trigger declarations.
     pub lazy: LazyTriggers,
+    /// Declared settings keys (`[settings]`, CTX-1195, issue #2010).
+    ///
+    /// Values-plane only: the exact keys this plugin reads through
+    /// `bitty.settings.get`, each with its type and shipped default.
+    /// Reading an undeclared key fails closed. Settings never grant
+    /// authority, so they intentionally stay out of
+    /// [`PluginManifest::canonical_bytes`]: adding or changing a
+    /// declaration never invalidates the grant pin bound to the hash.
+    pub settings: Vec<SettingDecl>,
     /// Raw manifest byte length (for the 256 KiB size check).
     pub raw_bytes_len: usize,
 }
@@ -2477,6 +2696,8 @@ impl PluginManifest {
     /// - self-declared `[limits]` budgets (checked against host ceilings,
     ///   then enforced on the manifest's own contents),
     /// - lazy trigger bounds,
+    /// - declared settings keys (`[settings]` quota, key grammar,
+    ///   kind/default agreement, duplicate rejection; values-plane only),
     /// - manifest size already supplied via `raw_bytes_len`.
     pub fn validate(&self) -> Result<(), PluginError> {
         if self.raw_bytes_len > MANIFEST_MAX_BYTES {
@@ -2570,6 +2791,30 @@ impl PluginManifest {
 
         self.capabilities.validate()?;
         self.lazy.validate()?;
+
+        // Declared settings keys (`[settings]`, CTX-1195): quota, per-key
+        // validation, duplicate rejection. Values-plane only (never
+        // authority): no pairing with capabilities exists by design, and no
+        // declaration here can widen a grant.
+        if self.settings.len() > MAX_SETTINGS_KEYS {
+            return Err(PluginError::LimitExceeded {
+                field: "settings".to_string(),
+                limit: MAX_SETTINGS_KEYS,
+                actual: self.settings.len(),
+            });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for decl in &self.settings {
+                decl.validate()?;
+                if !seen.insert(decl.key.clone()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "setting".to_string(),
+                        value: decl.key.clone(),
+                    });
+                }
+            }
+        }
 
         if self.tools.len() > MAX_TOOLS {
             return Err(PluginError::LimitExceeded {
@@ -2832,6 +3077,7 @@ mod tests {
             network: Vec::new(),
             limits: PluginLimits::default(),
             lazy: LazyTriggers::default(),
+            settings: Vec::new(),
             raw_bytes_len: 512,
         }
     }
@@ -2839,6 +3085,249 @@ mod tests {
     #[test]
     fn valid_minimal_manifest() {
         let m = minimal_manifest("xuepoo.markdown");
+        assert!(m.validate().is_ok());
+    }
+
+    /// Bar-fidelity declaration set (CTX-1195, issue #2010): the four scalar
+    /// settings bar reads today plus the new `modules` string array. Shared
+    /// with the runtime end-to-end proof so both sides pin the same contract.
+    fn bar_settings_decls() -> Vec<SettingDecl> {
+        vec![
+            SettingDecl::new(
+                "show".to_string(),
+                SettingKind::Bool,
+                SettingDefault::Bool(true),
+            )
+            .expect("bar show"),
+            SettingDecl::new(
+                "edge".to_string(),
+                SettingKind::String,
+                SettingDefault::String("bottom".to_string()),
+            )
+            .expect("bar edge"),
+            SettingDecl::new(
+                "show_single".to_string(),
+                SettingKind::Bool,
+                SettingDefault::Bool(false),
+            )
+            .expect("bar show_single"),
+            SettingDecl::new(
+                "name_max_chars".to_string(),
+                SettingKind::Int,
+                SettingDefault::Int(32),
+            )
+            .expect("bar name_max_chars"),
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec!["workspaces".to_string(), "clock".to_string()]),
+            )
+            .expect("bar modules"),
+        ]
+    }
+
+    #[test]
+    fn settings_bar_declarations_validate() {
+        let mut m = minimal_manifest("bitty-terminal.bar");
+        m.settings = bar_settings_decls();
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn settings_key_grammar_fail_closed() {
+        for good in [
+            "show",
+            "edge",
+            "show_single",
+            "name_max_chars",
+            "modules",
+            "a1",
+        ] {
+            assert!(
+                validate_setting_key(good).is_ok(),
+                "'{good}' must be accepted"
+            );
+        }
+        for bad in [
+            "",
+            "Show",
+            "9lives",
+            "_lead",
+            "has space",
+            "has-dash",
+            "has.dot",
+            "has/slash",
+            "UPPER",
+        ] {
+            assert!(
+                validate_setting_key(bad).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+        assert!(validate_setting_key(&"k".repeat(MAX_SETTING_KEY_LEN)).is_ok());
+        assert!(validate_setting_key(&"k".repeat(MAX_SETTING_KEY_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn settings_kind_spellings_closed() {
+        for (raw, kind) in [
+            ("bool", SettingKind::Bool),
+            ("int", SettingKind::Int),
+            ("string", SettingKind::String),
+            ("string-array", SettingKind::StringArray),
+        ] {
+            assert_eq!(SettingKind::parse(raw).expect("known kind"), kind);
+            assert_eq!(kind.as_str(), raw);
+        }
+        for bad in ["", "boolean", "integer", "str", "array", "table", "BOOL"] {
+            assert!(SettingKind::parse(bad).is_err(), "'{bad}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn settings_kind_default_agreement_fail_closed() {
+        // Bool kind with a string default disagrees.
+        assert!(
+            SettingDecl::new(
+                "show".to_string(),
+                SettingKind::Bool,
+                SettingDefault::String("yes".to_string()),
+            )
+            .is_err()
+        );
+        // String-array kind with a scalar default disagrees.
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::String("workspaces".to_string()),
+            )
+            .is_err()
+        );
+        // Int kind with an array default disagrees.
+        assert!(
+            SettingDecl::new(
+                "name_max_chars".to_string(),
+                SettingKind::Int,
+                SettingDefault::Strings(vec!["32".to_string()]),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn settings_default_bounds_fail_closed() {
+        // Overlong string default.
+        assert!(
+            SettingDecl::new(
+                "edge".to_string(),
+                SettingKind::String,
+                SettingDefault::String("e".repeat(MAX_SETTING_STRING_BYTES + 1)),
+            )
+            .is_err()
+        );
+        // NUL in a string default.
+        assert!(
+            SettingDecl::new(
+                "edge".to_string(),
+                SettingKind::String,
+                SettingDefault::String("a\0b".to_string()),
+            )
+            .is_err()
+        );
+        // Too many array items.
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec!["m".to_string(); MAX_SETTING_ARRAY_ITEMS + 1]),
+            )
+            .is_err()
+        );
+        // Overlong array item.
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec!["m".repeat(MAX_SETTING_ARRAY_ITEM_BYTES + 1)]),
+            )
+            .is_err()
+        );
+        // Empty array item.
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec![String::new()]),
+            )
+            .is_err()
+        );
+        // NUL array item.
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec!["a\0b".to_string()]),
+            )
+            .is_err()
+        );
+        // Empty array default is legal (opt-in lists).
+        assert!(
+            SettingDecl::new(
+                "modules".to_string(),
+                SettingKind::StringArray,
+                SettingDefault::Strings(Vec::new()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn settings_quota_and_duplicates_fail_closed() {
+        // Over quota.
+        let mut m = minimal_manifest("xuepoo.crowded");
+        m.settings = (0..MAX_SETTINGS_KEYS + 1)
+            .map(|n| {
+                SettingDecl::new(
+                    format!("key{n}"),
+                    SettingKind::Bool,
+                    SettingDefault::Bool(true),
+                )
+                .expect("generated decl")
+            })
+            .collect();
+        let error = m.validate().expect_err("over quota must fail");
+        assert!(matches!(error, PluginError::LimitExceeded { .. }));
+        // Duplicate keys.
+        let mut m = minimal_manifest("xuepoo.dupe");
+        m.settings = vec![
+            SettingDecl::new(
+                "show".to_string(),
+                SettingKind::Bool,
+                SettingDefault::Bool(true),
+            )
+            .expect("first"),
+            SettingDecl::new(
+                "show".to_string(),
+                SettingKind::Bool,
+                SettingDefault::Bool(false),
+            )
+            .expect("second"),
+        ];
+        let error = m.validate().expect_err("duplicates must fail");
+        assert!(matches!(error, PluginError::Duplicate { .. }));
+        // Exactly at quota passes.
+        let mut m = minimal_manifest("xuepoo.full");
+        m.settings = (0..MAX_SETTINGS_KEYS)
+            .map(|n| {
+                SettingDecl::new(
+                    format!("key{n}"),
+                    SettingKind::Bool,
+                    SettingDefault::Bool(n % 2 == 0),
+                )
+                .expect("generated decl")
+            })
+            .collect();
         assert!(m.validate().is_ok());
     }
 

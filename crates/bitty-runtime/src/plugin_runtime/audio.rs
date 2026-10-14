@@ -388,10 +388,13 @@ pub fn parse_set_volume_args(args: &LuaValue) -> Result<VolumeTarget, BridgeErro
         (None, Some(d)) => {
             let step: i32 = match d {
                 LuaValue::Integer(n) => {
-                    if n.abs() > 10 {
+                    // Range check first so `i64::MIN` cannot reach `abs()` (debug panic /
+                    // release wrap); after it, `n` is provably in `-10..=10`, so the cast
+                    // never clamps.
+                    if !(-10..=10).contains(n) {
                         return Err(volume_invalid(format!("volume step {n} exceeds +/-10")));
                     }
-                    i32::try_from(*n).unwrap_or(10)
+                    *n as i32
                 }
                 LuaValue::Number(n) => {
                     if !n.is_finite() || n.abs() > 10.0 || n.fract() != 0.0 {
@@ -981,6 +984,21 @@ mod tests {
         );
         assert!(
             parse_set_volume_args(&LuaValue::table([("delta", LuaValue::Integer(11))])).is_err()
+        );
+        // Regression: `i64::MIN` must be denied, not panic in `abs()` (debug) nor be
+        // silently clamped/inverted to `+10` by a failed `i32` conversion (release).
+        assert!(
+            parse_set_volume_args(&LuaValue::table([("delta", LuaValue::Integer(i64::MIN))]))
+                .is_err()
+        );
+        assert!(
+            parse_set_volume_args(&LuaValue::table([("delta", LuaValue::Integer(i64::MAX))]))
+                .is_err()
+        );
+        assert_eq!(
+            parse_set_volume_args(&LuaValue::table([("delta", LuaValue::Integer(-10))]))
+                .expect("lower bound"),
+            VolumeTarget::Delta(-10)
         );
         assert!(
             parse_set_volume_args(&LuaValue::table([

@@ -74,6 +74,20 @@ fn host_symbol_stack_reports_coverage_and_tofu() {
         assert!(resolved.covered, "U+{:04X} {c:?} must be covered", c as u32);
         assert!(resolved.bitmap.is_some());
     }
+    // CTX-1213 (issue #2084): the box-drawing run must resolve *drawable*
+    // (non-empty) bitmaps — a hollow primary glyph for U+2500 must fall
+    // through to tail coverage, never a silent blank cell.
+    for c in ['\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}'] {
+        let resolved = raster
+            .resolve(RasterKey::new(c, primary, POINT_SIZE).unwrap())
+            .expect("box resolution must not error on a live stack");
+        assert!(resolved.covered, "U+{:04X} must be covered", c as u32);
+        assert!(
+            resolved.bitmap.as_ref().is_some_and(|bm| !bm.is_blank()),
+            "U+{:04X} must resolve drawable (presence incl U+2500)",
+            c as u32,
+        );
+    }
     // U+10FFFF is a noncharacter: no host font may claim coverage, so it is
     // the deterministic tofu probe.
     let unknown = raster

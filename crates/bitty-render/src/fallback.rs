@@ -59,10 +59,12 @@ pub const fn is_tui_graph_scalar(c: char) -> bool {
 /// [`RenderError::FontNotFound`] are skipped best-effort so bare installs
 /// without the symbols face still start. On
 /// [`rasterize`](GlyphRasterizer::rasterize) each loaded face is tried in
-/// order until one yields a bitmap: the first `Some` wins, an all-blank walk
-/// returns `Ok(None)` (cacheable negative, as before), and a walk that
-/// produced only errors returns the last error so engine failures stay
-/// observable instead of silently blanking.
+/// order until one yields a drawable bitmap: for visible scalars the first
+/// non-empty `Some` wins (an empty bitmap continues the walk, CTX-1213,
+/// issue #2084); whitespace keeps first-`Some`-wins so spaces never warm
+/// tails. An all-missed walk returns `Ok(None)` (cacheable negative, as
+/// before), and a walk that produced only errors returns the last error so
+/// engine failures stay observable instead of silently blanking.
 ///
 /// [`resolve`](FallbackRasterizer::resolve) exposes the same walk with
 /// **coverage reporting** (CTX-0368, text-rendering RFC "Fallback chain
@@ -270,10 +272,10 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     ///
     /// Tries the requested face first (normally the primary) with no tail
     /// loading, so pure-primary coverage never maps a tail file (CTX-1026
-    /// lazy tails). Only when the requested face misses (blank) or errors
-    /// does the pinned chain warm once, after which the walk continues in
-    /// load order exactly as with eager loading; then the inner
-    /// rasterizer's dynamic fallback
+    /// lazy tails). Only when the requested face misses or errors does the
+    /// pinned chain warm once, after which the walk continues in load order
+    /// exactly as with eager loading; then the inner rasterizer's dynamic
+    /// fallback
     /// ([`GlyphRasterizer::dynamic_face_for`]) gets one chance: the shaped
     /// stack scans the system database beyond the pinned chain (the
     /// crossfont backend keeps its own internal fontconfig/DirectWrite
@@ -282,6 +284,17 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     /// bitmap; the caller paints tofu. Engine errors are skipped during the
     /// walk; a walk that produced only errors returns the last one so
     /// failures stay observable.
+    ///
+    /// Coverage means drawable (CTX-1213, issue #2084): a face that maps the
+    /// scalar to an *empty* bitmap (no pixels, e.g. a hollow box-drawing
+    /// glyph such as U+2500 in some primary faces) does not stop the walk
+    /// for a visible scalar — the walk continues to the first face with a
+    /// drawable bitmap, so real tail coverage is never shadowed into a
+    /// silent blank cell. The first empty bitmap is remembered: when no
+    /// face draws anything and nothing errored, it is returned as
+    /// `covered = true` (invisibility agreed by every face stays invisible,
+    /// never tofu). Whitespace keeps the legacy first-`Some`-wins fast path
+    /// so spaces never warm tails and never paint tofu.
     ///
     /// Deterministic: the pinned order is fixed by `load_font`, the dynamic
     /// order is fixed by family/post-script/index sort, and the result is a
@@ -292,24 +305,39 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     /// # Errors
     ///
     /// [`RenderError::UnknownFontHandle`] before any face was loaded, and the
-    /// last upstream error when no face produced coverage and at least one
-    /// errored.
+    /// last upstream error when no face produced a drawable bitmap and at
+    /// least one errored.
     pub fn resolve(&mut self, key: RasterKey) -> Result<ResolvedGlyph, RenderError> {
         if self.fonts.is_empty() {
             return Err(RenderError::UnknownFontHandle);
         }
+        // Empty bitmaps only continue the walk for visible scalars (see the
+        // coverage note above); whitespace resolves on the first `Some`.
+        let skip_blank = !key.character.is_whitespace();
+        let mut first_blank: Option<ResolvedGlyph> = None;
+        let mut last_err: Option<RenderError> = None;
         // Fast path (CTX-1026): the requested face first, with no tail
         // loading — the common primary-covered case stays a single call.
         let first = RasterKey::new(key.character, key.font, key.point_size)
             .map_err(|_| RenderError::UnknownFontHandle)?;
-        let mut last_err: Option<RenderError> = None;
         match self.inner.rasterize(first) {
-            Ok(Some(bitmap)) => {
+            Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                 return Ok(ResolvedGlyph {
                     font: key.font,
                     covered: true,
                     bitmap: Some(bitmap),
                 });
+            }
+            Ok(Some(bitmap)) => {
+                // Empty bitmap for a visible scalar: remember it as the
+                // honest fallback and keep walking (CTX-1213).
+                if first_blank.is_none() {
+                    first_blank = Some(ResolvedGlyph {
+                        font: key.font,
+                        covered: true,
+                        bitmap: Some(bitmap),
+                    });
+                }
             }
             Ok(None) => {}
             Err(err) => {
@@ -324,12 +352,22 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
             let attempt = RasterKey::new(key.character, font, key.point_size)
                 .map_err(|_| RenderError::UnknownFontHandle)?;
             match self.inner.rasterize(attempt) {
-                Ok(Some(bitmap)) => {
+                Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                     return Ok(ResolvedGlyph {
                         font,
                         covered: true,
                         bitmap: Some(bitmap),
                     });
+                }
+                Ok(Some(bitmap)) => {
+                    if first_blank.is_none() {
+                        first_blank = Some(ResolvedGlyph {
+                            font,
+                            covered: true,
+                            bitmap: Some(bitmap),
+                        });
+                    }
+                    continue;
                 }
                 Ok(None) => continue,
                 Err(err) => {
@@ -346,12 +384,21 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
             let attempt = RasterKey::new(key.character, dynamic, key.point_size)
                 .map_err(|_| RenderError::UnknownFontHandle)?;
             match self.inner.rasterize(attempt) {
-                Ok(Some(bitmap)) => {
+                Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                     return Ok(ResolvedGlyph {
                         font: dynamic,
                         covered: true,
                         bitmap: Some(bitmap),
                     });
+                }
+                Ok(Some(bitmap)) => {
+                    if first_blank.is_none() {
+                        first_blank = Some(ResolvedGlyph {
+                            font: dynamic,
+                            covered: true,
+                            bitmap: Some(bitmap),
+                        });
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -361,6 +408,9 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         }
         if let Some(err) = last_err {
             return Err(err);
+        }
+        if let Some(blank) = first_blank {
+            return Ok(blank);
         }
         Ok(ResolvedGlyph {
             font: key.font,
@@ -416,14 +466,17 @@ mod tests {
 
     /// Fake with per-family coverage: each loaded family gets a handle, and
     /// `blank` lists `(family, char)` pairs that rasterize to `None`
-    /// (upstream `MissingGlyph`). Families in `fail_load` fail with
-    /// `FontNotFound`; families in `fail_raster` fail with an upstream
-    /// error on every rasterize.
+    /// (upstream `MissingGlyph`). `hollow` lists `(family, char)` pairs that
+    /// rasterize to `Some` with an *empty* bitmap (a mapped but hollow glyph
+    /// — CTX-1213, issue #2084: some faces map U+2500 to no pixels).
+    /// Families in `fail_load` fail with `FontNotFound`; families in
+    /// `fail_raster` fail with an upstream error on every rasterize.
     #[derive(Debug, Default)]
     struct Fake {
         next_id: u64,
         families: HashMap<FontId, String>,
         blank: Vec<(String, char)>,
+        hollow: Vec<(String, char)>,
         fail_load: Vec<String>,
         fail_raster: Vec<String>,
         rasterize_calls: Cell<u32>,
@@ -449,6 +502,22 @@ mod tests {
         fn family_of(&self, id: FontId) -> String {
             self.families.get(&id).cloned().unwrap_or_default()
         }
+
+        /// An empty bitmap: mapped by the face, but with no pixels to draw.
+        fn empty_bitmap() -> GlyphBitmap {
+            GlyphBitmap::try_new(
+                GlyphMetrics {
+                    left: 0,
+                    top: 0,
+                    width: 0,
+                    height: 0,
+                    advance: [0, 0],
+                },
+                BitmapFormat::Rgb,
+                Vec::new(),
+            )
+            .unwrap()
+        }
     }
 
     impl GlyphRasterizer for Fake {
@@ -466,6 +535,13 @@ mod tests {
             let family = self.family_of(key.font);
             if self.fail_raster.contains(&family) {
                 return Err(RenderError::UpstreamRasterizer("synthetic".into()));
+            }
+            if self
+                .hollow
+                .iter()
+                .any(|(f, c)| *f == family && *c == key.character)
+            {
+                return Ok(Some(Self::empty_bitmap()));
             }
             if self.blank.contains(&(family, key.character)) {
                 return Ok(None);
@@ -790,6 +866,142 @@ mod tests {
     }
 
     #[test]
+    fn hollow_primary_u2500_falls_through_to_covering_tail() {
+        // CTX-1213 (issue #2084): the primary maps U+2500 to an empty
+        // bitmap (no pixels) while a tail holds the real horizontal-line
+        // glyph. The empty bitmap must not shadow tail coverage into a
+        // silent blank cell — the tail's drawable bitmap wins.
+        let mut inner = Fake::default();
+        inner.hollow.push(("Primary Mono".to_string(), '\u{2500}'));
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let key = RasterKey::new('\u{2500}', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).expect("tail must cover U+2500");
+        assert!(resolved.covered, "U+2500 must report coverage");
+        let bitmap = resolved.bitmap.as_ref().expect("coverage carries a bitmap");
+        assert!(
+            !bitmap.is_blank(),
+            "U+2500 must resolve drawable, not hollow"
+        );
+        assert_eq!(
+            wrapped.inner.family_of(resolved.font),
+            "JetBrains Mono",
+            "first covering tail wins"
+        );
+        // Primary hollow + one tail hit: exactly two upstream calls.
+        assert_eq!(wrapped.inner.rasterize_calls.get(), 2);
+        // The legacy rasterize projection serves the same drawable bitmap.
+        let bitmap = wrapped
+            .rasterize(RasterKey::new('\u{2500}', primary, 12.0).unwrap())
+            .unwrap()
+            .expect("tail must cover U+2500");
+        assert!(!bitmap.is_blank());
+    }
+
+    #[test]
+    fn box_drawing_run_resolves_drawable_including_u2500() {
+        // CTX-1213 acceptance shape: the whole box-drawing run
+        // (U+2500/U+250C/U+2510/U+2502) resolves covered with drawable
+        // bitmaps even when the primary hollows exactly U+2500 — neighbors
+        // keep their primary bitmaps.
+        let mut inner = Fake::default();
+        inner.hollow.push(("Primary Mono".to_string(), '\u{2500}'));
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        for c in ['\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}'] {
+            let key = RasterKey::new(c, primary, 12.0).unwrap();
+            let resolved = wrapped.resolve(key).expect("box scalar must resolve");
+            assert!(resolved.covered, "U+{:04X} must be covered", c as u32);
+            assert!(
+                resolved.bitmap.as_ref().is_some_and(|bm| !bm.is_blank()),
+                "U+{:04X} must resolve drawable",
+                c as u32,
+            );
+        }
+        let mut winners: Vec<(char, String)> = Vec::new();
+        for c in ['\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}'] {
+            let key = RasterKey::new(c, primary, 12.0).unwrap();
+            let resolved = wrapped.resolve(key).unwrap();
+            winners.push((c, wrapped.inner.family_of(resolved.font)));
+        }
+        assert_eq!(winners[0].1, "JetBrains Mono");
+        for (c, family) in winners.iter().skip(1) {
+            assert_eq!(family, "Primary Mono", "U+{:04X} keeps primary", *c as u32);
+        }
+    }
+
+    #[test]
+    fn whitespace_keeps_first_some_without_warming_tails() {
+        // Spaces resolve on the primary's empty bitmap exactly as before:
+        // one upstream call, tails stay pending (CTX-1026 lazy tails), and
+        // the result stays covered-blank (never tofu).
+        let mut inner = Fake::default();
+        inner.hollow.push(("Primary Mono".to_string(), ' '));
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let key = RasterKey::new(' ', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).expect("space must resolve");
+        assert!(resolved.covered);
+        assert_eq!(resolved.font, primary);
+        assert!(resolved.bitmap.as_ref().is_some_and(|bm| bm.is_blank()));
+        assert_eq!(wrapped.inner.rasterize_calls.get(), 1);
+        assert_eq!(wrapped.fonts(), &[primary]);
+        assert_eq!(wrapped.pending_tails().len(), tails().len());
+    }
+
+    #[test]
+    fn all_faces_hollow_returns_first_blank_covered_not_tofu() {
+        // Invisibility agreed by every face stays invisible: a visible
+        // scalar hollow everywhere resolves covered-blank (the primary's
+        // empty bitmap), never tofu.
+        let mut inner = Fake::default();
+        for family in [
+            "Primary Mono",
+            "JetBrains Mono",
+            "monospace",
+            "DejaVu Sans Mono",
+            "Noto Sans Symbols 2",
+        ] {
+            inner.hollow.push((family.to_string(), '\u{200B}'));
+        }
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let key = RasterKey::new('\u{200B}', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).unwrap();
+        assert!(resolved.covered);
+        assert_eq!(resolved.font, primary);
+        assert!(resolved.bitmap.as_ref().is_some_and(|bm| bm.is_blank()));
+        assert_eq!(
+            wrapped.inner.rasterize_calls.get(),
+            5,
+            "the whole chain is walked once"
+        );
+    }
+
+    #[test]
+    fn hollow_does_not_shadow_engine_errors() {
+        // A hollow primary plus broken tails stays an observable error,
+        // not a silent blank.
+        let mut inner = Fake::default();
+        inner.hollow.push(("Primary Mono".to_string(), '\u{2500}'));
+        for family in [
+            "JetBrains Mono",
+            "monospace",
+            "DejaVu Sans Mono",
+            "Noto Sans Symbols 2",
+        ] {
+            inner.fail_raster.push(family.to_string());
+        }
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let key = RasterKey::new('\u{2500}', primary, 12.0).unwrap();
+        assert!(matches!(
+            wrapped.resolve(key),
+            Err(RenderError::UpstreamRasterizer(_))
+        ));
+    }
+
+    #[test]
     fn all_faces_missing_returns_blank_not_error() {
         let mut inner = Fake::default();
         for family in [
@@ -1081,6 +1293,53 @@ mod tests {
         // the untouched grid cells stay blank (whitespace negatives).
         assert_eq!(list.glyphs.len(), 4);
         assert_eq!(renderer.counters().glyphs_emitted, 4);
+        assert_eq!(
+            renderer.counters().blank_cells_skipped,
+            (state.width() * state.height() - 4) as u64
+        );
+    }
+
+    #[test]
+    fn box_drawing_run_with_hollow_u2500_emits_drawn_glyphs() {
+        use crate::grid::{CellMetrics, GridRenderer};
+        use bitty_term_state::{Damage, DamageRect, DamagedRegion, State, TerminalAction};
+        use bitty_vt::GraphemeCell;
+
+        // CTX-1213 (issue #2084): the primary maps exactly U+2500 to an
+        // empty bitmap while neighbors and the tail hold real glyphs. The
+        // grid must emit four drawn instances — U+2500 via the tail, never
+        // a silent blank and never tofu.
+        let mut inner = Fake::default();
+        inner.hollow.push(("Primary Mono".to_string(), '\u{2500}'));
+        let wrapped = FallbackRasterizer::new(inner, tails());
+        let cell = CellMetrics::new(8, 16).unwrap();
+        let mut renderer = GridRenderer::new(wrapped, &query("Primary Mono", 12.0), cell).unwrap();
+        let mut state = State::new();
+        for c in ['\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        let damage = Damage {
+            generation: state.generation(),
+            regions: Box::new([DamagedRegion::Grid(DamageRect::full(
+                u16::try_from(state.height()).unwrap(),
+                u16::try_from(state.width()).unwrap(),
+            ))]),
+        };
+        let snapshot = state.snapshot();
+        let list = renderer.render(&snapshot, &damage).unwrap();
+        assert_eq!(list.glyphs.len(), 4, "every box scalar must emit a glyph");
+        for (i, instance) in list.glyphs.iter().enumerate() {
+            assert!(
+                instance.size[0] > 0 && instance.size[1] > 0,
+                "box glyph {i} must be drawn, not zero-sized"
+            );
+        }
+        assert_eq!(renderer.counters().glyphs_emitted, 4);
+        assert_eq!(
+            renderer.counters().missing_glyphs,
+            0,
+            "no tofu for covered box drawing"
+        );
         assert_eq!(
             renderer.counters().blank_cells_skipped,
             (state.width() * state.height() - 4) as u64

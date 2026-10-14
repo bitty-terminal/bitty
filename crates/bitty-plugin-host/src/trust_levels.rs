@@ -290,7 +290,13 @@ impl CapabilityDomain {
             | CapabilityFamily::Panel
             | CapabilityFamily::Browser
             | CapabilityFamily::Layout
-            | CapabilityFamily::Workspace => &[],
+            | CapabilityFamily::Workspace
+            // Audio monitor family (CTX-1196): device-state reads plus a
+            // bounded control head map to no adopted domain; the trust gate
+            // passes them through and their grants decide elsewhere, so the
+            // matrix never invents authority the accepted grammar does not
+            // already name.
+            | CapabilityFamily::Audio => &[],
         }
     }
 }

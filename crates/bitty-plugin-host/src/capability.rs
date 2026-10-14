@@ -53,6 +53,16 @@ pub enum CapabilityFamily {
     /// explicit per-plugin, per-source scope; exact Lua spellings stay
     /// parked to W-139 (SDK) under a new root, never `bitty.terminal.*`.
     History,
+    /// Scoped audio-monitor family (CTX-1196, bitty#2009/#2013).
+    ///
+    /// A NEW family beside every existing one: bounded reads over the
+    /// PulseAudio/PipeWire monitor (`audio.spectrum` fast-poll level meter,
+    /// `audio.state.read` volume/mute/port snapshot) plus a SEPARATE
+    /// control head (`audio.state.control`: bounded volume steps, mute
+    /// toggle). Read never implies control; control defaults to deny and
+    /// needs explicit consent. Scope travels with the host call, never as
+    /// a grant parameter (same precedent as `terminal.input.submit`).
+    Audio,
 }
 
 impl CapabilityFamily {
@@ -75,6 +85,7 @@ impl CapabilityFamily {
             "layout" => Some(Self::Layout),
             "workspace" => Some(Self::Workspace),
             "history" => Some(Self::History),
+            "audio" => Some(Self::Audio),
             _ => None,
         }
     }
@@ -99,6 +110,7 @@ impl CapabilityFamily {
             Self::Layout => "layout",
             Self::Workspace => "workspace",
             Self::History => "history",
+            Self::Audio => "audio",
         }
     }
 
@@ -174,6 +186,10 @@ impl CapabilityFamily {
                 "history.commands.read",
                 "history.kv.read",
             ],
+            // Audio monitor family (CTX-1196, bitty#2009/#2013): spectrum
+            // fast-poll read, state snapshot read, and the separate control
+            // head. Read never implies control.
+            Self::Audio => &["audio.spectrum", "audio.state.read", "audio.state.control"],
         }
     }
 }
@@ -447,6 +463,9 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         }
         "history.commands.read" => "Read bounded redacted snapshots of command history",
         "history.kv.read" => "Read this plugin's own key-value namespace (bounded)",
+        "audio.spectrum" => "Read the audio level meter (bounded fast poll, 5 Hz ceiling)",
+        "audio.state.read" => "Read volume, mute, and port state (bounded snapshot)",
+        "audio.state.control" => "Change volume and mute state (bounded steps)",
         _ => "Requested capability",
     }
 }
@@ -573,6 +592,7 @@ mod tests {
             CapabilityFamily::Layout,
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
+            CapabilityFamily::Audio,
         ];
         for family in families {
             assert!(family.denied_without_grant());
@@ -711,6 +731,42 @@ mod tests {
     }
 
     #[test]
+    fn audio_family_parses_without_parameter() {
+        // CTX-1196 (bitty#2009/#2013): the audio-monitor family is new and
+        // scoped beside every existing family. Scope travels with the host
+        // call, never as a grant parameter (same precedent as
+        // `terminal.input.submit`). Read never implies control: the two
+        // read heads and the control head are separate grants.
+        for (raw, statement) in [
+            (
+                "audio.spectrum",
+                "Read the audio level meter (bounded fast poll, 5 Hz ceiling)",
+            ),
+            (
+                "audio.state.read",
+                "Read volume, mute, and port state (bounded snapshot)",
+            ),
+            (
+                "audio.state.control",
+                "Change volume and mute state (bounded steps)",
+            ),
+        ] {
+            let granted = CapabilityId::parse(raw).expect("audio capability parses");
+            assert_eq!(granted.family(), CapabilityFamily::Audio);
+            assert_eq!(granted.family().as_str(), "audio");
+            assert!(!granted.has_param());
+            assert!(!granted.is_high_risk());
+            assert_eq!(effect_statement(&granted), statement);
+            assert!(CapabilityId::parse(&format!("{raw}:param")).is_err());
+        }
+        // Nothing audio-shaped validates under another family.
+        assert!(CapabilityId::parse("terminal.audio.read").is_err());
+        assert!(CapabilityId::parse("runtime.audio").is_err());
+        assert!(CapabilityId::parse("audio").is_err());
+        assert!(CapabilityId::parse("audio.state").is_err());
+    }
+
+    #[test]
     fn terminal_family_stays_frozen() {
         // RFC-0004 non-goal: no `terminal.*` member is widened,
         // reinterpreted, or given a read sub-scope. The v1 set is exactly
@@ -827,6 +883,7 @@ mod tests {
             CapabilityFamily::Layout,
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
+            CapabilityFamily::Audio,
         ] {
             host_heads.extend(family.closed_identifiers().iter().copied());
         }

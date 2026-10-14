@@ -321,6 +321,11 @@ pub const CAPABILITY_FAMILIES: &[&str] = &[
     // RFC-0004 read-only history/search/selection family (CTX-0955, W-139):
     // a NEW family beside `terminal.*`; the v1 `terminal` set stays frozen.
     "history",
+    // Audio monitor family (CTX-1196, bitty#2009/#2013): scoped
+    // PulseAudio/PipeWire reads plus a separate control head. Read never
+    // implies control; scope travels with the host call, never as a grant
+    // parameter (same precedent as `terminal.input.submit`).
+    "audio",
 ];
 
 /// Every non-parameterized capability head in the closed normative set.
@@ -388,6 +393,14 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "history.transcript.read",
     "history.commands.read",
     "history.kv.read",
+    // Audio monitor family (CTX-1196, bitty#2009/#2013): `audio.spectrum`
+    // is the cava-lite fast-poll level meter (provider-side 5 Hz ceiling);
+    // `audio.state.read` is the volume/mute/port snapshot; `audio.state.control`
+    // is the separate bounded volume/mute control head (defaults to deny;
+    // read grants never imply control).
+    "audio.spectrum",
+    "audio.state.read",
+    "audio.state.control",
 ];
 
 /// Whether a closed capability head requires a `:PARAMETER`.

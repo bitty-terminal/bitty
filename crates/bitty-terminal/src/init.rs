@@ -5,26 +5,6 @@ use std::io::IsTerminal as _;
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
-/// Wizard greeting art: thin alias over the single-owned mascot module
-/// ([`crate::mascot`], issue #1318) so the `bitty init` greeting and the
-/// startup splash can never disagree. The art stays vendored byte-identical
-/// from the workspace asset `recording/bitty-mascot/ascii/bitty_ascii.txt`
-/// (DEC-0002): pure text so it renders anywhere stdout goes, including
-/// piped headless runs; the sixel/block variants stay out of the binary.
-/// (Test-only: the wizard itself goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_ART as INIT_MASCOT_ART;
-/// One-line fallback when the window is too narrow for the art: fail closed
-/// with an honest line instead of a wrapped mess (see [`crate::mascot`]).
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_FALLBACK as INIT_MASCOT_FALLBACK;
-/// Greeting art for a known-or-unknown window width (see [`crate::mascot`]).
-pub(crate) use crate::mascot::mascot_art_for_width as init_greeting_art;
-/// Width of the vendored art in columns (see [`crate::mascot`]).
-/// (Test-only: runtime code goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::mascot_width as init_mascot_width;
-
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
 /// garbage or a stuck key can never spin the wizard forever.
 pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
@@ -1807,7 +1787,7 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     let _ = writeln!(output, "{}", init_style_label(&item, false, color));
 }
 
-/// Runs the interactive wizard: mascot greeting, then shell / theme / font
+/// Runs the interactive wizard: greeting line, then shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
 /// `input`, `output`, `shell_env`, `columns`, `shell_exists`,
@@ -1916,14 +1896,18 @@ fn run_init_interactive_impl(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
+    // Terminal width, currently unused by the wizard body: the greeting is
+    // a single text line since the owner decision (2026-10-08, 0.0.23)
+    // removed the mascot art block from `bitty init` output (issue #1318).
+    // Kept in the signature so callers stay stable for future width-aware
+    // layout.
+    _columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
     mut preview: Option<&mut InitPreview>,
     mut live: Option<&mut bitty_runtime::Runtime>,
 ) -> Result<InitAnswers, String> {
-    let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
         output,
         "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
@@ -2679,7 +2663,7 @@ pub(crate) fn write_init_config(
 pub(crate) fn init_usage() -> String {
     "usage: bitty init [--yes] [--force] [VALUE FLAGS] [--config PATH]\n\
      \n\
-     Opt-in setup wizard (never auto-runs): mascot greeting, then shell /\n\
+     Opt-in setup wizard (never auto-runs): greeting line, then shell /\n\
      theme / font family+size / decoration (gaps_in, gaps_out, border,\n\
      radius) / scrollback / close_confirm / keybinding-preset picks, then\n\
      writes the config file with shipped keys only (no secrets, no network).\n\
@@ -2732,7 +2716,7 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) xdg_config_home: Option<&'a str>,
     /// Stands in for `HOME` (XDG fallback root).
     pub(crate) home: Option<&'a str>,
-    /// Stands in for `COLUMNS` (greeting width).
+    /// Stands in for `COLUMNS` (reserved; the greeting no longer renders art).
     pub(crate) columns: Option<u16>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,

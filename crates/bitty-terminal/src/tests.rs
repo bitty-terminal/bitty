@@ -4865,23 +4865,20 @@ fn init_columns_parse() {
 }
 
 #[test]
-fn init_mascot_is_bounded_with_text_fallback() {
-    // The vendored art is small, pure ASCII, and bounded.
-    let width = init_mascot_width();
-    assert!(width > 0 && width <= 80, "art width {width}");
-    assert!(INIT_MASCOT_ART.lines().count() <= 32);
-    assert!(INIT_MASCOT_ART.is_ascii());
-
-    // Unknown or roomy widths print the full art (headless-safe).
-    assert_eq!(init_greeting_art(None), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(80)), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(width as u16)), INIT_MASCOT_ART);
-
-    // A tiny window fails closed to one honest line (pure-text fallback).
-    let narrow = init_greeting_art(Some(20));
-    assert_eq!(narrow, INIT_MASCOT_FALLBACK);
-    assert_eq!(narrow.lines().count(), 1);
-    assert!(init_greeting_art(Some(1)).contains("too narrow"));
+fn init_wizard_greeting_has_no_art_block() {
+    // Owner decision (2026-10-08, 0.0.23): no mascot art in `bitty init`
+    // output (issue #1318). The wizard opens with one text line at any
+    // width; the pixel splash lives on the startup/`--mascot` path only.
+    for columns in [None, Some(80), Some(20), Some(1)] {
+        let (result, printed) =
+            drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), columns);
+        assert!(result.is_ok());
+        assert!(printed.contains("Welcome to bitty"));
+        assert!(!printed.contains('\u{2580}'));
+        assert!(!printed.contains('\u{2584}'));
+        assert!(!printed.contains('\u{2588}'));
+        assert!(!printed.contains("MMMMM"));
+    }
 }
 
 /// Drives the interactive wizard with piped stdin; returns answers plus
@@ -4965,9 +4962,11 @@ fn init_interactive_all_defaults() {
     assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::WhenBusy);
     assert_eq!(answers.key_preset, InitKeyPreset::Default);
 
-    // Greeting shows the mascot plus every step prompt.
+    // Greeting shows the welcome line plus every step prompt (no art
+    // block: owner decision 2026-10-08, issue #1318).
     assert!(printed.contains("Welcome to bitty"));
-    assert!(printed.contains("MMMMM"));
+    assert!(!printed.contains('\u{2580}'));
+    assert!(!printed.contains("MMMMM"));
     assert!(printed.contains("Shell"));
     assert!(printed.contains("Theme"));
     assert!(printed.contains("Font family"));
@@ -5031,11 +5030,12 @@ fn init_interactive_retries_then_aborts() {
     let (result, _) = drive_init_wizard("", Some("/bin/bash"), None);
     assert!(result.is_err());
 
-    // A narrow window still wizards, with the text fallback greeting.
+    // A narrow window still wizards; the greeting stays one text line.
     let (result, printed) =
         drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), Some(20));
     assert!(result.is_ok());
-    assert!(printed.contains("too narrow"));
+    assert!(printed.contains("Welcome to bitty"));
+    assert!(!printed.contains('\u{2580}'));
     assert!(!printed.contains("MMMMM"));
 }
 
@@ -7709,22 +7709,116 @@ fn parse_mascot_and_no_splash_flags() {
 }
 
 #[test]
-fn mascot_art_is_bounded_ascii() {
-    // Single-owned vendored asset: small, pure ASCII, fits 80 columns.
-    assert!(MASCOT_ART.is_ascii());
-    assert!(MASCOT_ART.lines().count() <= MASCOT_MAX_LINES);
-    let width = mascot_width();
-    assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
+fn mascot_pixels_are_bounded_and_indexed() {
+    // Single-owned vendored asset: 32x32 indexed pixels over the 21-color
+    // workspace palette, 1-bit alpha, sane opaque/transparent coverage.
+    assert_eq!((MASCOT_COLS, MASCOT_ROWS), (32, 32));
+    assert_eq!(MASCOT_PIXELS.len(), MASCOT_ROWS);
+    let mut opaque = 0_usize;
+    let mut transparent = 0_usize;
+    let mut used = [false; 21];
+    for row in &MASCOT_PIXELS {
+        assert_eq!(row.len(), MASCOT_COLS);
+        for &index in row {
+            if index == MASCOT_TRANSPARENT {
+                transparent += 1;
+            } else {
+                assert!(
+                    (index as usize) < MASCOT_PALETTE.len(),
+                    "pixel index {index} outside palette"
+                );
+                used[index as usize] = true;
+                opaque += 1;
+            }
+        }
+    }
+    assert!(opaque > 100 && transparent > 100);
+    assert!(used.iter().filter(|used| **used).count() >= 8);
 }
 
 #[test]
-fn mascot_art_width_selection_matches_init_greeting() {
-    // Splash and `bitty init` greeting agree by construction (aliases).
+fn mascot_render_has_stable_geometry_and_canonical_eyes() {
+    // The canonical `> _` eyes survive the vendor pipeline as outline-dark
+    // (palette index 0) at the neutral-pose coordinates from
+    // `assets/gen_mascot_pixels.py`; mirroring or drift fails here.
+    for &(x, y) in &[(11, 12), (12, 12), (13, 13), (11, 14), (12, 14)] {
+        assert_eq!(MASCOT_PIXELS[y][x], 0, "prompt eye ({x},{y})");
+    }
+    assert_eq!(
+        MASCOT_PIXELS[14][18..22],
+        [0; 4],
+        "cursor eye `_` intact at row 14"
+    );
+    // Both modes share geometry: 16 rows of 32 cells (escapes excluded).
+    for color in [false, true] {
+        let art = render_mascot_art(color);
+        let lines: Vec<&str> = art.lines().collect();
+        assert_eq!(lines.len(), MASCOT_SPLASH_LINES);
+        for line in &lines {
+            let glyphs = strip_mascot_sgr(line);
+            assert_eq!(glyphs.chars().count(), MASCOT_COLS, "line {line:?}");
+        }
+    }
+
+    // Mono mode is escape-free but keeps the block glyphs.
+    let mono = render_mascot_art(false);
+    assert!(!mono.contains('\u{1b}'));
+    assert!(mono.contains('\u{2580}'));
+    assert!(mono.contains('\u{2584}'));
+
+    // Color mode sets truecolor runs and resets every line.
+    let vivid = render_mascot_art(true);
+    assert!(vivid.contains("\u{1b}[38;2;"));
+    assert!(vivid.contains("\u{1b}[48;2;"));
+    assert!(vivid.lines().all(|line| line.ends_with("\u{1b}[0m")));
+
+    // Color adds escapes only: same glyphs underneath.
+    assert_eq!(strip_mascot_sgr(&vivid), mono);
+}
+
+/// Test-only SGR stripper for [`mascot_render_has_stable_geometry_and_canonical_eyes`].
+fn strip_mascot_sgr(rendered: &str) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    let mut chars = rendered.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for control in chars.by_ref() {
+                if control == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn mascot_art_is_bounded_cells() {
+    // Splash geometry: 32 columns by 16 rows, inside the test bounds.
     let width = mascot_width();
-    assert_eq!(mascot_art_for_width(None), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(80)), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(width as u16)), MASCOT_ART);
-    let narrow = mascot_art_for_width(Some(20));
+    assert_eq!(width, MASCOT_COLS);
+    assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
+    assert_eq!(MASCOT_SPLASH_LINES, MASCOT_MAX_LINES);
+}
+
+#[test]
+fn mascot_art_width_selection_renders_pixels() {
+    // Roomy or unknown widths print the full pixel render; the color
+    // decision only toggles escapes, never geometry or policy.
+    let width = mascot_width();
+    assert_eq!(mascot_art_for_width(None, false), render_mascot_art(false));
+    assert_eq!(
+        mascot_art_for_width(Some(80), false),
+        render_mascot_art(false)
+    );
+    assert_eq!(
+        mascot_art_for_width(Some(width as u16), true),
+        render_mascot_art(true)
+    );
+    let narrow = mascot_art_for_width(Some(20), false);
+    assert_eq!(narrow, MASCOT_FALLBACK);
     assert!(narrow.contains("too narrow"));
     assert_eq!(narrow.lines().count(), 1);
 }

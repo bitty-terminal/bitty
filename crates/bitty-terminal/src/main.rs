@@ -295,22 +295,24 @@ use terminal_app::window_title_for_theme;
 
 #[cfg(test)]
 use mascot::{
-    MASCOT_ART, MASCOT_MAX_LINES, MASCOT_MAX_WIDTH, SPLASH_MARKER_FILE, mascot_art_for_width,
-    mascot_width, record_splash_shown, should_show_splash, splash_marker_path,
+    MASCOT_COLS, MASCOT_FALLBACK, MASCOT_MAX_LINES, MASCOT_MAX_WIDTH, MASCOT_PALETTE,
+    MASCOT_PIXELS, MASCOT_ROWS, MASCOT_SPLASH_LINES, MASCOT_TRANSPARENT, SPLASH_MARKER_FILE,
+    mascot_art_for_width, mascot_width, record_splash_shown, render_mascot_art, should_show_splash,
+    splash_marker_path,
 };
 
 #[cfg(test)]
 use init::{
-    INIT_MASCOT_ART, INIT_MASCOT_FALLBACK, InitAnswers, InitEnv, InitKeyPreset, InitOverrides,
-    InitPreview, InitWriteError, init_bundled_plugin_components, init_clean_shell,
-    init_columns_from_env, init_detect_shell_for_handoff, init_greeting_art, init_lua_escape,
-    init_mascot_width, init_parse_close_confirm_answer, init_parse_decoration_answer,
-    init_parse_font_family_answer, init_parse_font_size_answer, init_parse_plugins_answer,
-    init_parse_plugins_flag, init_parse_preset_answer, init_parse_scrollback_answer,
-    init_parse_shell_answer, init_parse_theme_answer, init_parse_yes_no_answer,
-    init_shell_candidates, init_shell_init_line, init_shell_name_from_path, init_shell_source_hint,
-    init_usage, init_yes_defaults, render_init_lua, run_init_interactive,
-    run_init_interactive_with_preview, run_init_subcommand_with_io, write_init_config,
+    InitAnswers, InitEnv, InitKeyPreset, InitOverrides, InitPreview, InitWriteError,
+    init_bundled_plugin_components, init_clean_shell, init_columns_from_env,
+    init_detect_shell_for_handoff, init_lua_escape, init_parse_close_confirm_answer,
+    init_parse_decoration_answer, init_parse_font_family_answer, init_parse_font_size_answer,
+    init_parse_plugins_answer, init_parse_plugins_flag, init_parse_preset_answer,
+    init_parse_scrollback_answer, init_parse_shell_answer, init_parse_theme_answer,
+    init_parse_yes_no_answer, init_shell_candidates, init_shell_init_line,
+    init_shell_name_from_path, init_shell_source_hint, init_usage, init_yes_defaults,
+    render_init_lua, run_init_interactive, run_init_interactive_with_preview,
+    run_init_subcommand_with_io, write_init_config,
 };
 
 #[cfg(test)]
@@ -628,7 +630,7 @@ fn main() {
     // not repeat the greeting.
     if args.mascot {
         let columns = init::init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
-        mascot::print_mascot_art(columns);
+        mascot::print_mascot_art(columns, help_color_enabled(&args));
         if let Some(marker) = mascot::splash_marker_path_live() {
             mascot::record_splash_shown(&marker);
         }
@@ -844,7 +846,7 @@ fn main() {
         if let Some(marker) = mascot::splash_marker_path_live() {
             if mascot::should_show_splash(args.no_splash, Some(&marker)) {
                 let columns = init::init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
-                mascot::print_mascot_art(columns);
+                mascot::print_mascot_art(columns, help_color_enabled(&args));
                 mascot::record_splash_shown(&marker);
             }
         }

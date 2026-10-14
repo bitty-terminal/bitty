@@ -2093,7 +2093,7 @@ pub(crate) fn help_text() -> String {
                              creates parents + starter when missing, never\n  \
                              overwrites existing content\n  \
              init [--yes] [--force] [VALUE FLAGS]  Opt-in guided setup wizard\n  \
-                              (never auto-runs): mascot greeting, shell/theme/\n  \
+                              (never auto-runs): greeting, shell/theme/\n  \
                               font family+size/decoration gaps+border+radius/\n  \
                               scrollback/close_confirm picks, vim keybinding\n  \
                               preset, writes init.lua with shipped keys only.\n  \

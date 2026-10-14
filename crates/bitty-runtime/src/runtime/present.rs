@@ -1132,6 +1132,82 @@ impl Runtime {
         for sess in self.pane_sessions.values_mut() {
             sess.last_presented_generation = sess.state.generation();
         }
+        // CTX-1231: every path through here consumes damage (real presents
+        // and idle write-backs alike), so no deferred frame is pending after
+        // it. The atlas-reject path intentionally bypasses this function and
+        // keeps a pending deferral armed.
+        self.coalesced_pending = false;
+    }
+
+    /// Minimum interval between presented frames (CTX-1231, #2093).
+    ///
+    /// Present-latest coalescing cadence: dirty ticks inside the interval
+    /// defer with damage retained. `ZERO` (default) disables the gate.
+    #[must_use]
+    pub fn min_present_interval(&self) -> std::time::Duration {
+        self.min_present_interval
+    }
+
+    /// Sets the present-latest coalescing cadence (CTX-1231, #2093).
+    ///
+    /// A 60 Hz compositor pace is `Duration::from_millis(16)`. `ZERO`
+    /// restores every-dirty-tick presents; a pending deferral still
+    /// presents on the next dirty tick because the gate reads the live
+    /// value.
+    pub fn set_min_present_interval(&mut self, interval: std::time::Duration) {
+        self.min_present_interval = interval;
+    }
+
+    /// Frames dropped by the coalescing gate with damage retained
+    /// (CTX-1231). Monotonic, saturating; idle ticks never count.
+    #[must_use]
+    pub fn presents_coalesced(&self) -> u64 {
+        self.presents_coalesced
+    }
+
+    /// Wake deadline for a deferred coalesced frame, if any (CTX-1231).
+    ///
+    /// `Some(last_present + interval)` while a deferred frame holds
+    /// un-presented damage; `None` otherwise (gate off, nothing deferred,
+    /// or already presented). The app arms `set_wait_until` at it so a
+    /// burst followed by quiet still presents the latest frame on time
+    /// instead of holding it until unrelated activity (frame-on-demand
+    /// liveness). `checked_add` fail-closed: an unrepresentable deadline
+    /// reports `None` and the next dirty tick presents immediately.
+    #[must_use]
+    pub fn present_coalescing_deadline(&self) -> Option<std::time::Instant> {
+        if !self.coalesced_pending {
+            return None;
+        }
+        let last = self.last_present_at?;
+        last.checked_add(self.min_present_interval)
+    }
+
+    /// Present-latest coalescing gate (CTX-1231, #2093).
+    ///
+    /// Returns `true` when this dirty tick must skip its present because
+    /// the last presented frame is younger than `min_present_interval`.
+    /// Damage is retained (the caller returns `None` without marking
+    /// presented), so the next tick past the deadline presents the
+    /// accumulated latest state: intermediate frames are dropped, never
+    /// torn-presented, and the final frame matches an uncoalesced run at
+    /// the same clock (same snapshots, same time-driven animation state;
+    /// only surface commits are skipped). The first frame always presents
+    /// (`last_present_at` is `None`), and a zero interval disables the
+    /// gate entirely.
+    fn defer_coalesced_present(&mut self, now: std::time::Instant) -> bool {
+        if self.min_present_interval.is_zero() {
+            return false;
+        }
+        let Some(last) = self.last_present_at else {
+            return false;
+        };
+        if now.saturating_duration_since(last) >= self.min_present_interval {
+            return false;
+        }
+        self.coalesced_pending = true;
+        self.presents_coalesced = self.presents_coalesced.saturating_add(1);
+        true
     }
 
     /// Pushes the Core-owned decoration ring for one leaf and returns the
@@ -1704,6 +1780,15 @@ impl Runtime {
             return None;
         }
         let basis = self.collect_tick_basis(now)?;
+        // CTX-1231: present-latest coalescing — drop this intermediate
+        // frame when ahead of the present cadence; damage stays retained
+        // for the deadline tick. Time-driven state (animations, kitty
+        // playback, hover) already advanced in `collect_tick_basis`, so the
+        // eventual frame shows the latest state, byte-identical to an
+        // uncoalesced run at the same clock.
+        if self.defer_coalesced_present(now) {
+            return None;
+        }
         let mut layers = self.build_leaf_primitives(&basis, now);
         // #1849 S7: arm the IME caret before the overlay phase (the
         // preedit overlay anchors here), but paint the cursor fill after
@@ -1727,7 +1812,14 @@ impl Runtime {
         if self.reject_stale_atlas_frame(&layers) {
             return None;
         }
-        self.present_assembled_frame(basis, layers)
+        let stats = self.present_assembled_frame(basis, layers);
+        // CTX-1231: the pacing gate measures real present cadence — stamp
+        // only ticks that actually committed a frame, never deferred, idle,
+        // or rejected ones.
+        if stats.is_some() {
+            self.last_present_at = Some(now);
+        }
+        stats
     }
 
     /// Issue #1409 (CTX-0797): refuse to present a frame whose leaf glyph
@@ -5328,6 +5420,281 @@ mod scroll_region_copy_tests {
             fast_stats.cells_examined, full_stats.cells_examined,
             "out-of-band companion must decline the fast path (fail-closed full render)"
         );
+    }
+}
+
+#[cfg(test)]
+mod present_coalescing_tests {
+    //! CTX-1231 (#2093): present-latest coalescing — drop intermediate
+    //! frames when behind.
+    //!
+    //! When dirty ticks arrive faster than the present cadence
+    //! (`min_present_interval`), intermediate presents are skipped with
+    //! damage retained and only the latest state presents. The burst test
+    //! below proves the final headless frame is byte-identical to an
+    //! uncoalesced run at the same virtual clock (no torn intermediate is
+    //! ever presented — intermediates are never presented at all) while
+    //! present count and renderer work drop. The scroll-storm shape also
+    //! exercises the CTX-1207 cross-tick frame-merge: deferred ticks
+    //! accumulate same-region motions in the damage ring and the deadline
+    //! tick sums them in one region-copy.
+    use super::*;
+    use crate::runtime::AnimationKind;
+    use std::time::{Duration, Instant};
+
+    /// Present cadence for the tests: dirty ticks 1 ms apart coalesce, the
+    /// tick at +16 ms presents (mirrors `ANIMATION_FRAME_INTERVAL`).
+    const INTERVAL: Duration = Duration::from_millis(16);
+
+    /// Deterministic single-pane runtime: 80x24 leaf, animations instant
+    /// (no time-varying alpha between compared ticks), cursor hidden at
+    /// settle so no blink-phase overlay can diverge.
+    fn runtime() -> Runtime {
+        let mut config = RuntimeConfig::default();
+        config.animations.duration_ms = [0; AnimationKind::COUNT];
+        let mut rt = Runtime::with_deterministic_rasterizer(config)
+            .expect("deterministic runtime must build");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.handle_resize(PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        rt
+    }
+
+    /// Fill the grid with distinct rows, hide the cursor, and present once
+    /// at `t0` (stamps the present cadence clock).
+    fn settle(rt: &mut Runtime, t0: Instant) {
+        for row in 0..24u8 {
+            let line = format!("row-{row:02} ABCDEFGH\r\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        rt.handle_pty_bytes(b"\x1b[?25l");
+        assert!(
+            rt.tick_at(t0).is_some(),
+            "settle tick must present the first frame"
+        );
+    }
+
+    /// One scroll-storm step: scroll a line at the bottom, print a marker
+    /// on the exposed row (motion plus companion print damage per tick).
+    fn burst_step(rt: &mut Runtime, step: u8) {
+        rt.handle_pty_bytes(b"\x1b[99;1H");
+        rt.handle_pty_bytes(b"\n");
+        let marker = format!("tick-{step:02}");
+        rt.handle_pty_bytes(marker.as_bytes());
+    }
+
+    /// First differing byte locator shared by the equality asserts (not a
+    /// dump: pixel coordinates plus both frames' work counters).
+    fn assert_rgba_equal(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>, context: &str, w: usize) {
+        if a != b {
+            if let (Some(x), Some(y)) = (a.as_ref(), b.as_ref()) {
+                let first = x
+                    .iter()
+                    .zip(y.iter())
+                    .position(|(p, q)| p != q)
+                    .unwrap_or(usize::MAX);
+                panic!(
+                    "{context}: first diff byte {first} (px {},{}); left={:?} right={:?}",
+                    (first / 4) % w,
+                    (first / 4) / w,
+                    &x[first..first + 4],
+                    &y[first..first + 4],
+                );
+            }
+            panic!("{context}: frame mismatch with rgba on only one side");
+        }
+    }
+
+    #[test]
+    fn burst_coalesces_to_latest_and_matches_uncoalesced() {
+        let t0 = Instant::now();
+        let mut coalesced = runtime();
+        coalesced.set_min_present_interval(INTERVAL);
+        let mut reference = runtime();
+        settle(&mut coalesced, t0);
+        settle(&mut reference, t0);
+        let mut reference_presents = 1u32;
+        let mut reference_cells = 0u64;
+        let mut coalesced_cells = 0u64;
+        // Twelve dirty ticks 1 ms apart: the reference presents every one,
+        // the gated runtime defers every one with damage retained. The
+        // burst exceeds the 64-batch damage-history window on purpose, so
+        // the deadline tick exercises the fail-closed full-grid fallback —
+        // still byte-identical, still fewer presents (the in-window
+        // region-copy regime is pinned by the next test).
+        for step in 0..12u8 {
+            let at = t0 + Duration::from_millis(u64::from(step) + 1);
+            burst_step(&mut coalesced, step);
+            burst_step(&mut reference, step);
+            assert!(
+                coalesced.tick_at(at).is_none(),
+                "burst tick {step} inside the interval must defer"
+            );
+            let stats = reference
+                .tick_at(at)
+                .expect("uncoalesced burst tick must present");
+            reference_presents += 1;
+            reference_cells += stats.cells_examined;
+        }
+        assert_eq!(
+            coalesced.presents_coalesced(),
+            12,
+            "every intermediate burst tick must count as coalesced"
+        );
+        assert_eq!(
+            reference_presents, 13,
+            "reference must present settle + 12 burst ticks"
+        );
+        // One more step, then the deadline tick presents the accumulated
+        // latest state on both runtimes at the same virtual clock.
+        let end = t0 + INTERVAL;
+        burst_step(&mut coalesced, 12);
+        burst_step(&mut reference, 12);
+        let final_stats = coalesced
+            .tick_at(end)
+            .expect("deadline tick must present the coalesced frame");
+        coalesced_cells += final_stats.cells_examined;
+        let reference_final = reference
+            .tick_at(end)
+            .expect("reference deadline tick must present");
+        reference_presents += 1;
+        reference_cells += reference_final.cells_examined;
+        let w = coalesced.present_plan_extent().width as usize;
+        assert_rgba_equal(
+            &coalesced.headless_rgba(),
+            &reference.headless_rgba(),
+            "coalesced final frame must equal the uncoalesced final frame",
+            w,
+        );
+        assert_eq!(
+            reference_presents, 14,
+            "reference must present every dirty tick"
+        );
+        assert!(
+            coalesced_cells < reference_cells,
+            "coalescing must skip renderer work (coalesced {coalesced_cells} vs reference {reference_cells} cells)"
+        );
+    }
+
+    #[test]
+    fn cross_tick_scroll_net_motion_matches_forced_full_render() {
+        // The CTX-1207 interaction: deferred ticks accumulate same-region
+        // scroll motions across ticks in the damage ring; the deadline tick
+        // must region-copy the net motion and match a forced full render
+        // byte-for-byte (the frame-merge follow-up the scroll path left
+        // open), examining fewer cells. Five steps stay inside the 64-batch
+        // damage-history window (~9 generations per step); wider bursts
+        // degrade to the fail-closed full-grid fallback pinned above.
+        let t0 = Instant::now();
+        let mut coalesced = runtime();
+        coalesced.set_min_present_interval(INTERVAL);
+        let mut full = runtime();
+        settle(&mut coalesced, t0);
+        settle(&mut full, t0);
+        for step in 0..4u8 {
+            let at = t0 + Duration::from_millis(u64::from(step) + 1);
+            burst_step(&mut coalesced, step);
+            burst_step(&mut full, step);
+            assert!(coalesced.tick_at(at).is_none());
+            // The reference presents every mid-burst step (uncoalesced
+            // cadence); its deadline tick below is forced to a full render
+            // of the same final grid state.
+            assert!(full.tick_at(at).is_some());
+        }
+        burst_step(&mut coalesced, 4);
+        burst_step(&mut full, 4);
+        // Force the full path on the reference deadline tick: full-frame
+        // invalidation declines the region-copy and re-renders the leaf.
+        full.pending_full_redraw = true;
+        let end = t0 + INTERVAL;
+        let fast_stats = coalesced.tick_at(end).expect("deadline tick must present");
+        let full_stats = full.tick_at(end).expect("full tick must present");
+        let w = coalesced.present_plan_extent().width as usize;
+        assert_rgba_equal(
+            &coalesced.headless_rgba(),
+            &full.headless_rgba(),
+            "cross-tick net-motion region-copy must equal a full repaint",
+            w,
+        );
+        assert!(
+            fast_stats.cells_examined < full_stats.cells_examined,
+            "net-motion copy must examine fewer cells (fast {} vs full {})",
+            fast_stats.cells_examined,
+            full_stats.cells_examined,
+        );
+    }
+
+    #[test]
+    fn deferral_arms_deadline_and_presents_at_cadence() {
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        rt.set_min_present_interval(INTERVAL);
+        settle(&mut rt, t0);
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            None,
+            "no deadline while nothing is deferred"
+        );
+        rt.handle_pty_bytes(b"hello");
+        assert!(
+            rt.tick_at(t0 + Duration::from_millis(1)).is_none(),
+            "dirty tick inside the interval must defer"
+        );
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            Some(t0 + INTERVAL),
+            "a deferred frame must arm the app wake at the cadence deadline"
+        );
+        let stats = rt
+            .tick_at(t0 + INTERVAL)
+            .expect("deadline tick must present the held frame");
+        assert_eq!(stats.generation, rt.state.generation());
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            None,
+            "deadline clears once the held frame presents"
+        );
+        assert_eq!(rt.presents_coalesced(), 1);
+        assert!(
+            rt.tick_at(t0 + INTERVAL + Duration::from_millis(1))
+                .is_none(),
+            "quiet tick after the present must idle, not defer"
+        );
+        assert_eq!(
+            rt.presents_coalesced(),
+            1,
+            "idle ticks must not count as coalesced"
+        );
+    }
+
+    #[test]
+    fn first_frame_always_presents() {
+        let mut rt = runtime();
+        rt.set_min_present_interval(INTERVAL);
+        rt.handle_pty_bytes(b"first");
+        assert!(
+            rt.tick_at(Instant::now()).is_some(),
+            "the first frame must present even with coalescing armed"
+        );
+    }
+
+    #[test]
+    fn zero_interval_presents_every_dirty_tick() {
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        assert_eq!(rt.min_present_interval(), Duration::ZERO);
+        settle(&mut rt, t0);
+        for step in 0..4u8 {
+            burst_step(&mut rt, step);
+            assert!(
+                rt.tick_at(t0 + Duration::from_millis(u64::from(step) + 1))
+                    .is_some(),
+                "default (zero interval) must preserve every-tick presents"
+            );
+        }
+        assert_eq!(rt.presents_coalesced(), 0);
+        assert_eq!(rt.present_coalescing_deadline(), None);
     }
 }
 

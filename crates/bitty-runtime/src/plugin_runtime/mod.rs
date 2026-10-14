@@ -78,11 +78,11 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
     MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue, OverlayPeers,
-    PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest,
-    QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger,
-    ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource, SnapshotSource,
-    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
-    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv,
+    QueuedPinRequest, QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY,
+    ServiceCallLedger, ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource,
+    SnapshotSource, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
+    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -600,9 +600,9 @@ pub struct PluginRuntime {
     /// `bitty.panel.set_pinned`, shared with every activated generation
     /// that holds `panel.focus`. `None` (no host wired yet) leaves granted
     /// calls failing closed with `E_NOT_IMPLEMENTED`, mirroring the
-    /// workspace-source pattern. Sibling panel verbs have no backend seam
-    /// yet, so wiring only `set_pinned` leaves nothing inconsistent: the
-    /// siblings stay `E_NOT_IMPLEMENTED` until their own seams land.
+    /// workspace-source pattern. CTX-1214 adds the sibling `panel.create`
+    /// seam below; the remaining panel verbs stay `E_NOT_IMPLEMENTED`
+    /// until their own seams land.
     ///
     /// CTX-1115: the production host supplies a deferred backend here. The
     /// closure validates against a per-tick published pin snapshot and
@@ -613,6 +613,14 @@ pub struct PluginRuntime {
     /// offer, so the deferred queue (mirroring CTX-0889 workspace requests)
     /// is the host-handle decision. Tests keep injecting direct closures.
     panel_pin_backend: Option<PanelPinHandler>,
+    /// CTX-1214 (Issue #2085): synchronous panel-creation backend for
+    /// `bitty.panel.create`, shared with every activated generation that
+    /// holds `panel.create`. `None` (no host wired yet) leaves granted
+    /// calls failing closed with `E_NOT_IMPLEMENTED`, mirroring the
+    /// pin-backend pattern. Creation allocates a `Created` registry record
+    /// only; mounting and focusing stay host-driven, so the backend carries
+    /// no layout authority.
+    panel_create_backend: Option<PanelCreateHandler>,
     /// CTX-1115: bounded queue of `bitty.panel.set_pinned` intents, drained
     /// by the application each tick
     /// ([`PluginRuntime::drain_panel_pin_requests`]).
@@ -723,6 +731,7 @@ impl PluginRuntime {
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
             panel_pin_backend: None,
+            panel_create_backend: None,
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
             image_roots: Vec::new(),
@@ -903,6 +912,16 @@ impl PluginRuntime {
     /// like every other panel verb without a host.
     pub fn set_panel_pin_backend(&mut self, backend: Option<PanelPinHandler>) {
         self.panel_pin_backend = backend;
+    }
+
+    /// Install the synchronous panel-creation backend for
+    /// `bitty.panel.create` (CTX-1214, Issue #2085). Call before activation:
+    /// each generation captures the backend when its services are built, and
+    /// only when `panel.create` is granted (no backend without grant).
+    /// Without it a granted call fails closed with `E_NOT_IMPLEMENTED`,
+    /// like every other panel verb without a host.
+    pub fn set_panel_create_backend(&mut self, backend: Option<PanelCreateHandler>) {
+        self.panel_create_backend = backend;
     }
 
     /// Seed the approved wallpaper roots for `bitty.image.read` (CTX-1169,
@@ -1566,10 +1585,18 @@ impl PluginRuntime {
         // CTX-1099: the `bitty.panel.set_pinned` host backend. Installed
         // only for `panel.focus` generations (no backend without grant);
         // the call-time grant gate in `panel_set_pinned` stays as the
-        // second layer. Sibling panel verbs have no backend seam, so they
-        // keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
+        // second layer.
         if panel_focus {
             plugin_services.set_panel_pin_backend(self.panel_pin_backend.clone());
+        }
+        // CTX-1214 (Issue #2085): the `bitty.panel.create` host backend.
+        // Installed only for `panel.create` generations (no backend without
+        // grant); the call-time grant gate in `panel_create` stays as the
+        // second layer, and the zero-PTY type policy there stays as the
+        // third. Remaining sibling panel verbs have no backend seam, so
+        // they keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
+        if panel_create {
+            plugin_services.set_panel_create_backend(self.panel_create_backend.clone());
         }
         // CTX-1139: the `bitty.fx.pulse` intent queue. Shared only with
         // `panel.focus` generations (no queue without grant); the call-time

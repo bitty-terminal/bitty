@@ -416,6 +416,22 @@ fn background_format_name(format: BackgroundFormat) -> &'static str {
 /// closed with `E_NOT_IMPLEMENTED`.
 pub type PanelPinHandler = Rc<dyn Fn(u64, bool) -> Result<bool, BridgeError>>;
 
+/// Synchronous panel-creation backend for one plugin generation (CTX-1214,
+/// Issue #2085).
+///
+/// Receives the Lua-validated panel type name (`rich`, `browser`, `helper`,
+/// or `canvas` — never `terminal`; the [`PluginServices::panel_create`]
+/// gate rejects PTY-backed types before the backend runs, so a backend
+/// never mints process-spawn authority) and returns the raw `(panel_id,
+/// generation)` pair for the freshly allocated registry record. The record
+/// starts in `Created` state: mounting and focusing stay host-driven
+/// (layout authority never crosses into the plugin), so the backend
+/// allocates only. Registry exhaustion maps to `E_DEF_LIMIT`; a disposed
+/// or otherwise unservable host maps to `E_NOT_IMPLEMENTED`. Tests inject
+/// canned closures over a real `PanelRegistry`; `None` (no backend) fails
+/// closed with `E_NOT_IMPLEMENTED`.
+pub type PanelCreateHandler = Rc<dyn Fn(&str) -> Result<(u64, u64), BridgeError>>;
+
 /// Settings source that has no settings.
 #[derive(Debug, Default)]
 pub struct EmptySettings;
@@ -1498,6 +1514,7 @@ pub struct PluginServices {
     workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
+    panel_create_backend: RefCell<Option<PanelCreateHandler>>,
     panel_pin_backend: RefCell<Option<PanelPinHandler>>,
     /// Whether this generation holds `platform.image-file` (CTX-1169).
     image_read_granted: Cell<bool>,
@@ -1579,6 +1596,7 @@ impl PluginServices {
             workspace_requests: RefCell::new(None),
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
+            panel_create_backend: RefCell::new(None),
             panel_pin_backend: RefCell::new(None),
             image_read_granted: Cell::new(false),
             image_roots: RefCell::new(None),
@@ -1614,6 +1632,13 @@ impl PluginServices {
     /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
     pub fn set_panel_pin_backend(&self, backend: Option<PanelPinHandler>) {
         *self.panel_pin_backend.borrow_mut() = backend;
+    }
+
+    /// Attach the synchronous panel-creation backend for `bitty.panel.create`
+    /// (CTX-1214, Issue #2085). Without it a granted call fails closed with
+    /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
+    pub fn set_panel_create_backend(&self, backend: Option<PanelCreateHandler>) {
+        *self.panel_create_backend.borrow_mut() = backend;
     }
 
     /// Grant `platform.image-file` from the activation snapshot (CTX-1169,
@@ -3502,8 +3527,36 @@ impl HostServices for PluginServices {
         if !self.panel_create_granted.get() {
             return Err(BridgeError::capability_denied("panel.create"));
         }
-        let _ = panel_type;
-        Err(BridgeError::not_implemented("bitty.panel.create"))
+        let backend = self
+            .panel_create_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.panel.create"))?;
+        // Zero-PTY policy (CTX-1214, Issue #2085): plugins allocate native
+        // panels only. `terminal` would mint PTY/process-spawn authority the
+        // grant never conveys, so it fails closed here even though the Lua
+        // bridge grammar still spells the full Core closed set. The check
+        // runs after the backend-presence gate so an unwired host keeps
+        // reporting `E_NOT_IMPLEMENTED` for every type, matching the sibling
+        // verbs.
+        match panel_type {
+            "rich" | "browser" | "helper" | "canvas" => {}
+            "terminal" => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "panel.create cannot create terminal panels: plugins create zero-PTY panels only",
+                ));
+            }
+            _ => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "panel.create type must be rich, browser, helper, or canvas",
+                ));
+            }
+        }
+        backend(panel_type)
     }
 
     fn panel_close(&self, panel_id: u64) -> Result<bool, BridgeError> {
@@ -3924,6 +3977,54 @@ mod tests {
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
         let error = focus_only.panel_get_state(1).expect_err("unimplemented");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn panel_create_applies_through_backend_zero_pty_only() {
+        // CTX-1214 (Issue #2085): a granted generation with a backend routes
+        // native types through; `terminal` (PTY/process authority) and
+        // unknown types fail closed with `E_DEF_INVALID` and never reach the
+        // backend.
+        let granted = services();
+        granted.set_panel_access(true, false);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let tapped = seen.clone();
+        granted.set_panel_create_backend(Some(Rc::new(move |panel_type: &str| {
+            tapped.borrow_mut().push(panel_type.to_string());
+            Ok((7, 3))
+        })));
+        assert_eq!(granted.panel_create("rich").expect("rich creates"), (7, 3));
+        assert_eq!(
+            granted.panel_create("helper").expect("helper creates"),
+            (7, 3)
+        );
+        let error = granted.panel_create("terminal").expect_err("no PTY");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        let error = granted.panel_create("bogus").expect_err("closed set");
+        assert_eq!(error.code, "E_DEF_INVALID");
+        assert_eq!(
+            *seen.borrow(),
+            vec!["rich".to_string(), "helper".to_string()],
+            "rejected types never reach the backend"
+        );
+    }
+
+    #[test]
+    fn panel_create_denies_before_backend_without_grant() {
+        // Grant gate first: even with a backend installed, an ungranted
+        // generation fails closed with `E_CAPABILITY_DENIED` and the backend
+        // never runs.
+        let denied = services();
+        let called = Rc::new(RefCell::new(false));
+        let flag = called.clone();
+        denied.set_panel_create_backend(Some(Rc::new(move |_: &str| {
+            *flag.borrow_mut() = true;
+            Ok((1, 1))
+        })));
+        let error = denied.panel_create("rich").expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.message, "capability 'panel.create' is not granted");
+        assert!(!*called.borrow(), "denied calls never reach the backend");
     }
 
     #[test]

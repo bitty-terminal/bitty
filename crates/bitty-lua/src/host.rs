@@ -4026,7 +4026,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
 
     // CTX-0915: `bitty.panel` API for panel lifecycle and presentation control
     // (Issue #1596). Grant-gated on `panel.create` (creation) and `panel.focus`
-    // (manipulation/queries). Backend wiring to PanelRegistry is deferred.
+    // (manipulation/queries). `create` routes through the services-layer
+    // `PanelCreateHandler` seam (CTX-1214, Issue #2085); without a host
+    // backend it fails closed with `E_NOT_IMPLEMENTED`, like the sibling
+    // verbs without a host.
     let panel = Table::new(&ctx);
     panel
         .set(

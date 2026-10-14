@@ -312,7 +312,11 @@ pub(crate) fn startup_pin_backend(
 }
 
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
-fn store_root() -> Option<PathBuf> {
+///
+/// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
+/// observability, bitty#2002), which discovers the same store without
+/// loading any plugin VM.
+pub(crate) fn store_root() -> Option<PathBuf> {
     store_root_for(
         std::env::var("XDG_DATA_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
@@ -345,7 +349,11 @@ fn data_home() -> Option<PathBuf> {
 }
 
 /// Untrusted local-path development roots from `$BITTY_PLUGIN_DIR`.
-fn dev_roots() -> Vec<PathBuf> {
+///
+/// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
+/// observability, bitty#2002), which discovers the same roots without
+/// loading any plugin VM.
+pub(crate) fn dev_roots() -> Vec<PathBuf> {
     let Ok(explicit) = std::env::var(PLUGIN_ROOT_ENV) else {
         return Vec::new();
     };

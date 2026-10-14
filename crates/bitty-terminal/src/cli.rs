@@ -696,7 +696,7 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
-/// - `list <themes|plugins|instances|actions|keymaps>` → resource enumeration (CTX-0172, CTX-1127);
+/// - `list <themes|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
 ///   class, safe mode); a program literally named `inspect` needs
@@ -2122,7 +2122,7 @@ pub(crate) fn help_text() -> String {
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
-             list <kind>      Enumerate resources: themes|plugins|instances|actions|keymaps\n  \
+             list <kind>      Enumerate resources: themes|plugins|instances|actions|keymaps|services\n  \
                               (--format table|json|jsonl, --socket/--instance for\n  \
                               instances; alias `ls`; `bitty list --help` for detail)\n  \
              inspect <target> <value>  Explain state and ownership (local, safe mode)\n  \
@@ -2294,7 +2294,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             config <verb>           Config path, check, or edit (alias cfg)\n  \
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
             doctor                  Diagnose installation and compatibility (local)\n  \
-            list <kind>             Enumerate themes|plugins|instances|actions|keymaps (alias ls)\n  \
+            list <kind>             Enumerate themes|plugins|instances|actions|keymaps|services (alias ls)\n  \
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
             plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \

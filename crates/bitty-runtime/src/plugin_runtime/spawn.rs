@@ -124,13 +124,16 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use bitty_ipc::execution::{
     DEFAULT_EXEC_TIMEOUT_MS, EnvPolicy, EnvVar, ExecutionRequest, ExecutionResult,
     MAX_EXEC_ARG_BYTES, MAX_EXEC_ARGS, MAX_EXEC_ARGS_TOTAL_BYTES, MAX_EXEC_CLIENT_ID_BYTES,
     MAX_EXEC_ENV_VARS, MAX_EXEC_OUTPUT_BUDGET_BYTES, MAX_EXEC_TIMEOUT_MS, MAX_EXECUTABLE_BYTES,
+    MAX_TRACKED_EXECUTIONS,
 };
 use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
@@ -139,6 +142,7 @@ use bitty_plugin_host::tools::{
     ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
     is_tool_spawn_allowed, is_valid_tool_name,
 };
+use bitty_pty::TreeBackend;
 
 /// Panel-path per-stream output budget (`8 KiB`).
 ///
@@ -162,6 +166,14 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// yet ample for a killed child's pipes to close on every platform.
 const SPAWN_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Pipe drain chunk size (`8 KiB`).
+///
+/// One blocking read per drain iteration; matches the registry drain chunk
+/// and the `bitty-pty` read-chunk precedent, so neither side re-derives its
+/// own. Named (instead of an inline literal) so the seam policy below can
+/// own the number and the parity test can pin it.
+const SPAWN_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
+
 /// Maximum bytes of one host-authored bridge message (`E_SPAWN_*` reasons).
 ///
 /// Reuses the bounded human-message precedent
@@ -170,6 +182,415 @@ const SPAWN_BRIDGE_MESSAGE_BYTES: usize = bitty_ipc::devtools::MAX_ERROR_MESSAGE
 
 /// Scope guarding every spawn (always separate; requires elevation).
 pub const SPAWN_SCOPE: Scope = Scope::ProcessSpawn;
+
+// ── execution seam (CTX-1182 + CTX-1184, issue #1997) ─────────────────────────
+//
+// Core-owned spawn-execution seam: [`SpawnMechanicsPolicy`] adopts the
+// published execution sidecar contract numbers verbatim (supervisor poll,
+// drain chunk, tracked-outcome ceiling, output ceiling, typed-cancel grace),
+// [`SpawnKillScope`] mirrors `KillScope::for_backend`, and the
+// [`SpawnGeneration`] / [`SpawnHandle`] / [`SpawnCancelRequest`] /
+// [`SpawnCancelOutcome`] / [`SpawnCancelReceipt`] vocabulary mirrors the
+// generation-fenced typed cancel (`cancel_sidecar_typed`). The small-core
+// graph fence keeps Core from importing the execution crate directly, so
+// this module owns the copy and the parity tests below pin every number and
+// behavior against the contract; the composition root ([`SpawnService`])
+// bridges this seam to live behavior (CTX-1184): it enforces the injected
+// policy, reports the adopted kill scope, mints generation-fenced handles,
+// and resolves cancels against live tracked state.
+//
+// Ownership boundaries (unchanged by this seam):
+// - Shape and allowlist gates ([`SpawnRequest::validate`], [`SpawnAuthorizer`])
+//   stay host-owned and are never re-derived here.
+// - One-shot kills are [`SpawnKillScope::DirectChild`]: no owned-tree backend
+//   is adopted for a synchronous spawn, so a grandchild holding a pipe is met
+//   by the bounded drain detach (partial output preserved), never by a tree
+//   kill. The adopted supervision scope ([`SpawnService::kill_scope`]) still
+//   reports the owned tree where a backend exists; executing tree kills for
+//   live supervision is follow-up work.
+// - A synchronous spawn has no live job to cancel: every cancel resolves on
+//   the spot (unknown id fails closed, stored outcome reports its terminal
+//   state, stale generation answers without touching anything). Executing an
+//   accepted cancel against a running job belongs to the async supervisor
+//   follow-up; the vocabulary below exists so that follow-up needs no new
+//   Core vocabulary.
+// - The drain join stays `1 s` while the long-lived registry supervisor joins
+//   drains under a wider `5 s` bound: a one-shot spawn answers against its
+//   `30 s` ceiling, so the tighter bound keeps it total without changing the
+//   mechanism (concurrent bounded drain, bounded join, detach with partial).
+// - The synchronous provider slot ([`ExecutionService::with_provider`]) takes
+//   a bare `fn` pointer owned by `bitty-ipc`, so it runs [`spawn_process`]
+//   (core defaults); tuned policies flow through [`spawn_process_with_policy`]
+//   and the [`SpawnService`] surface until that seam accepts context.
+
+/// Bounded spawn-execution numbers the spawn surface enforces.
+///
+/// Every default is the shared contract number, adopted verbatim from the
+/// published execution sidecar contract where the two sides overlap (poll,
+/// drain chunk, tracked ceiling, output ceiling, cancel grace); the drain
+/// join keeps the one-shot `1 s` bound documented above. A host with an
+/// approved reason tunes one field while keeping the rest: fields are public
+/// for that reason, and the tuned policy flows in through
+/// [`SpawnService::with_policy`], [`spawn_process_with_policy`],
+/// `join_drain_bounded`, `drain_bounded_shared`, and
+/// [`SpawnCancelRequest::new_with_policy`]. Use sites clamp defensively
+/// (`saturating_add` for the overflow spare, `max(1)` for the drain chunk
+/// and tracked cap), mirroring the drain below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnMechanicsPolicy {
+    /// Supervisor poll interval (`SPAWN_POLL_INTERVAL`, 10 ms).
+    pub poll_interval: Duration,
+    /// Pipe drain chunk (`SPAWN_DRAIN_CHUNK_BYTES`, 8 KiB).
+    pub drain_chunk_bytes: usize,
+    /// Bounded drain-join budget (`SPAWN_DRAIN_JOIN_TIMEOUT`, 1 s).
+    pub drain_join_timeout: Duration,
+    /// Tracked-outcome ceiling (`MAX_TRACKED_EXECUTIONS`, 64).
+    pub tracked_cap: usize,
+    /// Panel-path per-stream budget (`SPAWN_PANEL_OUTPUT_BUDGET`, 8 KiB).
+    pub panel_output_budget: usize,
+    /// Output budget ceiling (`MAX_EXEC_OUTPUT_BUDGET_BYTES`, 256 KiB).
+    pub output_budget_max: usize,
+    /// Largest grace a typed cancel request may carry (60 s).
+    pub cancel_grace_max_ms: u64,
+    /// Grace of a graceful-then-kill request (5 s).
+    pub cancel_grace_default_ms: u64,
+}
+
+impl SpawnMechanicsPolicy {
+    /// Contract numbers, matching the execution sidecar defaults exactly
+    /// except the documented one-shot drain-join bound.
+    #[must_use]
+    pub const fn core_defaults() -> Self {
+        Self {
+            poll_interval: SPAWN_POLL_INTERVAL,
+            drain_chunk_bytes: SPAWN_DRAIN_CHUNK_BYTES,
+            drain_join_timeout: SPAWN_DRAIN_JOIN_TIMEOUT,
+            tracked_cap: MAX_TRACKED_EXECUTIONS,
+            panel_output_budget: SPAWN_PANEL_OUTPUT_BUDGET,
+            output_budget_max: MAX_EXEC_OUTPUT_BUDGET_BYTES,
+            cancel_grace_max_ms: 60_000,
+            cancel_grace_default_ms: 5_000,
+        }
+    }
+
+    /// Bytes one drain retains for a `stream_budget`: the budget plus one
+    /// overflow spare so the service can detect overflow and mark
+    /// `truncated`. Saturates instead of wrapping at the address-space top.
+    #[must_use]
+    pub fn drain_retain_cap(&self, stream_budget: usize) -> usize {
+        stream_budget.saturating_add(1)
+    }
+}
+
+/// Kill scope a spawn cancel may request.
+///
+/// Mirrors `KillScope`: [`SpawnKillScope::DirectChild`] terminates the direct
+/// child only (the one-shot spawn scope; the caller owns the orphan gap via
+/// the bounded drain detach), while [`SpawnKillScope::OwnedTree`] terminates
+/// the whole owned process tree (long-lived supervision follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnKillScope {
+    /// Terminate the direct child only (fallback where no tree backend is
+    /// adopted; the caller owns the orphan gap).
+    DirectChild,
+    /// Terminate the whole owned process tree.
+    OwnedTree,
+}
+
+impl SpawnKillScope {
+    /// Scope the backend can honor: tree backends take
+    /// [`SpawnKillScope::OwnedTree`], [`TreeBackend::Unsupported`] degrades to
+    /// [`SpawnKillScope::DirectChild`]. Mirrors `KillScope::for_backend`.
+    #[must_use]
+    pub const fn for_tree_backend(backend: TreeBackend) -> Self {
+        match backend {
+            TreeBackend::Unsupported => Self::DirectChild,
+            TreeBackend::ProcessGroupPidfd
+            | TreeBackend::ProcessGroupKqueue
+            | TreeBackend::JobObject => Self::OwnedTree,
+        }
+    }
+
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectChild => "direct_child",
+            Self::OwnedTree => "owned_tree",
+        }
+    }
+}
+
+impl fmt::Display for SpawnKillScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Spawn generation: the host's handle generation, minted per spawn.
+///
+/// A handle carrying another generation is stale and the host rejects it
+/// (`StaleGeneration`). Mirrors the execution `ExecutionGeneration`: zero is
+/// never a generation, and the display is sixteen lowercase hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpawnGeneration(NonZeroU64);
+
+impl SpawnGeneration {
+    /// Wraps a raw generation; `None` for 0.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match NonZeroU64::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+
+    /// Raw generation value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for SpawnGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0.get())
+    }
+}
+
+/// Host handle for one spawn: execution id plus generation.
+///
+/// The id is the synchronous spawn's `execution_id` (zero is a valid id in
+/// the one-shot space); the generation fences stale cancels. Mirrors the
+/// execution `ExecutionHandle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpawnHandle {
+    /// Spawn execution id.
+    pub id: u64,
+    /// Generation the handle was minted with.
+    pub generation: SpawnGeneration,
+}
+
+/// How the host stops a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelMode {
+    /// Deliver a graceful stop request, then wait up to the grace period;
+    /// never escalates. A spawn still running afterwards keeps running.
+    Graceful,
+    /// Kill the owned scope now.
+    Immediate,
+    /// Graceful stop, wait, then kill the owned scope.
+    GracefulThenKill,
+}
+
+impl SpawnCancelMode {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Immediate => "immediate",
+            Self::GracefulThenKill => "graceful_then_kill",
+        }
+    }
+
+    /// Escalation rank: a later request with a higher rank upgrades a cancel
+    /// already executing; equal or lower ranks coalesce into it.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Graceful => 0,
+            Self::GracefulThenKill => 1,
+            Self::Immediate => 2,
+        }
+    }
+}
+
+/// A typed spawn-cancel request.
+///
+/// Carries the handle (id plus generation the host checks itself), the mode,
+/// and the grace period per graceful step. Mirrors the execution
+/// `CancelRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnCancelRequest {
+    handle: SpawnHandle,
+    mode: SpawnCancelMode,
+    grace: Duration,
+}
+
+impl SpawnCancelRequest {
+    /// Builds a request under the core-default policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` when `grace` exceeds the policy maximum
+    /// (`cancel_grace_max_ms`). A zero grace is allowed: graceful steps then
+    /// only check whether the spawn already stopped.
+    pub fn new(
+        handle: SpawnHandle,
+        mode: SpawnCancelMode,
+        grace: Duration,
+    ) -> Result<Self, IpcError> {
+        Self::new_with_policy(handle, mode, grace, &SpawnMechanicsPolicy::core_defaults())
+    }
+
+    /// Builds a request under an explicit policy (composition-root injection).
+    ///
+    /// The bound is the policy's `cancel_grace_max_ms`, so a host-tuned
+    /// policy takes effect here instead of being silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` when `grace` exceeds `policy.cancel_grace_max_ms`.
+    /// A zero grace is allowed: graceful steps then only check whether the
+    /// spawn already stopped.
+    pub fn new_with_policy(
+        handle: SpawnHandle,
+        mode: SpawnCancelMode,
+        grace: Duration,
+        policy: &SpawnMechanicsPolicy,
+    ) -> Result<Self, IpcError> {
+        let max_ms = policy.cancel_grace_max_ms;
+        if grace > Duration::from_millis(max_ms) {
+            return Err(IpcError::LimitExceeded {
+                field: "spawn cancel grace".into(),
+                limit: max_ms as usize,
+                actual: grace.as_millis().min(usize::MAX as u128) as usize,
+            });
+        }
+        Ok(Self {
+            handle,
+            mode,
+            grace,
+        })
+    }
+
+    /// An [`SpawnCancelMode::Immediate`] request (no grace).
+    #[must_use]
+    pub const fn immediate(handle: SpawnHandle) -> Self {
+        Self {
+            handle,
+            mode: SpawnCancelMode::Immediate,
+            grace: Duration::ZERO,
+        }
+    }
+
+    /// A [`SpawnCancelMode::GracefulThenKill`] request with the policy
+    /// default grace.
+    #[must_use]
+    pub const fn graceful_then_kill(handle: SpawnHandle) -> Self {
+        Self {
+            handle,
+            mode: SpawnCancelMode::GracefulThenKill,
+            grace: Duration::from_millis(
+                SpawnMechanicsPolicy::core_defaults().cancel_grace_default_ms,
+            ),
+        }
+    }
+
+    /// A [`SpawnCancelMode::GracefulThenKill`] request with a tuned policy's
+    /// default grace (composition-root injection).
+    #[must_use]
+    pub fn graceful_then_kill_with_policy(
+        handle: SpawnHandle,
+        policy: &SpawnMechanicsPolicy,
+    ) -> Self {
+        Self {
+            handle,
+            mode: SpawnCancelMode::GracefulThenKill,
+            grace: Duration::from_millis(policy.cancel_grace_default_ms),
+        }
+    }
+
+    /// Handle the request targets.
+    #[must_use]
+    pub const fn handle(&self) -> SpawnHandle {
+        self.handle
+    }
+
+    /// Requested mode.
+    #[must_use]
+    pub const fn mode(&self) -> SpawnCancelMode {
+        self.mode
+    }
+
+    /// Grace period per graceful step.
+    #[must_use]
+    pub const fn grace(&self) -> Duration {
+        self.grace
+    }
+}
+
+/// Typed result of one spawn-cancel request.
+///
+/// Mirrors the execution `CancelOutcome` so the async follow-up needs no new
+/// vocabulary: a stale generation changes nothing, a terminal spawn answers
+/// without touching anything, and a graceful-only request may leave the
+/// spawn running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelOutcome {
+    /// The request landed before the process existed; nothing ran.
+    CancelledBeforeStart,
+    /// The spawn exited within a grace period after a graceful stop request.
+    CancelledGracefully,
+    /// The host killed the owned scope and reaped the spawn.
+    Killed,
+    /// The spawn had already reached a terminal outcome; nothing changed.
+    AlreadyExited,
+    /// The kernel refused the stop signal; the spawn keeps running.
+    PermissionDenied,
+    /// The handle's generation is not the spawn's; nothing changed.
+    StaleGeneration,
+    /// A graceful-only request was delivered, but the spawn still runs after
+    /// the grace period (no escalation was asked for).
+    StillRunning,
+    /// No graceful stop exists for this spawn on this platform (no owned-tree
+    /// backend); nothing was sent. Use an escalating mode to stop it.
+    Unsupported,
+    /// The host could not determine what the request did.
+    Unknown,
+}
+
+impl SpawnCancelOutcome {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelledBeforeStart => "cancelled_before_start",
+            Self::CancelledGracefully => "cancelled_gracefully",
+            Self::Killed => "killed",
+            Self::AlreadyExited => "already_exited",
+            Self::PermissionDenied => "permission_denied",
+            Self::StaleGeneration => "stale_generation",
+            Self::StillRunning => "still_running",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for SpawnCancelOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Immediate answer to a spawn-cancel request.
+///
+/// Mirrors the execution `CancelReceipt`: accepted requests execute and
+/// resolve exactly once, while stale or terminal handles answer on the spot
+/// without touching the spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnCancelReceipt {
+    /// Accepted: the host executes it and resolves exactly once. Requests
+    /// arriving while a cancel executes coalesce into it (a stronger mode
+    /// escalates it).
+    Accepted,
+    /// Answered on the spot without touching the spawn
+    /// ([`SpawnCancelOutcome::AlreadyExited`] or
+    /// [`SpawnCancelOutcome::StaleGeneration`]).
+    Resolved(SpawnCancelOutcome),
+}
 
 // ── request ─────────────────────────────────────────────────────────────────
 
@@ -495,9 +916,21 @@ impl SpawnAuthorizer for HostToolsAuthorizer {
 /// Wraps the accepted [`ExecutionService`] with the real-process provider and
 /// the [`SpawnAuthorizer`] routing step. `SpawnService` owns no socket and
 /// spawns nothing until [`SpawnService::dispatch`] passes all six gates.
+///
+/// Composition-root bridge (CTX-1184, issue #1997): the service enforces one
+/// [`SpawnMechanicsPolicy`] (core defaults, or a host-tuned policy via
+/// [`SpawnService::with_policy`]), reports the adopted kill scope
+/// ([`SpawnService::kill_scope`]), mints a generation-fenced [`SpawnHandle`]
+/// per successful dispatch, and resolves typed cancels against live tracked
+/// state ([`SpawnService::cancel`]). The policy is fixed per instance: a host
+/// retunes by building a new service, so in-flight generations never change
+/// meaning under a live handle.
 pub struct SpawnService {
     authorizer: Box<dyn SpawnAuthorizer>,
     exec: ExecutionService,
+    policy: SpawnMechanicsPolicy,
+    generations: BTreeMap<u64, SpawnGeneration>,
+    next_generation: NonZeroU64,
 }
 
 impl fmt::Debug for SpawnService {
@@ -505,18 +938,66 @@ impl fmt::Debug for SpawnService {
         f.debug_struct("SpawnService")
             .field("authorizer", &self.authorizer)
             .field("tracked", &self.exec.len())
+            .field("policy", &self.policy)
             .finish()
     }
 }
 
 impl SpawnService {
-    /// Service with the real-process provider and `authorizer` routing.
+    /// Service with the real-process provider and `authorizer` routing under
+    /// the core-default mechanics policy.
     #[must_use]
     pub fn new(authorizer: Box<dyn SpawnAuthorizer>) -> Self {
+        Self::with_policy(authorizer, SpawnMechanicsPolicy::core_defaults())
+    }
+
+    /// Service with the real-process provider, `authorizer` routing, and an
+    /// explicit mechanics policy (composition-root injection).
+    ///
+    /// The policy governs the service surface: the tracked-outcome ceiling,
+    /// cancel grace bounds, and handle generations minted below. The
+    /// synchronous provider slot itself runs [`spawn_process`] (core
+    /// defaults) until the `bitty-ipc`-owned provider seam accepts context;
+    /// per-spawn tuning flows through [`spawn_process_with_policy`].
+    #[must_use]
+    pub fn with_policy(authorizer: Box<dyn SpawnAuthorizer>, policy: SpawnMechanicsPolicy) -> Self {
         Self {
             authorizer,
             exec: ExecutionService::with_provider(spawn_process),
+            policy,
+            generations: BTreeMap::new(),
+            next_generation: NonZeroU64::MIN,
         }
+    }
+
+    /// Enforced mechanics policy.
+    #[must_use]
+    pub const fn policy(&self) -> SpawnMechanicsPolicy {
+        self.policy
+    }
+
+    /// Tracked-outcome ceiling this service enforces.
+    ///
+    /// The policy's `tracked_cap`, clamped to at least one slot and at most
+    /// the registry ceiling (`MAX_TRACKED_EXECUTIONS`): the inner
+    /// [`ExecutionService`] registry still fails closed at its own ceiling,
+    /// so a tune above it clamps instead of silently never taking effect.
+    #[must_use]
+    pub fn effective_tracked_cap(&self) -> usize {
+        self.policy.tracked_cap.clamp(1, MAX_TRACKED_EXECUTIONS)
+    }
+
+    /// Kill scope adopted for supervision on this host.
+    ///
+    /// [`SpawnKillScope::OwnedTree`] where the platform backend terminates a
+    /// whole owned tree, else [`SpawnKillScope::DirectChild`] with the orphan
+    /// gap surfaced through the bounded drain detach. Mirrors
+    /// `KillScope::for_backend` over the detected backend; one-shot timeout
+    /// kills still terminate the direct child only, and executing tree kills
+    /// for live supervision is follow-up work.
+    #[must_use]
+    pub fn kill_scope(&self) -> SpawnKillScope {
+        SpawnKillScope::for_tree_backend(TreeBackend::detect())
     }
 
     /// Number of stored outcomes (burst accounting).
@@ -549,6 +1030,62 @@ impl SpawnService {
         self.exec.reconcile(execution_id)
     }
 
+    /// Handle minted for a tracked spawn, if any.
+    ///
+    /// Returns the generation-fenced handle for `execution_id` exactly as
+    /// minted by the successful [`SpawnService::dispatch`]; `None` when the
+    /// id was never dispatched. Handles are the only cancel keys
+    /// ([`SpawnService::cancel`]).
+    #[must_use]
+    pub fn handle_for(&self, execution_id: u64) -> Option<SpawnHandle> {
+        self.generations
+            .get(&execution_id)
+            .map(|&generation| SpawnHandle {
+                id: execution_id,
+                generation,
+            })
+    }
+
+    /// Resolve a typed cancel against live tracked state.
+    ///
+    /// Mirrors the execution `cancel_sidecar_typed` contract for a
+    /// synchronous surface (no live job exists, so nothing is ever accepted
+    /// for execution):
+    ///
+    /// - unknown id fails closed with `NotFound` (same shape as
+    ///   [`SpawnService::reconcile`]);
+    /// - a handle whose generation is not the spawn's answers
+    ///   [`SpawnCancelOutcome::StaleGeneration`] without touching anything;
+    /// - a current handle answers [`SpawnCancelOutcome::AlreadyExited`]: every
+    ///   stored synchronous outcome is terminal, so the answer is
+    ///   mode-independent.
+    ///
+    /// Executing an accepted cancel against a running job (the
+    /// [`SpawnCancelReceipt::Accepted`] path) belongs to the async supervisor
+    /// follow-up; this surface exists so that follow-up needs no new Core
+    /// vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the handle's id has no tracked spawn.
+    pub fn cancel(&self, request: SpawnCancelRequest) -> Result<SpawnCancelReceipt, IpcError> {
+        let handle = request.handle();
+        let generation = self
+            .generations
+            .get(&handle.id)
+            .ok_or_else(|| IpcError::NotFound {
+                reason: format!("unknown spawn id {}", handle.id),
+            })?;
+        if *generation != handle.generation {
+            return Ok(SpawnCancelReceipt::Resolved(
+                SpawnCancelOutcome::StaleGeneration,
+            ));
+        }
+        Ok(SpawnCancelReceipt::Resolved(
+            SpawnCancelOutcome::AlreadyExited,
+        ))
+    }
+
     /// Serve one bounded, consent-gated spawn (fail-closed, no partial state).
     ///
     /// Gate order is routing, authorization, effect opt-in, consent, then
@@ -561,7 +1098,8 @@ impl SpawnService {
     ///   the id is already tracked, or the authorizer-resolved spawn violates
     ///   a bound.
     /// - `LimitExceeded` when the tracked-outcome registry is at capacity
-    ///   (rapid bursts fail closed) or any field exceeds budget.
+    ///   (the enforced policy's `tracked_cap`, clamped to the registry
+    ///   ceiling; rapid bursts fail closed) or any field exceeds budget.
     /// - `Denied[AllowlistDenied]` when the authorizer rejects the tool/args
     ///   (no process is contacted).
     /// - `ScopeDenied` when `granted` lacks `process.spawn`.
@@ -569,6 +1107,10 @@ impl SpawnService {
     /// - `Denied[ConsentRequired]` when the ledger lacks an active
     ///   `(client_id, process.spawn)` grant at `now_ms`.
     /// - `Unavailable` when the child cannot be spawned at all.
+    ///
+    /// A successful dispatch mints a fresh generation-fenced [`SpawnHandle`]
+    /// for `execution_id` (readable via [`SpawnService::handle_for`]); failed
+    /// dispatches mint nothing and leave no partial state.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
@@ -590,6 +1132,14 @@ impl SpawnService {
                 field: "spawn client_id".into(),
                 limit: MAX_EXEC_CLIENT_ID_BYTES,
                 actual: client_id.len(),
+            });
+        }
+        let cap = self.effective_tracked_cap();
+        if self.exec.len() >= cap {
+            return Err(IpcError::LimitExceeded {
+                field: "spawn tracked outcomes".into(),
+                limit: cap,
+                actual: self.exec.len().saturating_add(1),
             });
         }
         let resolved = self.authorizer.authorize(&request.tool, &request.args)?;
@@ -626,14 +1176,19 @@ impl SpawnService {
             exec_request = exec_request.with_output_budget(budget);
         }
         exec_request.validate()?;
-        self.exec.dispatch(
+        let result = self.exec.dispatch(
             &exec_request,
             granted,
             consent,
             client_id,
             now_ms,
             execution_id,
-        )
+        )?;
+        let generation = SpawnGeneration::from_raw(self.next_generation.get())
+            .expect("generation counter never mints zero");
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.generations.insert(execution_id, generation);
+        Ok(result)
     }
 }
 
@@ -736,8 +1291,25 @@ fn closed_pipe_command(
 /// (no zombie) and the outcome is `Unknown`/`Unknown` with a timeout evidence
 /// ref, so callers reconcile instead of assuming the effect did or did not
 /// land. A child that cannot start at all fails as `Unavailable`.
+///
+/// Runs under the core-default mechanics policy; tuned policies flow through
+/// [`spawn_process_with_policy`]. The bare-`fn` shape is the
+/// `bitty-ipc`-owned provider slot ([`ExecutionService::with_provider`]).
 pub(crate) fn spawn_process(
     request: &bitty_ipc::execution::ExecutionRequest,
+) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
+    spawn_process_with_policy(request, &SpawnMechanicsPolicy::core_defaults())
+}
+
+/// Real-process provider under an explicit mechanics policy
+/// (composition-root injection, CTX-1184).
+///
+/// Poll interval, drain chunk, drain-join budget (including both detach
+/// evidence strings), and the drain retain cap all read `policy`; behavior
+/// is otherwise identical to [`spawn_process`].
+pub(crate) fn spawn_process_with_policy(
+    request: &bitty_ipc::execution::ExecutionRequest,
+    policy: &SpawnMechanicsPolicy,
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
     use bitty_ipc::execution::{EffectState, ExecutionStatus, RawExecutionOutput};
 
@@ -829,7 +1401,8 @@ pub(crate) fn spawn_process(
     // bounded join can still return partial output when a grandchild inherits
     // the pipe and holds EOF open forever.
     use std::sync::{Arc, Mutex};
-    let cap = request.effective_stream_budget().saturating_add(1);
+    let cap = policy.drain_retain_cap(request.effective_stream_budget());
+    let chunk_bytes = policy.drain_chunk_bytes.max(1);
     let stdout_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut stdout_thread = match guard.child_mut().stdout.take() {
@@ -837,7 +1410,7 @@ pub(crate) fn spawn_process(
             let shared = Arc::clone(&stdout_shared);
             let handle = std::thread::Builder::new()
                 .name("bitty-spawn-stdout".into())
-                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared, chunk_bytes))
                 .map_err(|_| IpcError::Internal {
                     reason: "spawn stdout reaper failed to start".into(),
                 });
@@ -856,7 +1429,7 @@ pub(crate) fn spawn_process(
             let shared = Arc::clone(&stderr_shared);
             let handle = std::thread::Builder::new()
                 .name("bitty-spawn-stderr".into())
-                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared, chunk_bytes))
                 .map_err(|_| IpcError::Internal {
                     reason: "spawn stderr reaper failed to start".into(),
                 });
@@ -911,11 +1484,11 @@ pub(crate) fn spawn_process(
                 guard.reaped();
                 let (stdout, stdout_detached) = stdout_thread
                     .take()
-                    .map(|h| join_drain_bounded(h, &stdout_shared))
+                    .map(|h| join_drain_bounded(h, &stdout_shared, policy))
                     .unwrap_or_default();
                 let (stderr, stderr_detached) = stderr_thread
                     .take()
-                    .map(|h| join_drain_bounded(h, &stderr_shared))
+                    .map(|h| join_drain_bounded(h, &stderr_shared, policy))
                     .unwrap_or_default();
                 let (status_view, effect, code) = if status.success() {
                     (
@@ -928,12 +1501,14 @@ pub(crate) fn spawn_process(
                 };
                 // A grandchild holding the pipe open detaches the drain but
                 // must not lose attribution: surface the stall as evidence so
-                // callers reconcile instead of assuming complete output.
+                // callers reconcile instead of assuming complete output. The
+                // bound is the enforced policy's, so tuned policies report
+                // the bound they actually waited.
                 let mut evidence_refs = Vec::new();
                 if stdout_detached || stderr_detached {
                     evidence_refs.push(format!(
                         "spawn drain detached after {} ms; grandchild may hold pipe; partial output preserved",
-                        SPAWN_DRAIN_JOIN_TIMEOUT.as_millis(),
+                        policy.drain_join_timeout.as_millis(),
                     ));
                 }
                 return Ok(RawExecutionOutput {
@@ -956,17 +1531,17 @@ pub(crate) fn spawn_process(
                 guard.reaped();
                 let (stdout, stdout_detached) = stdout_thread
                     .take()
-                    .map(|h| join_drain_bounded(h, &stdout_shared))
+                    .map(|h| join_drain_bounded(h, &stdout_shared, policy))
                     .unwrap_or_default();
                 let (stderr, stderr_detached) = stderr_thread
                     .take()
-                    .map(|h| join_drain_bounded(h, &stderr_shared))
+                    .map(|h| join_drain_bounded(h, &stderr_shared, policy))
                     .unwrap_or_default();
                 let drain_note = match (stdout_detached, stderr_detached) {
                     (false, false) => "drain joined".to_owned(),
                     _ => format!(
                         "drain detached after {} ms; partial output preserved",
-                        SPAWN_DRAIN_JOIN_TIMEOUT.as_millis()
+                        policy.drain_join_timeout.as_millis()
                     ),
                 };
                 return Ok(RawExecutionOutput {
@@ -984,7 +1559,7 @@ pub(crate) fn spawn_process(
                     effect_state: EffectState::Unknown,
                 });
             }
-            None => std::thread::sleep(SPAWN_POLL_INTERVAL),
+            None => std::thread::sleep(policy.poll_interval),
         }
     }
 }
@@ -1130,23 +1705,26 @@ fn post_spawn_setup<C: PostSpawnChildOps>(
     }
 }
 
-/// Shared-buffer drain for [`spawn_process`] (CTX-0476).
+/// Shared-buffer drain for [`spawn_process`] (CTX-0476, CTX-1184).
 ///
 /// Drains `pipe` to EOF while retaining at most `cap + 1` bytes in `shared`
 /// (the spare byte lets the service detect overflow and mark `truncated`).
 /// Bytes past the cap are read and discarded so the child never blocks on a
 /// full pipe, however much it emits. Publishes incrementally into `shared`
 /// so a bounded join can return partial output even when EOF never arrives
-/// (grandchild inherits the pipe). Retained memory is bounded by `cap + 8 KiB`
-/// (one chunk); read errors end the drain early (fail-closed downstream:
-/// short output is still validated and attributed). Time O(n), space O(cap)
-/// in the child output.
+/// (grandchild inherits the pipe). Reads in `chunk_bytes` steps (the enforced
+/// policy's drain chunk; clamped to at least one byte so a zero tune cannot
+/// spin on empty reads); retained memory is bounded by `cap` plus one chunk.
+/// Read errors end the drain early (fail-closed downstream: short output is
+/// still validated and attributed). Time O(n), space O(cap) in the child
+/// output.
 fn drain_bounded_shared(
     pipe: &mut impl std::io::Read,
     cap: usize,
     shared: &std::sync::Mutex<Vec<u8>>,
+    chunk_bytes: usize,
 ) {
-    let mut chunk = [0u8; 8192];
+    let mut chunk = vec![0u8; chunk_bytes.max(1)];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break,
@@ -1177,19 +1755,21 @@ fn clone_shared(shared: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-/// Bounded join for one drain thread (CTX-0476).
+/// Bounded join for one drain thread (CTX-0476, CTX-1184).
 ///
-/// Polls `is_finished` until [`SPAWN_DRAIN_JOIN_TIMEOUT`]; a finished thread
-/// joins normally (panics degrade to shared partial, never empty), while a
-/// hung thread (grandchild holding the pipe) detaches — dropping the
-/// `JoinHandle` — and the caller keeps the partial bytes collected so far.
-/// Returns the bytes plus whether the thread was detached. Never blocks past
-/// the timeout, so `spawn_process` stays total on every path.
+/// Polls `is_finished` until the enforced policy's drain-join budget; a
+/// finished thread joins normally (panics degrade to shared partial, never
+/// empty), while a hung thread (grandchild holding the pipe) detaches —
+/// dropping the `JoinHandle` — and the caller keeps the partial bytes
+/// collected so far. Polls on the policy's interval. Returns the bytes plus
+/// whether the thread was detached. Never blocks past the budget, so
+/// `spawn_process` stays total on every path.
 fn join_drain_bounded(
     handle: std::thread::JoinHandle<()>,
     shared: &std::sync::Mutex<Vec<u8>>,
+    policy: &SpawnMechanicsPolicy,
 ) -> (Vec<u8>, bool) {
-    let deadline = std::time::Instant::now() + SPAWN_DRAIN_JOIN_TIMEOUT;
+    let deadline = std::time::Instant::now() + policy.drain_join_timeout;
     loop {
         if handle.is_finished() {
             let _ = handle.join();
@@ -1201,7 +1781,7 @@ fn join_drain_bounded(
             drop(handle);
             return (clone_shared(shared), true);
         }
-        std::thread::sleep(SPAWN_POLL_INTERVAL);
+        std::thread::sleep(policy.poll_interval);
     }
 }
 
@@ -1406,7 +1986,7 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
         next_id.set(id.saturating_add(1));
         let request = SpawnRequest::new("git", args.to_vec())
             .with_timeout_ms(DEFAULT_EXEC_TIMEOUT_MS)
-            .with_output_budget(SPAWN_PANEL_OUTPUT_BUDGET)
+            .with_output_budget(SpawnMechanicsPolicy::core_defaults().panel_output_budget)
             .with_allow_effects(true);
         match service
             .borrow_mut()
@@ -1461,6 +2041,35 @@ mod tests {
             }
             Ok("sleep") => {
                 std::thread::sleep(Duration::from_secs(30));
+            }
+            Ok("sleep-short") => {
+                // CTX-1184 detach probe: hold inherited pipes briefly, then
+                // exit. Spawned as a grandchild by `detach-hold` below; the
+                // bounded drain join must detach while this sleeper still
+                // holds EOF open.
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            Ok("detach-hold") => {
+                // CTX-1184 detach probe: emit partial output, flush, spawn a
+                // grandchild inheriting both pipes (`sleep-short`), then exit
+                // at once. The supervisor reaps this child while the
+                // grandchild still holds the pipes, so the bounded join must
+                // detach with partial output preserved and evidence naming
+                // the enforced drain-join bound.
+                use std::io::Write as _;
+                let payload =
+                    std::env::var(HELPER_PAYLOAD_ENV).unwrap_or_else(|_| "detach-partial".into());
+                eprint!("{payload}");
+                let _ = std::io::stderr().flush();
+                print!("{payload}");
+                let _ = std::io::stdout().flush();
+                let exe = std::env::current_exe().expect("test binary path");
+                let _ = std::process::Command::new(exe)
+                    .arg("__bitty_spawn_helper_entry__")
+                    .arg("--nocapture")
+                    .env(HELPER_ENV, "sleep-short")
+                    .stdin(std::process::Stdio::null())
+                    .spawn();
             }
             Ok("partial-then-sleep") => {
                 // CTX-0476 hostile probe: emit partial output, flush, then
@@ -2048,6 +2657,411 @@ mod tests {
     }
 
     #[test]
+    fn spawn_mechanics_policy_core_defaults_match_the_contract() {
+        // CTX-1182 parity: every field adopts the published execution
+        // contract default verbatim, except the documented one-shot
+        // drain-join bound. The contract lives outside this repository, so
+        // the numbers are pinned here field by field; any contract change
+        // must update both.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.poll_interval, Duration::from_millis(10));
+        assert_eq!(policy.drain_chunk_bytes, 8 * 1024);
+        assert_eq!(policy.drain_join_timeout, Duration::from_secs(1));
+        assert_eq!(policy.tracked_cap, 64);
+        assert_eq!(policy.panel_output_budget, 8 * 1024);
+        assert_eq!(policy.output_budget_max, 256 * 1024);
+        assert_eq!(policy.cancel_grace_max_ms, 60_000);
+        assert_eq!(policy.cancel_grace_default_ms, 5_000);
+    }
+
+    #[test]
+    fn spawn_mechanics_policy_agrees_with_core_sources() {
+        // The Core constants stay the canonical source; the policy only
+        // routes through them, so drift in either direction fails here.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.poll_interval, super::SPAWN_POLL_INTERVAL);
+        assert_eq!(policy.drain_chunk_bytes, super::SPAWN_DRAIN_CHUNK_BYTES);
+        assert_eq!(policy.drain_join_timeout, super::SPAWN_DRAIN_JOIN_TIMEOUT);
+        assert_eq!(policy.tracked_cap, MAX_TRACKED_EXECUTIONS);
+        assert_eq!(policy.tracked_cap, bitty_ipc::channel::MAX_PENDING_REQUESTS);
+        assert_eq!(policy.panel_output_budget, SPAWN_PANEL_OUTPUT_BUDGET);
+        assert_eq!(policy.output_budget_max, MAX_EXEC_OUTPUT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn spawn_drain_retain_cap_adds_the_overflow_spare() {
+        // The drain retains budget + 1 bytes so the service can detect
+        // overflow and mark truncated; the spare saturates at the top.
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        assert_eq!(policy.drain_retain_cap(0), 1);
+        assert_eq!(policy.drain_retain_cap(16), 17);
+        assert_eq!(policy.drain_retain_cap(16 * 1024), 16 * 1024 + 1);
+        assert_eq!(policy.drain_retain_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn spawn_kill_scope_matches_the_tree_backend() {
+        // Contract mapping: tree backends take the owned tree, otherwise
+        // only the direct child is reachable and the gap stays surfaced.
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::ProcessGroupPidfd),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::ProcessGroupKqueue),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::JobObject),
+            SpawnKillScope::OwnedTree
+        );
+        assert_eq!(
+            SpawnKillScope::for_tree_backend(TreeBackend::Unsupported),
+            SpawnKillScope::DirectChild
+        );
+        for backend in [
+            TreeBackend::ProcessGroupPidfd,
+            TreeBackend::ProcessGroupKqueue,
+            TreeBackend::JobObject,
+            TreeBackend::Unsupported,
+        ] {
+            assert_eq!(
+                backend.kills_owned_tree(),
+                SpawnKillScope::for_tree_backend(backend) == SpawnKillScope::OwnedTree,
+                "{backend} capability must agree with its kill scope"
+            );
+        }
+        assert_eq!(SpawnKillScope::DirectChild.as_str(), "direct_child");
+        assert_eq!(SpawnKillScope::OwnedTree.as_str(), "owned_tree");
+        assert_eq!(SpawnKillScope::OwnedTree.to_string(), "owned_tree");
+    }
+
+    #[test]
+    fn spawn_cancel_grace_is_bounded() {
+        let generation = SpawnGeneration::from_raw(7).expect("generation");
+        let handle = SpawnHandle { id: 1, generation };
+        assert!(
+            SpawnCancelRequest::new(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(60_000)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            SpawnCancelRequest::new(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(60_001)
+            ),
+            Err(IpcError::LimitExceeded { .. })
+        ));
+        assert!(
+            SpawnCancelRequest::new(handle, SpawnCancelMode::GracefulThenKill, Duration::ZERO)
+                .is_ok()
+        );
+        let immediate = SpawnCancelRequest::immediate(handle);
+        assert_eq!(immediate.mode(), SpawnCancelMode::Immediate);
+        assert_eq!(immediate.grace(), Duration::ZERO);
+        assert_eq!(immediate.handle(), handle);
+        assert_eq!(
+            SpawnCancelRequest::graceful_then_kill(handle).grace(),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn spawn_cancel_request_honors_an_injected_policy() {
+        // CTX-1184 injection: the grace bound and the graceful-then-kill
+        // default both read the injected policy, so a host-tuned policy
+        // takes effect instead of being silently ignored.
+        let generation = SpawnGeneration::from_raw(7).expect("generation");
+        let handle = SpawnHandle { id: 1, generation };
+        let mut tuned = SpawnMechanicsPolicy::core_defaults();
+        tuned.cancel_grace_max_ms = 1_000;
+        tuned.cancel_grace_default_ms = 250;
+        assert!(
+            SpawnCancelRequest::new_with_policy(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(1_000),
+                &tuned,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            SpawnCancelRequest::new_with_policy(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(1_001),
+                &tuned,
+            ),
+            Err(IpcError::LimitExceeded { .. })
+        ));
+        // The tuned ceiling is stricter than the core default: 5 s passes
+        // under `new` but fails under the tuned policy.
+        assert!(
+            SpawnCancelRequest::new(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(5_000)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            SpawnCancelRequest::new_with_policy(
+                handle,
+                SpawnCancelMode::Graceful,
+                Duration::from_millis(5_000),
+                &tuned,
+            ),
+            Err(IpcError::LimitExceeded { .. })
+        ));
+        let graceful = SpawnCancelRequest::graceful_then_kill_with_policy(handle, &tuned);
+        assert_eq!(graceful.mode(), SpawnCancelMode::GracefulThenKill);
+        assert_eq!(graceful.grace(), Duration::from_millis(250));
+        assert_eq!(graceful.handle(), handle);
+    }
+
+    #[test]
+    fn spawn_service_enforces_its_injected_policy() {
+        // CTX-1184 bridge: the service stores the injected policy and the
+        // tracked-outcome ceiling actually gates dispatch (a tuned cap of 1
+        // fails the second dispatch closed, while core defaults serve both).
+        let mut tuned = SpawnMechanicsPolicy::core_defaults();
+        tuned.tracked_cap = 1;
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service =
+            SpawnService::with_policy(Box::new(StubAuthorizer::allowing(seen)), tuned);
+        assert_eq!(service.policy(), tuned);
+        let request = allowed_request("echo");
+        dispatch_ok(&mut service, &request, 51).expect("first serves under cap 1");
+        let error = dispatch_ok(&mut service, &request, 52).expect_err("tuned cap must gate");
+        assert!(
+            matches!(error, IpcError::LimitExceeded { .. }),
+            "tuned tracked cap must fail closed, got {error:?}"
+        );
+
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut defaults = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        assert_eq!(defaults.policy(), SpawnMechanicsPolicy::core_defaults());
+        dispatch_ok(&mut defaults, &request, 61).expect("defaults serve first");
+        dispatch_ok(&mut defaults, &request, 62).expect("defaults serve second");
+    }
+
+    #[test]
+    fn spawn_service_tracked_cap_clamps_to_the_registry_ceiling() {
+        // CodeRabbit follow-up on CTX-1184: the inner ExecutionService
+        // registry still fails closed at MAX_TRACKED_EXECUTIONS, so a tune
+        // above it must clamp instead of silently never taking effect —
+        // and a zero tune must clamp to one slot.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        assert_eq!(service.effective_tracked_cap(), MAX_TRACKED_EXECUTIONS);
+        for (tuned_cap, expected) in [
+            (0usize, 1usize),
+            (1, 1),
+            (2, 2),
+            (MAX_TRACKED_EXECUTIONS - 1, MAX_TRACKED_EXECUTIONS - 1),
+            (MAX_TRACKED_EXECUTIONS, MAX_TRACKED_EXECUTIONS),
+            (MAX_TRACKED_EXECUTIONS + 1, MAX_TRACKED_EXECUTIONS),
+            (usize::MAX, MAX_TRACKED_EXECUTIONS),
+        ] {
+            let mut policy = SpawnMechanicsPolicy::core_defaults();
+            policy.tracked_cap = tuned_cap;
+            let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+            let tuned = SpawnService::with_policy(Box::new(StubAuthorizer::allowing(seen)), policy);
+            assert_eq!(
+                tuned.effective_tracked_cap(),
+                expected,
+                "tuned cap {tuned_cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_service_kill_scope_adopts_the_detected_backend() {
+        // CTX-1184 bridge: the composition root owns the kill-scope
+        // decision, mirroring `KillScope::for_backend` over the detected
+        // backend instead of re-deriving it per call site.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let backend = TreeBackend::detect();
+        assert_eq!(
+            service.kill_scope(),
+            SpawnKillScope::for_tree_backend(backend)
+        );
+        assert_eq!(
+            (service.kill_scope() == SpawnKillScope::OwnedTree),
+            backend.kills_owned_tree(),
+            "adopted scope must agree with the backend capability"
+        );
+    }
+
+    #[test]
+    fn spawn_service_mints_handles_and_resolves_cancels() {
+        // CTX-1184 bridge: every successful dispatch mints a
+        // generation-fenced handle, and cancels resolve against live tracked
+        // state — current handles report the terminal outcome, stale
+        // generations answer without touching anything, unknown ids fail
+        // closed.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        assert!(service.handle_for(41).is_none());
+        let request = allowed_request("echo");
+        dispatch_ok(&mut service, &request, 41).expect("serves");
+        let handle = service.handle_for(41).expect("dispatch mints a handle");
+        assert_eq!(handle.id, 41);
+        for mode in [
+            SpawnCancelMode::Graceful,
+            SpawnCancelMode::Immediate,
+            SpawnCancelMode::GracefulThenKill,
+        ] {
+            let cancel =
+                SpawnCancelRequest::new(handle, mode, Duration::ZERO).expect("zero grace bounds");
+            assert!(
+                matches!(
+                    service.cancel(cancel),
+                    Ok(SpawnCancelReceipt::Resolved(
+                        SpawnCancelOutcome::AlreadyExited
+                    ))
+                ),
+                "stored synchronous outcomes are terminal for {mode:?}"
+            );
+        }
+
+        dispatch_ok(&mut service, &request, 42).expect("second serves");
+        let other = service.handle_for(42).expect("second handle");
+        assert_ne!(
+            handle.generation, other.generation,
+            "generations must advance per dispatch"
+        );
+        let stale = SpawnHandle {
+            id: 41,
+            generation: other.generation,
+        };
+        let cancel = SpawnCancelRequest::new(stale, SpawnCancelMode::Immediate, Duration::ZERO)
+            .expect("bounds");
+        assert!(
+            matches!(
+                service.cancel(cancel),
+                Ok(SpawnCancelReceipt::Resolved(
+                    SpawnCancelOutcome::StaleGeneration
+                ))
+            ),
+            "a foreign generation must answer stale without touching the spawn"
+        );
+
+        let ghost = SpawnHandle {
+            id: 999,
+            generation: handle.generation,
+        };
+        let cancel = SpawnCancelRequest::new(ghost, SpawnCancelMode::Immediate, Duration::ZERO)
+            .expect("bounds");
+        assert!(
+            matches!(service.cancel(cancel), Err(IpcError::NotFound { .. })),
+            "unknown ids fail closed"
+        );
+    }
+
+    #[test]
+    fn spawn_process_with_policy_reports_the_tuned_drain_bound() {
+        // CTX-1184 injection end to end: a grandchild holding the pipes past
+        // a tuned 100 ms drain-join budget must detach with partial output
+        // preserved and evidence naming the tuned bound — not the 1 s core
+        // default.
+        let mut tuned = SpawnMechanicsPolicy::core_defaults();
+        tuned.drain_join_timeout = Duration::from_millis(100);
+        let request = bitty_ipc::execution::ExecutionRequest::new(helper_exe(), helper_args())
+            .with_env_policy(
+                EnvPolicy::explicit(vec![
+                    (HELPER_ENV.to_owned(), "detach-hold".to_owned()),
+                    (
+                        HELPER_PAYLOAD_ENV.to_owned(),
+                        "detach-partial-1184".to_owned(),
+                    ),
+                ])
+                .expect("explicit env"),
+            )
+            .with_timeout_ms(30_000);
+        let start = std::time::Instant::now();
+        let output = super::spawn_process_with_policy(&request, &tuned).expect("detach serves");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "tuned detach path hung: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            output.status,
+            bitty_ipc::execution::ExecutionStatus::Completed,
+            "the child exits at once; only the grandchild holds the pipes"
+        );
+        assert!(
+            output.evidence_refs.iter().any(|r| r.contains("100 ms")),
+            "detach evidence must name the tuned bound: {:?}",
+            output.evidence_refs
+        );
+        assert!(
+            output.stdout.contains("detach-partial-1184")
+                || output.stderr.contains("detach-partial-1184"),
+            "detach must preserve partial output: stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn spawn_cancel_escalation_ranks_order_the_modes() {
+        assert!(SpawnCancelMode::Graceful.rank() < SpawnCancelMode::GracefulThenKill.rank());
+        assert!(SpawnCancelMode::GracefulThenKill.rank() < SpawnCancelMode::Immediate.rank());
+    }
+
+    #[test]
+    fn spawn_generation_zero_is_not_a_generation() {
+        assert!(SpawnGeneration::from_raw(0).is_none());
+        assert_eq!(
+            SpawnGeneration::from_raw(9).map(SpawnGeneration::get),
+            Some(9)
+        );
+        let generation = SpawnGeneration::from_raw(7).expect("generation");
+        assert_eq!(generation.to_string(), format!("{:016x}", 7u64));
+    }
+
+    #[test]
+    fn spawn_cancel_names_are_stable() {
+        assert_eq!(SpawnCancelMode::Graceful.as_str(), "graceful");
+        assert_eq!(SpawnCancelMode::Immediate.as_str(), "immediate");
+        assert_eq!(
+            SpawnCancelMode::GracefulThenKill.as_str(),
+            "graceful_then_kill"
+        );
+        let outcomes = [
+            (
+                SpawnCancelOutcome::CancelledBeforeStart,
+                "cancelled_before_start",
+            ),
+            (
+                SpawnCancelOutcome::CancelledGracefully,
+                "cancelled_gracefully",
+            ),
+            (SpawnCancelOutcome::Killed, "killed"),
+            (SpawnCancelOutcome::AlreadyExited, "already_exited"),
+            (SpawnCancelOutcome::PermissionDenied, "permission_denied"),
+            (SpawnCancelOutcome::StaleGeneration, "stale_generation"),
+            (SpawnCancelOutcome::StillRunning, "still_running"),
+            (SpawnCancelOutcome::Unsupported, "unsupported"),
+            (SpawnCancelOutcome::Unknown, "unknown"),
+        ];
+        for (outcome, name) in outcomes {
+            assert_eq!(outcome.as_str(), name);
+        }
+        assert_eq!(
+            SpawnCancelOutcome::StaleGeneration.to_string(),
+            "stale_generation"
+        );
+    }
+
+    #[test]
     fn host_tools_authorizer_enforces_the_accepted_contract() {
         let authorizer = HostToolsAuthorizer;
         assert_eq!(authorizer.tool_id(), "git");
@@ -2277,8 +3291,8 @@ mod tests {
     fn drain_join_is_bounded_when_thread_hangs() {
         // CTX-0476 hostile probe: a drain thread that never finishes
         // (grandchild inherits the pipe, EOF never arrives) must not hang
-        // `spawn_process` forever. The bounded join detaches within
-        // `SPAWN_DRAIN_JOIN_TIMEOUT` plus scheduling slack.
+        // `spawn_process` forever. The bounded join detaches within the
+        // enforced policy's drain-join budget plus scheduling slack.
         use std::sync::{Arc, Mutex};
         let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"partial".to_vec()));
         let shared_clone = Arc::clone(&shared);
@@ -2289,8 +3303,9 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(30));
             })
             .expect("spawn hung thread");
+        let policy = SpawnMechanicsPolicy::core_defaults();
         let start = std::time::Instant::now();
-        let (bytes, detached) = super::join_drain_bounded(handle, &shared);
+        let (bytes, detached) = super::join_drain_bounded(handle, &shared, &policy);
         assert!(detached, "hung drain must detach, not join");
         assert_eq!(bytes, b"partial");
         assert!(
@@ -2299,6 +3314,34 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(super::SPAWN_DRAIN_JOIN_TIMEOUT, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn drain_join_honors_a_tuned_policy_budget() {
+        // CTX-1184 injection: the join waits the injected policy's budget,
+        // not the core-default constant. A tuned 50 ms budget detaches a
+        // hung drain quickly.
+        use std::sync::{Arc, Mutex};
+        let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"partial".to_vec()));
+        let shared_clone = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("bitty-test-tuned-drain".into())
+            .spawn(move || {
+                let _ = &shared_clone;
+                std::thread::sleep(Duration::from_secs(30));
+            })
+            .expect("spawn hung thread");
+        let mut policy = SpawnMechanicsPolicy::core_defaults();
+        policy.drain_join_timeout = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let (bytes, detached) = super::join_drain_bounded(handle, &shared, &policy);
+        assert!(detached, "hung drain must detach under a tuned budget");
+        assert_eq!(bytes, b"partial");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "tuned join hung: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -2326,7 +3369,8 @@ mod tests {
         let mut flood = Flood {
             remaining: 64 * 1024,
         };
-        super::drain_bounded_shared(&mut flood, cap, &shared);
+        let policy = SpawnMechanicsPolicy::core_defaults();
+        super::drain_bounded_shared(&mut flood, cap, &shared, policy.drain_chunk_bytes);
         let retained = super::clone_shared(&shared);
         assert_eq!(
             retained.len(),
@@ -2335,6 +3379,44 @@ mod tests {
             retained.len()
         );
         assert!(retained.iter().all(|&b| b == b'q'));
+    }
+
+    #[test]
+    fn shared_drain_honors_a_tuned_chunk_and_clamps_zero() {
+        // CTX-1184 injection: a one-byte chunk drains the same retained
+        // bytes as the default chunk (chunk size is pacing, not semantics),
+        // and a zero tune clamps to one byte instead of spinning on empty
+        // reads.
+        struct Flood {
+            remaining: usize,
+        }
+        impl std::io::Read for Flood {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.remaining);
+                buf[..n].fill(b'z');
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+        use std::sync::{Arc, Mutex};
+        for chunk_bytes in [1usize, 8 * 1024, 0] {
+            let shared = Arc::new(Mutex::new(Vec::new()));
+            let mut flood = Flood {
+                remaining: 4 * 1024,
+            };
+            super::drain_bounded_shared(&mut flood, 16, &shared, chunk_bytes);
+            let retained = super::clone_shared(&shared);
+            assert_eq!(
+                retained.len(),
+                17,
+                "chunk {chunk_bytes} must retain cap+1, got {}",
+                retained.len()
+            );
+            assert!(retained.iter().all(|&b| b == b'z'));
+        }
     }
 
     // ── CTX-0526 post-spawn cleanup ──────────────────────────────────────

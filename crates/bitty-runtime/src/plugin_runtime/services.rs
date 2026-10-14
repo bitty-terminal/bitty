@@ -37,7 +37,9 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
-use bitty_plugin_host::{ProvidedService, service_version_satisfies, value_satisfies_schema};
+use bitty_plugin_host::{
+    ProvidedService, parse_service_reference, service_version_satisfies, value_satisfies_schema,
+};
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
 use super::overlay::{
@@ -845,16 +847,20 @@ pub struct ServiceRecord {
 /// One brokered service call for the observability ledger (dynapi 4/4 input).
 ///
 /// Recorded by the [`HostServices::service_call`] broker after every gate
-/// passes and before the provider VM runs: the provider owner plus the
-/// backing head(s) the call projects. Plain metadata only (no args, no
-/// results); the argv-first invocation, deadlines, and per-call budgets on
-/// the execution path itself are unchanged.
+/// passes and before the provider VM runs: the provider owner, the
+/// negotiated interface version, plus the backing head(s) the call
+/// projects. Plain metadata only (no args, no results); the argv-first
+/// invocation, deadlines, and per-call budgets on the execution path
+/// itself are unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCallRecord {
     /// Providing plugin id that served the call.
     pub provider: String,
     /// Service interface name.
     pub iface: String,
+    /// Negotiated interface version that served the call (dynapi
+    /// negotiation, bitty#2006).
+    pub version: String,
     /// Called method name.
     pub method: String,
     /// Backing Core capability heads projected by this call.
@@ -931,9 +937,9 @@ impl ServiceCallLedger {
 /// Owned by [`PluginRuntime`](super::PluginRuntime) and shared with every
 /// generation's [`PluginServices`]: activation publishes, suspend parks,
 /// resume restores, dispose/reload revokes. Keyed by interface with one
-/// record per provider, so several plugins may provide the same interface
-/// and resolution picks deterministically (highest satisfying version,
-/// ties broken by provider id).
+/// record per (provider, version), so side-by-side versions of one
+/// interface coexist and resolution picks deterministically (highest
+/// satisfying version, ties broken by provider id).
 #[derive(Debug, Default)]
 pub struct ServiceDirectory {
     records: BTreeMap<String, Vec<ServiceRecord>>,
@@ -946,12 +952,15 @@ impl ServiceDirectory {
         Self::default()
     }
 
-    /// Publish one activation record, replacing the same provider's prior
-    /// record for the interface (a provider publishes each interface once
-    /// per generation; re-activation after revoke starts clean).
+    /// Publish one activation record, replacing the same (provider,
+    /// version) prior record for the interface (a provider publishes each
+    /// declared (interface, version) once per generation; side-by-side
+    /// versions coexist, and re-activation after revoke starts clean).
     pub fn publish(&mut self, record: ServiceRecord) {
         let entry = self.records.entry(record.iface.clone()).or_default();
-        entry.retain(|existing| existing.provider != record.provider);
+        entry.retain(|existing| {
+            existing.provider != record.provider || existing.version != record.version
+        });
         entry.push(record);
     }
 
@@ -1001,13 +1010,18 @@ impl ServiceDirectory {
             .unwrap_or_default()
     }
 
-    /// Cloned active record for (`iface`, `provider`), if published.
+    /// Cloned active record for (`iface`, `provider`, `version`), if
+    /// published. The version pin keeps side-by-side records from serving
+    /// through each other's handles: a consumer handle always drives the
+    /// exact record its resolution selected, never a same-provider sibling.
     #[must_use]
-    pub fn find_active(&self, iface: &str, provider: &str) -> Option<ServiceRecord> {
+    pub fn find_active(&self, iface: &str, provider: &str, version: &str) -> Option<ServiceRecord> {
         self.records.get(iface).and_then(|records| {
             records
                 .iter()
-                .find(|record| record.provider == provider && !record.suspended)
+                .find(|record| {
+                    record.provider == provider && record.version == version && !record.suspended
+                })
                 .cloned()
         })
     }
@@ -1035,6 +1049,35 @@ fn service_resolution_error(iface: &str, detail: String) -> BridgeError {
         "E_SERVICE_RESOLUTION",
         format!("service '{iface}' cannot be resolved: {detail}"),
     )
+}
+
+/// Maximum versions named in a resolution-failure diagnostic.
+///
+/// Bounds the error detail: validated versions are at most 64 bytes each,
+/// so the listing stays small while still naming real candidates.
+const MAX_RESOLUTION_LISTED_VERSIONS: usize = 8;
+
+/// Render the visible-version listing for a resolution-failure diagnostic
+/// (dynapi negotiation, bitty#2006).
+///
+/// Callers pass grant-visible versions only, so the listing never leaks an
+/// ungranted provider; beyond the cap it names the first entries plus the
+/// remaining count.
+fn list_visible_versions(versions: BTreeSet<String>) -> String {
+    if versions.is_empty() {
+        return "no versions available".to_string();
+    }
+    let total = versions.len();
+    let listed: Vec<String> = versions
+        .into_iter()
+        .take(MAX_RESOLUTION_LISTED_VERSIONS)
+        .collect();
+    let rest = total.saturating_sub(listed.len());
+    let mut text = listed.join(", ");
+    if rest > 0 {
+        text.push_str(&format!(" (and {rest} more)"));
+    }
+    text
 }
 
 /// `E_SERVICE_GONE` for a dead, stale, or parked provider record.
@@ -2228,6 +2271,10 @@ impl PluginServices {
     /// `service_resolve`/`service_call` re-check this snapshot on every
     /// lookup and every call, so a generation renewed after revocation
     /// fails closed immediately with no restart beyond re-activation.
+    ///
+    /// Narrowing the snapshot on a live generation takes effect at once:
+    /// `service_resolve`/`service_call` re-read it on the next lookup or
+    /// call, so no process restart is needed for the gate to close.
     pub fn set_granted_capabilities(&self, mut capabilities: Vec<String>) {
         capabilities.sort();
         capabilities.dedup();
@@ -2973,6 +3020,30 @@ impl HostServices for PluginServices {
         if self.service_directory.borrow().is_none() {
             return Err(BridgeError::not_implemented("bitty.services.provide"));
         }
+        // Dynapi arbitration (bitty#2003): provide-side names the short
+        // interface only (the owner is implied — the providing plugin),
+        // never a Core-reserved spelling. Manifest validation is primary;
+        // this re-check covers direct host callers with the same naming
+        // diagnostic.
+        match parse_service_reference(iface, "services.provide") {
+            Ok((None, _)) => {}
+            Ok((Some(_), short)) => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_UNDECLARED",
+                    format!(
+                        "service '{iface}' is not declared in services.provided (provide the short interface '{short}')"
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_SERVICE_UNDECLARED",
+                    format!("service '{iface}' is not declared in services.provided ({error})"),
+                ));
+            }
+        }
         let declared = self
             .service_provided
             .borrow()
@@ -3020,7 +3091,9 @@ impl HostServices for PluginServices {
         };
         // Declaration discipline: the caller manifest's `services.required`
         // entry is mandatory. `opts.version` overrides its requirement text
-        // but never substitutes for the declaration.
+        // but never substitutes for the declaration. An owner-qualified
+        // lookup requires the qualified entry (`owner:iface`); a short
+        // entry never authorizes a qualified lookup.
         let manifest_req = self
             .service_required
             .borrow()
@@ -3034,25 +3107,54 @@ impl HostServices for PluginServices {
             ));
         };
         let effective = req.unwrap_or(&manifest_req).to_string();
-        // Deterministic pick over the live directory: highest satisfying
-        // version wins, ties break by provider id. Unparseable requirements
+        // Dynapi arbitration (bitty#2003): references are short
+        // (`calc.add`) or owner-qualified (`xuepoo.calc:calc.add`).
+        // Malformed or Core-reserved references fail closed with the same
+        // resolution code. A qualified reference pins the owner; a short
+        // reference shared by two or more visible owners fails closed
+        // naming each owner (every claimant stays reachable through its
+        // qualified form), even when `optional` is set — ambiguity is a
+        // naming error, not absence.
+        //
+        // Deterministic pick over the visible records (one owner: the
+        // pinned one, or the single unambiguous claimant): highest
+        // satisfying version wins. Unparseable requirements
         // or versions satisfy nothing (fail-closed, same grammar as the
-        // policy registry gate).
+        // policy registry gate). Negotiation is pure matching, never
+        // authority (dynapi negotiation, bitty#2006): the broker always
+        // serves the highest compatible version — never a silent downgrade
+        // to a lower pick — and an empty intersection fails closed with
+        // the visible versions listed, never a nearest-version guess.
         //
         // Dynapi gating (bitty#2005): records whose backing heads this
         // generation's grant does not cover are skipped as if absent, so an
         // ungranted consume is indistinguishable from no provider
         // (`E_SERVICE_RESOLUTION`, or nil when optional — the same posture
         // as `bitty.env`, whose ungranted reads share the backend-absent
-        // code). No new authority is minted anywhere on this path.
+        // code). Ambiguity is judged over visible records only, and the
+        // diagnostic below lists visible versions only, so neither ever
+        // leaks an ungranted provider. No new authority is minted
+        // anywhere on this path.
+        let (owner, short) = parse_service_reference(iface, "services.get")
+            .map_err(|error| service_resolution_error(iface, error.to_string()))?;
         let mut best: Option<(Version, String, ServiceRecord)> = None;
-        for record in directory.borrow().active_for(iface) {
-            if !service_version_satisfies(&record.version, &effective) {
+        let mut visible_owners: BTreeSet<String> = BTreeSet::new();
+        let mut visible_versions: BTreeSet<String> = BTreeSet::new();
+        for record in directory.borrow().active_for(&short) {
+            if owner
+                .as_deref()
+                .is_some_and(|wanted| wanted != record.provider)
+            {
                 continue;
             }
             if !self.service_heads_covered(&record.heads) {
                 continue;
             }
+            visible_versions.insert(record.version.clone());
+            if !service_version_satisfies(&record.version, &effective) {
+                continue;
+            }
+            visible_owners.insert(record.provider.clone());
             let Ok(version) = Version::parse(&record.version) else {
                 continue;
             };
@@ -3067,13 +3169,29 @@ impl HostServices for PluginServices {
                 best = Some((version, record.provider.clone(), record));
             }
         }
+        if owner.is_none() && visible_owners.len() > 1 {
+            let owners = visible_owners
+                .into_iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(service_resolution_error(
+                iface,
+                format!(
+                    "interface '{short}' is claimed by multiple owners ({owners}): use an owner-qualified name ('<owner>:{short}')"
+                ),
+            ));
+        }
         let Some((_, _, record)) = best else {
             if optional {
                 return Ok(None);
             }
             return Err(service_resolution_error(
                 iface,
-                format!("no provider satisfies '{effective}'"),
+                format!(
+                    "no provider satisfies '{effective}' (available: {})",
+                    list_visible_versions(visible_versions)
+                ),
             ));
         };
         Ok(Some(ServiceRoute {
@@ -3090,6 +3208,7 @@ impl HostServices for PluginServices {
         provider: &str,
         generation: u32,
         iface: &str,
+        version: &str,
         method: &str,
         args: &LuaValue,
     ) -> Result<LuaValue, BridgeError> {
@@ -3099,7 +3218,10 @@ impl HostServices for PluginServices {
         };
         // Snapshot the record under a short borrow: the directory borrow
         // must never span the (potentially re-entrant) provider VM call.
-        let record = directory.borrow().find_active(iface, provider);
+        // The version pin keeps side-by-side records on their own handles
+        // (dynapi negotiation, bitty#2006): a handle resolved at one
+        // version never drives a sibling record's functions.
+        let record = directory.borrow().find_active(iface, provider, version);
         let Some(record) = record else {
             return Err(service_gone_error(format!(
                 "service '{iface}' is unavailable"
@@ -3139,14 +3261,16 @@ impl HostServices for PluginServices {
                 ));
             }
         }
-        // Broker observability (dynapi 4/4 input): record the provider owner
-        // plus the backing heads projected by this call. Only dispatched
-        // calls record (rejected calls never reach a provider). Observe-only:
-        // a missing or full ledger never blocks the call.
+        // Broker observability (dynapi 4/4 input): record the provider owner,
+        // the negotiated version, plus the backing heads projected by this
+        // call. Only dispatched calls record (rejected calls never reach a
+        // provider). Observe-only: a missing or full ledger never blocks
+        // the call.
         if let Some(ledger) = self.service_call_ledger.borrow().clone() {
             ledger.borrow_mut().push(ServiceCallRecord {
                 provider: record.provider.clone(),
                 iface: record.iface.clone(),
+                version: record.version.clone(),
                 method: method.to_string(),
                 heads: record.heads.clone(),
             });
@@ -5431,11 +5555,64 @@ mod tests {
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 7, "calc.add", "1.0.0", &["add"]);
         host.set_granted_capabilities(Vec::new());
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("ungranted call must fail closed");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            7,
+            "calc.add",
+            "1.0.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("ungranted call must fail closed");
         // Indistinguishable from a parked provider: same code, no head names.
         assert_eq!(error.code, "E_SERVICE_GONE");
+    }
+
+    #[test]
+    fn narrowing_grant_snapshot_to_empty_fails_closed_without_restart() {
+        // A generation's granted-capability snapshot narrowed to empty
+        // makes the next lookup and call fail closed on the same live
+        // host: only the in-memory snapshot gates, no restart is needed.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("granted resolves")
+                .is_some()
+        );
+        // Narrow the snapshot to empty on the same live host.
+        host.set_granted_capabilities(Vec::new());
+        let error = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect_err("narrowed consume must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert_eq!(error.class, "runtime");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", None, true)
+                .expect("optional degrades to nil"),
+            None
+        );
+        // A call against the still-published record fails closed as gone:
+        // the denial is indistinguishable from the provider being gone.
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("narrowed call must fail closed");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        // Re-widening the snapshot serves again with no restart: the
+        // directory records never moved, only the in-memory snapshot gates.
+        host.set_granted_capabilities(vec![TEST_HEAD.to_string()]);
+        assert!(
+            HostServices::service_resolve(&host, "calc.add", None, false)
+                .expect("re-widened resolves")
+                .is_some()
+        );
     }
 
     #[test]
@@ -5456,18 +5633,33 @@ mod tests {
         );
         // No live VM behind the stashed record (Weak::new), so the call
         // itself fails closed — but the broker records the dispatch first.
-        let _ =
-            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil);
+        let _ = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            7,
+            "calc.add",
+            "1.0.0",
+            "add",
+            &LuaValue::Nil,
+        );
         let calls = ledger.borrow().calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].provider, "xuepoo.calc");
         assert_eq!(calls[0].iface, "calc.add");
+        assert_eq!(calls[0].version, "1.0.0");
         assert_eq!(calls[0].method, "add");
         assert_eq!(calls[0].heads, vec![TEST_HEAD.to_string()]);
         // Ungranted calls record nothing: the gate runs before the ledger.
         host.set_granted_capabilities(Vec::new());
-        let _ =
-            HostServices::service_call(&host, "xuepoo.calc", 7, "calc.add", "add", &LuaValue::Nil);
+        let _ = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            7,
+            "calc.add",
+            "1.0.0",
+            "add",
+            &LuaValue::Nil,
+        );
         assert_eq!(ledger.borrow().len(), 1);
     }
 
@@ -5478,6 +5670,7 @@ mod tests {
             assert!(ledger.push(ServiceCallRecord {
                 provider: "xuepoo.calc".to_string(),
                 iface: "calc.add".to_string(),
+                version: "1.0.0".to_string(),
                 method: method.to_string(),
                 heads: vec![TEST_HEAD.to_string()],
             }));
@@ -5485,6 +5678,7 @@ mod tests {
         assert!(!ledger.push(ServiceCallRecord {
             provider: "xuepoo.calc".to_string(),
             iface: "calc.add".to_string(),
+            version: "1.0.0".to_string(),
             method: "c".to_string(),
             heads: vec![TEST_HEAD.to_string()],
         }));
@@ -5522,40 +5716,244 @@ mod tests {
     }
 
     #[test]
-    fn resolve_picks_highest_satisfying_version() {
+    fn resolve_ambiguous_short_fails_closed_naming_owners() {
+        // Dynapi arbitration (bitty#2003): one short name claimed by two
+        // owners resolves through neither — the unqualified form fails
+        // closed naming both owners, while each qualified form keeps
+        // working. Ambiguity is a naming error, not absence, so `optional`
+        // still fails.
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
-        publish_record(&directory, "xuepoo.next", 1, "calc.add", "2.0.0", &["add"]);
-        let route = HostServices::service_resolve(&host, "calc.add", None, false)
-            .expect("resolution serves")
+        publish_record(&directory, "xuepoo.beta", 1, "calc.add", "1.5.0", &["add"]);
+        publish_record(&directory, "xuepoo.alpha", 1, "calc.add", "1.2.0", &["add"]);
+        for optional in [false, true] {
+            let error = HostServices::service_resolve(&host, "calc.add", None, optional)
+                .expect_err("ambiguous short must fail closed");
+            assert_eq!(error.code, "E_SERVICE_RESOLUTION", "optional={optional}");
+            assert_eq!(error.class, "runtime");
+            assert!(
+                error.message.contains("'xuepoo.alpha'"),
+                "names first owner: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("'xuepoo.beta'"),
+                "names second owner: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("owner-qualified"),
+                "points at the qualified form: {}",
+                error.message
+            );
+        }
+        host.set_service_manifest(
+            host.provided_services(),
+            vec![
+                ("calc.add".to_string(), ">=1.0".to_string()),
+                ("xuepoo.alpha:calc.add".to_string(), ">=1.0".to_string()),
+                ("xuepoo.beta:calc.add".to_string(), ">=1.0".to_string()),
+            ],
+        );
+        let route = HostServices::service_resolve(&host, "xuepoo.alpha:calc.add", None, false)
+            .expect("qualified alpha resolves")
             .expect("route present");
-        assert_eq!(route.provider, "xuepoo.next");
-        assert_eq!(route.version, "2.0.0");
-        assert_eq!(route.generation, 1);
-        assert_eq!(route.methods, vec!["add".to_string()]);
+        assert_eq!(route.provider, "xuepoo.alpha");
+        assert_eq!(route.version, "1.2.0");
+        let route = HostServices::service_resolve(&host, "xuepoo.beta:calc.add", None, false)
+            .expect("qualified beta resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.beta");
+        assert_eq!(route.version, "1.5.0");
     }
 
     #[test]
-    fn resolve_tie_breaks_by_provider_id() {
+    fn resolve_qualified_ignores_other_owners_versions() {
+        // A qualified lookup pins the owner even when another owner
+        // publishes a higher version: negotiation never crosses owners.
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.b", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.a", 1, "calc.add", "1.2.0", &["add"]);
-        let route = HostServices::service_resolve(&host, "calc.add", None, false)
-            .expect("resolution serves")
+        publish_record(&directory, "xuepoo.alpha", 1, "calc.add", "1.2.0", &["add"]);
+        publish_record(&directory, "xuepoo.beta", 1, "calc.add", "2.0.0", &["add"]);
+        host.set_service_manifest(
+            host.provided_services(),
+            vec![("xuepoo.alpha:calc.add".to_string(), ">=1.0".to_string())],
+        );
+        let route = HostServices::service_resolve(&host, "xuepoo.alpha:calc.add", None, false)
+            .expect("qualified alpha resolves")
             .expect("route present");
-        assert_eq!(route.provider, "xuepoo.a");
+        assert_eq!(route.provider, "xuepoo.alpha");
+        assert_eq!(route.version, "1.2.0");
+    }
+
+    #[test]
+    fn resolve_single_owner_short_still_resolves() {
+        // Backward-compatible spine: one owner per short name keeps the
+        // historic behavior (highest satisfying version wins).
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("single-owner short resolves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.calc");
+        assert_eq!(route.version, "1.2.0");
     }
 
     #[test]
     fn resolve_opts_version_overrides_manifest_req() {
         let (directory, host) = service_host();
-        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.2.0", &["add"]);
-        publish_record(&directory, "xuepoo.new", 1, "calc.add", "1.5.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
         let route = HostServices::service_resolve(&host, "calc.add", Some(">=1.2,<1.5"), false)
             .expect("resolution serves")
             .expect("route present");
         assert_eq!(route.version, "1.2.0");
+    }
+
+    #[test]
+    fn provide_check_rejects_qualified_and_reserved_spellings() {
+        // Dynapi arbitration (bitty#2003): provide-side names the short
+        // interface only, never a Core-reserved spelling. Both fail closed
+        // with the undeclared code and a naming diagnostic.
+        let (_, host) = service_host();
+        let error = host
+            .service_provide_check("xuepoo.calc:calc.add")
+            .expect_err("qualified provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert!(
+            error.message.contains("calc.add"),
+            "names the short form: {}",
+            error.message
+        );
+        let error = host
+            .service_provide_check("bitty.echo")
+            .expect_err("Core-reserved provision must fail");
+        assert_eq!(error.code, "E_SERVICE_UNDECLARED");
+        assert!(
+            error.message.contains("bitty.echo"),
+            "names the iface: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Core-reserved"),
+            "names the reservation: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_highest_compatible_across_side_by_side() {
+        // Dynapi negotiation (bitty#2006): side-by-side versions of one
+        // interface resolve to the highest compatible version — never a
+        // silent downgrade to a lower pick.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "2.0.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", None, false)
+            .expect("resolution serves")
+            .expect("route present");
+        assert_eq!(route.provider, "xuepoo.calc");
+        assert_eq!(route.version, "2.0.0");
+    }
+
+    #[test]
+    fn resolve_pinned_version_serves_pinned_release() {
+        // Consumers pin independently: an exact pin serves its release even
+        // when a higher sibling coexists.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "2.0.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", Some("1.0.0"), false)
+            .expect("pinned resolution serves")
+            .expect("route present");
+        assert_eq!(route.version, "1.0.0");
+    }
+
+    #[test]
+    fn resolve_empty_intersection_fails_closed_listing_available() {
+        // An empty intersection fails closed with a diagnostic naming the
+        // interface, the requested range, and the visible versions — never
+        // a silent pick of nearest.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "2.0.0", &["add"]);
+        let error = HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), false)
+            .expect_err("empty intersection must fail closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        let message = error.message;
+        assert!(message.contains("calc.add"), "names the iface: {message}");
+        assert!(message.contains(">=9.0"), "names the range: {message}");
+        assert!(message.contains("1.0.0"), "lists v1: {message}");
+        assert!(message.contains("2.0.0"), "lists v2: {message}");
+        assert_eq!(
+            HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), true)
+                .expect("optional degrades to nil"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_removing_only_compatible_version_flips_to_fail_closed() {
+        // No silent downgrade path: when the only compatible version
+        // leaves, consumption flips from OK to fail-closed instead of
+        // rebinding to an incompatible sibling.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.old", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.new", 1, "calc.add", "2.0.0", &["add"]);
+        let route = HostServices::service_resolve(&host, "calc.add", Some(">=2.0"), false)
+            .expect("v2 resolves")
+            .expect("route present");
+        assert_eq!(route.version, "2.0.0");
+        directory.borrow_mut().revoke_provider("xuepoo.new");
+        let error = HostServices::service_resolve(&host, "calc.add", Some(">=2.0"), false)
+            .expect_err("removal must flip to fail-closed");
+        assert_eq!(error.code, "E_SERVICE_RESOLUTION");
+        assert!(
+            error.message.contains("1.0.0"),
+            "diagnostic lists the remaining version: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn service_call_version_pin_drives_exact_record() {
+        // Side-by-side records never serve through each other's handles:
+        // the call resolves the exact (provider, version) record. Both
+        // records share a dead VM here, so the pin is observed through
+        // the failure message: the pinned version reaches its (dead)
+        // provider, an unknown version finds no record at all.
+        let (directory, host) = service_host();
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "2.0.0", &["add"]);
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.0.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("dead VM must be gone");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        assert!(
+            error.message.contains("is gone"),
+            "pinned version reaches its record: {}",
+            error.message
+        );
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "9.9.9",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("unknown version must be unavailable");
+        assert_eq!(error.code, "E_SERVICE_GONE");
+        assert!(
+            error.message.contains("is unavailable"),
+            "unknown version finds no record: {}",
+            error.message
+        );
     }
 
     #[test]
@@ -5601,6 +5999,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_failure_listing_caps_versions_and_hides_ungranted() {
+        // The available-versions listing stays bounded (first entries plus
+        // the remaining count) and never names an ungranted provider's
+        // versions: revoking the grant flips the listing to empty, the
+        // same posture as no provider.
+        let (directory, host) = service_host();
+        for minor in 0..10 {
+            publish_record(
+                &directory,
+                "xuepoo.calc",
+                1,
+                "calc.add",
+                &format!("1.0.{minor}"),
+                &["add"],
+            );
+        }
+        let error = HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), false)
+            .expect_err("empty intersection must fail closed");
+        assert!(
+            error.message.contains("1.0.0"),
+            "lists first versions: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("(and 2 more)"),
+            "caps the listing with the remainder: {}",
+            error.message
+        );
+        // Ungranted records stay invisible to the diagnostic.
+        host.set_granted_capabilities(Vec::new());
+        let error = HostServices::service_resolve(&host, "calc.add", Some(">=9.0"), false)
+            .expect_err("ungranted consume must fail closed");
+        assert!(
+            error.message.contains("no versions available"),
+            "hides ungranted versions: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn resolve_skips_suspended_records() {
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
@@ -5617,25 +6055,51 @@ mod tests {
     }
 
     #[test]
-    fn directory_publish_replaces_same_provider_record() {
+    fn directory_publish_coexists_side_by_side_replaces_same_version() {
+        // Dynapi negotiation (bitty#2006): side-by-side versions of one
+        // interface coexist; republishing the same (provider, version)
+        // replaces in place.
         let directory = Rc::new(RefCell::new(ServiceDirectory::new()));
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.0.0", &["add"]);
-        publish_record(&directory, "xuepoo.calc", 2, "calc.add", "1.1.0", &["add"]);
-        assert_eq!(directory.borrow().published_count(), 1);
-        let record = directory
+        publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.1.0", &["add"]);
+        assert_eq!(directory.borrow().published_count(), 2);
+        let old = directory
             .borrow()
-            .find_active("calc.add", "xuepoo.calc")
+            .find_active("calc.add", "xuepoo.calc", "1.0.0")
+            .expect("v1 present");
+        assert_eq!(old.generation, 1);
+        // Same (provider, version) republishes in place.
+        publish_record(&directory, "xuepoo.calc", 2, "calc.add", "1.0.0", &["add"]);
+        assert_eq!(directory.borrow().published_count(), 2);
+        let current = directory
+            .borrow()
+            .find_active("calc.add", "xuepoo.calc", "1.0.0")
             .expect("republished record present");
-        assert_eq!(record.generation, 2);
-        assert_eq!(record.version, "1.1.0");
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.version, "1.0.0");
+        // Version-pinned lookup finds no sibling: unknown versions resolve
+        // to nothing.
+        assert!(
+            directory
+                .borrow()
+                .find_active("calc.add", "xuepoo.calc", "9.9.9")
+                .is_none()
+        );
     }
 
     #[test]
     fn call_without_directory_is_not_implemented() {
         let host = services();
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("no backend must stay not-implemented");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("no backend must stay not-implemented");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
     }
 
@@ -5647,6 +6111,7 @@ mod tests {
             "xuepoo.calc",
             1,
             "calc.missing",
+            "1.0.0",
             "add",
             &LuaValue::Nil,
         )
@@ -5659,9 +6124,16 @@ mod tests {
     fn call_stale_generation_is_gone() {
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 2, "calc.add", "1.2.0", &["add"]);
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("stale generation must be gone");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("stale generation must be gone");
         assert_eq!(error.code, "E_SERVICE_GONE");
     }
 
@@ -5669,9 +6141,16 @@ mod tests {
     fn call_unknown_method_is_gone() {
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "sub", &LuaValue::Nil)
-                .expect_err("unpublished method must be gone");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "sub",
+            &LuaValue::Nil,
+        )
+        .expect_err("unpublished method must be gone");
         assert_eq!(error.code, "E_SERVICE_GONE");
     }
 
@@ -5680,9 +6159,16 @@ mod tests {
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
         directory.borrow_mut().suspend_provider("xuepoo.calc");
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("suspended provider must be gone");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("suspended provider must be gone");
         assert_eq!(error.code, "E_SERVICE_GONE");
     }
 
@@ -5692,9 +6178,16 @@ mod tests {
         // whose VM is dropped.
         let (directory, host) = service_host();
         publish_record(&directory, "xuepoo.calc", 1, "calc.add", "1.2.0", &["add"]);
-        let error =
-            HostServices::service_call(&host, "xuepoo.calc", 1, "calc.add", "add", &LuaValue::Nil)
-                .expect_err("dead provider VM must be gone");
+        let error = HostServices::service_call(
+            &host,
+            "xuepoo.calc",
+            1,
+            "calc.add",
+            "1.2.0",
+            "add",
+            &LuaValue::Nil,
+        )
+        .expect_err("dead provider VM must be gone");
         assert_eq!(error.code, "E_SERVICE_GONE");
     }
 
@@ -5725,6 +6218,7 @@ mod tests {
             "xuepoo.calc",
             1,
             "calc.add",
+            "1.2.0",
             "add",
             &LuaValue::Integer(5),
         )

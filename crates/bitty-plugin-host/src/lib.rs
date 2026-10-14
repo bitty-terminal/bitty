@@ -230,12 +230,14 @@ pub use lifecycle::{
     reload_generation,
 };
 pub use manifest::{
-    CMD_SCHEMA_MAX_BYTES, CMD_SCHEMA_MAX_DEPTH, CapabilityRequests, Compat, FilesystemRequest,
-    FsAccess, LazyCommand, LazyTriggers, MANIFEST_MAX_BYTES, MAX_COMMANDS, MAX_DEPENDENCIES,
-    MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND, MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES,
-    MAX_SERVICE_BACKING_HEADS, MAX_TOOLS, PluginDependency, PluginId, PluginIdentity,
+    CMD_SCHEMA_MAX_BYTES, CMD_SCHEMA_MAX_DEPTH, CORE_RESERVED_SERVICE_NAMESPACE,
+    CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand, LazyTriggers,
+    MANIFEST_MAX_BYTES, MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,
+    MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, MAX_SERVICE_BACKING_HEADS,
+    MAX_SERVICE_REFERENCE_BYTES, MAX_TOOLS, PluginDependency, PluginId, PluginIdentity,
     PluginManifest, ProvidedService, QualifiedName, SchemaSummary, ToolDeclaration,
-    is_hostile_fs_pattern, service_version_satisfies, summarize_interface_schema,
+    is_hostile_fs_pattern, parse_service_reference, service_version_satisfies,
+    short_service_iface_is_core_reserved, split_service_reference, summarize_interface_schema,
     validate_interface_schema, value_satisfies_schema,
 };
 pub use origin::{

@@ -355,6 +355,14 @@ fn list_socket_for_non_instances_is_usage_error() {
         "--socket with themes must be UsageError (exit 2), stderr={:?}",
         stderr(&output)
     );
+    // The services kind shares the instances-only socket/instance gate.
+    let output = run_bitty(&["list", "services", "--socket", "/tmp/x.sock"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--socket with services must be UsageError (exit 2), stderr={:?}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -465,4 +473,300 @@ fn list_themes_term_dumb_strips_swatches() {
         "TERM=dumb must strip swatches, got {text:?}"
     );
     assert!(text.contains("#1e1e2e"));
+}
+
+// ---------------------------------------------------------------------------
+// `bitty list services` (dynapi observability, bitty#2002)
+// ---------------------------------------------------------------------------
+
+/// Isolated fixture roots: plugin dir plus blank XDG homes so the listing
+/// never touches the developer's store, config, or sockets. No plugin VM
+/// ever loads: discovery parses manifests only.
+struct ServicesFixture {
+    root: std::path::PathBuf,
+}
+
+impl ServicesFixture {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "bitty-list-services-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["plugins", "data", "config"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        Self { root }
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "BITTY_PLUGIN_DIR".to_string(),
+                self.root.join("plugins").to_string_lossy().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                self.root.join("data").to_string_lossy().to_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                self.root.join("config").to_string_lossy().to_string(),
+            ),
+        ]
+    }
+
+    fn write_plugin(&self, id: &str, manifest_extra: &str, capabilities: &str) {
+        self.write_plugin_as(id, id, manifest_extra, capabilities);
+    }
+
+    /// Variant with an explicit on-disk directory name. Hostile-id fixtures
+    /// need this: Win32 rejects control characters in a path component
+    /// (`ERROR_INVALID_NAME`) before the discovery path under test runs, so the
+    /// manifest content — not the directory name — must carry the hostile value
+    /// on every OS.
+    fn write_plugin_as(&self, dir: &str, id: &str, manifest_extra: &str, capabilities: &str) {
+        let plugin = self.root.join("plugins").join(dir);
+        std::fs::create_dir_all(plugin.join("lua")).unwrap();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n{manifest_extra}\n[capabilities]\n{capabilities}\n[lazy]\ncommands = [\"{id}:ping\"]\nevents = []\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "error(\"sentinel: list services must not execute plugin VM\")\nreturn {}\n",
+        )
+        .unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let env = self.env();
+        let refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let output = run_bitty(args, &refs);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "list services must succeed without executing plugin VM, args={args:?}, stderr={:?}",
+            stderr(&output)
+        );
+        output
+    }
+}
+
+impl Drop for ServicesFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+const CALC_SERVICES: &str =
+    "[services.provided]\n\"calc.add\" = { version = \"1.0.0\", heads = [\"runtime.inspect\"] }\n";
+
+#[test]
+fn list_services_empty_without_fixtures_is_success_with_count_zero() {
+    // No bundled provision exists today, so a blank discovery is an empty
+    // success — exit 0, count 0, frozen keys present.
+    let fixture = ServicesFixture::new("empty");
+    let output = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "empty services must exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(doc.contains("\"kind\":\"services\""));
+    assert!(doc.contains("\"count\":0"), "count: {:?}", doc.text());
+    assert!(doc.contains("\"services\":[]"));
+    let table = fixture.run(&["list", "services"]);
+    assert_eq!(table.status.code(), Some(0));
+    assert!(
+        stdout(&table).contains("(no services)"),
+        "empty table must hint, got {:?}",
+        stdout(&table)
+    );
+}
+
+#[test]
+fn list_services_registered_rows_carry_frozen_keys() {
+    // Register (fixture present) -> listed with every frozen key; the
+    // sentinel init.lua beside it never executes (every run asserts exit 0).
+    let fixture = ServicesFixture::new("registered");
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let output = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "services must exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(doc.contains("\"kind\":\"services\""));
+    assert!(doc.contains("\"count\":1"), "count: {:?}", doc.text());
+    for needle in [
+        "\"interface\":\"calc.add\"",
+        "\"owner\":\"xuepoo\"",
+        "\"version\":\"1.0.0\"",
+        "\"provider\":\"xuepoo.calc\"",
+        "\"backing_head\":\"runtime.inspect\"",
+        "\"grant_source\":\"manifest\"",
+        "\"status\":\"active\"",
+    ] {
+        assert!(doc.contains(needle), "row {needle}: {:?}", doc.text());
+    }
+    assert!(!stdout(&output).contains("null"));
+    let table = fixture.run(&["list", "services"]);
+    assert_eq!(table.status.code(), Some(0));
+    let text = stdout(&table);
+    assert!(
+        text.contains("INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS"),
+        "header: {text:?}"
+    );
+    assert!(text.contains("calc.add"), "row: {text:?}");
+    assert!(text.contains("xuepoo.calc"), "row: {text:?}");
+}
+
+#[test]
+fn list_services_ungranted_is_absent_not_denied() {
+    // A provision naming an ungranted head is absent (not "denied"):
+    // indistinguishable from undeclared, the same posture as services.get.
+    let fixture = ServicesFixture::new("absent");
+    fixture.write_plugin(
+        "xuepoo.spoof",
+        "[services.provided]\n\"calc.spoof\" = { version = \"1.0.0\", heads = [\"workspace.read\"] }\n",
+        "",
+    );
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let output = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "listing stays exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(
+        doc.contains("\"count\":1"),
+        "only granted rows: {:?}",
+        doc.text()
+    );
+    assert!(
+        !doc.contains("calc.spoof"),
+        "ungranted absent: {:?}",
+        doc.text()
+    );
+    assert!(
+        !doc.contains("denied"),
+        "no denial posture: {:?}",
+        doc.text()
+    );
+}
+
+#[test]
+fn list_services_invalid_manifest_fails_root_closed_without_execution() {
+    // An invalid manifest fails its discovery root closed (nothing from
+    // that root lists — the same all-or-nothing the runtime load path
+    // enforces), stays exit 0, and never executes any payload.
+    let fixture = ServicesFixture::new("broken");
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let broken = fixture.root.join("plugins").join("xuepoo.broken");
+    std::fs::create_dir_all(broken.join("lua")).unwrap();
+    std::fs::write(broken.join("bitty-plugin.toml"), "not = [valid toml\n").unwrap();
+    std::fs::write(broken.join("lua/init.lua"), "return {}\n").unwrap();
+    let output = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "broken manifest stays exit 0, stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(
+        doc.contains("\"count\":0"),
+        "root fails closed: {:?}",
+        doc.text()
+    );
+}
+
+#[test]
+fn list_services_unregister_is_gone_and_safe_skips_third_party() {
+    // Unregister (fixture removed) -> gone; `--safe` skips third-party
+    // sources exactly like startup while staying exit 0.
+    let fixture = ServicesFixture::new("gone");
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let before = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(before.status.code(), Some(0));
+    assert!(parse_stdout_json(&stdout(&before)).contains("\"count\":1"));
+    std::fs::remove_dir_all(fixture.root.join("plugins").join("xuepoo.calc")).unwrap();
+    let after = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(after.status.code(), Some(0));
+    assert!(
+        parse_stdout_json(&stdout(&after)).contains("\"count\":0"),
+        "unregistered gone: {:?}",
+        stdout(&after)
+    );
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let safe = fixture.run(&["--safe", "list", "services", "--format", "json"]);
+    assert_eq!(safe.status.code(), Some(0));
+    assert!(
+        parse_stdout_json(&stdout(&safe)).contains("\"count\":0"),
+        "safe skips third-party: {:?}",
+        stdout(&safe)
+    );
+}
+
+#[test]
+fn list_services_control_char_id_is_rejected_safely() {
+    // A hostile provider id (control characters) cannot register and
+    // cannot inject display text: discovery rejects it fail-closed and
+    // the listing stays exit 0 without naming it.
+    let fixture = ServicesFixture::new("hostile");
+    // The hostile value lives in the manifest only: a control character in a
+    // directory name is itself invalid on Win32, which would fail the fixture
+    // before the discovery path under test is exercised.
+    fixture.write_plugin_as(
+        "xuepoo.evilcalc",
+        "xuepoo.evil\x07calc",
+        CALC_SERVICES,
+        "runtime.inspect = true\n",
+    );
+    let output = fixture.run(&["list", "services", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "hostile id must not break the listing, stderr={:?}",
+        stderr(&output)
+    );
+    assert!(
+        parse_stdout_json(&stdout(&output)).contains("\"count\":0"),
+        "hostile unregistered: {:?}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains('\u{7}'),
+        "no raw control chars reach stdout: {:?}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn list_services_singular_and_ls_alias_match() {
+    let fixture = ServicesFixture::new("alias");
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    for args in [&["list", "service"] as &[&str], &["ls", "services"]] {
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(
+            stdout(&output).contains("calc.add"),
+            "{args:?}: {:?}",
+            stdout(&output)
+        );
+    }
 }

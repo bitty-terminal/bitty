@@ -249,6 +249,14 @@ mod tests {
     /// Exit code the tests terminate jobs with.
     const KILL_CODE: u32 = 77;
 
+    /// Ceiling for the resume-after-exit drain loop in
+    /// `resuming_a_gone_process_fails` (bitty#2030): the kernel may still
+    /// list a terminated process's threads for a short window after reap.
+    /// Poll spacing reuses `POLL`, so the total bound is
+    /// `GONE_RESUME_ATTEMPTS` times `POLL`, computed with saturating math
+    /// at the assertion site. The assertion stays fail-closed.
+    const GONE_RESUME_ATTEMPTS: u32 = 200;
+
     /// `cmd /c ping` keeps a two-process tree (cmd plus ping) alive for
     /// about half a minute with inbox programs only.
     fn spawn_suspended_tree() -> Child {
@@ -419,9 +427,41 @@ mod tests {
     fn resuming_a_gone_process_fails() {
         let mut child = spawn_suspended_tree();
         let pid = child.id();
+        // Generation fencing: `child` keeps its process handle open across
+        // every probe below, so `pid` cannot be recycled to an unrelated
+        // process while this test runs. Keep `child` alive until the end.
         terminate_process(pid, KILL_CODE).expect("terminate suspended child");
-        let _ = child.wait();
-        assert!(resume_suspended_process(pid).is_err());
+        child.wait().expect("reap terminated child");
+        // Resume-vs-reap race (bitty#2030): the thread snapshot may still
+        // list the terminated process for a short window after reap, so a
+        // single resume attempt can succeed spuriously. Poll with a ceiling
+        // and fail closed with a diagnostic when the window never drains.
+        // Only `NotFound` proves the process is gone; any other error or
+        // success retries until the ceiling.
+        let mut attempts: u32 = 0;
+        let mut ok_polls: u32 = 0;
+        let mut last_error_kind: Option<io::ErrorKind> = None;
+        let drained = loop {
+            match resume_suspended_process(pid) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break true,
+                Err(error) => {
+                    last_error_kind = Some(error.kind());
+                }
+                Ok(()) => {
+                    ok_polls = ok_polls.saturating_add(1);
+                }
+            }
+            attempts = attempts.saturating_add(1);
+            if attempts >= GONE_RESUME_ATTEMPTS {
+                break false;
+            }
+            std::thread::sleep(POLL);
+        };
+        assert!(
+            drained,
+            "resume of terminated pid {pid} did not settle to NotFound after {attempts} polls (ceiling {GONE_RESUME_ATTEMPTS} x {POLL:?}, bound {:?}); ok polls {ok_polls}, last error {last_error_kind:?} (bitty#2030)",
+            POLL.saturating_mul(GONE_RESUME_ATTEMPTS),
+        );
         assert!(!process_is_running(pid).expect("probe"));
     }
 }

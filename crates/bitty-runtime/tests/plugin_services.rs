@@ -867,3 +867,220 @@ fn granted_calls_record_provider_owner_and_backing_heads() {
     assert_eq!(calls[2].heads, vec![TEST_HEAD.to_string()]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn duet_manifest() -> String {
+    format!(
+        "[services.provided]\n\"duet.play\" = {{ version = \"1.0.0\", heads = [\"{TEST_HEAD}\"] }}\n",
+    )
+}
+
+fn duet_init(marker: &str) -> String {
+    format!(
+        r#"
+bitty.commands.register({{
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+}})
+bitty.services.provide("duet.play", {{
+  play = function(args) return "{marker}" end,
+}})
+return {{}}
+"#
+    )
+}
+
+#[test]
+fn shared_short_name_resolves_only_through_qualified_forms() {
+    // bitty#2003: two extensions claim the same short name. Both qualified
+    // forms work end to end; the unqualified form fails closed with a
+    // diagnostic naming both owners.
+    let root = temp_dir("arbitration");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.alpha",
+        &duet_manifest(),
+        TEST_GRANT,
+        &["xuepoo.alpha:ping"],
+        &duet_init("alpha"),
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.beta",
+        &duet_manifest(),
+        TEST_GRANT,
+        &["xuepoo.beta:ping"],
+        &duet_init("beta"),
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.duet",
+        "[services.required]\n\"xuepoo.alpha:duet.play\" = \">=1.0\"\n\"xuepoo.beta:duet.play\" = \">=1.0\"\n\"duet.play\" = \">=1.0\"\n",
+        TEST_GRANT,
+        &["xuepoo.duet:probe"],
+        r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local alpha = bitty.services.get("xuepoo.alpha:duet.play")
+local beta = bitty.services.get("xuepoo.beta:duet.play")
+bitty.store.set("alpha", alpha.play({}))
+bitty.store.set("beta", beta.play({}))
+local ok, err = pcall(bitty.services.get, "duet.play")
+bitty.store.set("short_code", ok and "NONE" or err.code)
+bitty.store.set("short_msg", ok and "" or err.message)
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    rt.discover();
+    let alpha_id = PluginId::new("xuepoo.alpha").expect("id");
+    let beta_id = PluginId::new("xuepoo.beta").expect("id");
+    let duet_id = PluginId::new("xuepoo.duet").expect("id");
+    rt.activate(&alpha_id).expect("alpha activates");
+    rt.activate(&beta_id).expect("beta activates");
+    // A short-only consumer cannot activate against an ambiguous name...
+    // (declared below); the qualified consumer activates and both handles
+    // serve their own owner.
+    rt.activate(&duet_id).expect("qualified consumer activates");
+    assert_eq!(
+        store_string(&rt, &duet_id, "alpha"),
+        Some("alpha".to_string())
+    );
+    assert_eq!(
+        store_string(&rt, &duet_id, "beta"),
+        Some("beta".to_string())
+    );
+    assert_eq!(
+        store_string(&rt, &duet_id, "short_code"),
+        Some("E_SERVICE_RESOLUTION".to_string())
+    );
+    let msg = store_string(&rt, &duet_id, "short_msg").expect("diagnostic message");
+    assert!(msg.contains("xuepoo.alpha"), "names first owner: {msg}");
+    assert!(msg.contains("xuepoo.beta"), "names second owner: {msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn side_by_side_versions_coexist_and_pins_survive_republication() {
+    // bitty#2006: two versions of one interface coexist; a range serves
+    // the highest compatible (never a silent downgrade), an exact pin
+    // serves its release, an empty intersection fails closed listing the
+    // available versions, and a pinned consumer survives republication
+    // (dispose + re-activate) still pinned.
+    let root = temp_dir("negotiation");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.duet",
+        "[services.provided]\n\"duet.play\" = { version = [\"1.0.0\", \"2.0.0\"], heads = [\"runtime.inspect\"] }\n",
+        TEST_GRANT,
+        &["xuepoo.duet:ping"],
+        r#"
+bitty.commands.register({
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+})
+bitty.services.provide("duet.play", { play = function(args) return "v1" end })
+bitty.services.provide("duet.play", { play = function(args) return "v2" end })
+return {}
+"#,
+    );
+    write_service_plugin(
+        &third,
+        "xuepoo.duetfan",
+        "[services.required]\n\"duet.play\" = \">=1.0\"\n",
+        TEST_GRANT,
+        &["xuepoo.duetfan:probe"],
+        r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local latest = bitty.services.get("duet.play")
+bitty.store.set("latest", latest.play({}))
+local pinned = bitty.services.get("duet.play", { version = "1.0.0" })
+bitty.store.set("pinned", pinned.play({}))
+local ok, err = pcall(bitty.services.get, "duet.play", { version = ">=9.0" })
+bitty.store.set("empty_code", ok and "NONE" or err.code)
+bitty.store.set("empty_msg", ok and "" or err.message)
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    rt.discover();
+    let duet_id = PluginId::new("xuepoo.duet").expect("id");
+    let fan_id = PluginId::new("xuepoo.duetfan").expect("id");
+    rt.activate(&duet_id).expect("provider activates");
+    assert_eq!(rt.service_directory().borrow().published_count(), 2);
+    rt.activate(&fan_id).expect("consumer activates");
+    assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
+    assert_eq!(store_string(&rt, &fan_id, "pinned"), Some("v1".to_string()));
+    assert_eq!(
+        store_string(&rt, &fan_id, "empty_code"),
+        Some("E_SERVICE_RESOLUTION".to_string())
+    );
+    let msg = store_string(&rt, &fan_id, "empty_msg").expect("diagnostic message");
+    assert!(msg.contains(">=9.0"), "names the range: {msg}");
+    assert!(msg.contains("1.0.0"), "lists v1: {msg}");
+    assert!(msg.contains("2.0.0"), "lists v2: {msg}");
+    // Negotiation results are recorded per call for observability (4/4):
+    // the range call served v2, the pinned call served v1.
+    let calls = rt.service_call_ledger().borrow().calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].version, "2.0.0");
+    assert_eq!(calls[1].version, "1.0.0");
+    // Republication (the upgrade path: dispose + re-activate) keeps the
+    // pin on its release instead of rebinding or breaking.
+    rt.dispose(&duet_id).expect("dispose");
+    rt.dispose(&fan_id).expect("consumer dispose");
+    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    rt.activate(&duet_id).expect("re-activate after dispose");
+    rt.activate(&fan_id).expect("consumer re-activates");
+    assert_eq!(store_string(&rt, &fan_id, "latest"), Some("v2".to_string()));
+    assert_eq!(store_string(&rt, &fan_id, "pinned"), Some("v1".to_string()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn core_reserved_provide_rejected_at_install() {
+    // bitty#2003: the `bitty.*` namespace stays frozen — an extension
+    // manifest claiming it fails closed at install (discover) time.
+    let root = temp_dir("reserved");
+    let third = root.join("third");
+    write_service_plugin(
+        &third,
+        "xuepoo.greedy",
+        "[services.provided]\n\"bitty.echo\" = { version = \"1.0.0\", heads = [\"runtime.inspect\"] }\n",
+        TEST_GRANT,
+        &["xuepoo.greedy:ping"],
+        r#"
+bitty.commands.register({
+  id = "ping",
+  title = "Ping",
+  run = function() return "pong" end,
+})
+bitty.services.provide("bitty.echo", { run = function(args) return args end })
+return {}
+"#,
+    );
+    let mut rt = runtime(vec![third]);
+    let results = rt.discover();
+    assert_eq!(results.len(), 1);
+    let err = format!(
+        "{}",
+        results[0]
+            .1
+            .as_ref()
+            .expect_err("reserved provide must reject at install")
+    );
+    assert!(err.contains("bitty.echo"), "names the iface: {err}");
+    assert!(err.contains("Core-reserved"), "names the rule: {err}");
+    assert_eq!(rt.service_directory().borrow().published_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -362,6 +362,14 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "platform.notify",
     "platform.open-url",
     "platform.image-file",
+    // CTX-1193 (bitty#2019/#2011/#2016): read-only Phase B sensor heads for
+    // bar modules. One head per provider (cpu/memory/battery); each is
+    // read-only by construction (no control method exists in this revision)
+    // and carries no parameter. Ungranted consumption is indistinguishable
+    // from an absent source (fail-closed hide, never fabricated values).
+    "platform.cpu-read",
+    "platform.memory-read",
+    "platform.battery-read",
     "protocol.register",
     "panel.provider",
     "panel.create",

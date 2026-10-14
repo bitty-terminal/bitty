@@ -43,6 +43,7 @@ fn plain(text: &str) -> UiNode {
         bg: None,
         bold: None,
         on_click: None,
+        on_scroll: None,
     }
 }
 
@@ -56,6 +57,7 @@ fn pill(text: &str, id: f64) -> UiNode {
             command: "test-bar:focus".to_string(),
             args: vec![("id".to_string(), ClickArg::Number(id))],
         }),
+        on_scroll: None,
     }
 }
 
@@ -212,6 +214,7 @@ fn overlapping_foreign_claim_is_denied_never_routed() {
                 command: "other-plugin:focus".to_string(),
                 args: Vec::new(),
             }),
+            on_scroll: None,
         }]),
     );
     rt.tick();
@@ -447,6 +450,7 @@ fn accent_fg_and_bold_change_the_paint() {
         bg: None,
         bold: Some(true),
         on_click: None,
+        on_scroll: None,
     }]);
     let mut rt_styled = minimal_runtime();
     mount_bottom_bar(&mut rt_styled, styled);
@@ -479,6 +483,7 @@ fn unknown_tokens_fall_back_with_a_diagnostic() {
             bg: Some("also-not-a-token".to_string()),
             bold: None,
             on_click: None,
+            on_scroll: None,
         }]),
     );
     let stats = rt.tick().expect("unknown tokens still present");
@@ -645,4 +650,139 @@ fn band_reservation_resizes_the_primary_pty_winsize() {
     rt.set_chrome_bands(ChromeBands::default());
     rt.tick().expect("unmount tick reflows");
     assert_eq!(primary_frame_rows(&rt), leaf_before);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1190 (issue #2008): scroll bindings for mounted plugin UI
+//
+// A wheel over a span with `on_scroll` routes the owning plugin's declared
+// command with the host-computed `delta` step; unbound wheels fall through
+// to the viewport/capture/alt paths unchanged. The drain queue contents
+// pinned here are the application dispatch contract (see
+// `TerminalApp::dispatch_band_scroll`).
+// ---------------------------------------------------------------------------
+
+fn scroll_pill(text: &str) -> UiNode {
+    UiNode::Text {
+        text: text.to_string(),
+        fg: None,
+        bg: None,
+        bold: None,
+        on_click: None,
+        on_scroll: Some(ClickCommand {
+            command: "test-bar:scroll".to_string(),
+            args: vec![("step".to_string(), ClickArg::Number(2.0))],
+        }),
+    }
+}
+
+fn wheel_at(rt: &mut Runtime, row: u16, col: u16, y: f32) {
+    rt.handle_cursor_moved(cell_pixels(rt, row, col));
+    rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, y));
+}
+
+#[test]
+fn band_scroll_routes_bound_span_with_host_delta() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![plain("vol "), scroll_pill("vol+")]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    // Column 5 sits on the `vol+` scroll pill.
+    wheel_at(&mut rt, row, 5, 1.0);
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1, "one bound wheel routes once");
+    assert_eq!(scrolls[0].plugin_id, "test-bar");
+    assert_eq!(scrolls[0].command, "scroll");
+    assert_eq!(
+        scrolls[0].args,
+        vec![("step".to_string(), ClickArg::Number(2.0))]
+    );
+    assert_eq!(scrolls[0].delta, 3, "host-computed lines for one notch");
+    // The tick is chrome: no selection starts and clicks stay empty.
+    assert!(!rt.has_selection(), "band scroll starts no selection");
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "a scroll never double-routes as a click"
+    );
+    assert!(
+        rt.drain_band_scrolls().is_empty(),
+        "drain consumes the queue"
+    );
+    let stats = rt.band_host_stats();
+    assert_eq!(stats.scrolls_routed, 1);
+    assert_eq!(stats.scrolls_denied, 0);
+    assert_eq!(
+        stats.clicks_routed, 0,
+        "the repeated-click workaround path is untouched"
+    );
+}
+
+#[test]
+fn band_scroll_on_unbound_span_falls_through() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![plain("vol "), scroll_pill("vol+")]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    // Column 1 sits on the unclaimed `vol ` separator span.
+    wheel_at(&mut rt, row, 1, 1.0);
+    assert!(
+        rt.drain_band_scrolls().is_empty(),
+        "unbound wheel routes nothing"
+    );
+    assert_eq!(rt.band_host_stats().scrolls_unclaimed, 1);
+    // Grid wheel is off-band entirely: silent fall-through, uncounted.
+    rt.handle_cursor_moved(content_pixels(&rt, 0, 0));
+    rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+    assert!(rt.drain_band_scrolls().is_empty());
+    assert_eq!(rt.band_host_stats().scrolls_unclaimed, 1);
+}
+
+#[test]
+fn band_scroll_burst_coalesces_into_one_dispatch() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(&mut rt, UiNode::row(vec![scroll_pill("vol+")]));
+    rt.tick();
+    let row = bar_row(&rt);
+    for _ in 0..100 {
+        wheel_at(&mut rt, row, 1, 1.0);
+    }
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1, "a 100-tick burst drains as one request");
+    assert_eq!(scrolls[0].delta, 300, "ticks sum: 100 notches at 3 lines");
+    let stats = rt.band_host_stats();
+    assert_eq!(stats.scrolls_coalesced, 99);
+    assert_eq!(stats.scroll_queue_drops, 0);
+}
+
+#[test]
+fn band_scroll_with_foreign_command_is_denied() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![UiNode::Text {
+            text: "x".to_string(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: Some(ClickCommand {
+                command: "other-plugin:scroll".to_string(),
+                args: Vec::new(),
+            }),
+        }]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    wheel_at(&mut rt, row, 0, 1.0);
+    assert!(
+        rt.drain_band_scrolls().is_empty(),
+        "a foreign scroll never routes"
+    );
+    assert_eq!(rt.band_host_stats().scrolls_denied, 1);
 }

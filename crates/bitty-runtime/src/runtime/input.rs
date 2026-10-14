@@ -1528,6 +1528,21 @@ impl Runtime {
                     (self.wheel_line_accum_x + x * lines_per_notch).clamp(-32.0, 32.0);
                 let lines_y = self.wheel_line_accum_y.trunc() as isize;
                 let lines_x = self.wheel_line_accum_x.trunc() as isize;
+                // CTX-1190 (#2008): a wheel over a plugin band row with an
+                // `on_scroll` binding routes to the owning plugin's command
+                // and consumes the tick — Core chrome wins over the
+                // viewport, capture, and alt-scroll paths below, mirroring
+                // how band presses never reach a capturing app. Unbound
+                // rows fall through untouched (no regression). Shift keeps
+                // the selection-path escape, mirroring `band_press`.
+                if !self.shift_pressed && lines_y != 0 {
+                    let delta = lines_y.clamp(-32, 32) as i32;
+                    if self.band_scroll(delta) {
+                        self.wheel_line_accum_y -= lines_y as f32;
+                        self.wheel_line_accum_x = 0.0;
+                        return;
+                    }
+                }
                 // CTX-0566: mode 1007 alternate scroll applies only in the
                 // alternate screen and only when no mouse-tracking mode is
                 // active — xterm and ghostty both give mouse reporting

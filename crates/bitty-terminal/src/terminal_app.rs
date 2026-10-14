@@ -1608,6 +1608,16 @@ impl TerminalApp {
         plugin_runtime.push_overlay_move(text)
     }
 
+    /// Enqueue a wheel event as the first-class `wheel` kind with
+    /// trailing-tick coalescing, so a wheel burst cannot evict queued
+    /// key/text entries (CTX-1190, issue #2008).
+    pub(crate) fn push_overlay_wheel(&mut self, text: &str) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.push_overlay_wheel(text)
+    }
+
     /// Absolute monotonic deadline of the active overlay capture, if any.
     pub(crate) fn overlay_capture_deadline(&self) -> Option<std::time::Instant> {
         self.plugin_runtime
@@ -1818,6 +1828,55 @@ impl TerminalApp {
         }
     }
 
+    /// Dispatches one Core-routed plugin band scroll (CTX-1190, issue #2008).
+    ///
+    /// The scroll carries the band owner's declared command verb plus its
+    /// declared args merged with the host-computed `delta` step as one named
+    /// table (`run({id = 3, delta = 1})`; see
+    /// [`bitty_runtime::band_scroll_args_table`]). Fail-closed with a loud
+    /// diagnostic when the plugin id is invalid, the runtime is gone, or the
+    /// dispatch itself fails (unregistered verb, faulting handler): the
+    /// scroll is dropped and terminal state is untouched. A successful
+    /// dispatch surfaces its result on the banner like a band click.
+    pub(crate) fn dispatch_band_scroll(&mut self, scroll: bitty_runtime::BandScrollRequest) {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&scroll.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band scroll from '{}' dropped (invalid plugin id: {error})",
+                        scroll.plugin_id
+                    )
+                });
+                return;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band scroll '{}:{}' dropped (plugin runtime is gone)",
+                    scroll.plugin_id, scroll.command
+                )
+            });
+            return;
+        };
+        let args = bitty_runtime::band_scroll_args_table(&scroll.args, scroll.delta);
+        let outcome = plugin_runtime.dispatch_command(&id, &scroll.command, &[args]);
+        match outcome {
+            Ok(result) => {
+                self.surface_dispatch_result(&scroll.plugin_id, &scroll.command, &result);
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band scroll '{}:{}' refused ({error})",
+                        scroll.plugin_id, scroll.command
+                    )
+                });
+            }
+        }
+    }
+
     /// Empty args value for argument-free host-mediated invocations
     /// (CTX-1035).
     ///
@@ -1904,7 +1963,7 @@ impl TerminalApp {
             }
             WindowEventKind::MouseWheel(delta) => {
                 let text = format!("wheel:{delta:?}");
-                self.push_overlay_input("pointer", &text)
+                self.push_overlay_wheel(&text)
             }
             WindowEventKind::Focused(false) => {
                 self.revoke_overlay_capture();
@@ -2616,6 +2675,14 @@ impl AppHandler for TerminalApp {
         // hot loop) and never disturb terminal state.
         for click in self.runtime.drain_band_clicks() {
             self.dispatch_band_click(click);
+        }
+        // CTX-1190 (#2008): Core-routed plugin band scrolls. Same posture
+        // as clicks — the runtime owns the geometry and the host-computed
+        // delta; the application dispatches each through the normal
+        // `PluginRuntime::dispatch_command` path, where registration and
+        // capability gates fail closed as usual.
+        for scroll in self.runtime.drain_band_scrolls() {
+            self.dispatch_band_scroll(scroll);
         }
         // CTX-0370: a window-close request that did not exit armed a bounded
         // confirmation (or was superseded by one); report it loudly so the

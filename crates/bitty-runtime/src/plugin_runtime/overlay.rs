@@ -31,6 +31,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use bitty_lua::ui::UI_SCROLL_DELTA_SATURATE;
 use bitty_lua::{
     BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, OVERLAY_CAPTURE_QUEUE_MAX,
     OVERLAY_CAPTURE_TEXT_MAX_BYTES, OverlayInput,
@@ -165,6 +166,9 @@ pub struct OverlayCapture {
     dropped: u64,
     /// Sticky overflow flag for the live session (cleared on acquire).
     overflowed: bool,
+    /// Wheel ticks merged into the trailing wheel slot since creation
+    /// (CTX-1190, issue #2008): the coalesce half of the burst policy.
+    wheel_coalesced: u64,
     /// Sequence of the last event delivered to the live owner (0 when none).
     last_delivered: u64,
     /// Terminal record of the most recent ended session (cleared on acquire).
@@ -405,6 +409,42 @@ impl OverlayCapture {
         self.enqueue("pointer", text)
     }
 
+    /// Enqueue a wheel event as the first-class `wheel` kind, coalescing
+    /// with the trailing queued wheel tick instead of appending (CTX-1190,
+    /// issue #2008; move-coalescing parity).
+    ///
+    /// A wheel burst produces dozens of relative ticks; appending each one
+    /// would evict key/text entries via drop-oldest before the plugin drains
+    /// them. Coalescing sums the trailing run into one slot with saturating
+    /// math ([`UI_SCROLL_DELTA_SATURATE`]) and counts every merge in
+    /// [`Self::wheel_coalesced`], so a 100-tick frame costs one queue slot
+    /// and one poll entry — never a VM-budget overrun. A malformed payload
+    /// fails closed to a plain opaque append (kept, never merged); a
+    /// different kind, a different wheel variant (`Lines` vs `Pixels`), or an
+    /// unparseable text breaks the run. Returns `false` when no capture is
+    /// active.
+    pub fn enqueue_wheel(&mut self, text: &str) -> bool {
+        if self.owner.is_none() {
+            return false;
+        }
+        if let Some(back) = self.queue.back_mut() {
+            if back.kind == "wheel"
+                && let Some(merged) = coalesce_wheel_text(&back.text, text)
+            {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+                back.sequence = self.next_sequence;
+                back.text = merged;
+                self.wheel_coalesced = self.wheel_coalesced.saturating_add(1);
+                if let Some(owner) = self.owner.as_mut() {
+                    owner.expires_at =
+                        Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS);
+                }
+                return true;
+            }
+        }
+        self.enqueue("wheel", text)
+    }
+
     /// Absolute monotonic deadline of the active capture, if any.
     ///
     /// The application arms its idle wake on this instant so an idle window
@@ -555,6 +595,14 @@ impl OverlayCapture {
         self.dropped
     }
 
+    /// Number of wheel ticks merged into the trailing wheel slot since
+    /// creation (CTX-1190, issue #2008): the coalesce half of the documented
+    /// wheel burst policy (coalesce-or-drop, counted).
+    #[must_use]
+    pub fn wheel_coalesced(&self) -> u64 {
+        self.wheel_coalesced
+    }
+
     /// Whether the live session has overflowed its queue (sticky flag).
     #[must_use]
     pub fn overflowed(&self) -> bool {
@@ -613,6 +661,70 @@ fn bounded_kind(kind: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
         .take(32)
         .collect()
+}
+
+/// One parsed wheel payload: the variant plus its two relative components.
+///
+/// The wire shape is the platform scroll-delta debug form
+/// (`wheel:Lines(x, y)` / `wheel:Pixels(x, y)`); see the `MouseWheel` arm of
+/// the application capture fall-through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WheelDelta {
+    Lines(f32, f32),
+    Pixels(f64, f64),
+}
+
+/// Parse a `wheel:*` payload; `None` for any malformed shape (fail-closed:
+/// callers keep the text opaque instead of merging it).
+fn parse_wheel_text(text: &str) -> Option<WheelDelta> {
+    let body = text.strip_prefix("wheel:")?;
+    let (variant, args) = body
+        .strip_prefix("Lines(")
+        .map(|args| ("Lines", args))
+        .or_else(|| body.strip_prefix("Pixels(").map(|args| ("Pixels", args)))?;
+    let args = args.strip_suffix(')')?;
+    let (first, second) = args.split_once(',')?;
+    match variant {
+        "Lines" => {
+            let x = first.trim().parse::<f32>().ok()?;
+            let y = second.trim().parse::<f32>().ok()?;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            Some(WheelDelta::Lines(x, y))
+        }
+        _ => {
+            let x = first.trim().parse::<f64>().ok()?;
+            let y = second.trim().parse::<f64>().ok()?;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            Some(WheelDelta::Pixels(x, y))
+        }
+    }
+}
+
+/// Merge a new wheel payload into the trailing queued one; `None` when the
+/// pair must not merge (different variants or malformed text).
+///
+/// Same-variant components sum with saturation at
+/// [`UI_SCROLL_DELTA_SATURATE`], so a burst banks bounded drift. The merged
+/// text keeps the `wheel:*` debug shape through `{:?}` formatting.
+fn coalesce_wheel_text(previous: &str, next: &str) -> Option<String> {
+    let saturate = UI_SCROLL_DELTA_SATURATE;
+    match (parse_wheel_text(previous), parse_wheel_text(next)) {
+        (Some(WheelDelta::Lines(px, py)), Some(WheelDelta::Lines(nx, ny))) => {
+            let x = (f64::from(px) + f64::from(nx)).clamp(-saturate, saturate) as f32;
+            let y = (f64::from(py) + f64::from(ny)).clamp(-saturate, saturate) as f32;
+            Some(format!("wheel:Lines({x:?}, {y:?})"))
+        }
+        (Some(WheelDelta::Pixels(px, py)), Some(WheelDelta::Pixels(nx, ny))) => {
+            let x = (px + nx).clamp(-saturate, saturate);
+            let y = (py + ny).clamp(-saturate, saturate);
+            Some(format!("wheel:Pixels({x:?}, {y:?})"))
+        }
+        _ => None,
+    }
 }
 
 /// Truncate a captured payload at a UTF-8 char boundary to
@@ -914,5 +1026,85 @@ mod tests {
         assert!(capture.enqueue("key", "x"));
         assert!(capture.release_with_reason("a", 1, "cancelled"));
         assert_eq!(capture.input_available(), None);
+    }
+
+    #[test]
+    fn wheel_coalesces_by_saturating_sum() {
+        // CTX-1190 (#2008): wheel is a first-class capture kind. Trailing
+        // wheel ticks merge into one slot by summing (relative deltas must
+        // not be dropped like absolute move positions), consuming exactly
+        // one queue slot no matter how hard the wheel bursts.
+        let mut capture = OverlayCapture::new();
+        assert!(
+            !capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"),
+            "no owner queues nothing"
+        );
+        capture.acquire("a", 1, future(1000)).expect("acquire");
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"));
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 2.0)"));
+        assert_eq!(
+            capture.queued_len(),
+            1,
+            "trailing wheel ticks share one slot"
+        );
+        let drained = capture.poll("a", 1, 8).expect("owned poll");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].kind, "wheel");
+        assert_eq!(drained[0].text, "wheel:Lines(0.0, 3.0)");
+        assert_eq!(capture.wheel_coalesced(), 1);
+    }
+
+    #[test]
+    fn wheel_run_broken_by_other_kinds_and_variants() {
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(1000)).expect("acquire");
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"));
+        assert!(capture.enqueue("key", "k"), "a key breaks the wheel run");
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"));
+        assert!(
+            capture.enqueue_wheel("wheel:Pixels(0.0, 4.0)"),
+            "mixed variants never merge"
+        );
+        assert_eq!(capture.queued_len(), 4);
+        assert_eq!(capture.wheel_coalesced(), 0);
+    }
+
+    #[test]
+    fn malformed_wheel_payload_appends_without_coalescing() {
+        // CTX-1190: fail-closed on malformed scroll payloads — an
+        // unparseable wheel text is kept as an opaque event (never dropped,
+        // never merged), and normal ticks keep coalescing after it.
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(1000)).expect("acquire");
+        assert!(capture.enqueue_wheel("wheel:garbage"));
+        assert!(capture.enqueue_wheel("wheel:garbage"));
+        assert_eq!(capture.queued_len(), 2, "malformed payloads never merge");
+        assert_eq!(capture.wheel_coalesced(), 0);
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"));
+        assert!(capture.enqueue_wheel("wheel:Lines(0.0, 1.0)"));
+        assert_eq!(capture.queued_len(), 3, "well-formed ticks coalesce again");
+        assert_eq!(capture.wheel_coalesced(), 1);
+    }
+
+    #[test]
+    fn wheel_burst_stays_bounded_and_saturates() {
+        // CTX-1190 (#2008) burst acceptance: 100 wheel ticks in one frame
+        // degrade per the documented policy (coalesce into one slot,
+        // counted, delta saturated, never a VM-budget overrun).
+        let mut capture = OverlayCapture::new();
+        capture.acquire("a", 1, future(60_000)).expect("acquire");
+        for _ in 0..100 {
+            assert!(capture.enqueue_wheel("wheel:Lines(0.0, 100.0)"));
+        }
+        assert_eq!(capture.queued_len(), 1, "a 100-tick burst holds one slot");
+        assert_eq!(capture.wheel_coalesced(), 99);
+        assert_eq!(capture.dropped(), 0, "no overflow drop is needed");
+        let drained = capture.poll("a", 1, 8).expect("owned poll");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].text,
+            format!("wheel:Lines(0.0, {:?})", UI_SCROLL_DELTA_SATURATE as f32),
+            "the coalesced delta saturates instead of banking unbounded drift"
+        );
     }
 }

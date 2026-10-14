@@ -993,6 +993,12 @@ impl PluginRuntime {
         self.overlay_capture.borrow_mut().enqueue_move(text)
     }
 
+    /// Enqueue a wheel event as the first-class `wheel` kind with
+    /// trailing-tick coalescing (see [`OverlayCapture::enqueue_wheel`]).
+    pub fn push_overlay_wheel(&mut self, text: &str) -> bool {
+        self.overlay_capture.borrow_mut().enqueue_wheel(text)
+    }
+
     /// Absolute monotonic deadline of the active overlay capture, if any
     /// (application idle-wake arming; CodeRabbit PR #1643).
     pub fn overlay_capture_deadline(&self) -> Option<std::time::Instant> {

@@ -348,6 +348,7 @@ pub struct SpectrumGate {
     last_sample_ms: u64,
     last_poll_ms: u64,
     initialized: bool,
+    pre_init_last_ms: Option<u64>,
 }
 
 impl SpectrumGate {
@@ -387,6 +388,19 @@ impl SpectrumGate {
             let age_ms = now_ms.saturating_sub(self.last_sample_ms);
             return Ok(SpectrumPoll::Coalesced { levels, age_ms });
         }
+        if !self.initialized {
+            // Pre-init ceiling (bitty#2062): failed attempts advance the
+            // gate so a dead monitor is re-probed at the ceiling rate,
+            // never hammered per tick. The sampler stays uninvoked inside
+            // the window; the poll hides without monitor work.
+            if let Some(last) = self.pre_init_last_ms {
+                if now_ms.saturating_sub(last) < SPECTRUM_MIN_INTERVAL_MS {
+                    return Err(AudioError::unavailable(
+                        "spectrum monitor polling too fast (pre-init ceiling)",
+                    ));
+                }
+            }
+        }
         let age_ms = now_ms.saturating_sub(self.last_sample_ms);
         match sample() {
             Ok(taps) => match Self::check_taps(&taps) {
@@ -396,6 +410,7 @@ impl SpectrumGate {
                     self.last_sample_ms = now_ms;
                     self.last_poll_ms = now_ms;
                     self.initialized = true;
+                    self.pre_init_last_ms = None;
                     Ok(SpectrumPoll::Fresh {
                         levels: resample_levels(&self.taps, buckets),
                         age_ms,
@@ -408,6 +423,8 @@ impl SpectrumGate {
                     if self.initialized {
                         self.stale_or_hidden(now_ms, buckets, age_ms)
                     } else {
+                        self.pre_init_last_ms = Some(now_ms);
+                        self.last_poll_ms = now_ms;
                         Err(check)
                     }
                 }
@@ -416,6 +433,8 @@ impl SpectrumGate {
                 if self.initialized {
                     return self.stale_or_hidden(now_ms, buckets, age_ms);
                 }
+                self.pre_init_last_ms = Some(now_ms);
+                self.last_poll_ms = now_ms;
                 Err(error)
             }
         }
@@ -609,6 +628,7 @@ pub struct StateGate {
     last: Option<AudioState>,
     last_ok_ms: u64,
     last_poll_ms: u64,
+    pre_init_last_ms: Option<u64>,
 }
 
 impl StateGate {
@@ -633,6 +653,19 @@ impl StateGate {
                 return Ok(StatePoll::Coalesced(served));
             }
         }
+        if self.last.is_none() {
+            // Pre-init ceiling (bitty#2062): failed reads advance the
+            // gate so a silent monitor is re-probed at the ceiling rate,
+            // never hammered per tick. The reader stays uninvoked inside
+            // the window; the poll hides without monitor work.
+            if let Some(last) = self.pre_init_last_ms {
+                if now_ms.saturating_sub(last) < STATE_MIN_INTERVAL_MS {
+                    return Err(AudioError::unavailable(
+                        "audio state polling too fast (pre-init ceiling)",
+                    ));
+                }
+            }
+        }
         match read() {
             Ok(snapshot) => {
                 // Defense in depth: the reader is Core-side, but a
@@ -646,6 +679,7 @@ impl StateGate {
                 self.last = Some(stored.clone());
                 self.last_ok_ms = now_ms;
                 self.last_poll_ms = now_ms;
+                self.pre_init_last_ms = None;
                 Ok(StatePoll::Fresh(stored))
             }
             Err(error) => self.failed_read(now_ms, Some(error)),
@@ -690,6 +724,8 @@ impl StateGate {
                 "audio state stale for {age_ms} ms (hide, never fabricate)"
             )));
         }
+        self.pre_init_last_ms = Some(now_ms);
+        self.last_poll_ms = now_ms;
         Err(error.unwrap_or_else(|| AudioError::hidden("audio state never read (hide)")))
     }
 }
@@ -1176,6 +1212,49 @@ mod tests {
     }
 
     #[test]
+    fn spectrum_pre_init_failures_stay_within_ceiling() {
+        // Regression for bitty#2062: repeated sub-window pre-init
+        // failures must not hammer the sampler; the ceiling bounds
+        // attempts even before the first sample lands.
+        let mut gate = SpectrumGate::new();
+        let mut calls = 0_usize;
+        for tick in 0..50_u64 {
+            let now_ms = tick.saturating_mul(10);
+            let _ = gate.poll(now_ms, 4, || {
+                calls += 1;
+                Err(AudioError::unavailable("monitor gone"))
+            });
+        }
+        assert!(
+            calls <= 4,
+            "pre-init failures hammer the sampler: {calls} runs for 50 sub-window polls"
+        );
+        let fresh = gate
+            .poll(1000, 4, || Ok(taps(4, 0.5)))
+            .expect("recovers after window");
+        assert!(matches!(fresh, SpectrumPoll::Fresh { .. }));
+    }
+
+    #[test]
+    fn spectrum_pre_init_bad_samples_stay_within_ceiling() {
+        // Same ceiling for corrupt pre-init samples: the check failure
+        // path advances the gate instead of retrying every tick.
+        let mut gate = SpectrumGate::new();
+        let mut calls = 0_usize;
+        for tick in 0..50_u64 {
+            let now_ms = tick.saturating_mul(10);
+            let _ = gate.poll(now_ms, 4, || {
+                calls += 1;
+                Ok(Vec::new())
+            });
+        }
+        assert!(
+            calls <= 4,
+            "pre-init corrupt samples hammer the sampler: {calls} runs for 50 sub-window polls"
+        );
+    }
+
+    #[test]
     fn spectrum_rejects_bad_samples_without_displacing_last_good() {
         // Bootstrap with a corrupt sample and no history: the check error
         // surfaces (hide), never an empty render.
@@ -1317,20 +1396,49 @@ mod tests {
                 .is_err(),
             "never read hides"
         );
-        gate.poll(1000, || Ok(state(50))).expect("lands");
+        // Pre-init ceiling (bitty#2062): the landing read waits a full
+        // window after the pre-init failure so the test honors the same
+        // bound the regression test pins.
+        gate.poll(STATE_MIN_INTERVAL_MS, || Ok(state(50)))
+            .expect("lands");
         let stale = gate
             .poll(4000, || Err(AudioError::unavailable("gone")))
             .expect("silence stales");
         assert!(matches!(stale, StatePoll::Stale(_)));
-        assert_eq!(stale.state().stale_age_ms, 3000);
+        assert_eq!(stale.state().stale_age_ms, 4000 - STATE_MIN_INTERVAL_MS);
         assert_eq!(
-            gate.poll(1000 + STATE_STALE_HIDE_MS + STATE_MIN_INTERVAL_MS, || Err(
-                AudioError::unavailable("gone")
-            ))
+            gate.poll(
+                STATE_MIN_INTERVAL_MS + STATE_STALE_HIDE_MS + STATE_MIN_INTERVAL_MS,
+                || Err(AudioError::unavailable("gone"))
+            )
             .expect_err("grace exhausted hides")
             .kind(),
             AudioErrorKind::Hidden
         );
+    }
+
+    #[test]
+    fn state_pre_init_failures_stay_within_ceiling() {
+        // Regression for bitty#2062: repeated sub-window pre-init
+        // failures must not hammer the reader; the ceiling bounds
+        // attempts even before the first snapshot lands.
+        let mut gate = StateGate::new();
+        let mut reads = 0_usize;
+        for tick in 0..20_u64 {
+            let now_ms = tick.saturating_mul(100);
+            let _ = gate.poll(now_ms, || {
+                reads += 1;
+                Err(AudioError::unavailable("monitor gone"))
+            });
+        }
+        assert!(
+            reads <= 2,
+            "pre-init failures hammer the reader: {reads} runs for 20 sub-window polls"
+        );
+        let fresh = gate
+            .poll(4000, || Ok(state(50)))
+            .expect("recovers after window");
+        assert!(matches!(fresh, StatePoll::Fresh(_)));
     }
 
     #[test]

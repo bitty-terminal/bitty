@@ -375,6 +375,20 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "platform.cpu-read",
     "platform.memory-read",
     "platform.battery-read",
+    // CTX-1201 (bitty#2012/#2017/#2020): privilege-sensitive Phase B
+    // device heads for bar modules (network, bluetooth, backlight, idle).
+    // Read vs control never share an interface; ESSID carries its own head
+    // (`platform.essid.read`: the `#2056` registry spelling
+    // `platform.network.essid.read` carries four dot segments and cannot
+    // enter the closed `family.resource[.scope]` set; the bridge maps it).
+    "platform.network.read",
+    "platform.essid.read",
+    "platform.bluetooth.read",
+    "platform.bluetooth.control",
+    "platform.backlight.read",
+    "platform.backlight.control",
+    "platform.idle.read",
+    "platform.idle.control",
     "protocol.register",
     "panel.provider",
     "panel.create",

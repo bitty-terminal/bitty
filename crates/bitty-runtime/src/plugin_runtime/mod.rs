@@ -22,6 +22,7 @@
 //! The numeric bounds below are the RFC's ratified defaults.
 
 pub mod debug;
+pub mod device_providers;
 pub mod fs;
 pub mod manifest_toml;
 pub mod overlay;

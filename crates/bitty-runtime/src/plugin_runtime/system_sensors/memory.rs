@@ -38,10 +38,10 @@ pub struct MeminfoValues {
 
 /// Parse `/proc/meminfo` text.
 ///
-/// Returns `None` when `MemTotal` is missing, malformed, or zero (no
-/// denominator exists). `MemAvailable` falls back to `MemFree`; swap fields
-/// default to zero (swapless is exact, not fabricated). Malformed numeric
-/// fields fail the line they sit on; unknown lines are ignored.
+/// Returns `None` when `MemTotal` is missing or zero (no denominator
+/// exists). `MemAvailable` falls back to `MemFree`; swap fields default to
+/// zero (swapless is exact, not fabricated). A malformed value skips its
+/// own line, so unknown or future keys never fail the whole parse.
 #[must_use]
 pub fn parse_meminfo(text: &str) -> Option<MeminfoValues> {
     let mut total: Option<u64> = None;
@@ -55,8 +55,12 @@ pub fn parse_meminfo(text: &str) -> Option<MeminfoValues> {
             continue;
         };
         // Third field is the `kB` unit where present; it is accepted but
-        // never required, so unit-less fixtures still parse.
-        let parsed: u64 = value.parse().ok()?;
+        // never required, so unit-less fixtures still parse. A non-numeric
+        // value skips its own line (unknown or future keys never fail the
+        // whole parse); required keys missing afterwards still hide.
+        let Ok(parsed) = value.parse::<u64>() else {
+            continue;
+        };
         match key {
             "MemTotal:" => total = Some(parsed),
             "MemAvailable:" => available = Some(parsed),
@@ -267,6 +271,17 @@ mod tests {
         assert!(parse_meminfo("MemAvailable: 100 kB\n").is_none());
         assert!(parse_meminfo("MemTotal: 0 kB\nMemAvailable: 0 kB\n").is_none());
         assert!(parse_meminfo("not meminfo at all\n").is_none());
+    }
+
+    #[test]
+    fn unknown_garbled_lines_never_fail_the_parse() {
+        let text = "MemTotal:        2097152 kB\n\
+             MemAvailable:    1048576 kB\n\
+             FutureKernelThing: lots\n\
+             Hugetlb:       not-a-number kB\n";
+        let values = parse_meminfo(text).expect("unknown lines are skipped");
+        assert_eq!(values.total_kib, 2_097_152);
+        assert_eq!(values.available_kib, 1_048_576);
     }
 
     #[test]

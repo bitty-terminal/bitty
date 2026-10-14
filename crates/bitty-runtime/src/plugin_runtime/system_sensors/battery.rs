@@ -101,6 +101,10 @@ impl BatteryState {
 pub struct SysfsBatteryRaw {
     /// Supply entry name (e.g. `BAT0`); selection order is by name.
     pub name: String,
+    /// Raw `type` file (`Battery`, `Mains`, `USB`, HID++ `Battery`, ...).
+    pub type_text: Option<String>,
+    /// Raw `scope` file (`System` vs `Device`) where the kernel provides it.
+    pub scope_text: Option<String>,
     /// Raw `capacity` file (percent integer).
     pub capacity_text: Option<String>,
     /// Raw `status` file (kernel vocabulary).
@@ -155,6 +159,8 @@ impl SysfsBatterySource for FsPowerSupply {
         names
             .into_iter()
             .map(|name| SysfsBatteryRaw {
+                type_text: self.read_entry(&name, "type"),
+                scope_text: self.read_entry(&name, "scope"),
                 capacity_text: self.read_entry(&name, "capacity"),
                 status_text: self.read_entry(&name, "status"),
                 power_uw_text: self.read_entry(&name, "power_now"),
@@ -265,12 +271,21 @@ struct BatteryValues {
     seconds_to_empty: Option<u64>,
 }
 
-/// Parse one sysfs candidate; `None` when its capacity is unusable.
+/// Parse one sysfs candidate; `None` when it is not a servable battery.
 ///
-/// A garbled capacity disqualifies only its own entry (the provider tries
-/// the next battery by name); power glitches clear the optional field
-/// without failing the snapshot.
+/// Non-battery supplies (`Mains`, `USB`, ...) and device-scoped peripherals
+/// (HID++ mouse/keyboard cells, `scope == Device`) never qualify, even when
+/// they report a capacity: only `type == Battery` entries with a usable
+/// capacity serve. A garbled capacity disqualifies only its own entry (the
+/// provider tries the next battery by name); power glitches clear the
+/// optional field without failing the snapshot.
 fn parse_sysfs_candidate(raw: &SysfsBatteryRaw) -> Option<BatteryValues> {
+    if raw.type_text.as_deref().map(str::trim) != Some("Battery") {
+        return None;
+    }
+    if raw.scope_text.as_deref().map(str::trim) == Some("Device") {
+        return None;
+    }
     let capacity_pct: f64 = raw.capacity_text.as_deref()?.trim().parse().ok()?;
     if !(0.0..=100.0).contains(&capacity_pct) {
         return None;
@@ -441,6 +456,8 @@ mod tests {
                     .into_iter()
                     .map(|(name, capacity, status)| SysfsBatteryRaw {
                         name: name.to_string(),
+                        type_text: Some("Battery".to_string()),
+                        scope_text: None,
                         capacity_text: Some(capacity.to_string()),
                         status_text: Some(status.to_string()),
                         power_uw_text: Some("5000000".to_string()),
@@ -468,6 +485,8 @@ mod tests {
     fn raw(name: &str, capacity: Option<&str>, status: Option<&str>) -> SysfsBatteryRaw {
         SysfsBatteryRaw {
             name: name.to_string(),
+            type_text: Some("Battery".to_string()),
+            scope_text: None,
             capacity_text: capacity.map(str::to_string),
             status_text: status.map(str::to_string),
             power_uw_text: None,
@@ -574,6 +593,46 @@ mod tests {
     }
 
     #[test]
+    fn non_battery_supplies_never_serve() {
+        // A wireless mouse cell sorting before BAT0 must not become the
+        // laptop reading; mains adapters never qualify either.
+        let sysfs = FakeSysfs {
+            raws: vec![
+                SysfsBatteryRaw {
+                    name: "AC".to_string(),
+                    type_text: Some("Mains".to_string()),
+                    scope_text: None,
+                    capacity_text: None,
+                    status_text: None,
+                    power_uw_text: None,
+                },
+                SysfsBatteryRaw {
+                    name: "AAA0".to_string(),
+                    type_text: Some("Battery".to_string()),
+                    scope_text: Some("Device".to_string()),
+                    capacity_text: Some("99".to_string()),
+                    status_text: Some("Discharging".to_string()),
+                    power_uw_text: None,
+                },
+                SysfsBatteryRaw {
+                    name: "hidpp_battery_0".to_string(),
+                    type_text: Some("Battery".to_string()),
+                    scope_text: Some("Device".to_string()),
+                    capacity_text: Some("55".to_string()),
+                    status_text: Some("Discharging".to_string()),
+                    power_uw_text: None,
+                },
+                raw("BAT0", Some("42"), Some("Charging")),
+            ],
+            calls: Rc::new(Cell::new(0)),
+        };
+        let mut provider = BatteryProvider::with_policy(FakeUpower::absent(), sysfs, 5000);
+        let snapshot = provider.get(0, true).expect("real battery serves");
+        assert!((snapshot.capacity_pct - 42.0).abs() < 1e-9);
+        assert_eq!(snapshot.state, BatteryState::Charging);
+    }
+
+    #[test]
     fn garbled_capacity_disqualifies_its_entry_only() {
         let sysfs = FakeSysfs {
             raws: vec![
@@ -669,6 +728,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bitty-battery-{}", std::process::id()));
         let bat = dir.join("BAT0");
         std::fs::create_dir_all(&bat).expect("fixture dir");
+        std::fs::write(bat.join("type"), "Battery\n").expect("type");
         std::fs::write(bat.join("capacity"), "42\n").expect("capacity");
         std::fs::write(bat.join("status"), "Charging\n").expect("status");
         std::fs::write(dir.join("AC").join("type"), "Mains").ok();

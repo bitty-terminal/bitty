@@ -134,6 +134,12 @@ fn common_damage_bytes(damage: &bitty_term_state::Damage) -> Vec<u8> {
                 out.extend_from_slice(&first_line_id.to_le_bytes());
                 out.extend_from_slice(&count.to_le_bytes());
             }
+            bitty_term_state::DamagedRegion::Scroll { top, bottom, lines } => {
+                out.push(3);
+                out.extend_from_slice(&top.to_le_bytes());
+                out.extend_from_slice(&bottom.to_le_bytes());
+                out.extend_from_slice(&lines.to_le_bytes());
+            }
         }
     }
     out

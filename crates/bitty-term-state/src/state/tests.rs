@@ -270,6 +270,106 @@ fn scroll_under_screen_bottom_captures_scrollback() {
 }
 
 #[test]
+fn scroll_up_emits_copy_motion_not_full_region() {
+    // CTX-1207: a region scroll records a copy motion; the full-region
+    // grid rectangle is gone so downstream copies instead of repainting.
+    let mut s = State::new();
+    let damage = s.apply(&TerminalAction::ScrollUp { n: Count(3) });
+    assert!(
+        damage.regions.contains(&crate::DamagedRegion::Scroll {
+            top: 0,
+            bottom: GRID_ROWS as u16 - 1,
+            lines: 3,
+        }),
+        "scroll-up must emit a copy motion, got {:?}",
+        damage.regions
+    );
+    assert!(
+        !damage.regions.iter().any(|r| matches!(
+            r,
+            crate::DamagedRegion::Grid(rect)
+            if rect.top == 0 && rect.bottom == GRID_ROWS as u16 - 1
+        )),
+        "scroll-up must not emit a full-region rectangle, got {:?}",
+        damage.regions
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn scroll_down_emits_negative_copy_motion() {
+    let mut s = State::new();
+    let damage = s.apply(&TerminalAction::ScrollDown { n: Count(2) });
+    assert!(
+        damage.regions.contains(&crate::DamagedRegion::Scroll {
+            top: 0,
+            bottom: GRID_ROWS as u16 - 1,
+            lines: -2,
+        }),
+        "scroll-down must emit a negative copy motion, got {:?}",
+        damage.regions
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn scroll_up_still_captures_scrollback_alongside_motion() {
+    // The copy motion must not displace the scrollback history ranges.
+    let mut s = State::new();
+    prints(&mut s, "line one");
+    let damage = s.apply(&TerminalAction::ScrollUp { n: Count(1) });
+    assert_eq!(s.scrollback_len(), 1);
+    assert!(
+        damage
+            .regions
+            .iter()
+            .any(|r| matches!(r, crate::DamagedRegion::Scrollback { .. })),
+        "scrollback capture must ride along, got {:?}",
+        damage.regions
+    );
+    assert!(
+        damage
+            .regions
+            .iter()
+            .any(|r| matches!(r, crate::DamagedRegion::Scroll { lines: 1, .. })),
+        "copy motion must ride along, got {:?}",
+        damage.regions
+    );
+}
+
+#[test]
+fn insert_and_delete_lines_emit_copy_motions() {
+    // CTX-1207: IL/DL displace a sub-region like a scroll, so they emit
+    // motions anchored at the cursor row instead of region rectangles.
+    let mut s = State::new();
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(5),
+        col: Col(1),
+    });
+    let damage = s.apply(&TerminalAction::InsertLines { n: Count(2) });
+    assert!(
+        damage.regions.contains(&crate::DamagedRegion::Scroll {
+            top: 4,
+            bottom: GRID_ROWS as u16 - 1,
+            lines: -2,
+        }),
+        "insert-lines must emit a downward motion, got {:?}",
+        damage.regions
+    );
+    let damage = s.apply(&TerminalAction::DeleteLines { n: Count(2) });
+    assert!(
+        damage.regions.contains(&crate::DamagedRegion::Scroll {
+            top: 4,
+            bottom: GRID_ROWS as u16 - 1,
+            lines: 2,
+        }),
+        "delete-lines must emit an upward motion, got {:?}",
+        damage.regions
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn configured_scrollback_capacity_bounds_retention() {
     const CAP: usize = 3;
     let mut s = State::with_scrollback_lines(CAP);
@@ -2453,6 +2553,7 @@ fn kitty_tick_advance_damages_only_changed_images() {
                 "damage must stay inside rows 0..1, got {rect:?}"
             ),
             crate::DamagedRegion::Scrollback { .. } => panic!("advance must not scroll"),
+            crate::DamagedRegion::Scroll { .. } => panic!("advance must not scroll"),
         }
     }
     // No change: no damage, no generation bump (frame-on-demand idles).

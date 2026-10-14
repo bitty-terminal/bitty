@@ -99,7 +99,7 @@ use bitty_render::{
         RasterKey,
     },
     gpu::{GpuContext, Surface},
-    grid::{CellMetrics, DrawList, GridRenderer},
+    grid::{CellMetrics, DrawList, GridRenderer, ScrollCopy},
     grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};

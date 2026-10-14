@@ -71,6 +71,22 @@ impl DamageRect {
 pub enum DamagedRegion {
     /// A rectangle of the visible grid.
     Grid(DamageRect),
+    /// Scroll-region line motion (foot `scroll_damage` pattern, CTX-1207).
+    ///
+    /// Rows `[top..=bottom]` moved by `lines`: positive moved content up
+    /// (exposed rows at the bottom), negative moved it down (exposed at
+    /// the top). A consumer copies the retained span and repaints only the
+    /// exposed rows instead of the whole region. `lines == 0` is never
+    /// emitted; `|lines| >= region height` degrades to a [`DamageRect`]
+    /// covering the region because no span survives to copy.
+    Scroll {
+        /// First moved row.
+        top: u16,
+        /// Last moved row.
+        bottom: u16,
+        /// Signed moved line count (positive: content moved up).
+        lines: i32,
+    },
     /// Scrollback lines with ids in `[first_line_id, first_line_id + count)`.
     Scrollback {
         /// First affected line id.
@@ -102,16 +118,23 @@ impl Damage {
     }
 }
 
-/// Deterministic coalescing pass over accumulated primitives plus
-/// scrollback events.
+/// Deterministic coalescing pass over accumulated primitives, scroll-region
+/// motions, plus scrollback events.
 ///
-/// Sorts, merges grid rectangles at a fixed point, applies the region cap,
-/// then merges contiguous scrollback id ranges. Output ordering is part of
-/// the replay contract: identical action sequences produce byte-identical
-/// `regions` vectors.
+/// Sorts, merges grid rectangles at a fixed point, merges same-region
+/// scroll motions by summing their line counts (foot `term_damage_scroll`
+/// pattern), applies the region cap, then merges contiguous scrollback id
+/// ranges. A merged motion whose net count reaches the region height
+/// degrades to a full-region grid rectangle (nothing survives to copy);
+/// a motion that sums to zero also degrades (opposite motions do not
+/// restore displaced rows, so dropping them would under-damage).
+/// Output ordering is part of the replay contract: identical action
+/// sequences produce byte-identical `regions` vectors (grid rectangles,
+/// then scroll motions in `(top, bottom)` order, then scrollback ranges).
 pub(crate) fn coalesce(
     rects: Vec<DamageRect>,
     mut scroll_events: Vec<(u64, u64)>,
+    mut scroll_moves: Vec<(u16, u16, i32)>,
     grid_rows: u16,
     grid_cols: u16,
 ) -> Vec<DamagedRegion> {
@@ -152,11 +175,51 @@ pub(crate) fn coalesce(
             }
         }
     }
-    let mut regions: Vec<DamagedRegion> = if rects.len() > DAMAGE_MAX_REGIONS_PER_BATCH {
+    // A merged motion that reaches the region height (or sums to zero)
+    // cannot copy: it becomes a full-region grid rectangle instead. On a
+    // rect-cap fallback the full grid already covers every motion, so the
+    // moves are dropped while scrollback history still rides along.
+    // (`rects_over_cap` still holds: the merge above only shrinks the
+    // vector, and it is skipped entirely past the cap.)
+    let mut regions: Vec<DamagedRegion> = if rects_over_cap {
         vec![DamagedRegion::Grid(DamageRect::full(grid_rows, grid_cols))]
     } else {
         rects.into_iter().map(DamagedRegion::Grid).collect()
     };
+    // Scroll-region motions merge like foot's scroll damage: same region
+    // accumulates line counts; anything at/over the region height (or a
+    // zero net motion) becomes a full-region grid rectangle instead.
+    scroll_moves.retain(|&(_, _, lines)| lines != 0);
+    if !rects_over_cap && !scroll_moves.is_empty() {
+        scroll_moves.sort_unstable();
+        let mut merged_moves: Vec<(u16, u16, i32)> = Vec::with_capacity(scroll_moves.len());
+        for (top, bottom, lines) in scroll_moves {
+            // Order corners defensively: covering the swapped span is safe
+            // over-damage and keeps the height math free of underflow.
+            let (top, bottom) = (top.min(bottom), top.max(bottom));
+            match merged_moves.last_mut() {
+                Some(last) if last.0 == top && last.1 == bottom => {
+                    last.2 = last.2.saturating_add(lines);
+                }
+                _ => merged_moves.push((top, bottom, lines)),
+            }
+        }
+        let last_col = grid_cols.saturating_sub(1);
+        for (top, bottom, lines) in merged_moves {
+            let height = u32::from(bottom) - u32::from(top) + 1;
+            let moved = lines.unsigned_abs();
+            if moved == 0 || moved >= height {
+                regions.push(DamagedRegion::Grid(DamageRect {
+                    top,
+                    left: 0,
+                    bottom,
+                    right: last_col,
+                }));
+            } else {
+                regions.push(DamagedRegion::Scroll { top, bottom, lines });
+            }
+        }
+    }
     scroll_events.retain(|&(_, count)| count > 0);
     if !scroll_events.is_empty() {
         scroll_events.sort_unstable();
@@ -196,6 +259,7 @@ mod tests {
         let out = coalesce(
             vec![rect(0, 0, 0, 0), rect(0, 1, 0, 1), rect(0, 2, 0, 2)],
             vec![],
+            vec![],
             24,
             80,
         );
@@ -204,7 +268,13 @@ mod tests {
 
     #[test]
     fn disjoint_marks_stay_separate_in_sorted_order() {
-        let out = coalesce(vec![rect(5, 10, 5, 12), rect(0, 0, 0, 3)], vec![], 24, 80);
+        let out = coalesce(
+            vec![rect(5, 10, 5, 12), rect(0, 0, 0, 3)],
+            vec![],
+            vec![],
+            24,
+            80,
+        );
         assert_eq!(
             out,
             vec![
@@ -216,13 +286,19 @@ mod tests {
 
     #[test]
     fn touching_rows_merge() {
-        let out = coalesce(vec![rect(0, 0, 0, 79), rect(1, 0, 1, 79)], vec![], 24, 80);
+        let out = coalesce(
+            vec![rect(0, 0, 0, 79), rect(1, 0, 1, 79)],
+            vec![],
+            vec![],
+            24,
+            80,
+        );
         assert_eq!(out, vec![DamagedRegion::Grid(rect(0, 0, 1, 79))]);
     }
 
     #[test]
     fn scroll_ranges_coalesce_when_contiguous() {
-        let out = coalesce(vec![], vec![(0, 2), (4, 1), (2, 2)], 24, 80);
+        let out = coalesce(vec![], vec![(0, 2), (4, 1), (2, 2)], vec![], 24, 80);
         // (0..2) + (2..4) are contiguous and merge; (4..5) chains onto them.
         assert_eq!(
             out,
@@ -238,7 +314,7 @@ mod tests {
         // Even rows only: no two rectangles touch, so none merge and the
         // region cap forces the coarse full-grid fallback.
         let many: Vec<DamageRect> = (0..600u16).step_by(2).map(|r| rect(r, 0, r, 79)).collect();
-        let out = coalesce(many, vec![], 24, 80);
+        let out = coalesce(many, vec![], vec![], 24, 80);
         assert_eq!(out, vec![DamagedRegion::Grid(DamageRect::full(24, 80))]);
     }
 
@@ -248,7 +324,7 @@ mod tests {
         // region, but the batch cap must force the coarse fallback BEFORE
         // any quadratic merge work so hostile rect floods stay bounded.
         let many = vec![rect(0, 0, 0, 0); DAMAGE_MAX_REGIONS_PER_BATCH + 1];
-        let out = coalesce(many, vec![], 24, 80);
+        let out = coalesce(many, vec![], vec![], 24, 80);
         assert_eq!(out, vec![DamagedRegion::Grid(DamageRect::full(24, 80))]);
     }
 
@@ -264,7 +340,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let out = coalesce(many, vec![(4, 2), (7, 1)], 24, 80);
+        let out = coalesce(many, vec![(4, 2), (7, 1)], vec![], 24, 80);
         assert_eq!(
             out,
             vec![
@@ -282,6 +358,131 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "rect flood must degrade without quadratic merge"
+        );
+    }
+
+    #[test]
+    fn single_scroll_up_emits_copy_not_full_region() {
+        // One scroll-up of 1 over 0..=23 must NOT become a full-region
+        // grid rectangle: the consumer copies rows and repaints one row.
+        let out = coalesce(vec![], vec![], vec![(0, 23, 1)], 24, 80);
+        assert_eq!(
+            out,
+            vec![DamagedRegion::Scroll {
+                top: 0,
+                bottom: 23,
+                lines: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn same_region_motions_sum_foot_pattern() {
+        // Three scroll-ups of 1 in one batch (e.g. three linefeeds) merge
+        // into one copy of 3, mirroring foot's term_damage_scroll.
+        let out = coalesce(
+            vec![],
+            vec![],
+            vec![(0, 23, 1), (0, 23, 1), (0, 23, 1)],
+            24,
+            80,
+        );
+        assert_eq!(
+            out,
+            vec![DamagedRegion::Scroll {
+                top: 0,
+                bottom: 23,
+                lines: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn cancelling_motions_degrade_to_region_rect() {
+        // Up 1 then down 1 does not restore rows (the down-scroll blanks
+        // the top), so a zero net motion must over-damage the region
+        // rather than vanish.
+        let out = coalesce(vec![], vec![], vec![(0, 23, 1), (0, 23, -1)], 24, 80);
+        assert_eq!(out, vec![DamagedRegion::Grid(rect(0, 0, 23, 79))]);
+    }
+
+    #[test]
+    fn full_height_motion_degrades_to_region_rect() {
+        // Scrolling the whole region out leaves nothing to copy.
+        let out = coalesce(vec![], vec![], vec![(0, 23, 24)], 24, 80);
+        assert_eq!(out, vec![DamagedRegion::Grid(rect(0, 0, 23, 79))]);
+        // Reverse direction degrades the same way.
+        let out = coalesce(vec![], vec![], vec![(5, 9, -5)], 24, 80);
+        assert_eq!(out, vec![DamagedRegion::Grid(rect(5, 0, 9, 79))]);
+    }
+
+    #[test]
+    fn zero_line_motions_are_dropped() {
+        let out = coalesce(vec![], vec![], vec![(0, 23, 0)], 24, 80);
+        assert!(out.is_empty(), "zero motion must emit nothing, got {out:?}");
+    }
+
+    #[test]
+    fn scroll_regions_order_after_grids_before_scrollback() {
+        let out = coalesce(
+            vec![rect(0, 0, 0, 3)],
+            vec![(7, 1)],
+            vec![(2, 9, -2)],
+            24,
+            80,
+        );
+        assert_eq!(
+            out,
+            vec![
+                DamagedRegion::Grid(rect(0, 0, 0, 3)),
+                DamagedRegion::Scroll {
+                    top: 2,
+                    bottom: 9,
+                    lines: -2
+                },
+                DamagedRegion::Scrollback {
+                    first_line_id: 7,
+                    count: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn disjoint_scroll_regions_stay_separate() {
+        let out = coalesce(vec![], vec![], vec![(0, 5, 1), (10, 23, 2)], 24, 80);
+        assert_eq!(
+            out,
+            vec![
+                DamagedRegion::Scroll {
+                    top: 0,
+                    bottom: 5,
+                    lines: 1
+                },
+                DamagedRegion::Scroll {
+                    top: 10,
+                    bottom: 23,
+                    lines: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cap_fallback_drops_motions_keeps_scrollback() {
+        // The coarse full-grid rectangle subsumes every copy hint, while
+        // scrollback history still rides along like the rect flood case.
+        let many: Vec<DamageRect> = (0..600u16).step_by(2).map(|r| rect(r, 0, r, 79)).collect();
+        let out = coalesce(many, vec![(4, 2)], vec![(0, 23, 1)], 24, 80);
+        assert_eq!(
+            out,
+            vec![
+                DamagedRegion::Grid(DamageRect::full(24, 80)),
+                DamagedRegion::Scrollback {
+                    first_line_id: 4,
+                    count: 2
+                },
+            ]
         );
     }
 }

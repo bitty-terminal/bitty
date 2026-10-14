@@ -1144,13 +1144,57 @@ pub fn selection_fill_rects_in(
 /// Construction is infallible: conversion uses saturating `u64`/`i64`
 /// intermediates, and out-of-range regions are later clipped by the planner
 /// rather than rejected (over-damage is safe). Scrollback regions
-/// contribute nothing on this surface (see module docs).
+/// contribute nothing on this surface (see module docs). Scroll motions
+/// contribute their exposed rows to the paint set (paint-only-exposed) and
+/// record the retained span in [`SnapshotDamage::scroll_copies`] for the
+/// region-copy step (CTX-1207).
 #[derive(Debug, Clone)]
 pub struct SnapshotDamage {
     extent: ExtentPx,
     pixel_regions: Vec<RectPx>,
     grid_regions: Vec<DamageRect>,
+    scroll_copies: Vec<ScrollCopy>,
     full_hint: bool,
+}
+
+/// Grid-domain scroll-region copy descriptor (CTX-1207 region-copy).
+///
+/// Rows `[top..=bottom]` moved by `lines` (positive: content moved up).
+/// A consumer shifts the retained primitives for the surviving span and
+/// repaints only the [`ScrollCopy::exposed_rows`] band: shifting
+/// primitives (not pixels) keeps glyph overhang byte-exact, because each
+/// glyph carries its geometry across the move instead of leaving clipped
+/// edge pixels behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollCopy {
+    /// First moved row.
+    pub top: u16,
+    /// Last moved row.
+    pub bottom: u16,
+    /// Signed moved line count (positive: content moved up).
+    pub lines: i32,
+}
+
+impl ScrollCopy {
+    /// Inclusive exposed row band that must repaint (`(top, bottom)`).
+    ///
+    /// Infallible: zero motion or a motion reaching the region height
+    /// degrades to the full region (safe over-damage for hand-built
+    /// damage; state-produced motions never hit either case).
+    #[must_use]
+    pub fn exposed_rows(&self) -> (u16, u16) {
+        let (top, bottom) = (self.top.min(self.bottom), self.top.max(self.bottom));
+        let height = u32::from(bottom) - u32::from(top) + 1;
+        let moved = self.lines.unsigned_abs();
+        if moved == 0 || moved >= height {
+            return (top, bottom);
+        }
+        if self.lines > 0 {
+            (bottom - moved as u16 + 1, bottom)
+        } else {
+            (top, top + moved as u16 - 1)
+        }
+    }
 }
 
 impl SnapshotDamage {
@@ -1158,30 +1202,61 @@ impl SnapshotDamage {
     #[must_use]
     pub fn new(snapshot: &Snapshot, damage: &Damage, cell: CellMetrics) -> Self {
         let extent = cell.extent_for(snapshot.width, snapshot.height);
+        let right = snapshot.width.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
         let mut grid_regions = Vec::new();
         let mut pixel_regions = Vec::new();
+        let mut scroll_copies = Vec::new();
         for region in &damage.regions {
-            let DamageRect {
-                top,
-                left,
-                bottom,
-                right,
-            } = match region {
-                DamagedRegion::Grid(rect) => ordered(*rect),
+            match region {
+                DamagedRegion::Grid(rect) => {
+                    let ordered = ordered(*rect);
+                    let DamageRect {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    } = ordered;
+                    grid_regions.push(DamageRect {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    });
+                    pixel_regions.push(grid_rect_to_px(top, left, bottom, right, cell));
+                }
+                DamagedRegion::Scroll { top, bottom, lines } => {
+                    // Paint-only-exposed: only the exposed band enters the
+                    // paint set; the retained span is recorded for the
+                    // region-copy step.
+                    let copy = ScrollCopy {
+                        top: *top,
+                        bottom: *bottom,
+                        lines: *lines,
+                    };
+                    let (exposed_top, exposed_bottom) = copy.exposed_rows();
+                    grid_regions.push(DamageRect {
+                        top: exposed_top,
+                        left: 0,
+                        bottom: exposed_bottom,
+                        right,
+                    });
+                    pixel_regions.push(grid_rect_to_px(
+                        exposed_top,
+                        0,
+                        exposed_bottom,
+                        right,
+                        cell,
+                    ));
+                    scroll_copies.push(copy);
+                }
                 DamagedRegion::Scrollback { .. } => continue,
-            };
-            grid_regions.push(DamageRect {
-                top,
-                left,
-                bottom,
-                right,
-            });
-            pixel_regions.push(grid_rect_to_px(top, left, bottom, right, cell));
+            }
         }
         Self {
             extent,
             pixel_regions,
             grid_regions,
+            scroll_copies,
             full_hint: false,
         }
     }
@@ -1195,10 +1270,19 @@ impl SnapshotDamage {
     }
 
     /// The grid-coordinate regions behind this descriptor (same order;
-    /// scrollback entries dropped).
+    /// scrollback entries dropped; scroll motions represented by their
+    /// exposed repaint band).
     #[must_use]
     pub fn grid_regions(&self) -> &[DamageRect] {
         &self.grid_regions
+    }
+
+    /// Grid-domain scroll-region copies behind this descriptor, in damage
+    /// order. A retained-pixel consumer copies each span, then repaints
+    /// the exposed band from the frame planned off this descriptor.
+    #[must_use]
+    pub fn scroll_copies(&self) -> &[ScrollCopy] {
+        &self.scroll_copies
     }
 }
 

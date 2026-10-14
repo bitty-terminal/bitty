@@ -310,6 +310,106 @@ fn descriptor_drops_scrollback_and_converts_grid_rects() {
 }
 
 #[test]
+fn scroll_motion_paints_only_exposed_rows() {
+    // CTX-1207 paint-only-exposed: a scroll-up of 1 over 24 rows paints
+    // one row, and the copy descriptor records the retained span.
+    let state = state_from(&[print('A')]);
+    let damage = Damage {
+        generation: state.generation(),
+        regions: Box::new([DamagedRegion::Scroll {
+            top: 0,
+            bottom: 23,
+            lines: 1,
+        }]),
+    };
+    let desc = super::SnapshotDamage::new(&state.snapshot(), &damage, cell_metrics());
+    assert_eq!(desc.grid_regions().len(), 1);
+    assert_eq!(
+        desc.grid_regions()[0],
+        DamageRect {
+            top: 23,
+            left: 0,
+            bottom: 23,
+            right: 79
+        }
+    );
+    assert_eq!(desc.damaged_regions().len(), 1);
+    assert_eq!(
+        (desc.damaged_regions()[0].x, desc.damaged_regions()[0].y),
+        (0, 23 * 16)
+    );
+    assert_eq!(
+        (
+            desc.damaged_regions()[0].width,
+            desc.damaged_regions()[0].height
+        ),
+        (640, 16)
+    );
+    assert_eq!(
+        desc.scroll_copies(),
+        [super::ScrollCopy {
+            top: 0,
+            bottom: 23,
+            lines: 1
+        }]
+    );
+    // Reverse motion exposes the top band instead.
+    let damage = Damage {
+        generation: state.generation(),
+        regions: Box::new([DamagedRegion::Scroll {
+            top: 2,
+            bottom: 9,
+            lines: -2,
+        }]),
+    };
+    let desc = super::SnapshotDamage::new(&state.snapshot(), &damage, cell_metrics());
+    assert_eq!(
+        desc.grid_regions()[0],
+        DamageRect {
+            top: 2,
+            left: 0,
+            bottom: 3,
+            right: 79
+        }
+    );
+    let copy = desc.scroll_copies()[0];
+    assert_eq!((copy.top, copy.bottom, copy.lines), (2, 9, -2));
+    assert_eq!(copy.exposed_rows(), (2, 3));
+}
+
+#[test]
+fn scroll_render_visits_only_exposed_cells() {
+    // The frame planner and placement pass must scale with the exposed
+    // band, not the scrolled region: 80 cells, not 1920.
+    let state = state_from(&[print('A')]);
+    let damage = Damage {
+        generation: state.generation(),
+        regions: Box::new([DamagedRegion::Scroll {
+            top: 0,
+            bottom: 23,
+            lines: 1,
+        }]),
+    };
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    assert_eq!(list.plan.mode, FrameMode::Partial);
+    assert_eq!(list.plan.dirty_rects.len(), 1);
+    assert_eq!(grid.counters().cells_examined, 80);
+}
+
+#[test]
+fn scroll_copy_degrades_without_a_surviving_span() {
+    // A motion reaching the region height has no copy (whole region
+    // repaints); the exposed band degrades to the full region.
+    let copy = super::ScrollCopy {
+        top: 0,
+        bottom: 23,
+        lines: 24,
+    };
+    assert_eq!(copy.exposed_rows(), (0, 23));
+}
+
+#[test]
 fn a_reversed_damage_rect_is_ordered_instead_of_panicking() {
     // CORE-ENG-022: `right - left + 1` underflowed for an embedder-built
     // rectangle whose corners were swapped.

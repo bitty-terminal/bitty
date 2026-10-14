@@ -217,7 +217,7 @@ pub use glyph::{
 };
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
-    ImageBlit, RenderCounters, RoundedClip, RoundedFill, SnapshotDamage, ThemePalette,
+    ImageBlit, RenderCounters, RoundedClip, RoundedFill, ScrollCopy, SnapshotDamage, ThemePalette,
     curly_amplitude_px, curly_segment_offset_px, curly_sine_offset, curly_step_px,
     curly_wavelength_px, dashed_params_px, dotted_params_px, double_gap_px, pattern_thickness,
 };

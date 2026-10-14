@@ -318,6 +318,12 @@ pub fn damage_bytes(damage: &Damage) -> Vec<u8> {
                 out.extend_from_slice(&first_line_id.to_le_bytes());
                 out.extend_from_slice(&count.to_le_bytes());
             }
+            DamagedRegion::Scroll { top, bottom, lines } => {
+                out.push(3);
+                out.extend_from_slice(&top.to_le_bytes());
+                out.extend_from_slice(&bottom.to_le_bytes());
+                out.extend_from_slice(&lines.to_le_bytes());
+            }
         }
     }
     out

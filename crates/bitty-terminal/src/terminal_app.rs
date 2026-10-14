@@ -1062,6 +1062,9 @@ impl TerminalApp {
     /// Returns the exact `bitty tick: ...` line `drive_tick` emits when
     /// [`Self::tick_logging_enabled`] is true. Pure over its inputs so
     /// level-gating tests assert content without capturing stderr.
+    /// `uptime_ms` is milliseconds since process start (CTX-1216): headed
+    /// idle runs attribute every present to wall time, so a zero-submit
+    /// claim is checkable per window instead of per run.
     pub(crate) fn format_tick_line(
         present: &bitty_runtime::PresentStats,
         presented_frames: u64,
@@ -1069,9 +1072,11 @@ impl TerminalApp {
         leafs: usize,
         gpu: bool,
         crossfont: bool,
+        uptime_ms: u64,
     ) -> String {
         format!(
-            "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={} images={} images_skipped={}",
+            "bitty tick: t_ms={} frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={} images={} images_skipped={}",
+            uptime_ms,
             present.frame,
             present.fills,
             present.glyphs,
@@ -1085,6 +1090,22 @@ impl TerminalApp {
             present.images,
             present.images_skipped
         )
+    }
+
+    /// Milliseconds since process start for debug tick lines (CTX-1216).
+    ///
+    /// A function-local static keeps [`Self::format_tick_line`] pure and
+    /// every constructor untouched: the clock starts on the first present
+    /// of the process, which is all a headed idle attribution needs.
+    fn tick_uptime_ms() -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     /// Returns the tick line when logging is enabled, else `None` (CTX-0190).
@@ -1105,6 +1126,7 @@ impl TerminalApp {
             self.runtime.leaf_count(),
             self.runtime.has_gpu(),
             self.runtime.is_crossfont(),
+            Self::tick_uptime_ms(),
         ))
     }
 

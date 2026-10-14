@@ -106,6 +106,26 @@ pub const AUDIO_INTERFACE_VERSION: &str = "1.0.0";
 /// Default spectrum bucket count when Lua passes no `buckets`.
 pub const DEFAULT_SPECTRUM_BUCKETS: usize = 8;
 
+/// Deadline per `pactl` spawn in milliseconds.
+///
+/// `pactl` is a fast local query (normally single-digit milliseconds), so a
+/// hung daemon past this bound is a dead monitor: the spawn is killed and
+/// reaped, and the timeout maps to `MonitorUnavailable` so the gates serve
+/// stale inside the hide grace, then hide. Deliberately tighter than the
+/// generic tool-spawn 5 s: a state read performs up to three spawns, and the
+/// bar tick must degrade to hide rather than stall behind a wedged daemon.
+pub const AUDIO_SPAWN_TIMEOUT_MS: u64 = 1_000;
+
+/// Poll interval while waiting for a spawned monitor to exit.
+const AUDIO_SPAWN_POLL_MS: u64 = 5;
+
+// The hung-monitor deadline is a tight local bound: well under the generic
+// 5 s tool-spawn contract, above a single poll slice.
+const _: () = {
+    assert!(AUDIO_SPAWN_TIMEOUT_MS >= 100 && AUDIO_SPAWN_TIMEOUT_MS <= 2_000);
+    assert!(AUDIO_SPAWN_POLL_MS >= 1 && AUDIO_SPAWN_POLL_MS <= AUDIO_SPAWN_TIMEOUT_MS);
+};
+
 /// Production spawner over one argv vector: returns bounded stdout text.
 ///
 /// Pure function type so tests inject fixtures; [`live_spawn`] is the
@@ -151,15 +171,25 @@ pub fn audio_descriptors() -> Vec<ProvidedService> {
 /// Run one fixed `pactl` argv and return bounded stdout text.
 ///
 /// Discipline: [`check_argv`] first (fixed program, no metacharacters,
-/// byte cap), [`std::process::Command`] with an argv array (no shell),
-/// output capped at [`MONITOR_OUTPUT_MAX_BYTES`]. Missing binary, spawn
-/// failure, and non-zero exit all map to `MonitorUnavailable` (retryable;
-/// the gates stale-then-hide). Non-UTF8 stdout maps to `Invalid`.
+/// byte cap), [`std::process::Command`] with an argv array (no shell,
+/// piped stdout, null stdin/stderr), execution bounded by
+/// [`AUDIO_SPAWN_TIMEOUT_MS`] via `spawn` + `try_wait` polling (a hung
+/// monitor is killed and reaped, never waited on forever), output capped
+/// at [`MONITOR_OUTPUT_MAX_BYTES`]. Missing binary, spawn failure, timeout,
+/// and non-zero exit all map to `MonitorUnavailable` (retryable; the gates
+/// stale-then-hide). Non-UTF8 stdout maps to `Invalid`.
 pub fn live_spawn(argv: &[String]) -> Result<String, AudioError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     check_argv(argv)?;
-    let output = std::process::Command::new(&argv[0])
+    let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| {
             use std::io::ErrorKind as Io;
             match error.kind() {
@@ -172,19 +202,52 @@ pub fn live_spawn(argv: &[String]) -> Result<String, AudioError> {
                 )),
             }
         })?;
-    if !output.status.success() {
+    let deadline = Duration::from_millis(AUDIO_SPAWN_TIMEOUT_MS);
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|error| {
+            AudioError::unavailable(format!(
+                "audio monitor wait failed (fail-closed): {}",
+                truncate_io_error(&error.to_string())
+            ))
+        })? {
+            Some(status) => break status,
+            None => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AudioError::unavailable(format!(
+                        "pactl hung past {AUDIO_SPAWN_TIMEOUT_MS} ms (killed, fail-closed, retryable)"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(AUDIO_SPAWN_POLL_MS));
+            }
+        }
+    };
+    if !status.success() {
         return Err(AudioError::unavailable(format!(
             "pactl exited {} (fail-closed, retryable)",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )));
     }
-    if output.stdout.len() > MONITOR_OUTPUT_MAX_BYTES {
+    let mut stdout = Vec::new();
+    if let Some(piped) = child.stdout.take() {
+        piped
+            .take(
+                u64::try_from(MONITOR_OUTPUT_MAX_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut stdout)
+            .map_err(|_| AudioError::invalid("monitor output unreadable (rejected)"))?;
+    }
+    if stdout.len() > MONITOR_OUTPUT_MAX_BYTES {
         return Err(AudioError::budget(format!(
             "monitor output {} bytes exceeds {MONITOR_OUTPUT_MAX_BYTES} (rejected)",
-            output.stdout.len()
+            stdout.len()
         )));
     }
-    String::from_utf8(output.stdout)
+    String::from_utf8(stdout)
         .map_err(|_| AudioError::invalid("monitor output is not UTF-8 (rejected)"))
 }
 
@@ -351,14 +414,20 @@ pub fn parse_set_volume_args(args: &LuaValue) -> Result<VolumeTarget, BridgeErro
     }
 }
 
+/// Bridge error for a malformed `set_volume` argument (fail-closed, never clamped).
 fn volume_invalid(message: impl Into<String>) -> BridgeError {
     BridgeError::new("validation", "E_SERVICE_INVALID", message)
 }
 
+/// Bridge error for an unavailable audio service (indistinguishable from a parked provider).
 fn service_gone(message: impl Into<String>) -> BridgeError {
     BridgeError::new("runtime", "E_SERVICE_GONE", message)
 }
 
+/// Map a contract [`AudioError`] onto the broker-indistinguishable bridge code.
+///
+/// Bounds/parse failures surface as `E_SERVICE_INVALID`; absent, lost, or
+/// hidden monitors surface as `E_SERVICE_GONE` (like a parked provider).
 fn audio_error_to_gone(error: AudioError) -> BridgeError {
     match error.kind() {
         AudioErrorKind::Budget | AudioErrorKind::Invalid => BridgeError::new(
@@ -372,6 +441,7 @@ fn audio_error_to_gone(error: AudioError) -> BridgeError {
     }
 }
 
+/// Bound one OS error string for a fail-closed diagnostic (single line, 120 chars).
 fn truncate_io_error(message: &str) -> String {
     let out: String = message.chars().take(120).collect();
     out.replace(['\n', '\r'], " ")
@@ -674,6 +744,24 @@ mod tests {
     fn live_sample_spectrum_hides_without_io() {
         let error = live_sample_spectrum().expect_err("no pactl source hides");
         assert_eq!(error.kind(), AudioErrorKind::MonitorUnavailable);
+    }
+
+    #[test]
+    fn live_spawn_discipline_rejects_before_io() {
+        // Hostile argv never reaches the OS: the discipline rejects first.
+        assert!(live_spawn(&[]).is_err());
+        assert!(
+            live_spawn(&["sh".to_string(), "-c".to_string(), "pactl list".to_string()]).is_err()
+        );
+        assert!(
+            live_spawn(&[
+                "pactl".to_string(),
+                "set-sink-volume".to_string(),
+                "@DEFAULT_SINK@".to_string(),
+                "$(evil)".to_string()
+            ])
+            .is_err()
+        );
     }
 
     #[test]

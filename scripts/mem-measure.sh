@@ -12,7 +12,20 @@
 #
 # Evidence stays local and uncommitted under --out-dir (default
 # recording/mem, gitignored): status.txt, pss.txt, uss.txt, pmap.txt,
-# topmappings.txt, smaps.txt, shot.png, summary.txt.
+# topmappings.txt, smaps.txt, shot.png, driver.txt, summary.txt.
+#
+# Comparability contract (CTX-1216, issue #2087): headed RSS mixes
+# bitty-owned memory with NVIDIA/Vulkan driver-resident pages that bitty
+# cannot control. A driver upgrade alone (615.71.09 -> 615.78.08) moves
+# ~+35 MB of driver-resident RSS for the same binary, and the driver's
+# post-device faulting is nondeterministic run to run (~50 MB spread for
+# identical launches), so two runs compare ONLY when the driver version
+# (driver.txt) and the settle seconds match. summary.txt therefore splits
+# pmap RSS into DRIVER_RSS_KB (named NVIDIA/Vulkan/GL/VkLayer mappings), ANON_RSS_KB
+# (all anonymous mappings: heap plus driver arenas, inseparable by name),
+# and OWNED_OTHER_KB (binary, libc, fonts — the bitty-linked set); a
+# genuine bitty regression moves OWNED_OTHER_KB or the heap slice of
+# ANON_RSS_KB, never the driver line.
 #
 # Interim gate: idle single-panel main-process RSS at or below 250 MB
 # (ghostty parity, ~40% cut from the ~421 MB baseline) toward the 150 MB
@@ -68,7 +81,7 @@ while [ $# -gt 0 ]; do
     shift
     ;;
   --help | -h)
-    sed -n '2,24p' "$0"
+    sed -n '2,41p' "$0"
     echo "  --binary PATH   explicit bitty binary (default: target/release/bitty)"
     echo "  --build         cargo build -p bitty-terminal --release first"
     echo "  --workspace ID  Hyprland workspace 1..10 (default 5)"
@@ -269,6 +282,17 @@ awk '/^Private_Clean:/{c+=$2} /^Private_Dirty:/{d+=$2} END{print "USS_kB="c+d}' 
 pmap -x "$TARGET_PID" >"$RUN_DIR/pmap.txt" 2>&1 || true
 sort -k3 -n -r "$RUN_DIR/pmap.txt" 2>/dev/null | head -n 25 | tee "$RUN_DIR/topmappings.txt" || true
 cp "/proc/$TARGET_PID/smaps" "$RUN_DIR/smaps.txt"
+# CTX-1216: record the GPU driver version with the sample. Driver-resident
+# pages dominate headed RSS and move under bitty's feet across upgrades, so
+# a sample without its driver version cannot bisect a regression.
+DRIVER_VERSION="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+if [ -z "$DRIVER_VERSION" ]; then
+  DRIVER_VERSION="$(awk '/NVRM version:/{print $4}' /proc/driver/nvidia/version 2>/dev/null || true)"
+fi
+if [ -z "$DRIVER_VERSION" ]; then
+  DRIVER_VERSION="unknown"
+fi
+printf '%s\n' "$DRIVER_VERSION" | tee "$RUN_DIR/driver.txt"
 # Evidence must show the measured window: the launch used a silent workspace,
 # so a bare grim would capture whatever workspace the operator sits on.
 # Focus the measure workspace for the shot, then hand focus back (the EXIT
@@ -281,6 +305,17 @@ RSS_KB="$(awk '/VmRSS:/{print $2}' "$RUN_DIR/status.txt")"
 VSZ_KB="$(awk '/VmSize:/{print $2}' "$RUN_DIR/status.txt")"
 PSS_KB="$(awk -F= '/PSS_kB/{print $2}' "$RUN_DIR/pss.txt")"
 USS_KB="$(awk -F= '/USS_kB/{print $2}' "$RUN_DIR/uss.txt")"
+# CTX-1216 three-way pmap split (columns: Address Kbytes RSS Dirty Mode
+# Mapping; the total line carries no mapping and never matches either
+# class). DRIVER_RSS_KB is NVIDIA/Vulkan/GL-resident pages bitty cannot
+# control; ANON_RSS_KB is every anonymous mapping (heap plus driver arenas,
+# inseparable by name); OWNED_OTHER_KB is the named bitty-linked set
+# (binary, libc, fonts) where a genuine regression must appear.
+PMAP_RSS_KB="$(awk '$1 == "total" {print $4}' "$RUN_DIR/pmap.txt")"
+PMAP_RSS_KB="${PMAP_RSS_KB:-0}"
+DRIVER_RSS_KB="$(awk '$6 ~ /nvidia|libvulkan|libGL|libEGL|libOpenGL|libglvnd|glvkspirv|VkLayer/ {d+=$3} END{print d+0}' "$RUN_DIR/pmap.txt")"
+ANON_RSS_KB="$(awk '/\[ anon \]/ {a+=$3} END{print a+0}' "$RUN_DIR/pmap.txt")"
+OWNED_OTHER_KB="$((PMAP_RSS_KB - DRIVER_RSS_KB - ANON_RSS_KB))"
 # Interim gate: 250 MB RSS (toward the 150 MB budget).
 if [ "$RSS_KB" -le 256000 ]; then
   GATE="PASS"
@@ -289,10 +324,17 @@ else
 fi
 {
   echo "BIN=$BIN"
+  echo "DRIVER=$DRIVER_VERSION"
+  echo "SETTLE_SECS=$SETTLE_SECS"
   echo "RSS_KB=$RSS_KB"
   echo "VSZ_KB=$VSZ_KB"
   echo "PSS_KB=$PSS_KB"
   echo "USS_KB=$USS_KB"
+  echo "PMAP_RSS_KB=$PMAP_RSS_KB"
+  echo "DRIVER_RSS_KB=$DRIVER_RSS_KB"
+  echo "ANON_RSS_KB=$ANON_RSS_KB"
+  echo "OWNED_OTHER_KB=$OWNED_OTHER_KB"
+  echo "COMPARE=only same DRIVER plus same SETTLE_SECS runs compare (see header)"
   echo "GATE=$GATE (interim: RSS <= 250MB toward 150MB budget)"
 } | tee "$RUN_DIR/summary.txt"
 

@@ -49,6 +49,13 @@ expect_stdout "mem-measure: plan" "$SESSION" --dry-run --binary /bin/true
 expect_stdout "workspace=5" "$SESSION" --dry-run --binary /bin/true
 expect_exit 0 "$SESSION" --dry-run --binary /bin/true --font-size 12.5
 
+# CTX-1216 (issue #2087): the comparability contract stays documented —
+# same-driver plus same-settle comparisons, with the three-way RSS split.
+expect_stdout "driver" "$SESSION" --help
+expect_stdout "DRIVER_RSS_KB" "$SESSION" --help
+expect_stdout "OWNED_OTHER_KB" "$SESSION" --help
+expect_stdout "driver.txt" "$SESSION" --help
+
 # Refusals: unknown flag, bad workspace, bad settle, bad font size, missing binary.
 expect_exit 2 "$SESSION" --bogus-flag
 expect_exit 2 "$SESSION" --dry-run --binary /bin/true --workspace 11

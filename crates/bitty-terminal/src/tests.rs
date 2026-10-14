@@ -609,8 +609,9 @@ fn tick_line_format_carries_frame_stats() {
         backgrounds: 0,
         images_skipped: 0,
     };
-    let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false);
+    let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false, 1234);
     assert!(line.starts_with("bitty tick:"));
+    assert!(line.contains("t_ms=1234"));
     assert!(line.contains("frame=2"));
     assert!(line.contains("fills=1921"));
     assert!(line.contains("glyphs=21"));

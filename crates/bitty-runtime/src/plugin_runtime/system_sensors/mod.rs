@@ -57,11 +57,13 @@
 pub mod battery;
 pub mod common;
 pub mod cpu;
+pub mod host;
 pub mod memory;
 
 pub use battery::{BatteryProvider, BatterySnapshot, BatteryState, FsPowerSupply, NoUpower};
 pub use common::{FAST_SENSOR_CEILING_MS, SLOW_SENSOR_CEILING_MS, STALE_HIDE_WINDOWS};
 pub use cpu::{CpuProvider, CpuSnapshot};
+pub use host::{SENSOR_GENERATION, SensorHost};
 pub use memory::{MemoryProvider, MemorySnapshot};
 
 use bitty_plugin_host::ProvidedService;

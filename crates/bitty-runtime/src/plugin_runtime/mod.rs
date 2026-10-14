@@ -667,6 +667,14 @@ pub struct PluginRuntime {
     /// empty. Replaceable through [`PluginRuntime::set_store_backend`] so
     /// latency and failure can be injected deterministically (bitty #1518).
     store_backend: Option<Arc<dyn store::KvCommitBackend>>,
+    /// CTX-1199: runtime-owned native sensor host (bitty#2019/#2011/#2016).
+    ///
+    /// One host spans every generation, so the provider-side ceilings stay
+    /// global. Published into the service directory at construction;
+    /// activation wires the handle into each generation. Tests replace the
+    /// contents through [`PluginRuntime::sensor_host`] (fixture sources
+    /// plus a pinned clock) without republishing.
+    sensor_host: Rc<RefCell<system_sensors::host::SensorHost>>,
     /// Test-only wall-clock override for the activation VM in milliseconds.
     ///
     /// `None` by default (production): activation uses
@@ -682,6 +690,9 @@ impl PluginRuntime {
     /// Create an empty runtime.
     #[must_use]
     pub fn new(config: PluginRuntimeConfig) -> Self {
+        let service_directory = Rc::new(RefCell::new(ServiceDirectory::new()));
+        let sensor_host = Rc::new(RefCell::new(system_sensors::host::SensorHost::live()));
+        Self::publish_native_sensors(&service_directory);
         Self {
             safe_mode: config.safe_mode,
             data_dir: config.data_dir,
@@ -698,7 +709,7 @@ impl PluginRuntime {
             event_sequence: 0,
             entries: BTreeMap::new(),
             order: Vec::new(),
-            service_directory: Rc::new(RefCell::new(ServiceDirectory::new())),
+            service_directory,
             service_call_ledger: Rc::new(RefCell::new(ServiceCallLedger::new(
                 SERVICE_CALL_LEDGER_CAPACITY,
             ))),
@@ -723,7 +734,36 @@ impl PluginRuntime {
             target_lenses: Rc::new(RefCell::new(Vec::new())),
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
             store_backend: None,
+            sensor_host,
             vm_wall_budget_ms: None,
+        }
+    }
+
+    /// Publish the three batch-A native sensor records (CTX-1199).
+    ///
+    /// Runtime-owned (not a plugin activation): provider
+    /// `bitty-terminal.sensors` at [`system_sensors::host::SENSOR_GENERATION`]
+    /// serving `system.cpu`/`system.memory`/`system.battery` `get()` backed
+    /// by the read-only heads. Version, methods, and heads come from the
+    /// descriptors, never from Lua. Suspend/dispose filter by plugin id, so
+    /// native records survive every plugin lifecycle transition.
+    fn publish_native_sensors(directory: &Rc<RefCell<ServiceDirectory>>) {
+        use std::collections::BTreeMap;
+        use std::rc::Weak;
+        for service in system_sensors::sensor_descriptors() {
+            directory.borrow_mut().publish(ServiceRecord {
+                provider: system_sensors::SENSOR_PROVIDER.to_string(),
+                generation: system_sensors::host::SENSOR_GENERATION,
+                iface: service.iface.clone(),
+                version: service.version.clone(),
+                methods: vec!["get".to_string()],
+                funcs: BTreeMap::new(),
+                args_schema: None,
+                result_schema: None,
+                heads: service.heads.clone(),
+                vm: Weak::new(),
+                suspended: false,
+            });
         }
     }
 
@@ -1505,6 +1545,12 @@ impl PluginRuntime {
         // `E_NOT_IMPLEMENTED`.
         plugin_services.set_service_directory(self.service_directory.clone());
         plugin_services.set_service_call_ledger(self.service_call_ledger.clone());
+        // CTX-1199: native sensor host (bitty#2019/#2011/#2016). Shared with
+        // every generation; the broker dispatches
+        // `bitty-terminal.sensors:system.*.get()` host-side. The call-time
+        // grant gate in `service_call` stays as the second layer, so
+        // ungranted consumption stays indistinguishable from absent.
+        plugin_services.set_sensor_host(Some(self.sensor_host.clone()));
         // CTX-1035: command directory wiring for the generic host-mediated
         // invocation path. Without it `commands.list`/`invoke` fail closed
         // with `E_NOT_IMPLEMENTED`.
@@ -2543,6 +2589,16 @@ impl PluginRuntime {
     #[must_use]
     pub fn command_directory(&self) -> &Rc<RefCell<CommandDirectory>> {
         &self.command_directory
+    }
+
+    /// Shared native sensor host (CTX-1199; diagnostics, tests).
+    ///
+    /// Tests replace the contents with fixture sources plus a pinned clock
+    /// without republishing: publication is structural (descriptors only),
+    /// dispatch reads the live host contents.
+    #[must_use]
+    pub fn sensor_host(&self) -> &Rc<RefCell<system_sensors::host::SensorHost>> {
+        &self.sensor_host
     }
 }
 

@@ -676,9 +676,10 @@ fn silent_deadline_for_attempt(
     if remaining_attempts == 0 {
         return None;
     }
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let now = std::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
     let shares = remaining_attempts.saturating_add(1);
-    Some(std::time::Instant::now() + remaining / (shares as u32))
+    Some(now + remaining / (shares as u32))
 }
 
 /// Drains one flood PTY until clean EOF or the shared deadline, asserting

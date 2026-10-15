@@ -904,6 +904,55 @@ pub trait HostServices {
     }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
+    /// Submit bounded text to the focused panel through the paste pipeline
+    /// for `bitty.terminal.submit` (CTX-1239, issue #2101).
+    ///
+    /// Host-mediated and grant-gated: the implementation must serve only the
+    /// calling generation's grant snapshot (`terminal.input.submit`,
+    /// deny-by-default) and return the outcome as a table the composer
+    /// policy switches on (`{status="accepted", bytes=N}`,
+    /// `{status="denied", deny=<code>}`, or
+    /// `{status="unavailable", reason=<code>}`). Mutating, so the bridge
+    /// routes through the pre-commit expiry guard; see
+    /// [`HostServices::terminal_submit_with_expiry`].
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
+    /// host without a submit backend can never gain ambient PTY writes from
+    /// the always-present `bitty.terminal` namespace.
+    fn terminal_submit(&self, text: &str) -> Result<LuaValue, BridgeError> {
+        let _ = text;
+        Err(BridgeError::not_implemented("bitty.terminal.submit"))
+    }
+    /// Expiry-aware [`HostServices::terminal_submit`] for the pre-commit
+    /// timeout path.
+    ///
+    /// Same contract as [`HostServices::store_set_with_expiry`]: check expiry
+    /// before committing and fail-closed with [`BridgeError::timeout`]
+    /// without mutating when expired. The default checks expiry before
+    /// delegating (fail-fast).
+    fn terminal_submit_with_expiry(
+        &self,
+        text: &str,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.terminal_submit(text)
+    }
+    /// Whether this generation observes `bitty.terminal.submit` at all
+    /// (CTX-1239, issue #2101).
+    ///
+    /// Presence probe for the bridge: `true` only when the calling
+    /// generation holds the `terminal.input.submit` grant AND a submit
+    /// backend is wired. Otherwise the bridge leaves the `submit` key
+    /// unset, so ungranted (or unwired) generations observe nil —
+    /// indistinguishable from a host without the surface, which is exactly
+    /// the composer `submit_surface()` nil path (`unavailable:no-submit`).
+    /// The default is `false` (absent): no new ambient authority.
+    fn has_terminal_submit(&self) -> bool {
+        false
+    }
     /// Hand a notification to the platform asynchronously; returns acceptance.
     fn notify_show(&self, payload: &LuaValue) -> Result<bool, BridgeError>;
     /// Expiry-aware `notify_show` for the pre-commit timeout path (CTX-0464).
@@ -3145,6 +3194,46 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("terminal table accepts 'snapshot'");
+    // CTX-1239 (issue #2101): `bitty.terminal.submit` beside `snapshot`
+    // (never a widening of it: read never implies control). Installed only
+    // when the generation probes present (grant plus wired backend, see
+    // `has_terminal_submit`); otherwise the key stays unset so ungranted
+    // generations observe nil, indistinguishable from absent. The argument
+    // is the raw submission text (a string); over-bound, unbudgeted, or
+    // undeliverable text is a host outcome table, never a shape error —
+    // only a non-string argument fails closed here with `E_DEF_INVALID`
+    // before any host call.
+    if state.services.has_terminal_submit() {
+        terminal
+            .set(
+                ctx,
+                "submit",
+                Callback::from_fn(&ctx, {
+                    let state = state.clone();
+                    move |ctx, _exec, mut stack| {
+                        let text = match stack.get(0) {
+                            Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                            _ => {
+                                return Err(BridgeError::new(
+                                    "validation",
+                                    "E_DEF_INVALID",
+                                    "terminal.submit requires a string argument",
+                                )
+                                .to_error(ctx));
+                            }
+                        };
+                        let outcome = state
+                            .bounded_mutation(|expiry| {
+                                state.services.terminal_submit_with_expiry(&text, expiry)
+                            })
+                            .map_err(|e| e.to_error(ctx))?;
+                        stack.replace(ctx, outcome.to_lua(ctx));
+                        Ok(CallbackReturn::Return)
+                    }
+                }),
+            )
+            .expect("terminal table accepts 'submit'");
+    }
 
     let notify = Table::new(&ctx);
     notify

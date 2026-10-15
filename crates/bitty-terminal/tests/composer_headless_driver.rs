@@ -16,16 +16,21 @@
 //! live file and records a drift note when it differs from the pin; CI uses
 //! the vendored pin hermetically.
 //!
-//! Harness versus production bridges: the Rust host currently serves
+//! Harness versus production bridges: the Rust host serves
 //! `bitty.ui.overlay.*` with a flat `{seq,type,text}` event shape while the
-//! plugin expects `{seq,type,data}`, and it does not serve
-//! `bitty.terminal.submit` or `bitty.process.editor.start` at all. The mock
-//! host serves the correct shapes. This driver therefore provides correct
-//! harness bridges in Lua (prelude below, mirroring the mock host semantics)
-//! so the real policy is proven; the same byte-exact framing, allowlist, and
-//! capture semantics are then proven against the real Core operations
+//! plugin expects `{seq,type,data}`. Production `bitty.terminal.submit` is
+//! bridged since CTX-1239 (#2101, grant-gated `terminal.input.submit` with
+//! a deferred PTY drain); `bitty.process.editor.start` is still unbridged.
+//! The mock host serves the correct shapes for both. This driver therefore
+//! keeps its correct harness bridges in Lua (prelude below, mirroring the
+//! mock host semantics, now also mirroring the production submit outcome
+//! tables) so the real policy is proven deterministically with frame
+//! recording into `bitty.store`; the same byte-exact framing, allowlist,
+//! and capture semantics are proven against the real Core operations
 //! (`Runtime::terminal_submit`, `resolve_editor`, `OverlayCapture`) in the
-//! linking tests. Production bridge gaps are recorded as notes, never silent.
+//! linking tests. The retained submit shim is intentional harness parity,
+//! not a production gap (the gap it once papered over closed in CTX-1239).
+//! Production bridge gaps are recorded as notes, never silent.
 //!
 //! Standing rules: no sleep polling (all steps are synchronous VM calls,
 //! filesystem operations, or foreground child waits; no `thread::sleep`, no

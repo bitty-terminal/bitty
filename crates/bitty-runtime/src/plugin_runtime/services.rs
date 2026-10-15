@@ -24,8 +24,9 @@ use bitty_lua::{
 };
 use bitty_package::Version;
 use bitty_rich::{
-    BG_MAX_ENCODED_BYTES, BG_MAX_ROOTS, BackgroundFormat, ResourcePolicy, check_header_bounds,
-    expand_background_path, sniff_image, validate_resource_path,
+    BG_MAX_ENCODED_BYTES, BG_MAX_ROOTS, BackgroundFormat, ResourcePolicy, SubmitBudget, SubmitDeny,
+    check_header_bounds, check_terminal_submit, expand_background_path, sniff_image,
+    validate_resource_path,
 };
 use bitty_ui::{
     CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, LabelAllocator,
@@ -269,8 +270,116 @@ impl PanelPinQueue {
     }
 }
 
-/// One queued colorscheme intent (CTX-1169, issue #1976).
+/// Per-generation `bitty.terminal.submit` byte window (CTX-1239, issue #2101).
 ///
+/// Matches the native-operation test window (1 MiB): the numeric budget
+/// policy belongs to the Isolation/Resource lane, which this operation must
+/// not invent (DEC-W103-4); this only enforces and attributes. Charged only
+/// on enqueue success; denials and dropped (queue-full) intents leave it
+/// untouched.
+pub const TERMINAL_SUBMIT_WINDOW_BYTES: u64 = 1024 * 1024;
+
+/// One queued submit intent (CTX-1239, issue #2101).
+///
+/// Carries the byte-exact bracketed-paste frame, validated and budgeted at
+/// enqueue time against the generation's `terminal.input.submit` grant, so
+/// the drain performs a mechanical PTY write with no further authorization.
+/// Authority was checked at enqueue; the frame bytes are already-framed
+/// output data, never a re-interpretable request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSubmitRequest {
+    /// Byte-exact frame (`ESC[200~` content `ESC[201~` `CR`) for one PTY write.
+    pub frame: Vec<u8>,
+}
+
+/// Bounded runtime-shared submit intent queue (CTX-1239, issue #2101).
+///
+/// Same governance as [`PanelPinQueue`]: overflow drops the newest intent
+/// and counts it, and the application drains it once per tick. The queue
+/// holds validated, budgeted frames only.
+#[derive(Debug)]
+pub struct TerminalSubmitQueue {
+    items: VecDeque<QueuedSubmitRequest>,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl TerminalSubmitQueue {
+    /// Create a bounded queue (capacity at least 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Push a request; returns whether it was accepted.
+    pub fn push(&mut self, request: QueuedSubmitRequest) -> bool {
+        if self.items.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.items.push_back(request);
+        true
+    }
+
+    /// Drain all queued requests in FIFO order.
+    pub fn drain(&mut self) -> Vec<QueuedSubmitRequest> {
+        self.items.drain(..).collect()
+    }
+
+    /// Number of queued requests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Number dropped since creation.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+/// Accepted `bitty.terminal.submit` outcome table (CTX-1239).
+///
+/// Shape contract the composer policy switches on: `status` is always
+/// `"accepted"` here, `bytes` the framed byte count queued for one PTY
+/// write.
+fn submit_accepted(bytes: usize) -> LuaValue {
+    LuaValue::table([
+        ("status", LuaValue::String("accepted".to_string())),
+        (
+            "bytes",
+            LuaValue::Integer(bytes.min(i64::MAX as usize) as i64),
+        ),
+    ])
+}
+
+/// Refused `bitty.terminal.submit` outcome table (CTX-1239).
+///
+/// `deny` names the violated rule, never the payload: `"too-large"` (over
+/// the content cap), `"lease-denied"` (lease write refused — unreachable on
+/// the grant-authorized path, kept for mapping completeness),
+/// `"budget-exceeded"` (generation window exhausted), or `"queue-full"`
+/// (shared queue saturated; nothing charged, retry later). Every denial
+/// leaves the buffer and the modal session intact by composer contract.
+fn submit_denied(deny: &str) -> LuaValue {
+    LuaValue::table([
+        ("status", LuaValue::String("denied".to_string())),
+        ("deny", LuaValue::String(deny.to_string())),
+    ])
+}
+
+/// One queued colorscheme intent (CTX-1169, issue #1976).///
 /// Carries the validated palette plus its durability: `persist = false` is a
 /// preview (live-apply only, never a file write), `persist = true` is a
 /// confirm (live-apply after the durable commit lands). Authority was checked
@@ -1440,6 +1549,24 @@ pub struct PluginServices {
     snapshot: Rc<dyn SnapshotSource>,
     notifications: Rc<RefCell<NotificationQueue>>,
     terminal_read: bool,
+    /// Whether this generation holds `terminal.input.submit` (CTX-1239).
+    ///
+    /// Fixed at activation from the grant snapshot (declared capabilities
+    /// intersected with consent); absent grants fail closed with
+    /// `E_CAPABILITY_DENIED` at call time and with a nil `submit` key at
+    /// the bridge (see `has_terminal_submit`).
+    terminal_submit_granted: Cell<bool>,
+    /// Per-generation submit byte window (CTX-1239, P0-AC-014 attribution).
+    ///
+    /// Charged only on enqueue success; denials and queue-full drops leave
+    /// it untouched, exactly like the native operation's probe-then-commit.
+    submit_budget: RefCell<SubmitBudget>,
+    /// Runtime-shared submit intent queue (CTX-1239).
+    ///
+    /// Shared at activation only with `terminal.input.submit` generations
+    /// (no queue without grant); `None` leaves granted calls failing closed
+    /// with `E_NOT_IMPLEMENTED`, like every other verb without a host.
+    submit_queue: RefCell<Option<Rc<RefCell<TerminalSubmitQueue>>>>,
     platform_notify: bool,
     spawn_git: Cell<bool>,
     spawn_backend: RefCell<Option<SpawnHandler>>,
@@ -1555,14 +1682,19 @@ impl PluginServices {
         terminal_read: bool,
         platform_notify: bool,
     ) -> Self {
+        let plugin_id: String = plugin_id.into();
+        let submit_budget = SubmitBudget::new(&plugin_id, TERMINAL_SUBMIT_WINDOW_BYTES);
         Self {
-            plugin_id: plugin_id.into(),
+            plugin_id,
             store: RefCell::new(store),
             settings,
             declared_settings: RefCell::new(BTreeSet::new()),
             snapshot,
             notifications,
             terminal_read,
+            terminal_submit_granted: Cell::new(false),
+            submit_budget: RefCell::new(submit_budget),
+            submit_queue: RefCell::new(None),
             platform_notify,
             spawn_git: Cell::new(false),
             spawn_backend: RefCell::new(None),
@@ -1639,6 +1771,21 @@ impl PluginServices {
     /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
     pub fn set_panel_create_backend(&self, backend: Option<PanelCreateHandler>) {
         *self.panel_create_backend.borrow_mut() = backend;
+    }
+
+    /// Grant `terminal.input.submit` from the activation snapshot (CTX-1239,
+    /// issue #2101). Absent grants fail closed with `E_CAPABILITY_DENIED`
+    /// at call time and with a nil `submit` key at the bridge.
+    pub fn set_terminal_submit_access(&self, granted: bool) {
+        self.terminal_submit_granted.set(granted);
+    }
+
+    /// Share the runtime-shared submit intent queue for
+    /// `bitty.terminal.submit` (CTX-1239, issue #2101). Without it a granted
+    /// call fails closed with `E_NOT_IMPLEMENTED`, like every other verb
+    /// without a host.
+    pub fn set_submit_queue(&self, queue: Option<Rc<RefCell<TerminalSubmitQueue>>>) {
+        *self.submit_queue.borrow_mut() = queue;
     }
 
     /// Grant `platform.image-file` from the activation snapshot (CTX-1169,
@@ -2509,6 +2656,53 @@ impl HostServices for PluginServices {
             ));
         }
         Ok(snapshot)
+    }
+
+    fn has_terminal_submit(&self) -> bool {
+        self.terminal_submit_granted.get() && self.submit_queue.borrow().is_some()
+    }
+
+    fn terminal_submit(&self, text: &str) -> Result<LuaValue, BridgeError> {
+        // CTX-1239 (issue #2101): grant gate first, mirroring the snapshot
+        // and panel verbs. The bridge additionally presence-gates the key,
+        // so an ungranted Lua caller observes nil and never reaches this
+        // error; this gate is the defense-in-depth layer for direct
+        // callers. The grant IS the lease authorization for this path
+        // (submit_host.rs: holder attribution arrives with the capability
+        // grant lane): with the grant held, `check_terminal_submit` runs
+        // with the lease satisfied and the budget charged only on enqueue
+        // success, exactly like the native probe-then-commit. The drain
+        // performs a mechanical PTY write of the already-authorized frame.
+        if !self.terminal_submit_granted.get() {
+            return Err(BridgeError::capability_denied("terminal.input.submit"));
+        }
+        let queue = self
+            .submit_queue
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.terminal.submit"))?;
+        // Validate (cap, framing) and price against a probe first so every
+        // denial — and a full-queue drop below — leaves the generation's
+        // budget untouched; the charge commits only after the frame queues.
+        let mut probe = self.submit_budget.borrow().clone();
+        let frame = match check_terminal_submit(text, true, &mut probe) {
+            Ok(frame) => frame,
+            Err(SubmitDeny::TooLarge { .. }) => {
+                return Ok(submit_denied("too-large"));
+            }
+            Err(SubmitDeny::LeaseDenied) => {
+                return Ok(submit_denied("lease-denied"));
+            }
+            Err(SubmitDeny::BudgetExceeded { .. }) => {
+                return Ok(submit_denied("budget-exceeded"));
+            }
+        };
+        let bytes = frame.len();
+        if !queue.borrow_mut().push(QueuedSubmitRequest { frame }) {
+            return Ok(submit_denied("queue-full"));
+        }
+        *self.submit_budget.borrow_mut() = probe;
+        Ok(submit_accepted(bytes))
     }
 
     fn notify_show(&self, payload: &LuaValue) -> Result<bool, BridgeError> {
@@ -4025,6 +4219,178 @@ mod tests {
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
         assert_eq!(error.message, "capability 'panel.create' is not granted");
         assert!(!*called.borrow(), "denied calls never reach the backend");
+    }
+
+    fn submit_services() -> PluginServices {
+        // CTX-1239: granted generation with a shared queue wired, the
+        // activation shape for `terminal.input.submit` holders.
+        let services = services();
+        services.set_terminal_submit_access(true);
+        services.set_submit_queue(Some(Rc::new(RefCell::new(TerminalSubmitQueue::new(8)))));
+        services
+    }
+
+    fn outcome_string(outcome: &LuaValue, key: &str) -> Option<String> {
+        match outcome.get(key)? {
+            LuaValue::String(text) => Some(text.clone()),
+            LuaValue::Integer(value) => Some(value.to_string()),
+            LuaValue::Bool(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn terminal_submit_absent_without_grant_or_queue() {
+        // CTX-1239 (issue #2101): presence requires BOTH the grant and a
+        // wired queue. Either missing observes nil at the bridge, so the
+        // composer nil path (`unavailable:no-submit`) cannot distinguish
+        // ungranted from unwired from absent.
+        let bare = services();
+        assert!(!bare.has_terminal_submit(), "bare generation probes absent");
+        let granted_only = services();
+        granted_only.set_terminal_submit_access(true);
+        assert!(
+            !granted_only.has_terminal_submit(),
+            "grant without a queue still probes absent"
+        );
+        let queued_only = services();
+        queued_only.set_submit_queue(Some(Rc::new(RefCell::new(TerminalSubmitQueue::new(8)))));
+        assert!(
+            !queued_only.has_terminal_submit(),
+            "queue without a grant still probes absent"
+        );
+        assert!(
+            submit_services().has_terminal_submit(),
+            "grant plus queue probes present"
+        );
+    }
+
+    #[test]
+    fn terminal_submit_denies_before_queue_without_grant() {
+        // Grant gate first: even with a queue wired, an ungranted generation
+        // fails closed with `E_CAPABILITY_DENIED` and nothing queues.
+        let denied = services();
+        denied.set_submit_queue(Some(Rc::new(RefCell::new(TerminalSubmitQueue::new(8)))));
+        let error = denied.terminal_submit("cargo test").expect_err("denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'terminal.input.submit' is not granted"
+        );
+    }
+
+    #[test]
+    fn terminal_submit_granted_without_queue_is_not_implemented() {
+        // A granted call without a shared queue fails closed with
+        // `E_NOT_IMPLEMENTED`, like every other verb without a host.
+        let granted = services();
+        granted.set_terminal_submit_access(true);
+        let error = granted
+            .terminal_submit("cargo test")
+            .expect_err("unimplemented");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn terminal_submit_accepts_byte_exact_frame_and_charges() {
+        // CTX-1239: a granted submit frames byte-exact (the same
+        // bracketed-paste bytes the native operation writes), queues one
+        // intent, charges the generation window, and reports accepted.
+        let granted = submit_services();
+        let outcome = granted.terminal_submit("cargo test").expect("accepted");
+        assert_eq!(
+            outcome_string(&outcome, "status").as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(outcome_string(&outcome, "bytes").as_deref(), Some("23"));
+        assert_eq!(
+            granted.submit_budget.borrow().used(),
+            23,
+            "accepted submit charges the window"
+        );
+        let queue = granted.submit_queue.borrow().clone().expect("queue");
+        let drained = queue.borrow_mut().drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].frame,
+            b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+            "queued frame must be the byte-exact paste frame"
+        );
+    }
+
+    #[test]
+    fn terminal_submit_over_cap_denies_without_charge() {
+        // Over-cap text is a denied table (buffer kept, session stays open
+        // by composer contract), never an error, and charges nothing.
+        let granted = submit_services();
+        let big = "q".repeat(bitty_rich::host::COMPOSER_MAX_BYTES + 1);
+        let outcome = granted.terminal_submit(&big).expect("denied table");
+        assert_eq!(
+            outcome_string(&outcome, "status").as_deref(),
+            Some("denied")
+        );
+        assert_eq!(
+            outcome_string(&outcome, "deny").as_deref(),
+            Some("too-large")
+        );
+        assert_eq!(granted.submit_budget.borrow().used(), 0);
+        let queue = granted.submit_queue.borrow().clone().expect("queue");
+        assert!(queue.borrow().is_empty(), "denials queue nothing");
+    }
+
+    #[test]
+    fn terminal_submit_exhausted_budget_denies_without_charge() {
+        // A generation whose window cannot cover the frame is denied with
+        // the prior usage untouched. The shared queue drains each round so
+        // saturation never masks the budget denial.
+        let granted = submit_services();
+        let queue = granted.submit_queue.borrow().clone().expect("queue");
+        let filler = "x".repeat(4096);
+        loop {
+            let outcome = granted.terminal_submit(&filler).expect("table");
+            if outcome_string(&outcome, "status").as_deref() == Some("denied") {
+                assert_eq!(
+                    outcome_string(&outcome, "deny").as_deref(),
+                    Some("budget-exceeded")
+                );
+                break;
+            }
+            queue.borrow_mut().drain();
+        }
+        let used = granted.submit_budget.borrow().used();
+        assert!(
+            used <= TERMINAL_SUBMIT_WINDOW_BYTES,
+            "charged bytes never exceed the window"
+        );
+        assert!(queue.borrow().is_empty(), "denials queue nothing");
+    }
+
+    #[test]
+    fn terminal_submit_full_queue_denies_without_charge() {
+        // A saturated shared queue drops the newest intent, counts it, and
+        // reports a denied table with the budget untouched (retry later).
+        let granted = services();
+        granted.set_terminal_submit_access(true);
+        granted.set_submit_queue(Some(Rc::new(RefCell::new(TerminalSubmitQueue::new(1)))));
+        granted.terminal_submit("first").expect("first queues");
+        let used = granted.submit_budget.borrow().used();
+        let outcome = granted.terminal_submit("second").expect("denied table");
+        assert_eq!(
+            outcome_string(&outcome, "status").as_deref(),
+            Some("denied")
+        );
+        assert_eq!(
+            outcome_string(&outcome, "deny").as_deref(),
+            Some("queue-full")
+        );
+        assert_eq!(
+            granted.submit_budget.borrow().used(),
+            used,
+            "dropped intents charge nothing"
+        );
+        let queue = granted.submit_queue.borrow().clone().expect("queue");
+        assert_eq!(queue.borrow().dropped(), 1);
+        assert_eq!(queue.borrow().len(), 1);
     }
 
     #[test]

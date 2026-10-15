@@ -23,6 +23,17 @@ path = "src/bin/bitty-component-fixture.rs"
 test = false
 doc = false
 
+# CTX-1253 (#2123, DIR-030 S-1): hermetic resident-helper test fixture. Speaks
+# the accepted bitty-ipc length-prefixed framing over stdio so the
+# resident-singleton supervisor integration tests spawn a real coprocess with
+# no AI build and no network access; never installed or packaged
+# (publish = false, and the release bundles only ship the `bitty` binary).
+[[bin]]
+name = "bitty-ai-helper-fixture"
+path = "src/bin/bitty-ai-helper-fixture.rs"
+test = false
+doc = false
+
 [dependencies]
 bitty-config = { version = "0.0.23", path = "../bitty-config" }
 bitty-vt = { version = "0.0.23", path = "../bitty-vt" }

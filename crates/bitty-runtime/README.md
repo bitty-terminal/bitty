@@ -44,6 +44,19 @@ diagram lives in `src/lib.rs`.
   sandboxing are follow-ups; nothing calls the broker from Lua yet. The
   `bitty-component-fixture` binary is a hermetic test fixture only (never
   packaged).
+- Resident AI helper (`src/ai_helper.rs`, DIR-030 S-1, bitty#2123): the
+  Core-side spawn path for the native `ai` component (executable `bitty-ai`).
+  It reuses the `src/component/` resolution (`resolve_search`, `PATH` never
+  read) and per-spawn SHA-256 digest verification, then spawns the helper as
+  a **resident** stdio coprocess over the accepted bitty-ipc length-prefixed
+  framing. Unlike `net` it is never idle-stopped; it keeps one fenced writer
+  (single stdin owner per generation), a bounded inbound frame queue, a 64
+  KiB stderr ring, and the DIR-030 restart bounds (1 s→30 s backoff, 5
+  crashes in 5 minutes latch it unavailable until a new session). The `ai.*`
+  handler surface, the snapshot-version correlator, and the per-request gates
+  stay helper-side; the Lua/IPC surface that drives `submit_frame` and
+  registry install sources are follow-ups. `bitty-ai-helper-fixture` is a
+  hermetic test fixture only (never packaged).
 - No Lua, config, or plugin code enters the hot path (see `src/lib.rs`).
 - The plugin side queue never holds hot-path objects: no GPU, window, or PTY
   handles and no Lua VM.
@@ -59,6 +72,11 @@ diagram lives in `src/lib.rs`.
 
 - `Cargo.toml` — package metadata and workspace-internal dependencies.
 - `src/lib.rs` — crate docs with the data flow and headless seam.
+- `src/ai_helper.rs` — resident-singleton supervisor for the native `ai`
+  helper (`bitty-ai`): DIR-030 resolution plus SHA-256 digest verification,
+  stdio-coprocess spawn over the accepted bitty-ipc framing, and the bounded
+  restart policy (DIR-030 S-1, bitty#2123). Contract record:
+  `specifications/ai-helper-resident-singleton.md`.
 - `src/runtime.rs` and `src/runtime/` — runtime handle plus resize, input,
   panes, present, plugin, search, selection, and workspace slices;
   `src/runtime/band_slots.rs` is the single host placement policy for the v1

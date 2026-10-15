@@ -288,7 +288,13 @@ capabilities run as separately installed, on-demand stdio coprocesses
 (SHA-256 before every spawn), spawns, and grants them, and links only the
 dependency-free `bitty-network-wire` codec. The first component is `net`
 (`bitty-net`, built from the bitty-network repository); the Lua-facing
-request surface is a follow-up. Consent-issued automation bearers carry a
+request surface is a follow-up. The `ai` helper (`bitty-ai`) uses the same
+DIR-030 resolution and per-spawn SHA-256 digest verification, but is a
+**resident singleton**: Core spawns it once per session as a stdio coprocess
+over the accepted bitty-ipc length-prefixed framing and keeps it alive with a
+bounded restart policy (never idle-stopped); the `ai.*` handler surface,
+snapshot-version correlator, and per-request gates stay helper-side
+(`bitty`#2123). Consent-issued automation bearers carry a
 session revocation surface, and per-plugin network grants bind granted
 `network.connect:*` capabilities to the plugin id for attribution.
 `bitty dev trace` measurement lives in the external `bitty-perf` validation

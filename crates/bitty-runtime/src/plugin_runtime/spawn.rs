@@ -103,6 +103,26 @@
 //! - Tracked outcomes `64` (`channel::MAX_PENDING_REQUESTS`): rapid spawn
 //!   bursts fail closed with `LimitExceeded`, never silently evict.
 //!
+//! # Spawn audit ledger (CTX-1248, issue #2068)
+//!
+//! FS decisions audit through `FsAuditLedger`; the mediated spawn surface
+//! audits through a sibling bounded ledger, so every spawn this surface
+//! mediates records who asked, which tool and argv, and the outcome —
+//! matching the FS and tool ledgers. Each [`SpawnService`] owns one
+//! [`bitty_plugin_host::tools::ToolSpawnLedger`] ([`SpawnService::tool_audit`])
+//! and every [`SpawnService::dispatch`] appends exactly one entry: `Allow`
+//! when the gates authorize the spawn for execution, `Deny` when any gate
+//! refuses before it. The ledger is bounded drop-oldest
+//! ([`bitty_plugin_host::tools::MAX_TOOL_SPAWN_AUDIT_ENTRIES`], counted in
+//! `dropped`) and sequence-numbered (no wall-clock), so a hostile caller
+//! cannot grow it without bound. Environment is never a parameter of the
+//! audit path: the caller identity and bounded arg previews are attribution
+//! only, so `secret://` handle names record like any other arg while secret
+//! *values* (which travel via env) can never enter the ledger. An authorized
+//! spawn that then fails to start ([`IpcError::Unavailable`]) is recorded as
+//! `Allow`: a `Deny` entry means a policy gate refused, never an execution
+//! failure.
+//!
 //! # Bridge accounting (no orphan leak)
 //!
 //! The Lua bridge exempts `process.spawn` from its post-hoc cheap-call
@@ -139,7 +159,7 @@ use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::tools::{
-    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
+    ACCEPTED_TOOL_GIT, ToolSpawnLedger, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
     is_tool_spawn_allowed, is_valid_tool_name,
 };
 use bitty_pty::TreeBackend;
@@ -925,12 +945,18 @@ impl SpawnAuthorizer for HostToolsAuthorizer {
 /// state ([`SpawnService::cancel`]). The policy is fixed per instance: a host
 /// retunes by building a new service, so in-flight generations never change
 /// meaning under a live handle.
+///
+/// The service also owns the mediated-spawn audit ledger
+/// ([`SpawnService::tool_audit`]): every [`SpawnService::dispatch`] appends
+/// exactly one bounded, drop-oldest entry (who asked, which tool and argv),
+/// mirroring the FS audit ledger.
 pub struct SpawnService {
     authorizer: Box<dyn SpawnAuthorizer>,
     exec: ExecutionService,
     policy: SpawnMechanicsPolicy,
     generations: BTreeMap<u64, SpawnGeneration>,
     next_generation: NonZeroU64,
+    audit: ToolSpawnLedger,
 }
 
 impl fmt::Debug for SpawnService {
@@ -939,6 +965,7 @@ impl fmt::Debug for SpawnService {
             .field("authorizer", &self.authorizer)
             .field("tracked", &self.exec.len())
             .field("policy", &self.policy)
+            .field("audit_entries", &self.audit.len())
             .finish()
     }
 }
@@ -967,7 +994,22 @@ impl SpawnService {
             policy,
             generations: BTreeMap::new(),
             next_generation: NonZeroU64::MIN,
+            audit: ToolSpawnLedger::new(),
         }
+    }
+
+    /// Mediated-spawn audit ledger (caller, tool, bounded arg previews only;
+    /// environment is never recorded).
+    ///
+    /// Attribution for every spawn this service mediated, mirroring
+    /// [`PluginHost::fs_audit`](bitty_plugin_host::host::PluginHost::fs_audit)
+    /// and `PluginHost::tool_audit`: entries are appended by
+    /// [`SpawnService::dispatch`], bounded drop-oldest, and sequence-numbered
+    /// (no wall-clock). One entry per dispatch: `Allow` when the gates
+    /// authorized the spawn for execution, `Deny` when a gate refused it.
+    #[must_use]
+    pub fn tool_audit(&self) -> &ToolSpawnLedger {
+        &self.audit
     }
 
     /// Enforced mechanics policy.
@@ -1111,6 +1153,12 @@ impl SpawnService {
     /// A successful dispatch mints a fresh generation-fenced [`SpawnHandle`]
     /// for `execution_id` (readable via [`SpawnService::handle_for`]); failed
     /// dispatches mint nothing and leave no partial state.
+    ///
+    /// Every dispatch appends exactly one entry to the spawn audit ledger
+    /// ([`SpawnService::tool_audit`]): `Allow` when the gates authorize the
+    /// spawn for execution (including an authorized child that then fails to
+    /// start), `Deny` when any gate refuses it. The caller identity, tool,
+    /// and bounded arg previews record; environment never does.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
@@ -1121,6 +1169,57 @@ impl SpawnService {
         now_ms: u64,
         execution_id: u64,
     ) -> Result<ExecutionResult, IpcError> {
+        let exec_request =
+            match self.authorize_mediated(request, granted, consent, client_id, now_ms) {
+                Ok(exec_request) => {
+                    self.audit
+                        .push_decision(&request.tool, &request.args, client_id, true);
+                    exec_request
+                }
+                Err(error) => {
+                    self.audit
+                        .push_decision(&request.tool, &request.args, client_id, false);
+                    return Err(error);
+                }
+            };
+        let result = self.exec.dispatch(
+            &exec_request,
+            granted,
+            consent,
+            client_id,
+            now_ms,
+            execution_id,
+        )?;
+        let generation = SpawnGeneration::from_raw(self.next_generation.get())
+            .expect("generation counter never mints zero");
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.generations.insert(execution_id, generation);
+        Ok(result)
+    }
+
+    /// Evaluate every mediated spawn gate (shape, routing, scope, effect
+    /// opt-in, consent, budgets) and build the execution request.
+    ///
+    /// Split from [`SpawnService::dispatch`] so the audit records exactly one
+    /// entry per mediated spawn: a refusal here is a policy `Deny`, while a
+    /// request that passes every gate is an `Allow` even if the child later
+    /// fails to start. Gate order is CTX-0421 (routing, authorization, effect
+    /// opt-in, consent); shape validation precedes everything and never
+    /// consults the authorizer.
+    ///
+    /// # Errors
+    ///
+    /// The refusal set of [`SpawnService::dispatch`] up to (not including)
+    /// execution: `InvalidRequest`, `LimitExceeded`, `Denied[...]`,
+    /// `ScopeDenied`, and the authorizer's `NotFound`.
+    fn authorize_mediated(
+        &self,
+        request: &SpawnRequest,
+        granted: &ScopeSet,
+        consent: &ConsentLedger,
+        client_id: &str,
+        now_ms: u64,
+    ) -> Result<ExecutionRequest, IpcError> {
         request.validate()?;
         if client_id.is_empty() {
             return Err(IpcError::InvalidRequest {
@@ -1176,19 +1275,7 @@ impl SpawnService {
             exec_request = exec_request.with_output_budget(budget);
         }
         exec_request.validate()?;
-        let result = self.exec.dispatch(
-            &exec_request,
-            granted,
-            consent,
-            client_id,
-            now_ms,
-            execution_id,
-        )?;
-        let generation = SpawnGeneration::from_raw(self.next_generation.get())
-            .expect("generation counter never mints zero");
-        self.next_generation = self.next_generation.saturating_add(1);
-        self.generations.insert(execution_id, generation);
-        Ok(result)
+        Ok(exec_request)
     }
 }
 
@@ -3809,5 +3896,121 @@ mod tests {
             vec![("SEALED".to_owned(), Some("1".to_owned()))],
             "ambient environment must be cleared, explicit vars only"
         );
+    }
+
+    // ── mediated-spawn audit ledger (CTX-1248, issue #2068) ──────────────
+
+    /// One allow and one deny each append exactly one entry, in order, with
+    /// the caller, tool, and args attributed (sequence-numbered, no clock).
+    #[test]
+    fn mediated_spawn_audits_allow_and_deny_exactly_once() {
+        use bitty_plugin_host::tools::ToolSpawnDecision;
+
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        assert!(service.tool_audit().is_empty());
+
+        dispatch_ok(&mut service, &allowed_request("echo"), 900).expect("echo serves");
+
+        let refused = SpawnRequest::new("git", vec!["status".to_owned()]).with_allow_effects(true);
+        service
+            .dispatch(
+                &refused,
+                &ScopeSet::new(),
+                &consented(1_000),
+                "plugin-test",
+                1_000,
+                901,
+            )
+            .expect_err("missing scope must refuse");
+
+        let ledger = service.tool_audit();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.dropped(), 0);
+        let entries: Vec<_> = ledger.iter().collect();
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[0].caller, "plugin-test");
+        assert_eq!(entries[0].tool, "test");
+        assert_eq!(entries[0].args, vec!["ignored".to_owned()]);
+        assert_eq!(entries[0].decision, ToolSpawnDecision::Allow);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(entries[1].caller, "plugin-test");
+        assert_eq!(entries[1].tool, "git");
+        assert_eq!(entries[1].decision, ToolSpawnDecision::Deny);
+    }
+
+    /// The ledger stays bounded under unbounded refusals: drop-oldest keeps
+    /// the newest entries (no unbounded growth) and counts each eviction.
+    #[test]
+    fn spawn_audit_is_bounded_drop_oldest() {
+        let bound = bitty_plugin_host::tools::MAX_TOOL_SPAWN_AUDIT_ENTRIES;
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::denying()));
+        let total = bound + 10;
+        for id in 0..total as u64 {
+            let request = SpawnRequest::new("git", vec!["log".to_owned()]).with_allow_effects(true);
+            service
+                .dispatch(
+                    &request,
+                    &granted_spawn(),
+                    &consented(1_000),
+                    "plugin-test",
+                    1_000,
+                    id,
+                )
+                .expect_err("deny-all authorizer refuses");
+        }
+        let ledger = service.tool_audit();
+        assert_eq!(ledger.len(), bound, "ledger must not grow past its bound");
+        assert_eq!(ledger.dropped(), (total - bound) as u64);
+        // The oldest retained entry is the first one to survive eviction.
+        assert_eq!(ledger.iter().next().expect("oldest entry").seq, 10);
+    }
+
+    /// Environment is not a parameter of the audit path: neither the env
+    /// name nor its value can enter an entry (only tool, caller, args do).
+    #[test]
+    fn spawn_audit_never_records_env() {
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let secret = "spawn-audit-secret-value";
+        let request = SpawnRequest::new("test", vec!["status".to_owned()])
+            .with_env(vec![("BITTY_AUDIT_PROBE".to_owned(), secret.to_owned())])
+            .with_allow_effects(true);
+        dispatch_ok(&mut service, &request, 910).expect("spawn serves");
+
+        let entry = service.tool_audit().iter().next().expect("audit entry");
+        assert_eq!(entry.tool, "test");
+        assert_eq!(entry.args, vec!["status".to_owned()]);
+        assert!(!entry.detail.contains(secret));
+        assert!(!entry.detail.contains("BITTY_AUDIT_PROBE"));
+    }
+
+    /// An authorized spawn that cannot start still audits as `Allow`: a
+    /// `Deny` entry means a policy gate refused, never an execution failure.
+    #[test]
+    fn authorized_but_unstartable_spawn_audits_allow() {
+        use bitty_plugin_host::tools::ToolSpawnDecision;
+
+        #[derive(Debug)]
+        struct MissingAuthorizer;
+        impl SpawnAuthorizer for MissingAuthorizer {
+            fn tool_id(&self) -> &'static str {
+                "missing"
+            }
+
+            fn authorize(&self, _tool: &str, _args: &[String]) -> Result<ResolvedSpawn, IpcError> {
+                Ok(ResolvedSpawn {
+                    executable: "definitely-not-a-bitty-binary-xyz".into(),
+                    args: vec!["--version".into()],
+                })
+            }
+        }
+        let mut service = SpawnService::new(Box::new(MissingAuthorizer));
+        let request = SpawnRequest::new("missing", vec!["x".to_owned()]).with_allow_effects(true);
+        dispatch_ok(&mut service, &request, 71).expect_err("missing binary must fail");
+
+        let entry = service.tool_audit().iter().next().expect("audit entry");
+        assert_eq!(entry.tool, "missing");
+        assert_eq!(entry.decision, ToolSpawnDecision::Allow);
     }
 }

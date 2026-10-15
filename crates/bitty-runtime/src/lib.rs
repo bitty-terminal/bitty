@@ -185,6 +185,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ai_helper;
 pub mod component;
 pub mod config;
 pub mod cw_present;
@@ -207,6 +208,10 @@ pub mod workspace;
 pub use bitty_rich::hints::{DispatchOutcome, HintFeedError, HintScope};
 pub use runtime::cw_live::HintLinkOpenError;
 
+pub use ai_helper::{
+    HELPER_COMPONENT_NAME, HelperConfig, HelperError, HelperEvent, HelperState, HelperStatus,
+    ResidentHelper, StopOutcome as HelperStopOutcome,
+};
 pub use component::data_home_for;
 pub use config::{
     BACKGROUND_FITS, ChromeStyle, CloseConfirmMode, DEFAULT_BACKGROUND_FIT,

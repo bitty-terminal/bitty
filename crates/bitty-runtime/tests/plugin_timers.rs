@@ -8,7 +8,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
@@ -275,6 +275,178 @@ fn disposed_timers_clear_the_wake() {
     assert_eq!(rt.timer_deadline(), None);
     let far = std::time::Instant::now() + Duration::from_secs(60);
     assert_eq!(rt.pump_due_timers_at(far), 0);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ten_plan_repeating_chains_survive_past_15s() {
+    // CTX-1247 (#2107 follow-up): 10-module bar-plan mimic.
+    //
+    // Bar arms per=3 timers per module (1 repeating chain + 2 one-shot
+    // follow-ups, `chain_ticks(10)==3`) over cadences
+    // {2000,2000,5000,3000,5000,5000,5000,2000,250,60000}. Every repeating
+    // tick re-arms via pcall (E_DEF_LIMIT swallowed, counted as
+    // `rearm_fail`). Pre-fix fired rows are never pruned from the VM
+    // capture, so the 64-cap counts dead rows and every successful re-arm
+    // permanently consumes a slot: at 64 all creates fail and lineages die
+    // ~15s (fires_15-59s==0). Post-fix fired rows are pruned on fire, the
+    // cap covers live timers only, fires continue past 15s, rearm_fail==0.
+    // Fake-clock deadline-to-deadline to 70s; cold-tick only.
+    let data = temp_dir("ten-plan");
+    let root = temp_dir("ten-plan-root");
+    let id = PluginId::new("bitty-featured.tenplan").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.tenplan",
+        r#"
+        bitty.store.set("fires", 0)
+        bitty.store.set("rearm_fail", 0)
+        local cadences = {2000,2000,5000,3000,5000,5000,5000,2000,250,60000}
+        local per = 3
+        for _, ms in ipairs(cadences) do
+          local cb
+          cb = function()
+            local n = bitty.store.get("fires") or 0
+            bitty.store.set("fires", n + 1)
+            local ok, _ = pcall(function() return bitty.timers.create(ms, cb) end)
+            if not ok then
+              local f = bitty.store.get("rearm_fail") or 0
+              bitty.store.set("rearm_fail", f + 1)
+            end
+          end
+          local ok, _ = pcall(function() return bitty.timers.create(ms, cb) end)
+          if not ok then
+            local f = bitty.store.get("rearm_fail") or 0
+            bitty.store.set("rearm_fail", f + 1)
+          end
+          for k = 2, per do
+            local delay = ms * k
+            local ok2, _ = pcall(function()
+              return bitty.timers.create(delay, function()
+                local n = bitty.store.get("fires") or 0
+                bitty.store.set("fires", n + 1)
+              end)
+            end)
+            if not ok2 then
+              local f = bitty.store.get("rearm_fail") or 0
+              bitty.store.set("rearm_fail", f + 1)
+            end
+          end
+        end
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert!(rt.timer_deadline().is_some(), "10-plan must arm");
+
+    let t0 = Instant::now();
+    let end = t0 + Duration::from_secs(70);
+    let mut fires_mid: usize = 0;
+    let mut total_fires: usize = 0;
+    // Deadline-to-deadline fake clock: always pump at the earliest wake.
+    while let Some(deadline) = rt.timer_deadline() {
+        if deadline > end {
+            break;
+        }
+        let elapsed = deadline.saturating_duration_since(t0);
+        let fired = rt.pump_due_timers_at(deadline);
+        total_fires += fired;
+        if elapsed >= Duration::from_secs(15) && elapsed <= Duration::from_secs(59) {
+            fires_mid += fired;
+        }
+        // Guard against an infinite pump loop hiding a regression.
+        if total_fires > 50_000 {
+            panic!("runaway timer loop");
+        }
+    }
+
+    let rearm_fail = match store_get(&rt, &id, "rearm_fail") {
+        Some(LuaValue::Integer(n)) => n,
+        other => panic!("rearm_fail must be an integer, got {other:?}"),
+    };
+    assert_eq!(
+        rearm_fail, 0,
+        "repeating re-arms must never hit E_DEF_LIMIT (live cap only)"
+    );
+    assert!(
+        fires_mid > 0,
+        "10-plan lineages must keep firing 15-59s (got fires_mid==0, total=={total_fires})"
+    );
+    // Sanity: the 250ms spectrum chain alone fires ~180x in 15-59s; require
+    // a comfortable margin past flake while still catching a total stall.
+    assert!(
+        total_fires > 100,
+        "70s run must deliver substantial fires (got {total_fires})"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn at_cap_repeating_chain_reuses_freed_slot() {
+    // CTX-1247 CodeRabbit follow-up: at the 64 live-timer cap a firing
+    // callback must reuse the freed slot. The pump prunes the fired row
+    // before invoking the callback (clone-then-consume-then-invoke), so a
+    // `timers.create` inside the callback sees 63 live rows, not 64.
+    // Prune-after would fail this with E_DEF_LIMIT even though the one-shot
+    // deadline is gone.
+    let data = temp_dir("at-cap");
+    let root = temp_dir("at-cap-root");
+    let id = PluginId::new("bitty-featured.atcap").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.atcap",
+        r#"
+        bitty.store.set("fires", 0)
+        bitty.store.set("rearm_fail", 0)
+        local cb
+        cb = function()
+          local n = bitty.store.get("fires") or 0
+          bitty.store.set("fires", n + 1)
+          local ok, _ = pcall(function() return bitty.timers.create(100, cb) end)
+          if not ok then
+            local f = bitty.store.get("rearm_fail") or 0
+            bitty.store.set("rearm_fail", f + 1)
+          end
+        end
+        -- Fill to the 64 live-timer cap: 1 repeating chain + 63 one-shots.
+        local ok, _ = pcall(function() return bitty.timers.create(100, cb) end)
+        if not ok then
+          bitty.store.set("rearm_fail", 999)
+        end
+        for _ = 2, 64 do
+          bitty.timers.create(100000, function()
+            local n = bitty.store.get("fires") or 0
+            bitty.store.set("fires", n + 1)
+          end)
+        end
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert!(rt.timer_deadline().is_some(), "at-cap plan must arm");
+
+    let deadline = rt.timer_deadline().expect("first wake at 100ms");
+    let fired = rt.pump_due_timers_at(deadline);
+    assert_eq!(fired, 1, "exactly the repeating chain fires first");
+    let rearm_fail = match store_get(&rt, &id, "rearm_fail") {
+        Some(LuaValue::Integer(n)) => n,
+        other => panic!("rearm_fail must be an integer, got {other:?}"),
+    };
+    assert_eq!(
+        rearm_fail, 0,
+        "at-cap re-arm must reuse the freed slot (prune-before-invoke)"
+    );
+    // The chain re-armed: another wake is armed for the next cadence.
+    assert!(
+        rt.timer_deadline().is_some(),
+        "re-armed chain must keep a wake"
+    );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }

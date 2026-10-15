@@ -740,12 +740,15 @@ pub struct PluginRuntime {
     /// stays `None` (zero-submit preserved). Cold-tick only, never the hot
     /// path (P0-AC-015).
     timer_deadlines: BTreeMap<(PluginId, i64), Instant>,
-    /// Handles already fired (one-shot containment).
+    /// Handles already fired (one-shot containment fallback).
     ///
-    /// The VM capture retains fired rows (one-shot firing removes only the
-    /// host deadline), so this set stops the post-callback sync from
-    /// re-arming them. Cleared per plugin on dispose/reload/rollback; at
-    /// most one entry per armed timer, so bounded by the live timer cap.
+    /// CTX-1247: the pump prunes each fired row from the VM capture on fire
+    /// (bridge `consume_timer`), so the `REGISTRATION_MAX_TIMERS` cap counts
+    /// live timers only and this set stays empty in steady state. Entries are
+    /// kept only when the consume borrow contends (fail-closed: the
+    /// post-callback sync must never re-arm a fired handle) and are cleared
+    /// per plugin on dispose/reload/rollback. Bounded by the live timer cap
+    /// in practice (one entry per unconsumed fire, normally zero).
     timer_fired: BTreeSet<(PluginId, i64)>,
 }
 
@@ -1409,6 +1412,13 @@ impl PluginRuntime {
                 .entries
                 .get(&plugin)
                 .is_some_and(|entry| entry.state == LifecycleState::Active);
+            // CTX-1247: prune the fired row before invoking the callback so
+            // a callback-created timer reuses the freed 64-cap slot (at-cap
+            // chains would otherwise fail `E_DEF_LIMIT` even though the
+            // one-shot deadline is gone). The callback was cloned above, so
+            // pruning cannot lose it; on consume contention the
+            // `timer_fired` entry is kept fail-closed.
+            self.consume_fired_timer(&plugin, handle);
             if active {
                 if let (Some(vm), Some(callback)) = (vm, callback) {
                     if let Ok(mut vm_ref) = vm.try_borrow_mut() {
@@ -1465,6 +1475,32 @@ impl PluginRuntime {
             .map(|timer| timer.callback.clone())
     }
 
+    /// Prune a fired one-shot row from the VM capture (CTX-1247).
+    ///
+    /// Frees the bridge 64-cap slot so the cap covers live timers only
+    /// (one-shot semantics preserved: the host deadline is already removed
+    /// and handles never reuse). Drops the `timer_fired` containment entry
+    /// when the row is confirmed absent — removed here or already gone
+    /// (for example the callback previously cancelled its own handle) —
+    /// keeping that set bounded (normally empty). Retains the entry only on
+    /// missing VM or borrow contention fail-closed, where the row might
+    /// still be present and the sync must never re-arm it.
+    /// Cold-tick only, never the hot path.
+    fn consume_fired_timer(&mut self, plugin: &PluginId, handle: i64) {
+        let outcome: Option<bool> = self
+            .entries
+            .get(plugin)
+            .and_then(|entry| entry.vm.clone())
+            .and_then(|vm| {
+                vm.try_borrow()
+                    .ok()
+                    .and_then(|vm_ref| vm_ref.consume_timer(handle))
+            });
+        if outcome.is_some() {
+            self.timer_fired.remove(&(plugin.clone(), handle));
+        }
+    }
+
     /// Drop deadlines whose handle left the VM capture (Lua `cancel`).
     ///
     /// Cancelled handles are removed without joining `timer_fired` (handles
@@ -1500,11 +1536,12 @@ impl PluginRuntime {
     /// Arm VM-capture timers not yet tracked (activation chain + callback
     /// re-arms) at `now + delay_ms`.
     ///
-    /// Skips already-pending and already-fired handles (one-shot: the VM
-    /// capture retains fired rows). Enforces the live timer cap per plugin
-    /// fail-closed (extra handles stay unarmed). Only `Active` generations
-    /// arm; `checked_add` overflow arms at `now` (fire immediately,
-    /// fail-closed liveness).
+    /// Skips already-pending and already-fired handles (one-shot: fired rows
+    /// are pruned from the capture on fire, `timer_fired` is the
+    /// fail-closed fallback for contended consumes). Enforces the live timer
+    /// cap per plugin fail-closed (extra handles stay unarmed). Only
+    /// `Active` generations arm; `checked_add` overflow arms at `now` (fire
+    /// immediately, fail-closed liveness).
     fn sync_new_timers(&mut self, now: Instant) {
         let ids: Vec<PluginId> = self
             .entries

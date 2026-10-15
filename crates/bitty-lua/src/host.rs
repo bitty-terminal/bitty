@@ -2535,6 +2535,18 @@ impl RegistrationCapture {
         self.timers.len() != before
     }
 
+    /// Remove a fired one-shot timer by handle (CTX-1247).
+    ///
+    /// Same removal as [`Self::cancel_timer`]: frees the
+    /// `REGISTRATION_MAX_TIMERS` bridge slot so the cap counts live timers
+    /// only. Called by the runtime pump after firing (one-shot semantics
+    /// preserved: the host deadline is already removed, handles never reuse,
+    /// so the pruned row can never re-arm). Cancel-awareness unchanged
+    /// (cancelled rows are already gone).
+    pub fn consume_timer(&mut self, handle: i64) -> bool {
+        self.cancel_timer(handle)
+    }
+
     /// Remove a task by handle; returns whether it existed (CTX-0707).
     ///
     /// Bridge-side removal releases the RC-4 cap slot; cooperative
@@ -2824,6 +2836,21 @@ impl LuaVm {
             next_task_handle: capture.next_task_handle,
             services: capture.services.clone(),
         }
+    }
+
+    /// Remove a fired one-shot timer row from the VM capture (CTX-1247).
+    ///
+    /// Frees the `REGISTRATION_MAX_TIMERS` bridge slot so the cap counts
+    /// live timers only. Returns `Some(true)` when a row was removed,
+    /// `Some(false)` when the row was already absent (for example the
+    /// callback cancelled its own handle), and `None` on borrow contention
+    /// (fail-closed: the caller keeps the `timer_fired` containment entry
+    /// so the row can never re-arm). Cold-tick only, never the hot path.
+    pub fn consume_timer(&self, handle: i64) -> Option<bool> {
+        self.capture
+            .try_borrow_mut()
+            .ok()
+            .map(|mut capture| capture.consume_timer(handle))
     }
 
     /// Invoke a stashed registration handle (command `run`, event handler,

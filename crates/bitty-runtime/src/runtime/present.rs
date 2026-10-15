@@ -1202,6 +1202,12 @@ impl Runtime {
         let Some(last) = self.last_present_at else {
             return false;
         };
+        // CTX-1231 review: an unrepresentable wake deadline must never
+        // defer without a wake — present immediately instead (fail-closed
+        // liveness; only fires for absurd intervals near `Instant::MAX`).
+        if last.checked_add(self.min_present_interval).is_none() {
+            return false;
+        }
         if now.saturating_duration_since(last) >= self.min_present_interval {
             return false;
         }
@@ -2009,6 +2015,19 @@ impl Runtime {
                 .collect();
             for origin in entering {
                 self.bump_kitty_local_delete_epoch(origin);
+                // CTX-1231 review: clear the entering origin's placements
+                // at observation time (pre-gate), mirroring the paint-phase
+                // clear below. An enter+leave inside one coalescing
+                // interval never paints while alt is active, so a
+                // paint-phase-only clear would leave stale placements on
+                // the deadline frame. Idempotent: the paint-phase clear
+                // re-runs the same guard on presented alt frames.
+                if !self.kitty_images.placement_for_origin_is_empty(origin) {
+                    self.kitty_images.clear_origin(origin);
+                    // S6 (#1849): placements are gone, so their cached
+                    // blits are dead budget; drop them (images stay inert).
+                    self.invalidate_kitty_raster_cache();
+                }
             }
             self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
@@ -5677,6 +5696,71 @@ mod present_coalescing_tests {
             rt.tick_at(Instant::now()).is_some(),
             "the first frame must present even with coalescing armed"
         );
+    }
+
+    #[test]
+    fn unrepresentable_deadline_presents_immediately() {
+        // CodeRabbit PR #2094 Minor: an interval past `Instant::MAX` makes
+        // the wake deadline unrepresentable; the gate must present
+        // immediately (fail-closed liveness) instead of deferring a frame
+        // no wake can ever release.
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        rt.set_min_present_interval(Duration::MAX);
+        settle(&mut rt, t0);
+        rt.handle_pty_bytes(b"hello");
+        assert!(
+            rt.tick_at(t0 + Duration::from_millis(1)).is_some(),
+            "an unrepresentable deadline must not defer without a wake"
+        );
+        assert_eq!(rt.presents_coalesced(), 0);
+        assert_eq!(rt.present_coalescing_deadline(), None);
+    }
+
+    /// 2x2 opaque red RGBA payload (`f=32`), mirroring the
+    /// `kitty_images_present` wiring suite.
+    fn red_2x2() -> Vec<u8> {
+        [0xFF, 0x00, 0x00, 0xFF].repeat(4)
+    }
+
+    #[test]
+    fn alt_enter_leave_across_deferred_ticks_clears_placements() {
+        // CodeRabbit PR #2094 Minor: the alternate-screen entry placement
+        // clear used to live only in the paint phase. With entry observed
+        // on one deferred tick and the leave on the next, no tick ever
+        // paints while alt is active, so the deadline frame would show
+        // stale placements an uncoalesced run had cleared. The clear now
+        // runs at entry observation (pre-gate).
+        //
+        // (Enter+leave inside a single PTY batch is latch-invisible with
+        // or without coalescing — pre-existing parity, out of scope here.)
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        rt.set_min_present_interval(INTERVAL);
+        settle(&mut rt, t0);
+        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+            .expect("admissible payload must place");
+        assert_eq!(rt.kitty_placement_count(), 1);
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        assert!(
+            rt.tick_at(t0 + Duration::from_millis(1)).is_none(),
+            "alt-entry tick inside the interval must defer"
+        );
+        assert_eq!(
+            rt.kitty_placement_count(),
+            0,
+            "alt entry must clear placements even when the tick defers"
+        );
+        rt.handle_pty_bytes(b"\x1b[?1049l");
+        assert!(
+            rt.tick_at(t0 + Duration::from_millis(2)).is_none(),
+            "alt-leave tick inside the interval must defer"
+        );
+        let stats = rt
+            .tick_at(t0 + INTERVAL)
+            .expect("deadline tick must present");
+        assert_eq!(stats.images, 0, "deadline frame must paint no stale blit");
+        assert_eq!(rt.kitty_placement_count(), 0);
     }
 
     #[test]

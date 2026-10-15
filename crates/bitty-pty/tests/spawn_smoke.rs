@@ -611,13 +611,22 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
 
 #[test]
 fn backpressure_bound_holds_under_flood() {
-    // Flood the bounded channel: the child produces unbounded output (`yes`
-    // piped through `head -n 5000` so it terminates), but the in-crate
-    // buffer never exceeds MAX_BUFFERED_BYTES. The kernel PTY buffer +
-    // channel backpressure blocks the child instead of growing the heap.
+    // Flood the bounded channel with a self-terminating single process:
+    // `seq 1 5000` exits on its own after bounded output, with no
+    // pipeline-death dependence. The previous `yes | head -n 5000` source
+    // hung forever on FreeBSD 15.1 (CTX-1249 / #2119): when the pipeline
+    // never dies no EOF arrives, and the old `while let Ok(Some) =
+    // reader.recv()` drain blocked forever because its deadline assert only
+    // ran after a chunk arrived (zero chunks = infinite block, stuck
+    // release). `seq` ships everywhere this suite runs: FreeBSD base since
+    // 9.0, macOS BSD userland, and GNU coreutils on Linux.
+    //
+    // The kernel PTY buffer + channel backpressure blocks the child instead
+    // of growing the heap; the in-crate buffer never exceeds
+    // MAX_BUFFERED_BYTES.
     let mut pty = PtyBuilder::new("/bin/sh")
         .arg("-c")
-        .arg("yes | head -n 5000")
+        .arg("seq 1 5000")
         .spawn()
         .expect("spawn flood");
 
@@ -628,30 +637,64 @@ fn backpressure_bound_holds_under_flood() {
     let mut chunks = 0usize;
     let mut max_chunk = 0usize;
     // Drain until EOF, asserting per-chunk bound holds even under flood.
-    while let Ok(Some(chunk)) = reader.recv() {
-        assert!(
-            chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
-            "flood chunk {} exceeds READ_CHUNK_SIZE {}",
-            chunk.len(),
-            bitty_pty::READ_CHUNK_SIZE
-        );
-        max_chunk = max_chunk.max(chunk.len());
-        total += chunk.len();
-        chunks += 1;
-        assert!(
-            std::time::Instant::now() < deadline,
-            "flood drain timed out"
-        );
-        // The channel itself is bounded to 16 chunks; even if we drained
-        // slowly, total buffered inside the crate at any instant could never
-        // exceed MAX_BUFFERED_BYTES. We prove the weaker invariant that no
-        // single chunk exceeds READ_CHUNK_SIZE and that the pump completes
-        // without unbounded growth (total > MAX shunts would have hung or
-        // panicked if backpressure were broken).
-        assert!(
-            total <= 5000 * 10 + 8192,
-            "unreasonable total {total}, backpressure may have duplicated or leaked"
-        );
+    // Every wait is bounded by the overall deadline: silence past it (or a
+    // dead pump) panics with diagnostics instead of hanging the release.
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "flood drain timed out after {:?}: chunks={chunks} total={total} \
+                 child pid={:?} fg={:?} exit={:?} pump_error={:?}",
+                ECHO_TIMEOUT,
+                pty.pid(),
+                pty.foreground_pgid(),
+                pty.try_wait().ok().flatten(),
+                reader.pump_error(),
+            );
+        }
+        match reader.recv_timeout(remaining) {
+            Ok(Some(chunk)) => {
+                assert!(
+                    chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
+                    "flood chunk {} exceeds READ_CHUNK_SIZE {}",
+                    chunk.len(),
+                    bitty_pty::READ_CHUNK_SIZE
+                );
+                max_chunk = max_chunk.max(chunk.len());
+                total += chunk.len();
+                chunks += 1;
+                // The channel itself is bounded to 16 chunks; even if we drained
+                // slowly, total buffered inside the crate at any instant could never
+                // exceed MAX_BUFFERED_BYTES. We prove the weaker invariant that no
+                // single chunk exceeds READ_CHUNK_SIZE and that the pump completes
+                // without unbounded growth (total > MAX shunts would have hung or
+                // panicked if backpressure were broken).
+                //
+                // `seq 1 5000` emits 23,893 bytes raw (numbers 1..5000 plus
+                // newlines); PTY ONLCR expands each LF to CRLF, so at most
+                // 28,893 bytes reach the master. The bound below (48,192)
+                // leaves ~19 KiB of headroom for line-discipline echo;
+                // anything beyond means backpressure duplicated or leaked.
+                assert!(
+                    total <= 5000 * 8 + 8192,
+                    "unreasonable total {total}, backpressure may have duplicated or leaked"
+                );
+            }
+            // Clean EOF once the queue drained: `seq` exited on its own.
+            Ok(None) => break,
+            // Fail closed (CTX-1249): a stalled drain or a dead pump is a
+            // loud failure with counts plus child state, never a stuck run.
+            Err(recv_err) => {
+                panic!(
+                    "flood drain stalled ({recv_err:?}): chunks={chunks} total={total} \
+                     child pid={:?} fg={:?} exit={:?} pump_error={:?}",
+                    pty.pid(),
+                    pty.foreground_pgid(),
+                    pty.try_wait().ok().flatten(),
+                    reader.pump_error(),
+                );
+            }
+        }
     }
     assert!(chunks > 0, "flood should produce at least one chunk");
     assert!(
@@ -666,8 +709,8 @@ fn backpressure_bound_holds_under_flood() {
     );
 
     let status = pty.wait().expect("reap flood");
-    // `yes | head` exits 0 on most cores (SIGPIPE on `yes` is masked by pipe).
-    // We only assert the child was reaped, not success.
+    // `seq` exits 0 after bounded output. We only assert the child was
+    // reaped, not success, matching the previous posture.
     let _ = status.code();
     reader.join().expect("pump clean after flood");
 }

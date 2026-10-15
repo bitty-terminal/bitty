@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.23] - 2026-10-15
+
+### Added
+
+- **Render fast paths (CTX-1206, CTX-1207, CTX-1230, CTX-1231):** scroll
+  region-copy for scroll sequences, glyph-atlas slimming, an ASCII fast
+  path for printable runs, and present-latest frame coalescing. Perf
+  baselines against alacritty/kitty (idle, panels, profiles) are underway;
+  the idle RSS regression bisect (CTX-1216, #2087) already landed.
+- **Providers published at runtime (CTX-1193, CTX-1196, CTX-1197, CTX-1199,
+  CTX-1200, CTX-1201, CTX-1238):** cpu/memory/battery, audio spectrum and
+  state, and network/bluetooth/backlight providers are published at
+  runtime with Lua bridges, plus SDK closed-set parity and bar/composer
+  activation and `[settings]` declarations (CTX-1224-CTX-1228).
+- **Overlay input pump and submit (CTX-1170, CTX-1194, CTX-1223, CTX-1236,
+  CTX-1239):** host pump driver for overlay capture input, composer scene
+  chrome with headed input proof, modifier bits on flat overlay key
+  events (#2098), and `terminal.submit` bridged to Lua behind grants.
+- **Panel and scratchpad (CTX-1214, CTX-1240, CTX-1241):** `panel.create`
+  backend behind grants (#2085), plugin-free scratchpad show/hide path
+  (#2091), and shift-only `Char` excluded from the overlay chord.
+- **Box-drawing fix (CTX-1213, #2084):** U+2500 renders instead of blank.
+
+### Follow-ups (not in this release)
+
+- Per-extension live-activation proofs (CTX-1232) and remaining
+  table-options work continue after this release and are not claimed
+  above.
+
+### Release engineering
+
+- Workspace version bumped `0.0.22 -> 0.0.23`, applied to `Cargo.toml`,
+  `Cargo.lock`, internal `path` dependency pins (including the crates.io
+  metadata pins added since 0.0.22), `packaging/PKGBUILD*` `pkgver`,
+  `nfpm.yaml`, the `flake.nix` fallback, and the `README.md` release
+  line. `scripts/check-release-version.sh --tag v0.0.23` keeps
+  `bitty --version`, packaging metadata, and the release tag in
+  agreement.
+
 ## [0.0.22] - 2026-10-08
 
 ### Removed

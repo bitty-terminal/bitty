@@ -228,10 +228,12 @@ pub use hidpi::{
 };
 pub use pipeline::UNDERLINE_WGSL;
 pub use shaped::{
-    CJK_ADVANCE_EPSILON_PX, GlyphSource, MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES,
-    MAX_LOADED_FACES, MAX_RUN_CACHE_ENTRIES, MAX_SHAPE_PLANS_PER_FACE,
-    MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, ShapePlanKey,
-    ShapedCluster, ShapedGlyphKey, ShapedRun, SwashSingle, cells_for_range, collect_run_text,
-    features_for_policy, form_runs_for_row, harfrust_features,
+    ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GlyphSource,
+    MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_ENTRIES,
+    MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs,
+    RunCacheKey, ShapePlanKey, ShapedCluster, ShapedGlyphKey, ShapedRun, SwashSingle,
+    ascii_fast_path_eligible, cells_for_range, collect_run_text, features_are_unshaped,
+    features_for_policy, form_runs_for_row, harfrust_features, is_printable_ascii_byte,
+    is_printable_ascii_str, run_is_ascii_candidate,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

@@ -1772,6 +1772,13 @@ pub struct RenderCounters {
     /// monotone counter, no log spam; cells are never stretched or
     /// clipped.
     pub shaping_misaligned: u64,
+    /// Runs served by the ASCII fast path without harfbuzz shaping
+    /// (CTX-1230, issue #2092): printable ASCII runs with an unshaped
+    /// effective feature set emit straight through the char-keyed
+    /// cached-glyph path. Bounded monotone counter; each counted run
+    /// skipped its `shape_run` call entirely (runs missing the dirty range
+    /// also skip shaping but are not counted).
+    pub ascii_fast_path_runs: u64,
 }
 
 /// Occupancy fraction at which an exhausted atlas earns growth (CTX-1206,
@@ -2849,6 +2856,52 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.counters.glyphs_emitted += 1;
     }
 
+    /// Emits one ASCII-candidate run through the char-keyed cached-glyph
+    /// path without shaping (CTX-1230, issue #2092).
+    ///
+    /// Generic over the rasterizer so the shaped run path
+    /// (`FallbackRasterizer<SwashSingle>`) and headless tests share one
+    /// emission truth with the unshaped `render` path: each character emits
+    /// via [`Self::emit_glyph`] (same cache, same atlas, same tofu rule),
+    /// so fast-path output is byte-identical to per-cell rendering by
+    /// construction.
+    ///
+    /// Callers must establish
+    /// [`crate::shaped::ascii_fast_path_eligible`] first: this helper trusts
+    /// the 1:1 byte-to-cell mapping (`run.start_col + i` names char `i`'s
+    /// cell) and emits exactly `run.text.chars()` in order. Only cells
+    /// intersecting `dirty` (`[dirty_start, dirty_end)`, already clipped to
+    /// the run) emit; spaces stay background-only exactly as on both
+    /// existing paths. Returns the dirty-intersecting span for the caller's
+    /// background-union bookkeeping (one span; single-cell glyphs never
+    /// widen the repaint beyond the dirty range the way multi-cell ligature
+    /// spans do), or an empty vector when nothing intersected.
+    fn emit_ascii_fast_path(
+        &mut self,
+        run: &crate::shaped::ShapedRun,
+        row: usize,
+        dirty_start: usize,
+        dirty_end: usize,
+        fg: Rgba8,
+        list: &mut DrawList,
+    ) -> Vec<(usize, usize)> {
+        if dirty_start >= dirty_end {
+            return Vec::new();
+        }
+        for (abs_col, ch) in (run.start_col..).zip(run.text.chars()) {
+            if abs_col < dirty_start || abs_col >= dirty_end {
+                continue;
+            }
+            if ch == ' ' {
+                self.counters.blank_cells_skipped += 1;
+                continue;
+            }
+            self.emit_glyph(ch, row, abs_col, 1, fg, list);
+        }
+        self.counters.ascii_fast_path_runs = self.counters.ascii_fast_path_runs.saturating_add(1);
+        vec![(dirty_start, dirty_end - dirty_start)]
+    }
+
     /// Paints the RFC "Missing-glyph behavior" tofu box (CTX-0368).
     ///
     /// A visible `1 px` outline at the cluster's cell extent in the cell
@@ -3294,6 +3347,19 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         // shaped, tofu, and unshaped fallback alike).
         if shaped_run_is_invisible(snapshot, row, snapshot.width, run) {
             return Ok(vec![(run.start_col, run.col_count)]);
+        }
+        // ASCII fast path (CTX-1230, issue #2092): printable ASCII runs
+        // with an unshaped effective feature set bypass harfbuzz shaping
+        // (no run-cache lookup, no `shape_run` call, no shape miss counted)
+        // and emit per cell through the char-keyed cached-glyph path. Mixed
+        // runs and ligature-live feature sets fall through to shaping below,
+        // so ligatures and exotic features keep their shaped output.
+        if crate::shaped::ascii_fast_path_eligible(run, effective) {
+            let cols = snapshot.width;
+            let fg = self.shaped_run_fg(snapshot, row, cols, run);
+            let dirty_start = dirty_cols.start.max(run.start_col);
+            let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
+            return Ok(self.emit_ascii_fast_path(run, row, dirty_start, dirty_end, fg, list));
         }
         let attrs = RunAttrs {
             features: effective.to_vec(),

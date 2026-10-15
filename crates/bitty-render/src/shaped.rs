@@ -941,6 +941,92 @@ pub fn form_runs_for_row(
     runs
 }
 
+/// First printable ASCII byte (`space`, CTX-1230).
+pub const ASCII_PRINTABLE_FIRST: u8 = 0x20;
+/// Last printable ASCII byte (`~`, CTX-1230).
+pub const ASCII_PRINTABLE_LAST: u8 = 0x7E;
+
+/// True when `b` is a printable ASCII byte (`0x20..=0x7E`, CTX-1230).
+///
+/// C0/C1 controls, DEL, and every non-ASCII byte are excluded: shaping stays
+/// mandatory for all of them (combining marks, wide scalars, and bidi
+/// controls all live outside this range).
+#[must_use]
+pub const fn is_printable_ascii_byte(b: u8) -> bool {
+    b >= ASCII_PRINTABLE_FIRST && b <= ASCII_PRINTABLE_LAST
+}
+
+/// True when `text` is non-empty and every byte is printable ASCII (CTX-1230).
+///
+/// The byte scan implies pure ASCII (`str` bytes above `0x7F` fail), so for
+/// eligible runs `text.len()` also counts characters and grid cells.
+#[must_use]
+pub fn is_printable_ascii_str(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(is_printable_ascii_byte)
+}
+
+/// True when `run` may bypass harfbuzz shaping for the cached-glyph fast path
+/// (CTX-1230, issue #2092): pure printable ASCII with an exact byte-to-cell
+/// mapping.
+///
+/// The `col_count == text.len()` conjunct pins one grid cell per byte: wide
+/// scalars and combining-mark sequences change the byte/cell ratio (and are
+/// non-ASCII besides), so they can never satisfy both halves at once. Blank
+/// runs never occur ([`form_runs_for_row`] never emits empty text), and the
+/// empty check keeps direct callers total.
+#[must_use]
+pub fn run_is_ascii_candidate(run: &ShapedRun) -> bool {
+    !run.text.is_empty() && run.col_count == run.text.len() && is_printable_ascii_str(&run.text)
+}
+
+/// True when `features` (already effective for the run's policy) leave no
+/// shaping work for an ASCII candidate (CTX-1230).
+///
+/// Exactly the four [`PROGRAMMING_LIGATURE_TAGS`] zeroed and nothing else:
+/// every entry must name one of the four with value `0`, and each of the
+/// four must appear. Any other tag (for example a stylistic alternate such
+/// as `ss01=2`) may reshape even single glyphs, which the char-keyed glyph
+/// cache cannot represent — so the run stays shaped. An empty list keeps
+/// font-default ligatures live and is ineligible. This is the same tag set
+/// the cursor un-shape rule zeroes, so `Always` output (which forces exactly
+/// these four) is eligible while `Never`/`Cursor` verbatim lists are not
+/// unless the caller zeroed all four by hand.
+#[must_use]
+pub fn features_are_unshaped(features: &[bitty_config::types::OpenTypeFeature]) -> bool {
+    if features.is_empty() {
+        return false;
+    }
+    let mut seen = [false; PROGRAMMING_LIGATURE_TAGS.len()];
+    for feature in features {
+        let Some(index) = PROGRAMMING_LIGATURE_TAGS
+            .iter()
+            .position(|tag| *tag == feature.tag)
+        else {
+            return false;
+        };
+        if feature.value != 0 {
+            return false;
+        }
+        seen[index] = true;
+    }
+    seen.iter().all(|seen| *seen)
+}
+
+/// True when `run` may skip harfbuzz shaping and emit straight through the
+/// char-keyed cached-glyph path (CTX-1230, issue #2092).
+///
+/// Both halves are required: an ASCII-candidate run *and* an unshaped
+/// effective feature set. Mixed runs (any non-ASCII byte, wide scalar, or
+/// combining mark) and ligature-live feature sets (the `Never`/`Cursor`
+/// defaults, or any exotic tag) fall back to [`SwashSingle::shape_run`].
+#[must_use]
+pub fn ascii_fast_path_eligible(
+    run: &ShapedRun,
+    effective: &[bitty_config::types::OpenTypeFeature],
+) -> bool {
+    run_is_ascii_candidate(run) && features_are_unshaped(effective)
+}
+
 /// Maps the owned style vocabulary onto `fontdb` match attributes.
 fn style_attrs(style: &FontStyle) -> (Weight, Style) {
     match style {
@@ -1739,6 +1825,209 @@ mod tests {
             shaper.dynamic_face_count(),
             MAX_DYNAMIC_FALLBACK_FACES,
             "cache overflow must not reset the dynamic-face quota"
+        );
+    }
+
+    #[test]
+    fn printable_ascii_byte_boundaries() {
+        // CTX-1230: space through tilde eligible; controls, DEL, high bytes out.
+        assert!(!is_printable_ascii_byte(0x00));
+        assert!(!is_printable_ascii_byte(0x09));
+        assert!(!is_printable_ascii_byte(0x0A));
+        assert!(!is_printable_ascii_byte(0x1F));
+        assert!(is_printable_ascii_byte(0x20));
+        assert!(is_printable_ascii_byte(0x30));
+        assert!(is_printable_ascii_byte(0x7E));
+        assert!(!is_printable_ascii_byte(0x7F));
+        assert!(!is_printable_ascii_byte(0x80));
+        assert!(!is_printable_ascii_byte(0xFF));
+    }
+
+    #[test]
+    fn printable_ascii_str_rejects_mixed_and_empty() {
+        // CTX-1230: pure runs eligible; anything else falls back to shaping.
+        assert!(is_printable_ascii_str("hello 123!~"));
+        assert!(is_printable_ascii_str("->=>==!= ffi"));
+        assert!(!is_printable_ascii_str(""));
+        assert!(!is_printable_ascii_str("héllo"));
+        assert!(!is_printable_ascii_str("a\nb"));
+        assert!(!is_printable_ascii_str("a\tb"));
+        assert!(!is_printable_ascii_str("a\u{7F}b"));
+        assert!(!is_printable_ascii_str("漢"));
+        assert!(!is_printable_ascii_str("A\u{1F600}B"));
+        assert!(!is_printable_ascii_str("é"));
+    }
+
+    #[test]
+    fn ascii_candidate_pins_one_cell_per_byte() {
+        // CTX-1230: candidate needs ASCII text with byte/cell parity.
+        let candidate = ShapedRun {
+            start_col: 4,
+            text: "abc123".to_string(),
+            col_count: 6,
+        };
+        assert!(run_is_ascii_candidate(&candidate));
+        // Byte/cell mismatch (wide scalar span, combining expansion): shaped.
+        let wide = ShapedRun {
+            start_col: 0,
+            text: "漢".to_string(),
+            col_count: 2,
+        };
+        assert!(!run_is_ascii_candidate(&wide));
+        let empty = ShapedRun {
+            start_col: 0,
+            text: String::new(),
+            col_count: 0,
+        };
+        assert!(!run_is_ascii_candidate(&empty));
+        let mixed = ShapedRun {
+            start_col: 0,
+            text: "A漢".to_string(),
+            col_count: 3,
+        };
+        assert!(!run_is_ascii_candidate(&mixed));
+        let marked = ShapedRun {
+            start_col: 0,
+            text: "é".to_string(),
+            col_count: 1,
+        };
+        assert!(!run_is_ascii_candidate(&marked));
+    }
+
+    #[test]
+    fn unshaped_feature_gate() {
+        // CTX-1230: exactly the four programming tags zeroed, nothing else.
+        use bitty_config::types::{LigaturePolicy, OpenTypeFeature};
+        let always = features_for_policy(&[], LigaturePolicy::Always);
+        assert!(features_are_unshaped(&always));
+        // Ligature-live defaults stay shaped.
+        assert!(!features_are_unshaped(&[]));
+        assert!(!features_are_unshaped(&features_for_policy(
+            &[],
+            LigaturePolicy::Never
+        )));
+        assert!(!features_are_unshaped(&features_for_policy(
+            &[],
+            LigaturePolicy::Cursor
+        )));
+        // Partial zeroes leave a ligature live.
+        let partial = vec![OpenTypeFeature::parse("calt=0").unwrap()];
+        assert!(!features_are_unshaped(&partial));
+        // An enabled programming tag stays shaped.
+        let enabled = vec![
+            OpenTypeFeature::parse("calt=0").unwrap(),
+            OpenTypeFeature::parse("liga=1").unwrap(),
+            OpenTypeFeature::parse("clig=0").unwrap(),
+            OpenTypeFeature::parse("dlig=0").unwrap(),
+        ];
+        assert!(!features_are_unshaped(&enabled));
+        // An exotic tag may reshape single glyphs: shaped even with the
+        // four zeroed (Always + user alternate).
+        let mut exotic = features_for_policy(
+            &[OpenTypeFeature::parse("ss01=2").unwrap()],
+            LigaturePolicy::Always,
+        );
+        exotic.sort_by_key(|feature| feature.tag);
+        assert!(!features_are_unshaped(&exotic));
+        // Hand-zeroed four (Never + explicit user list) is unshaped.
+        let hand = vec![
+            OpenTypeFeature::parse("calt=0").unwrap(),
+            OpenTypeFeature::parse("liga=0").unwrap(),
+            OpenTypeFeature::parse("clig=0").unwrap(),
+            OpenTypeFeature::parse("dlig=0").unwrap(),
+        ];
+        assert!(features_are_unshaped(&hand));
+    }
+
+    #[test]
+    fn ascii_eligibility_needs_both_halves() {
+        // CTX-1230: candidate run + unshaped features; either half missing
+        // falls back to shaping.
+        use bitty_config::types::LigaturePolicy;
+        let run = ShapedRun {
+            start_col: 0,
+            text: "seq 12345".to_string(),
+            col_count: 9,
+        };
+        let always = features_for_policy(&[], LigaturePolicy::Always);
+        assert!(ascii_fast_path_eligible(&run, &always));
+        let never = features_for_policy(&[], LigaturePolicy::Never);
+        assert!(!ascii_fast_path_eligible(&run, &never));
+        let cjk = ShapedRun {
+            start_col: 0,
+            text: "漢".to_string(),
+            col_count: 2,
+        };
+        assert!(!ascii_fast_path_eligible(&cjk, &always));
+        let ligature_text = ShapedRun {
+            start_col: 0,
+            text: "->".to_string(),
+            col_count: 2,
+        };
+        // Ligature-formable ASCII is still a candidate structurally, but the
+        // feature half decides: Always bypasses (ligatures forced off),
+        // Never shapes (ligature may form).
+        assert!(ascii_fast_path_eligible(&ligature_text, &always));
+        assert!(!ascii_fast_path_eligible(&ligature_text, &never));
+    }
+
+    #[test]
+    fn formed_runs_route_ascii_and_mixed_correctly() {
+        // CTX-1230: run formation output routes end to end without fonts.
+        use bitty_config::types::LigaturePolicy;
+        use bitty_term_state::{Cell, Style};
+        let style = Style::default();
+        let mut ascii_cells = Vec::new();
+        for ch in "abc123".chars() {
+            let mut cell = Cell::erased(style);
+            cell.glyph = ch;
+            ascii_cells.push(cell);
+        }
+        let mut cjk_cell = Cell::erased(style);
+        cjk_cell.glyph = '漢';
+        cjk_cell.width = 2;
+        let spacer = Cell::wide_spacer(style);
+        let blank = Cell::erased(style);
+        let mut row = ascii_cells;
+        row.push(cjk_cell);
+        row.push(spacer);
+        row.push(blank);
+        let runs = form_runs_for_row(&row, 0);
+        // The wide leading cell joins the same-style run (only spacers and
+        // blanks break runs), so ASCII+CJK fuse into one mixed run that must
+        // stay shaped.
+        assert_eq!(runs.len(), 1, "mixed content fuses: {runs:?}");
+        assert_eq!(runs[0].text, "abc123漢");
+        assert_eq!(runs[0].col_count, 8);
+        let always = features_for_policy(&[], LigaturePolicy::Always);
+        assert!(
+            !ascii_fast_path_eligible(&runs[0], &always),
+            "mixed ASCII+CJK run must stay shaped: {:?}",
+            runs[0]
+        );
+        // Pure ASCII row fast-paths.
+        let mut pure = Vec::new();
+        for ch in "abc123".chars() {
+            let mut cell = Cell::erased(style);
+            cell.glyph = ch;
+            pure.push(cell);
+        }
+        let pure_runs = form_runs_for_row(&pure, 0);
+        assert_eq!(pure_runs.len(), 1);
+        assert!(
+            ascii_fast_path_eligible(&pure_runs[0], &always),
+            "pure ASCII run must fast-path: {:?}",
+            pure_runs[0]
+        );
+        // Combining mark on an ASCII base breaks eligibility (mark bytes).
+        let mut base = Cell::erased(style);
+        base.glyph = 'e';
+        base.push_zerowidth('́');
+        let marked_runs = form_runs_for_row(std::slice::from_ref(&base), 0);
+        assert_eq!(marked_runs.len(), 1);
+        assert!(
+            !ascii_fast_path_eligible(&marked_runs[0], &always),
+            "combining mark must stay shaped"
         );
     }
 }

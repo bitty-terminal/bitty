@@ -2868,3 +2868,152 @@ fn shaped_atlas_growth_gate_mirrors_char_path() {
     assert!(atlas.is_exhausted());
     assert_eq!(atlas.dims().width, 512);
 }
+
+// ---------------------------------------------------------------------------
+// ASCII fast path (CTX-1230, issue #2092): headless emission parity
+
+#[test]
+fn ascii_fast_path_emission_matches_per_cell_glyphs() {
+    use super::{DrawList, SnapshotDamage};
+    use crate::shaped::ShapedRun;
+
+    // Reference: the unshaped per-cell path over an ASCII row.
+    let mut reference = renderer();
+    let state = state_from(&[
+        print('A'),
+        print('B'),
+        print('C'),
+        print('1'),
+        print('2'),
+        print('3'),
+    ]);
+    let snap = state.snapshot();
+    let damage = full_damage(&state);
+    let list = reference.render(&snap, &damage).expect("renders");
+
+    // Fast path: the same cells through the ASCII helper on a fresh
+    // renderer (same fake, same insertion order).
+    let mut fast = renderer();
+    let descriptor = SnapshotDamage::new(&snap, &damage, cell_metrics());
+    let plan = plan_frame(&descriptor);
+    let mut fast_list = DrawList {
+        generation: snap.generation,
+        atlas_epoch: fast.atlas_epoch(),
+        plan,
+        fills: Vec::new(),
+        rounded_fills: Vec::new(),
+        backgrounds: Vec::new(),
+        overlay_fills: Vec::new(),
+        glyphs: Vec::new(),
+        images: Vec::new(),
+    };
+    let run = ShapedRun {
+        start_col: 0,
+        text: "ABC123".to_string(),
+        col_count: 6,
+    };
+    let (fg, _) = resolved_colors(&snap.cells[0].style);
+    let spans = fast.emit_ascii_fast_path(&run, 0, 0, 6, fg, &mut fast_list);
+
+    assert_eq!(spans, vec![(0, 6)]);
+    assert_eq!(fast.counters().ascii_fast_path_runs, 1);
+    assert_eq!(
+        fast_list.glyphs, list.glyphs,
+        "fast-path glyphs must be byte-identical to per-cell emission"
+    );
+}
+
+#[test]
+fn ascii_fast_path_clips_dirty_and_skips_spaces() {
+    use crate::shaped::ShapedRun;
+
+    // Row "A C": the space stays background-only on the fast path exactly
+    // as on both existing paths; dirty clipping serves the middle cell only.
+    let mut grid = renderer();
+    let state = state_from(&[print('A'), print(' '), print('C')]);
+    let snap = state.snapshot();
+    let (fg, _) = resolved_colors(&snap.cells[0].style);
+    let run = ShapedRun {
+        start_col: 0,
+        text: "A C".to_string(),
+        col_count: 3,
+    };
+    let descriptor = super::SnapshotDamage::new(&snap, &full_damage(&state), cell_metrics());
+    let plan = plan_frame(&descriptor);
+    let mut list = super::DrawList {
+        generation: snap.generation,
+        atlas_epoch: grid.atlas_epoch(),
+        plan,
+        fills: Vec::new(),
+        rounded_fills: Vec::new(),
+        backgrounds: Vec::new(),
+        overlay_fills: Vec::new(),
+        glyphs: Vec::new(),
+        images: Vec::new(),
+    };
+    let spans = grid.emit_ascii_fast_path(&run, 0, 0, 3, fg, &mut list);
+    assert_eq!(spans, vec![(0, 3)]);
+    assert_eq!(list.glyphs.len(), 2, "space emits no glyph");
+    assert_eq!(list.glyphs[0].dest[0], 0, "A at col 0");
+    assert_eq!(
+        list.glyphs[1].dest[0],
+        i32::try_from(cell_metrics().width).unwrap() * 2,
+        "C at col 2"
+    );
+    assert_eq!(grid.counters().ascii_fast_path_runs, 1);
+
+    // Dirty clipping to the middle (space) column emits nothing but still
+    // reports the intersecting span for background bookkeeping.
+    let mut clipped = renderer();
+    let (fg, _) = resolved_colors(&snap.cells[0].style);
+    let descriptor = super::SnapshotDamage::new(&snap, &full_damage(&state), cell_metrics());
+    let plan = plan_frame(&descriptor);
+    let mut clipped_list = super::DrawList {
+        generation: snap.generation,
+        atlas_epoch: clipped.atlas_epoch(),
+        plan,
+        fills: Vec::new(),
+        rounded_fills: Vec::new(),
+        backgrounds: Vec::new(),
+        overlay_fills: Vec::new(),
+        glyphs: Vec::new(),
+        images: Vec::new(),
+    };
+    let spans = clipped.emit_ascii_fast_path(&run, 0, 1, 2, fg, &mut clipped_list);
+    assert_eq!(spans, vec![(1, 1)]);
+    assert!(clipped_list.glyphs.is_empty());
+}
+
+#[test]
+fn ascii_fast_path_empty_dirty_emits_nothing() {
+    use crate::shaped::ShapedRun;
+
+    let mut grid = renderer();
+    let state = state_from(&[print('A')]);
+    let snap = state.snapshot();
+    let (fg, _) = resolved_colors(&snap.cells[0].style);
+    let run = ShapedRun {
+        start_col: 0,
+        text: "A".to_string(),
+        col_count: 1,
+    };
+    let descriptor = super::SnapshotDamage::new(&snap, &full_damage(&state), cell_metrics());
+    let plan = plan_frame(&descriptor);
+    let mut list = super::DrawList {
+        generation: snap.generation,
+        atlas_epoch: grid.atlas_epoch(),
+        plan,
+        fills: Vec::new(),
+        rounded_fills: Vec::new(),
+        backgrounds: Vec::new(),
+        overlay_fills: Vec::new(),
+        glyphs: Vec::new(),
+        images: Vec::new(),
+    };
+    assert!(
+        grid.emit_ascii_fast_path(&run, 0, 0, 0, fg, &mut list)
+            .is_empty()
+    );
+    assert!(list.glyphs.is_empty());
+    assert_eq!(grid.counters().ascii_fast_path_runs, 0);
+}

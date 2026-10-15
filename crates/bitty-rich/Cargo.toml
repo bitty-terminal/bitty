@@ -14,14 +14,14 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-term-state = { version = "0.0.22", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.22", path = "../bitty-vt" }
-bitty-platform = { version = "0.0.22", path = "../bitty-platform" }
+bitty-term-state = { version = "0.0.23", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.23", path = "../bitty-vt" }
+bitty-platform = { version = "0.0.23", path = "../bitty-platform" }
 # W-103 G-3: the blocking hosted-editor spawn records and kills the whole
 # owned process tree through the execution boundary's reviewed tracker
 # (`bitty_pty::OwnedTree`); workspace-internal path edge, no new
 # supply-chain surface.
-bitty-pty = { version = "0.0.22", path = "../bitty-pty" }
+bitty-pty = { version = "0.0.23", path = "../bitty-pty" }
 # Fragment-to-RichBlock projection (CTX-0439) reads the bounded ingestion
 # DTOs; workspace-internal edge, no new supply-chain surface.
 # `version` is required for `cargo publish` (lockfile pins 0.0.1); the git

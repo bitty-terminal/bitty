@@ -609,48 +609,60 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
     reader.join().expect("pump ended cleanly after shell");
 }
 
-#[test]
-fn backpressure_bound_holds_under_flood() {
-    // Flood the bounded channel with a self-terminating single process:
-    // `seq 1 5000` exits on its own after bounded output, with no
-    // pipeline-death dependence. The previous `yes | head -n 5000` source
-    // hung forever on FreeBSD 15.1 (CTX-1249 / #2119): when the pipeline
-    // never dies no EOF arrives, and the old `while let Ok(Some) =
-    // reader.recv()` drain blocked forever because its deadline assert only
-    // ran after a chunk arrived (zero chunks = infinite block, stuck
-    // release). `seq` ships everywhere this suite runs: FreeBSD base since
-    // 9.0, macOS BSD userland, and GNU coreutils on Linux.
-    //
-    // The kernel PTY buffer + channel backpressure blocks the child instead
-    // of growing the heap; the in-crate buffer never exceeds
-    // MAX_BUFFERED_BYTES.
-    let mut pty = PtyBuilder::new("/bin/sh")
-        .arg("-c")
-        .arg("seq 1 5000")
-        .spawn()
-        .expect("spawn flood");
+/// Outcome of a single flood-drain attempt against one PTY.
+struct FloodAttempt {
+    chunks: usize,
+    total: usize,
+    max_chunk: usize,
+    /// True when the drain saw clean EOF; false when the overall deadline
+    /// expired or the pump died mid-drain.
+    finished: bool,
+}
 
-    let reader = pty.take_reader().expect("reader half");
+/// Maximum flood attempts: the first spawn plus one fresh-PTY respawn.
+const MAX_FLOOD_ATTEMPTS: usize = 2;
 
-    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+/// Whether a flood attempt's outcome earns a fresh-PTY respawn (CTX-1251).
+///
+/// Only a silent startup is retryable: the attempt delivered nothing, so it
+/// carries no signal about the bound under test. That covers both FreeBSD
+/// recycled-PTS transient signatures — a stalled drain (the child took a
+/// stale hangup SIGHUP at startup while something still holds the slave, so
+/// the pump never sees EOF) and a clean EOF with zero chunks (a fast `seq`
+/// exit discarded before the pump's first read, the CTX-1019 exit-vs-drain
+/// race). Any attempt that delivered output is accepted (clean EOF) or a
+/// genuine failure (mid-stream stall), never a retry; the bound asserts in
+/// the caller still run on every accepted attempt.
+fn flood_attempt_needs_retry(attempt: &FloodAttempt, attempts_used: usize) -> bool {
+    if attempts_used >= MAX_FLOOD_ATTEMPTS {
+        return false;
+    }
+    attempt.chunks == 0
+}
+
+/// Drains one flood PTY until clean EOF or the shared deadline, asserting
+/// the per-chunk and total bounds on the way.
+///
+/// Returns the attempt outcome instead of panicking: the caller owns the
+/// retry-or-fail-loud decision (`flood_attempt_needs_retry`). `finished` is
+/// true only on clean EOF; a stall (deadline expired or pump failure) sets
+/// it false and the caller panics with the child state attached.
+fn drain_flood_attempt(
+    reader: &bitty_pty::PtyReader,
+    deadline: std::time::Instant,
+) -> FloodAttempt {
     let mut total = 0usize;
     let mut chunks = 0usize;
     let mut max_chunk = 0usize;
-    // Drain until EOF, asserting per-chunk bound holds even under flood.
-    // Every wait is bounded by the overall deadline: silence past it (or a
-    // dead pump) panics with diagnostics instead of hanging the release.
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            panic!(
-                "flood drain timed out after {:?}: chunks={chunks} total={total} \
-                 child pid={:?} fg={:?} exit={:?} pump_error={:?}",
-                ECHO_TIMEOUT,
-                pty.pid(),
-                pty.foreground_pgid(),
-                pty.try_wait().ok().flatten(),
-                reader.pump_error(),
-            );
+            return FloodAttempt {
+                chunks,
+                total,
+                max_chunk,
+                finished: false,
+            };
         }
         match reader.recv_timeout(remaining) {
             Ok(Some(chunk)) => {
@@ -681,21 +693,217 @@ fn backpressure_bound_holds_under_flood() {
                 );
             }
             // Clean EOF once the queue drained: `seq` exited on its own.
-            Ok(None) => break,
-            // Fail closed (CTX-1249): a stalled drain or a dead pump is a
-            // loud failure with counts plus child state, never a stuck run.
-            Err(recv_err) => {
-                panic!(
-                    "flood drain stalled ({recv_err:?}): chunks={chunks} total={total} \
-                     child pid={:?} fg={:?} exit={:?} pump_error={:?}",
-                    pty.pid(),
-                    pty.foreground_pgid(),
-                    pty.try_wait().ok().flatten(),
-                    reader.pump_error(),
-                );
+            Ok(None) => {
+                return FloodAttempt {
+                    chunks,
+                    total,
+                    max_chunk,
+                    finished: true,
+                };
+            }
+            // Stall or dead pump: report it, never hang. The caller turns
+            // this into a retry (silent startup transient) or a loud panic
+            // with the child state attached.
+            Err(_) => {
+                return FloodAttempt {
+                    chunks,
+                    total,
+                    max_chunk,
+                    finished: false,
+                };
             }
         }
     }
+}
+
+#[test]
+fn flood_retry_covers_only_silent_startup_transients() {
+    // CTX-1251: a flood attempt that delivered nothing is a startup
+    // transient (stale-PTS SIGHUP stall, or a fast-`seq` exit discarded
+    // before the pump's first read) and earns one fresh-PTY respawn; a
+    // second miss is genuine and must panic loud.
+    let silent_eof = FloodAttempt {
+        chunks: 0,
+        total: 0,
+        max_chunk: 0,
+        finished: true,
+    };
+    assert!(flood_attempt_needs_retry(&silent_eof, 1));
+    assert!(!flood_attempt_needs_retry(&silent_eof, 2));
+    let stalled_silent = FloodAttempt {
+        chunks: 0,
+        total: 0,
+        max_chunk: 0,
+        finished: false,
+    };
+    assert!(flood_attempt_needs_retry(&stalled_silent, 1));
+    assert!(!flood_attempt_needs_retry(&stalled_silent, 2));
+    // Any attempt that delivered output says nothing about startup: a
+    // clean EOF is accepted (the bound asserts below still run on it) and
+    // a mid-stream stall is a genuine failure, never a retry.
+    let partial_eof = FloodAttempt {
+        chunks: 3,
+        total: 100,
+        max_chunk: 64,
+        finished: true,
+    };
+    assert!(!flood_attempt_needs_retry(&partial_eof, 1));
+    let partial_stall = FloodAttempt {
+        chunks: 3,
+        total: 100,
+        max_chunk: 64,
+        finished: false,
+    };
+    assert!(!flood_attempt_needs_retry(&partial_stall, 1));
+}
+
+#[test]
+fn flood_drain_attempt_reports_clean_eof_with_output() {
+    // Small live probe of the shared drain helper: direct `seq` resolves
+    // through PATH on every runner and the helper reports clean EOF with
+    // output. One bounded respawn absorbs the FreeBSD fast-exit discard
+    // (CTX-1019 family) so this probe is not itself flaky there.
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut attempts_used = 0usize;
+    let mut accepted: Option<FloodAttempt> = None;
+    let mut pty = None;
+    let mut reader = None;
+    while attempts_used < MAX_FLOOD_ATTEMPTS {
+        attempts_used += 1;
+        let mut spawned = PtyBuilder::new("seq")
+            .arg("1")
+            .arg("10")
+            .spawn()
+            .expect("spawn seq");
+        let spawned_reader = spawned.take_reader().expect("reader half");
+        let attempt = drain_flood_attempt(&spawned_reader, deadline);
+        if attempt.finished && attempt.chunks > 0 {
+            accepted = Some(attempt);
+            pty = Some(spawned);
+            reader = Some(spawned_reader);
+            break;
+        }
+    }
+    let attempt = accepted.expect("seq 1 10 must deliver output within the deadline");
+    assert!(attempt.total > 0);
+    assert!(attempt.max_chunk > 0 && attempt.max_chunk <= bitty_pty::READ_CHUNK_SIZE);
+    let mut pty = pty.expect("pty half");
+    let status = pty.wait().expect("reap seq");
+    assert!(status.is_success(), "seq should exit 0, got {status:?}");
+    reader.expect("reader half").join().expect("pump clean");
+}
+
+#[test]
+fn backpressure_bound_holds_under_flood() {
+    // Flood the bounded channel with a self-terminating single process:
+    // `seq 1 5000` exits on its own after bounded output, with no
+    // pipeline-death dependence. The previous `yes | head -n 5000` source
+    // hung forever on FreeBSD 15.1 (CTX-1249 / #2119): when the pipeline
+    // never dies no EOF arrives, and the old `while let Ok(Some) =
+    // reader.recv()` drain blocked forever because its deadline assert only
+    // ran after a chunk arrived (zero chunks = infinite block, stuck
+    // release).
+    //
+    // CTX-1251 (reopened #2119, re-release run 38781204894): the
+    // self-terminating source plus the fail-closed drain worked as designed
+    // — the 60-minute silent hang became a loud 10-second timeout — but the
+    // child died at startup with SIGHUP and zero chunks ever arrived
+    // (`flood drain stalled (Timeout): chunks=0 total=0 ... fg=None
+    // exit=Hangup pump_error=None`). Root-cause analysis:
+    //
+    // - The spawn path has no Linux/FreeBSD divergence to fix: `portable-pty`
+    //   resets the inherited signal dispositions (including SIGHUP) to
+    //   `SIG_DFL`, unblocks the mask, and runs `setsid` + `TIOCSCTTY`
+    //   identically on every Unix. A SIGHUP that lands after a successful
+    //   spawn is a kernel-delivered hangup on a recycled PTS (the CTX-1020
+    //   family already documents stale terminal state on recycled devices
+    //   under parallel-spawn load in the emulated FreeBSD VM), outside
+    //   anything the library controls — so, as with that family, the right
+    //   layer is a bounded fresh-PTY retry in the test, not a spawn change.
+    // - The old `sh -c` middleman is gone: `seq` is spawned directly as an
+    //   argv vector (no shell fork/orphan/job-control chain left to
+    //   diagnose, and direct argv exec matches the crate's security
+    //   posture). The bare name resolves through PATH on every runner
+    //   (FreeBSD base, macOS BSD userland, GNU coreutils on Linux), so no
+    //   absolute-path portability claim is needed.
+    // - A silent attempt (stalled drain or clean EOF, both with zero chunks)
+    //   is a startup transient and earns exactly one fresh-PTY respawn; the
+    //   shared `ECHO_TIMEOUT` deadline still bounds both attempts together,
+    //   and every bound assert below still runs unchanged on the accepted
+    //   attempt. A second miss, or a mid-stream stall after output started,
+    //   panics loud with the child state attached instead of hanging the
+    //   release.
+    //
+    // The kernel PTY buffer + channel backpressure blocks the child instead
+    // of growing the heap; the in-crate buffer never exceeds
+    // MAX_BUFFERED_BYTES.
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut diagnosis = String::from("no attempts ran");
+    let mut attempts_used = 0usize;
+    let mut accepted: Option<(FloodAttempt, bitty_pty::Pty, bitty_pty::PtyReader)> = None;
+    while attempts_used < MAX_FLOOD_ATTEMPTS {
+        attempts_used += 1;
+        let mut pty = match PtyBuilder::new("seq").arg("1").arg("5000").spawn() {
+            Ok(pty) => pty,
+            Err(err) => {
+                diagnosis = format!("attempt {attempts_used}: spawn failed: {err:?}");
+                continue;
+            }
+        };
+        let reader = pty.take_reader().expect("reader half");
+        let attempt = drain_flood_attempt(&reader, deadline);
+        if attempt.finished && attempt.chunks > 0 {
+            accepted = Some((attempt, pty, reader));
+            break;
+        }
+        if flood_attempt_needs_retry(&attempt, attempts_used) {
+            // Silent startup transient: record the terminal state, then drop
+            // the dud (its `Drop` kills and reaps within a bound, so a
+            // stuck or stopped holder of the slave cannot linger) and try
+            // once more with a fresh device. `try_wait` here only marks the
+            // dud reaped when it is already dead; a live dud stays unreaped
+            // so `Drop` still kills it — no leak either way.
+            diagnosis = format!(
+                "attempt {attempts_used}: {} chunks={} total={} \
+                 child pid={:?} fg={:?} exit={:?} pump_error={:?}",
+                if attempt.finished {
+                    "silent EOF"
+                } else {
+                    "stalled drain"
+                },
+                attempt.chunks,
+                attempt.total,
+                pty.pid(),
+                pty.foreground_pgid(),
+                pty.try_wait().ok().flatten(),
+                reader.pump_error(),
+            );
+            drop(pty);
+            continue;
+        }
+        // Mid-stream stall after output started, or a silent second attempt:
+        // genuine failure, loud with the child state attached.
+        panic!(
+            "flood drain failed ({}) after {attempts_used} attempt(s): chunks={} total={} \
+             child pid={:?} fg={:?} exit={:?} pump_error={:?}",
+            if attempt.finished {
+                "silent EOF twice"
+            } else {
+                "stalled drain"
+            },
+            attempt.chunks,
+            attempt.total,
+            pty.pid(),
+            pty.foreground_pgid(),
+            pty.try_wait().ok().flatten(),
+            reader.pump_error(),
+        );
+    }
+    let (attempt, mut pty, reader) = accepted.unwrap_or_else(|| {
+        panic!("flood never produced output after a fresh respawn: {diagnosis}");
+    });
+    let chunks = attempt.chunks;
+    let max_chunk = attempt.max_chunk;
     assert!(chunks > 0, "flood should produce at least one chunk");
     assert!(
         max_chunk > 0 && max_chunk <= bitty_pty::READ_CHUNK_SIZE,

@@ -640,22 +640,57 @@ fn flood_attempt_needs_retry(attempt: &FloodAttempt, attempts_used: usize) -> bo
     attempt.chunks == 0
 }
 
+/// Silent-phase deadline for a flood attempt: how long the drain waits for
+/// the *first* chunk before giving up the attempt.
+///
+/// The first attempt must reserve time for the respawn: a silent startup
+/// stall (the CTX-1251 SIGHUP signature) would otherwise burn the whole
+/// shared deadline and leave the retry nothing to run on. So attempt 1 waits
+/// only half the remaining shared budget for its first chunk; once any chunk
+/// arrives the attempt is healthy and drains until the shared deadline, and
+/// the final attempt always gets the full remainder (a second silence is
+/// genuine and panics loud).
+fn silent_deadline_for_attempt(
+    deadline: std::time::Instant,
+    attempts_used: usize,
+) -> Option<std::time::Instant> {
+    if attempts_used == 1 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        Some(std::time::Instant::now() + remaining / 2)
+    } else {
+        None
+    }
+}
+
 /// Drains one flood PTY until clean EOF or the shared deadline, asserting
 /// the per-chunk and total bounds on the way.
 ///
 /// Returns the attempt outcome instead of panicking: the caller owns the
 /// retry-or-fail-loud decision (`flood_attempt_needs_retry`). `finished` is
-/// true only on clean EOF; a stall (deadline expired or pump failure) sets
+/// true only on clean EOF; a stall (deadlines expired or pump failure) sets
 /// it false and the caller panics with the child state attached.
+///
+/// `silent_deadline` caps only the wait for the *first* chunk (the attempt-1
+/// reservation from `silent_deadline_for_attempt`): while still silent the
+/// drain waits on it, so a startup stall leaves time for the fresh-PTY
+/// respawn. After the first chunk — or when `None` (final attempt) — the
+/// full shared `deadline` applies, so a healthy but slow drain is never cut
+/// short for retry time it does not need.
 fn drain_flood_attempt(
     reader: &bitty_pty::PtyReader,
     deadline: std::time::Instant,
+    silent_deadline: Option<std::time::Instant>,
 ) -> FloodAttempt {
     let mut total = 0usize;
     let mut chunks = 0usize;
     let mut max_chunk = 0usize;
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait_deadline = if chunks == 0 {
+            silent_deadline.unwrap_or(deadline)
+        } else {
+            deadline
+        };
+        let remaining = wait_deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return FloodAttempt {
                 chunks,
@@ -758,6 +793,30 @@ fn flood_retry_covers_only_silent_startup_transients() {
 }
 
 #[test]
+fn flood_silent_deadline_reserves_retry_time_only_for_first_attempt() {
+    // CTX-1251 (CodeRabbit on #2125): a silent first attempt must not burn
+    // the whole shared deadline, or the respawn it earned has nothing to
+    // run on. Attempt 1 therefore gets about half the remaining budget for
+    // its first chunk; the final attempt gets the full remainder.
+    let far = std::time::Instant::now() + Duration::from_secs(10);
+    let first = silent_deadline_for_attempt(far, 1).expect("attempt 1 caps silence");
+    let now = std::time::Instant::now();
+    assert!(first > now, "silent deadline must be in the future");
+    assert!(
+        first <= far,
+        "silent deadline must not exceed the shared one"
+    );
+    assert!(
+        first >= now + Duration::from_secs(4),
+        "attempt 1 must keep about half the budget, got {first:?}"
+    );
+    assert!(
+        silent_deadline_for_attempt(far, 2).is_none(),
+        "final attempt waits on the full remainder"
+    );
+}
+
+#[test]
 fn flood_drain_attempt_reports_clean_eof_with_output() {
     // Small live probe of the shared drain helper: direct `seq` resolves
     // through PATH on every runner and the helper reports clean EOF with
@@ -776,7 +835,7 @@ fn flood_drain_attempt_reports_clean_eof_with_output() {
             .spawn()
             .expect("spawn seq");
         let spawned_reader = spawned.take_reader().expect("reader half");
-        let attempt = drain_flood_attempt(&spawned_reader, deadline);
+        let attempt = drain_flood_attempt(&spawned_reader, deadline, None);
         if attempt.finished && attempt.chunks > 0 {
             accepted = Some(attempt);
             pty = Some(spawned);
@@ -828,11 +887,13 @@ fn backpressure_bound_holds_under_flood() {
     //   absolute-path portability claim is needed.
     // - A silent attempt (stalled drain or clean EOF, both with zero chunks)
     //   is a startup transient and earns exactly one fresh-PTY respawn; the
-    //   shared `ECHO_TIMEOUT` deadline still bounds both attempts together,
-    //   and every bound assert below still runs unchanged on the accepted
-    //   attempt. A second miss, or a mid-stream stall after output started,
-    //   panics loud with the child state attached instead of hanging the
-    //   release.
+    //   shared `ECHO_TIMEOUT` deadline still bounds both attempts together
+    //   (the first attempt waits only half the remaining budget for its
+    //   first chunk, so a silent stall always leaves time for the respawn;
+    //   after the first chunk the full deadline applies), and every bound
+    //   assert below still runs unchanged on the accepted attempt. A second
+    //   miss, or a mid-stream stall after output started, panics loud with
+    //   the child state attached instead of hanging the release.
     //
     // The kernel PTY buffer + channel backpressure blocks the child instead
     // of growing the heap; the in-crate buffer never exceeds
@@ -851,7 +912,11 @@ fn backpressure_bound_holds_under_flood() {
             }
         };
         let reader = pty.take_reader().expect("reader half");
-        let attempt = drain_flood_attempt(&reader, deadline);
+        let attempt = drain_flood_attempt(
+            &reader,
+            deadline,
+            silent_deadline_for_attempt(deadline, attempts_used),
+        );
         if attempt.finished && attempt.chunks > 0 {
             accepted = Some((attempt, pty, reader));
             break;

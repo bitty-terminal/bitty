@@ -222,3 +222,50 @@ fn mixed_ascii_cjk_row_splits_fast_and_shaped() {
     );
     assert_eq!(snap.cells[1].glyph, '漢', "grid truth untouched");
 }
+
+#[test]
+fn box_drawing_runs_never_take_ascii_fast_path() {
+    // CTX-1234 (issue #2096): the verify2 scare suspected #2095 of
+    // misrouting box runs past harfbuzz shaping. Box scalars are non-ASCII
+    // (multi-byte UTF-8), so neither eligibility half can hold: pure-box
+    // and mixed box/ASCII rows must shape under both ligature policies —
+    // never fast-path — while still emitting one glyph per cell.
+    for policy in [LigaturePolicy::Always, LigaturePolicy::Never] {
+        for text in [
+            "\u{250C}\u{2500}\u{2510}\u{2502}\u{2514}\u{2518}\u{251C}\u{253C}\u{2524}\u{2554}\u{2550}\u{2557}\u{2503}",
+            "\u{2502}abc\u{2502}",
+        ] {
+            let Some(mut renderer) = live_renderer_for("JetBrainsMono Nerd Font") else {
+                eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
+                return;
+            };
+            let snap = snapshot_for(text);
+            let damage = full_damage(&snap);
+            let (_, misses_before) = renderer.shape_stats();
+            let list = renderer
+                .render_shaped(&snap, &damage, policy, &[])
+                .expect("box run renders");
+            let (_, misses_after) = renderer.shape_stats();
+            assert_eq!(
+                renderer.counters().ascii_fast_path_runs,
+                0,
+                "box runs must never fast-path ({policy:?}, {text:?})"
+            );
+            assert!(
+                misses_after > misses_before,
+                "box runs must reach harfbuzz ({policy:?}, {text:?})"
+            );
+            assert_eq!(
+                list.glyphs.len(),
+                text.chars().count(),
+                "every box cell must emit a glyph ({policy:?}, {text:?}): {}",
+                list.glyphs.len()
+            );
+            assert_eq!(
+                renderer.counters().missing_glyphs,
+                0,
+                "no box cell may go tofu on a covering host ({policy:?}, {text:?})"
+            );
+        }
+    }
+}

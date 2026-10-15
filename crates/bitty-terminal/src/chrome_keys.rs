@@ -1032,6 +1032,66 @@ impl TerminalApp {
         self.runtime.workspace_prev_in(&occupied)
     }
 
+    /// Toggle the window scratchpad slot for the core-owned keymap command
+    /// (CTX-1241, issue #2091).
+    ///
+    /// `command:bitty.workspace:scratchpad-toggle` routes here instead of
+    /// the host-mediated plugin path, so show/hide works with no plugin
+    /// runtime alive. Shows the parked leaf when occupied (the focused
+    /// target is ignored); otherwise hides the focused leaf through the
+    /// `bitty.workspace:scratchpad-toggle` string dispatch
+    /// (`Runtime::scratchpad_toggle`). Validate on the live tree BEFORE
+    /// touching zoom (mirroring `TogglePinned`): a non-tiled focused leaf
+    /// rejects with a warning and zero state change (a floating or
+    /// fullscreen leaf would silently return as tiled, and a scratchpad
+    /// stamp never sits in-tree). For a valid toggle, zoom restores next
+    /// so the mutation lands on the real tree, not the zoom proxy —
+    /// except when the backed-up tree holds a single leaf (CodeRabbit PR
+    /// #1903 discipline): hiding there refuses (it would strand an empty
+    /// live layout), so restoring first would consume the zoom backup
+    /// behind a refused action. Skipping the restore on `Some(1)` keeps a
+    /// refused toggle byte-identical; show never refuses on leaf count,
+    /// and a show landing in the proxy is covered by the stale-backup
+    /// discipline on disengage. No focused pane warns and keeps everything.
+    /// Never a window close (the caller keeps the `false` return).
+    fn apply_scratchpad_toggle(&mut self) {
+        const CMD: &str = bitty_runtime::SCRATCHPAD_CMD_TOGGLE;
+        let focused = match self.runtime.focused_view() {
+            Some(id) => id,
+            None => {
+                eprintln!("warning: keymap command:{CMD} has no focused pane — ignoring");
+                return;
+            }
+        };
+        if !self.runtime.scratchpad_occupied() {
+            let current = match self.runtime.layout().find_leaf(focused) {
+                Some(leaf) => leaf.presentation(),
+                None => {
+                    eprintln!(
+                        "warning: keymap command:{CMD} found no focused pane {focused:?} — ignoring"
+                    );
+                    return;
+                }
+            };
+            if !matches!(current, PresentationMode::Tiled) {
+                eprintln!(
+                    "warning: keymap command:{CMD} needs a tiled leaf, found {current} — ignoring"
+                );
+                return;
+            }
+        }
+        if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+            self.restore_zoom();
+        }
+        match self.runtime.scratchpad_toggle(Some(focused)) {
+            Ok(None) => eprintln!("bitty: keymap command:{CMD} -> {focused:?} parked"),
+            Ok(Some(restored)) => {
+                eprintln!("bitty: keymap command:{CMD} -> {restored:?} restored")
+            }
+            Err(err) => eprintln!("warning: keymap command:{CMD} refused ({err}) — ignoring"),
+        }
+    }
+
     /// Applies one `fold_toggle`/`fold_expand`/`fold_collapse` verb to the
     /// focused view's latest command block (CTX-0723 #980).
     ///
@@ -1280,6 +1340,15 @@ impl TerminalApp {
                 }
             }
             A::InvokeCommand(qualified) => {
+                // CTX-1241 (issue #2091): the core-owned scratchpad toggle
+                // stays reachable with no plugin runtime alive. Every other
+                // qualified name keeps the host-mediated invocation path
+                // below (undeclared and foreign-qualified names refused,
+                // args-schema refusals, callee failures contained).
+                if qualified == bitty_runtime::SCRATCHPAD_CMD_TOGGLE {
+                    self.apply_scratchpad_toggle();
+                    return false;
+                }
                 // CTX-1035 (#1829): the generic host-mediated invocation
                 // path. The chord carries no arguments, so the invocation
                 // validates as the empty object `{}`; undeclared and
@@ -4446,6 +4515,165 @@ mod tests {
             "valid pin consumes the zoom restore"
         );
         assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+    }
+
+    #[test]
+    fn chrome_scratchpad_command_toggle_roundtrips_without_plugin_runtime() {
+        // CTX-1241 (issue #2091, verify1 A4): the keymap spelling
+        // `command:bitty.workspace:scratchpad-toggle` must reach the core
+        // slot with no plugin runtime alive. Parked via the chord, the
+        // focused leaf leaves the tree; toggling again restores it beside
+        // its anchor with layout order and focus preserved. Neither
+        // toggle is a window close.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let toggle = ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string());
+        assert!(
+            !app.apply_chrome_action(toggle.clone()),
+            "hide is not a close"
+        );
+        assert!(
+            app.runtime.scratchpad_occupied(),
+            "first toggle parks the focused leaf"
+        );
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(!app.apply_chrome_action(toggle), "show is not a close");
+        assert!(
+            !app.runtime.scratchpad_occupied(),
+            "second toggle restores the parked leaf"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)],
+            "restore keeps anchor order"
+        );
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(1)),
+            "restore focuses the returned leaf"
+        );
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(ViewId::new(1))
+                .expect("restored leaf")
+                .presentation(),
+            PresentationMode::Tiled,
+            "restore returns to tiling"
+        );
+    }
+
+    #[test]
+    fn chrome_scratchpad_command_toggle_fails_closed_without_state_change() {
+        // CTX-1241: hiding the live layout's last leaf or a non-tiled leaf
+        // refuses loudly with layout, slot, and focus untouched (a floating
+        // or fullscreen leaf would silently return as tiled).
+        use bitty_config::ChromeAction;
+        let toggle =
+            || ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string());
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(toggle());
+        assert!(!app.runtime.scratchpad_occupied(), "refusal parks nothing");
+        assert_eq!(format!("{:?}", app.runtime.layout()), before);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+
+        for mode in [PresentationMode::Floating, PresentationMode::Fullscreen] {
+            let mut app = workspace_test_app();
+            app.runtime.set_layout(two_pane_layout());
+            assert!(app.runtime.set_focus(ViewId::new(1)));
+            let mut seeded = app.runtime.layout().clone();
+            let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
+            assert!(PresentationMode::request_transition(leaf, mode));
+            app.runtime.set_layout(seeded);
+            let before = format!("{:?}", app.runtime.layout());
+            app.apply_chrome_action(toggle());
+            assert!(
+                !app.runtime.scratchpad_occupied(),
+                "refusal on {mode} parks nothing"
+            );
+            assert_eq!(
+                format!("{:?}", app.runtime.layout()),
+                before,
+                "refusal on {mode} keeps the layout byte-identical"
+            );
+            assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        }
+    }
+
+    #[test]
+    fn chrome_scratchpad_command_toggle_keeps_zoom_on_refused_sole_leaf() {
+        // CodeRabbit PR #1903 discipline under the scratchpad slot: a zoomed
+        // single-leaf workspace refuses the hide (it would strand an empty
+        // live layout). The refusal must leave zoom state untouched: still
+        // zoomed, backup intact, layout byte-identical.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "backed-up tree holds the sole leaf"
+        );
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(ChromeAction::InvokeCommand(
+            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string(),
+        ));
+        assert!(
+            !app.runtime.scratchpad_occupied(),
+            "refused hide parks nothing"
+        );
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime),
+            "refusal keeps the zoom backup"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(1),
+            "refusal keeps the backed-up leaf count"
+        );
+        assert_eq!(
+            format!("{:?}", app.runtime.layout()),
+            before,
+            "refusal keeps the layout byte-identical"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_scratchpad_command_toggle_restores_zoom_for_multi_leaf_hide() {
+        // Companion to the sole-leaf refusal above: with 2+ backed-up leaves
+        // the restore still runs, so the hide lands on the real tree and the
+        // zoom backup is consumed.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            Some(2),
+            "backed-up tree holds both leaves"
+        );
+        app.apply_chrome_action(ChromeAction::InvokeCommand(
+            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string(),
+        ));
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "valid hide consumes the zoom restore"
+        );
+        assert!(app.runtime.scratchpad_occupied());
         assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
     }
 

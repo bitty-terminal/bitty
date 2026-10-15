@@ -76,8 +76,13 @@ fn host_symbol_stack_reports_coverage_and_tofu() {
     }
     // CTX-1213 (issue #2084): the box-drawing run must resolve *drawable*
     // (non-empty) bitmaps — a hollow primary glyph for U+2500 must fall
-    // through to tail coverage, never a silent blank cell.
-    for c in ['\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}'] {
+    // through to tail coverage, never a silent blank cell. CTX-1234 (issue
+    // #2096) extends the pin to the full verify2 run: corners, verticals,
+    // tees, cross, doubles, heavy vertical, and U+2500.
+    for c in [
+        '\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}', '\u{2514}', '\u{2518}', '\u{251C}',
+        '\u{253C}', '\u{2524}', '\u{2554}', '\u{2550}', '\u{2557}', '\u{2503}',
+    ] {
         let resolved = raster
             .resolve(RasterKey::new(c, primary, POINT_SIZE).unwrap())
             .expect("box resolution must not error on a live stack");
@@ -147,6 +152,47 @@ fn host_pipeline_paints_symbols_and_tofu() {
     assert!(
         tofu_fills >= 2,
         "tofu outline top/bottom edges expected, found {tofu_fills}"
+    );
+}
+
+#[test]
+fn host_box_run_paints_every_cell() {
+    // CTX-1234 (issue #2096): the full verify2 box run — corners,
+    // verticals, tees, cross, doubles, heavy vertical — must emit one real
+    // glyph per cell through the production unshaped path, with zero tofu.
+    // This is the headless pin for the headed boxdraw shape: eyeball reads
+    // of thin box glyphs at screenshot scale misfire, this count does not.
+    let Some(raster) = live_chain() else {
+        eprintln!("skipped: no host font stack or primary family");
+        return;
+    };
+    let mut renderer =
+        GridRenderer::new(raster, &query(), CellMetrics::new(10, 22).unwrap()).unwrap();
+    let row = "\u{250C}\u{2500}\u{2510}\u{2502}\u{2514}\u{2518}\u{251C}\u{253C}\u{2524}\u{2554}\u{2550}\u{2557}\u{2503}";
+    let mut state = bitty_term_state::State::new();
+    for ch in row.chars() {
+        state.apply(&bitty_term_state::TerminalAction::Print(
+            bitty_vt::GraphemeCell::from(ch),
+        ));
+    }
+    let snap = state.snapshot();
+    let damage = bitty_term_state::Damage {
+        generation: snap.generation,
+        regions: vec![bitty_term_state::DamagedRegion::Grid(
+            bitty_term_state::DamageRect::full(snap.height as u16, snap.width as u16),
+        )]
+        .into_boxed_slice(),
+    };
+    let list = renderer.render(&snap, &damage).expect("render");
+    assert_eq!(
+        list.glyphs.len(),
+        row.chars().count(),
+        "every box cell must emit a real glyph on a host that covers it"
+    );
+    assert_eq!(
+        renderer.counters().missing_glyphs,
+        0,
+        "no box cell may go tofu on a covering host"
     );
 }
 

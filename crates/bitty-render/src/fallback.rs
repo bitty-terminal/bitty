@@ -931,6 +931,42 @@ mod tests {
     }
 
     #[test]
+    fn box_drawing_full_run_resolves_drawable_with_hollow_primary() {
+        // CTX-1234 (issue #2096): the whole verify2 box run — corners,
+        // verticals, tees, cross, doubles, heavy vertical, and U+2500 —
+        // resolves covered with drawable bitmaps even when the primary maps
+        // every one of them to an empty bitmap (the hollow-substitution
+        // worst case behind the verify2 scare). A hollow primary must never
+        // shadow tail coverage into a silent blank cell for any of them.
+        const BOX_RUN: [char; 13] = [
+            '\u{2500}', '\u{250C}', '\u{2510}', '\u{2502}', '\u{2514}', '\u{2518}', '\u{251C}',
+            '\u{253C}', '\u{2524}', '\u{2554}', '\u{2550}', '\u{2557}', '\u{2503}',
+        ];
+        let mut inner = Fake::default();
+        for c in BOX_RUN {
+            inner.hollow.push(("Primary Mono".to_string(), c));
+        }
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        for c in BOX_RUN {
+            let key = RasterKey::new(c, primary, 12.0).unwrap();
+            let resolved = wrapped.resolve(key).expect("box scalar must resolve");
+            assert!(resolved.covered, "U+{:04X} must be covered", c as u32);
+            assert!(
+                resolved.bitmap.as_ref().is_some_and(|bm| !bm.is_blank()),
+                "U+{:04X} must resolve drawable, never hollow",
+                c as u32,
+            );
+            assert_eq!(
+                wrapped.inner.family_of(resolved.font),
+                "JetBrains Mono",
+                "U+{:04X} must fall through to the first covering tail",
+                c as u32,
+            );
+        }
+    }
+
+    #[test]
     fn whitespace_keeps_first_some_without_warming_tails() {
         // Spaces resolve on the primary's empty bitmap exactly as before:
         // one upstream call, tails stay pending (CTX-1026 lazy tails), and

@@ -875,6 +875,14 @@ jobs:
   # payload, and the version match. Unsigned 0.1.0 is asserted as NotSigned
   # so a silent signing without updating bitty.iss and packaging/README.md
   # fails here instead of shipping quietly.
+  # CTX-1250 (#2120): the maiden verify run never got the setup process
+  # started (empty $LASTEXITCODE from the bare call operator, ~250ms after
+  # start) while the artifact itself was intact. The launch therefore goes
+  # through Start-Process -Wait -PassThru (a process that never starts throws
+  # instead of leaving an empty exit code), pre-flight diagnostics (file size,
+  # Zone.Identifier MOTW stream, Windows build, Defender status) distinguish a
+  # scan/SmartScreen first-launch block from a corrupt artifact, and exactly
+  # ONE bounded 45s retry absorbs a transient on-access scan storm.
   verify-windows-installer:
     name: Verify Windows setup install/uninstall
     needs: windows-installer
@@ -905,8 +913,68 @@ jobs:
           }
           $installDir = Join-Path $env:RUNNER_TEMP 'bitty-setup-test'
           if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
-          & $setup.FullName /SILENT /NORESTART /SUPPRESSMSGBOXES /DIR="$installDir" /TASKS="desktopicon"
-          if ($LASTEXITCODE -ne 0) { throw "setup exited $LASTEXITCODE" }
+          # CTX-1250 (#2120) pre-flight: distinguish a first-launch
+          # scan/SmartScreen block from a corrupt artifact. All queries are
+          # best-effort diagnostics; only the launch assertions below fail.
+          Write-Host "setup file: $($setup.FullName)"
+          Write-Host ("setup length: {0} bytes" -f $setup.Length)
+          $zone = Get-Content -Path "$($setup.FullName):Zone.Identifier" -ErrorAction SilentlyContinue
+          if ($zone) {
+            Write-Host 'Zone.Identifier stream present (MOTW):'
+            $zone | ForEach-Object { Write-Host "  $_" }
+          } else {
+            Write-Host 'Zone.Identifier stream: none'
+          }
+          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+          try {
+            $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+            Write-Host "Windows build: $($cv.CurrentBuildNumber).$($cv.UBR) ($($cv.DisplayVersion))"
+          } catch {
+            Write-Host "Windows build query unavailable: $($_.Exception.Message)"
+          }
+          try {
+            $mp = Get-MpComputerStatus -ErrorAction Stop
+            Write-Host "Defender: AMService=$($mp.AMServiceEnabled) Antivirus=$($mp.AntivirusEnabled) RealTime=$($mp.RealTimeProtectionEnabled) Signatures=$($mp.AntivirusSignatureVersion)"
+          } catch {
+            Write-Host "Defender status query unavailable: $($_.Exception.Message)"
+          }
+          try {
+            $svc = Get-Service -Name WinDefend -ErrorAction Stop
+            Write-Host "WinDefend service: $($svc.Status)"
+          } catch {
+            Write-Host "WinDefend service query unavailable: $($_.Exception.Message)"
+          }
+          # CTX-1250 (#2120): Start-Process -Wait -PassThru captures the TRUE
+          # exit code. The bare call operator left $LASTEXITCODE empty when the
+          # process never started, hiding a first-launch block behind
+          # 'setup exited '. Exactly one bounded retry absorbs a transient
+          # on-access scan storm; a genuine failure still throws below.
+          $setupArgs = @('/SILENT', '/NORESTART', '/SUPPRESSMSGBOXES', "/DIR=`"$installDir`"", '/TASKS="desktopicon"')
+          $attempt = 0
+          $exitCode = $null
+          $lastError = $null
+          while ($attempt -lt 2) {
+            $attempt++
+            try {
+              Write-Host "setup launch attempt $attempt/2 ..."
+              $proc = Start-Process -FilePath $setup.FullName -ArgumentList $setupArgs -Wait -PassThru
+              $exitCode = $proc.ExitCode
+              Write-Host "setup attempt $attempt exit code: $exitCode"
+            } catch {
+              $lastError = $_.Exception.Message
+              Write-Host "setup attempt $attempt failed to start: $lastError"
+              $exitCode = $null
+            }
+            if ($exitCode -eq 0) { break }
+            if ($attempt -lt 2) {
+              Write-Host 'first attempt did not succeed; waiting 45s for the on-access scan to settle before one bounded retry ...'
+              Start-Sleep -Seconds 45
+            }
+          }
+          if ($exitCode -ne 0) {
+            if ($null -eq $exitCode) { throw "setup never started (Start-Process threw): $lastError" }
+            throw "setup exited $exitCode after $attempt attempt(s)"
+          }
           $exe = Join-Path $installDir 'bitty.exe'
           if (-not (Test-Path $exe -PathType Leaf)) { throw "bitty.exe missing after install: $exe" }
           $output = & $exe --version
@@ -939,8 +1007,11 @@ jobs:
           $unins = "$($entry.UninstallString)"
           if ($unins -match '"([^"]+)"') { $unins = $Matches[1] } else { $unins = ($unins -split '\s+')[0] }
           if (-not (Test-Path $unins)) { throw "uninstaller missing: $unins" }
-          & $unins /SILENT /NORESTART /SUPPRESSMSGBOXES
-          if ($LASTEXITCODE -ne 0) { throw "uninstaller exited $LASTEXITCODE" }
+          # CTX-1250 (#2120): same true-exit-code discipline as the setup
+          # launch above; the uninstaller is locally generated (no MOTW), so
+          # no retry is warranted here.
+          $uproc = Start-Process -FilePath $unins -ArgumentList @('/SILENT', '/NORESTART', '/SUPPRESSMSGBOXES') -Wait -PassThru
+          if ($uproc.ExitCode -ne 0) { throw "uninstaller exited $($uproc.ExitCode)" }
           Start-Sleep -Seconds 5
           if (Test-Path $exe) { throw 'bitty.exe survived uninstall' }
           if (Test-Path $startMenu) { throw 'Start Menu shortcut survived uninstall' }

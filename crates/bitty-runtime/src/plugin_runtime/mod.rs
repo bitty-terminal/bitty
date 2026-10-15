@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
@@ -729,6 +729,24 @@ pub struct PluginRuntime {
     /// integration tests (bitty#1744, same treatment as bitty#1727);
     /// production code never sets this.
     vm_wall_budget_ms: Option<u64>,
+    /// CTX-1244 (issue #2107): host-owned one-shot timer deadlines.
+    ///
+    /// Keyed by `(plugin, handle)`; the value is the absolute firing
+    /// deadline (`activation now + delay_ms`, or `callback-now + delay_ms`
+    /// for timers created inside a timer callback). Armed at activation,
+    /// fired once by [`Self::pump_due_timers_at`], removed on fire, cancel,
+    /// or dispose. Only `Active` entries fire; [`Self::timer_deadline`]
+    /// joins the app wake-min so idle wakes for timers while unarmed idle
+    /// stays `None` (zero-submit preserved). Cold-tick only, never the hot
+    /// path (P0-AC-015).
+    timer_deadlines: BTreeMap<(PluginId, i64), Instant>,
+    /// Handles already fired (one-shot containment).
+    ///
+    /// The VM capture retains fired rows (one-shot firing removes only the
+    /// host deadline), so this set stops the post-callback sync from
+    /// re-arming them. Cleared per plugin on dispose/reload/rollback; at
+    /// most one entry per armed timer, so bounded by the live timer cap.
+    timer_fired: BTreeSet<(PluginId, i64)>,
 }
 
 impl PluginRuntime {
@@ -791,6 +809,8 @@ impl PluginRuntime {
             device_host,
             audio_host,
             vm_wall_budget_ms: None,
+            timer_deadlines: BTreeMap::new(),
+            timer_fired: BTreeSet::new(),
         }
     }
 
@@ -1329,6 +1349,238 @@ impl PluginRuntime {
     /// Revoke any overlay capture past its deadline at the current instant.
     pub fn expire_overlay_captures(&mut self) -> bool {
         self.expire_overlay_captures_at(Instant::now())
+    }
+
+    /// Earliest pending one-shot timer deadline, if any (CTX-1244).
+    ///
+    /// `Some(min)` while an `Active` generation holds un-fired timers;
+    /// `None` when no timers are armed (uninstalled, unarmed, suspended-only,
+    /// disposed, or all fired/cancelled). The app arms `set_wait_until` at
+    /// it so idle wakes for timers; unarmed idle stays on `set_wait`
+    /// (zero-submit preserved). Cold-tick read only, never the hot path.
+    #[must_use]
+    pub fn timer_deadline(&self) -> Option<Instant> {
+        self.timer_deadlines
+            .iter()
+            .filter(|((plugin, _), _)| {
+                self.entries
+                    .get(plugin)
+                    .is_some_and(|entry| entry.state == LifecycleState::Active)
+            })
+            .map(|(_, deadline)| *deadline)
+            .min()
+    }
+
+    /// Fire due one-shot timers at the current instant (CTX-1244).
+    ///
+    /// Cold-tick pump only (the app calls it from `drive_tick` before
+    /// present, never on the input hot path). Returns the number of
+    /// callbacks that ran. One-shot: each due timer fires at most once;
+    /// failures are contained (a faulting callback still consumes its
+    /// one shot). Bounded: at most the armed timers plus at most one
+    /// optimistic re-arm chain per fire, capped fail-closed.
+    pub fn pump_due_timers(&mut self) -> usize {
+        self.pump_due_timers_at(Instant::now())
+    }
+
+    /// Deterministic timer pump at `now` (CTX-1244).
+    ///
+    /// Fake-clock entry point for tests: arm at activation `T`, then
+    /// `pump_due_timers_at(T + delay)` fires. Production calls
+    /// [`Self::pump_due_timers`]. Same bounds and containment as the
+    /// wall-clock pump; `now` frozen for the whole pump so a `0`-delay
+    /// re-arm fires in the same pump (bounded) while future delays stay
+    /// pending.
+    pub fn pump_due_timers_at(&mut self, now: Instant) -> usize {
+        self.sync_timer_cancels();
+        self.sync_new_timers(now);
+        let mut fired = 0usize;
+        // Contain a hostile `0`-delay re-arm loop: one pump fires at most
+        // the armed set plus a bounded re-arm chain.
+        while let Some((plugin, handle)) = self.earliest_due_timer(now) {
+            if fired >= 512 {
+                break;
+            }
+            self.timer_deadlines.remove(&(plugin.clone(), handle));
+            self.timer_fired.insert((plugin.clone(), handle));
+            let callback = self.live_timer_callback(&plugin, handle);
+            let vm = self.entries.get(&plugin).and_then(|entry| entry.vm.clone());
+            let active = self
+                .entries
+                .get(&plugin)
+                .is_some_and(|entry| entry.state == LifecycleState::Active);
+            if active {
+                if let (Some(vm), Some(callback)) = (vm, callback) {
+                    if let Ok(mut vm_ref) = vm.try_borrow_mut() {
+                        let _ = vm_ref.call_function(&callback, &[]);
+                    }
+                    fired += 1;
+                }
+            }
+            self.sync_timer_cancels();
+            self.sync_new_timers(now);
+        }
+        fired
+    }
+
+    /// Earliest due timer at `now` among `Active` generations, if any.
+    fn earliest_due_timer(&self, now: Instant) -> Option<(PluginId, i64)> {
+        self.timer_deadlines
+            .iter()
+            .filter(|((plugin, _), deadline)| {
+                **deadline <= now
+                    && self
+                        .entries
+                        .get(plugin)
+                        .is_some_and(|entry| entry.state == LifecycleState::Active)
+            })
+            .min_by_key(|(_, deadline)| **deadline)
+            .map(|((plugin, handle), _)| (plugin.clone(), *handle))
+    }
+
+    /// Live callback for `(plugin, handle)`, if still registered.
+    ///
+    /// Reads the VM capture (which holds post-activation creates) with a
+    /// fallback to the committed snapshot, so activation-armed and
+    /// callback-armed timers both fire. `None` when cancelled or gone.
+    fn live_timer_callback(
+        &self,
+        plugin: &PluginId,
+        handle: i64,
+    ) -> Option<bitty_lua::StashedFunction> {
+        let entry = self.entries.get(plugin)?;
+        if let Some(vm) = entry.vm.as_ref() {
+            if let Ok(vm_ref) = vm.try_borrow() {
+                let live = vm_ref.take_registrations();
+                if let Some(timer) = live.timers.iter().find(|timer| timer.handle == handle) {
+                    return Some(timer.callback.clone());
+                }
+            }
+        }
+        entry
+            .registrations
+            .timers
+            .iter()
+            .find(|timer| timer.handle == handle)
+            .map(|timer| timer.callback.clone())
+    }
+
+    /// Drop deadlines whose handle left the VM capture (Lua `cancel`).
+    ///
+    /// Cancelled handles are removed without joining `timer_fired` (handles
+    /// never reuse, so the post-callback sync cannot re-arm them).
+    fn sync_timer_cancels(&mut self) {
+        let keys: Vec<(PluginId, i64)> = self.timer_deadlines.keys().cloned().collect();
+        for (plugin, handle) in keys {
+            let Some(entry) = self.entries.get(&plugin) else {
+                self.timer_deadlines.remove(&(plugin, handle));
+                continue;
+            };
+            let Some(vm) = entry.vm.as_ref() else {
+                self.timer_deadlines.remove(&(plugin, handle));
+                continue;
+            };
+            let live_handles: Option<Vec<i64>> = vm.try_borrow().ok().map(|vm_ref| {
+                vm_ref
+                    .take_registrations()
+                    .timers
+                    .iter()
+                    .map(|timer| timer.handle)
+                    .collect()
+            });
+            let Some(live_handles) = live_handles else {
+                continue;
+            };
+            if !live_handles.contains(&handle) {
+                self.timer_deadlines.remove(&(plugin, handle));
+            }
+        }
+    }
+
+    /// Arm VM-capture timers not yet tracked (activation chain + callback
+    /// re-arms) at `now + delay_ms`.
+    ///
+    /// Skips already-pending and already-fired handles (one-shot: the VM
+    /// capture retains fired rows). Enforces the live timer cap per plugin
+    /// fail-closed (extra handles stay unarmed). Only `Active` generations
+    /// arm; `checked_add` overflow arms at `now` (fire immediately,
+    /// fail-closed liveness).
+    fn sync_new_timers(&mut self, now: Instant) {
+        let ids: Vec<PluginId> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state == LifecycleState::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let live: Vec<(i64, u64)> = {
+                let Some(entry) = self.entries.get(&id) else {
+                    continue;
+                };
+                let Some(vm) = entry.vm.as_ref() else {
+                    continue;
+                };
+                let Ok(vm_ref) = vm.try_borrow() else {
+                    continue;
+                };
+                vm_ref
+                    .take_registrations()
+                    .timers
+                    .iter()
+                    .map(|timer| (timer.handle, timer.delay_ms))
+                    .collect()
+            };
+            for (handle, delay_ms) in live {
+                let key = (id.clone(), handle);
+                if self.timer_deadlines.contains_key(&key) || self.timer_fired.contains(&key) {
+                    continue;
+                }
+                let pending = self
+                    .timer_deadlines
+                    .keys()
+                    .filter(|(plugin, _)| plugin == &id)
+                    .count();
+                if pending >= bitty_lua::REGISTRATION_MAX_TIMERS {
+                    continue;
+                }
+                let deadline = now
+                    .checked_add(Duration::from_millis(delay_ms))
+                    .unwrap_or(now);
+                self.timer_deadlines.insert(key, deadline);
+            }
+        }
+    }
+
+    /// Arm a plugin's committed timers at `now` (activation path).
+    ///
+    /// Clears any stale deadlines/fired rows for `id` first (fresh
+    /// generation), then arms every committed timer at `now + delay_ms`.
+    fn arm_plugin_timers_at(&mut self, id: &PluginId, now: Instant) {
+        self.clear_plugin_timers(id);
+        let timers: Vec<(i64, u64)> = self
+            .entries
+            .get(id)
+            .map(|entry| {
+                entry
+                    .registrations
+                    .timers
+                    .iter()
+                    .map(|timer| (timer.handle, timer.delay_ms))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (handle, delay_ms) in timers {
+            let deadline = now
+                .checked_add(Duration::from_millis(delay_ms))
+                .unwrap_or(now);
+            self.timer_deadlines.insert((id.clone(), handle), deadline);
+        }
+    }
+
+    /// Drop every deadline and fired row for `id` (dispose/reload/rollback).
+    fn clear_plugin_timers(&mut self, id: &PluginId) {
+        self.timer_deadlines.retain(|(plugin, _), _| plugin != id);
+        self.timer_fired.retain(|(plugin, _)| plugin != id);
     }
 
     /// Scan the configured roots and register every valid package.
@@ -1955,6 +2207,10 @@ impl PluginRuntime {
             let entry = self.entries.get(id).expect("entry exists");
             self.publish_commands(id, generation, &manifest, &entry.registrations, &vm);
         }
+        // CTX-1244 (issue #2107): arm one-shot timers at activation `now +
+        // delay_ms` so idle wakes for them. Without this the host pumps
+        // zero ticks when idle and armed plugin timers never fire.
+        self.arm_plugin_timers_at(id, Instant::now());
         Ok(ActivationReport {
             plugin: id.clone(),
             state: LifecycleState::Active,
@@ -2123,6 +2379,9 @@ impl PluginRuntime {
             .borrow_mut()
             .revoke_owner(id.as_str());
         let _ = self.host.remove(id);
+        // CTX-1244: a disposed generation's timers are dead; drop deadlines
+        // and fired rows so a stale handle can never fire or wake.
+        self.clear_plugin_timers(id);
         Ok(())
     }
 
@@ -2755,6 +3014,9 @@ impl PluginRuntime {
             .borrow_mut()
             .revoke_owner(id.as_str());
         self.drop_traces(id);
+        // CTX-1244: a failed activation arms nothing; drop any stale timer
+        // rows so a dead handle can never fire or wake.
+        self.clear_plugin_timers(id);
     }
 
     /// Whether the policy host still holds a registry entry for `id`

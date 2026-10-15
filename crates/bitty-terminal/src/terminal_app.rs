@@ -1268,6 +1268,12 @@ impl TerminalApp {
         // frames through the single input router before present, so a
         // granted submit lands in the focused PTY on this tick.
         self.apply_plugin_submit_requests();
+        // CTX-1244 (issue #2107): fire due one-shot plugin timers before
+        // present, so a timer callback's `bitty.ui.update` lands in
+        // `update_chrome_bands` on this same tick and presents while idle.
+        // Cold-tick only, never the input hot path (P0-AC-015); no-op
+        // without a plugin runtime or armed timers.
+        self.pump_plugin_timers();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -1665,6 +1671,29 @@ impl TerminalApp {
         self.plugin_runtime
             .as_ref()
             .and_then(|runtime| runtime.overlay_capture_deadline())
+    }
+
+    /// Earliest pending plugin timer deadline, if any (CTX-1244).
+    ///
+    /// Joins the `AboutToWait` wake-min so armed timers fire while idle;
+    /// `None` when no timers are armed, so unarmed idle stays on
+    /// `set_wait` (zero-submit preserved).
+    pub(crate) fn plugin_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.timer_deadline())
+    }
+
+    /// Fire due one-shot plugin timers (CTX-1244).
+    ///
+    /// Cold-tick pump only (called from `drive_tick` before present, never
+    /// on the input hot path). Returns the number of callbacks that ran.
+    /// No-op without a plugin runtime or due timers.
+    fn pump_plugin_timers(&mut self) -> usize {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return 0;
+        };
+        plugin_runtime.pump_due_timers()
     }
 
     /// Revoke the active overlay capture unconditionally (user focus-switch
@@ -2978,10 +3007,24 @@ impl AppHandler for TerminalApp {
                 // `None` while the gate is off or nothing is deferred, so
                 // frame-on-demand idling is unchanged.
                 let coalesced = self.runtime.present_coalescing_deadline();
-                let wake = [hover, animation, bell, capture, kitty_local, coalesced]
-                    .into_iter()
-                    .flatten()
-                    .min();
+                // CTX-1244 (issue #2107): arm a wake at the earliest armed
+                // plugin timer deadline too, otherwise idle never wakes and
+                // armed timers never fire (3-4 mount frames then silence).
+                // `None` when no timers are armed, so unarmed idle stays
+                // on `set_wait` (zero-submit preserved).
+                let timers = self.plugin_timer_deadline();
+                let wake = [
+                    hover,
+                    animation,
+                    bell,
+                    capture,
+                    kitty_local,
+                    coalesced,
+                    timers,
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),

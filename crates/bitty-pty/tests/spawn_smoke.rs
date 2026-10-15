@@ -619,8 +619,23 @@ struct FloodAttempt {
     finished: bool,
 }
 
-/// Maximum flood attempts: the first spawn plus one fresh-PTY respawn.
-const MAX_FLOOD_ATTEMPTS: usize = 2;
+/// Maximum flood attempts: the first spawn plus bounded fresh-PTY respawns.
+///
+/// CTX-1255 (re-release run 38809771936): the SIGHUP fast-exit transient is
+/// bursty — consecutive spawns can go silent back-to-back, burning the old
+/// budget of 2 in 0.14s without consuming any deadline. Five matches the
+/// library's own `MAX_SPAWN_ATTEMPTS` bound for the same FreeBSD spawn-race
+/// family (`platform/unix.rs`); worst-case cost stays inside the shared
+/// `ECHO_TIMEOUT` (silent stalls are time-shared by
+/// `silent_deadline_for_attempt`, instant failures cost only a
+/// `FLOOD_RETRY_PAUSE` settle pause each).
+const MAX_FLOOD_ATTEMPTS: usize = 5;
+
+/// Settle pause between flood attempts: lets a SIGHUP burst clear instead of
+/// hot-spinning spawns inside the same burst window. Bounded (four 100 ms
+/// pauses worst case, ~4% of the shared deadline) and paid only on the
+/// already-silent path; a healthy first attempt never sleeps.
+const FLOOD_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// Whether a flood attempt's outcome earns a fresh-PTY respawn (CTX-1251).
 ///
@@ -630,9 +645,10 @@ const MAX_FLOOD_ATTEMPTS: usize = 2;
 /// stale hangup SIGHUP at startup while something still holds the slave, so
 /// the pump never sees EOF) and a clean EOF with zero chunks (a fast `seq`
 /// exit discarded before the pump's first read, the CTX-1019 exit-vs-drain
-/// race). Any attempt that delivered output is accepted (clean EOF) or a
-/// genuine failure (mid-stream stall), never a retry; the bound asserts in
-/// the caller still run on every accepted attempt.
+/// race, or an instant SIGHUP fast-exit, CTX-1255). Any attempt that
+/// delivered output is accepted (clean EOF) or a genuine failure (mid-stream
+/// stall), never a retry; the bound asserts in the caller still run on every
+/// accepted attempt.
 fn flood_attempt_needs_retry(attempt: &FloodAttempt, attempts_used: usize) -> bool {
     if attempts_used >= MAX_FLOOD_ATTEMPTS {
         return false;
@@ -643,23 +659,27 @@ fn flood_attempt_needs_retry(attempt: &FloodAttempt, attempts_used: usize) -> bo
 /// Silent-phase deadline for a flood attempt: how long the drain waits for
 /// the *first* chunk before giving up the attempt.
 ///
-/// The first attempt must reserve time for the respawn: a silent startup
-/// stall (the CTX-1251 SIGHUP signature) would otherwise burn the whole
-/// shared deadline and leave the retry nothing to run on. So attempt 1 waits
-/// only half the remaining shared budget for its first chunk; once any chunk
-/// arrives the attempt is healthy and drains until the shared deadline, and
-/// the final attempt always gets the full remainder (a second silence is
-/// genuine and panics loud).
+/// Every non-final attempt must reserve time for the respawns it may earn: a
+/// silent startup stall (the CTX-1251 SIGHUP signature) would otherwise burn
+/// the whole shared deadline and leave the retries nothing to run on. So each
+/// non-final attempt waits only an equal share of the remaining shared budget
+/// for its first chunk (attempt 1 of N gets ~1/N); once any chunk arrives the
+/// attempt is healthy and drains until the shared deadline, and the final
+/// attempt always gets the full remainder (a last silence is genuine and
+/// panics loud). With two attempts this is exactly the CTX-1254 half-split
+/// (attempt 1: half, attempt 2: full remainder).
 fn silent_deadline_for_attempt(
     deadline: std::time::Instant,
     attempts_used: usize,
 ) -> Option<std::time::Instant> {
-    if attempts_used == 1 {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        Some(std::time::Instant::now() + remaining / 2)
-    } else {
-        None
+    let remaining_attempts = MAX_FLOOD_ATTEMPTS.saturating_sub(attempts_used);
+    if remaining_attempts == 0 {
+        return None;
     }
+    let now = std::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    let shares = remaining_attempts.saturating_add(1);
+    Some(now + remaining / (shares as u32))
 }
 
 /// Drains one flood PTY until clean EOF or the shared deadline, asserting
@@ -754,9 +774,10 @@ fn drain_flood_attempt(
 #[test]
 fn flood_retry_covers_only_silent_startup_transients() {
     // CTX-1251: a flood attempt that delivered nothing is a startup
-    // transient (stale-PTS SIGHUP stall, or a fast-`seq` exit discarded
-    // before the pump's first read) and earns one fresh-PTY respawn; a
-    // second miss is genuine and must panic loud.
+    // transient (stale-PTS SIGHUP stall, a fast-`seq` exit discarded
+    // before the pump's first read, or an instant SIGHUP fast-exit burst,
+    // CTX-1255) and earns a fresh-PTY respawn while budget remains; an
+    // exhausted budget is genuine and must panic loud.
     let silent_eof = FloodAttempt {
         chunks: 0,
         total: 0,
@@ -764,7 +785,11 @@ fn flood_retry_covers_only_silent_startup_transients() {
         finished: true,
     };
     assert!(flood_attempt_needs_retry(&silent_eof, 1));
-    assert!(!flood_attempt_needs_retry(&silent_eof, 2));
+    assert!(flood_attempt_needs_retry(
+        &silent_eof,
+        MAX_FLOOD_ATTEMPTS - 1
+    ));
+    assert!(!flood_attempt_needs_retry(&silent_eof, MAX_FLOOD_ATTEMPTS));
     let stalled_silent = FloodAttempt {
         chunks: 0,
         total: 0,
@@ -772,7 +797,10 @@ fn flood_retry_covers_only_silent_startup_transients() {
         finished: false,
     };
     assert!(flood_attempt_needs_retry(&stalled_silent, 1));
-    assert!(!flood_attempt_needs_retry(&stalled_silent, 2));
+    assert!(!flood_attempt_needs_retry(
+        &stalled_silent,
+        MAX_FLOOD_ATTEMPTS
+    ));
     // Any attempt that delivered output says nothing about startup: a
     // clean EOF is accepted (the bound asserts below still run on it) and
     // a mid-stream stall is a genuine failure, never a retry.
@@ -793,11 +821,11 @@ fn flood_retry_covers_only_silent_startup_transients() {
 }
 
 #[test]
-fn flood_silent_deadline_reserves_retry_time_only_for_first_attempt() {
-    // CTX-1251 (CodeRabbit on #2125): a silent first attempt must not burn
-    // the whole shared deadline, or the respawn it earned has nothing to
-    // run on. Attempt 1 therefore gets about half the remaining budget for
-    // its first chunk; the final attempt gets the full remainder.
+fn flood_silent_deadline_reserves_retry_time_for_non_final_attempts() {
+    // CTX-1251 (CodeRabbit on #2125), generalized by CTX-1255: every
+    // non-final attempt must reserve time for the respawns it may earn, or a
+    // silent stall burns the whole shared deadline and the retries have
+    // nothing to run on. Only the final attempt waits on the full remainder.
     let far = std::time::Instant::now() + Duration::from_secs(10);
     let first = silent_deadline_for_attempt(far, 1).expect("attempt 1 caps silence");
     let now = std::time::Instant::now();
@@ -806,12 +834,18 @@ fn flood_silent_deadline_reserves_retry_time_only_for_first_attempt() {
         first <= far,
         "silent deadline must not exceed the shared one"
     );
+    // Attempt 1 of MAX_FLOOD_ATTEMPTS takes one equal share, leaving most
+    // of the budget for the respawns.
     assert!(
-        first >= now + Duration::from_secs(4),
-        "attempt 1 must keep about half the budget, got {first:?}"
+        first < now + Duration::from_secs(4),
+        "attempt 1 must leave budget for the respawns, got {first:?}"
     );
     assert!(
-        silent_deadline_for_attempt(far, 2).is_none(),
+        silent_deadline_for_attempt(far, MAX_FLOOD_ATTEMPTS - 1).is_some(),
+        "penultimate attempt still reserves retry time"
+    );
+    assert!(
+        silent_deadline_for_attempt(far, MAX_FLOOD_ATTEMPTS).is_none(),
         "final attempt waits on the full remainder"
     );
 }
@@ -820,11 +854,15 @@ fn flood_silent_deadline_reserves_retry_time_only_for_first_attempt() {
 fn flood_drain_attempt_reports_clean_eof_with_output() {
     // Small live probe of the shared drain helper: direct `seq` resolves
     // through PATH on every runner and the helper reports clean EOF with
-    // output. One bounded respawn absorbs the FreeBSD fast-exit discard
-    // (CTX-1019 family) so this probe is not itself flaky there.
+    // output. Bounded fresh-PTY respawns with a settle pause absorb the
+    // FreeBSD burst-silence transient (CTX-1255, re-release run 38809771936:
+    // back-to-back spawns died instantly with SIGHUP and zero chunks, so the
+    // old budget of 2 burned in 0.14s without consuming any deadline). Every
+    // bound assert below still runs unchanged on the accepted attempt.
     let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
     let mut attempts_used = 0usize;
     let mut accepted: Option<FloodAttempt> = None;
+    let mut diagnosis = String::from("no attempts ran");
     let mut pty = None;
     let mut reader = None;
     while attempts_used < MAX_FLOOD_ATTEMPTS {
@@ -835,15 +873,56 @@ fn flood_drain_attempt_reports_clean_eof_with_output() {
             .spawn()
             .expect("spawn seq");
         let spawned_reader = spawned.take_reader().expect("reader half");
-        let attempt = drain_flood_attempt(&spawned_reader, deadline, None);
+        let attempt = drain_flood_attempt(
+            &spawned_reader,
+            deadline,
+            silent_deadline_for_attempt(deadline, attempts_used),
+        );
         if attempt.finished && attempt.chunks > 0 {
             accepted = Some(attempt);
             pty = Some(spawned);
             reader = Some(spawned_reader);
             break;
         }
+        if flood_attempt_needs_retry(&attempt, attempts_used) {
+            // Silent startup transient: record the terminal state, drop the
+            // dud (its `Drop` kills and reaps within a bound, so a stuck
+            // holder of the slave cannot linger), and pause so a SIGHUP
+            // burst can clear before the next fresh device.
+            diagnosis = format!(
+                "attempt {attempts_used}: {} chunks={} total={} \
+                 child pid={:?} fg={:?} exit={:?} pump_error={:?}",
+                if attempt.finished {
+                    "silent EOF"
+                } else {
+                    "stalled drain"
+                },
+                attempt.chunks,
+                attempt.total,
+                spawned.pid(),
+                spawned.foreground_pgid(),
+                spawned.try_wait().ok().flatten(),
+                spawned_reader.pump_error(),
+            );
+            drop(spawned);
+            std::thread::sleep(FLOOD_RETRY_PAUSE);
+            continue;
+        }
+        // Output started but the drain stalled, or the final attempt stayed
+        // silent: genuine failure, loud with the child state attached.
+        diagnosis = format!(
+            "attempt {attempts_used}: {} chunks={} total={}",
+            if attempt.finished {
+                "silent EOF"
+            } else {
+                "stalled drain"
+            },
+            attempt.chunks,
+            attempt.total,
+        );
+        break;
     }
-    let attempt = accepted.expect("seq 1 10 must deliver output within the deadline");
+    let attempt = accepted.unwrap_or_else(|| panic!("seq 1 10 must deliver output: {diagnosis}"));
     assert!(attempt.total > 0);
     assert!(attempt.max_chunk > 0 && attempt.max_chunk <= bitty_pty::READ_CHUNK_SIZE);
     let mut pty = pty.expect("pty half");
@@ -886,14 +965,18 @@ fn backpressure_bound_holds_under_flood() {
     //   (FreeBSD base, macOS BSD userland, GNU coreutils on Linux), so no
     //   absolute-path portability claim is needed.
     // - A silent attempt (stalled drain or clean EOF, both with zero chunks)
-    //   is a startup transient and earns exactly one fresh-PTY respawn; the
-    //   shared `ECHO_TIMEOUT` deadline still bounds both attempts together
-    //   (the first attempt waits only half the remaining budget for its
-    //   first chunk, so a silent stall always leaves time for the respawn;
-    //   after the first chunk the full deadline applies), and every bound
-    //   assert below still runs unchanged on the accepted attempt. A second
-    //   miss, or a mid-stream stall after output started, panics loud with
-    //   the child state attached instead of hanging the release.
+    //   is a startup transient and earns a fresh-PTY respawn (bounded by
+    //   `MAX_FLOOD_ATTEMPTS`, with a `FLOOD_RETRY_PAUSE` settle pause between
+    //   attempts so a bursty run of consecutive silent spawns can clear —
+    //   CTX-1255 saw two instant silents burn the old budget of 2 in 0.14s);
+    //   the shared `ECHO_TIMEOUT` deadline still bounds all attempts together
+    //   (each non-final attempt waits only an equal share of the remaining
+    //   budget for its first chunk, so a silent stall always leaves time for
+    //   the respawns; after the first chunk the full deadline applies), and
+    //   every bound assert below still runs unchanged on the accepted attempt.
+    //   An exhausted budget, or a mid-stream stall after output started,
+    //   panics loud with the child state attached instead of hanging the
+    //   release.
     //
     // The kernel PTY buffer + channel backpressure blocks the child instead
     // of growing the heap; the in-crate buffer never exceeds
@@ -924,8 +1007,9 @@ fn backpressure_bound_holds_under_flood() {
         if flood_attempt_needs_retry(&attempt, attempts_used) {
             // Silent startup transient: record the terminal state, then drop
             // the dud (its `Drop` kills and reaps within a bound, so a
-            // stuck or stopped holder of the slave cannot linger) and try
-            // once more with a fresh device. `try_wait` here only marks the
+            // stuck or stopped holder of the slave cannot linger), pause so
+            // a SIGHUP burst can clear (CTX-1255), and try once more with a
+            // fresh device. `try_wait` here only marks the
             // dud reaped when it is already dead; a live dud stays unreaped
             // so `Drop` still kills it — no leak either way.
             diagnosis = format!(
@@ -944,15 +1028,16 @@ fn backpressure_bound_holds_under_flood() {
                 reader.pump_error(),
             );
             drop(pty);
+            std::thread::sleep(FLOOD_RETRY_PAUSE);
             continue;
         }
-        // Mid-stream stall after output started, or a silent second attempt:
+        // Mid-stream stall after output started, or a silent final attempt:
         // genuine failure, loud with the child state attached.
         panic!(
             "flood drain failed ({}) after {attempts_used} attempt(s): chunks={} total={} \
              child pid={:?} fg={:?} exit={:?} pump_error={:?}",
             if attempt.finished {
-                "silent EOF twice"
+                "silent EOF on the final attempt"
             } else {
                 "stalled drain"
             },
@@ -965,7 +1050,7 @@ fn backpressure_bound_holds_under_flood() {
         );
     }
     let (attempt, mut pty, reader) = accepted.unwrap_or_else(|| {
-        panic!("flood never produced output after a fresh respawn: {diagnosis}");
+        panic!("flood never produced output after bounded respawns: {diagnosis}");
     });
     let chunks = attempt.chunks;
     let max_chunk = attempt.max_chunk;

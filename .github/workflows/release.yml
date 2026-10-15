@@ -26,7 +26,7 @@ jobs:
   # Validate packaging metadata before building (nfpm + nix)
   validate:
     name: Validate packaging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,7 +89,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
             # apk is musl-only and comes from the `build-alpine` job (CTX-0447).
@@ -298,7 +298,7 @@ jobs:
           # (nfpm.yaml maps ./target/terminfo/b/bitty). Each packaging job
           # runs in its own workspace, so the validate job's tic output is
           # unavailable here; compile in this workspace instead (tic from
-          # ncurses-bin, preinstalled on ubuntu-latest).
+          # ncurses-bin, preinstalled on ubuntu-24.04).
           tic -x -o target/terminfo terminfo/bitty.ti
           # Map target arch to nfpm arch
           NFPM_ARCH="${{ matrix.arch }}"
@@ -341,7 +341,7 @@ jobs:
   build-alpine:
     name: Build x86_64-unknown-linux-musl (Alpine)
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: alpine:3.22
     timeout-minutes: 30
     steps:
@@ -444,7 +444,7 @@ jobs:
   build-freebsd:
     name: Build x86_64-unknown-freebsd (FreeBSD 15.1)
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     # `cargo test` would otherwise emit target/debug/incremental output that
     # the VM action syncs between guest and runner for no benefit.
@@ -548,7 +548,7 @@ jobs:
   verify-install:
     name: Install smoke (${{ matrix.distro }})
     needs: [build, build-alpine]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -677,7 +677,7 @@ jobs:
   windows-zip:
     name: Windows x86_64 Portable ZIP
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -961,7 +961,7 @@ jobs:
   unix-bundle:
     name: Unix bundle (${{ matrix.target }})
     needs: [build, build-alpine]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -1031,7 +1031,7 @@ jobs:
   verify-unix-bundle:
     name: Verify Unix bundle
     needs: unix-bundle
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # The foreign-arch branch calls the repo-owned scripts/check-binary-arch.sh,
@@ -1175,7 +1175,7 @@ jobs:
         unix-bundle,
         verify-unix-bundle,
       ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -1208,7 +1208,7 @@ jobs:
   aur:
     name: Publish AUR (Arch)
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_PUBLISH == 'true'
@@ -1279,7 +1279,7 @@ jobs:
   aur-bin:
     name: Publish AUR bitty-bin (Arch, prebuilt)
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_BIN_PUBLISH == 'true'
@@ -1375,7 +1375,7 @@ jobs:
   homebrew:
     name: Bump Homebrew Formula
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_PUBLISH == 'true'
     steps:
@@ -1446,7 +1446,7 @@ jobs:
   scoop:
     name: Bump Scoop Manifest
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.SCOOP_PUBLISH == 'true'
     steps:
@@ -1525,7 +1525,7 @@ jobs:
   r2-mirror:
     name: Mirror release to R2
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     env:
@@ -1623,7 +1623,7 @@ jobs:
   r2-stable:
     name: Publish R2 stable pointers
     needs: r2-mirror
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     env:

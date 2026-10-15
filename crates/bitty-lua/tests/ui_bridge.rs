@@ -15,7 +15,7 @@ use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
     BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, OverlayInput,
-    OverlayPoll, UiNode,
+    OverlayKeyChord, OverlayPoll, UiNode,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -751,11 +751,13 @@ fn overlay_poll_returns_bounded_events() {
             sequence: 1,
             kind: "text".to_string(),
             text: "hello".to_string(),
+            chord: None,
         },
         OverlayInput {
             sequence: 2,
             kind: "key".to_string(),
             text: "enter".to_string(),
+            chord: None,
         },
     ]);
     let mut vm = gate_vm("overlay-events");
@@ -789,6 +791,67 @@ fn overlay_poll_returns_bounded_events() {
     assert_eq!(stored(&services, "seq1"), Some(LuaValue::Integer(1)));
     assert_eq!(stored(&services, "seq"), Some(LuaValue::Integer(2)));
     assert_eq!(stored(&services, "overflowed"), Some(LuaValue::Bool(false)));
+}
+
+/// CTX-1236 (issue #2098): a modified key event carries its chord as a `data`
+/// table (`{ key, ctrl, alt, shift, super }`) while a bare key event carries
+/// no `data` key at all, so unmodified input marshals byte-identical to
+/// before and the composer mock envelope (`ev.data`) serves the chord first.
+#[test]
+fn overlay_poll_carries_modifier_chord_on_modified_keys_only() {
+    let services = Rc::new(UiServices::default());
+    services.overlay_events.borrow_mut().extend([
+        OverlayInput {
+            sequence: 1,
+            kind: "key".to_string(),
+            text: "key:Enter".to_string(),
+            chord: None,
+        },
+        OverlayInput {
+            sequence: 2,
+            kind: "key".to_string(),
+            text: "key:Enter".to_string(),
+            chord: Some(OverlayKeyChord::new("enter", true, false, false, false)),
+        },
+    ]);
+    let mut vm = gate_vm("overlay-chord");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local poll = bitty.ui.overlay.poll(11)
+        bitty.store.set("n", #poll.events)
+        bitty.store.set("text1", poll.events[1].text)
+        bitty.store.set("bare_data_nil", poll.events[1].data == nil)
+        bitty.store.set("text2", poll.events[2].text)
+        bitty.store.set("key2", poll.events[2].data.key)
+        bitty.store.set("ctrl2", poll.events[2].data.ctrl)
+        bitty.store.set("alt2", poll.events[2].data.alt)
+        bitty.store.set("shift2", poll.events[2].data.shift)
+        bitty.store.set("super2", poll.events[2].data.super)
+    "#,
+    );
+    assert_eq!(stored(&services, "n"), Some(LuaValue::Integer(2)));
+    assert_eq!(
+        stored(&services, "text1"),
+        Some(LuaValue::String("key:Enter".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "bare_data_nil"),
+        Some(LuaValue::Bool(true))
+    );
+    assert_eq!(
+        stored(&services, "text2"),
+        Some(LuaValue::String("key:Enter".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "key2"),
+        Some(LuaValue::String("enter".to_string()))
+    );
+    assert_eq!(stored(&services, "ctrl2"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "alt2"), Some(LuaValue::Bool(false)));
+    assert_eq!(stored(&services, "shift2"), Some(LuaValue::Bool(false)));
+    assert_eq!(stored(&services, "super2"), Some(LuaValue::Bool(false)));
 }
 
 /// CTX-0941: a non-integer overlay handle is a typed component error before

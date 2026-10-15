@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use bitty_lua::ui::UI_SCROLL_DELTA_SATURATE;
 use bitty_lua::{
     BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, OVERLAY_CAPTURE_QUEUE_MAX,
-    OVERLAY_CAPTURE_TEXT_MAX_BYTES, OverlayInput,
+    OVERLAY_CAPTURE_TEXT_MAX_BYTES, OverlayInput, OverlayKeyChord,
 };
 
 /// Core-side capture session timeout in milliseconds (CTX-0941).
@@ -360,6 +360,22 @@ impl OverlayCapture {
     /// (`P0-AC-015`). Returns `false` when no capture is active; otherwise the
     /// event is queued (dropping the oldest and counting it on overflow).
     pub fn enqueue(&mut self, kind: &str, text: &str) -> bool {
+        self.enqueue_event(kind, text, None)
+    }
+
+    /// Append one captured `key` event with its chord identity (issue #2098).
+    ///
+    /// The flat key event carries only produced text — a `ctrl+enter` submit
+    /// and a bare `enter` both deliver `"\r"` — so the chord rides alongside
+    /// the payload for the owner to tell the default chord from plain Enter.
+    /// `None` (or a chord with no modifier bit) queues an unmodified key with
+    /// the prior shape. Same hot-path/no-plugin and overflow semantics as
+    /// [`Self::enqueue`].
+    pub fn enqueue_key(&mut self, text: &str, chord: Option<OverlayKeyChord>) -> bool {
+        self.enqueue_event("key", text, chord)
+    }
+
+    fn enqueue_event(&mut self, kind: &str, text: &str, chord: Option<OverlayKeyChord>) -> bool {
         if self.owner.is_none() {
             return false;
         }
@@ -373,6 +389,7 @@ impl OverlayCapture {
             sequence: self.next_sequence,
             kind: bounded_kind(kind),
             text: bounded_text(text),
+            chord: chord.filter(OverlayKeyChord::is_modified),
         });
         // Captured input proves the session is live: extend the idle
         // deadline so fast typing never kills its own session.

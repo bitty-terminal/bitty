@@ -88,7 +88,7 @@ pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTE
 // Bridge value/error types the host-service traits are expressed in, so the
 // application can implement `SettingsSource`/`SnapshotSource` without taking a
 // direct `bitty-lua` dependency.
-pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue};
+pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue, OverlayKeyChord};
 
 /// Maximum stored manifest body bytes (RFC proposed default).
 pub const PLUGIN_MANIFEST_MAX_BYTES: usize = 256 * 1024;
@@ -1084,6 +1084,17 @@ impl PluginRuntime {
     /// is active, so input falls through to the terminal as before.
     pub fn push_overlay_input(&mut self, kind: &str, text: &str) -> bool {
         self.overlay_capture.borrow_mut().enqueue(kind, text)
+    }
+
+    /// Enqueue one captured `key` event with its chord identity (issue #2098).
+    ///
+    /// A flat key event carries only produced text, so `ctrl+enter` and a bare
+    /// `enter` arrive identically; `chord` is the missing channel that lets the
+    /// owner tell the default submit chord from plain Enter. `None` queues an
+    /// unmodified key, byte-identical to before. Returns `false` when no
+    /// capture is active.
+    pub fn push_overlay_key(&mut self, text: &str, chord: Option<OverlayKeyChord>) -> bool {
+        self.overlay_capture.borrow_mut().enqueue_key(text, chord)
     }
 
     /// Enqueue a pointer-motion event with trailing-motion coalescing (see

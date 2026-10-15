@@ -8806,6 +8806,36 @@ claims = []
         "an active capture must expose its deadline"
     );
 
+    // Issue #2098: the default submit chord `ctrl+enter` must be reachable
+    // while the capture holds. The flat key event now carries its chord
+    // identity, so the owner can tell it apart from a bare `enter` (both
+    // deliver the same CR text) — the modifier channel the capture queue
+    // previously lacked.
+    app.chrome.app_mods.control = true;
+    let cr = test_key(LogicalKey::Named(NamedKey::Enter), Some("\r"));
+    assert!(
+        app.intercept_chrome_key(&WindowEventKind::KeyboardInput(cr)),
+        "the default submit chord must be captured while the session holds"
+    );
+    assert_eq!(queued_len(&app), 5);
+    let drained = app
+        .plugin_runtime
+        .as_ref()
+        .expect("plugin runtime")
+        .overlay_capture()
+        .borrow_mut()
+        .poll(id, handle, 16)
+        .expect("owner poll");
+    let chord = drained
+        .iter()
+        .find(|event| event.kind == "key" && event.text == "\r")
+        .and_then(|event| event.chord.clone())
+        .expect("the ctrl+enter capture must carry its chord identity");
+    assert_eq!(chord.key, "enter");
+    assert!(chord.ctrl, "the modifier channel must carry ctrl");
+    assert!(!chord.alt && !chord.shift && !chord.super_held);
+    app.chrome.app_mods.control = false;
+
     // Bare Esc through the intercept cancels the session.
     let esc = test_key(LogicalKey::Named(NamedKey::Escape), None);
     assert!(

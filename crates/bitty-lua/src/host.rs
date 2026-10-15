@@ -650,6 +650,54 @@ pub struct OverlayInput {
     pub kind: String,
     /// Bounded UTF-8 payload.
     pub text: String,
+    /// Chord identity for a captured `key` event, absent for every other kind
+    /// and for an unmodified key (issue #2098). The flat key event otherwise
+    /// carries only produced text, so the default `ctrl+enter` submit and a
+    /// bare `enter` marshal identically; this is the missing modifier channel.
+    pub chord: Option<OverlayKeyChord>,
+}
+
+/// Chord identity of a captured `key` event (issue #2098).
+///
+/// `key` is the shared keymap spelling of the pressed key
+/// (`KeyName::canonical`, e.g. `"enter"`) and the flags are the same modifier
+/// bits `Chord` matches on, so a consumer composes the exact chord it would
+/// bind in a keymap (`ctrl+enter`). It is surfaced to Lua as the `data` field
+/// (`{ key, ctrl, alt, shift, super }`) and only when at least one modifier is
+/// held, so unmodified input marshals byte-identical to before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayKeyChord {
+    /// Keymap spelling of the pressed key.
+    pub key: String,
+    /// Control held.
+    pub ctrl: bool,
+    /// Alt held.
+    pub alt: bool,
+    /// Shift held.
+    pub shift: bool,
+    /// Super held.
+    pub super_held: bool,
+}
+
+impl OverlayKeyChord {
+    /// Build a chord from a keymap key spelling plus its modifier bits.
+    #[must_use]
+    pub fn new(key: &str, ctrl: bool, alt: bool, shift: bool, super_held: bool) -> Self {
+        Self {
+            key: key.to_string(),
+            ctrl,
+            alt,
+            shift,
+            super_held,
+        }
+    }
+
+    /// Whether any modifier bit is set. A chord with no modifier is not a
+    /// chord for the capture channel: it marshals as absent `data`.
+    #[must_use]
+    pub fn is_modified(&self) -> bool {
+        self.ctrl || self.alt || self.shift || self.super_held
+    }
 }
 
 /// Detailed overlay poll result per the accepted W-01 contract (CTX-0941).
@@ -1841,21 +1889,38 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
 /// (CTX-0941, accepted W-01 envelope). Each event is `{ seq, type, text }`
 /// with the decided `key`, `text`, `pointer`, `wheel` (CTX-1190), and
 /// `paste` tags (plus the mechanism-internal `ime` class, observed as
-/// committed text). The host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and bounded
-/// each text payload.
+/// committed text). A modified `key` event additionally carries `data =
+/// { key, ctrl, alt, shift, super }` (issue #2098) so the capture owner can
+/// tell a chord (the default `ctrl+enter` submit) from the same flat text
+/// produced by a bare key; unmodified input keeps the exact prior shape. The
+/// host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and
+/// bounded each text payload.
 fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
     LuaValue::array(
         events
             .iter()
             .map(|event| {
-                LuaValue::table([
-                    (
-                        "seq",
-                        LuaValue::Integer(i64::try_from(event.sequence).unwrap_or(i64::MAX)),
-                    ),
-                    ("type", LuaValue::String(event.kind.clone())),
-                    ("text", LuaValue::String(event.text.clone())),
-                ])
+                let seq = LuaValue::Integer(i64::try_from(event.sequence).unwrap_or(i64::MAX));
+                let kind = LuaValue::String(event.kind.clone());
+                let text = LuaValue::String(event.text.clone());
+                match &event.chord {
+                    Some(chord) if chord.is_modified() => LuaValue::table([
+                        ("seq", seq),
+                        ("type", kind),
+                        ("text", text),
+                        (
+                            "data",
+                            LuaValue::table([
+                                ("key", LuaValue::String(chord.key.clone())),
+                                ("ctrl", LuaValue::Bool(chord.ctrl)),
+                                ("alt", LuaValue::Bool(chord.alt)),
+                                ("shift", LuaValue::Bool(chord.shift)),
+                                ("super", LuaValue::Bool(chord.super_held)),
+                            ]),
+                        ),
+                    ]),
+                    _ => LuaValue::table([("seq", seq), ("type", kind), ("text", text)]),
+                }
             })
             .collect(),
     )

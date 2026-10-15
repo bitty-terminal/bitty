@@ -79,9 +79,10 @@ pub use services::{
     CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
     MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue, OverlayPeers,
     PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv,
-    QueuedPinRequest, QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY,
-    ServiceCallLedger, ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource,
-    SnapshotSource, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
+    QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest,
+    SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord, ServiceDirectory,
+    ServiceRecord, SettingsSource, SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES,
+    TerminalSubmitQueue, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
     UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
@@ -129,6 +130,17 @@ pub const PANEL_PIN_QUEUE_CAPACITY: usize = 64;
 /// variant-generation burst while a hostile loop still cannot queue unbounded
 /// work. Overflow drops the newest intent and the Lua call returns `false`.
 pub const THEME_REQUEST_QUEUE_CAPACITY: usize = 16;
+
+/// Bound on queued `bitty.terminal.submit` frames across all plugins between
+/// two app ticks (CTX-1239, issue #2101).
+///
+/// Same governance as [`PANEL_PIN_QUEUE_CAPACITY`], sized tighter: one
+/// frame carries up to the 64 KiB content cap plus framing, so 16 bounds
+/// the queued bytes near one full per-generation budget window while a
+/// hostile loop still cannot queue unbounded work. Overflow drops the newest
+/// intent, counts it, and the Lua call reports a `denied`/`queue-full`
+/// outcome table with the budget untouched (retry later).
+pub const TERMINAL_SUBMIT_QUEUE_CAPACITY: usize = 16;
 
 /// Event-kind prefix of the workspace domain (CTX-0889, ADR-0014).
 ///
@@ -643,6 +655,13 @@ pub struct PluginRuntime {
     /// previews through `Runtime::set_theme_palette` and commits confirms
     /// through the persist backend first, so a preview can never persist.
     theme_requests: Rc<RefCell<ThemeRequestQueue>>,
+    /// CTX-1239 (issue #2101): bounded queue of `bitty.terminal.submit`
+    /// frames, drained by the application each tick
+    /// ([`PluginRuntime::drain_submit_requests`]). The drain writes each
+    /// already-authorized frame through the single input router
+    /// (`Runtime::push_input_bytes`); authorization (grant, cap, budget,
+    /// framing) ran at enqueue time, so the drain is mechanical.
+    submit_requests: Rc<RefCell<TerminalSubmitQueue>>,
     /// CTX-1169: durable-commit backend behind confirmed colorschemes.
     ///
     /// `None` by default (no persist configured): confirms drain to a
@@ -757,6 +776,9 @@ impl PluginRuntime {
             image_roots: Vec::new(),
             theme_requests: Rc::new(RefCell::new(ThemeRequestQueue::new(
                 THEME_REQUEST_QUEUE_CAPACITY,
+            ))),
+            submit_requests: Rc::new(RefCell::new(TerminalSubmitQueue::new(
+                TERMINAL_SUBMIT_QUEUE_CAPACITY,
             ))),
             theme_persist_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
@@ -1122,6 +1144,35 @@ impl PluginRuntime {
     #[must_use]
     pub fn theme_requests_dropped(&self) -> u64 {
         self.theme_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared submit intent queue handle (CTX-1239, issue #2101).
+    ///
+    /// Shared with every activated generation that holds
+    /// `terminal.input.submit`, so granted `bitty.terminal.submit` calls
+    /// from those generations enqueue here. Diagnostics and tests read the
+    /// live queue through this handle.
+    #[must_use]
+    pub fn submit_queue(&self) -> &Rc<RefCell<TerminalSubmitQueue>> {
+        &self.submit_requests
+    }
+
+    /// Drain queued `bitty.terminal.submit` frames in FIFO order (CTX-1239,
+    /// issue #2101).
+    ///
+    /// The application writes each frame on its own thread through the
+    /// single input router (`Runtime::push_input_bytes`); every frame
+    /// drained here was already authorized (grant, cap, budget, framing) at
+    /// enqueue time, so the drain is mechanical. Bounded by
+    /// [`TERMINAL_SUBMIT_QUEUE_CAPACITY`].
+    pub fn drain_submit_requests(&mut self) -> Vec<QueuedSubmitRequest> {
+        self.submit_requests.borrow_mut().drain()
+    }
+
+    /// Submit intents dropped by queue overflow since creation.
+    #[must_use]
+    pub fn submit_requests_dropped(&self) -> u64 {
+        self.submit_requests.borrow().dropped()
     }
 
     /// Runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -1544,6 +1595,14 @@ impl PluginRuntime {
         let panel_focus = granted
             .iter()
             .any(|capability| capability.as_str() == "panel.focus");
+        // CTX-1239 (issue #2101): the submit grant is the lease
+        // authorization for the Lua path (submit_host.rs: holder
+        // attribution arrives with the capability grant lane). Read never
+        // implies submit and submit never implies read: the composer holds
+        // both, each gated independently.
+        let terminal_submit = granted
+            .iter()
+            .any(|capability| capability.as_str() == "terminal.input.submit");
         // CTX-0889: the workspace domain grants are independent (read never
         // implies control, control never implies read).
         let workspace_read = granted
@@ -1697,6 +1756,16 @@ impl PluginRuntime {
         // they keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
         if panel_create {
             plugin_services.set_panel_create_backend(self.panel_create_backend.clone());
+        }
+        // CTX-1239 (issue #2101): the `bitty.terminal.submit` intent queue.
+        // Shared only with `terminal.input.submit` generations (no queue
+        // without grant); the call-time grant gate in `terminal_submit`
+        // stays as the second layer, and the bridge presence probe
+        // (`has_terminal_submit`) requires both, so ungranted generations
+        // observe nil — indistinguishable from absent.
+        plugin_services.set_terminal_submit_access(terminal_submit);
+        if terminal_submit {
+            plugin_services.set_submit_queue(Some(self.submit_requests.clone()));
         }
         // CTX-1139: the `bitty.fx.pulse` intent queue. Shared only with
         // `panel.focus` generations (no queue without grant); the call-time

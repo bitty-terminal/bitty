@@ -1264,6 +1264,10 @@ impl TerminalApp {
         // the colorscheme. Previews live-apply with no durable write;
         // confirms commit through the persist backend first.
         self.apply_plugin_theme_requests();
+        // CTX-1239 (issue #2101): write queued `bitty.terminal.submit`
+        // frames through the single input router before present, so a
+        // granted submit lands in the focused PTY on this tick.
+        self.apply_plugin_submit_requests();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -2233,6 +2237,38 @@ impl TerminalApp {
         for queued in requests {
             if let Err(error) = self.runtime.apply_theme_request(&queued, &backend) {
                 crate::logging::warn(|| format!("bitty: plugin theme request dropped ({error})"));
+            }
+        }
+    }
+
+    /// Writes queued `bitty.terminal.submit` frames to the focused PTY
+    /// (CTX-1239, issue #2101).
+    ///
+    /// Bounded by the plugin runtime's submit queue capacity. Every frame
+    /// drained here was already authorized at enqueue time (grant, content
+    /// cap, per-generation budget, byte-exact framing), so the drain is a
+    /// mechanical write through the single input router
+    /// (`Runtime::push_input_bytes`) — the same router the native
+    /// `Runtime::terminal_submit` uses after its own checks. Fail-closed
+    /// rules:
+    /// - a frame no live PTY accepts (headless buffer, session-less leaf)
+    ///   stays buffered with a warning and the budget stays charged: the
+    ///   Lua call already reported `accepted` for the validated frame, so
+    ///   the composer already closed its modal. Headed with a live shell
+    ///   the write lands synchronously.
+    pub(crate) fn apply_plugin_submit_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let requests = plugin_runtime.drain_submit_requests();
+        for queued in requests {
+            if !self.runtime.push_input_bytes(&queued.frame) {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: plugin submit buffered (no live PTY accepted {} bytes)",
+                        queued.frame.len()
+                    )
+                });
             }
         }
     }

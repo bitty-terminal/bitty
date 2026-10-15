@@ -1060,4 +1060,144 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             vec![ViewId::new(1), ViewId::new(2)]
         );
     }
+
+    const SUBMIT_PROBE_COMMANDS: &[&str] = &["go", "big"];
+
+    const SUBMIT_PROBE: &str = r#"
+local function call_submit(text)
+  local submit = bitty.terminal.submit
+  if submit == nil then return "ABSENT" end
+  local ok, result = pcall(submit, text)
+  if not ok then return "ERR:" .. result.code end
+  if result.status == "accepted" then
+    return "OK:accepted:" .. tostring(result.bytes)
+  end
+  return "OK:" .. tostring(result.status) .. ":" .. tostring(result.deny)
+end
+
+bitty.commands.register({ id = "go", title = "Go", run = function()
+  return call_submit("cargo test") end })
+bitty.commands.register({ id = "big", title = "Big", run = function()
+  return call_submit(string.rep("q", 70000)) end })
+"#;
+
+    fn write_submit_probe(root: &Path, id: &str, capabilities: &[&str]) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let qualified: Vec<String> = SUBMIT_PROBE_COMMANDS
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect();
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{capabilities_toml}[lazy]\ncommands = [{}]\nevents = []\n",
+                qualified.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), SUBMIT_PROBE).expect("init");
+    }
+
+    fn submit_test_app(
+        tag: &str,
+        id: &str,
+        capabilities: &[&str],
+    ) -> crate::terminal_app::TerminalApp {
+        let root = pin_test_dir(tag);
+        write_submit_probe(&root, id, capabilities);
+        let live = two_leaf_runtime();
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+            .expect("dev root must yield a session");
+        let pin_state = Rc::clone(&session.pin_state);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        crate::terminal_app::TerminalApp::with_theme(
+            live,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(session.runtime))
+        .with_live_pin_state(Some(pin_state))
+    }
+
+    #[test]
+    fn startup_terminal_submit_lands_byte_exact_on_tick() {
+        // CTX-1239 prod path: activation shares the submit queue with
+        // `terminal.input.submit` generations, so a granted
+        // `bitty.terminal.submit` from Lua queues the byte-exact frame and
+        // the tick drain writes it through the single input router.
+        // Headless (no live writer) the frame buffers in pending input;
+        // headed the same drain delivers it to the live PTY (verify3b).
+        let mut app = submit_test_app("granted", "xuepoo.prodsubmit", &["terminal.input.submit"]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodsubmit", "go"),
+            "OK:accepted:23",
+            "granted submit reports the framed byte count"
+        );
+        assert!(
+            app.runtime.pending_input().is_empty(),
+            "nothing lands before the tick drain"
+        );
+        app.apply_plugin_submit_requests();
+        assert_eq!(
+            app.runtime.pending_input(),
+            b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+            "the drain writes the byte-exact paste frame"
+        );
+        assert!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .submit_queue()
+                .borrow()
+                .is_empty(),
+            "the drain must consume every queued frame"
+        );
+        // Over-cap text is a denied table with nothing queued.
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodsubmit", "big"),
+            "OK:denied:too-large"
+        );
+        app.apply_plugin_submit_requests();
+        assert_eq!(
+            app.runtime.pending_input(),
+            b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+            "denials emit nothing"
+        );
+    }
+
+    #[test]
+    fn startup_terminal_submit_absent_without_grant() {
+        // Fail-closed indistinguishability: without
+        // `terminal.input.submit` the generation observes no `submit` key
+        // at all (the composer nil path), so the Lua call can never reach
+        // the queue and the runtime is never touched.
+        let mut app = submit_test_app("denied", "xuepoo.prodsubmitdenied", &[]);
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodsubmitdenied", "go"),
+            "ABSENT"
+        );
+        assert_eq!(
+            dispatch_pin(&mut app, "xuepoo.prodsubmitdenied", "big"),
+            "ABSENT"
+        );
+        app.apply_plugin_submit_requests();
+        assert!(app.runtime.pending_input().is_empty());
+    }
 }

@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
+use bitty_runtime::plugin_runtime::OverlayKeyChord;
 use bitty_runtime::{
     FocusDirection, LayoutNode, PanelLayoutMode, PresentationMode, Runtime, SplitAxis, View,
     ViewCloseRequest, ViewId, WsCloseRequest,
@@ -408,6 +409,30 @@ pub(crate) fn track_app_modifiers(mods: &mut AppModifiers, key: &KeyEvent) {
 /// shell bytes.
 pub(crate) fn clear_app_modifiers_on_focus(mods: &mut AppModifiers, _focused: bool) {
     *mods = AppModifiers::default();
+}
+
+/// Chord identity for a captured overlay key event (issue #2098).
+///
+/// The flat overlay key event carries only produced text, so while a capture
+/// holds a `ctrl+enter` submit and a bare `enter` deliver the same `\r` and are
+/// indistinguishable to the consumer. This builds the chord — the key's shared
+/// keymap spelling (`KeyName::canonical`) plus the live modifier bits — that
+/// restores the missing channel, so a consumer can compose the exact chord it
+/// would bind in a keymap. `None` when the press has no chord identity (dead
+/// keys, media keys, non-ASCII text) or no modifier is held, so unmodified
+/// input keeps its prior shape.
+pub(crate) fn overlay_key_chord(key: &KeyEvent, mods: &AppModifiers) -> Option<OverlayKeyChord> {
+    let keyref = key_ref_from_event(key, mods)?;
+    if !(keyref.ctrl || keyref.alt || keyref.shift || keyref.super_held) {
+        return None;
+    }
+    Some(OverlayKeyChord::new(
+        &keyref.key.canonical(),
+        keyref.ctrl,
+        keyref.alt,
+        keyref.shift,
+        keyref.super_held,
+    ))
 }
 
 /// Convert a key press plus the app modifier mirror into a matchable
@@ -2431,7 +2456,15 @@ impl TerminalApp {
                                     .text
                                     .clone()
                                     .unwrap_or_else(|| super::terminal_app::overlay_key_text(key));
-                                self.push_overlay_input("key", &text);
+                                // Issue #2098: carry the chord identity next to
+                                // the flat text so a `ctrl+enter` submit stays
+                                // distinguishable from a bare `enter` (both
+                                // deliver the same CR literal). This is the
+                                // modifier channel the flat event lacked, so the
+                                // default submit chord is reachable while the
+                                // capture holds.
+                                let chord = overlay_key_chord(key, &self.chrome.app_mods);
+                                self.push_overlay_key(&text, chord);
                                 if let Some(win) = self.window.handle.as_ref() {
                                     win.request_redraw();
                                 }

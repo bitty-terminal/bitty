@@ -8,7 +8,7 @@ use bitty_platform::{
     PhysicalSize, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
 };
 use bitty_render::gpu::{GpuContext, select_instance_backends};
-use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime, WorkspaceRequest};
+use bitty_runtime::plugin_runtime::{LuaValue, OverlayKeyChord, PluginRuntime, WorkspaceRequest};
 use bitty_runtime::{Runtime, ViewId, WorkspaceSummary};
 
 use crate::ctl;
@@ -1621,6 +1621,22 @@ impl TerminalApp {
         plugin_runtime.push_overlay_input(kind, text)
     }
 
+    /// Enqueue one captured `key` event with its chord identity (issue #2098).
+    ///
+    /// The flat key event carries only produced text, so a `ctrl+enter` submit
+    /// reaches the queue identically to a bare `enter`; `chord` (the shared
+    /// keymap spelling plus modifier bits from
+    /// [`crate::chrome_keys::overlay_key_chord`] over the live modifier mirror)
+    /// is the channel that keeps the default chord reachable for the capture
+    /// owner. `None` queues an unmodified key. Returns `false` with no capture
+    /// active.
+    pub(crate) fn push_overlay_key(&mut self, text: &str, chord: Option<OverlayKeyChord>) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        plugin_runtime.push_overlay_key(text, chord)
+    }
+
     /// Enqueue a pointer-motion event with trailing-motion coalescing, so a
     /// mouse wiggle cannot evict queued key/text entries (CodeRabbit PR #1643).
     pub(crate) fn push_overlay_move(&mut self, text: &str) -> bool {
@@ -1960,7 +1976,11 @@ impl TerminalApp {
                     return false;
                 }
                 let text = key.text.clone().unwrap_or_else(|| overlay_key_text(key));
-                self.push_overlay_input("key", &text)
+                // Issue #2098: keep the chord channel on the flat key event so
+                // a `ctrl+enter` submit is distinguishable from a bare `enter`
+                // at the capture owner.
+                let chord = crate::chrome_keys::overlay_key_chord(key, &self.chrome.app_mods);
+                self.push_overlay_key(&text, chord)
             }
             WindowEventKind::Ime(bitty_platform::ImeEvent::Commit(text)) => {
                 self.push_overlay_input("text", text)

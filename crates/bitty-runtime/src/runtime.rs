@@ -480,6 +480,28 @@ pub struct Runtime {
     /// epoch-consistent frame. See `runtime::present::reject_stale_atlas_frame`.
     stale_atlas_frame_rejects: u8,
     pending_full_redraw: bool,
+    /// Minimum interval between presented frames (CTX-1231, #2093).
+    ///
+    /// Present-latest coalescing: when dirty ticks arrive faster than this
+    /// interval, intermediate frames are dropped with damage retained and
+    /// only the latest state presents. `ZERO` (default) preserves the
+    /// pre-CTX-1231 behavior: every dirty tick presents.
+    min_present_interval: std::time::Duration,
+    /// Wall clock of the last presented frame, if any (CTX-1231).
+    ///
+    /// Stamped only by ticks that actually present (`tick_at` returning
+    /// `Some`); deferred, idle, and rejected ticks leave it unchanged, so
+    /// the pacing gate measures real present cadence, never skipped work.
+    last_present_at: Option<std::time::Instant>,
+    /// Frames dropped by the coalescing gate with damage retained
+    /// (CTX-1231). Monotonic, saturating; headless burst-load accounting.
+    presents_coalesced: u64,
+    /// Whether the last dirty tick was deferred by the gate (CTX-1231).
+    ///
+    /// Set on defer, cleared by `mark_frame_presented` (every path that
+    /// consumes damage). While set, `present_coalescing_deadline` arms the
+    /// app wake so a quiet window still presents the latest frame on time.
+    coalesced_pending: bool,
     /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
     /// Geometry-only layout changes (tree edits via `layout_mut`,
@@ -1314,6 +1336,8 @@ impl std::fmt::Debug for Runtime {
             .field("pending_input_len", &self.pending_input.len())
             .field("pending_input_dropped", &self.pending_input_dropped)
             .field("pending_full_redraw", &self.pending_full_redraw)
+            .field("presents_coalesced", &self.presents_coalesced)
+            .field("coalesced_pending", &self.coalesced_pending)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
             .field("workspace_count", &self.workspaces.len())
@@ -1610,6 +1634,10 @@ impl Runtime {
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
+            min_present_interval: std::time::Duration::ZERO,
+            last_present_at: None,
+            presents_coalesced: 0,
+            coalesced_pending: false,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,
@@ -1872,6 +1900,10 @@ impl Runtime {
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
+            min_present_interval: std::time::Duration::ZERO,
+            last_present_at: None,
+            presents_coalesced: 0,
+            coalesced_pending: false,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,

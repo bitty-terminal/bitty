@@ -2916,7 +2916,13 @@ impl AppHandler for TerminalApp {
                 // `ControlFlow::Wait` until unrelated activity wakes the
                 // loop. `None` when no worker is in flight.
                 let kitty_local = self.runtime.kitty_local_deadline();
-                let wake = [hover, animation, bell, capture, kitty_local]
+                // CTX-1231 (#2093): arm a wake at the coalesced-present
+                // deadline too, otherwise a burst followed by quiet holds
+                // the deferred latest frame until unrelated activity.
+                // `None` while the gate is off or nothing is deferred, so
+                // frame-on-demand idling is unchanged.
+                let coalesced = self.runtime.present_coalescing_deadline();
+                let wake = [hover, animation, bell, capture, kitty_local, coalesced]
                     .into_iter()
                     .flatten()
                     .min();

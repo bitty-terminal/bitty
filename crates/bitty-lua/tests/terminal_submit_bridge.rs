@@ -269,13 +269,17 @@ fn submit_absent_by_default_for_legacy_hosts() {
     // surface: the defaults fail closed with the key absent.
     let services = Rc::new(LegacyServices::default());
     let mut vm = gate_vm("submit-legacy");
-    let services_dyn: Rc<dyn HostServices> = services;
+    let services_dyn: Rc<dyn HostServices> = services.clone();
     install(&mut vm, services_dyn);
     let outcome = vm
-        .execute_bounded(r#"legacy_nil = bitty.terminal.submit == nil"#)
+        .execute_bounded(r#"bitty.store.set("legacy_nil", bitty.terminal.submit == nil)"#)
         .expect("execute");
     assert!(
         matches!(outcome, BoundedExecution::Completed),
         "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("legacy_nil"),
+        Some(&LuaValue::Bool(true))
     );
 }

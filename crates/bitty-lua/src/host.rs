@@ -2841,15 +2841,16 @@ impl LuaVm {
     /// Remove a fired one-shot timer row from the VM capture (CTX-1247).
     ///
     /// Frees the `REGISTRATION_MAX_TIMERS` bridge slot so the cap counts
-    /// live timers only. Returns whether a row was removed; `false` on a
-    /// missing row or borrow contention (fail-closed: the caller keeps the
-    /// `timer_fired` containment entry so the row can never re-arm).
-    /// Cold-tick only, never the hot path.
-    pub fn consume_timer(&self, handle: i64) -> bool {
+    /// live timers only. Returns `Some(true)` when a row was removed,
+    /// `Some(false)` when the row was already absent (for example the
+    /// callback cancelled its own handle), and `None` on borrow contention
+    /// (fail-closed: the caller keeps the `timer_fired` containment entry
+    /// so the row can never re-arm). Cold-tick only, never the hot path.
+    pub fn consume_timer(&self, handle: i64) -> Option<bool> {
         self.capture
             .try_borrow_mut()
+            .ok()
             .map(|mut capture| capture.consume_timer(handle))
-            .unwrap_or(false)
     }
 
     /// Invoke a stashed registration handle (command `run`, event handler,

@@ -1412,6 +1412,13 @@ impl PluginRuntime {
                 .entries
                 .get(&plugin)
                 .is_some_and(|entry| entry.state == LifecycleState::Active);
+            // CTX-1247: prune the fired row before invoking the callback so
+            // a callback-created timer reuses the freed 64-cap slot (at-cap
+            // chains would otherwise fail `E_DEF_LIMIT` even though the
+            // one-shot deadline is gone). The callback was cloned above, so
+            // pruning cannot lose it; on consume contention the
+            // `timer_fired` entry is kept fail-closed.
+            self.consume_fired_timer(&plugin, handle);
             if active {
                 if let (Some(vm), Some(callback)) = (vm, callback) {
                     if let Ok(mut vm_ref) = vm.try_borrow_mut() {
@@ -1420,12 +1427,6 @@ impl PluginRuntime {
                     fired += 1;
                 }
             }
-            // CTX-1247: prune the fired row from the VM capture so the
-            // bridge 64-cap counts live timers only. On success the
-            // `timer_fired` containment entry is dropped (bounded, normally
-            // empty); on borrow contention it is kept fail-closed so the
-            // post-callback sync can never re-arm the fired handle.
-            self.consume_fired_timer(&plugin, handle);
             self.sync_timer_cancels();
             self.sync_new_timers(now);
         }
@@ -1478,23 +1479,24 @@ impl PluginRuntime {
     ///
     /// Frees the bridge 64-cap slot so the cap covers live timers only
     /// (one-shot semantics preserved: the host deadline is already removed
-    /// and handles never reuse). On success the `timer_fired` containment
-    /// entry is dropped to keep that set bounded (normally empty); on
-    /// missing VM, missing row, or borrow contention the entry is kept
-    /// fail-closed so the sync can never re-arm the fired handle.
+    /// and handles never reuse). Drops the `timer_fired` containment entry
+    /// when the row is confirmed absent — removed here or already gone
+    /// (for example the callback previously cancelled its own handle) —
+    /// keeping that set bounded (normally empty). Retains the entry only on
+    /// missing VM or borrow contention fail-closed, where the row might
+    /// still be present and the sync must never re-arm it.
     /// Cold-tick only, never the hot path.
     fn consume_fired_timer(&mut self, plugin: &PluginId, handle: i64) {
-        let consumed = self
+        let outcome: Option<bool> = self
             .entries
             .get(plugin)
             .and_then(|entry| entry.vm.clone())
             .and_then(|vm| {
                 vm.try_borrow()
                     .ok()
-                    .map(|vm_ref| vm_ref.consume_timer(handle))
-            })
-            .unwrap_or(false);
-        if consumed {
+                    .and_then(|vm_ref| vm_ref.consume_timer(handle))
+            });
+        if outcome.is_some() {
             self.timer_fired.remove(&(plugin.clone(), handle));
         }
     }

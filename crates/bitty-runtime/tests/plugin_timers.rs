@@ -384,3 +384,69 @@ fn ten_plan_repeating_chains_survive_past_15s() {
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn at_cap_repeating_chain_reuses_freed_slot() {
+    // CTX-1247 CodeRabbit follow-up: at the 64 live-timer cap a firing
+    // callback must reuse the freed slot. The pump prunes the fired row
+    // before invoking the callback (clone-then-consume-then-invoke), so a
+    // `timers.create` inside the callback sees 63 live rows, not 64.
+    // Prune-after would fail this with E_DEF_LIMIT even though the one-shot
+    // deadline is gone.
+    let data = temp_dir("at-cap");
+    let root = temp_dir("at-cap-root");
+    let id = PluginId::new("bitty-featured.atcap").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.atcap",
+        r#"
+        bitty.store.set("fires", 0)
+        bitty.store.set("rearm_fail", 0)
+        local cb
+        cb = function()
+          local n = bitty.store.get("fires") or 0
+          bitty.store.set("fires", n + 1)
+          local ok, _ = pcall(function() return bitty.timers.create(100, cb) end)
+          if not ok then
+            local f = bitty.store.get("rearm_fail") or 0
+            bitty.store.set("rearm_fail", f + 1)
+          end
+        end
+        -- Fill to the 64 live-timer cap: 1 repeating chain + 63 one-shots.
+        local ok, _ = pcall(function() return bitty.timers.create(100, cb) end)
+        if not ok then
+          bitty.store.set("rearm_fail", 999)
+        end
+        for _ = 2, 64 do
+          bitty.timers.create(100000, function()
+            local n = bitty.store.get("fires") or 0
+            bitty.store.set("fires", n + 1)
+          end)
+        end
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert!(rt.timer_deadline().is_some(), "at-cap plan must arm");
+
+    let deadline = rt.timer_deadline().expect("first wake at 100ms");
+    let fired = rt.pump_due_timers_at(deadline);
+    assert_eq!(fired, 1, "exactly the repeating chain fires first");
+    let rearm_fail = match store_get(&rt, &id, "rearm_fail") {
+        Some(LuaValue::Integer(n)) => n,
+        other => panic!("rearm_fail must be an integer, got {other:?}"),
+    };
+    assert_eq!(
+        rearm_fail, 0,
+        "at-cap re-arm must reuse the freed slot (prune-before-invoke)"
+    );
+    // The chain re-armed: another wake is armed for the next cadence.
+    assert!(
+        rt.timer_deadline().is_some(),
+        "re-armed chain must keep a wake"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}

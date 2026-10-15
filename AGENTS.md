@@ -102,6 +102,20 @@
 - CodeRabbit comments gate the merge: before merging, read every CodeRabbit review comment and inline suggestion on the PR. Apply each valid suggestion in the PR (reply with the fix commit), reply with the reason for each declined one, and file out-of-scope findings as follow-up tasks/issues; record the disposition in a CarryCtx progress note. Re-run the local gates after applying fixes and wait for CI on the new head; do not merge while a CodeRabbit comment has neither an applied fix nor a reply.
 - Docs-only PRs merge immediately (owner directive): a PR that changes only Markdown prose (no code, scripts, `justfile`, workflows, config, lockfiles, fixtures, or submodule pins) is exempt from `just ci-local` and does not wait for remote CI, a reviewer, or CodeRabbit. Run the local Markdown gates (`just markdownlint`, `just status-drift`, `just scratch-paths`), push, open the PR with labels and milestone, apply any CodeRabbit comment already posted, then `gh pr merge --squash --delete-branch`. Comments that arrive after the merge become follow-up tasks. Anything beyond Markdown prose follows the full gate above.
 
+### Release and secrets (owner directive 2026-10-15)
+
+- All release secrets live at the GitHub organization level (`CLOUDFLARE_ACCOUNT_ID`,
+  `CLOUDFLARE_API_TOKEN`, `CARGO_REGISTRY_TOKEN`, `GH_PAT`, plus publish toggles
+  `AUR_PUBLISH`/`AUR_BIN_PUBLISH`/`HOMEBREW_PUBLISH`/`SCOOP_PUBLISH`). Never ask the
+  owner for secrets; the CD release workflow consumes them directly.
+- Release flow is CD-automated: prepare a `chore(release): X.Y.Z` bump PR (mirror the
+  previous release commit's file set), merge it only after the release gate is green,
+  push the `vX.Y.Z` tag (tag push is the owner's irreversible point — confirm with the
+  user first), then the release workflow publishes (R2/CDN/package managers) and agents
+  verify live (per-OS download + smoke) as a staged follow-up. Never document unshipped
+  flows as shipped; mark pending release steps PENDING in user docs.
+- Never print or persist secret values; checking presence by name (`${VAR+x}`) is fine.
+
 ### Continuous patrol and Code Review
 
 - Every completed task receives independent commander/reviewer review of its diff before acceptance (mandatory post-completion Code Review). Record defects via CarryCtx progress/risk and convert to follow-up tasks.

@@ -411,7 +411,7 @@ pub(crate) fn clear_app_modifiers_on_focus(mods: &mut AppModifiers, _focused: bo
     *mods = AppModifiers::default();
 }
 
-/// Chord identity for a captured overlay key event (issue #2098).
+/// Chord identity for a captured overlay key event (issue #2098, #2104).
 ///
 /// The flat overlay key event carries only produced text, so while a capture
 /// holds a `ctrl+enter` submit and a bare `enter` deliver the same `\r` and are
@@ -419,11 +419,23 @@ pub(crate) fn clear_app_modifiers_on_focus(mods: &mut AppModifiers, _focused: bo
 /// keymap spelling (`KeyName::canonical`) plus the live modifier bits — that
 /// restores the missing channel, so a consumer can compose the exact chord it
 /// would bind in a keymap. `None` when the press has no chord identity (dead
-/// keys, media keys, non-ASCII text) or no modifier is held, so unmodified
-/// input keeps its prior shape.
+/// keys, media keys, non-ASCII text), when no modifier is held (unmodified
+/// input keeps its prior shape), or for a shift-only `Char` (issue #2104):
+/// `Shift+A` produces text (`A`, `!`, ...) rather than a chord, so it stays a
+/// flat literal and the consumer inserts it; named keys keep all modifiers
+/// (`Shift+Enter` stays a chord) and `Char` with `ctrl`/`alt`/`super` keeps
+/// its chord (real chord intent).
 pub(crate) fn overlay_key_chord(key: &KeyEvent, mods: &AppModifiers) -> Option<OverlayKeyChord> {
     let keyref = key_ref_from_event(key, mods)?;
     if !(keyref.ctrl || keyref.alt || keyref.shift || keyref.super_held) {
+        return None;
+    }
+    if matches!(keyref.key, bitty_config::KeyName::Char(_))
+        && keyref.shift
+        && !keyref.ctrl
+        && !keyref.alt
+        && !keyref.super_held
+    {
         return None;
     }
     Some(OverlayKeyChord::new(
@@ -5017,6 +5029,175 @@ claims = []
             .overlay_capture()
             .borrow()
             .queued_len()
+    }
+
+    #[test]
+    fn overlay_key_chord_rule_matrix_shift_only_char_stays_flat() {
+        // Issue #2104 (regression from #2099): a shift-only `Char` produces
+        // text (`A`, `!`, ...) rather than a chord, so it must stay a flat
+        // literal (`None`); named keys keep all modifiers and `Char` with a
+        // real modifier keeps its chord.
+        let plain = AppModifiers::default();
+        let shift_only = AppModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        // Bare keys carry no chord (prior shape unchanged).
+        assert!(overlay_key_chord(&test_char_key("a"), &plain).is_none());
+        assert!(overlay_key_chord(&test_key(LogicalKey::Named(NamedKey::Enter)), &plain).is_none());
+        assert!(
+            overlay_key_chord(&test_key(LogicalKey::Named(NamedKey::Escape)), &plain).is_none()
+        );
+        // Shift-only Char stays flat: capitals and shifted symbols insert.
+        for reported in ["A", "Z", "!", "@", "#", "$"] {
+            assert!(
+                overlay_key_chord(&test_char_key(reported), &shift_only).is_none(),
+                "shift-only Char {reported} must stay a flat literal"
+            );
+        }
+        // Shift-only named keys keep the chord with all mods.
+        for (named, want) in [
+            (NamedKey::Enter, "enter"),
+            (NamedKey::Escape, "escape"),
+            (NamedKey::Tab, "tab"),
+            (NamedKey::ArrowUp, "up"),
+            (NamedKey::ArrowDown, "down"),
+        ] {
+            let chord = overlay_key_chord(&test_key(LogicalKey::Named(named)), &shift_only)
+                .expect("shift-only named key keeps its chord");
+            assert_eq!(chord.key, want);
+            assert!(chord.shift, "shift bit survives for {want}");
+            assert!(!chord.ctrl && !chord.alt && !chord.super_held);
+        }
+        // Ctrl+Enter stays reachable (#2098 stays fixed).
+        let ctrl = AppModifiers {
+            control: true,
+            ..Default::default()
+        };
+        let chord = overlay_key_chord(&test_key(LogicalKey::Named(NamedKey::Enter)), &ctrl)
+            .expect("ctrl+enter keeps its chord");
+        assert_eq!(chord.key, "enter");
+        assert!(chord.ctrl && !chord.shift);
+        // Char with a real modifier keeps its chord (chord intent).
+        let ctrl_shift = AppModifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let chord = overlay_key_chord(&test_char_key("A"), &ctrl_shift)
+            .expect("ctrl+shift Char keeps its chord");
+        assert_eq!(chord.key, "a");
+        assert!(chord.ctrl && chord.shift);
+        let alt_shift = AppModifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        let chord = overlay_key_chord(&test_char_key("H"), &alt_shift)
+            .expect("alt+shift Char keeps its chord");
+        assert!(chord.alt && chord.shift);
+        let super_shift = AppModifiers {
+            super_held: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert!(
+            overlay_key_chord(&test_char_key("X"), &super_shift).is_some(),
+            "super+shift Char keeps its chord"
+        );
+        let ctrl_only = AppModifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert!(
+            overlay_key_chord(&test_char_key("c"), &ctrl_only).is_some(),
+            "ctrl Char keeps its chord"
+        );
+    }
+
+    #[test]
+    fn overlay_capture_shift_char_stays_flat_while_shift_named_keeps_chord() {
+        // Issue #2104 integration: with a capture held, Shift+A must queue as
+        // a flat literal (chord None, text preserved) while Shift+Enter queues
+        // with its chord — both through the real intercept into the poll
+        // shape the Lua consumer marshals (`data` only when modified).
+        use bitty_platform::{KeyLocation, WindowEventKind};
+        let (mut app, root, data) = overlay_capture_test_app("shift-chord");
+        assert!(app.overlay_capture_active());
+        fn key_press(logical: LogicalKey, text: Option<&str>) -> WindowEventKind {
+            WindowEventKind::KeyboardInput(KeyEvent {
+                logical_key: logical,
+                text: text.map(str::to_string),
+                location: KeyLocation::Standard,
+                state: PressState::Pressed,
+                repeat: false,
+                is_synthetic: false,
+            })
+        }
+        // Shift+A (produced `A`) through the intercept.
+        app.chrome.app_mods = AppModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(
+            app.intercept_chrome_key(&key_press(
+                LogicalKey::Character("A".to_string()),
+                Some("A"),
+            )),
+            "shifted char must be captured while the session holds"
+        );
+        app.chrome.app_mods = AppModifiers::default();
+        // Shift+Enter through the intercept.
+        app.chrome.app_mods = AppModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(
+            app.intercept_chrome_key(&key_press(LogicalKey::Named(NamedKey::Enter), Some("\r"),)),
+            "shift+enter must be captured while the session holds"
+        );
+        app.chrome.app_mods = AppModifiers::default();
+        assert_eq!(overlay_queued_len(&app), 2);
+        let (owner, handle) = {
+            let capture = app
+                .plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .overlay_capture();
+            let capture = capture.borrow();
+            (
+                capture.owner_plugin().expect("owner").to_string(),
+                capture.owner_handle().expect("handle"),
+            )
+        };
+        let drained = app
+            .plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .overlay_capture()
+            .borrow_mut()
+            .poll(&owner, handle, 16)
+            .expect("owner poll");
+        assert_eq!(drained.len(), 2);
+        let flat = drained
+            .iter()
+            .find(|event| event.text == "A")
+            .expect("shifted char text preserved");
+        assert_eq!(flat.kind, "key");
+        assert!(
+            flat.chord.is_none(),
+            "shift-only Char must queue flat (no chord) so capitals insert"
+        );
+        let shifted = drained
+            .iter()
+            .find(|event| event.text == "\r")
+            .and_then(|event| event.chord.clone())
+            .expect("shift+enter must carry its chord");
+        assert_eq!(shifted.key, "enter");
+        assert!(shifted.shift, "shift bit survives for named keys");
+        assert!(!shifted.ctrl && !shifted.alt && !shifted.super_held);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

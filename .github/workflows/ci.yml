@@ -23,7 +23,7 @@ jobs:
   # aggregates pass/fail: the job is green only when both shards are green.
   quality:
     name: Quality gates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -144,7 +144,7 @@ jobs:
         if: matrix.shard == 1
         run: cargo fmt --all -- --check
 
-      # Arch tooling is absent on ubuntu-latest, so this gate runs its
+      # Arch tooling is absent on ubuntu-24.04, so this gate runs its
       # in-tree assertions and skips the makepkg --printsrcinfo probe.
       - name: Validate packaging recipes (artifact-install consistency)
         if: matrix.shard == 1
@@ -340,7 +340,7 @@ jobs:
 
   msrv:
     name: MSRV 1.85 check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out repository
@@ -396,7 +396,7 @@ jobs:
 
   linux-x11:
     name: Linux X11 (xvfb)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # CTX-0971 R4: sccache shares dep units with quality/linux-wayland via
     # the same Cargo.lock-scoped GHA namespace (see quality job comment).
@@ -565,7 +565,7 @@ jobs:
 
   linux-wayland:
     name: Linux Wayland
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # CTX-0971 R4: sccache shares dep units with quality/linux-x11 via
     # the same Cargo.lock-scoped GHA namespace (see quality job comment).
@@ -869,7 +869,7 @@ jobs:
 
   supply-chain:
     name: Supply chain (deny/audit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out repository
@@ -1128,7 +1128,7 @@ jobs:
     name: M1 matrix (Tier 1 aggregate)
     if: always()
     needs: [linux-x11, linux-wayland, macos, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       M1_JOB_LINUX_X11: ${{ needs['linux-x11'].result }}
@@ -1166,7 +1166,7 @@ jobs:
     name: Compat release matrix (Tier 1 aggregate)
     if: always()
     needs: [linux-x11, linux-wayland, macos, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       COMPAT_JOB_LINUX_X11: ${{ needs['linux-x11'].result }}

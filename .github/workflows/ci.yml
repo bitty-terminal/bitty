@@ -1077,11 +1077,11 @@ jobs:
           & $script -Version 0.0.23 -Target arm64 -DryRun
           Write-Host 'arm64 dry-run OK'
           $urls = @( & $script -Version 0.0.23 -Target x64 -PrintUrl )
-          if ($urls[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
-          if ($urls[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
+          if ($urls[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
+          if ($urls[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
           $urlsArm = @( & $script -Version 0.0.23 -Target arm64 -PrintUrl )
-          if ($urlsArm[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe') { throw "arm64 PrintUrl mismatch: $($urlsArm[0])" }
-          if ($urlsArm[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe.sha256') { throw "arm64 sidecar mismatch: $($urlsArm[1])" }
+          if ($urlsArm[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe') { throw "arm64 PrintUrl mismatch: $($urlsArm[0])" }
+          if ($urlsArm[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe.sha256') { throw "arm64 sidecar mismatch: $($urlsArm[1])" }
           Write-Host 'PrintUrl templates OK'
           try {
             & $script -Version 0.0.23-rc1 -Target x64 -DryRun | Out-Null
@@ -1091,7 +1091,7 @@ jobs:
             Write-Host 'prerelease rejection OK'
           }
           $text = Get-Content -Path $script -Raw
-          foreach ($needle in @('bitty/install/latest.txt', 'Expand-Archive', 'Get-FileHash', 'irm https://cdn.bitty.run/bitty/install/install.ps1 | iex')) {
+          foreach ($needle in @('install/latest.txt', 'Expand-Archive', 'Get-FileHash', 'irm https://cdn.bitty.run/install/install.ps1 | iex')) {
             if ("$text" -notmatch [regex]::Escape($needle)) { throw "install.ps1 missing '$needle'" }
           }
           Write-Host 'install.ps1 static asserts OK'
@@ -1108,8 +1108,8 @@ jobs:
           # is not meaningful: the dry-run path spawns no native process).
           & $script -Version 0.0.23 -Target x64 -DryRun
           $urls = @( & $script -Version 0.0.23 -Target x64 -PrintUrl )
-          if ($urls[0] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
-          if ($urls[1] -ne 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
+          if ($urls[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
+          if ($urls[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
           Write-Host 'install.ps1 5.1 dry-run OK'
 
   # M1-10 / CTX-0574: aggregate the four ADR-0002 Tier 1 platform legs into a

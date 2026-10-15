@@ -18,7 +18,7 @@
 //!   `--proto =https`, no shell interpolation) plus system `tar` for
 //!   extraction plus Rust-side SHA-256 verification. No Rust network stack
 //!   in bitty (DIR-030 D6 / DIR-016 / DIR-017 stay intact).
-//! - Layout: `bitty/extensions/<name>/<version>/<target>.tar.gz` plus the
+//! - Layout: `extensions/<name>/<version>/<target>.tar.gz` plus the
 //!   aggregate `SHA256SUMS` manifest (the authoritative checksum record per
 //!   `packaging/README.md`); the tarball holds exactly `bitty-component.toml`
 //!   plus `bitty-<name>` at the archive root.
@@ -258,7 +258,7 @@ pub fn registry_digest_for(_name: &str, _version: &str) -> Option<String> {
 }
 
 /// R2 key prefix for prebuilt component distributions.
-pub const SEED_KEY_PREFIX: &str = "bitty/extensions";
+pub const SEED_KEY_PREFIX: &str = "extensions";
 
 /// Maximum bytes of a `--version` value (mirrors the component CLI bound).
 pub const SEED_VERSION_MAX_BYTES: usize = 64;
@@ -331,9 +331,9 @@ pub const SEED_TAR_LIST_MAX_BYTES: usize = 8192;
 /// here with zero spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedUrls {
-    /// `https://cdn.bitty.run/bitty/extensions/<name>/<version>/<target>.tar.gz`.
+    /// `https://cdn.bitty.run/extensions/<name>/<version>/<target>.tar.gz`.
     pub tarball_url: String,
-    /// `https://cdn.bitty.run/bitty/extensions/<name>/<version>/SHA256SUMS`.
+    /// `https://cdn.bitty.run/extensions/<name>/<version>/SHA256SUMS`.
     pub manifest_url: String,
     /// Tarball file name (`<target>.tar.gz`, the manifest lookup key).
     pub tarball_file: String,
@@ -513,7 +513,7 @@ pub fn valid_seed_target(target: &str) -> bool {
 
 /// Final audit over a constructed URL: exact `https://cdn.bitty.run` base
 /// (built from [`SEED_CDN_HOST`], the single allowlisted host), exact
-/// `bitty/extensions/` prefix, bounded length, and no byte outside the
+/// `extensions/` prefix, bounded length, and no byte outside the
 /// URL-safe set the validated parts can produce. Belt and braces after part
 /// validation: the audit pins the invariant for review even though
 /// validated parts cannot violate it.
@@ -1672,11 +1672,11 @@ mod tests {
         let urls = seed_urls("net", "0.0.23", "x86_64-unknown-linux-gnu").expect("urls");
         assert_eq!(
             urls.tarball_url,
-            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz"
+            "https://cdn.bitty.run/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz"
         );
         assert_eq!(
             urls.manifest_url,
-            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS"
+            "https://cdn.bitty.run/extensions/net/0.0.23/SHA256SUMS"
         );
         assert_eq!(urls.tarball_file, "x86_64-unknown-linux-gnu.tar.gz");
     }
@@ -1869,9 +1869,9 @@ mod tests {
     #[test]
     fn builtin_url_check_rejects_hostile_posing() {
         for builtin in [
-            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS",
-            "https://cdn.bitty.run:443/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run/extensions/net/0.0.23/SHA256SUMS",
+            "https://cdn.bitty.run:443/extensions/net/0.0.23/x.tar.gz",
         ] {
             assert!(
                 is_builtin_installer_url(builtin),
@@ -1879,10 +1879,10 @@ mod tests {
             );
         }
         for hostile in [
-            "https://cdn.bitty.run.evil.com/bitty/extensions/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run@evil/bitty/extensions/net/0.0.23/x.tar.gz",
-            "https://CDN.BITTY.RUN/bitty/extensions/net/0.0.23/x.tar.gz",
-            "https://cdn.bitty.run:8443/bitty/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run.evil.com/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run@evil/extensions/net/0.0.23/x.tar.gz",
+            "https://CDN.BITTY.RUN/extensions/net/0.0.23/x.tar.gz",
+            "https://cdn.bitty.run:8443/extensions/net/0.0.23/x.tar.gz",
             "https://cdn.bitty.run:80/x",
             "http://cdn.bitty.run/x",
             "HTTPS://cdn.bitty.run/x",

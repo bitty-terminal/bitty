@@ -4,10 +4,10 @@
 
 .DESCRIPTION
   Entry point (stable, served from the CDN):
-    irm https://cdn.bitty.run/bitty/install/install.ps1 | iex
+    irm https://cdn.bitty.run/install/install.ps1 | iex
 
   Resolves the release through one pointer:
-    https://cdn.bitty.run/bitty/install/latest.txt
+    https://cdn.bitty.run/install/latest.txt
   which holds TAG (for example v0.0.23) with a trailing newline. VERSION is
   TAG without the leading v and is what the portable ZIP name embeds.
 
@@ -15,9 +15,9 @@
   decision (packaging/README.md, CTX-1056, closes #1794). Only TAG and
   VERSION resolve at install time:
     Windows x64:
-      https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip
+      https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip
     Windows arm64:
-      https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe
+      https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe
   Each row has a <artifact>.sha256 sidecar at the same URL with .sha256
   appended, verified before installing (fail closed on mismatch). There are
   no signatures in 0.1.0: verification is hash-only (signing deferred past
@@ -38,7 +38,7 @@
   with no admin rights and no Rust toolchain.
 
   FreeBSD is not a bootstrap target (manual tar.xz download); Linux/macOS
-  must use install.sh (curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash).
+  must use install.sh (curl -fsSL https://cdn.bitty.run/install/install.sh | bash).
 
 .PARAMETER Version
   Release version to install (X.Y.Z or vX.Y.Z). Default resolves latest.txt.
@@ -63,10 +63,10 @@
   beyond the version pointer unless -Version was given).
 
 .EXAMPLE
-  irm https://cdn.bitty.run/bitty/install/install.ps1 | iex
+  irm https://cdn.bitty.run/install/install.ps1 | iex
 
 .EXAMPLE
-  iex "& { $(irm https://cdn.bitty.run/bitty/install/install.ps1) } -Version 0.0.23 -InstallDir $env:USERPROFILE\bin"
+  iex "& { $(irm https://cdn.bitty.run/install/install.ps1) } -Version 0.0.23 -InstallDir $env:USERPROFILE\bin"
 
 .NOTES
   PowerShell 5.1 and 7+ compatible. No Rust toolchain needed. Fail-closed on
@@ -103,7 +103,7 @@ function Get-BittyTag {
     }
     return "v$bare"
   }
-  $latestUrl = "$Base/bitty/install/latest.txt"
+  $latestUrl = "$Base/install/latest.txt"
   try {
     $response = Invoke-WebRequest -Uri $latestUrl -UseBasicParsing -TimeoutSec 30
   } catch {
@@ -178,7 +178,7 @@ try {
   }
 }
 if (-not $onWindows) {
-  throw 'install.ps1 serves Windows only; on Linux/macOS run: curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash'
+  throw 'install.ps1 serves Windows only; on Linux/macOS run: curl -fsSL https://cdn.bitty.run/install/install.sh | bash'
 }
 
 $CdnBase = "$CdnBase".TrimEnd('/')
@@ -190,7 +190,7 @@ $tag = Get-BittyTag -RequestedVersion $Version -Base $CdnBase
 $versionBare = $tag.TrimStart('v')
 $shortTarget = Get-BittyTarget -Override $Target
 $artifact = Get-BittyArtifact -ShortTarget $shortTarget -VersionBare $versionBare
-$url = "$CdnBase/bitty/releases/$tag/$artifact"
+$url = "$CdnBase/releases/$tag/$artifact"
 $shaUrl = "$url.sha256"
 
 if ($PrintUrl) {
@@ -213,7 +213,7 @@ if ($shortTarget -eq 'x64') {
 }
 
 if ($DryRun) {
-  Write-BittyLog "dry-run: version pointer: $CdnBase/bitty/install/latest.txt"
+  Write-BittyLog "dry-run: version pointer: $CdnBase/install/latest.txt"
   Write-BittyLog "dry-run: TAG=$tag VERSION=$versionBare TARGET=$shortTarget KIND=$kind"
   Write-BittyLog "dry-run: artifact URL: $url"
   Write-BittyLog "dry-run: sidecar URL: $shaUrl"

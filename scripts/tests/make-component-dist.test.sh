@@ -289,7 +289,7 @@ expect_fail "empty binary" --source "$EMPTY_SRC" --version "$VERSION" --target "
 
 # --- --print-url literal conformance (packaging/README.md layout table) ---
 URL_OUT="$("$SCRIPT" --print-url --name net --version 0.0.23 --target "$TARGET")"
-if [[ "$URL_OUT" == "$(printf 'https://cdn.bitty.run/bitty/extensions/net/0.0.23/%s.tar.gz\nhttps://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS' "$TARGET")" ]]; then
+if [[ "$URL_OUT" == "$(printf 'https://cdn.bitty.run/extensions/net/0.0.23/%s.tar.gz\nhttps://cdn.bitty.run/extensions/net/0.0.23/SHA256SUMS' "$TARGET")" ]]; then
   pass "--print-url emits the literal R2 layout"
 else
   fail "--print-url mismatch:
@@ -331,7 +331,7 @@ expect_bad_url "foreign cdn host" --name net --version 0.0.23 --target "$TARGET"
 # A subdomain of this zone stays allowed (test override leg).
 SUB_OUT="$("$SCRIPT" --print-url --name net --version 0.0.23 --target "$TARGET" \
   --cdn-base "https://staging.bitty.run" 2>/dev/null)"
-if [[ "$SUB_OUT" == "$(printf 'https://staging.bitty.run/bitty/extensions/net/0.0.23/%s.tar.gz\nhttps://staging.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS' "$TARGET")" ]]; then
+if [[ "$SUB_OUT" == "$(printf 'https://staging.bitty.run/extensions/net/0.0.23/%s.tar.gz\nhttps://staging.bitty.run/extensions/net/0.0.23/SHA256SUMS' "$TARGET")" ]]; then
   pass "--cdn-base allows a same-zone staging host"
 else
   fail "--cdn-base staging host mismatch:

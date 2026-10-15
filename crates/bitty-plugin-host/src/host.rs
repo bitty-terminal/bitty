@@ -808,9 +808,9 @@ impl PluginHost {
     /// Attributed inspect surface for the CTX-1152 ledger, mirroring
     /// [`Self::fs_audit`]: attribution for `[tools.*]` spawn decisions
     /// that enter via [`Self::authorize_tool_spawn`], inspectable without
-    /// a new CLI surface. Live runtime dispatch via `HostToolsAuthorizer`
-    /// enforces the same predicates but bypasses this ledger; wiring it
-    /// into the attributed path is sequel work.
+    /// a new CLI surface. The live runtime dispatch (the `bitty-runtime`
+    /// spawn service, CTX-1248/issue #2068) enforces the same predicates
+    /// and records its own `ToolSpawnLedger` per mediated spawn.
     #[must_use]
     pub fn tool_audit(&self) -> &crate::tools::ToolSpawnLedger {
         &self.tool_audit

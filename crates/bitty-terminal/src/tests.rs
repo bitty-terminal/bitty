@@ -9447,3 +9447,143 @@ fn trace_kinds_live_pty_session_records() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+// CTX-1244 (issue #2107): host timer pump + idle wake.
+
+fn timer_test_app(id: &str, init_src: &str) -> (TerminalApp, String, std::path::PathBuf) {
+    use bitty_runtime::plugin_runtime::{EmptySettings, PluginRuntime, PluginRuntimeConfig};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tag = format!("timer1244-{n}-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Timer\"\nversion = \"0.1.0\"\ndescription = \"timer test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n[lazy]\ncommands = [\"{id}:ok\"]\nevents = []\n"
+        ),
+    )
+    .expect("manifest");
+    let body = format!(
+        "bitty.commands.register({{ id = \"ok\", title = \"ok\", run = function() return \"ok\" end }})\n{init_src}"
+    );
+    std::fs::write(plugin_dir.join("lua/init.lua"), body).expect("init");
+    struct NoSnapshot;
+    impl bitty_runtime::plugin_runtime::SnapshotSource for NoSnapshot {
+        fn snapshot(
+            &self,
+            _scope: &str,
+        ) -> Result<
+            bitty_runtime::plugin_runtime::LuaValue,
+            bitty_runtime::plugin_runtime::BridgeError,
+        > {
+            Ok(bitty_runtime::plugin_runtime::LuaValue::table([
+                (
+                    "version",
+                    bitty_runtime::plugin_runtime::LuaValue::Integer(1),
+                ),
+                (
+                    "zones",
+                    bitty_runtime::plugin_runtime::LuaValue::array(vec![]),
+                ),
+            ]))
+        }
+    }
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(NoSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+    let mut app = editor_test_app();
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+    (app, id.to_string(), root)
+}
+
+#[test]
+fn plugin_timer_deadline_none_when_unarmed_preserves_zero_submit() {
+    // No runtime -> no wake; unarmed plugin -> no wake (zero-submit holds).
+    let bare = editor_test_app();
+    assert_eq!(bare.plugin_timer_deadline(), None);
+    let (app, _id, root) = timer_test_app("bitty-featured.timerunarmed", "-- no timers\n");
+    assert_eq!(
+        app.plugin_timer_deadline(),
+        None,
+        "unarmed idle must not arm a wake"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plugin_timer_deadline_armed_while_pending() {
+    // A far-future timer arms a wake but does not fire on this tick.
+    let (mut app, id, root) = timer_test_app(
+        "bitty-featured.timerarmed",
+        "bitty.timers.create(60000, function() bitty.store.set(\"late\", true) end)",
+    );
+    let deadline = app.plugin_timer_deadline().expect("armed must wake");
+    assert!(
+        deadline > std::time::Instant::now(),
+        "60s timer must wake in the future"
+    );
+    let _ = app.drive_tick();
+    let pid = bitty_plugin_host::manifest::PluginId::new(&id).expect("id");
+    let fired = app
+        .plugin_runtime
+        .as_ref()
+        .expect("runtime")
+        .services(&pid)
+        .and_then(|services| services.with_store(|store| store.get("late")));
+    assert_eq!(fired, None, "future timer must not fire on this tick");
+    assert!(
+        app.plugin_timer_deadline().is_some(),
+        "pending timer keeps its wake"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn drive_tick_pumps_due_zero_delay_timers() {
+    // A 0-delay timer fires on the next cold tick (no sleep, no events).
+    let (mut app, id, root) = timer_test_app(
+        "bitty-featured.timerdue",
+        "bitty.timers.create(0, function() bitty.store.set(\"ticked\", 1) end)",
+    );
+    assert!(
+        app.plugin_timer_deadline().is_some(),
+        "0-delay timer must arm a wake"
+    );
+    let _ = app.drive_tick();
+    let pid = bitty_plugin_host::manifest::PluginId::new(&id).expect("id");
+    let ticked = app
+        .plugin_runtime
+        .as_ref()
+        .expect("runtime")
+        .services(&pid)
+        .and_then(|services| services.with_store(|store| store.get("ticked")));
+    assert_eq!(
+        ticked,
+        Some(bitty_runtime::plugin_runtime::LuaValue::Integer(1)),
+        "drive_tick must pump due timers on the cold path"
+    );
+    assert_eq!(
+        app.plugin_timer_deadline(),
+        None,
+        "one-shot consumed leaves no wake (back to zero-submit)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

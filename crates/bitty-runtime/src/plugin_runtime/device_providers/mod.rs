@@ -69,10 +69,12 @@
 #![forbid(unsafe_code)]
 
 pub mod bluetooth;
+pub mod host;
 pub mod network;
 pub mod power;
 
 pub use bluetooth::{BluetoothBridge, MemBluetoothBackend, MemBluetoothSource, NoBluetoothSource};
+pub use host::{DEVICE_GENERATION, DeviceHost, MemEssidSource};
 pub use network::{NetworkBridge, NoEssid, ProcNetDevCounters, SysfsNetLink};
 pub use power::{
     BacklightBridge, IdleBridge, MemBacklightBackend, MemIdleBackend, MemIdleSource, NoIdleSource,

@@ -685,6 +685,22 @@ pub struct PluginRuntime {
     /// contents through [`PluginRuntime::sensor_host`] (fixture sources
     /// plus a pinned clock) without republishing.
     sensor_host: Rc<RefCell<system_sensors::host::SensorHost>>,
+    /// CTX-1238: runtime-owned native device host (issue #2100).
+    ///
+    /// One host spans every generation, so the provider-side ceilings stay
+    /// global. Published into the service directory at construction;
+    /// activation wires the handle into each generation. Tests replace the
+    /// contents through [`PluginRuntime::device_host`] (fixture roots plus
+    /// a pinned clock) without republishing.
+    device_host: Rc<RefCell<device_providers::host::DeviceHost>>,
+    /// CTX-1238: runtime-owned native audio host (issue #2100).
+    ///
+    /// One host spans every generation, so the provider-side gates stay
+    /// global. Published into the service directory at construction;
+    /// activation wires the handle into each generation. Tests replace the
+    /// contents through [`PluginRuntime::audio_host`] (fixture spawner plus
+    /// a pinned clock) without republishing.
+    audio_host: Rc<RefCell<audio::AudioHost>>,
     /// Test-only wall-clock override for the activation VM in milliseconds.
     ///
     /// `None` by default (production): activation uses
@@ -702,7 +718,11 @@ impl PluginRuntime {
     pub fn new(config: PluginRuntimeConfig) -> Self {
         let service_directory = Rc::new(RefCell::new(ServiceDirectory::new()));
         let sensor_host = Rc::new(RefCell::new(system_sensors::host::SensorHost::live()));
+        let device_host = Rc::new(RefCell::new(device_providers::host::DeviceHost::live()));
+        let audio_host = Rc::new(RefCell::new(audio::AudioHost::live()));
         Self::publish_native_sensors(&service_directory);
+        Self::publish_native_devices(&service_directory);
+        Self::publish_native_audio(&service_directory);
         Self {
             safe_mode: config.safe_mode,
             data_dir: config.data_dir,
@@ -746,6 +766,8 @@ impl PluginRuntime {
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
             store_backend: None,
             sensor_host,
+            device_host,
+            audio_host,
             vm_wall_budget_ms: None,
         }
     }
@@ -768,6 +790,65 @@ impl PluginRuntime {
                 iface: service.iface.clone(),
                 version: service.version.clone(),
                 methods: vec!["get".to_string()],
+                funcs: BTreeMap::new(),
+                args_schema: None,
+                result_schema: None,
+                heads: service.heads.clone(),
+                vm: Weak::new(),
+                suspended: false,
+            });
+        }
+    }
+
+    /// Publish the eight batch-B native device records (CTX-1238).
+    ///
+    /// Runtime-owned (not a plugin activation): provider
+    /// `bitty-terminal.devices` at
+    /// [`device_providers::host::DEVICE_GENERATION`] serving
+    /// `network.state`/`network.essid`/`bluetooth.*`/`backlight.*`/`idle.*`
+    /// backed by their broker heads. Version, methods, and heads come from
+    /// the descriptors, never from Lua. Suspend/dispose filter by plugin
+    /// id, so native records survive every plugin lifecycle transition.
+    fn publish_native_devices(directory: &Rc<RefCell<ServiceDirectory>>) {
+        use std::collections::BTreeMap;
+        use std::rc::Weak;
+        for service in device_providers::device_descriptors() {
+            let methods = device_providers::device_methods(&service.iface);
+            directory.borrow_mut().publish(ServiceRecord {
+                provider: device_providers::DEVICE_PROVIDER.to_string(),
+                generation: device_providers::host::DEVICE_GENERATION,
+                iface: service.iface.clone(),
+                version: service.version.clone(),
+                methods,
+                funcs: BTreeMap::new(),
+                args_schema: None,
+                result_schema: None,
+                heads: service.heads.clone(),
+                vm: Weak::new(),
+                suspended: false,
+            });
+        }
+    }
+
+    /// Publish the three native audio records (CTX-1238).
+    ///
+    /// Runtime-owned (not a plugin activation): provider
+    /// `bitty-terminal.audio` at [`audio::AUDIO_GENERATION`] serving
+    /// `audio.state`/`audio.control`/`audio.spectrum` backed by their
+    /// capability heads. Version, methods, and heads come from the
+    /// descriptors, never from Lua. Suspend/dispose filter by plugin id, so
+    /// native records survive every plugin lifecycle transition.
+    fn publish_native_audio(directory: &Rc<RefCell<ServiceDirectory>>) {
+        use std::collections::BTreeMap;
+        use std::rc::Weak;
+        for service in audio::audio_descriptors() {
+            let methods = audio::audio_methods(&service.iface);
+            directory.borrow_mut().publish(ServiceRecord {
+                provider: audio::AUDIO_PROVIDER.to_string(),
+                generation: audio::AUDIO_GENERATION,
+                iface: service.iface.clone(),
+                version: service.version.clone(),
+                methods,
                 funcs: BTreeMap::new(),
                 args_schema: None,
                 result_schema: None,
@@ -1583,6 +1664,14 @@ impl PluginRuntime {
         // grant gate in `service_call` stays as the second layer, so
         // ungranted consumption stays indistinguishable from absent.
         plugin_services.set_sensor_host(Some(self.sensor_host.clone()));
+        // CTX-1238: native device + audio hosts (issue #2100). Shared with
+        // every generation; the broker dispatches
+        // `bitty-terminal.devices:*` and `bitty-terminal.audio:audio.*`
+        // host-side. The call-time grant gates in `service_call` stay as
+        // the second layer, so ungranted consumption stays
+        // indistinguishable from absent.
+        plugin_services.set_device_host(Some(self.device_host.clone()));
+        plugin_services.set_audio_host(Some(self.audio_host.clone()));
         // CTX-1035: command directory wiring for the generic host-mediated
         // invocation path. Without it `commands.list`/`invoke` fail closed
         // with `E_NOT_IMPLEMENTED`.
@@ -2639,6 +2728,26 @@ impl PluginRuntime {
     #[must_use]
     pub fn sensor_host(&self) -> &Rc<RefCell<system_sensors::host::SensorHost>> {
         &self.sensor_host
+    }
+
+    /// Shared native device host (CTX-1238; diagnostics, tests).
+    ///
+    /// Tests replace the contents with fixture roots plus a pinned clock
+    /// without republishing: publication is structural (descriptors only),
+    /// dispatch reads the live host contents.
+    #[must_use]
+    pub fn device_host(&self) -> &Rc<RefCell<device_providers::host::DeviceHost>> {
+        &self.device_host
+    }
+
+    /// Shared native audio host (CTX-1238; diagnostics, tests).
+    ///
+    /// Tests replace the contents with a fixture spawner plus a pinned
+    /// clock without republishing: publication is structural (descriptors
+    /// only), dispatch reads the live host contents.
+    #[must_use]
+    pub fn audio_host(&self) -> &Rc<RefCell<audio::AudioHost>> {
+        &self.audio_host
     }
 }
 

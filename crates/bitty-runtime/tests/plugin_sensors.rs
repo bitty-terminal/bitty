@@ -258,16 +258,16 @@ fn native_sensors_publish_once_and_survive_plugin_lifecycle() {
     assert_eq!(rt.discover().len(), 2);
     // Native publication lands at construction: three records before any
     // plugin activates, all from the native component.
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     rt.activate(&bar_id()).expect("bar activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     rt.activate(&nog_id()).expect("nog activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     rt.suspend(&bar_id()).expect("suspend");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     rt.resume(&bar_id()).expect("resume");
     rt.dispose(&bar_id()).expect("dispose");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(sysfs_root.parent().expect("parent"));
 }

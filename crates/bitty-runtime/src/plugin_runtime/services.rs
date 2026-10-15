@@ -1541,6 +1541,20 @@ pub struct PluginServices {
     /// `None` leaves native sensor calls failing closed with
     /// `E_SERVICE_GONE`, like a parked provider.
     sensor_host: RefCell<Option<Rc<RefCell<super::system_sensors::host::SensorHost>>>>,
+    /// Runtime-shared native device host (CTX-1238, issue #2100).
+    ///
+    /// Shared at activation with every generation; the broker dispatches
+    /// `bitty-terminal.devices:*` through it host-side (no VM).
+    /// `None` leaves native device calls failing closed with
+    /// `E_SERVICE_GONE`, like a parked provider.
+    device_host: RefCell<Option<Rc<RefCell<super::device_providers::host::DeviceHost>>>>,
+    /// Runtime-shared native audio host (CTX-1238, issue #2100).
+    ///
+    /// Shared at activation with every generation; the broker dispatches
+    /// `bitty-terminal.audio:audio.*` through it host-side (no VM).
+    /// `None` leaves native audio calls failing closed with
+    /// `E_SERVICE_GONE`, like a parked provider.
+    audio_host: RefCell<Option<Rc<RefCell<super::audio::AudioHost>>>>,
 }
 
 impl PluginServices {
@@ -1604,6 +1618,8 @@ impl PluginServices {
             theme_requests: RefCell::new(None),
             fx_requests: RefCell::new(None),
             sensor_host: RefCell::new(None),
+            device_host: RefCell::new(None),
+            audio_host: RefCell::new(None),
         }
     }
 
@@ -1616,6 +1632,25 @@ impl PluginServices {
         host: Option<Rc<RefCell<super::system_sensors::host::SensorHost>>>,
     ) {
         *self.sensor_host.borrow_mut() = host;
+    }
+
+    /// Attach the runtime-shared native device host (CTX-1238).
+    ///
+    /// Wired once at activation with every generation; without it native
+    /// `bitty-terminal.devices` calls fail closed with `E_SERVICE_GONE`.
+    pub fn set_device_host(
+        &self,
+        host: Option<Rc<RefCell<super::device_providers::host::DeviceHost>>>,
+    ) {
+        *self.device_host.borrow_mut() = host;
+    }
+
+    /// Attach the runtime-shared native audio host (CTX-1238).
+    ///
+    /// Wired once at activation with every generation; without it native
+    /// `bitty-terminal.audio` calls fail closed with `E_SERVICE_GONE`.
+    pub fn set_audio_host(&self, host: Option<Rc<RefCell<super::audio::AudioHost>>>) {
+        *self.audio_host.borrow_mut() = host;
     }
 
     /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
@@ -3391,6 +3426,46 @@ impl HostServices for PluginServices {
             };
             let granted = self.service_heads_covered(&record.heads);
             return host.borrow_mut().call(&record.iface, method, granted);
+        }
+        // CTX-1238: native device dispatch (issue #2100). Records published
+        // by the runtime-owned `bitty-terminal.devices` component carry no
+        // VM: reads and controls run host-side through the shared device
+        // host (ceilings and `stale_age_ms` preserved, hide as nil). The
+        // grant gate above already passed; the host re-checks the full
+        // grant snapshot per call (ESSID sub-grant isolation, control
+        // heads). Unwired hosts fail closed with `E_SERVICE_GONE`, like a
+        // parked provider. No new error code, no new ambient authority.
+        if super::device_providers::host::DeviceHost::is_device_provider(&record.provider) {
+            let host = self.device_host.borrow().clone();
+            let Some(host) = host else {
+                return Err(service_gone_error(format!(
+                    "service '{iface}' is unavailable"
+                )));
+            };
+            let granted_heads: Vec<String> =
+                self.granted_capabilities.borrow().iter().cloned().collect();
+            return host
+                .borrow_mut()
+                .call(&record.iface, method, args, &granted_heads);
+        }
+        // CTX-1238: native audio dispatch (issue #2100). Records published
+        // by the runtime-owned `bitty-terminal.audio` component carry no
+        // VM: `get`/`spectrum`/`set_volume`/`toggle_mute` run host-side
+        // through the shared audio host (gates and `stale_age_ms`
+        // preserved, hide as `E_SERVICE_GONE`). The grant gate above
+        // already passed, so `granted` is true here; the host re-checks it
+        // for defense in depth. Unwired hosts fail closed with
+        // `E_SERVICE_GONE`, like a parked provider. No new error code, no
+        // new ambient authority (`pactl` fixed argv only).
+        if super::audio::is_audio_provider(&record.provider) {
+            let host = self.audio_host.borrow().clone();
+            let Some(host) = host else {
+                return Err(service_gone_error(format!(
+                    "service '{iface}' is unavailable"
+                )));
+            };
+            let granted = self.service_heads_covered(&record.heads);
+            return host.borrow_mut().call(&record.iface, method, args, granted);
         }
         let vm = record
             .vm

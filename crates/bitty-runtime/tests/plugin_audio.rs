@@ -141,6 +141,9 @@ const AUDIO_REQUIRE_MANIFEST: &str = r#"[services.required]
 "audio.state" = ">=1.0"
 "audio.control" = ">=1.0"
 "audio.spectrum" = ">=1.0"
+"xuepoo.audio:audio.state" = ">=1.0"
+"xuepoo.audio:audio.control" = ">=1.0"
+"xuepoo.audio:audio.spectrum" = ">=1.0"
 "#;
 
 const AUDIO_PROVIDER_INIT: &str = r#"
@@ -175,16 +178,16 @@ bitty.commands.register({
   title = "Probe",
   run = function() return "probed" end,
 })
-local state = bitty.services.get("audio.state")
+local state = bitty.services.get("xuepoo.audio:audio.state")
 local snapshot = state.get({})
 bitty.store.set("volume", snapshot.volume)
 bitty.store.set("port", snapshot.port)
-local spectrum = bitty.services.get("audio.spectrum")
+local spectrum = bitty.services.get("xuepoo.audio:audio.spectrum")
 local meter = spectrum.spectrum({ buckets = 8 })
 bitty.store.set("buckets", #meter.levels)
-local ok, err = pcall(bitty.services.get, "audio.control")
+local ok, err = pcall(bitty.services.get, "xuepoo.audio:audio.control")
 bitty.store.set("control_code", ok and "NONE" or err.code)
-local opt = bitty.services.get("audio.control", { optional = true })
+local opt = bitty.services.get("xuepoo.audio:audio.control", { optional = true })
 bitty.store.set("control_nil", opt == nil)
 return {}
 "#;
@@ -195,7 +198,7 @@ bitty.commands.register({
   title = "Probe",
   run = function() return "probed" end,
 })
-local control = bitty.services.get("audio.control")
+local control = bitty.services.get("xuepoo.audio:audio.control")
 local ok_vol, vol = pcall(control.set_volume, { volume = 60 })
 bitty.store.set("set_volume", ok_vol and vol.volume or -1)
 local ok_mute, mute = pcall(control.toggle_mute, {})
@@ -272,7 +275,7 @@ fn audio_read_and_spectrum_serve_while_control_stays_absent() {
     assert_eq!(rt.discover().len(), 3);
 
     rt.activate(&audio_id()).expect("provider activates");
-    assert_eq!(rt.service_directory().borrow().published_count(), 6);
+    assert_eq!(rt.service_directory().borrow().published_count(), 17);
     rt.activate(&bar_id()).expect("bar activates");
 
     assert_eq!(store_int(&rt, &bar_id(), "volume"), Some(50));
@@ -356,6 +359,6 @@ return {}
     );
     assert!(err.contains("audio.state"), "names the iface: {err}");
     assert!(err.contains("heads"), "names the field: {err}");
-    assert_eq!(rt.service_directory().borrow().published_count(), 3);
+    assert_eq!(rt.service_directory().borrow().published_count(), 14);
     let _ = std::fs::remove_dir_all(&root);
 }

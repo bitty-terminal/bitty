@@ -100,6 +100,14 @@ use bitty_plugin_host::{
 /// Native audio provider id (mirrors `SENSOR_PROVIDER` for batch A).
 pub const AUDIO_PROVIDER: &str = "bitty-terminal.audio";
 
+/// Generation pinned into native audio records (mirrors `SENSOR_GENERATION`).
+///
+/// Runtime-owned (never a plugin activation generation): the directory route
+/// carries it, so a republished replacement could never hijack a live
+/// handle. Native records never suspend or revoke (their provider is never
+/// a plugin id), so the generation never advances.
+pub const AUDIO_GENERATION: u32 = 0;
+
 /// Interface version served by this revision (must match the contract).
 pub const AUDIO_INTERFACE_VERSION: &str = "1.0.0";
 
@@ -631,6 +639,108 @@ impl AudioMonitor {
                 "service '{iface}.{method}' is not published"
             ))),
         }
+    }
+}
+
+/// Whether `iface` is one of the three native audio interfaces.
+#[must_use]
+pub fn is_audio_iface(iface: &str) -> bool {
+    matches!(iface, STATE_IFACE | CONTROL_IFACE | SPECTRUM_IFACE)
+}
+
+/// Whether `provider` names the native audio component.
+#[must_use]
+pub fn is_audio_provider(provider: &str) -> bool {
+    provider == AUDIO_PROVIDER
+}
+
+/// Method names published for one audio interface, in call order.
+#[must_use]
+pub fn audio_methods(iface: &str) -> Vec<String> {
+    match iface {
+        STATE_IFACE => vec![STATE_METHOD_GET.to_string()],
+        CONTROL_IFACE => vec![
+            CONTROL_METHOD_SET_VOLUME.to_string(),
+            CONTROL_METHOD_TOGGLE_MUTE.to_string(),
+        ],
+        SPECTRUM_IFACE => vec![SPECTRUM_METHOD.to_string()],
+        _ => vec!["get".to_string()],
+    }
+}
+
+/// Runtime-owned audio host: one live monitor plus the monotonic clock.
+///
+/// Shared per runtime (`Rc<RefCell<...>>`): every generation dispatches
+/// through the same monitor, so the spectrum/state/control ceilings stay
+/// global, not per-consumer.
+pub struct AudioHost {
+    monitor: AudioMonitor,
+    start: Instant,
+    manual_now_ms: Option<u64>,
+}
+
+impl AudioHost {
+    /// Live host: real `pactl` spawner behind the gates.
+    #[must_use]
+    pub fn live() -> Self {
+        Self {
+            monitor: AudioMonitor::live(),
+            start: Instant::now(),
+            manual_now_ms: None,
+        }
+    }
+
+    /// Test host over an injected spawner plus a pinned clock.
+    #[must_use]
+    pub fn for_test(spawn: SpawnFn, initial_now_ms: u64) -> Self {
+        Self {
+            monitor: AudioMonitor::with_spawn(spawn),
+            start: Instant::now(),
+            manual_now_ms: Some(initial_now_ms),
+        }
+    }
+
+    /// Current host instant in milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        if let Some(now) = self.manual_now_ms {
+            return now;
+        }
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Pin the clock (tests); `None` restores the live monotonic clock.
+    pub fn set_manual_now_ms(&mut self, now_ms: Option<u64>) {
+        self.manual_now_ms = now_ms;
+    }
+
+    /// Serve one native call at the host instant.
+    ///
+    /// `granted` must be the caller generation gate (already checked by the
+    /// broker; `false` hides without touching the spawner). Unknown
+    /// interfaces or methods fail closed with `E_SERVICE_GONE`
+    /// (indistinguishable from a parked provider, never a new code).
+    pub fn call(
+        &mut self,
+        iface: &str,
+        method: &str,
+        args: &LuaValue,
+        granted: bool,
+    ) -> Result<LuaValue, BridgeError> {
+        if !is_audio_iface(iface) {
+            return Err(service_gone(format!(
+                "service '{iface}.{method}' is not published"
+            )));
+        }
+        let now = self.now_ms();
+        self.monitor.dispatch(iface, method, args, now, granted)
+    }
+
+    /// Borrow the inner monitor for fixture assertions (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn monitor(&self) -> &AudioMonitor {
+        &self.monitor
     }
 }
 

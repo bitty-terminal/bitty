@@ -740,12 +740,15 @@ pub struct PluginRuntime {
     /// stays `None` (zero-submit preserved). Cold-tick only, never the hot
     /// path (P0-AC-015).
     timer_deadlines: BTreeMap<(PluginId, i64), Instant>,
-    /// Handles already fired (one-shot containment).
+    /// Handles already fired (one-shot containment fallback).
     ///
-    /// The VM capture retains fired rows (one-shot firing removes only the
-    /// host deadline), so this set stops the post-callback sync from
-    /// re-arming them. Cleared per plugin on dispose/reload/rollback; at
-    /// most one entry per armed timer, so bounded by the live timer cap.
+    /// CTX-1247: the pump prunes each fired row from the VM capture on fire
+    /// (bridge `consume_timer`), so the `REGISTRATION_MAX_TIMERS` cap counts
+    /// live timers only and this set stays empty in steady state. Entries are
+    /// kept only when the consume borrow contends (fail-closed: the
+    /// post-callback sync must never re-arm a fired handle) and are cleared
+    /// per plugin on dispose/reload/rollback. Bounded by the live timer cap
+    /// in practice (one entry per unconsumed fire, normally zero).
     timer_fired: BTreeSet<(PluginId, i64)>,
 }
 
@@ -1417,6 +1420,12 @@ impl PluginRuntime {
                     fired += 1;
                 }
             }
+            // CTX-1247: prune the fired row from the VM capture so the
+            // bridge 64-cap counts live timers only. On success the
+            // `timer_fired` containment entry is dropped (bounded, normally
+            // empty); on borrow contention it is kept fail-closed so the
+            // post-callback sync can never re-arm the fired handle.
+            self.consume_fired_timer(&plugin, handle);
             self.sync_timer_cancels();
             self.sync_new_timers(now);
         }
@@ -1465,6 +1474,31 @@ impl PluginRuntime {
             .map(|timer| timer.callback.clone())
     }
 
+    /// Prune a fired one-shot row from the VM capture (CTX-1247).
+    ///
+    /// Frees the bridge 64-cap slot so the cap covers live timers only
+    /// (one-shot semantics preserved: the host deadline is already removed
+    /// and handles never reuse). On success the `timer_fired` containment
+    /// entry is dropped to keep that set bounded (normally empty); on
+    /// missing VM, missing row, or borrow contention the entry is kept
+    /// fail-closed so the sync can never re-arm the fired handle.
+    /// Cold-tick only, never the hot path.
+    fn consume_fired_timer(&mut self, plugin: &PluginId, handle: i64) {
+        let consumed = self
+            .entries
+            .get(plugin)
+            .and_then(|entry| entry.vm.clone())
+            .and_then(|vm| {
+                vm.try_borrow()
+                    .ok()
+                    .map(|vm_ref| vm_ref.consume_timer(handle))
+            })
+            .unwrap_or(false);
+        if consumed {
+            self.timer_fired.remove(&(plugin.clone(), handle));
+        }
+    }
+
     /// Drop deadlines whose handle left the VM capture (Lua `cancel`).
     ///
     /// Cancelled handles are removed without joining `timer_fired` (handles
@@ -1500,11 +1534,12 @@ impl PluginRuntime {
     /// Arm VM-capture timers not yet tracked (activation chain + callback
     /// re-arms) at `now + delay_ms`.
     ///
-    /// Skips already-pending and already-fired handles (one-shot: the VM
-    /// capture retains fired rows). Enforces the live timer cap per plugin
-    /// fail-closed (extra handles stay unarmed). Only `Active` generations
-    /// arm; `checked_add` overflow arms at `now` (fire immediately,
-    /// fail-closed liveness).
+    /// Skips already-pending and already-fired handles (one-shot: fired rows
+    /// are pruned from the capture on fire, `timer_fired` is the
+    /// fail-closed fallback for contended consumes). Enforces the live timer
+    /// cap per plugin fail-closed (extra handles stay unarmed). Only
+    /// `Active` generations arm; `checked_add` overflow arms at `now` (fire
+    /// immediately, fail-closed liveness).
     fn sync_new_timers(&mut self, now: Instant) {
         let ids: Vec<PluginId> = self
             .entries

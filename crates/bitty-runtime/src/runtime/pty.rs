@@ -727,7 +727,7 @@ impl Runtime {
         }
         // CTX-0146: pre-scan overlap ++ new bytes for parameterized queries
         // (DECRQM mode numbers, XTGETTCAP payloads, secondary-DA request
-        // forms, XTWINOPS 14/18 ops). Bounded scans; matches ending inside the overlap were
+        // forms, XTWINOPS 14/16/18 ops). Bounded scans; matches ending inside the overlap were
         // answered on the earlier call and are filtered by the scanners.
         let overlap_len = self.query_overlap.len();
         let mut combined = Vec::with_capacity(overlap_len + bytes.len());
@@ -1487,14 +1487,21 @@ impl Runtime {
                     let query = tcaps.remove(0);
                     pending.push(crate::queries::xtgettcap_reply(&query.payload));
                 } else if crate::queries::is_xtwinops(seq) && !xtwinops.is_empty() {
-                    // XTWINOPS text area (#1334 fastfetch kitty probe):
-                    // `14 t` wants pixels, `18 t` wants cells. The
+                    // XTWINOPS text area (#1334 fastfetch kitty probe; #2131
+                    // yazi/chafa cell-size probe): `14 t` wants pixels,
+                    // `16 t` wants the cell size, `18 t` wants cells. The
                     // pre-scan carries the exact op (the parser reports
                     // no params), consumed in parse order like DECRQM.
                     let op = xtwinops.remove(0);
                     let (cols, rows, width, height) = self.xtwinops_text_area();
                     pending.push(if op == 14 {
                         crate::queries::xtwinops_pixels_reply(width, height)
+                    } else if op == 16 {
+                        let live = self.live_cell_metrics();
+                        crate::queries::xtwinops_cell_size_reply(
+                            live.width.max(1),
+                            live.height.max(1),
+                        )
                     } else {
                         crate::queries::xtwinops_cells_reply(cols, rows)
                     });
@@ -1545,7 +1552,7 @@ impl Runtime {
         self.state.take_replies()
     }
 
-    /// Text area for XTWINOPS `14 t` / `18 t` replies (#1334 fastfetch probe).
+    /// Text area for XTWINOPS `14 t` / `16 t` / `18 t` replies (#1334 fastfetch probe; #2131 cell-size probe).
     ///
     /// `(cols, rows, width_px, height_px)` of the focused leaf's content
     /// frame (first frame when focus is unknown, primary grid when the

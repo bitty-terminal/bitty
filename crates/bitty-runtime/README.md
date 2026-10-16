@@ -57,6 +57,29 @@ diagram lives in `src/lib.rs`.
   stay helper-side; the Lua/IPC surface that drives `submit_frame` and
   registry install sources are follow-ups. `bitty-ai-helper-fixture` is a
   hermetic test fixture only (never packaged).
+- Core AI request producer (`src/ai_request.rs`, AI-0314 / bitty#2162): owns a
+  bounded metadata snapshot with monotonic saturating version bumps and builds
+  every supported outbound `ai.*` envelope through one path. Its public
+  metadata boundary accepts bounded ASCII identifiers for the initial
+  service/version/capability slice, including legitimate names such as
+  `token-counting`. It rejects only credential-shaped values such as URL
+  userinfo, bearer/API-key assignments, and known key/JWT forms; no credential
+  or network access is performed. Provider/model names and routing facts are
+  deferred behind a typed extension point rather than overloaded into service
+  strings.
+  It rejects malformed, duplicate, caller-supplied correlator, over-depth, and
+  over-bound input before calling `ResidentHelper::submit_frame`; unknown
+  fields remain helper-owned. Metadata mutation, refresh, and invalidation
+  explicitly stale the last acknowledgement. Requests fail closed until the
+  current immutable publication is acknowledged through the explicit local
+  Core seam. The
+  producer is a tested Core seam only: application event-loop and Lua/IPC
+  callers, automatic metadata hooks, and a helper metadata endpoint are not
+  present in this repository yet. The follow-up integration must transport
+  `publish_metadata()` to that boundary. The current
+  `acknowledge_local_metadata()` method is explicitly a local test/integration
+  seam and does not prove helper acceptance; a future helper adapter must own
+  that receipt before this code can claim end-to-end synchronization.
 - No Lua, config, or plugin code enters the hot path (see `src/lib.rs`).
 - The plugin side queue never holds hot-path objects: no GPU, window, or PTY
   handles and no Lua VM.

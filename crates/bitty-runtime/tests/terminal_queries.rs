@@ -465,3 +465,57 @@ fn xtwinops_other_window_ops_stay_silent() {
     rt.handle_pty_bytes(&own[0]);
     assert!(replies_text(&mut rt).is_empty(), "16t echo stays silent");
 }
+
+/// #2131: yazi's exact capability-detect batch must report a kitty-capable
+/// terminal when the brand is unknown.
+///
+/// yazi sends this batch only when `Brand::from_env` misses (bitty keeps
+/// the honest `TERM=xterm-256color` + `TERM_PROGRAM=bitty`, so no brand
+/// hits): the KGP support probe, XTVERSION, the 16t cell probe, the
+/// background query, and DA1. yazi then reads `Unknown { kgp, sixel }` off
+/// the replies and picks the KgpOld driver for `(true, false)`. Every
+/// clause below pins one side of that decision: `a=q` answered OK
+/// (`kgp=true`), 16t non-zero (layout geometry), XTVERSION honest `Bitty`
+/// (no known-brand substring), DA1 exactly `?6c` (no sixel extension, so
+/// `sixel=false` and no false sixel claim), background answered (themed).
+#[test]
+fn yazi_probe_battery_reports_kitty_capable() {
+    let mut rt = themed_runtime();
+    rt.handle_pty_bytes(
+        b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>q\x1b[16t\x1b]11;?\x07\x1b[0c",
+    );
+    let replies = replies_text(&mut rt);
+    let flat: Vec<u8> = replies.concat();
+    let text = std::str::from_utf8(&flat).expect("replies are ASCII");
+    assert!(
+        text.contains("\x1b_Gi=31;OK\x1b\\"),
+        "KGP probe must answer OK (yazi kgp=true), got {replies:?}"
+    );
+    assert!(
+        text.contains("\x1bP>|Bitty"),
+        "XTVERSION must name Bitty honestly (unknown brand), got {replies:?}"
+    );
+    let mut cell: Option<(u16, u16)> = None;
+    for reply in &replies {
+        if let Ok(s) = std::str::from_utf8(reply) {
+            if let Some(rest) = s.strip_prefix("\x1b[6;") {
+                if let Some(body) = rest.strip_suffix("t") {
+                    let mut parts = body.split(';');
+                    let h: u16 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let w: u16 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    cell = Some((w, h));
+                }
+            }
+        }
+    }
+    let (w, h) = cell.expect("16t cell reply must arrive");
+    assert!(w > 0 && h > 0, "16t cell must be non-zero, got {w}x{h}");
+    assert!(
+        replies.iter().any(|r| r == b"\x1b[?6c"),
+        "DA1 must be exactly VT102 baseline (sixel=false), got {replies:?}"
+    );
+    assert!(
+        text.contains("\x1b]11;rgb:"),
+        "background query must be answered (themed), got {replies:?}"
+    );
+}

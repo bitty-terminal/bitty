@@ -304,9 +304,12 @@ fn child_environment_builder_overrides_defaults() {
 
 #[test]
 fn child_has_term_program_bitty_by_default() {
-    // CTX-0194: TERM_PROGRAM must read `bitty` so term-DB probes fall back
-    // to symbols instead of Kitty-graphics APC. No chafa dependency: assert
-    // the sanitized child environment directly via headless PTY byte capture.
+    // CTX-0194: TERM_PROGRAM must read `bitty` so detectors identify the
+    // child as bitty itself: name-based term-DB probes (e.g. chafa) fall
+    // back to symbols until they recognize bitty, while query-based probes
+    // (kitty `a=q`, XTWINOPS, DA1) detect bitty's own bounded kitty support
+    // (#2131). No chafa dependency: assert the sanitized child environment
+    // directly via headless PTY byte capture.
     let (_pty, reader, mut out) = spawn_gated(b"__BITTY_ENV_DONE__", || {
         PtyBuilder::new("/bin/sh")
             .arg("-c")

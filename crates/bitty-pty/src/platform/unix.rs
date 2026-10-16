@@ -7,10 +7,11 @@
 //!   this wrapper never uses `CommandBuilder::new_default_prog`.
 //! - **Inherited session environment with overrides plus graphics
 //!   sanitization.** Children inherit the session environment by default
-//!   (DEC-0017, Ghostty/Alacritty reference). Inherited markers claiming
-//!   graphics capabilities bitty lacks (CTX-0194: `GHOSTTY_*`, `WEZTERM_*`,
-//!   `KITTY_*`, `VTE_VERSION`, iTerm markers, `TERM_PROGRAM_VERSION`) are
-//!   removed before exec; explicit builder entries (`TERM`, `COLORTERM`,
+//!   (DEC-0017, Ghostty/Alacritty reference). Inherited markers claiming the
+//!   outer terminal's graphics capabilities (CTX-0194: `GHOSTTY_*`,
+//!   `WEZTERM_*`, `KITTY_*`, `VTE_VERSION`, iTerm markers,
+//!   `TERM_PROGRAM_VERSION`) are removed before exec so detectors identify
+//!   bitty itself; explicit builder entries (`TERM`, `COLORTERM`,
 //!   `TERM_PROGRAM=bitty`, and caller additions) are applied after that
 //!   removal and therefore win. Upstream unconditionally injects
 //!   a single extra variable (`SHELL`, resolved from `$SHELL` or the password
@@ -134,9 +135,10 @@ fn open_pty_and_spawn_once(
     //
     // CTX-0194: strip inherited graphics-fingerprint markers before applying
     // overrides. A bitty child launched from ghostty/kitty/wezterm would
-    // otherwise inherit e.g. TERM_PROGRAM=ghostty, and term-DB probes (chafa)
-    // match that entry over xterm-256color and emit Kitty-graphics APC that
-    // bitty renders blank. Removal is fail-safe (unknown keys are kept) and
+    // otherwise inherit e.g. TERM_PROGRAM=ghostty, and detectors would
+    // attribute the outer terminal's identity and graphics to the child
+    // instead of detecting bitty's own bounded kitty support (#2131).
+    // Removal is fail-safe (unknown keys are kept) and
     // only touches the documented fingerprint list; PATH/HOME/TERM stay
     // inherited. Explicit builder entries (TERM, COLORTERM,
     // TERM_PROGRAM=bitty, caller additions) are applied after removal and win.

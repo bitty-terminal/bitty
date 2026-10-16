@@ -601,6 +601,92 @@ impl Runtime {
         self.floats.ids()
     }
 
+    /// Discards detached float `id` without restoring it (issue #2141).
+    ///
+    /// Drops the stored [`View`](bitty_ui::View), its Alt+drag re-anchor
+    /// offset, and any in-flight drag/resize grab on it; tears down its
+    /// pane session; moves focus off it onto the first live leaf and
+    /// re-homes a dead primary owner. Returns `true` when a detached float
+    /// was removed.
+    pub fn discard_floated(&mut self, id: ViewId) -> bool {
+        if self.floats.discard(id).is_none() {
+            return false;
+        }
+        self.float_offsets.remove(&id);
+        if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
+            self.alt_drag = None;
+        }
+        if self.float_resize.is_some_and(|resize| resize.leaf == id) {
+            self.float_resize = None;
+        }
+        self.close_pane_session(&id);
+        if self.focus.focused() == Some(id) {
+            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                self.focus = Focus::with_focus(first);
+            } else {
+                self.focus.clear();
+            }
+        }
+        if self.primary_view == Some(id) {
+            self.primary_view = self.focus.focused();
+        }
+        self.clear_hover_pending();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Discards pinned leaf `id` without restoring it (issue #2141).
+    ///
+    /// Same teardown as [`Self::discard_floated`] for the window-global
+    /// pinned store. Returns `true` when a pinned leaf was removed.
+    pub fn discard_pinned(&mut self, id: ViewId) -> bool {
+        if self.pinned.discard(id).is_none() {
+            return false;
+        }
+        self.pinned_offsets.remove(&id);
+        if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
+            self.alt_drag = None;
+        }
+        if self.float_resize.is_some_and(|resize| resize.leaf == id) {
+            self.float_resize = None;
+        }
+        self.close_pane_session(&id);
+        if self.focus.focused() == Some(id) {
+            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                self.focus = Focus::with_focus(first);
+            } else {
+                self.focus.clear();
+            }
+        }
+        if self.primary_view == Some(id) {
+            self.primary_view = self.focus.focused();
+        }
+        self.clear_hover_pending();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Discards `id` from whichever floating store holds it (issue #2141).
+    ///
+    /// Returns `true` when `id` was a detached float or pinned leaf.
+    pub fn discard_floating_view(&mut self, id: ViewId) -> bool {
+        if self.floats.contains(id) {
+            return self.discard_floated(id);
+        }
+        if self.pinned.contains(id) {
+            return self.discard_pinned(id);
+        }
+        false
+    }
+
     /// Shared post-edit fixups after the live layout lost or gained a leaf
     /// through the scratchpad slot (CTX-0954), the pinned store (CTX-1077),
     /// or the detached-float store (CTX-1147).
@@ -1307,8 +1393,24 @@ impl Runtime {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != self.active_workspace)
-            .map(|(_, slot)| slot.layout.leaf_ids().len())
+            .map(|(_, slot)| slot.layout.leaf_ids().len() + slot.floats.len())
             .sum()
+    }
+
+    /// Window-wide live panel count: active layout plus active detached
+    /// floats plus window-global pins plus every inactive slot's layout and
+    /// detached floats (issue #2141).
+    ///
+    /// The pre-#2141 `leaf_count` + `inactive_workspaces_leaf_count` sum
+    /// missed floats and pins, so a dead float could read as the last panel
+    /// (spurious app exit) or a live float could be ignored (stuck empty
+    /// panel). This is the single window-close denominator.
+    #[must_use]
+    pub fn window_leaf_count(&self) -> usize {
+        self.layout.leaf_ids().len()
+            + self.floats.len()
+            + self.pinned.len()
+            + self.inactive_workspaces_leaf_count()
     }
 
     /// Kill every pane session owned by workspace `index`'s leaves.
@@ -3996,5 +4098,77 @@ mod tests {
             !leaf_row_has_ink(&rt, new_owner),
             "no grid is duplicated onto the new owner"
         );
+    }
+
+    #[test]
+    fn discard_floated_removes_dead_float_issue_2141() {
+        // Issue #2141: a detached float whose child exits must disappear,
+        // never linger as an empty unkillable panel.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        assert!(rt.floated_views().contains(&first));
+        assert_eq!(rt.window_leaf_count(), 2);
+        // Focus moved off the float onto the survivor at detach.
+        assert_eq!(rt.focused_view(), Some(second));
+        // Dismiss the dead float (child exited): store + offsets cleared,
+        // focus stays on the survivor, layout untouched.
+        assert!(rt.discard_floated(first));
+        assert!(!rt.floated_views().contains(&first));
+        assert!(!rt.discard_floated(first));
+        assert!(!rt.discard_floated(ViewId::new(404)));
+        assert_eq!(rt.window_leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(second));
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+    }
+
+    #[test]
+    fn discard_pinned_removes_dead_pin_issue_2141() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.pin_floating(first).expect("pin");
+        assert!(rt.pinned_views().contains(&first));
+        assert_eq!(rt.window_leaf_count(), 2);
+        assert!(rt.discard_pinned(first));
+        assert!(!rt.pinned_views().contains(&first));
+        assert!(!rt.discard_pinned(first));
+        assert_eq!(rt.window_leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(second));
+    }
+
+    #[test]
+    fn window_leaf_count_covers_floats_pins_and_inactive_floats_issue_2141() {
+        let mut rt = fresh();
+        assert_eq!(rt.window_leaf_count(), 1);
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert_eq!(rt.window_leaf_count(), 2);
+        rt.float_detach(first).expect("detach");
+        assert_eq!(rt.window_leaf_count(), 2);
+        rt.workspace_new().expect("ws2");
+        assert_eq!(rt.window_leaf_count(), 3);
     }
 }

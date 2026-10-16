@@ -975,8 +975,18 @@ impl TerminalApp {
             .chrome
             .zoom
             .backup_leaf_count(&self.runtime)
-            .unwrap_or_else(|| self.runtime.leaf_count());
-        active + self.runtime.inactive_workspaces_leaf_count()
+            .unwrap_or_else(|| self.runtime.window_leaf_count());
+        // Zoom backup counts layout leaves only; add live floats/pins that
+        // the backup predates (issue #2141). The non-zoom path already
+        // includes them via `window_leaf_count`.
+        if self.chrome.zoom.backup_leaf_count(&self.runtime).is_some() {
+            active
+                + self.runtime.floated_count()
+                + self.runtime.pinned_count()
+                + self.runtime.inactive_workspaces_leaf_count()
+        } else {
+            active
+        }
     }
 
     /// Occupied workspace indices in index order for the occupied cycle
@@ -1472,6 +1482,24 @@ impl TerminalApp {
                     ViewCloseRequest::Proceed => {}
                 }
                 self.restore_zoom();
+                // Issue #2141: a focused detached float or pinned panel
+                // lives outside the live layout. Tearing down only its
+                // session would leave the empty bordered panel behind
+                // (unkillable). Discard the floating view instead so the
+                // panel disappears and focus returns to tiling.
+                if self.runtime.floated_views().contains(&focused)
+                    || self.runtime.pinned_views().contains(&focused)
+                {
+                    if self.runtime.discard_floating_view(focused) {
+                        eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
+                    }
+                    eprintln!(
+                        "bitty: keymap close_view -> leafs={} focused={:?}",
+                        self.runtime.leaf_count(),
+                        self.runtime.focused_view()
+                    );
+                    return false;
+                }
                 // CTX-1039 (#1843): the active workspace is down to its
                 // last panel but other workspaces still hold panels. Never
                 // exit: keep the emptied workspace selected, tear down the
@@ -4201,6 +4229,27 @@ mod tests {
             PresentationMode::Tiled,
             "restore returns to tiling"
         );
+    }
+
+    #[test]
+    fn chrome_close_view_discards_focused_float_issue_2141() {
+        // Issue #2141: a focused detached float is outside the live layout,
+        // so the tiled close path would warn and leave the empty bordered
+        // panel behind. CloseView must discard it instead.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        app.runtime.float_detach(focused).expect("detach");
+        assert!(app.runtime.floated_views().contains(&focused));
+        assert!(app.runtime.set_focus(focused));
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(
+            !app.runtime.floated_views().contains(&focused),
+            "dead float must disappear, never linger empty"
+        );
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_ne!(app.runtime.focused_view(), Some(focused));
     }
 
     #[test]

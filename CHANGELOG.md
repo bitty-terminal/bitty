@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.24] - 2026-10-17
+
+### Added
+
+- **Resident AI helper spawn path (CTX-1253, #2123):** Core-side resolution,
+  digest verification, stdio framing, and bounded restart supervision for the
+  native `ai` component.
+- **Kitty graphics support (CTX-1272, #2131):** bounded capability detection,
+  image retention across alt-screen cycles, and related terminal-state and
+  rendering coverage.
+
+### Fixed
+
+- **Workspace and floating-panel lifecycle (CTX-1264, CTX-1271, CTX-1278,
+  CTX-1285):** stale float/pin cleanup, detached-view scrolling and chrome
+  occlusion, workspace-switch animation behavior, child-exit cleanup, and
+  overlay indicator preservation.
+- **PTY and input behavior (CTX-1254, CTX-1255, CTX-1267):** bounded
+  FreeBSD flood respawn handling, fail-closed drain behavior, and fcitx5
+  Shift-toggle input handling.
+
+### Changed
+
+- **Release and installation tooling:** hardened Windows installer checks,
+  immutable R2 rerun protection, and plugin-install next steps.
+
+### Release engineering
+
+- Workspace version bumped `0.0.23 -> 0.0.24`, applied to `Cargo.toml`,
+  `Cargo.lock`, internal `path` dependency pins, `packaging/PKGBUILD*`
+  `pkgver`, `nfpm.yaml`, the `flake.nix` fallback, and the `README.md`
+  release line. `scripts/check-release-version.sh --tag v0.0.24` keeps
+  `bitty --version`, packaging metadata, and the release tag in agreement.
+
 ## [0.0.23] - 2026-10-15
 
 ### Added

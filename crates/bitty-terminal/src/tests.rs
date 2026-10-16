@@ -8791,6 +8791,306 @@ fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
 
 #[test]
 #[cfg(unix)]
+fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
+    // Issue #2169: typing `exit` in a floating panel must dismiss the
+    // float and return focus — never hard-freeze the terminal. The float
+    // is focused here (the user is typing in it), unlike the #2141
+    // detach path where focus already moved to the survivor.
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    // The float's shell exits on its own (user typed `exit` + Enter).
+    let script = write_fake_editor("exit-float", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    assert!(app.runtime.has_pane_session(&float_view));
+
+    // Detach pane 2 into a float, then focus it (user clicks the float).
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.floated_views().contains(&float_view));
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+
+    // Poll until reap_exited_shells observes the exit. A deadline breach
+    // here is the #2169 hang (reap never returns / never observes).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "exiting float must dismiss the panel, never the app (and never hang)"
+    );
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "dead float must be discarded"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "float session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(survivor),
+        "focus must return to the surviving tile"
+    );
+    assert_eq!(app.effective_window_leaf_count(), 1);
+
+    // The terminal stays responsive: ticks present and input routes to
+    // the survivor instead of a dead float.
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    let _ = std::fs::remove_file(&script);
+}
+
+#[cfg(unix)]
+fn reap_until_change_2169(app: &mut TerminalApp, secs: u64) -> terminal_app::ShellExitOutcome {
+    // Bounded reap helper for the #2169 float-exit matrix. A deadline
+    // breach surfaces as NoExit (the hang signature) instead of blocking
+    // the test runner forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    outcome
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_focused_pin_dismisses_without_freeze_issue_2169() {
+    // Exiting shell in a focused PINNED panel (window-global sticky
+    // float) must dismiss without hanging.
+    require_pty!();
+    let mut app = editor_test_app();
+    let pin_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-pin", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pin_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pin shell");
+    assert!(app.runtime.set_focus(pin_view));
+    app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned);
+    assert!(app.runtime.pinned_views().contains(&pin_view));
+    assert!(app.runtime.set_focus(pin_view), "pin must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert!(!app.runtime.pinned_views().contains(&pin_view));
+    assert!(!app.runtime.has_pane_session(&pin_view));
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    let _ = app.drive_tick();
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_focused_float_dismisses_while_zoomed_issue_2169() {
+    // Zoom engaged on the survivor while the focused float's shell
+    // exits (reap runs restore_zoom before discard).
+    require_pty!();
+    let mut app = editor_test_app();
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-zoomfloat", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.set_focus(survivor));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert!(!app.runtime.floated_views().contains(&float_view));
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert!(app.runtime.focused_view().is_some(), "focus must be live");
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_inactive_workspace_float_discards_without_freeze_issue_2169() {
+    // The float lives on the INACTIVE workspace when its shell exits
+    // (sibling #2167 ghost family — must not hang either). With the
+    // stashed-container release, the parked float is discarded from its
+    // home slot instead of stranding a session-less ghost there.
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-inactive", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "inactive-workspace float exit must close the pane (no hang, no app exit)"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "parked float session must be torn down"
+    );
+    // Switching back must show the survivor only: no session-less ghost.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "parked float must be discarded from its home slot"
+    );
+    let _ = app.drive_tick();
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_owner_float_dismisses_while_zoomed_issue_2169() {
+    // Zoom engaged, then the PRIMARY-OWNER float's shell exits
+    // (primary_exit_status + floated branch, which carries no restore_zoom).
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    let float_view = ViewId::new(1);
+    let survivor = ViewId::new(2);
+    let pane_script = write_fake_editor("keep-pane", "#!/bin/sh\nsleep 30\n");
+    let pane_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, pane_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    let prim_script = write_fake_editor("exit-prim", "#!/bin/sh\nexit 0\n");
+    let prim_arg = prim_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(prim_arg.as_str())
+        .expect("spawn primary shell");
+    // Detach the primary FIRST (zoom collapses the tree to a proxy, and a
+    // leaf living only in the zoom backup is not detachable).
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach primary to float");
+    assert!(app.runtime.set_focus(survivor));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "primary-owner float exit must dismiss, never hang or exit the app"
+    );
+    assert!(!app.runtime.floated_views().contains(&float_view));
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert!(app.runtime.focused_view().is_some(), "focus must be live");
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&prim_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_float_after_refocus_keeps_survivor_focus_issue_2169() {
+    // Issue #2169 race branch (CTX-1284 headed `refocusrace` variant):
+    // the user types `exit` in the float, then focus moves to the
+    // surviving tile BEFORE the reap observes the exit. The discard must
+    // keep the survivor focus (never clear it) and the terminal must stay
+    // responsive: ticks present and input still routes to the survivor.
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    let script = write_fake_editor("exit-float-race", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    assert!(app.runtime.has_pane_session(&float_view));
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.floated_views().contains(&float_view));
+    // Focus leaves the dying float before the reap runs.
+    assert!(app.runtime.set_focus(survivor));
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "float exit with focus elsewhere must still dismiss the pane"
+    );
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "dead float must be discarded"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "float session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(survivor),
+        "survivor keeps focus, never cleared"
+    );
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
 fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
     // Issue #2167 (CodeRabbit on PR #2170): while zoomed the live layout
     // is a single-leaf proxy and the exited leaf hides in the zoom backup.

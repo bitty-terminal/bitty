@@ -1912,12 +1912,12 @@ impl Runtime {
     /// composition and commit"). The preedit overlay clears first so a cancel
     /// of a stale composition can never paint after the commit.
     ///
-    /// The commit string is passed through **verbatim** — never trimmed. A
-    /// trailing space that an input method genuinely appends is user input
-    /// (Terminal Truth); the synthetic one from issue #1449 is a raw key
-    /// re-inserted after the commit, which
-    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press) consumes, not a
-    /// byte the commit path adds.
+    /// Unsolicited commits are passed through **verbatim**. For an armed IME
+    /// claim, one trailing ASCII space is removed when present because fcitx5
+    /// can include the committing Space in the commit text. The raw key
+    /// re-inserted after the commit is consumed by
+    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press), not added by
+    /// the commit path.
     ///
     /// `handle_ime_commit` delegates with `Instant::now()` via
     /// [`Self::handle_ime_commit_at`], the clock seam the rest of the runtime
@@ -1930,10 +1930,14 @@ impl Runtime {
     /// post-commit echo deadline (CTX-0783).
     #[allow(clippy::explicit_counter_loop)]
     pub fn handle_ime_commit_at(&mut self, text: String, now: std::time::Instant) {
+        // CTX-1267 (#2142b): whether this commit ends a real composition.
+        // A commit with no composition behind it is unsolicited and owns no
+        // key; its trailing space (if any) is deliberate user input.
+        let was_armed = !matches!(self.ime_key_claim, ImeKeyClaim::Free);
         // Bounded before allocation (TXT-11)
         let bytes_len = text.len();
         let char_count = text.chars().count();
-        let bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
+        let mut bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
             let mut out = String::new();
             let mut bytes = 0usize;
             let mut chars = 0usize;
@@ -1950,6 +1954,15 @@ impl Runtime {
         } else {
             text
         };
+        // CTX-1267 (#2142b): fcitx5 Space-commit carries the committing
+        // Space inside the commit text on some builds, so every composed
+        // string arrives with a trailing ASCII space. Trim exactly one
+        // trailing space for real compositions (claim armed); unsolicited
+        // commits preserve verbatim (Terminal Truth: a deliberate trailing
+        // space inside the commit survives).
+        if was_armed && bounded.ends_with(' ') {
+            bounded.pop();
+        }
         // CTX-0783: a commit ends the gesture, and the raw copy of the key
         // that produced it is still in flight — hold the one-shot claim so it
         // cannot re-enter the PTY. Whether the commit carries text decides

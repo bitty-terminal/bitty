@@ -296,6 +296,22 @@ struct RingFrameContext {
     workspace_factor: f32,
     now: std::time::Instant,
     pad_px: i32,
+    /// CTX-1280 (#2168): a detached float is presented this frame, so
+    /// background leaves suppress their Core-owned chrome (clean backdrop).
+    /// Read with the leaf tier inside the push helpers; the float itself
+    /// and higher tiers (Popup/Messages foreground UI) are exempt.
+    detached_float_up: bool,
+}
+
+impl RingFrameContext {
+    /// Whether a leaf on `tier` hides its Core-owned chrome (shadow, glow,
+    /// ring) while a detached float is up (CTX-1280). Only background tiers
+    /// hide: `None` tiled leaves and `Editor` base chrome, both strictly
+    /// below `Float` (`Option` ordering puts `None` first). The float keeps
+    /// its own chrome and higher-tier foreground UI is untouched.
+    fn suppress_backdrop_chrome(&self, tier: Option<OverlayTier>) -> bool {
+        self.detached_float_up && tier < Some(OverlayTier::Float)
+    }
 }
 
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
@@ -1220,7 +1236,10 @@ impl Runtime {
     /// inner content clip for its glyphs (CTX-0311, moved verbatim from the
     /// leaf loop under CTX-0386 so a reused retained leaf still owns a live
     /// ring). `border == 0` paints nothing; the returned clip is `None` for
-    /// square or zero-size frames.
+    /// square or zero-size frames. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) skips the ring push but still
+    /// returns the clip, so it keeps glyph clipping while painting no
+    /// outline.
     fn push_leaf_ring(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1259,7 +1278,7 @@ impl Runtime {
                     .width_idle
                     .map_or(frame.border, |w| self.outline_width_physical(w))
             };
-            if ring_border > 0 {
+            if ring_border > 0 && !ctx.suppress_backdrop_chrome(frame.tier) {
                 let outline_color = if is_focused_view {
                     view_outline.focused
                 } else {
@@ -1334,7 +1353,9 @@ impl Runtime {
             }
             // The content clip is tied to the geometry border (not the
             // outline width) so the content grid and glyph clipping are
-            // unchanged by a focused/idle width override.
+            // unchanged by a focused/idle width override — and by a
+            // CTX-1280 suppression: the ring push above is skipped but the
+            // clip still applies, so suppressed leaves keep glyph clipping.
             frame_clip =
                 bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
         }
@@ -1393,7 +1414,9 @@ impl Runtime {
     /// background blits composite above. Paint-only:
     /// cell metrics, insets, and clip rects are untouched. Returns whether a
     /// shadow was pushed. An unset shadow color pushes nothing, so unstyled
-    /// configs present exactly as before.
+    /// configs present exactly as before. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
+    /// `false`.
     fn push_leaf_shadow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1406,6 +1429,9 @@ impl Runtime {
             return false;
         };
         if frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let color = bitty_render::grid::scale_alpha(
@@ -1454,7 +1480,9 @@ impl Runtime {
     /// envelope, so the default pulse envelope differs from the styled one
     /// exactly by its style contribution. With no style halo and no live
     /// pulse nothing is pushed, so unstyled steady-state configs present
-    /// exactly as before.
+    /// exactly as before. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
+    /// `false`.
     fn push_leaf_glow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1465,6 +1493,9 @@ impl Runtime {
         combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
     ) -> bool {
         if frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let mut motion_factor = 1.0f32;
@@ -2167,11 +2198,30 @@ impl Runtime {
             .animation_progress(AnimationKind::Workspace, None, now)
             .map(|p| p.clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        // CTX-1280 (#2168): a detached float owns the backdrop. While one is
+        // presented, the tiled leaves behind it paint no Core-owned chrome
+        // (shadow/glow/ring): the surface already clears to theme background
+        // in the gap bands, so suppressing chrome leaves a clean backdrop
+        // instead of divider/outline bands around the float. HIDE, not dim:
+        // no new primitive, no alpha policy, and tiled text stays live. The
+        // float keeps its own chrome; the gate is detached-only
+        // (`FloatStore`, not the pinned store): pinned overlays share the
+        // Float tier but must not restyle the workspace they annotate.
+        // Empty float frames never trigger, and the tiled baseline (no
+        // detached float) is unchanged. Loop-invariant, so it rides in the
+        // ring context; the push helpers pair it with the leaf tier.
+        let detached_float_up = allocations.iter().any(|frame| {
+            frame.tier == Some(OverlayTier::Float)
+                && frame.frame.width > 0
+                && frame.frame.height > 0
+                && self.floats.contains(frame.view)
+        });
         let ring_ctx = RingFrameContext {
             focused_id: self.focus.focused(),
             workspace_factor,
             now,
             pad_px,
+            detached_float_up,
         };
 
         // CTX-0367: recompute the IME caret for this frame; `paint_cursor`

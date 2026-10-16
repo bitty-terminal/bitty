@@ -8,9 +8,10 @@
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
-//! `[limits]`, `[dependencies]`, `[settings]`, `[services.provided]`,
-//! `[services.required]`, `[tools.git]` (accepted Layer-2 v1, CTX-0425),
-//! `[[capabilities.filesystem]]` and `[[network.egress]]` (array-of-tables).
+//! `[limits]`, `[dependencies]`, `[settings]`, `[hints]`,
+//! `[services.provided]`, `[services.required]`, `[tools.git]` (accepted
+//! Layer-2 v1, CTX-0425), `[[capabilities.filesystem]]` and
+//! `[[network.egress]]` (array-of-tables).
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
 //! non-negative integers are supported. Inline-table values are accepted for
 //! the declared shapes only: `[dependencies]` `{ version, prerelease }`,
@@ -100,6 +101,10 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // `[settings]` entries: `"key" = { type = "...", default = ... }`
     // (CTX-1195: declared settings keys with quota, types, shipped defaults).
     let mut settings: Vec<SettingDecl> = Vec::new();
+    // `[hints] next_steps` entries (CTX-1268, bitty#2144): display-only
+    // post-install onboarding lines. Bounded count/bytes and validated in
+    // [`PluginManifest::validate`]; never part of the grant-binding hash.
+    let mut next_steps: Vec<String> = Vec::new();
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
@@ -232,7 +237,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             }
             match inner.as_str() {
                 "plugin" | "compat" | "capabilities" | "lazy" | "limits" | "dependencies"
-                | "services.provided" | "services.required" | "settings" => {
+                | "services.provided" | "services.required" | "settings" | "hints" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
@@ -415,6 +420,18 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                         .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?,
                 );
             }
+            "hints" => {
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate key '{key}' in [{section}]"));
+                }
+                match key.as_str() {
+                    "next_steps" => {
+                        next_steps = parse_next_steps(&value)
+                            .map_err(|e| format!("invalid '[hints] next_steps': {e}"))?;
+                    }
+                    other => return Err(format!("unsupported [hints] key '{other}'")),
+                }
+            }
             "dependencies" | "services.provided" | "services.required" | "settings" => {
                 if !seen_keys.insert(section_key) {
                     return Err(format!("duplicate key '{key}' in [{section}]"));
@@ -536,6 +553,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             claims: lazy_claims,
         },
         settings,
+        next_steps,
         raw_bytes_len: bytes.len(),
     };
     manifest
@@ -1213,6 +1231,21 @@ fn parse_array(value: &str) -> Result<Vec<String>, String> {
         return Err("unterminated string in array".to_string());
     }
     Ok(items)
+}
+
+/// Parse a `[hints] next_steps` value (CTX-1268, bitty#2144).
+///
+/// Accepts either an array of double-quoted strings
+/// (`next_steps = ["...", "..."]`) or a single double-quoted string
+/// (`next_steps = "..."`, one hint). Count, byte, emptiness, NUL/ESC, and
+/// duplicate checks belong to [`PluginManifest::validate`](bitty_plugin_host::manifest::PluginManifest::validate);
+/// this layer only shapes the value and fails closed on non-string input.
+fn parse_next_steps(value: &str) -> Result<Vec<String>, String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        return parse_array(trimmed);
+    }
+    Ok(vec![parse_string(trimmed)?])
 }
 
 #[cfg(test)]
@@ -1946,5 +1979,73 @@ mod tests {
             minimal_body("xuepoo.svcdup")
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn hints_next_steps_array_and_single_string_parse() {
+        // Array form: two hints.
+        let body = format!(
+            "{}\n[hints]\nnext_steps = [\"Enable with `bitty plugin enable xuepoo.hints`.\", \"Edit your bar config.\"]\n",
+            minimal_body("xuepoo.hints")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("hints array must parse");
+        assert_eq!(manifest.next_steps.len(), 2);
+        assert!(manifest.next_steps[0].contains("bitty plugin enable"));
+
+        // Single-string form: one hint.
+        let body = format!(
+            "{}\n[hints]\nnext_steps = \"Just enable it.\"\n",
+            minimal_body("xuepoo.hints")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("hints string must parse");
+        assert_eq!(manifest.next_steps, vec!["Just enable it.".to_string()]);
+
+        // Absent `[hints]`: no hints, still valid.
+        let manifest =
+            parse_manifest(minimal_body("xuepoo.plain").as_bytes()).expect("plain must parse");
+        assert!(manifest.next_steps.is_empty());
+    }
+
+    #[test]
+    fn hints_reject_unknown_keys_duplicates_and_bad_shapes() {
+        // Unknown `[hints]` keys fail closed (verb smuggling surface).
+        let body = format!(
+            "{}\n[hints]\nnext_steps = [\"ok\"]\nexec = \"evil\"\n",
+            minimal_body("xuepoo.hintbad")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Duplicate `next_steps` fails closed.
+        let body = format!(
+            "{}\n[hints]\nnext_steps = [\"one\"]\nnext_steps = [\"two\"]\n",
+            minimal_body("xuepoo.hintdup")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Non-string shapes fail closed.
+        for fragment in [
+            "[hints]\nnext_steps = 42\n",
+            "[hints]\nnext_steps = [\"ok\", 42]\n",
+            "[hints]\nnext_steps = true\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.hintshape"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Hostile and empty hints fail validation (never recorded silently).
+        for fragment in [
+            "[hints]\nnext_steps = [\"\"]\n",
+            "[hints]\nnext_steps = [\"   \"]\n",
+            "[hints]\nnext_steps = [\"nul\0byte\"]\n",
+        ] {
+            let body = format!("{}\n{fragment}", minimal_body("xuepoo.hintevil"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
     }
 }

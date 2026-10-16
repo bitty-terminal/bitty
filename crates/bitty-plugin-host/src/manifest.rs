@@ -72,6 +72,15 @@ pub const CMD_SCHEMA_MAX_BYTES: usize = 16 * 1024;
 /// JSON Schema composes through `$ref`-style nesting; unbounded depth is a
 /// stack-exhaustion vector, so validation fails closed past this depth.
 pub const CMD_SCHEMA_MAX_DEPTH: usize = 16;
+/// Maximum post-install next-step hints (`[hints] next_steps`, CTX-1268).
+///
+/// Hints are display-only onboarding text (bitty#2144): short, single-topic
+/// lines shown after `plugin install` / `plugin enable` alongside the
+/// generic enable/config/where-to-read-more steps. They never grant
+/// authority and never enter the grant-binding manifest hash.
+pub const MAX_NEXT_STEPS: usize = 8;
+/// Maximum bytes of one `[hints] next_steps` entry.
+pub const MAX_NEXT_STEP_BYTES: usize = 512;
 
 // ── plugin id ────────────────────────────────────────────────────────────
 
@@ -2475,6 +2484,16 @@ pub struct PluginManifest {
     /// [`PluginManifest::canonical_bytes`]: adding or changing a
     /// declaration never invalidates the grant pin bound to the hash.
     pub settings: Vec<SettingDecl>,
+    /// Post-install next-step hints (`[hints] next_steps`, CTX-1268,
+    /// issue #2144).
+    ///
+    /// Display-only onboarding text: short single-topic lines rendered
+    /// after `plugin install` / `plugin enable` alongside the generic
+    /// enable/config/where-to-read-more steps. Hints never grant
+    /// authority, so like [`PluginManifest::settings`] they stay out of
+    /// [`PluginManifest::canonical_bytes`]: adding or changing a hint
+    /// never invalidates the grant pin bound to the hash.
+    pub next_steps: Vec<String>,
     /// Raw manifest byte length (for the 256 KiB size check).
     pub raw_bytes_len: usize,
 }
@@ -2488,8 +2507,10 @@ impl PluginManifest {
     /// interface schemas and backing capability heads), required services, Layer-2 `tools`
     /// declarations, structured `network.egress` destinations, lazy command
     /// declarations (with schemas), and `[limits]`
-    /// budgets. Used to bind grant records to the exact manifest
-    /// that was approved (`hash(manifest) == record.manifest_hash`).
+    /// budgets. Display-only planes stay out: `[settings]` declarations and
+    /// `[hints] next_steps` never enter the hash, so adding or changing one
+    /// never invalidates the grant pin. Used to bind grant records to the exact
+    /// manifest that was approved (`hash(manifest) == record.manifest_hash`).
     /// Raising `tools.<name>.required` from `false` to `true` changes the hash
     /// and is a capability increase whose grant must be re-confirmed.
     #[must_use]
@@ -2816,6 +2837,50 @@ impl PluginManifest {
             }
         }
 
+        // Post-install next-step hints (`[hints] next_steps`, CTX-1268):
+        // display-only onboarding text. Bounded count and bytes, no NUL or
+        // ESC (untrusted display data rendered by the host CLI, never as
+        // markup), non-empty after trimming, no duplicates. Like settings,
+        // hints never enter `canonical_bytes`, so changing one never
+        // invalidates the grant pin.
+        if self.next_steps.len() > MAX_NEXT_STEPS {
+            return Err(PluginError::LimitExceeded {
+                field: "hints.next_steps".to_string(),
+                limit: MAX_NEXT_STEPS,
+                actual: self.next_steps.len(),
+            });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for step in &self.next_steps {
+                if step.len() > MAX_NEXT_STEP_BYTES {
+                    return Err(PluginError::LimitExceeded {
+                        field: "hints.next_steps".to_string(),
+                        limit: MAX_NEXT_STEP_BYTES,
+                        actual: step.len(),
+                    });
+                }
+                if step.trim().is_empty() {
+                    return Err(PluginError::manifest(
+                        "hints.next_steps",
+                        "entries must not be empty",
+                    ));
+                }
+                if step.contains('\0') || step.contains('\x1b') {
+                    return Err(PluginError::manifest(
+                        "hints.next_steps",
+                        "entries must not contain NUL or ESC",
+                    ));
+                }
+                if !seen.insert(step.clone()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "next-step".to_string(),
+                        value: step.clone(),
+                    });
+                }
+            }
+        }
+
         if self.tools.len() > MAX_TOOLS {
             return Err(PluginError::LimitExceeded {
                 field: "tools".to_string(),
@@ -3078,6 +3143,7 @@ mod tests {
             limits: PluginLimits::default(),
             lazy: LazyTriggers::default(),
             settings: Vec::new(),
+            next_steps: Vec::new(),
             raw_bytes_len: 512,
         }
     }
@@ -4153,6 +4219,70 @@ mod tests {
             version_req: ">=2.30".to_string(),
         });
         m
+    }
+
+    // ── `[hints] next_steps` (CTX-1268, bitty#2144) ────────────────────────
+
+    #[test]
+    fn next_steps_accept_bounded_hints() {
+        let mut m = minimal_manifest("xuepoo.hints");
+        m.next_steps = vec![
+            "Add `modules = [\"clock\"]` to your bar config.".to_string(),
+            "Restart bitty to pick up the change.".to_string(),
+        ];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn next_steps_reject_over_count_over_bytes_and_empty() {
+        // Over count.
+        let mut m = minimal_manifest("xuepoo.hints");
+        m.next_steps = (0..MAX_NEXT_STEPS + 1)
+            .map(|n| format!("hint {n}"))
+            .collect();
+        assert!(m.validate().is_err());
+
+        // Over bytes.
+        let mut m = minimal_manifest("xuepoo.hints");
+        m.next_steps = vec!["x".repeat(MAX_NEXT_STEP_BYTES + 1)];
+        assert!(m.validate().is_err());
+
+        // Empty / whitespace-only.
+        for bad in [String::new(), "   ".to_string(), "\t".to_string()] {
+            let mut m = minimal_manifest("xuepoo.hints");
+            m.next_steps = vec![bad];
+            assert!(m.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn next_steps_reject_hostile_bytes_and_duplicates() {
+        for bad in ["nul\0byte", "esc\x1b[2J"] {
+            let mut m = minimal_manifest("xuepoo.hints");
+            m.next_steps = vec![bad.to_string()];
+            assert!(m.validate().is_err(), "must reject {bad:?}");
+        }
+        let mut m = minimal_manifest("xuepoo.hints");
+        m.next_steps = vec!["same".to_string(), "same".to_string()];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn next_steps_and_settings_stay_out_of_the_grant_hash() {
+        let m1 = minimal_manifest("xuepoo.hints");
+        let mut m2 = minimal_manifest("xuepoo.hints");
+        m2.next_steps = vec!["Enable it with `bitty plugin enable xuepoo.hints`.".to_string()];
+        assert_eq!(m1.manifest_hash(), m2.manifest_hash());
+        let mut m3 = minimal_manifest("xuepoo.hints");
+        m3.settings.push(
+            SettingDecl::new(
+                "show".to_string(),
+                SettingKind::Bool,
+                SettingDefault::Bool(true),
+            )
+            .expect("fixture setting validates"),
+        );
+        assert_eq!(m1.manifest_hash(), m3.manifest_hash());
     }
 
     #[test]

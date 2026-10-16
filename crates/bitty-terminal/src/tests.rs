@@ -8802,11 +8802,17 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
     let float_view = ViewId::new(2);
     let survivor = ViewId::new(1);
 
-    // The float's shell exits on its own (user typed `exit` + Enter).
-    let script = write_fake_editor("exit-float", "#!/bin/sh\nexit 0\n");
-    let script_arg = script.to_string_lossy().into_owned();
+    // Keep a live shell behind the float so the post-reap focus and input
+    // route are observable, rather than treating a session-less tile as a
+    // survivor.
     app.runtime
-        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .spawn_shell_for_view_in(survivor, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .expect("spawn survivor shell");
+
+    // The float owns an interactive shell. The test sends the exact bytes a
+    // user types through Runtime's focused input router below.
+    app.runtime
+        .spawn_shell_for_view_in(float_view, "/bin/sh", &[], 80, 24, None)
         .expect("spawn float shell");
     assert!(app.runtime.has_pane_session(&float_view));
 
@@ -8816,6 +8822,11 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
         .expect("detach to float");
     assert!(app.runtime.floated_views().contains(&float_view));
     assert!(app.runtime.set_focus(float_view), "float must be focusable");
+
+    assert!(
+        app.runtime.push_input_bytes(b"exit\r"),
+        "typed exit must reach the focused floating shell"
+    );
 
     // Poll until reap_exited_shells observes the exit. A deadline breach
     // here is the #2169 hang (reap never returns / never observes).
@@ -8855,7 +8866,16 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
     let _ = app.drive_tick();
     let _ = app.drive_tick();
     assert_eq!(app.runtime.focused_view(), Some(survivor));
-    let _ = std::fs::remove_file(&script);
+    assert!(
+        app.runtime.has_pane_session(&survivor),
+        "survivor shell must remain alive after float reap"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"echo survivor\r"),
+        "survivor shell must remain the live input owner after float reap"
+    );
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
 }
 
 #[cfg(unix)]

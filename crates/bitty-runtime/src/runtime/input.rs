@@ -1175,10 +1175,11 @@ impl Runtime {
         // resize and consumes the event (no selection starts). Runs before
         // the interior move so edges win over interiors; interiors and
         // anchored floats fail soft here and fall through to the move below.
+        // Alt-only: Super is the compositor's window-drag Mod (issue #2140).
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
-            && (self.alt_pressed || self.super_pressed)
+            && self.alt_pressed
             && self.begin_float_resize()
         {
             return;
@@ -1188,11 +1189,12 @@ impl Runtime {
         // grab fails soft on tiled leaves (the Mod tiled-drag path below
         // owns them) and under Shift (which forces the selection path per
         // the CTX-0181 precedent) — both fall through, so Alt+drag never
-        // breaks selection.
+        // breaks selection. Alt-only: Super is the compositor's
+        // window-drag Mod (issue #2140).
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
-            && (self.alt_pressed || self.super_pressed)
+            && self.alt_pressed
             && self.begin_alt_drag()
         {
             return;

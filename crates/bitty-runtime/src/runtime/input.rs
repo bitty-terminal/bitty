@@ -1912,12 +1912,12 @@ impl Runtime {
     /// composition and commit"). The preedit overlay clears first so a cancel
     /// of a stale composition can never paint after the commit.
     ///
-    /// The commit string is passed through **verbatim** — never trimmed. A
-    /// trailing space that an input method genuinely appends is user input
-    /// (Terminal Truth); the synthetic one from issue #1449 is a raw key
-    /// re-inserted after the commit, which
-    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press) consumes, not a
-    /// byte the commit path adds.
+    /// Unsolicited commits are passed through **verbatim**. For an armed IME
+    /// claim, one trailing ASCII space is removed when present because fcitx5
+    /// can include the committing Space in the commit text. The raw key
+    /// re-inserted after the commit is consumed by
+    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press), not added by
+    /// the commit path.
     ///
     /// `handle_ime_commit` delegates with `Instant::now()` via
     /// [`Self::handle_ime_commit_at`], the clock seam the rest of the runtime

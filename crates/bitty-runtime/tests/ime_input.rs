@@ -499,7 +499,7 @@ fn idle_after_commit_does_not_absorb_the_next_keystroke() {
 }
 
 #[test]
-fn commit_text_is_never_trimmed() {
+fn unsolicited_commit_text_is_not_trimmed() {
     // Terminal Truth, refined by CTX-1267 (#2142b): a trailing space inside
     // an *unsolicited* commit (no composition, claim Free) is deliberate
     // user input and survives verbatim. For a *real* composition (claim

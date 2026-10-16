@@ -568,8 +568,10 @@ impl Runtime {
     /// current one and arms the matching animations (CTX-0341).
     ///
     /// Called once per present before the idle short-circuit. Open/close are
-    /// derived from the View-set delta (a new View fades in, a removed one
-    /// fades out through a retained [`ClosingFrame`]); focus from the focused
+    /// derived from the View-set delta (a new View fades in, a destroyed one
+    /// fades out through a retained [`ClosingFrame`]; a View that merely
+    /// left the visible set but stays live — workspace stash, scratchpad,
+    /// pin, detach — fades nothing, #2134). Focus from the focused
     /// View change; workspace from the active index change. Move/resize/drag
     /// (CTX-0967) are NOT detected here — a move or resize keeps the same
     /// `View` set, so those paths trigger their transition directly at the
@@ -614,8 +616,17 @@ impl Runtime {
         }
         if policy.animates(AnimationKind::Close) {
             let previous = self.last_presented_allocations.clone();
+            // #2134: only a destroyed view fades its ring out. Views that
+            // merely left the visible set but stay live (stashed in an
+            // inactive workspace slot, scratchpad, pin, detach) are not
+            // closed: retaining their rings would ghost the previous
+            // workspace over the new one on every switch.
+            let live: std::collections::HashSet<u64> = self.live_view_raws().into_iter().collect();
             for old in &previous {
                 if new_ids.contains(&old.view) {
+                    continue;
+                }
+                if live.contains(&old.view.0) {
                     continue;
                 }
                 if self.closing_frames.iter().any(|c| c.view == old.view) {

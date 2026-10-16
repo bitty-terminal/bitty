@@ -186,6 +186,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ai_helper;
+pub mod ai_request;
 pub mod component;
 pub mod config;
 pub mod cw_present;
@@ -211,6 +212,13 @@ pub use runtime::cw_live::HintLinkOpenError;
 pub use ai_helper::{
     HELPER_COMPONENT_NAME, HelperConfig, HelperError, HelperEvent, HelperState, HelperStatus,
     ResidentHelper, StopOutcome as HelperStopOutcome,
+};
+pub use ai_request::{
+    AI_METHODS, AiMetadataProducer, AiMetadataPublication, AiMetadataSnapshot, AiRequestError,
+    AiRequestProducer, MAX_AI_PARAMS_DEPTH, MAX_AI_PARAMS_FIELDS, MAX_METADATA_CAPABILITIES,
+    MAX_METADATA_CAPABILITY_BYTES, MAX_METADATA_ENTRIES, MAX_METADATA_SERVICE_BYTES,
+    MAX_METADATA_SNAPSHOT_BYTES, MAX_METADATA_VERSION_BYTES, MetadataError, MetadataExtension,
+    MetadataSyncError, SNAPSHOT_VERSION_INITIAL, ServiceMetadata, SnapshotSyncState,
 };
 pub use component::data_home_for;
 pub use config::{

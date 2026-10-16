@@ -11,6 +11,7 @@
 //! those strings. A future contract can add them through a typed extension
 //! point without widening this credential-free boundary implicitly.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -907,7 +908,7 @@ impl JsonParser<'_> {
 
     fn parse_object(&mut self, root: bool) -> Result<(), JsonError> {
         self.position = self.position.saturating_add(1);
-        let mut fields: Vec<&[u8]> = Vec::with_capacity(MAX_AI_PARAMS_FIELDS);
+        let mut fields: Option<HashSet<String>> = None;
         self.skip_whitespace();
         if self.input.get(self.position) == Some(&b'}') {
             self.position = self.position.saturating_add(1);
@@ -915,22 +916,23 @@ impl JsonParser<'_> {
         }
         loop {
             self.skip_whitespace();
-            if fields.len() >= MAX_AI_PARAMS_FIELDS {
+            if fields
+                .as_ref()
+                .is_some_and(|fields| fields.len() >= MAX_AI_PARAMS_FIELDS)
+            {
                 return Err(JsonError::Malformed);
             }
-            let key_start = self.position;
-            self.parse_string()?;
-            let key_end = self.position;
-            let key = &self.input[key_start..key_end];
-            if fields.iter().any(|previous| json_key_eq(previous, key)) {
-                return if root && json_key_is(key, b"snapshot_version") {
+            let key = self.parse_key()?;
+            let fields = fields.get_or_insert_with(|| HashSet::with_capacity(1));
+            let is_snapshot_version = root && key == SNAPSHOT_VERSION_KEY;
+            if !fields.insert(key) {
+                return if is_snapshot_version {
                     Err(JsonError::SnapshotVersion)
                 } else {
                     Err(JsonError::Duplicate)
                 };
             }
-            fields.push(key);
-            if root && json_key_is(key, b"snapshot_version") {
+            if is_snapshot_version {
                 return Err(JsonError::SnapshotVersion);
             }
             self.skip_whitespace();
@@ -1004,6 +1006,68 @@ impl JsonParser<'_> {
                 }
                 byte if byte < 0x20 => return Err(JsonError::Malformed),
                 _ => {}
+            }
+        }
+    }
+
+    fn parse_key(&mut self) -> Result<String, JsonError> {
+        if self.input.get(self.position) != Some(&b'"') {
+            return Err(JsonError::Malformed);
+        }
+        self.position = self.position.saturating_add(1);
+        let mut key = String::new();
+        loop {
+            let byte = self
+                .input
+                .get(self.position)
+                .copied()
+                .ok_or(JsonError::Malformed)?;
+            self.position = self.position.saturating_add(1);
+            match byte {
+                b'"' => return Ok(key),
+                b'\\' => {
+                    let escape = self
+                        .input
+                        .get(self.position)
+                        .copied()
+                        .ok_or(JsonError::Malformed)?;
+                    self.position = self.position.saturating_add(1);
+                    let character = if escape == b'u' {
+                        self.parse_unicode_escape()?
+                    } else {
+                        match escape {
+                            b'"' => '"',
+                            b'\\' => '\\',
+                            b'/' => '/',
+                            b'b' => '\u{08}',
+                            b'f' => '\u{0c}',
+                            b'n' => '\n',
+                            b'r' => '\r',
+                            b't' => '\t',
+                            _ => return Err(JsonError::Malformed),
+                        }
+                    };
+                    key.push(character);
+                }
+                byte if byte < 0x20 => return Err(JsonError::Malformed),
+                byte => {
+                    let start = self.position.saturating_sub(1);
+                    let remaining = self.input.get(start..).ok_or(JsonError::Malformed)?;
+                    let scalar_width = match byte {
+                        0x00..=0x7f => 1,
+                        0xc2..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf4 => 4,
+                        _ => return Err(JsonError::Malformed),
+                    };
+                    let text = std::str::from_utf8(
+                        remaining.get(..scalar_width).ok_or(JsonError::Malformed)?,
+                    )
+                    .map_err(|_| JsonError::Malformed)?;
+                    let character = text.chars().next().ok_or(JsonError::Malformed)?;
+                    self.position = start.saturating_add(character.len_utf8());
+                    key.push(character);
+                }
             }
         }
     }
@@ -1116,82 +1180,7 @@ impl JsonParser<'_> {
     }
 }
 
-fn json_key_is(encoded: &[u8], expected: &[u8]) -> bool {
-    let mut encoded = JsonStringChars::new(encoded);
-    let mut expected = expected.iter().copied().map(u32::from);
-    loop {
-        match (encoded.next(), expected.next()) {
-            (None, None) => return true,
-            (Some(Ok(left)), Some(right)) if left == right => {}
-            _ => return false,
-        }
-    }
-}
-
-fn json_key_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut left = JsonStringChars::new(left);
-    let mut right = JsonStringChars::new(right);
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return true,
-            (Some(Ok(left)), Some(Ok(right))) if left == right => {}
-            _ => return false,
-        }
-    }
-}
-
-struct JsonStringChars<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> JsonStringChars<'a> {
-    fn new(encoded: &'a [u8]) -> Self {
-        Self {
-            bytes: encoded
-                .get(1..encoded.len().saturating_sub(1))
-                .unwrap_or_default(),
-            position: 0,
-        }
-    }
-}
-
-impl Iterator for JsonStringChars<'_> {
-    type Item = Result<u32, ()>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let byte = *self.bytes.get(self.position)?;
-        if byte != b'\\' {
-            let remaining = self.bytes.get(self.position..)?;
-            let scalar_width = match byte {
-                0x00..=0x7f => 1,
-                0xc2..=0xdf => 2,
-                0xe0..=0xef => 3,
-                0xf0..=0xf4 => 4,
-                _ => return Some(Err(())),
-            };
-            let text = std::str::from_utf8(remaining.get(..scalar_width)?).ok()?;
-            let character = text.chars().next()?;
-            self.position = self.position.saturating_add(character.len_utf8());
-            return Some(Ok(u32::from(character)));
-        }
-        self.position = self.position.saturating_add(1);
-        let escape = *self.bytes.get(self.position)?;
-        self.position = self.position.saturating_add(1);
-        match escape {
-            b'"' => Some(Ok(u32::from(b'"'))),
-            b'\\' => Some(Ok(u32::from(b'\\'))),
-            b'/' => Some(Ok(u32::from(b'/'))),
-            b'b' => Some(Ok(0x08)),
-            b'f' => Some(Ok(0x0c)),
-            b'n' => Some(Ok(u32::from(b'\n'))),
-            b'r' => Some(Ok(u32::from(b'\r'))),
-            b't' => Some(Ok(u32::from(b'\t'))),
-            b'u' => Some(decode_unicode_escape(self.bytes, &mut self.position)),
-            _ => Some(Err(())),
-        }
-    }
-}
+const SNAPSHOT_VERSION_KEY: &str = "snapshot_version";
 
 fn read_unicode_escape(input: &[u8], position: &mut usize) -> Result<u16, JsonError> {
     let end = position.saturating_add(4);
@@ -1207,27 +1196,6 @@ fn read_unicode_escape(input: &[u8], position: &mut usize) -> Result<u16, JsonEr
     }
     *position = end;
     Ok(value)
-}
-
-fn decode_unicode_escape(input: &[u8], position: &mut usize) -> Result<u32, ()> {
-    let code_unit = read_unicode_escape(input, position).map_err(|_| ())?;
-    if (0xD800..=0xDBFF).contains(&code_unit) {
-        if input.get(*position..(*position).saturating_add(2)) != Some(br"\u") {
-            return Err(());
-        }
-        *position = (*position).saturating_add(2);
-        let low = read_unicode_escape(input, position).map_err(|_| ())?;
-        if !(0xDC00..=0xDFFF).contains(&low) {
-            return Err(());
-        }
-        return Ok(0x1_0000 + (u32::from(code_unit - 0xD800) << 10) + u32::from(low - 0xDC00));
-    }
-    if (0xDC00..=0xDFFF).contains(&code_unit) {
-        return Err(());
-    }
-    char::from_u32(u32::from(code_unit))
-        .map(u32::from)
-        .ok_or(())
 }
 
 fn hex_value(digit: u8) -> Option<u32> {
@@ -1519,14 +1487,14 @@ mod tests {
     #[test]
     fn long_shared_prefix_json_keys_decode_with_bounded_progress() {
         let mut params = String::from("{");
-        let prefix = "a".repeat(72);
-        for index in 0..32 {
+        let prefix = "a".repeat(512);
+        for index in 0..(MAX_AI_PARAMS_FIELDS - 1) {
             if index != 0 {
                 params.push(',');
             }
             params.push('"');
             params.push_str(&prefix);
-            params.push_str(&format!("{index:02}"));
+            params.push_str(&format!("{index:03}"));
             params.push_str("\":0");
         }
         params.push('}');

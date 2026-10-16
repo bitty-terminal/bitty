@@ -1190,8 +1190,14 @@ impl TerminalApp {
         // CTX-1100: the occupied cycle revokes only after a successful
         // switch (see its arms below); a refused cycle (<2 occupied)
         // preserves the capture, so it is deferred here.
-        let defer_capture_revoke =
-            matches!(&action, A::WorkspaceNextOccupied | A::WorkspacePrevOccupied);
+        // CTX-1289: `WorkspaceMove` is deferred the same way. A refused move
+        // (no focused pane, invalid/over-capacity target, view-kind conflict)
+        // must preserve the transient capture so the window-ID indicator
+        // stays up — the move only releases it after a real reparent.
+        let defer_capture_revoke = matches!(
+            &action,
+            A::WorkspaceNextOccupied | A::WorkspacePrevOccupied | A::WorkspaceMove(_)
+        );
         if !defer_capture_revoke && Self::is_overlay_focus_switch(action.clone()) {
             self.revoke_overlay_capture();
         }
@@ -1743,10 +1749,17 @@ impl TerminalApp {
                 // the real tiled tree, not the zoom proxy.
                 self.restore_zoom();
                 match self.runtime.workspace_move_focused_to_one_based(n) {
-                    Ok((moved, from, to)) => eprintln!(
-                        "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
-                        self.runtime.workspace_names().join(" ")
-                    ),
+                    Ok((moved, from, to)) => {
+                        // CTX-1289: release the transient capture only after a
+                        // real move landed. A refused move leaves the overlay
+                        // (window-ID indicator) up, mirroring the occupied
+                        // cycle contract.
+                        self.revoke_overlay_capture();
+                        eprintln!(
+                            "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
+                            self.runtime.workspace_names().join(" ")
+                        )
+                    }
                     Err(err) => eprintln!(
                         "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
                         self.runtime.workspace_names().join(" ")
@@ -2500,7 +2513,8 @@ impl TerminalApp {
                         match &matched {
                             Some(
                                 bitty_config::ChromeAction::WorkspaceNextOccupied
-                                | bitty_config::ChromeAction::WorkspacePrevOccupied,
+                                | bitty_config::ChromeAction::WorkspacePrevOccupied
+                                | bitty_config::ChromeAction::WorkspaceMove(_),
                             ) => {
                                 // CTX-1100: eligible for focus-switch dispatch
                                 // (falls through below like the other
@@ -2510,6 +2524,9 @@ impl TerminalApp {
                                 // (<2 occupied) preserves it (CodeRabbit
                                 // PR #1917). No queue, no swallow: the chord
                                 // must reach dispatch, never the overlay.
+                                // CTX-1289: `WorkspaceMove` defers the same
+                                // way — a refused move keeps the indicator
+                                // up, only a real reparent releases it.
                             }
                             Some(action) if Self::is_overlay_focus_switch(action.clone()) => {
                                 self.revoke_overlay_capture();
@@ -8091,6 +8108,49 @@ claims = []
         assert!(
             app.runtime.plugin_overlay().is_none(),
             "the window-ID indicator must disappear after capture release"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn refused_workspace_move_preserves_overlay_capture() {
+        // CTX-1289: a refused Mod+Shift+num move must NOT release the
+        // transient capture — the window-ID indicator stays up until a real
+        // reparent lands. Mirrors the CTX-1100 occupied-cycle contract, which
+        // revokes only after a successful switch. Pre-change the revoke ran
+        // unconditionally before dispatch, so these assertions failed.
+        use bitty_config::ChromeAction as A;
+        let (mut app, root, data) = overlay_capture_test_app("ctx1289-refused");
+        assert!(app.overlay_capture_active(), "setup must hold capture");
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the active capture must surface the window-ID indicator"
+        );
+        let leaves_before = app.runtime.layout().leaf_ids();
+        let ws_before = app.runtime.workspace_count();
+        // Index 0 fails closed at the top of the move path.
+        let _ = app.apply_chrome_action(A::WorkspaceMove(0));
+        // Beyond the workspace cap also fails closed.
+        let _ = app.apply_chrome_action(A::WorkspaceMove(17));
+        assert!(
+            app.overlay_capture_active(),
+            "a refused workspace move must preserve overlay capture"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            leaves_before,
+            "a refused move must not touch the layout"
+        );
+        assert_eq!(
+            app.runtime.workspace_count(),
+            ws_before,
+            "a refused move must not create a workspace"
+        );
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the window-ID indicator must remain visible after a refused move"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);

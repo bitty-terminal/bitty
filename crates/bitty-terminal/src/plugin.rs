@@ -5173,8 +5173,11 @@ mod tests {
             out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
             "{out}"
         );
+        // Path separators are platform-native (`\` on Windows): normalize
+        // before matching the managed `plugins/` layout.
+        let portable = out.replace('\\', "/");
         assert!(
-            out.contains("plugins/bitty-terminal.shell-integration.toml"),
+            portable.contains("plugins/bitty-terminal.shell-integration.toml"),
             "{out}"
         );
         assert!(

@@ -490,8 +490,11 @@ fn plugin_store_install_and_enable_print_next_steps() {
         text.contains("enable: bitty plugin enable xuepoo.onboard"),
         "{text}"
     );
-    assert!(text.contains("packages/xuepoo.onboard/1.0.0"), "{text}");
-    assert!(text.contains("plugins/xuepoo.onboard.toml"), "{text}");
+    // Path separators are platform-native (`\` on Windows): normalize
+    // before matching the store/config layout.
+    let portable = text.replace('\\', "/");
+    assert!(portable.contains("packages/xuepoo.onboard/1.0.0"), "{text}");
+    assert!(portable.contains("plugins/xuepoo.onboard.toml"), "{text}");
     assert!(text.contains("show = true"), "{text}");
     assert!(text.contains("edge = \"bottom\""), "{text}");
     assert!(

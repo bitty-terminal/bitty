@@ -438,6 +438,36 @@ fn workspace_switch_fades_no_ring_for_stashed_views() {
 }
 
 #[test]
+fn explicit_close_still_fades_despite_stale_active_slot() {
+    // CodeRabbit on #2134: the active slot refreshes only on switch-away,
+    // so after an explicit close it still names the destroyed leaf. The
+    // close gate must exclude the active slot, or the destroyed view would
+    // wrongly skip its fade.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("first frame presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    // Round-trip through a second workspace so the active slot holds a
+    // fresh copy of the two-pane layout (stale after the close below).
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(start).expect("switch presents");
+    assert!(rt.workspace_switch(0), "switch back must succeed");
+    let _ = rt.tick_at(start).expect("switch back presents");
+    // Explicitly close leaf v:2; the stashed active slot still names it.
+    rt.set_layout_closing(
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        ViewId::new(2),
+    );
+    let _ = rt.tick_at(start).expect("close presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Close, Some(ViewId::new(2)), start)
+            .is_some(),
+        "destroyed views must still fade out"
+    );
+}
+
+#[test]
 fn open_transition_fades_the_core_owned_ring_alpha() {
     // RFC-0002: a panel-open transition fades Core-owned chrome in. Pixel
     // proof: the ring alpha at the mid-transition frame sits strictly between

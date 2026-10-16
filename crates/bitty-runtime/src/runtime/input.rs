@@ -1178,7 +1178,7 @@ impl Runtime {
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
-            && self.alt_pressed
+            && (self.alt_pressed || self.super_pressed)
             && self.begin_float_resize()
         {
             return;
@@ -1192,7 +1192,7 @@ impl Runtime {
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
-            && self.alt_pressed
+            && (self.alt_pressed || self.super_pressed)
             && self.begin_alt_drag()
         {
             return;

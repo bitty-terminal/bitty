@@ -15,7 +15,7 @@ fn split(left: LayoutNode, right: LayoutNode) -> LayoutNode {
 }
 
 fn many_leaves(count: usize) -> LayoutNode {
-    (1..count as u64)
+    (1..=count as u64)
         .map(leaf)
         .reduce(split)
         .expect("test layout must contain a leaf")
@@ -88,6 +88,7 @@ fn report_json_is_complete_and_contains_no_sensitive_runtime_values() {
 #[cfg(unix)]
 #[test]
 fn duplicate_layout_views_share_owner_accounting() {
+    bitty_test_support::require_pty!();
     let mut runtime = Runtime::with_defaults().expect("runtime");
     runtime.set_layout(split(leaf(1), split(leaf(2), leaf(2))));
     runtime
@@ -113,6 +114,7 @@ fn duplicate_layout_views_share_owner_accounting() {
 #[cfg(unix)]
 #[test]
 fn shared_owner_is_charged_once_when_seen_in_two_retained_slots() {
+    bitty_test_support::require_pty!();
     let mut runtime = Runtime::with_defaults().expect("runtime");
     runtime.set_layout(split(leaf(1), leaf(2)));
     runtime
@@ -142,7 +144,7 @@ fn shared_owner_is_charged_once_when_seen_in_two_retained_slots() {
 #[test]
 fn report_marks_detached_floats_omitted_by_leaf_bound() {
     let mut runtime = Runtime::with_defaults().expect("runtime");
-    runtime.set_layout(many_leaves(MAX_WORKSPACE_MEMORY_LEAVES + 2));
+    runtime.set_layout(many_leaves(MAX_WORKSPACE_MEMORY_LEAVES + 1));
     runtime.float_detach(ViewId::new(1)).expect("float detach");
 
     let row = &runtime.workspace_memory_report().workspaces[0];

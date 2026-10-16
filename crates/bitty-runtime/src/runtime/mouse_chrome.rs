@@ -205,7 +205,7 @@ impl Runtime {
     /// Attempts to grab the floating pane under the last known cursor for
     /// an Alt+drag move.
     ///
-    /// Requires Alt held and Shift released (Shift forces selection, per
+    /// Requires Mod held (Alt, the working Mod per OQ-052, or Super for Hyprland muscle memory) and Shift released (Shift forces selection, per
     /// the CTX-0181 precedent) plus a known cursor over a floating leaf.
     /// The grab also focuses the dragged pane (Hyprland-like). Returns
     /// `true` when the drag started (caller consumes the press and skips
@@ -214,8 +214,18 @@ impl Runtime {
     ///
     /// CTX-1150: fails soft while a float resize holds the pointer (edge
     /// wins over interior; see [`Self::begin_float_resize`]).
+    /// Whether a Mod+float gesture may grab (issue #2137).
+    ///
+    /// Mod is Alt (the working Mod per OQ-052) or Super (Hyprland muscle
+    /// memory); Shift always forces selection per the CTX-0181 precedent.
+    /// Shared by the float move and float edge-resize grabs so the two can
+    /// never disagree about which modifier owns floats.
+    fn float_mod_held(&self) -> bool {
+        (self.alt_pressed || self.super_pressed) && !self.shift_pressed
+    }
+
     pub fn begin_alt_drag(&mut self) -> bool {
-        if !self.alt_pressed || self.shift_pressed {
+        if !self.float_mod_held() {
             return false;
         }
         if self.float_resize.is_some() {
@@ -490,7 +500,7 @@ impl Runtime {
     /// Attempts to grab a structural float border for an Alt+edge resize
     /// (CTX-1150).
     ///
-    /// Requires Alt held and Shift released (the Alt+drag move family owns
+    /// Requires Mod held (Alt or Super, the Alt+drag move family owns
     /// floats; Shift forces selection per the CTX-0181 precedent), no active
     /// drag of any kind, a known cursor over a structural float border
     /// ([`detect_resize_edge`] with a [`RESIZE_HANDLE_CELLS`]-cell hit
@@ -505,7 +515,7 @@ impl Runtime {
     /// those kinds stays a follow-up; this keeps the solver untouched and
     /// the gesture fail-closed.
     pub fn begin_float_resize(&mut self) -> bool {
-        if !self.alt_pressed || self.shift_pressed {
+        if !self.float_mod_held() {
             return false;
         }
         if self.alt_drag.is_some()
@@ -1393,5 +1403,31 @@ impl Runtime {
     /// path took over, or focus was applied elsewhere).
     pub(super) fn clear_hover_pending(&mut self) {
         self.hover_pending = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mod_state(alt: bool, super_: bool, shift: bool) -> Runtime {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.alt_pressed = alt;
+        rt.super_pressed = super_;
+        rt.shift_pressed = shift;
+        rt
+    }
+
+    #[test]
+    fn float_mod_held_accepts_alt_or_super_without_shift_issue_2137() {
+        // Issue #2137: Hyprland-style Mod+drag must own floats on either
+        // Mod (Alt per OQ-052, Super muscle memory). Shift always forces
+        // selection.
+        assert!(!mod_state(false, false, false).float_mod_held());
+        assert!(mod_state(true, false, false).float_mod_held());
+        assert!(mod_state(false, true, false).float_mod_held());
+        assert!(mod_state(true, true, false).float_mod_held());
+        assert!(!mod_state(true, false, true).float_mod_held());
+        assert!(!mod_state(false, true, true).float_mod_held());
     }
 }

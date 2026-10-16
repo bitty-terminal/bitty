@@ -2,7 +2,7 @@
 # make-component-dist.sh — assemble an R2 prebuilt component distribution.
 #
 # Packs one target's component binary plus its `bitty-component.toml` into
-# `bitty/extensions/<name>/<version>/<target>.tar.gz` payload form and
+# `extensions/<name>/<version>/<target>.tar.gz` payload form and
 # maintains the aggregate `SHA256SUMS` manifest beside it (CTX-1063, issue
 # #1792; layout reserved by CTX-1056 in packaging/README.md). The future
 # `r2-components` publisher uploads exactly these files with the immutable
@@ -200,8 +200,8 @@ if [[ "$PRINT_URL" -eq 1 ]]; then
   valid_version "$VERSION" || die "--version must look like X.Y.Z, got: $VERSION"
   valid_target "$TARGET" || die "--target must look like a rust target triple, got: $TARGET"
   valid_cdn_base "$CDN_BASE" || die "--cdn-base must be this CDN host over https, got: $CDN_BASE"
-  printf '%s/bitty/extensions/%s/%s/%s.tar.gz\n' "$CDN_BASE" "$NAME" "$VERSION" "$TARGET"
-  printf '%s/bitty/extensions/%s/%s/SHA256SUMS\n' "$CDN_BASE" "$NAME" "$VERSION"
+  printf '%s/extensions/%s/%s/%s.tar.gz\n' "$CDN_BASE" "$NAME" "$VERSION" "$TARGET"
+  printf '%s/extensions/%s/%s/SHA256SUMS\n' "$CDN_BASE" "$NAME" "$VERSION"
   exit 0
 fi
 
@@ -383,7 +383,7 @@ fi
 (cd "$OUT_DIR" && $SHA256SUM "$(basename "$OUTPUT")" >"$(basename "$OUTPUT").sha256")
 
 # Aggregate manifest over every target tarball in the output dir (the file
-# the publisher uploads as bitty/extensions/<name>/<version>/SHA256SUMS).
+# the publisher uploads as extensions/<name>/<version>/SHA256SUMS).
 shopt -s nullglob
 TARBALLS=()
 for candidate in "$OUT_DIR"/*.tar.gz; do

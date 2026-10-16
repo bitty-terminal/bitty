@@ -13,25 +13,25 @@ before installing and fail closed on mismatch; there are no signatures in
 Linux and macOS:
 
 ```sh
-curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash
+curl -fsSL https://cdn.bitty.run/install/install.sh | bash
 ```
 
 With an explicit version:
 
 ```sh
-curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash -s -- --version 0.0.23
+curl -fsSL https://cdn.bitty.run/install/install.sh | bash -s -- --version 0.0.23
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://cdn.bitty.run/bitty/install/install.ps1 | iex
+irm https://cdn.bitty.run/install/install.ps1 | iex
 ```
 
 Both scripts resolve the release through one pointer,
-`https://cdn.bitty.run/bitty/install/latest.txt` (holds the TAG, e.g.
+`https://cdn.bitty.run/install/latest.txt` (holds the TAG, e.g.
 `v0.0.23`), fetch the per-OS artifact plus its `.sha256` sidecar from
-`https://cdn.bitty.run/bitty/releases/<TAG>/`, verify the hash, and install.
+`https://cdn.bitty.run/releases/<TAG>/`, verify the hash, and install.
 No Rust toolchain is needed — only `curl` + `sha256sum` (Linux/macOS) or
 PowerShell 5.1+ (Windows). Failing closed: hash mismatch, unknown
 OS/arch, and (on Windows) an unsigned-installer SmartScreen dialog, which is

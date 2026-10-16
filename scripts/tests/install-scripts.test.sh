@@ -57,19 +57,19 @@ expect_url() { # <label> <target> <artifact-url>
 
 # 1. Literal layout-table conformance at TAG=v0.0.23 (packaging/README.md).
 expect_url 'linux x86_64 glibc' x86_64-unknown-linux-gnu \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst'
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst'
 expect_url 'linux aarch64 glibc' aarch64-unknown-linux-gnu \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-aarch64-unknown-linux-gnu.tar.zst'
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-aarch64-unknown-linux-gnu.tar.zst'
 expect_url 'linux x86_64 musl' x86_64-unknown-linux-musl \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst'
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst'
 expect_url 'macos x86_64' x86_64-apple-darwin \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-x86_64-apple-darwin'
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-x86_64-apple-darwin'
 expect_url 'macos arm64' aarch64-apple-darwin \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-apple-darwin'
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-apple-darwin'
 
 # 2. v-prefixed explicit versions normalize to the same TAG.
 out="$(BITTY_CDN_BASE='https://cdn.bitty.run' "$SCRIPT" --version v0.0.23 --target x86_64-apple-darwin --print-url 2>&1 | head -n 1)"
-if [[ "$out" != 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-x86_64-apple-darwin' ]]; then
+if [[ "$out" != 'https://cdn.bitty.run/releases/v0.0.23/bitty-x86_64-apple-darwin' ]]; then
   echo "FAIL: v-prefixed --version did not normalize" >&2
   printf '%s\n' "$out" >&2
   FAIL=1
@@ -89,8 +89,8 @@ dry="$(BITTY_CDN_BASE='https://cdn.bitty.run' "$SCRIPT" --version 0.0.23 --targe
   FAIL=1
 }
 for needle in 'TAG=v0.0.23' 'TARGET=x86_64-unknown-linux-gnu' \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst' \
-  'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst.sha256'; do
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst' \
+  'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst.sha256'; do
   if ! grep -qF -- "$needle" <<<"$dry"; then
     echo "FAIL: --dry-run missing '$needle'" >&2
     printf '%s\n' "$dry" >&2
@@ -160,13 +160,13 @@ fi
 # 6. musl/glibc auto-detect via ldd stub (Linux x86_64 uname stub).
 musl_url="$(PATH="$TMP/linux-bin:$TMP/ldd-musl:/usr/bin:/bin" BITTY_CDN_BASE='https://cdn.bitty.run' \
   "$SCRIPT" --version 0.0.23 --print-url 2>&1 | head -n 1)"
-if [[ "$musl_url" != 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst' ]]; then
+if [[ "$musl_url" != 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst' ]]; then
   echo "FAIL: musl auto-detect URL mismatch: $musl_url" >&2
   FAIL=1
 fi
 gnu_url="$(PATH="$TMP/linux-bin:$TMP/ldd-gnu:/usr/bin:/bin" BITTY_CDN_BASE='https://cdn.bitty.run' \
   "$SCRIPT" --version 0.0.23 --print-url 2>&1 | head -n 1)"
-if [[ "$gnu_url" != 'https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst' ]]; then
+if [[ "$gnu_url" != 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst' ]]; then
   echo "FAIL: glibc auto-detect URL mismatch: $gnu_url" >&2
   FAIL=1
 fi
@@ -176,9 +176,9 @@ if [[ ! -f "$PS1_SCRIPT" ]]; then
   echo "FAIL: $PS1_SCRIPT missing (PowerShell has no in-repo precedent; placed alongside install.sh)" >&2
   FAIL=1
 else
-  for needle in 'bitty/install/latest.txt' 'bitty/releases/' \
+  for needle in 'install/latest.txt' 'releases/$tag' \
     'bitty-$VersionBare-windows-x86_64.zip' 'bitty-aarch64-pc-windows-msvc.exe' \
-    'irm https://cdn.bitty.run/bitty/install/install.ps1 | iex' \
+    'irm https://cdn.bitty.run/install/install.ps1 | iex' \
     'Expand-Archive' 'Get-FileHash'; do
     if ! grep -qF -- "$needle" "$PS1_SCRIPT"; then
       echo "FAIL: install.ps1 missing '$needle'" >&2
@@ -210,9 +210,9 @@ fi
 FAKE_VER="0.0.99"
 FAKE_TAG="v0.0.99"
 FAKE_CDN="$TMP/fake-cdn"
-FAKE_REL="$FAKE_CDN/bitty/releases/$FAKE_TAG"
-mkdir -p "$FAKE_CDN/bitty/install" "$FAKE_REL"
-printf '%s\n' "$FAKE_TAG" >"$FAKE_CDN/bitty/install/latest.txt"
+FAKE_REL="$FAKE_CDN/releases/$FAKE_TAG"
+mkdir -p "$FAKE_CDN/install" "$FAKE_REL"
+printf '%s\n' "$FAKE_TAG" >"$FAKE_CDN/install/latest.txt"
 
 write_sidecar() { # <file>: GNU sha256sum format, shasum fallback (macOS).
   if command -v sha256sum >/dev/null 2>&1; then

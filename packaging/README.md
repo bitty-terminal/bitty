@@ -315,8 +315,11 @@ as the R2 path segment. `VERSION` is the same number without the leading `v`
 
 ### Bucket and prefixes
 
-Bucket `bitty`. Every key keeps the `bitty/` root prefix so the one shipped
-and verified prefix never moves:
+Bucket `bitty`. Object addresses below are written `bitty/<key>` (bucket
+name, then key) to match the `wrangler r2 object put "bitty/<key>"`
+invocations in the release workflow; the key itself is the part after the
+bucket name. Every object address keeps the `bitty/` bucket prefix so the one
+shipped and verified bucket never moves:
 
 | Prefix                                                             | Class                                 | State                                                                                               |
 | ------------------------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -331,13 +334,15 @@ See `bitty-terminal-docs/architecture/directory-semantics.md` for extension dire
 
 ### CDN key-to-URL mapping
 
-The CDN serves the bucket root one-to-one: the URL path is the full R2 key,
-including the `bitty/` prefix. Scripts must not strip it:
+The CDN serves the bucket root one-to-one: the URL path is the R2 object
+key, which is the part after the `bitty/` bucket name in
+`wrangler r2 object put "bitty/<key>"`. Scripts must use the key without
+the bucket name:
 
 ```text
 https://cdn.bitty.run/<R2-key>
-https://cdn.bitty.run/bitty/releases/v0.0.23/SHA256SUMS
-https://cdn.bitty.run/bitty/install/latest.txt
+https://cdn.bitty.run/releases/v0.0.23/SHA256SUMS
+https://cdn.bitty.run/install/latest.txt
 ```
 
 ### Pointer classes and cache policy
@@ -366,28 +371,28 @@ silent addition.
 artifact per OS and arch. OS and arch segments below are literal; only `TAG`
 and `VERSION` resolve at install time via `latest.txt`:
 
-| Script OS and arch         | Bootstrap artifact (literal template)                                                          |
-| -------------------------- | ---------------------------------------------------------------------------------------------- |
-| Linux x86_64 glibc         | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-gnu.tar.zst`  |
-| Linux aarch64 glibc        | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-aarch64-unknown-linux-gnu.tar.zst` |
-| Linux x86_64 musl (Alpine) | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-musl.tar.zst` |
-| macOS arm64                | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-apple-darwin`                        |
-| macOS x86_64               | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-x86_64-apple-darwin`                         |
-| Windows x64                | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip`                |
-| Windows arm64              | `https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe`                 |
+| Script OS and arch         | Bootstrap artifact (literal template)                                                    |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| Linux x86_64 glibc         | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-gnu.tar.zst`  |
+| Linux aarch64 glibc        | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-aarch64-unknown-linux-gnu.tar.zst` |
+| Linux x86_64 musl (Alpine) | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-musl.tar.zst` |
+| macOS arm64                | `https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-apple-darwin`                        |
+| macOS x86_64               | `https://cdn.bitty.run/releases/<TAG>/bitty-x86_64-apple-darwin`                         |
+| Windows x64                | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip`                |
+| Windows arm64              | `https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe`                 |
 
 Each row has a `<artifact>.sha256` sidecar at the same URL with `.sha256`
 appended, which the script verifies before installing. Worked example at
 `TAG=v0.0.23`, `VERSION=0.0.23`:
 
 ```text
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-aarch64-unknown-linux-gnu.tar.zst
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-apple-darwin
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-x86_64-apple-darwin
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip
-https://cdn.bitty.run/bitty/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe
+https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-gnu.tar.zst
+https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-aarch64-unknown-linux-gnu.tar.zst
+https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.tar.zst
+https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-apple-darwin
+https://cdn.bitty.run/releases/v0.0.23/bitty-x86_64-apple-darwin
+https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip
+https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe
 ```
 
 Rationale per OS:
@@ -417,17 +422,17 @@ Rationale per OS:
 ### Stable entry points
 
 ```sh
-curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash
+curl -fsSL https://cdn.bitty.run/install/install.sh | bash
 ```
 
 ```powershell
-irm https://cdn.bitty.run/bitty/install/install.ps1 | iex
+irm https://cdn.bitty.run/install/install.ps1 | iex
 ```
 
 Both scripts resolve the version through one pointer:
 
 ```sh
-curl -fsSL https://cdn.bitty.run/bitty/install/latest.txt
+curl -fsSL https://cdn.bitty.run/install/latest.txt
 ```
 
 ### latest.txt format
@@ -476,15 +481,15 @@ built for. Both segments below are literal; only `NAME`, `VERSION`, and
 `TARGET` vary:
 
 ```text
-https://cdn.bitty.run/bitty/extensions/<name>/<version>/<target>.tar.gz
-https://cdn.bitty.run/bitty/extensions/<name>/<version>/SHA256SUMS
+https://cdn.bitty.run/extensions/<name>/<version>/<target>.tar.gz
+https://cdn.bitty.run/extensions/<name>/<version>/SHA256SUMS
 ```
 
 Worked example (`net`, `0.0.23`, Linux x86_64 glibc):
 
 ```text
-https://cdn.bitty.run/bitty/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz
-https://cdn.bitty.run/bitty/extensions/net/0.0.23/SHA256SUMS
+https://cdn.bitty.run/extensions/net/0.0.23/x86_64-unknown-linux-gnu.tar.gz
+https://cdn.bitty.run/extensions/net/0.0.23/SHA256SUMS
 ```
 
 Pack one target with `scripts/make-component-dist.sh` (needs only `tar`,

@@ -2,11 +2,11 @@
 # install.sh — first-class Bitty installer for Linux and macOS (CTX-1047, #1847).
 #
 # Entry points (stable, served from the CDN):
-#   curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash
-#   curl -fsSL https://cdn.bitty.run/bitty/install/install.sh | bash -s -- --version 0.0.23
+#   curl -fsSL https://cdn.bitty.run/install/install.sh | bash
+#   curl -fsSL https://cdn.bitty.run/install/install.sh | bash -s -- --version 0.0.23
 #
 # The script resolves the release through one pointer:
-#   https://cdn.bitty.run/bitty/install/latest.txt
+#   https://cdn.bitty.run/install/latest.txt
 # which holds TAG (for example `v0.0.23`) with a trailing newline. VERSION is
 # TAG without the leading `v` and is what bundle names embed.
 #
@@ -14,15 +14,15 @@
 # (packaging/README.md, CTX-1056, closes #1794). Only TAG and VERSION resolve
 # at install time; OS and arch segments below are literal:
 #   Linux x86_64 glibc:
-#     https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-gnu.tar.zst
+#     https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-gnu.tar.zst
 #   Linux aarch64 glibc:
-#     https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-aarch64-unknown-linux-gnu.tar.zst
+#     https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-aarch64-unknown-linux-gnu.tar.zst
 #   Linux x86_64 musl (Alpine):
-#     https://cdn.bitty.run/bitty/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-musl.tar.zst
+#     https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-x86_64-unknown-linux-musl.tar.zst
 #   macOS arm64:
-#     https://cdn.bitty.run/bitty/releases/<TAG>/bitty-aarch64-apple-darwin
+#     https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-apple-darwin
 #   macOS x86_64:
-#     https://cdn.bitty.run/bitty/releases/<TAG>/bitty-x86_64-apple-darwin
+#     https://cdn.bitty.run/releases/<TAG>/bitty-x86_64-apple-darwin
 # Each row has a `<artifact>.sha256` sidecar at the same URL with `.sha256`
 # appended, verified before installing (fail closed on mismatch). There are no
 # signatures in 0.1.0: verification is hash-only (Windows signing deferred
@@ -48,7 +48,7 @@
 #
 # Options:
 #   --version VERSION  release version to install (X.Y.Z or vX.Y.Z); default
-#                      resolves https://cdn.bitty.run/bitty/install/latest.txt
+#                      resolves https://cdn.bitty.run/install/latest.txt
 #   --prefix DIR       install prefix (binary goes to DIR/bin); default uses
 #                      HOME/.local (binary HOME/.local/bin)
 #   --bin-dir DIR      binary directory override (wins over --prefix;
@@ -72,7 +72,7 @@ set -euo pipefail
 export LC_ALL=C
 
 CDN_DEFAULT="https://cdn.bitty.run"
-LATEST_SUFFIX="bitty/install/latest.txt"
+LATEST_SUFFIX="install/latest.txt"
 
 VERSION_ARG=""
 PREFIX=""
@@ -86,7 +86,7 @@ usage() {
 Usage: install.sh [--version VERSION] [--prefix DIR] [--bin-dir DIR] [--dry-run] [--print-url] [--target TRIPLE] [-h|--help]
 
   --version VERSION  release version to install (X.Y.Z or vX.Y.Z); default
-                     resolves https://cdn.bitty.run/bitty/install/latest.txt
+                     resolves https://cdn.bitty.run/install/latest.txt
   --prefix DIR       install prefix (binary goes to DIR/bin)
   --bin-dir DIR      binary directory override (wins over --prefix;
                        desktop integration is skipped when set without --prefix)
@@ -254,7 +254,7 @@ detect_target() {
     die "FreeBSD is not a bootstrap target; download bitty-<version>-x86_64-unknown-freebsd.tar.xz from the release page manually"
     ;;
   MINGW* | MSYS* | CYGWIN*)
-    die "Windows Git-Bash detected; run install.ps1 instead: irm https://cdn.bitty.run/bitty/install/install.ps1 | iex"
+    die "Windows Git-Bash detected; run install.ps1 instead: irm https://cdn.bitty.run/install/install.ps1 | iex"
     ;;
   *)
     die "unsupported OS: $os (bootstrap serves Linux and macOS; Windows uses install.ps1)"
@@ -316,7 +316,7 @@ TAG="$(resolve_tag)"
 VERSION="${TAG#v}"
 TARGET="$(detect_target)"
 ARTIFACT="$(artifact_name "$VERSION" "$TARGET")"
-URL="${CDN_BASE}/bitty/releases/${TAG}/${ARTIFACT}"
+URL="${CDN_BASE}/releases/${TAG}/${ARTIFACT}"
 SHA_URL="${URL}.sha256"
 
 if [[ "$PRINT_URL" -eq 1 ]]; then

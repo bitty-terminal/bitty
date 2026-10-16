@@ -2775,6 +2775,29 @@ fn atlas_growth_refused_when_fragmented_evicts_instead() {
 }
 
 #[test]
+fn malformed_glyph_dimensions_fail_closed_without_overflowing_coverage() {
+    let mut atlas = super::GlyphAtlas::new(2048).unwrap();
+    let font = FontId::next(&mut 0u64);
+    let key = RasterKey::new('!', font, 12.0).unwrap();
+    let malformed = GlyphBitmap {
+        metrics: GlyphMetrics {
+            left: 0,
+            top: i32::MAX,
+            width: i32::MAX,
+            height: i32::MAX,
+            advance: [0, 0],
+        },
+        format: BitmapFormat::Rgb,
+        data: Vec::new(),
+    };
+    assert!(matches!(
+        atlas.ensure(key, &malformed),
+        GlyphSource::Inline { mask, .. } if mask.is_empty()
+    ));
+    assert!(!atlas.is_exhausted());
+}
+
+#[test]
 fn atlas_grows_when_genuinely_full() {
     // Sixty-four 64x64 glyphs pack the 512 atlas to exactly 100%; the
     // 65th fails at full occupancy — genuine pressure — so growth to

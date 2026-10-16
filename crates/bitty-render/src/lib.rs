@@ -132,8 +132,8 @@
 //!
 //! All buffers are bounded at construction: [`GlyphBitmap::try_new`] rejects
 //! length mismatches and capacity overflows, [`atlas::AtlasLayout::allocate`]
-//! refuses allocations that cannot fit, [`cache::GlyphCache`] enforces an
-//! entry cap with deterministic eviction, and the software surface caps its
+//! refuses allocations that cannot fit, [`cache::GlyphCache`] enforces entry
+//! and retained-pixel-byte caps with deterministic eviction, and the software surface caps its
 //! byte size. Unbounded growth on untrusted input is forbidden by the
 //! security corpus.
 //!
@@ -204,7 +204,7 @@ pub mod window;
 #[cfg(feature = "sw-fallback")]
 pub mod software;
 
-pub use cache::GlyphCache;
+pub use cache::{DEFAULT_GLYPH_CACHE_BYTE_CAPACITY, GlyphCache};
 pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;
 pub use fallback::{
@@ -213,7 +213,8 @@ pub use fallback::{
 };
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{
-    FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey,
+    FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer,
+    MAX_CACHED_BITMAP_BYTES, RasterKey,
 };
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
@@ -229,11 +230,12 @@ pub use hidpi::{
 pub use pipeline::UNDERLINE_WGSL;
 pub use shaped::{
     ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GlyphSource,
-    MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_ENTRIES,
-    MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs,
-    RunCacheKey, ShapePlanKey, ShapedCluster, ShapedGlyphKey, ShapedRun, SwashSingle,
-    ascii_fast_path_eligible, cells_for_range, collect_run_text, features_are_unshaped,
-    features_for_policy, form_runs_for_row, harfrust_features, is_printable_ascii_byte,
-    is_printable_ascii_str, run_is_ascii_candidate,
+    MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_BYTES,
+    MAX_RUN_CACHE_ENTRIES, MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_BYTES,
+    MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, ShapePlanKey,
+    ShapedCluster, ShapedGlyphKey, ShapedRun, SwashSingle, ascii_fast_path_eligible,
+    cells_for_range, collect_run_text, features_are_unshaped, features_for_policy,
+    form_runs_for_row, harfrust_features, is_printable_ascii_byte, is_printable_ascii_str,
+    run_is_ascii_candidate,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

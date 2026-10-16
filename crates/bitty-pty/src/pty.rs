@@ -121,6 +121,16 @@ impl Pty {
         self.session.pid()
     }
 
+    /// Whether the child status has already been consumed by a wait.
+    ///
+    /// This is a read-only ownership snapshot. It does not poll the child or
+    /// reap anything. A `false` result means that this handle still owns an
+    /// unreaped child status; it does not prove that the child is running.
+    #[must_use]
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+
     /// The child's owned process tree, when one exists: signal it to reach
     /// every member the child grew, not just the direct child this handle
     /// reaps. `None` only when the platform reported no pid for the child.

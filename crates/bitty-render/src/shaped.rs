@@ -46,8 +46,8 @@ use fontdb::{Database, Family, Query, Source, Style, Weight};
 
 use crate::error::RenderError;
 use crate::glyph::{
-    BitmapFormat, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics,
-    GlyphRasterizer, RasterKey,
+    BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
+    GlyphMetrics, GlyphRasterizer, RasterKey,
 };
 
 /// Maximum bytes retained per loaded face (design 1.4).
@@ -75,12 +75,18 @@ pub const MAX_SHAPE_PLANS_PER_FACE: usize = 6;
 /// scroll of ligature-dense code converges to ~zero shapes per frame.
 pub const MAX_RUN_CACHE_ENTRIES: usize = 512;
 
+/// Maximum bytes retained by the shaped-run cache, excluding map overhead.
+pub const MAX_RUN_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Maximum shaped glyph bitmaps retained (glyph-id-keyed, design 5).
 ///
 /// Parallel to the char-keyed `GlyphCache` (2048): shaped glyph ids get
 /// their own bounded LRU keyed by face + glyph id + size + features,
 /// with the same negative-blank caching.
 pub const MAX_SHAPED_GLYPH_CACHE_ENTRIES: usize = 2048;
+
+/// Maximum pixel bytes retained by the shaped-glyph cache.
+pub const MAX_SHAPED_GLYPH_CACHE_BYTES: usize = crate::glyph::MAX_CACHED_BITMAP_BYTES;
 
 /// Maximum distinct dynamic-fallback faces loaded per session (CTX-0961).
 ///
@@ -221,10 +227,17 @@ pub struct SwashSingle {
     run_cache: HashMap<RunCacheKey, Vec<ShapedCluster>>,
     /// LRU order for runs (most-recent at back, single-victim eviction).
     run_lru: VecDeque<RunCacheKey>,
+    run_cache_bytes: usize,
     /// Retained shaped glyph bitmaps by glyph id (Phase B, design 5).
-    shaped_glyphs: HashMap<ShapedGlyphKey, Option<GlyphBitmap>>,
+    shaped_glyphs: HashMap<ShapedGlyphKey, Option<CachedBitmap>>,
     /// LRU order for shaped glyphs (most-recent at back).
     shaped_lru: VecDeque<ShapedGlyphKey>,
+    shaped_glyph_bytes: usize,
+    /// One non-retained oversized shaped glyph. This preserves rendering for
+    /// a key that cannot fit the bounded retained cache and avoids rerastering
+    /// it on every frame when it remains the active glyph.
+    transient_shaped_key: Option<ShapedGlyphKey>,
+    transient_shaped_glyph: Option<CachedBitmap>,
     /// Cumulative run-cache hits (served without shaping).
     shape_hits: u64,
     /// Cumulative run-cache misses (shaped and inserted).
@@ -277,8 +290,12 @@ impl SwashSingle {
             shape_plan_lru: VecDeque::new(),
             run_cache: HashMap::new(),
             run_lru: VecDeque::new(),
+            run_cache_bytes: 0,
             shaped_glyphs: HashMap::new(),
             shaped_lru: VecDeque::new(),
+            shaped_glyph_bytes: 0,
+            transient_shaped_key: None,
+            transient_shaped_glyph: None,
             shape_hits: 0,
             shape_misses: 0,
             shaping_misaligned: 0,
@@ -308,8 +325,12 @@ impl SwashSingle {
             shape_plan_lru: VecDeque::new(),
             run_cache: HashMap::new(),
             run_lru: VecDeque::new(),
+            run_cache_bytes: 0,
             shaped_glyphs: HashMap::new(),
             shaped_lru: VecDeque::new(),
+            shaped_glyph_bytes: 0,
+            transient_shaped_key: None,
+            transient_shaped_glyph: None,
             shape_hits: 0,
             shape_misses: 0,
             shaping_misaligned: 0,
@@ -420,11 +441,17 @@ impl SwashSingle {
             })?;
         let data = match image.content {
             swash::scale::image::Content::Mask => {
-                // 1 byte/px alpha coverage -> triplicated `Rgb` coverage,
-                // the format the atlas path averages to luminance.
-                let mut rgb = Vec::with_capacity(image.data.len() * 3);
-                for b in &image.data {
-                    rgb.extend_from_slice(&[*b, *b, *b]);
+                let byte_count =
+                    image
+                        .data
+                        .len()
+                        .checked_mul(3)
+                        .ok_or(RenderError::InvalidInput {
+                            reason: "glyph pixel count overflows the address space bound",
+                        })?;
+                let mut rgb = Vec::with_capacity(byte_count);
+                for coverage in image.data {
+                    rgb.extend_from_slice(&[coverage; 3]);
                 }
                 rgb
             }
@@ -441,7 +468,13 @@ impl SwashSingle {
                         reason: "color bitmap length is not a multiple of 4",
                     });
                 }
-                let mut rgb = Vec::with_capacity(image.data.len() / 4 * 3);
+                let rgb_len =
+                    (image.data.len() / 4)
+                        .checked_mul(3)
+                        .ok_or(RenderError::InvalidInput {
+                            reason: "glyph pixel count overflows the address space bound",
+                        })?;
+                let mut rgb = Vec::with_capacity(rgb_len);
                 for rgba in image.data.chunks_exact(4) {
                     rgb.extend_from_slice(&rgba[..3]);
                 }
@@ -466,7 +499,16 @@ impl SwashSingle {
         };
         // `try_new` enforces the length invariant here too: malformed
         // upstream output is rejected instead of trusted.
-        let bitmap = GlyphBitmap::try_new(metrics, BitmapFormat::Rgb, data)?;
+        let format = match image.content {
+            swash::scale::image::Content::Mask => BitmapFormat::Rgb,
+            swash::scale::image::Content::Color => BitmapFormat::Rgb,
+            swash::scale::image::Content::SubpixelMask => {
+                return Err(RenderError::flatten_rasterizer(
+                    "subpixel mask content is not served on this path",
+                ));
+            }
+        };
+        let bitmap = GlyphBitmap::try_new(metrics, format, data)?;
         Ok((bitmap, source))
     }
 
@@ -567,8 +609,12 @@ impl SwashSingle {
         self.shape_plan_lru.clear();
         self.run_cache.clear();
         self.run_lru.clear();
+        self.run_cache_bytes = 0;
         self.shaped_glyphs.clear();
         self.shaped_lru.clear();
+        self.shaped_glyph_bytes = 0;
+        self.transient_shaped_key = None;
+        self.transient_shaped_glyph = None;
     }
 
     /// Records one CJK-advance misalignment (emitter degraded to unshaped).
@@ -708,24 +754,54 @@ impl SwashSingle {
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
     ) -> Result<Option<GlyphBitmap>, RenderError> {
+        self.rasterize_shaped_cached_ref(face, glyph_id, point_size, features)?
+            .map(CachedBitmap::to_glyph_bitmap)
+            .transpose()
+    }
+
+    /// Rasterizes one shaped glyph while retaining the packed cache form.
+    /// Grid/atlas callers use this path so a shaped-cache hit does not expand
+    /// one-byte coverage into public RGB data.
+    pub(crate) fn rasterize_shaped_cached_ref(
+        &mut self,
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<&CachedBitmap>, RenderError> {
         if !(point_size.is_finite() && point_size > 0.0) {
             return Err(RenderError::InvalidInput {
                 reason: "raster size must be finite and positive",
             });
         }
         let key = ShapedGlyphKey::new(face, glyph_id, point_size, features);
-        if let Some(cached) = self.shaped_glyphs.get(&key).cloned() {
+        if self.transient_shaped_key == Some(key) {
+            return Ok(self.transient_shaped_glyph.as_ref());
+        }
+        if self.shaped_glyphs.contains_key(&key) {
             self.touch_shaped_lru(key);
-            return Ok(cached);
+            return Ok(self.shaped_glyphs.get(&key).and_then(Option::as_ref));
         }
         let owned = self.stored(face)?.clone();
-        let stored = self.render_glyph_checked(&owned, glyph_id, point_size)?;
-        if self.shaped_glyphs.len() >= MAX_SHAPED_GLYPH_CACHE_ENTRIES {
+        let stored = self
+            .render_glyph_checked(&owned, glyph_id, point_size)?
+            .map(CachedBitmap::grayscale)
+            .transpose()?;
+        let stored_bytes = stored.as_ref().map_or(0, CachedBitmap::retained_bytes);
+        if stored_bytes > MAX_SHAPED_GLYPH_CACHE_BYTES {
+            self.transient_shaped_key = Some(key);
+            self.transient_shaped_glyph = stored;
+            return Ok(self.transient_shaped_glyph.as_ref());
+        }
+        while self.shaped_glyphs.len() >= MAX_SHAPED_GLYPH_CACHE_ENTRIES
+            || self.shaped_glyph_bytes.saturating_add(stored_bytes) > MAX_SHAPED_GLYPH_CACHE_BYTES
+        {
             self.evict_shaped_lru();
         }
-        self.shaped_glyphs.insert(key, stored.clone());
+        self.shaped_glyph_bytes = self.shaped_glyph_bytes.saturating_add(stored_bytes);
+        self.shaped_glyphs.insert(key, stored);
         self.shaped_lru.push_back(key);
-        Ok(stored)
+        Ok(self.shaped_glyphs.get(&key).and_then(Option::as_ref))
     }
 
     /// Renders one shaped glyph, mapping "no renderable source" to `None`.
@@ -756,7 +832,11 @@ impl SwashSingle {
     /// Evicts exactly the least-recently-used shaped glyph.
     fn evict_shaped_lru(&mut self) {
         if let Some(victim) = self.shaped_lru.pop_front() {
-            self.shaped_glyphs.remove(&victim);
+            if let Some(Some(bitmap)) = self.shaped_glyphs.remove(&victim) {
+                self.shaped_glyph_bytes = self
+                    .shaped_glyph_bytes
+                    .saturating_sub(bitmap.retained_bytes());
+            }
         }
     }
 
@@ -1195,6 +1275,11 @@ pub struct ShapedCluster {
     pub byte_offset: usize,
 }
 
+fn retained_run_bytes(run: &Vec<ShapedCluster>) -> usize {
+    run.capacity()
+        .saturating_mul(std::mem::size_of::<ShapedCluster>())
+}
+
 /// Cache key for a per-face shape plan (Phase B retains plans under this).
 ///
 /// Plans are a pure function of (face, direction, script, language,
@@ -1442,10 +1527,18 @@ impl SwashSingle {
         }
         self.shape_misses = self.shape_misses.saturating_add(1);
         let shaped = self.shape_run_uncached(text, chain, attrs)?;
-        if self.run_cache.len() >= MAX_RUN_CACHE_ENTRIES {
+        let cached_run = shaped.clone();
+        let shaped_bytes = retained_run_bytes(&cached_run);
+        if shaped_bytes > MAX_RUN_CACHE_BYTES {
+            return Ok(shaped);
+        }
+        while self.run_cache.len() >= MAX_RUN_CACHE_ENTRIES
+            || self.run_cache_bytes.saturating_add(shaped_bytes) > MAX_RUN_CACHE_BYTES
+        {
             self.evict_run_lru();
         }
-        self.run_cache.insert(run_key, shaped.clone());
+        self.run_cache_bytes = self.run_cache_bytes.saturating_add(shaped_bytes);
+        self.run_cache.insert(run_key, cached_run);
         self.run_lru.push_back(run_key);
         Ok(shaped)
     }
@@ -1462,7 +1555,11 @@ impl SwashSingle {
     /// wholesale clear — mirrors `GlyphCache` CTX-0471 semantics).
     fn evict_run_lru(&mut self) {
         if let Some(victim) = self.run_lru.pop_front() {
-            self.run_cache.remove(&victim);
+            if let Some(run) = self.run_cache.remove(&victim) {
+                self.run_cache_bytes = self
+                    .run_cache_bytes
+                    .saturating_sub(retained_run_bytes(&run));
+            }
         }
     }
 
@@ -1700,6 +1797,32 @@ impl SwashSingle {
 mod tests {
     use super::*;
 
+    // Tiny deterministic TrueType fixture: one drawable `A` glyph. Keeping
+    // the bytes in the test makes shaped rasterization coverage independent
+    // of the host font stack.
+    const DEMO_TTF_HEX: &str = "000100000007004000020030636d617000090076000001000000002c676c7966f1cb6698000001340000005c68656164f235ddf80000007c0000003668686561066100ca000000b400000024686d74780474006a000000f8000000086c6f6361002e00140000012c000000066d6178700005000b000000d8000000200001000000010000f59c29445f0f3cf5000203e800000000b492f40000000000dc2fa65c00060000025802bc000000030002000000000000000100000400fe70000002580006ffff0258000100000000000000000000000000000002000100000002000b00020000000000000000000000000000000000000000000002580064021c000600000001000000030000000c00040020000000040004000100000041ffff00000041ffffffc000010000000000000014002e0000000200640000025802bc00030007000033112111252111216401f4fe3401a4fe5c02bcfd4428026c000200060000021d02900002000a00001333030113331323272307adc463fef8da60dd593eef42010b0140fdb50290fd70c8c800";
+
+    fn demo_ttf() -> Vec<u8> {
+        DEMO_TTF_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn shaper_with_demo_font() -> (SwashSingle, FontId) {
+        let mut shaper = SwashSingle::empty_for_cache_test();
+        let face = FontId::next(&mut shaper.next_font_id);
+        shaper.faces.insert(
+            face,
+            StoredFace {
+                data: Arc::new(demo_ttf()),
+                face_index: 0,
+            },
+        );
+        (shaper, face)
+    }
+
     #[test]
     fn pt_to_px_mirrors_crossfont_scale() {
         // crossfont Size::as_px = pt * 96/72; the CTX-0157 probe (12pt ->
@@ -1826,6 +1949,37 @@ mod tests {
             MAX_DYNAMIC_FALLBACK_FACES,
             "cache overflow must not reset the dynamic-face quota"
         );
+    }
+
+    #[test]
+    fn shaped_rasterization_cache_hit_retains_packed_coverage_without_rerasterizing() {
+        let (mut shaper, face) = shaper_with_demo_font();
+        let key = ShapedGlyphKey::new(face, 1, 12.0, &[]);
+        let bitmap = shaper
+            .rasterize_shaped(face, 1, 12.0, &[])
+            .unwrap()
+            .expect("demo glyph must rasterize");
+        assert_eq!(shaper.shaped_glyphs.len(), 1);
+        assert_eq!(shaper.shaped_lru, std::collections::VecDeque::from([key]));
+        assert_eq!(bitmap.format, BitmapFormat::Rgb);
+        let pixels = usize::try_from(bitmap.metrics.width * bitmap.metrics.height).unwrap();
+        let retained = shaper
+            .shaped_glyphs
+            .get(&key)
+            .and_then(Option::as_ref)
+            .expect("shaped cache must retain the glyph");
+        assert_eq!(
+            retained.retained_bytes(),
+            pixels * BitmapFormat::Rgb.channels()
+        );
+
+        let cached = shaper
+            .rasterize_shaped(face, 1, 12.0, &[])
+            .unwrap()
+            .expect("repeated glyph must be cached");
+        assert_eq!(cached, bitmap);
+        assert_eq!(cached.format, BitmapFormat::Rgb);
+        assert_eq!(shaper.shaped_lru, std::collections::VecDeque::from([key]));
     }
 
     #[test]

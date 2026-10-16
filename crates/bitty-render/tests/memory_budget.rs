@@ -1,14 +1,15 @@
-//! Idle memory-budget gate for issue #1809 (CTX-1026, CTX-1036).
+//! Modeled idle memory-accounting checks for issue #1809 (CTX-1026, CTX-1036).
 //!
 //! A single idle panel reported 382 MB RSS / 1.5 GB VSZ. GPU-driver mappings
-//! own most of the VSZ floor (out of scope here); this gate pins the heap
-//! Bitty itself controls so a cap doubled or an eager load reintroduced
-//! fails CI instead of regressing silently:
+//! own most of the VSZ floor (out of scope here). These checks model the
+//! renderer-owned cache line items so a cap doubled or an eager load
+//! reintroduced fails CI instead of regressing silently. Runtime cache byte
+//! quotas are enforced by the renderer; this test does not measure process
+//! RSS/VSZ:
 //!
 //! - startup maps exactly one font face (fallback tails stay pending until
 //!   the first fallback miss);
-//! - every glyph/shape/atlas/dynamic cache keeps a named cap, each with a
-//!   byte line-item under the idle budget;
+//! - every glyph/shape/atlas/dynamic cache keeps a named entry or byte cap;
 //! - the atlas starts at the 512 px lazy dimension (256 KiB R8), never the
 //!   2048 px maximum, until glyph pressure grows it;
 //! - (CTX-1036, phase 2) the GPU surface negotiates `Fifo` first (double,
@@ -17,9 +18,8 @@
 //!   device requests `MemoryUsage` sizing, and atlas-less frames size their
 //!   texture at the lazy 512 px dimension.
 //!
-//! Budgets are deliberately headroom-tight (not exact): a legitimate new
-//! cache must update the named constant AND this gate together, which is
-//! the review tripwire.
+//! The combined ceiling is deliberately headroom-tight: a legitimate new
+//! cache must update the named constant AND this check together.
 //!
 //! CTX-1216 (issue #2087) attribution note: headed idle RSS also carries
 //! NVIDIA/Vulkan driver-resident pages that no cache cap controls. A
@@ -44,16 +44,18 @@ use bitty_render::{
     cache::DEFAULT_GLYPH_CACHE_CAPACITY,
     glyph::{BitmapFormat, GlyphMetrics},
     gpu::{BackendSelection, PresentMode, pick_present_mode, resolve_instance_backends},
-    shaped::{MAX_DYNAMIC_CACHE_ENTRIES, MAX_RUN_CACHE_ENTRIES, MAX_SHAPED_GLYPH_CACHE_ENTRIES},
+    shaped::{
+        MAX_DYNAMIC_CACHE_ENTRIES, MAX_RUN_CACHE_BYTES, MAX_RUN_CACHE_ENTRIES,
+        MAX_SHAPED_GLYPH_CACHE_BYTES, MAX_SHAPED_GLYPH_CACHE_ENTRIES,
+    },
 };
 
-/// Combined worst-case ceiling for the render-side caches (issue #1809).
+/// Combined modeled budget for the render-side caches (issue #1809).
 ///
-/// Pathology, not idle: both glyph caches full of 64x64 Rgb strikes plus a
-/// maxed 2048x2048 R8 atlas. Idle is a small fraction (warm ASCII working
-/// set + 512 px atlas); this ceiling only trips when a cap grows or a new
-/// unbounded cache lands.
-const RENDER_WORST_CASE_BUDGET_BYTES: usize = 56 * 1024 * 1024;
+/// This bound covers the runtime byte quotas for both bitmap caches, the shaped
+/// run cache, and a maxed 2048x2048 R8 atlas.
+/// Idle is a small fraction (warm ASCII working set plus a 512 px atlas).
+const RENDER_MODELED_WORST_CASE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Counting fake: records every upstream face load.
 #[derive(Debug, Default)]
@@ -152,31 +154,34 @@ fn startup_maps_exactly_one_face_until_first_miss() {
 }
 
 #[test]
-fn cache_caps_hold_named_byte_lines() {
+fn modeled_cache_caps_hold_named_byte_lines() {
     // CTX-1206 cap review (issue #2076): every cap below is retained. The
     // steady-state cut lands elsewhere (the atlas growth gate keeps the
     // 512 px lazy texture through transient bursts instead of ratcheting
     // to the 2048 px maximum), so the worst-case ceiling is unchanged and
     // still pinned here.
-    // Glyph bitmap worst case: a 64x64 Rgb strike (large for a terminal
-    // cell at sane point sizes; emoji CBDT strikes stay near this order).
-    // The 3 B/px triplet is the upstream retention cost the grayscale
-    // policy flattens to 1 B/px at atlas upload (see
-    // `atlas::coverage_policy_for`): the cache holds triplets, the atlas
-    // holds luminance.
-    const WORST_STRIKE_BYTES: usize = 64 * 64 * 3;
+    // Renderer-managed grayscale caches retain one validated RGB-compatible
+    // source allocation. Atlas coverage is derived on demand, so the cache
+    // quota accounts for the allocation exposed through public glyph lookup.
+    const WORST_STRIKE_BYTES: usize = 64 * 64;
     let glyph_line = DEFAULT_GLYPH_CACHE_CAPACITY * WORST_STRIKE_BYTES;
     assert_eq!(DEFAULT_GLYPH_CACHE_CAPACITY, 2048);
+    assert_eq!(
+        bitty_render::DEFAULT_GLYPH_CACHE_BYTE_CAPACITY,
+        8 * 1024 * 1024
+    );
     assert!(
-        glyph_line <= 24 * 1024 * 1024,
-        "char glyph cache line must stay under 24 MiB, is {glyph_line}"
+        glyph_line <= 8 * 1024 * 1024,
+        "char glyph cache line must stay under 8 MiB, is {glyph_line}"
     );
     let shaped_line = MAX_SHAPED_GLYPH_CACHE_ENTRIES * WORST_STRIKE_BYTES;
     assert_eq!(MAX_SHAPED_GLYPH_CACHE_ENTRIES, 2048);
     assert!(
-        shaped_line <= 24 * 1024 * 1024,
-        "shaped glyph cache line must stay under 24 MiB, is {shaped_line}"
+        shaped_line <= 8 * 1024 * 1024,
+        "shaped glyph cache line must stay under 8 MiB, is {shaped_line}"
     );
+    assert_eq!(MAX_SHAPED_GLYPH_CACHE_BYTES, 8 * 1024 * 1024);
+    assert_eq!(MAX_RUN_CACHE_BYTES, 4 * 1024 * 1024);
     // Run cache: 512 short owned vecs; dynamic outcome cache: 4096 tiny
     // map entries (~48 B each with HashMap overhead).
     assert_eq!(MAX_RUN_CACHE_ENTRIES, 512);
@@ -213,11 +218,15 @@ fn cache_caps_hold_named_byte_lines() {
         4 * 1024 * 1024,
         "R8 march: 2048x2048 must be 4 MiB"
     );
-    // Combined worst-case owned heap stays inside the ceiling.
-    let worst_owned = glyph_line + shaped_line + dynamic_line + max_texels;
+    // Runtime bitmap and run quotas plus the atlas stay inside the ceiling.
+    let worst_owned = bitty_render::DEFAULT_GLYPH_CACHE_BYTE_CAPACITY
+        + MAX_SHAPED_GLYPH_CACHE_BYTES
+        + MAX_RUN_CACHE_BYTES
+        + dynamic_line
+        + max_texels;
     assert!(
-        worst_owned <= RENDER_WORST_CASE_BUDGET_BYTES,
-        "combined cache/atlas worst case {worst_owned} must stay under {RENDER_WORST_CASE_BUDGET_BYTES}"
+        worst_owned <= RENDER_MODELED_WORST_CASE_BYTES,
+        "modeled cache/atlas bytes {worst_owned} must stay under the modeled ceiling {RENDER_MODELED_WORST_CASE_BYTES}"
     );
 }
 
@@ -228,10 +237,10 @@ fn cache_caps_hold_named_byte_lines() {
 /// RSS (145 MB `RssShmem` on `/dev/nvidiactl`) with the GL stack resident
 /// beside it (~15 MB file mappings + init threads) even though the surface
 /// negotiates Vulkan. This gate pins the three policy choices that keep the
-/// driver set minimal; the numeric budget (interim headed gate: idle
+/// driver set minimal; the numeric target (interim headed target: idle
 /// single-panel main-process RSS at or below 250 MB toward 150 MB) is
-/// measured headed by `scripts/mem-measure.sh`, while CI pins the policy here
-/// so a default flipped back can never regress silently.
+/// measured headed by `scripts/mem-measure.sh`; this test only pins the
+/// related policy choices and does not enforce that process-memory target.
 #[test]
 fn gpu_surface_policy_stays_memory_lean() {
     // Present mode: Fifo (double-buffered vsync) first — one fewer

@@ -159,6 +159,7 @@ pub mod selection;
 pub mod session;
 pub mod shell_jump;
 pub mod submit_host;
+pub mod workspace_memory;
 pub mod workspaces;
 
 pub use self::animations::{
@@ -1286,6 +1287,28 @@ pub struct Runtime {
     pointer_stacks: pointer::PointerStacks,
 }
 
+/// Bounded read-only accounting for one layout leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalDiagnostics {
+    /// Stable layout view identifier.
+    pub view_id: u64,
+    /// Terminal identifier paired with the view. The current runtime keeps a
+    /// one-to-one `t:N`/`v:N` mapping.
+    pub terminal_id: u64,
+    /// Whether the leaf currently owns a PTY-backed session.
+    pub has_session: bool,
+    /// Retained scrollback line count.
+    pub scrollback_lines: usize,
+    /// Capacity-accurate heap retained by terminal state.
+    pub retained_heap_bytes: usize,
+    /// Recorded direct child pid, when the PTY backend exposes one.
+    pub child_pid: Option<u32>,
+    /// Observed ownership lifecycle of the recorded child. Values are
+    /// `unreaped`, `reaped`, or `absent`; `unreaped` does not assert that the
+    /// child is currently running because this read-only query does not poll.
+    pub child_state: &'static str,
+}
+
 /// Opaque, runtime-issued proof of a platform input gesture.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivationGesture(u64);
@@ -2376,6 +2399,57 @@ impl Runtime {
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Read-only bounded diagnostics for one terminal/view pair.
+    ///
+    /// The primary view uses the runtime-global terminal state; split views
+    /// use their private session state. The returned values contain only
+    /// identifiers, counts, byte accounting, and the recorded direct-child
+    /// pid. No command, cwd, or host path is exposed.
+    #[must_use]
+    pub fn terminal_diagnostics(&self, view: ViewId) -> TerminalDiagnostics {
+        let primary = self.primary_view == Some(view);
+        if let Some(session) = self.pane_sessions.get(&view) {
+            return TerminalDiagnostics {
+                view_id: view.0,
+                terminal_id: view.0,
+                has_session: true,
+                scrollback_lines: session.state.scrollback_len(),
+                retained_heap_bytes: session.state.retained_heap_bytes(),
+                child_pid: session.pty.pid(),
+                child_state: if session.pty.is_reaped() {
+                    "reaped"
+                } else {
+                    "unreaped"
+                },
+            };
+        }
+
+        let has_session = primary && self.pty.is_some();
+        TerminalDiagnostics {
+            view_id: view.0,
+            terminal_id: view.0,
+            has_session,
+            scrollback_lines: if primary {
+                self.state.scrollback_len()
+            } else {
+                0
+            },
+            retained_heap_bytes: if primary {
+                self.state.retained_heap_bytes()
+            } else {
+                0
+            },
+            child_pid: if has_session { self.pty_pid() } else { None },
+            child_state: if !has_session {
+                "absent"
+            } else if self.pty.as_ref().is_some_and(bitty_pty::Pty::is_reaped) {
+                "reaped"
+            } else {
+                "unreaped"
+            },
+        }
     }
 
     /// Current `OSC 22` pointer shape for leaf `view`, if its stack is non-empty.

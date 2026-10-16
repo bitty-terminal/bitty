@@ -127,17 +127,23 @@ impl SurfaceRgba {
                 reason: "glyph dimensions must be non-negative",
             });
         }
+        let expected = usize::try_from(bw)
+            .ok()
+            .and_then(|width| usize::try_from(bh).ok()?.checked_mul(width))
+            .and_then(|pixels| pixels.checked_mul(bitmap.format.channels()));
+        if expected != Some(bitmap.data.len()) {
+            return Err(RenderError::InvalidInput {
+                reason: if expected.is_none() {
+                    "glyph pixel count overflows the address space bound"
+                } else {
+                    "glyph bitmap length does not match its dimensions"
+                },
+            });
+        }
         if bitmap.is_blank() {
             return Ok(());
         }
-        let channels = match bitmap.format {
-            BitmapFormat::Rgb | BitmapFormat::Rgba => bitmap.format.channels(),
-        };
-        if bitmap.data.len() != bw as usize * bh as usize * channels {
-            return Err(RenderError::InvalidInput {
-                reason: "glyph bitmap length does not match its dimensions",
-            });
-        }
+        let channels = bitmap.format.channels();
 
         // Destination clip window in glyph-local coordinates (i64 throughout
         // so extreme offsets cannot overflow).
@@ -261,7 +267,15 @@ impl SurfaceRgba {
         let Some(mask_width) = usize::try_from(mask_width).ok().filter(|w| *w > 0) else {
             return;
         };
-        let mask_height = usize::try_from(mask_height).unwrap_or(0);
+        let Some(mask_height) = usize::try_from(mask_height).ok().filter(|h| *h > 0) else {
+            return;
+        };
+        let Some(mask_len) = mask_width.checked_mul(mask_height) else {
+            return;
+        };
+        if mask.len() < mask_len {
+            return;
+        }
 
         let dst_left = i64::from(-x).max(0);
         let dst_top = i64::from(-y).max(0);
@@ -275,9 +289,24 @@ impl SurfaceRgba {
         let [cr, cg, cb, ca] = color;
         for gy in dst_top..dst_bottom {
             for gx in dst_left..dst_right {
-                let sx = (i64::from(x) + gx) as usize;
-                let sy = (i64::from(y) + gy) as usize;
-                let mut coverage = u32::from(mask[gy as usize * mask_width + gx as usize]);
+                let sx = usize::try_from(i64::from(x) + gx).unwrap_or(usize::MAX);
+                let sy = usize::try_from(i64::from(y) + gy).unwrap_or(usize::MAX);
+                let Some(mask_index) = gy
+                    .try_into()
+                    .ok()
+                    .and_then(|row: usize| row.checked_mul(mask_width))
+                    .and_then(|offset| {
+                        gx.try_into()
+                            .ok()
+                            .and_then(|col: usize| offset.checked_add(col))
+                    })
+                else {
+                    return;
+                };
+                let Some(&mask_value) = mask.get(mask_index) else {
+                    return;
+                };
+                let mut coverage = u32::from(mask_value);
                 if coverage == 0 {
                     continue;
                 }
@@ -507,11 +536,33 @@ pub fn draw_list_onto(
                     });
                 };
                 let stride = usize::from(dims.width);
-                let mut mask =
-                    Vec::with_capacity(usize::from(slot.width) * usize::from(slot.height));
+                let Some(mask_len) = usize::from(slot.width).checked_mul(usize::from(slot.height))
+                else {
+                    return Err(RenderError::InvalidInput {
+                        reason: "atlas slot dimensions overflow the address space bound",
+                    });
+                };
+                let mut mask = Vec::with_capacity(mask_len);
                 for row in 0..usize::from(slot.height) {
-                    let start = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
-                    mask.extend_from_slice(&texels[start..start + usize::from(slot.width)]);
+                    let Some(start) = (usize::from(slot.y) + row)
+                        .checked_mul(stride)
+                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                    else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "atlas slot offset overflows the address space bound",
+                        });
+                    };
+                    let Some(end) = start.checked_add(usize::from(slot.width)) else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "atlas slot range overflows the address space bound",
+                        });
+                    };
+                    let Some(row_data) = texels.get(start..end) else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "atlas slot exceeds atlas texels",
+                        });
+                    };
+                    mask.extend_from_slice(row_data);
                 }
                 surface.blend_coverage_mask_clipped(
                     &mask,
@@ -528,7 +579,12 @@ pub fn draw_list_onto(
                 width,
                 height,
             } => {
-                if mask.len() != *width as usize * *height as usize {
+                let Some(mask_len) = (*width as usize).checked_mul(*height as usize) else {
+                    return Err(RenderError::InvalidInput {
+                        reason: "inline mask dimensions overflow the address space bound",
+                    });
+                };
+                if mask.len() != mask_len {
                     return Err(RenderError::InvalidInput {
                         reason: "inline mask length does not match its dimensions",
                     });
@@ -622,6 +678,29 @@ mod tests {
         let glyph = rgb_bitmap(2, 1, 255); // Full white coverage everywhere.
         surface.blend_glyph(&glyph, 0, 0).unwrap();
         assert_eq!(&surface.as_bytes()[..8], &[255; 8]);
+    }
+
+    #[test]
+    fn r8_glyph_matches_rgb_grayscale_compositing() {
+        let mut r8_surface = SurfaceRgba::try_new(2, 1).unwrap();
+        let mut rgb_surface = SurfaceRgba::try_new(2, 1).unwrap();
+        r8_surface.clear([0, 0, 0, 0]);
+        rgb_surface.clear([0, 0, 0, 0]);
+        let r8 = GlyphBitmap::try_new(
+            metrics(2, 1),
+            BitmapFormat::Rgb,
+            vec![40, 40, 40, 200, 200, 200],
+        )
+        .unwrap();
+        let rgb = GlyphBitmap::try_new(
+            metrics(2, 1),
+            BitmapFormat::Rgb,
+            vec![40, 40, 40, 200, 200, 200],
+        )
+        .unwrap();
+        r8_surface.blend_glyph(&r8, 0, 0).unwrap();
+        rgb_surface.blend_glyph(&rgb, 0, 0).unwrap();
+        assert_eq!(r8_surface.as_bytes(), rgb_surface.as_bytes());
     }
 
     #[test]
@@ -722,6 +801,26 @@ mod tests {
             metrics: metrics(2, 2),
             format: BitmapFormat::Rgb,
             data: vec![0; 3], // Wrong length for 2x2 RGB.
+        };
+        assert!(matches!(
+            surface.blend_glyph(&bad, 0, 0),
+            Err(RenderError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn overflowing_bitmap_dimensions_are_rejected_without_panicking() {
+        let mut surface = SurfaceRgba::try_new(1, 1).unwrap();
+        let bad = GlyphBitmap {
+            metrics: GlyphMetrics {
+                left: 0,
+                top: i32::MAX,
+                width: i32::MAX,
+                height: i32::MAX,
+                advance: [0, 0],
+            },
+            format: BitmapFormat::Rgba,
+            data: Vec::new(),
         };
         assert!(matches!(
             surface.blend_glyph(&bad, 0, 0),

@@ -89,14 +89,15 @@ use bitty_term_state::{
     Color, Damage, DamageRect, DamagedRegion, Rgb, Snapshot, Style, char_cell_width,
 };
 
-use crate::atlas::{AtlasDims, AtlasLayout, AtlasSlot, DEFAULT_ATLAS_DIMENSION};
-use crate::cache::{CachedGlyph, GlyphCache};
+use crate::atlas::{AtlasDims, AtlasLayout, AtlasSlot, CoveragePolicy, DEFAULT_ATLAS_DIMENSION};
+use crate::cache::{CachedGlyphRef, GlyphCache};
 use crate::error::RenderError;
 use crate::fallback::FallbackRasterizer;
 use crate::frame::{DamageDescriptor, FramePlan, plan_frame};
 use crate::geometry::{ExtentPx, RectPx};
 use crate::glyph::{
-    BitmapFormat, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer, RasterKey,
+    BitmapFormat, CachedBitmap, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
+    RasterKey,
 };
 use crate::shaped::{
     RunAttrs, ShapedCluster, SwashSingle, cells_for_range, features_for_policy, form_runs_for_row,
@@ -1873,7 +1874,11 @@ impl GlyphAtlas {
         // Start with a small atlas, grow on demand up to the requested max.
         let initial_dim = crate::atlas::INITIAL_ATLAS_DIMENSION.min(width.min(height));
         let layout = AtlasLayout::new(initial_dim, initial_dim)?;
-        let len = usize::from(initial_dim) * usize::from(initial_dim);
+        let len = usize::from(initial_dim)
+            .checked_mul(usize::from(initial_dim))
+            .ok_or(RenderError::InvalidInput {
+                reason: "atlas dimensions overflow the address space bound",
+            })?;
         Ok(Self {
             layout,
             slots: HashMap::new(),
@@ -2058,7 +2063,9 @@ impl GlyphAtlas {
         let next = u16::try_from(next).expect("capped by max_dimension which is u16");
 
         // Reallocate texture buffer.
-        let new_len = usize::from(next) * usize::from(next);
+        let Some(new_len) = usize::from(next).checked_mul(usize::from(next)) else {
+            return false;
+        };
         let mut new_texels = vec![0; new_len];
 
         // Copy existing slot data to the new buffer (coordinates stay valid
@@ -2068,10 +2075,31 @@ impl GlyphAtlas {
         for slot in self.slots.values().chain(self.shaped_slots.values()) {
             let slot_w = usize::from(slot.width);
             for row in 0..usize::from(slot.height) {
-                let old_offset = (usize::from(slot.y) + row) * old_stride + usize::from(slot.x);
-                let new_offset = (usize::from(slot.y) + row) * new_stride + usize::from(slot.x);
-                new_texels[new_offset..new_offset + slot_w]
-                    .copy_from_slice(&self.texels[old_offset..old_offset + slot_w]);
+                let Some(old_offset) = (usize::from(slot.y) + row)
+                    .checked_mul(old_stride)
+                    .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                else {
+                    return false;
+                };
+                let Some(new_offset) = (usize::from(slot.y) + row)
+                    .checked_mul(new_stride)
+                    .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                else {
+                    return false;
+                };
+                let (Some(old_end), Some(new_end)) = (
+                    old_offset.checked_add(slot_w),
+                    new_offset.checked_add(slot_w),
+                ) else {
+                    return false;
+                };
+                let (Some(old_row), Some(new_row)) = (
+                    self.texels.get(old_offset..old_end),
+                    new_texels.get_mut(new_offset..new_end),
+                ) else {
+                    return false;
+                };
+                new_row.copy_from_slice(old_row);
             }
         }
 
@@ -2089,10 +2117,24 @@ impl GlyphAtlas {
         for slot in self.slots.values().chain(self.shaped_slots.values()) {
             let slot_w = usize::from(slot.width);
             let slot_h = usize::from(slot.height);
-            let mut data = Vec::with_capacity(slot_w * slot_h);
+            let Some(slot_len) = slot_w.checked_mul(slot_h) else {
+                return false;
+            };
+            let mut data = Vec::with_capacity(slot_len);
             for row in 0..slot_h {
-                let offset = (usize::from(slot.y) + row) * new_stride + usize::from(slot.x);
-                data.extend_from_slice(&self.texels[offset..offset + slot_w]);
+                let Some(offset) = (usize::from(slot.y) + row)
+                    .checked_mul(new_stride)
+                    .and_then(|value| value.checked_add(usize::from(slot.x)))
+                else {
+                    return false;
+                };
+                let Some(end) = offset.checked_add(slot_w) else {
+                    return false;
+                };
+                let Some(row_data) = self.texels.get(offset..end) else {
+                    return false;
+                };
+                data.extend_from_slice(row_data);
             }
             self.pending.push(AtlasUpload { slot: *slot, data });
         }
@@ -2137,6 +2179,10 @@ impl GlyphAtlas {
         }
         self.misses += 1;
 
+        if bitmap.validate_source_len().is_err() {
+            return self.fallback_inline(bitmap);
+        }
+
         let width = u16::try_from(bitmap.metrics.width.max(0));
         let height = u16::try_from(bitmap.metrics.height.max(0));
         let (width, height) = match (width, height) {
@@ -2155,6 +2201,51 @@ impl GlyphAtlas {
         };
 
         let coverage = coverage_mask(bitmap);
+        write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
+        self.pending.push(AtlasUpload {
+            slot,
+            data: coverage,
+        });
+        self.slots.insert(key, slot);
+        GlyphSource::Atlas { slot }
+    }
+
+    /// Ensures a cache-owned bitmap without materializing its packed coverage
+    /// as a public RGB bitmap.
+    pub(crate) fn ensure_cached(&mut self, key: RasterKey, bitmap: &CachedBitmap) -> GlyphSource {
+        if let Some(slot) = self.slots.get(&key) {
+            self.hits += 1;
+            return GlyphSource::Atlas { slot: *slot };
+        }
+        let metrics = bitmap.metrics();
+        let mask = bitmap.coverage_mask();
+        self.ensure_mask(key, metrics, mask)
+    }
+
+    fn ensure_mask(
+        &mut self,
+        key: RasterKey,
+        metrics: GlyphMetrics,
+        coverage: Vec<u8>,
+    ) -> GlyphSource {
+        if let Some(slot) = self.slots.get(&key) {
+            self.hits += 1;
+            return GlyphSource::Atlas { slot: *slot };
+        }
+        self.misses += 1;
+        let width = u16::try_from(metrics.width.max(0));
+        let height = u16::try_from(metrics.height.max(0));
+        let (width, height) = match (width, height) {
+            (Ok(w), Ok(h)) => (w, h),
+            _ => return self.fallback_inline_mask(metrics, coverage),
+        };
+        if self.oversized(width, height) {
+            return self.fallback_inline_mask(metrics, coverage);
+        }
+        let Some(slot) = self.place_or_grow(width, height) else {
+            self.exhausted = true;
+            return self.fallback_inline_mask(metrics, coverage);
+        };
         write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
         self.pending.push(AtlasUpload {
             slot,
@@ -2184,6 +2275,10 @@ impl GlyphAtlas {
         }
         self.misses += 1;
 
+        if bitmap.validate_source_len().is_err() {
+            return self.fallback_inline(bitmap);
+        }
+
         let width = u16::try_from(bitmap.metrics.width.max(0));
         let height = u16::try_from(bitmap.metrics.height.max(0));
         let (width, height) = match (width, height) {
@@ -2209,12 +2304,56 @@ impl GlyphAtlas {
         GlyphSource::Atlas { slot }
     }
 
+    /// Ensures a cache-owned shaped bitmap without materializing public RGB.
+    pub(crate) fn ensure_shaped_cached(
+        &mut self,
+        key: crate::shaped::ShapedGlyphKey,
+        bitmap: &CachedBitmap,
+    ) -> GlyphSource {
+        if let Some(slot) = self.shaped_slots.get(&key) {
+            self.hits += 1;
+            return GlyphSource::Atlas { slot: *slot };
+        }
+        let metrics = bitmap.metrics();
+        let coverage = bitmap.coverage_mask();
+        self.misses += 1;
+        let width = u16::try_from(metrics.width.max(0));
+        let height = u16::try_from(metrics.height.max(0));
+        let (width, height) = match (width, height) {
+            (Ok(w), Ok(h)) => (w, h),
+            _ => return self.fallback_inline_mask(metrics, coverage),
+        };
+        if self.oversized(width, height) {
+            return self.fallback_inline_mask(metrics, coverage);
+        }
+        let Some(slot) = self.place_or_grow(width, height) else {
+            self.exhausted = true;
+            return self.fallback_inline_mask(metrics, coverage);
+        };
+        write_slot_texels(&mut self.texels, self.layout.dimensions(), slot, &coverage);
+        self.pending.push(AtlasUpload {
+            slot,
+            data: coverage,
+        });
+        self.shaped_slots.insert(key, slot);
+        GlyphSource::Atlas { slot }
+    }
+
     fn fallback_inline(&mut self, bitmap: &GlyphBitmap) -> GlyphSource {
         self.inline_fallbacks += 1;
         GlyphSource::Inline {
             width: saturating_u32(u64::try_from(bitmap.metrics.width.max(0)).unwrap_or(u64::MAX)),
             height: saturating_u32(u64::try_from(bitmap.metrics.height.max(0)).unwrap_or(u64::MAX)),
             mask: coverage_mask(bitmap),
+        }
+    }
+
+    fn fallback_inline_mask(&mut self, metrics: GlyphMetrics, mask: Vec<u8>) -> GlyphSource {
+        self.inline_fallbacks += 1;
+        GlyphSource::Inline {
+            width: saturating_u32(u64::try_from(metrics.width.max(0)).unwrap_or(u64::MAX)),
+            height: saturating_u32(u64::try_from(metrics.height.max(0)).unwrap_or(u64::MAX)),
+            mask,
         }
     }
 }
@@ -2232,8 +2371,19 @@ impl GlyphAtlas {
 /// preserve the triplets here instead; until then every serving path
 /// flattens to `R8`.
 fn coverage_mask(bitmap: &GlyphBitmap) -> Vec<u8> {
+    if bitmap.validate_source_len().is_err() {
+        return Vec::new();
+    }
     let GlyphMetrics { width, height, .. } = bitmap.metrics;
-    let mut mask = Vec::with_capacity(width.max(0) as usize * height.max(0) as usize);
+    let pixels = usize::try_from(width.max(0)).ok().and_then(|width| {
+        usize::try_from(height.max(0))
+            .ok()
+            .and_then(|height| width.checked_mul(height))
+    });
+    let Some(pixels) = pixels else {
+        return Vec::new();
+    };
+    let mut mask = Vec::with_capacity(pixels);
     match bitmap.format {
         BitmapFormat::Rgb => {
             for px in bitmap.data.chunks_exact(3) {
@@ -2254,10 +2404,32 @@ fn coverage_mask(bitmap: &GlyphBitmap) -> Vec<u8> {
 fn write_slot_texels(texels: &mut [u8], dims: AtlasDims, slot: AtlasSlot, mask: &[u8]) {
     let stride = usize::from(dims.width);
     let slot_w = usize::from(slot.width);
+    let Some(mask_len) = slot_w.checked_mul(usize::from(slot.height)) else {
+        return;
+    };
+    if mask.len() < mask_len {
+        return;
+    }
     for row in 0..usize::from(slot.height) {
-        let src = row * slot_w;
-        let dst = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
-        texels[dst..dst + slot_w].copy_from_slice(&mask[src..src + slot_w]);
+        let Some(src) = row.checked_mul(slot_w) else {
+            return;
+        };
+        let Some(dst) = (usize::from(slot.y) + row)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+        else {
+            return;
+        };
+        let (Some(src_end), Some(dst_end)) = (src.checked_add(slot_w), dst.checked_add(slot_w))
+        else {
+            return;
+        };
+        let (Some(source), Some(destination)) =
+            (mask.get(src..src_end), texels.get_mut(dst..dst_end))
+        else {
+            return;
+        };
+        destination.copy_from_slice(source);
     }
 }
 
@@ -2330,7 +2502,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         dimension: u16,
     ) -> Result<Self, RenderError> {
         query.validate()?;
-        let mut cache = GlyphCache::new(rasterizer, crate::cache::DEFAULT_GLYPH_CACHE_CAPACITY)?;
+        let mut cache = GlyphCache::with_coverage_policy(
+            rasterizer,
+            crate::cache::DEFAULT_GLYPH_CACHE_CAPACITY,
+            CoveragePolicy::Grayscale,
+        )?;
         let font = cache.load_font(query)?;
         // Face measurement is best-effort: backends without metrics (or a
         // failed measurement) resolve to the legacy fallback, never an error.
@@ -2797,9 +2973,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters.blank_cells_skipped += 1;
             return;
         };
-        let bitmap = match self.cache.glyph(key) {
-            Ok(CachedGlyph::Bitmap(bitmap)) => bitmap,
-            Ok(CachedGlyph::Blank) => {
+        let bitmap = match self.cache.cached_glyph(key) {
+            Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
+            Ok(CachedGlyphRef::Blank) => {
                 // The rasterizer contract answers `Ok(None)` exactly when no
                 // loaded face covers the scalar; paint the visible RFC tofu
                 // box and count it so missing glyphs never read as blank.
@@ -2815,8 +2991,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             }
         };
 
-        let metrics = bitmap.metrics;
-        let source = self.atlas.ensure(key, bitmap);
+        let metrics = bitmap.metrics();
+        let source = self.atlas.ensure_cached(key, bitmap);
         let dest_x = col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
         let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
         let dest_y = baseline - i64::from(metrics.top);
@@ -3027,9 +3203,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             };
-            let bitmap = match self.cache.glyph(key) {
-                Ok(CachedGlyph::Bitmap(bitmap)) => bitmap,
-                Ok(CachedGlyph::Blank) => {
+            let bitmap = match self.cache.cached_glyph(key) {
+                Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
+                Ok(CachedGlyphRef::Blank) => {
                     self.counters.blank_cells_skipped += 1;
                     continue;
                 }
@@ -3038,8 +3214,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     continue;
                 }
             };
-            let metrics = bitmap.metrics;
-            let source = self.atlas.ensure(key, bitmap);
+            let metrics = bitmap.metrics();
+            let source = self.atlas.ensure_cached(key, bitmap);
             let dest_x =
                 origin_x + col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
             let dest_y = baseline - i64::from(metrics.top);
@@ -3541,12 +3717,12 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         color: Rgba8,
         list: &mut DrawList,
     ) -> Result<(), RenderError> {
-        let bitmap = match self.cache.rasterizer_mut().inner_mut().rasterize_shaped(
-            cluster.face,
-            cluster.glyph_id,
-            self.point_size,
-            features,
-        ) {
+        let bitmap = match self
+            .cache
+            .rasterizer_mut()
+            .inner_mut()
+            .rasterize_shaped_cached_ref(cluster.face, cluster.glyph_id, self.point_size, features)
+        {
             // Rasterizer failure degrades this cluster to tofu — never a
             // frame error (design 2.3 validation order).
             Ok(Some(bitmap)) => bitmap,
@@ -3555,14 +3731,14 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                 return Ok(());
             }
         };
-        let metrics = bitmap.metrics;
+        let metrics = bitmap.metrics();
         let shaped_key = crate::shaped::ShapedGlyphKey::new(
             cluster.face,
             cluster.glyph_id,
             self.point_size,
             features,
         );
-        let source = self.atlas.ensure_shaped(shaped_key, &bitmap);
+        let source = self.atlas.ensure_shaped_cached(shaped_key, bitmap);
         // Grid origin plus bearing plus the shaper's GPOS horizontal
         // offset (Phase C): combining marks shaped as separate glyphs
         // carry their mark shift in `x_offset_px`, previously dropped.

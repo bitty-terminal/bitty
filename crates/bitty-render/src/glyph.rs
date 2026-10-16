@@ -12,6 +12,9 @@
 
 use std::fmt;
 
+/// Maximum pixel bytes retained by one renderer bitmap cache entry set.
+pub const MAX_CACHED_BITMAP_BYTES: usize = 8 * 1024 * 1024;
+
 use crate::error::RenderError;
 
 /// Opaque handle to a font face loaded inside one rasterizer session.
@@ -213,8 +216,9 @@ impl GlyphBitmap {
     ///
     /// [`RenderError::InvalidInput`] when either dimension is negative, when
     /// the pixel count overflows `usize`, or when `data.len()` does not equal
-    /// `width * height * channels`. This is the bounded-memory gate for all
-    /// bitmap data entering the crate.
+    /// `width * height * channels`. This is the input-integrity gate for all
+    /// bitmap data entering the crate. Renderer caches apply their own
+    /// retained-byte quota before insertion.
     pub fn try_new(
         metrics: GlyphMetrics,
         format: BitmapFormat,
@@ -232,27 +236,19 @@ impl GlyphBitmap {
                 reason: "glyph dimensions must be non-negative",
             });
         }
-        let expected = usize::try_from(width)
-            .ok()
-            .and_then(|w| w.checked_mul(usize::try_from(height).ok()?));
-        let expected = match expected {
-            Some(e) => e.checked_mul(format.channels()),
-            None => None,
-        };
+        let expected = expected_data_len(metrics, format);
         match expected {
-            Some(len) if len == data.len() => Ok(Self {
+            Ok(len) if len == data.len() => Ok(Self {
                 metrics,
                 format,
                 data,
             }),
             // The mismatch is reported without echoing sizes back: reasons
             // stay 'static so hostile inputs cannot grow error allocations.
-            Some(_) => Err(RenderError::InvalidInput {
+            Ok(_) => Err(RenderError::InvalidInput {
                 reason: "glyph bitmap length does not match its dimensions",
             }),
-            None => Err(RenderError::InvalidInput {
-                reason: "glyph pixel count overflows the address space bound",
-            }),
+            Err(error) => Err(error),
         }
     }
 
@@ -261,6 +257,119 @@ impl GlyphBitmap {
     pub fn is_blank(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Checks the source invariant before converting any channel layout.
+    pub(crate) fn validate_source_len(&self) -> Result<(), RenderError> {
+        let expected = expected_data_len(self.metrics, self.format)?;
+        if self.data.len() != expected {
+            return Err(RenderError::InvalidInput {
+                reason: "glyph bitmap length does not match its dimensions",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Bitmap retained by a renderer cache.
+///
+/// The validated source bitmap is retained exactly once. Renderer paths derive
+/// coverage from it on demand, while public glyph lookup borrows the same
+/// [`GlyphBitmap`] without creating a second retained allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedBitmap {
+    bitmap: GlyphBitmap,
+}
+
+impl CachedBitmap {
+    /// Validates and normalizes a bitmap for grayscale rendering in place.
+    ///
+    /// The source allocation is reused for the public RGB-compatible value, so
+    /// grayscale lookup does not retain a private coverage buffer alongside a
+    /// second public bitmap. RGBA buffers are shortened without reallocating;
+    /// their capacity remains part of the accounted retained allocation.
+    pub(crate) fn grayscale(mut bitmap: GlyphBitmap) -> Result<Self, RenderError> {
+        bitmap.validate_source_len()?;
+        match bitmap.format {
+            BitmapFormat::Rgb => {
+                for pixel in bitmap.data.chunks_exact_mut(3) {
+                    let coverage =
+                        ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3)
+                            as u8;
+                    pixel.fill(coverage);
+                }
+            }
+            BitmapFormat::Rgba => {
+                let pixel_count = bitmap.data.len() / BitmapFormat::Rgba.channels();
+                for pixel in bitmap.data.chunks_exact_mut(4) {
+                    let alpha = pixel[3];
+                    pixel[..3].fill(alpha);
+                }
+                bitmap
+                    .data
+                    .truncate(pixel_count * BitmapFormat::Rgb.channels());
+                bitmap.format = BitmapFormat::Rgb;
+            }
+        }
+        Ok(Self { bitmap })
+    }
+
+    /// Validates and retains a bitmap without changing its channel layout.
+    pub(crate) fn source(bitmap: GlyphBitmap) -> Result<Self, RenderError> {
+        bitmap.validate_source_len()?;
+        Ok(Self { bitmap })
+    }
+
+    /// Placement metrics for the retained bitmap.
+    #[must_use]
+    pub(crate) const fn metrics(&self) -> GlyphMetrics {
+        self.bitmap.metrics
+    }
+
+    /// Number of retained pixel bytes, excluding map and key overhead.
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bitmap.data.capacity()
+    }
+
+    /// Produces one-byte coverage for atlas or inline rendering.
+    #[must_use]
+    pub(crate) fn coverage_mask(&self) -> Vec<u8> {
+        match self.bitmap.format {
+            BitmapFormat::Rgb => self
+                .bitmap
+                .data
+                .chunks_exact(3)
+                .map(|px| ((u16::from(px[0]) + u16::from(px[1]) + u16::from(px[2])) / 3) as u8)
+                .collect(),
+            BitmapFormat::Rgba => self.bitmap.data.chunks_exact(4).map(|px| px[3]).collect(),
+        }
+    }
+
+    /// Borrows the retained value through the public bitmap contract.
+    pub(crate) const fn as_glyph_bitmap(&self) -> &GlyphBitmap {
+        &self.bitmap
+    }
+
+    /// Clones the retained value for APIs that return an owned bitmap.
+    pub(crate) fn to_glyph_bitmap(&self) -> Result<GlyphBitmap, RenderError> {
+        Ok(self.bitmap.clone())
+    }
+}
+
+/// Returns the exact source byte count for a bitmap format.
+fn expected_data_len(metrics: GlyphMetrics, format: BitmapFormat) -> Result<usize, RenderError> {
+    let width = usize::try_from(metrics.width).map_err(|_| RenderError::InvalidInput {
+        reason: "glyph dimensions must be non-negative",
+    })?;
+    let height = usize::try_from(metrics.height).map_err(|_| RenderError::InvalidInput {
+        reason: "glyph dimensions must be non-negative",
+    })?;
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(format.channels()))
+        .ok_or(RenderError::InvalidInput {
+            reason: "glyph pixel count overflows the address space bound",
+        })
 }
 
 impl fmt::Display for GlyphBitmap {

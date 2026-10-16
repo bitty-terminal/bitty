@@ -297,7 +297,13 @@ pub fn apply_control(
         // and a leaf may still have no shell (spawn failure), so report live
         // pane-session presence per entry instead of implying one shell per
         // tile.
-        let ids = runtime.layout().leaf_ids();
+        // Keep both arrays aligned and bound the complete terminal diagnostics
+        // envelope even if a test or embedder supplies a larger raw layout.
+        // `total_lower_bound` and `truncated` make the bounded prefix explicit
+        // to callers without presenting a lower-bound sentinel as an exact
+        // total.
+        let (ids, truncated) =
+            bitty_runtime::bounded_layout_leaf_ids(runtime.layout(), bitty_runtime::MAX_TERMINALS);
         let mut out = String::from("{\"terminals\":[");
         for (idx, id) in ids.iter().enumerate() {
             if idx > 0 {
@@ -309,7 +315,30 @@ pub fn apply_control(
                 runtime.has_pane_session(id)
             ));
         }
-        out.push_str("]}");
+        out.push_str("],\"diagnostics\":[");
+        for (idx, id) in ids.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            let diagnostics = runtime.terminal_diagnostics(*id);
+            let child_pid = diagnostics
+                .child_pid
+                .map_or_else(|| String::from("null"), |pid| pid.to_string());
+            out.push_str(&format!(
+                "{{\"terminal_id\":\"t:{}\",\"view_id\":\"v:{}\",\"has_session\":{},\"scrollback_lines\":{},\"retained_heap_bytes\":{},\"child_pid\":{},\"child_state\":\"{}\"}}",
+                diagnostics.terminal_id,
+                diagnostics.view_id,
+                diagnostics.has_session,
+                diagnostics.scrollback_lines,
+                diagnostics.retained_heap_bytes,
+                child_pid,
+                diagnostics.child_state,
+            ));
+        }
+        out.push_str(&format!(
+            "],\"total_lower_bound\":{},\"truncated\":{truncated}}}",
+            ids.len()
+        ));
         return Ok(out);
     }
     if method == ipc_ctl::METHOD_SEND_INPUT {
@@ -536,8 +565,9 @@ pub fn apply_control(
         let active_id = runtime
             .workspace_seq_at(runtime.active_workspace_index())
             .map_or_else(String::new, |seq| format!("ws:{seq}"));
+        let memory = runtime.workspace_memory_report().to_json();
         return Ok(format!(
-            "{{\"workspaces\":{},\"names\":{},\"active\":{},\"active_id\":\"{}\",\"count\":{}}}",
+            "{{\"workspaces\":{},\"names\":{},\"active\":{},\"active_id\":\"{}\",\"count\":{},\"memory\":{memory}}}",
             json_string_array(&ids),
             json_string_array(&runtime.workspace_names()),
             runtime.active_workspace_index() + 1,

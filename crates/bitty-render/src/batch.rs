@@ -625,7 +625,11 @@ pub fn pack_inline_glyphs(glyphs: &[GlyphInstance]) -> InlinePlan {
             skipped += 1;
             continue;
         }
-        if mask.len() != w as usize * h as usize {
+        let Some(mask_len) = (w as usize).checked_mul(h as usize) else {
+            skipped += 1;
+            continue;
+        };
+        if mask.len() != mask_len {
             skipped += 1;
             continue;
         }
@@ -662,10 +666,39 @@ pub fn pack_inline_glyphs(glyphs: &[GlyphInstance]) -> InlinePlan {
         }
         let slot_x = cursor_x;
         let slot_y = shelf_top;
+        let mut packed = true;
         for row in 0..h {
-            let src = row as usize * w as usize;
-            let dst = (slot_y + row) as usize * side as usize + slot_x as usize;
-            texels[dst..dst + w as usize].copy_from_slice(&mask[src..src + w as usize]);
+            let Some(src) = (row as usize).checked_mul(w as usize) else {
+                packed = false;
+                break;
+            };
+            let Some(dst) = (slot_y + row)
+                .checked_mul(side)
+                .and_then(|offset| offset.checked_add(slot_x))
+                .and_then(|offset| usize::try_from(offset).ok())
+            else {
+                packed = false;
+                break;
+            };
+            let Some(src_end) = src.checked_add(w as usize) else {
+                packed = false;
+                break;
+            };
+            let Some(dst_end) = dst.checked_add(w as usize) else {
+                packed = false;
+                break;
+            };
+            let (Some(dst_slice), Some(src_slice)) =
+                (texels.get_mut(dst..dst_end), mask.get(src..src_end))
+            else {
+                packed = false;
+                break;
+            };
+            dst_slice.copy_from_slice(src_slice);
+        }
+        if !packed {
+            skipped += 1;
+            continue;
         }
         cursor_x += w;
         shelf_h = shelf_h.max(h);
@@ -778,7 +811,10 @@ pub fn compute_atlas_dirty(
     if prev_dims != next_dims {
         return AtlasDirty::Full;
     }
-    if prev_texels.len() != stride * height || next_texels.len() != stride * height {
+    let Some(expected) = stride.checked_mul(height) else {
+        return AtlasDirty::Full;
+    };
+    if prev_texels.len() != expected || next_texels.len() != expected {
         return AtlasDirty::Full;
     }
     if stride == 0 || height == 0 {
@@ -787,8 +823,18 @@ pub fn compute_atlas_dirty(
     let mut first: Option<usize> = None;
     let mut last: usize = 0;
     for row in 0..height {
-        let start = row * stride;
-        if prev_texels[start..start + stride] != next_texels[start..start + stride] {
+        let Some(start) = row.checked_mul(stride) else {
+            return AtlasDirty::Full;
+        };
+        let Some(end) = start.checked_add(stride) else {
+            return AtlasDirty::Full;
+        };
+        let (Some(prev_row), Some(next_row)) =
+            (prev_texels.get(start..end), next_texels.get(start..end))
+        else {
+            return AtlasDirty::Full;
+        };
+        if prev_row != next_row {
             if first.is_none() {
                 first = Some(row);
             }
@@ -818,13 +864,19 @@ pub fn padded_bytes_per_row(width: u32) -> u32 {
 pub fn build_padded_full(texels: &[u8], dims: AtlasDims) -> Option<Vec<u8>> {
     let w = dims.width as usize;
     let h = dims.height as usize;
-    if texels.len() != w * h {
+    let expected = w.checked_mul(h)?;
+    if texels.len() != expected {
         return None;
     }
     let padded = padded_bytes_per_row(u32::from(dims.width)) as usize;
-    let mut out = vec![0u8; padded * h];
+    let out_len = padded.checked_mul(h)?;
+    let mut out = vec![0u8; out_len];
     for row in 0..h {
-        out[row * padded..row * padded + w].copy_from_slice(&texels[row * w..row * w + w]);
+        let src = row.checked_mul(w)?;
+        let dst = row.checked_mul(padded)?;
+        let (src_end, dst_end) = (src.checked_add(w)?, dst.checked_add(w)?);
+        out.get_mut(dst..dst_end)?
+            .copy_from_slice(texels.get(src..src_end)?);
     }
     Some(out)
 }
@@ -841,14 +893,19 @@ pub fn build_padded_strip(texels: &[u8], dims: AtlasDims, y: u32, height: u32) -
     if w == 0 || h == 0 || strip == 0 || y0.saturating_add(strip) > h {
         return None;
     }
-    if texels.len() != w * h {
+    let expected = w.checked_mul(h)?;
+    if texels.len() != expected {
         return None;
     }
     let padded = padded_bytes_per_row(u32::from(dims.width)) as usize;
-    let mut out = vec![0u8; padded * strip];
+    let out_len = padded.checked_mul(strip)?;
+    let mut out = vec![0u8; out_len];
     for row in 0..strip {
-        let src = (y0 + row) * w;
-        out[row * padded..row * padded + w].copy_from_slice(&texels[src..src + w]);
+        let src = y0.checked_add(row)?.checked_mul(w)?;
+        let dst = row.checked_mul(padded)?;
+        let (src_end, dst_end) = (src.checked_add(w)?, dst.checked_add(w)?);
+        out.get_mut(dst..dst_end)?
+            .copy_from_slice(texels.get(src..src_end)?);
     }
     Some(out)
 }

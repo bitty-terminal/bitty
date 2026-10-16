@@ -8689,6 +8689,160 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
 }
 
 #[test]
+#[cfg(unix)]
+fn reap_exited_shell_in_inactive_workspace_leaves_no_ghost_issue_2167() {
+    // Issue #2167: a tiled pane whose child exits while its workspace is in
+    // the background must be released from its stash, never stranded as a
+    // session-less erased tile (empty bordered panel + cursor, unusable).
+    // Before the fix the reap path ran layout surgery against the *active*
+    // tree (refused: the view lives elsewhere) and still tore the session
+    // down, so switching back showed the ghost.
+    require_pty!();
+    let mut app = editor_test_app();
+    let exited_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    // Immediately-exiting child in pane 2; no reap runs before the switch,
+    // so the exit status is still pending while the workspace goes inactive.
+    let script = write_fake_editor("exit-bg-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exited_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.has_pane_session(&exited_view));
+
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "background pane exit must close the pane, never the app"
+    );
+
+    // Switching back must show the survivor only: no session-less ghost.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(
+        !app.runtime.has_pane_session(&exited_view),
+        "exited background pane must be fully torn down"
+    );
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
+    // Issue #2167: a scratchpad-parked panel whose child exits must leave
+    // the slot empty, never a dead parked leaf that restores as a ghost.
+    require_pty!();
+    let mut app = editor_test_app();
+    let parked_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    let script = write_fake_editor("exit-parked-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(parked_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    app.runtime
+        .scratchpad_hide(parked_view)
+        .expect("parked panel hides");
+    assert!(app.runtime.scratchpad_occupied());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "parked pane exit must close the pane, never the app"
+    );
+    assert!(
+        !app.runtime.scratchpad_occupied(),
+        "no dead parked leaf may linger"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&parked_view),
+        "exited parked pane must be fully torn down"
+    );
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
+    // Issue #2167 (CodeRabbit on PR #2170): while zoomed the live layout
+    // is a single-leaf proxy and the exited leaf hides in the zoom backup.
+    // Surgery must run against the real tree (restore_zoom first), or the
+    // dead leaf survives in the backup and ghosts on unzoom.
+    require_pty!();
+    let mut app = editor_test_app();
+    let exiting = ViewId::new(2);
+
+    let script = write_fake_editor("exit-zoomed-bg", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.set_focus(ViewId::new(1)));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert_eq!(
+        app.runtime.leaf_count(),
+        1,
+        "zoom collapses the live layout to a proxy"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "zoomed backup exit must close the pane, never the app"
+    );
+    // The dead leaf must be gone from the real tree (session torn down),
+    // never parked in the zoom backup to ghost on unzoom.
+    assert!(
+        !app.runtime.has_pane_session(&exiting),
+        "exited backup leaf must be fully torn down"
+    );
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(
+        !app.runtime.layout().leaf_ids().contains(&exiting),
+        "unzoom must not resurrect the dead leaf"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key
     // table, the Leader binding, and the hint switch, cancels a Leader

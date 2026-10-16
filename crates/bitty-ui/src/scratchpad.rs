@@ -221,6 +221,17 @@ impl ScratchpadSlot {
         self.hide(tree, id).map(|()| None)
     }
 
+    /// Discards parked leaf `id` without restoring it to any tree
+    /// (issue #2167: dead-panel teardown after its child exits while
+    /// parked). Returns the removed [`View`] when present, `None`
+    /// otherwise. Anchor metadata leaves with the entry.
+    pub fn discard(&mut self, id: ViewId) -> Option<View> {
+        if self.hidden.as_ref().is_some_and(|h| h.view.id() == id) {
+            return self.hidden.take().map(|h| h.view);
+        }
+        None
+    }
+
     /// Puts `view` back into `tree` beside `anchor` (or a fallback dock).
     fn restore_view(tree: &mut LayoutNode, view: View, anchor: Option<ViewId>, after: bool) {
         if tree.leaf_count() == 0 {
@@ -308,6 +319,21 @@ mod tests {
         let alloc = tree.layout(Rect::new(0, 0, 80, 24));
         assert_eq!(alloc.len(), 2);
         assert_eq!(alloc[0].1.width as u32 + alloc[1].1.width as u32, 80);
+    }
+
+    #[test]
+    fn discard_removes_parked_leaf_without_restoring_issue_2167() {
+        // Issue #2167: a parked panel whose child exits must leave the
+        // slot empty, never a dead parked leaf that restores as a ghost.
+        let mut tree = pair();
+        let mut slot = ScratchpadSlot::new();
+        slot.hide(&mut tree, ViewId::new(1)).expect("hide leaf 1");
+        let removed = slot.discard(ViewId::new(1)).expect("discard parked");
+        assert_eq!(removed.id(), ViewId::new(1));
+        assert!(slot.is_empty());
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
+        assert!(slot.discard(ViewId::new(1)).is_none());
+        assert!(slot.discard(ViewId::new(404)).is_none());
     }
 
     #[test]

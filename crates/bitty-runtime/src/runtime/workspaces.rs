@@ -894,7 +894,11 @@ impl Runtime {
     }
 
     /// Raw ids of every live leaf: the live layout plus all stashed slots.
-    fn live_view_raws(&self) -> Vec<u64> {
+    ///
+    /// Besides allocation, the present layer reads this to tell a destroyed
+    /// view (fades its ring out) from a merely hidden one (workspace stash,
+    /// scratchpad, pin, detach: no close fade, #2134).
+    pub(super) fn live_view_raws(&self) -> Vec<u64> {
         let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
         for slot in &self.workspaces {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));

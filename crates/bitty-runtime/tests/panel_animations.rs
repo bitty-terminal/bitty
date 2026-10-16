@@ -413,6 +413,31 @@ fn workspaces_switch_arms_workspace_transition() {
 }
 
 #[test]
+fn workspace_switch_fades_no_ring_for_stashed_views() {
+    // #2134: switching workspaces stashes the old panels instead of
+    // closing them, so no close fade may arm for them — retained rings
+    // fading out over the new workspace read as ghosting. The workspace
+    // transition itself still arms.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("first frame");
+    assert!(rt.tick_at(start).is_none());
+    let old = rt.focused_view().expect("single leaf focused");
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(start).expect("workspace switch presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Workspace, None, start)
+            .is_some(),
+        "workspace transition must be active"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Close, Some(old), start)
+            .is_none(),
+        "stashed views must not fade out on switch"
+    );
+}
+
+#[test]
 fn open_transition_fades_the_core_owned_ring_alpha() {
     // RFC-0002: a panel-open transition fades Core-owned chrome in. Pixel
     // proof: the ring alpha at the mid-transition frame sits strictly between

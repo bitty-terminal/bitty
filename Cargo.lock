@@ -388,6 +388,7 @@ dependencies = [
  "bitty-term-state",
  "bitty-test-support",
  "bitty-vt",
+ "nix 0.31.3",
  "pollster",
 ]
 

@@ -4901,6 +4901,7 @@ fn drive_init_wizard_with_color(
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
         color,
+        false,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed)
@@ -5498,6 +5499,357 @@ fn init_option_list_color_previews_theme_and_marker() {
     );
 }
 
+// -- `bitty init` picker key loop: single-keypress navigation (#2136) -----
+//
+// The TTY picker responds to single keypresses without Enter (j/k and
+// arrows move, Enter selects). These tests drive
+// [`crate::init::init_picker_key_loop`] directly with injected bytes plus
+// an EOF-terminated wait closure (no TTY needed): the injected bytes stand
+// in for single keypresses exactly as the raw TTY delivers them.
+
+/// Drives one three-option key-loop picker headlessly; returns the selected
+/// value plus everything the picker printed plus the history it recorded.
+fn drive_picker_key_loop(
+    stdin_bytes: &[u8],
+    numbered: bool,
+) -> (Result<String, String>, String, Vec<String>) {
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "gamma".to_string(),
+            value_text: "gamma".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(stdin_bytes);
+    let mut output = Vec::new();
+    let mut history = Vec::new();
+    // EOF-terminated: no more bytes means the escape (if any) is bare.
+    // Production passes a poll-based closure over the real stdin instead.
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        numbered,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        false,
+        &mut wait,
+    );
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    (result, printed, history)
+}
+
+#[test]
+fn init_escape_burst_complete_cases() {
+    use crate::init::init_escape_burst_complete;
+    // Bare ESC needs more bytes (or a timeout) to disambiguate.
+    assert!(!init_escape_burst_complete(b"\x1b"));
+    // CSI introducer without a final byte is truncated.
+    assert!(!init_escape_burst_complete(b"\x1b["));
+    assert!(!init_escape_burst_complete(b"\x1b[1"));
+    assert!(!init_escape_burst_complete(b"\x1b[1;5"));
+    // Arrows, Home/End, and kitty `CSI u` forms are complete.
+    assert!(init_escape_burst_complete(b"\x1b[B"));
+    assert!(init_escape_burst_complete(b"\x1b[A"));
+    assert!(init_escape_burst_complete(b"\x1b[H"));
+    assert!(init_escape_burst_complete(b"\x1b[1;5B"));
+    assert!(init_escape_burst_complete(b"\x1b[13u"));
+    // SS3 needs its third byte.
+    assert!(!init_escape_burst_complete(b"\x1bO"));
+    assert!(init_escape_burst_complete(b"\x1bOB"));
+    // Alt prefixes (`ESC` + printable) are complete single keys.
+    assert!(init_escape_burst_complete(b"\x1bx"));
+    // OSC without a terminator is truncated; BEL-terminated is complete.
+    assert!(!init_escape_burst_complete(b"\x1b]8;;http://x"));
+    assert!(init_escape_burst_complete(b"\x1b]8;;http://x\x07"));
+}
+
+#[test]
+fn init_key_loop_j_moves_then_enter_selects() {
+    // Single `j` (no Enter) moves the cursor; Enter selects beta.
+    let (result, printed, _) = drive_picker_key_loop(b"j\r", true);
+    assert_eq!(result.expect("j plus Enter selects beta"), "beta");
+    assert!(
+        printed.contains("> 2) beta"),
+        "moved marker, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_k_wraps_to_last() {
+    // Single `k` from the default wraps to gamma.
+    let (result, _, _) = drive_picker_key_loop(b"k\r", true);
+    assert_eq!(result.expect("wrapped pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_arrow_down_moves() {
+    // Down-arrow escape plus Enter behaves like `j`.
+    let (result, _, _) = drive_picker_key_loop(b"\x1b[B\r", true);
+    assert_eq!(result.expect("arrow-navigated pick accepted"), "beta");
+}
+
+#[test]
+fn init_key_loop_arrow_up_wraps() {
+    // Up-arrow escape from the default wraps to gamma.
+    let (result, _, _) = drive_picker_key_loop(b"\x1b[A\r", true);
+    assert_eq!(result.expect("wrapped arrow pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_enter_selects_default() {
+    let (result, _, _) = drive_picker_key_loop(b"\r", true);
+    assert_eq!(result.expect("Enter selects the default"), "alpha");
+}
+
+#[test]
+fn init_key_loop_number_fast_path() {
+    // Numbered lists keep the digit fast path: `3` plus Enter picks gamma.
+    let (result, _, _) = drive_picker_key_loop(b"3\r", true);
+    assert_eq!(result.expect("numbered pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_typed_value_submits() {
+    // Unnumbered lists accept typed values exactly like the line loop.
+    let (result, printed, history) = drive_picker_key_loop(b"custom\r", false);
+    assert_eq!(result.expect("typed value accepted"), "custom");
+    assert_eq!(history, vec!["custom".to_string()]);
+    assert!(
+        printed.contains("(typed: custom)"),
+        "typed echo, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_j_inside_buffer_appends() {
+    // `j` navigates only from an empty buffer; mid-value it is text.
+    let (result, _, _) = drive_picker_key_loop(b"aj\r", false);
+    assert_eq!(result.expect("buffered j accepted"), "aj");
+}
+
+#[test]
+fn init_key_loop_uppercase_j_types() {
+    // Uppercase `J` is typed text (the hint advertises lowercase j/k), so
+    // values like `JetBrains` stay enterable without the arrow keys.
+    let (result, _, _) = drive_picker_key_loop(b"JetBrains\r", false);
+    assert_eq!(result.expect("uppercase value accepted"), "JetBrains");
+}
+
+#[test]
+fn init_key_loop_esc_cancels() {
+    let (result, _, _) = drive_picker_key_loop(b"\x1b", true);
+    assert_eq!(
+        result.expect_err("bare Esc must cancel"),
+        "bitty init: aborted (cancelled)"
+    );
+}
+
+#[test]
+fn init_key_loop_ctrl_d_aborts() {
+    let (result, _, _) = drive_picker_key_loop(b"\x04", true);
+    assert_eq!(
+        result.expect_err("Ctrl-D must abort"),
+        "bitty init: aborted (end of input)"
+    );
+}
+
+#[test]
+fn init_key_loop_backspace_edits() {
+    let (result, _, _) = drive_picker_key_loop(b"ab\x7f\r", false);
+    assert_eq!(result.expect("edited value accepted"), "a");
+}
+
+#[test]
+fn init_key_loop_invalid_retries_then_succeeds() {
+    let options = vec![crate::init::InitOptionItem {
+        label: "alpha".to_string(),
+        value_text: "alpha".to_string(),
+        style_fg: None,
+        style_bg: None,
+    }];
+    let mut input = std::io::BufReader::new(b"bad\r\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        false,
+        |line: &str| {
+            if line == "bad" {
+                Err("nope".to_string())
+            } else {
+                Ok(line.to_string())
+            }
+        },
+        &mut history,
+        false,
+        &mut wait,
+    );
+    // A rejected value reprompts (buffer cleared); empty Enter then takes
+    // the cursor default.
+    assert_eq!(result.expect("retry accepted"), "alpha");
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    assert!(
+        printed.contains("nope — try again"),
+        "retry message, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_too_many_invalid_aborts() {
+    let options = vec![crate::init::InitOptionItem {
+        label: "alpha".to_string(),
+        value_text: "alpha".to_string(),
+        style_fg: None,
+        style_bg: None,
+    }];
+    let mut input = std::io::BufReader::new(b"bad\rbad\rbad\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result: Result<String, String> = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        false,
+        |_: &str| Err("nope".to_string()),
+        &mut history,
+        false,
+        &mut wait,
+    );
+    assert!(
+        result
+            .expect_err("three strikes must abort")
+            .contains("too many"),
+        "attempt bound"
+    );
+}
+
+#[test]
+fn init_ask_option_falls_back_to_line_without_raw_tty() {
+    use std::io::IsTerminal as _;
+    // The raw key loop needs a real TTY stdin; under an interactive
+    // `cargo test` the harness stdin may be that TTY, which would steal the
+    // developer's terminal modes. Skip there; CI (piped stdin) runs it.
+    if std::io::stdin().is_terminal() {
+        return;
+    }
+    // `tty_interactive` with no raw-capable stdin keeps the line loop
+    // byte-identical: `j` plus Enter moves, Enter selects.
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(b"j\n\n".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let result: Result<String, String> = crate::init::init_ask_option(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        true,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        true,
+    );
+    assert_eq!(result.expect("line fallback accepted"), "beta");
+}
+
+#[test]
+fn init_key_loop_inplace_repaints_with_cursor_up() {
+    // In-place frames repaint over the previous frame (cursor-up plus
+    // clear-line) and hide the cursor while looping.
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(b"j\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result: Result<String, String> = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        true,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        true,
+        &mut wait,
+    );
+    assert_eq!(result.expect("inplace pick accepted"), "beta");
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    // One frame is prompt plus two entries plus hint plus typed line.
+    assert!(
+        printed.contains("\x1b[5A"),
+        "cursor-up repaint, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("\x1b[?25l") && printed.contains("\x1b[?25h"),
+        "cursor hide/show, got:\n{printed}"
+    );
+}
+
 #[test]
 fn init_color_enabled_impl_matches_convention() {
     // Pure decision table: explicit flag, NO_COLOR, dumb terminal, or piped
@@ -5580,6 +5932,7 @@ fn drive_init_wizard_with_preview(
         false,
         Some(&mut preview),
         None,
+        false,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed, preview)
@@ -6204,6 +6557,7 @@ fn init_preview_echo_tracks_running_theme_with_color() {
         true,
         Some(&mut preview),
         None,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6278,6 +6632,7 @@ fn init_preview_echo_plain_without_color() {
         false,
         Some(&mut preview),
         None,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6311,6 +6666,7 @@ fn init_preview_echo_absent_without_preview() {
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         true,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6351,6 +6707,7 @@ fn init_live_preview_hot_updates_per_step_unix() {
         false,
         Some(&mut preview),
         Some(&mut live),
+        false,
     );
     let answers = result.expect("custom picks accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
@@ -6412,6 +6769,7 @@ fn init_live_preview_esc_restores_baseline_unix() {
         false,
         Some(&mut preview),
         Some(&mut live),
+        false,
     );
     let err = result.expect_err("Esc cancels");
     assert!(err.contains("cancelled"), "unexpected: {err}");

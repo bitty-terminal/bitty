@@ -8790,6 +8790,59 @@ fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
 }
 
 #[test]
+#[cfg(unix)]
+fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
+    // Issue #2167 (CodeRabbit on PR #2170): while zoomed the live layout
+    // is a single-leaf proxy and the exited leaf hides in the zoom backup.
+    // Surgery must run against the real tree (restore_zoom first), or the
+    // dead leaf survives in the backup and ghosts on unzoom.
+    require_pty!();
+    let mut app = editor_test_app();
+    let exiting = ViewId::new(2);
+
+    let script = write_fake_editor("exit-zoomed-bg", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.set_focus(ViewId::new(1)));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert_eq!(
+        app.runtime.leaf_count(),
+        1,
+        "zoom collapses the live layout to a proxy"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "zoomed backup exit must close the pane, never the app"
+    );
+    // The dead leaf must be gone from the real tree (session torn down),
+    // never parked in the zoom backup to ghost on unzoom.
+    assert!(
+        !app.runtime.has_pane_session(&exiting),
+        "exited backup leaf must be fully torn down"
+    );
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(
+        !app.runtime.layout().leaf_ids().contains(&exiting),
+        "unzoom must not resurrect the dead leaf"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key
     // table, the Leader binding, and the hint switch, cancels a Leader

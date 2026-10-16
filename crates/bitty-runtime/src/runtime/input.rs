@@ -664,7 +664,7 @@ impl Runtime {
         let Some(fid) = self.focus.focused() else {
             return;
         };
-        let Some(view) = self.layout.find_leaf_mut(fid) else {
+        let Some(view) = self.find_view_mut(fid) else {
             return;
         };
         if view.scroll_offset() != 0 {
@@ -1653,22 +1653,21 @@ impl Runtime {
                             let max = self.scrollback_len();
                             let scrolled_view = self.focused_view().or(Some(ViewId::new(1)));
                             let old_offset = scrolled_view
-                                .and_then(|id| self.layout.find_leaf(id))
+                                .and_then(|id| self.find_view(id))
                                 .map_or(0, |view| view.scroll_offset());
                             if let Some(view_id) = self.focused_view() {
-                                if let Some(view) = self.layout.find_leaf_mut(view_id) {
+                                if let Some(view) = self.find_view_mut(view_id) {
                                     view.scroll_by(lines_y, max);
                                 }
                             } else {
                                 // Single-window fallback: find leaf 1
-                                if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
+                                if let Some(view) = self.find_view_mut(ViewId::new(1)) {
                                     view.scroll_by(lines_y, max);
                                 }
                             }
                             if let Some(view_id) = scrolled_view {
                                 let new_offset = self
-                                    .layout
-                                    .find_leaf(view_id)
+                                    .find_view(view_id)
                                     .map_or(old_offset, |view| view.scroll_offset());
                                 let delta = new_offset as isize - old_offset as isize;
                                 if delta != 0 {
@@ -1725,10 +1724,9 @@ impl Runtime {
             None => return false,
         };
         let old_offset = self
-            .layout
-            .find_leaf(target)
+            .find_view(target)
             .map_or(0, |view| view.scroll_offset());
-        let scrolled = match self.layout.find_leaf_mut(target) {
+        let scrolled = match self.find_view_mut(target) {
             Some(view) => {
                 let page = usize::from(view.rows()).max(1) as isize;
                 view.scroll_by(if up { page } else { -page }, max);
@@ -1738,8 +1736,7 @@ impl Runtime {
         };
         if scrolled {
             let new_offset = self
-                .layout
-                .find_leaf(target)
+                .find_view(target)
                 .map_or(old_offset, |view| view.scroll_offset());
             // CTX-1021 (#1807): page scrolls move the viewport under a
             // scrolled selection the same way wheel scrolls do.

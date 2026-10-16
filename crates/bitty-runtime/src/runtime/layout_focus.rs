@@ -1516,11 +1516,35 @@ impl Runtime {
         )
     }
 
-    /// Scroll offset of leaf `view` in the active layout (`0` when absent).
-    pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {
+    /// Shared view lookup across layout, detached floats, and pins
+    /// (issue #2139: float scroll must address the focused float, not just
+    /// tiled leaves).
+    pub(super) fn find_view(&self, id: ViewId) -> Option<&View> {
         self.layout
-            .find_leaf(view)
-            .map_or(0, |leaf| leaf.scroll_offset())
+            .find_leaf(id)
+            .or_else(|| self.floats.get(id))
+            .or_else(|| self.pinned.get(id))
+    }
+
+    /// Mutable shared view lookup across layout, detached floats, and pins
+    /// (issue #2139).
+    pub(super) fn find_view_mut(&mut self, id: ViewId) -> Option<&mut View> {
+        if let Some(leaf) = self.layout.find_leaf_mut(id) {
+            return Some(leaf);
+        }
+        if let Some(stored) = self.floats.find_mut(id) {
+            return Some(stored);
+        }
+        if let Some(stored) = self.pinned.find_mut(id) {
+            return Some(stored);
+        }
+        None
+    }
+
+    /// Scroll offset of leaf `view` in the active layout, detached floats,
+    /// or pins (`0` when absent).
+    pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {
+        self.find_view(view).map_or(0, |leaf| leaf.scroll_offset())
     }
 
     /// Whether `view` currently shows a scrolled history viewport (CTX-1021,
@@ -1555,7 +1579,7 @@ impl Runtime {
             return None;
         }
         let state = self.live_view_state(view)?;
-        let leaf = self.layout.find_leaf(view)?;
+        let leaf = self.find_view(view)?;
         let cells = leaf.visible_cells(state);
         let base = state.snapshot();
         Some(Snapshot {
@@ -1596,7 +1620,7 @@ impl Runtime {
     ) -> Option<CellPos> {
         if self.is_viewport_scrolled(owner) {
             let viewport = self.viewport_snapshot_for(owner)?;
-            let leaf = self.layout.find_leaf(owner)?;
+            let leaf = self.find_view(owner)?;
             let max_row = leaf.rows().saturating_sub(1);
             let max_col = leaf.cols().saturating_sub(1);
             let row = local.row.min(max_row);

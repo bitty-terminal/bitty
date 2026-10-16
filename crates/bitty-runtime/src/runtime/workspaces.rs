@@ -4175,4 +4175,31 @@ mod tests {
         rt.workspace_new().expect("ws2");
         assert_eq!(rt.window_leaf_count(), 3);
     }
+
+    #[test]
+    fn scroll_focused_page_reaches_detached_float_issue_2139() {
+        // Issue #2139: Mod+U/I must scroll a focused float, not report
+        // no-focused-pane. The view lookup has to cover detached floats
+        // (and pins), not just tiled leaves.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        assert!(rt.set_focus(first), "detached float stays focusable");
+        assert!(
+            rt.scroll_focused_page(true),
+            "focused float must accept page scroll"
+        );
+        assert!(
+            rt.scroll_focused_page(false),
+            "focused float must accept page scroll down"
+        );
+    }
 }

@@ -895,9 +895,9 @@ impl Runtime {
 
     /// Raw ids of every live leaf: the live layout plus all stashed slots.
     ///
-    /// Besides allocation, the present layer reads this to tell a destroyed
-    /// view (fades its ring out) from a merely hidden one (workspace stash,
-    /// scratchpad, pin, detach: no close fade, #2134).
+    /// Allocation high-water only: coverage errs on including a stale
+    /// active-slot copy (an id is never re-issued). The present close-fade
+    /// gate uses [`Self::live_view_raws_excluding_active_slot`] instead.
     pub(super) fn live_view_raws(&self) -> Vec<u64> {
         let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
         for slot in &self.workspaces {
@@ -919,6 +919,30 @@ impl Runtime {
         for slot in &self.workspaces {
             raws.extend(slot.floats.ids().iter().map(|id| id.0));
         }
+        raws
+    }
+
+    /// Raw ids of every live leaf except the active slot's stashed copy.
+    ///
+    /// Close-fade gate (#2134): the active slot is refreshed only on
+    /// switch-away, so between a `set_layout_closing` and the next switch
+    /// it still names a destroyed leaf. The live layout plus the inactive
+    /// slots decide whether a removed view was destroyed or merely hidden;
+    /// window-owned parked/pinned/detached leaves count as live either way.
+    pub(super) fn live_view_raws_excluding_active_slot(&self) -> Vec<u64> {
+        let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
+        for (index, slot) in self.workspaces.iter().enumerate() {
+            if index == self.active_workspace {
+                continue;
+            }
+            raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
+            raws.extend(slot.floats.ids().iter().map(|id| id.0));
+        }
+        if let Some(parked) = self.scratchpad.peek() {
+            raws.push(parked.id().0);
+        }
+        raws.extend(self.pinned.ids().iter().map(|id| id.0));
+        raws.extend(self.floats.ids().iter().map(|id| id.0));
         raws
     }
 

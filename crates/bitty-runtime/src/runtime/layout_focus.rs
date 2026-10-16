@@ -620,8 +620,13 @@ impl Runtime {
             // merely left the visible set but stay live (stashed in an
             // inactive workspace slot, scratchpad, pin, detach) are not
             // closed: retaining their rings would ghost the previous
-            // workspace over the new one on every switch.
-            let live: std::collections::HashSet<u64> = self.live_view_raws().into_iter().collect();
+            // workspace over the new one on every switch. The active
+            // slot is excluded: it refreshes only on switch-away, so it
+            // can still name a leaf an explicit close just destroyed.
+            let live: std::collections::HashSet<u64> = self
+                .live_view_raws_excluding_active_slot()
+                .into_iter()
+                .collect();
             for old in &previous {
                 if new_ids.contains(&old.view) {
                     continue;

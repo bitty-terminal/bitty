@@ -155,6 +155,16 @@ impl FloatStore {
         self.entries.iter().map(View::id).collect()
     }
 
+    /// Discards detached leaf `id` without restoring it to any tree
+    /// (issue #2141: dead-float teardown after its child exits).
+    ///
+    /// Returns the removed [`View`] when present, `None` otherwise. The
+    /// tree is never touched.
+    pub fn discard(&mut self, id: ViewId) -> Option<View> {
+        let pos = self.entries.iter().position(|view| view.id() == id)?;
+        Some(self.entries.remove(pos))
+    }
+
     /// Reinstalls a previously captured detached leaf (session restore,
     /// CTX-1147): pushes `view` without touching any layout tree. Detach
     /// order is the restore order.
@@ -599,6 +609,21 @@ mod tests {
         assert!(view.reflow_to_rect(Rect::new(0, 0, 10, 8)));
         assert_eq!(store.get(ViewId::new(1)).expect("parked").cols(), 10);
         assert!(store.find_mut(ViewId::new(404)).is_none());
+    }
+
+    #[test]
+    fn discard_removes_without_touching_tree_issue_2141() {
+        let mut tree = pair();
+        let mut store = FloatStore::new();
+        store.detach(&mut tree, ViewId::new(1)).expect("detach");
+        let before = tree.clone();
+        let removed = store.discard(ViewId::new(1)).expect("discard returns view");
+        assert_eq!(removed.id(), ViewId::new(1));
+        assert!(store.is_empty());
+        assert!(!store.contains(ViewId::new(1)));
+        assert_eq!(tree, before, "discard never touches the tree");
+        assert!(store.discard(ViewId::new(1)).is_none());
+        assert!(store.discard(ViewId::new(404)).is_none());
     }
 
     #[test]

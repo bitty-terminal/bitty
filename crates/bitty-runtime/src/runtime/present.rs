@@ -2331,6 +2331,45 @@ impl Runtime {
                                 && leaf.fade_factor == fade
                         });
 
+                // CTX-1148 (#1978) + CTX-1271 (#2138): detached floats
+                // must paint opaque. The grid fills cover only the content
+                // rect; the decoration frame (border plus content-inset
+                // band, sub-cell remainder) would otherwise show tiled
+                // content beneath (siblings refill the container after
+                // detach, unlike the keep-slot model). One theme-bg fill
+                // covering the float frame occludes the base beneath the
+                // cell fills. The `DrawList` order paints fills before
+                // rounded fills, so lower leaves' rings/shadows/glows would
+                // still draw over that fill (#2138): a second solid
+                // rounded cover (same frame, `border: 0`) occludes lower
+                // chrome in the rounded pass too, ahead of this float's
+                // own shadow/glow/ring below. Float tier only, so the tiled
+                // baseline is unchanged. Empty frames skip fail-closed.
+                // Bounded: one fill plus one rounded cover per float frame.
+                if frame.tier == Some(OverlayTier::Float)
+                    && frame.frame.width > 0
+                    && frame.frame.height > 0
+                {
+                    let bg = self.renderer.theme_palette().background;
+                    let cover = bitty_render::geometry::RectPx::new(
+                        px_add(pad_px, frame.frame.x),
+                        px_add(pad_px, frame.frame.y),
+                        frame.frame.width,
+                        frame.frame.height,
+                    );
+                    built.fills.push(bitty_render::grid::FillRect {
+                        rect: cover,
+                        color: bg,
+                    });
+                    built.rounded.push(bitty_render::grid::RoundedFill {
+                        frame: cover,
+                        border: 0,
+                        radius: frame.radius,
+                        color: bg,
+                    });
+                    built.needs_draw = true;
+                }
+
                 // CTX-0311 ring (+ CTX-1162 S3 shadow/glow): shared by the
                 // reuse and re-render paths so a retained leaf still paints
                 // its live focus/open chrome. Back-to-front in
@@ -2354,32 +2393,6 @@ impl Runtime {
                     &mut built.rounded,
                 );
                 built.needs_draw |= shadow_painted || glow_painted || ring_painted;
-
-                // CTX-1148 (#1978): detached floats must paint opaque. The
-                // grid fills cover only the content rect; the decoration
-                // frame (border plus content-inset band, sub-cell remainder)
-                // would otherwise show tiled content beneath (siblings refill
-                // the container after detach, unlike the keep-slot model).
-                // One theme-bg fill covering the float frame occludes the base
-                // beneath the cell fills; the chrome ring still paints above.
-                // Float tier only, so the tiled baseline is unchanged. Empty
-                // frames skip fail-closed. Bounded: one fill per float frame.
-                if frame.tier == Some(OverlayTier::Float)
-                    && frame.frame.width > 0
-                    && frame.frame.height > 0
-                {
-                    let bg = self.renderer.theme_palette().background;
-                    built.fills.push(bitty_render::grid::FillRect {
-                        rect: bitty_render::geometry::RectPx::new(
-                            px_add(pad_px, frame.frame.x),
-                            px_add(pad_px, frame.frame.y),
-                            frame.frame.width,
-                            frame.frame.height,
-                        ),
-                        color: bg,
-                    });
-                    built.needs_draw = true;
-                }
 
                 // CTX-0347 (RFC-0001/OQ-042): the resolved per-`View` background
                 // image paints inside the content rect, above cell backgrounds

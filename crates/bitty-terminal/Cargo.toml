@@ -46,6 +46,12 @@ bitty-rich = { version = "0.0.23", path = "../bitty-rich" }
 bitty-term-state = { version = "0.0.23", path = "../bitty-term-state" }
 bitty-vt = { version = "0.0.23", path = "../bitty-vt" }
 pollster = { workspace = true }
+# CTX-1265 (#2136): Unix TTY single-keypress picker navigation. `nix` (already
+# workspace-pinned) provides the safe termios/poll wrappers: cbreak mode
+# (ICANON/ECHO off, ISIG kept) plus readiness polling for ESC disambiguation.
+# Unix-only; Windows and piped setups keep the line loop (no new crates).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "poll", "term"] }
 
 [features]
 default = []

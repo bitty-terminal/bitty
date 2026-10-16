@@ -19,16 +19,19 @@
 //! | `DCS + q <hex> ST` (XTGETTCAP) | `DCS 1 + r <hex>=<hex> ST` or `DCS 0 + r ST` | [`xtgettcap_reply`] |
 //! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | [`decrqm_value`] reads live `State` |
 //! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | [`xtwinops_pixels_reply`]: focused leaf content grid × live cell metrics (exact multiples) |
+//! | `CSI 16 t` (XTWINOPS cell size, pixels) | `CSI 6 ; height ; width t` | [`xtwinops_cell_size_reply`]: live cell metrics (yazi/chafa sizing probe, #2131) |
 //! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | [`xtwinops_cells_reply`]: focused leaf content grid |
 //! | `APC G i=<id>,a=q,f=..;bytes ST` (Kitty support probe, spec) | `ESC _ G i=<id>;OK ST` or `ESC _ G i=<id>;EINVAL:<msg> ST` / `;ENOSPC:<msg> ST` | [`kitty_probe_ok_reply`] / [`kitty_probe_einval_reply`] / [`kitty_probe_enospc_reply`] |
 //! | `APC G a=q,i=..[p=..] ST` with empty payload (payload-less status lookup, bitty extension in spec shape) | `ESC _ G i=<id>[,p=<pin>];OK ST` or `ESC _ G i=<id>[,p=<pin>];ENOENT:<msg> ST` (`I=` echoed when queried by number) | [`kitty_status_ok_reply`] / [`kitty_status_enoent_reply`] |
 //!
 //! Values are bitty's TRUE capabilities, never borrowed prestige:
 //!
-//! - XTWINOPS answers only `14 t` / `18 t` (fastfetch's kitty cell-size
-//!   probe, #1334): every other window operation stays silent, and the
-//!   pixel reply is the exact `cols × cell` / `rows × cell` product so a
-//!   prober recovers the live cell dimensions without rounding error.
+//! - XTWINOPS answers `14 t` / `16 t` / `18 t` (fastfetch's kitty cell-size
+//!   probe, #1334; yazi/chafa cell-size probe, #2131): every other window
+//!   operation stays silent, and the pixel reply is the exact `cols × cell`
+//!   / `rows × cell` product so a prober recovers the live cell dimensions
+//!   without rounding error. `16 t` reports the live cell itself so probers
+//!   that divide area-by-count (or query the cell directly) agree.
 //!
 //! - XTGETTCAP answers only `TN`/`name` (= [`bitty_pty::DEFAULT_TERM`], the
 //!   `TERM` children actually see), `Co`/`colors` (`256`: SGR `38;5` indexed
@@ -505,17 +508,27 @@ pub(crate) fn xtwinops_pixels_reply(width: u32, height: u32) -> Vec<u8> {
     format!("\x1b[4;{height};{width}t").into_bytes()
 }
 
+/// XTWINOPS cell-size-in-pixels reply (`CSI 6 ; height ; width t`).
+///
+/// `width`/`height` are the live cell metrics the runtime passes in, so a
+/// prober (yazi `csi_16t`, chafa geometry, #2131) learns the exact cell
+/// without dividing area by count (which rounds on odd sizes).
+#[must_use]
+pub(crate) fn xtwinops_cell_size_reply(cell_width: u32, cell_height: u32) -> Vec<u8> {
+    format!("\x1b[6;{cell_height};{cell_width}t").into_bytes()
+}
+
 /// XTWINOPS text-area-in-cells reply (`CSI 8 ; rows ; cols t`).
 #[must_use]
 pub(crate) fn xtwinops_cells_reply(cols: u16, rows: u16) -> Vec<u8> {
     format!("\x1b[8;{rows};{cols}t").into_bytes()
 }
 
-/// Scan for fresh XTWINOPS text-area queries (`CSI 14 t` / `CSI 18 t`).
+/// Scan for fresh XTWINOPS text-area queries (`CSI 14 t` / `CSI 16 t` / `CSI 18 t`).
 ///
-/// Params must be exactly `14` or `18` (no private markers, no extra
+/// Params must be exactly `14`, `16`, or `18` (no private markers, no extra
 /// params): every other window operation stays silent, and our own
-/// replies (`CSI 4 ; .. t`, `CSI 8 ; .. t`) can never retrigger the
+/// replies (`CSI 4 ; .. t`, `CSI 6 ; .. t`, `CSI 8 ; .. t`) can never retrigger the
 /// scan, which closes the reply-echo loop. Returns the requested ops in
 /// byte order, at most [`QUERY_MATCHES_MAX`].
 #[must_use]
@@ -530,6 +543,8 @@ pub(crate) fn find_xtwinops(combined: &[u8], new_start: usize) -> Vec<u16> {
         let params = &combined[i + 2..i + 4];
         let op = if params == b"14" {
             14u16
+        } else if params == b"16" {
+            16u16
         } else if params == b"18" {
             18u16
         } else {
@@ -959,6 +974,11 @@ mod tests {
             "14t reports height before width"
         );
         assert_eq!(
+            xtwinops_cell_size_reply(9, 18),
+            b"\x1b[6;18;9t",
+            "16t reports cell height before width"
+        );
+        assert_eq!(
             xtwinops_cells_reply(80, 22),
             b"\x1b[8;22;80t",
             "18t reports rows before cols"
@@ -966,10 +986,16 @@ mod tests {
     }
 
     #[test]
-    fn find_xtwinops_accepts_exact_14_and_18_only() {
+    fn find_xtwinops_accepts_exact_14_16_and_18_only() {
         // fastfetch's probe shape: both ops in one write, byte order kept.
         assert_eq!(find_xtwinops(b"\x1b[18t\x1b[14t", 0), vec![18, 14]);
         assert_eq!(find_xtwinops(b"\x1b[14t", 0), vec![14]);
+        // yazi/chafa cell-size probe (#2131): 16t is answered.
+        assert_eq!(find_xtwinops(b"\x1b[16t", 0), vec![16]);
+        assert_eq!(
+            find_xtwinops(b"\x1b[18t\x1b[16t\x1b[14t", 0),
+            vec![18, 16, 14]
+        );
         // Stale (fully in overlap) matches are skipped.
         let bytes = b"\x1b[14t";
         assert!(find_xtwinops(bytes, bytes.len()).is_empty());
@@ -990,6 +1016,7 @@ mod tests {
         }
         // Echoes of our own replies must not retrigger (loop guard).
         assert!(find_xtwinops(b"\x1b[4;418;720t", 0).is_empty());
+        assert!(find_xtwinops(b"\x1b[6;18;9t", 0).is_empty());
         assert!(find_xtwinops(b"\x1b[8;22;80t", 0).is_empty());
     }
 }

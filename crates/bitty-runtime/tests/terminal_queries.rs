@@ -411,20 +411,35 @@ fn xtwinops_reports_cell_exact_text_area() {
     // #1334: fastfetch's kitty backend probes `CSI 18 t` + `CSI 14 t`
     // to derive cell pixels. Both answers must arrive, in order, with
     // pixels == cells x live cell metrics exactly.
+    // #2131: yazi/chafa probe `CSI 16 t` for the cell size directly;
+    // the answer must match the config cell metrics (and therefore the
+    // 14t/18t quotient) exactly.
     let mut rt = Runtime::with_defaults().expect("build");
     let cfg = RuntimeConfig::default();
-    rt.handle_pty_bytes(b"\x1b[18t\x1b[14t");
+    rt.handle_pty_bytes(b"\x1b[18t\x1b[16t\x1b[14t");
     let replies = replies_text(&mut rt);
-    assert_eq!(replies.len(), 2, "both ops answered, got {replies:?}");
+    assert_eq!(replies.len(), 3, "all ops answered, got {replies:?}");
     let (kind_cells, rows, cols) = parse_t_reply(&replies[0]);
     assert_eq!(kind_cells, 8, "18t reports cells, got {replies:?}");
-    let (kind_px, height, width) = parse_t_reply(&replies[1]);
+    let (kind_cell, cell_h, cell_w) = parse_t_reply(&replies[1]);
+    assert_eq!(kind_cell, 6, "16t reports cell size, got {replies:?}");
+    assert_eq!(
+        (cell_w, cell_h),
+        (cfg.cell_width, cfg.cell_height),
+        "16t must match live cell metrics, got {replies:?}"
+    );
+    let (kind_px, height, width) = parse_t_reply(&replies[2]);
     assert_eq!(kind_px, 4, "14t reports pixels, got {replies:?}");
     assert!(cols > 0 && rows > 0, "non-degenerate grid, got {replies:?}");
     assert_eq!(
         (width, height),
         (cols * cfg.cell_width, rows * cfg.cell_height),
         "pixels must be exact cell multiples, got {replies:?}"
+    );
+    assert_eq!(
+        (width, height),
+        (cols * cell_w, rows * cell_h),
+        "14t/18t quotient must agree with 16t, got {replies:?}"
     );
 }
 
@@ -435,7 +450,7 @@ fn xtwinops_other_window_ops_stay_silent() {
     rt.handle_pty_bytes(b"\x1b[1t\x1b[2t\x1b[3t\x1b[5t\x1b[6t\x1b[11t\x1b[13t\x1b[15t\x1b[19t");
     assert!(
         replies_text(&mut rt).is_empty(),
-        "only 14t/18t are answered"
+        "only 14t/16t/18t are answered"
     );
     // Echoes of our own replies must not retrigger (loop guard).
     rt.handle_pty_bytes(b"\x1b[18t");
@@ -443,4 +458,10 @@ fn xtwinops_other_window_ops_stay_silent() {
     assert_eq!(own.len(), 1);
     rt.handle_pty_bytes(&own[0]);
     assert!(replies_text(&mut rt).is_empty(), "reply echo stays silent");
+    // The 16t echo shape (`CSI 6 ; .. t`) must not retrigger either.
+    rt.handle_pty_bytes(b"\x1b[16t");
+    let own: Vec<Vec<u8>> = replies_text(&mut rt);
+    assert_eq!(own.len(), 1);
+    rt.handle_pty_bytes(&own[0]);
+    assert!(replies_text(&mut rt).is_empty(), "16t echo stays silent");
 }

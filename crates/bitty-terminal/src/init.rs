@@ -5,26 +5,6 @@ use std::io::IsTerminal as _;
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
-/// Wizard greeting art: thin alias over the single-owned mascot module
-/// ([`crate::mascot`], issue #1318) so the `bitty init` greeting and the
-/// startup splash can never disagree. The art stays vendored byte-identical
-/// from the workspace asset `recording/bitty-mascot/ascii/bitty_ascii.txt`
-/// (DEC-0002): pure text so it renders anywhere stdout goes, including
-/// piped headless runs; the sixel/block variants stay out of the binary.
-/// (Test-only: the wizard itself goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_ART as INIT_MASCOT_ART;
-/// One-line fallback when the window is too narrow for the art: fail closed
-/// with an honest line instead of a wrapped mess (see [`crate::mascot`]).
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_FALLBACK as INIT_MASCOT_FALLBACK;
-/// Greeting art for a known-or-unknown window width (see [`crate::mascot`]).
-pub(crate) use crate::mascot::mascot_art_for_width as init_greeting_art;
-/// Width of the vendored art in columns (see [`crate::mascot`]).
-/// (Test-only: runtime code goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::mascot_width as init_mascot_width;
-
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
 /// garbage or a stuck key can never spin the wizard forever.
 pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
@@ -1807,10 +1787,10 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     let _ = writeln!(output, "{}", init_style_label(&item, false, color));
 }
 
-/// Runs the interactive wizard: mascot greeting, then shell / theme / font
+/// Runs the interactive wizard: shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
-/// `input`, `output`, `shell_env`, `columns`, `shell_exists`,
+/// `input`, `output`, `shell_env`, `shell_exists`,
 /// `overrides`, and `color`, so the whole flow is headless-testable with
 /// piped stdin.
 ///
@@ -1836,7 +1816,6 @@ pub(crate) fn run_init_interactive_with_preview(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
@@ -1861,7 +1840,6 @@ pub(crate) fn run_init_interactive_with_preview(
         input,
         output,
         shell_env,
-        columns,
         shell_exists,
         overrides,
         color,
@@ -1888,7 +1866,6 @@ pub(crate) fn run_init_interactive(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
@@ -1897,7 +1874,6 @@ pub(crate) fn run_init_interactive(
         input,
         output,
         shell_env,
-        columns,
         shell_exists,
         overrides,
         color,
@@ -1916,14 +1892,12 @@ fn run_init_interactive_impl(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
     mut preview: Option<&mut InitPreview>,
     mut live: Option<&mut bitty_runtime::Runtime>,
 ) -> Result<InitAnswers, String> {
-    let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
         output,
         "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
@@ -2679,7 +2653,7 @@ pub(crate) fn write_init_config(
 pub(crate) fn init_usage() -> String {
     "usage: bitty init [--yes] [--force] [VALUE FLAGS] [--config PATH]\n\
      \n\
-     Opt-in setup wizard (never auto-runs): mascot greeting, then shell /\n\
+     Opt-in setup wizard (never auto-runs): shell /\n\
      theme / font family+size / decoration (gaps_in, gaps_out, border,\n\
      radius) / scrollback / close_confirm / keybinding-preset picks, then\n\
      writes the config file with shipped keys only (no secrets, no network).\n\
@@ -2732,8 +2706,6 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) xdg_config_home: Option<&'a str>,
     /// Stands in for `HOME` (XDG fallback root).
     pub(crate) home: Option<&'a str>,
-    /// Stands in for `COLUMNS` (greeting width).
-    pub(crate) columns: Option<u16>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,
 }
@@ -2751,7 +2723,7 @@ pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
 }
 
 /// [`run_init_subcommand`] with injected `BITTY_CONFIG`/`SHELL` values; the
-/// remaining environment (XDG root, `BITTY_PROFILE`, COLUMNS, TTY-ness) is
+/// remaining environment (XDG root, `BITTY_PROFILE`, TTY-ness) is
 /// read live. Tests use [`run_init_subcommand_with_io`] for full hermeticity.
 pub(crate) fn run_init_subcommand_with_env(
     args: &Args,
@@ -2761,14 +2733,12 @@ pub(crate) fn run_init_subcommand_with_env(
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
     let profile = std::env::var("BITTY_PROFILE").ok();
-    let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
     let env = InitEnv {
         bitty_config: bitty_config_env,
         bitty_profile: profile.as_deref(),
         shell: shell_env,
         xdg_config_home: xdg.as_deref(),
         home: home.as_deref(),
-        columns,
         stdin_is_tty: std::io::stdin().is_terminal(),
     };
     let stdin = std::io::stdin();
@@ -3021,7 +2991,6 @@ pub(crate) fn run_init_subcommand_with_io(
             input,
             output,
             env.shell,
-            env.columns,
             &|path| std::path::Path::new(path).exists(),
             &overrides,
             color,

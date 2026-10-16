@@ -1,18 +1,17 @@
-//! Bittie mascot splash (issue #1318, CTX-0729).
+//! Bittie mascot splash (issue #1318, CTX-0729; `--mascot` flag removed in
+//! #2135, 0.0.24).
 //!
 //! Single owner of the vendored mascot art and the first-run splash
 //! policy. `crates/bitty-terminal/assets/mascot.txt` is the only text asset
 //! compiled into the binary (pure ASCII, bounded: see [`MASCOT_MAX_LINES`]
 //! / [`MASCOT_MAX_WIDTH`]); the sixel/block variants in
-//! `recording/bitty-mascot/` stay out. `init.rs` re-exports these names
-//! for the `bitty init` wizard greeting so both surfaces agree.
+//! `recording/bitty-mascot/` stay out.
 //!
-//! Policy: `--mascot` prints the art and exits 0 (local class: no config,
-//! no instance, no plugin VM, no network, no stdin read). Normal startup
-//! shows the splash once (first-run marker file under the XDG data root),
-//! suppressed for one launch by `--no-splash` and always skipped for the
-//! machine flows (`--headless`, `--test-mode`). Marker writes are
-//! best-effort and swallowed: the splash never blocks shell spawn.
+//! Policy: normal startup shows the splash once (first-run marker file
+//! under the XDG data root), suppressed for one launch by `--no-splash`
+//! and always skipped for the machine flows (`--headless`, `--test-mode`).
+//! Marker writes are best-effort and swallowed: the splash never blocks
+//! shell spawn.
 
 use std::path::{Path, PathBuf};
 

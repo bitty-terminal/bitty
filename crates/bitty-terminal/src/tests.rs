@@ -4865,44 +4865,22 @@ fn init_columns_parse() {
     assert_eq!(init_columns_from_env(Some("")), None);
 }
 
-#[test]
-fn init_mascot_is_bounded_with_text_fallback() {
-    // The vendored art is small, pure ASCII, and bounded.
-    let width = init_mascot_width();
-    assert!(width > 0 && width <= 80, "art width {width}");
-    assert!(INIT_MASCOT_ART.lines().count() <= 32);
-    assert!(INIT_MASCOT_ART.is_ascii());
-
-    // Unknown or roomy widths print the full art (headless-safe).
-    assert_eq!(init_greeting_art(None), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(80)), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(width as u16)), INIT_MASCOT_ART);
-
-    // A tiny window fails closed to one honest line (pure-text fallback).
-    let narrow = init_greeting_art(Some(20));
-    assert_eq!(narrow, INIT_MASCOT_FALLBACK);
-    assert_eq!(narrow.lines().count(), 1);
-    assert!(init_greeting_art(Some(1)).contains("too narrow"));
-}
-
 /// Drives the interactive wizard with piped stdin; returns answers plus
 /// everything the wizard printed.
 fn drive_init_wizard(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
 ) -> (Result<InitAnswers, String>, String) {
-    drive_init_wizard_with_overrides(stdin_lines, shell_env, columns, &InitOverrides::default())
+    drive_init_wizard_with_overrides(stdin_lines, shell_env, &InitOverrides::default())
 }
 
 /// [`drive_init_wizard`] with explicit value-flag overrides (skipped steps).
 fn drive_init_wizard_with_overrides(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
 ) -> (Result<InitAnswers, String>, String) {
-    drive_init_wizard_with_color(stdin_lines, shell_env, columns, overrides, false)
+    drive_init_wizard_with_color(stdin_lines, shell_env, overrides, false)
 }
 
 /// [`drive_init_wizard`] with an explicit option-list color decision.
@@ -4911,7 +4889,6 @@ fn drive_init_wizard_with_overrides(
 fn drive_init_wizard_with_color(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
     color: bool,
 ) -> (Result<InitAnswers, String>, String) {
@@ -4921,7 +4898,6 @@ fn drive_init_wizard_with_color(
         &mut input,
         &mut output,
         shell_env,
-        columns,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
         color,
@@ -4934,7 +4910,7 @@ fn drive_init_wizard_with_color(
 fn init_interactive_all_defaults() {
     // Eleven Enters: default shell, theme, family, size, gaps_in, gaps_out,
     // border, radius, scrollback, close_confirm, keys.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("defaults accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/bash"));
     assert_eq!(answers.theme, "dark");
@@ -4966,9 +4942,13 @@ fn init_interactive_all_defaults() {
     assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::WhenBusy);
     assert_eq!(answers.key_preset, InitKeyPreset::Default);
 
-    // Greeting shows the mascot plus every step prompt.
+    // Greeting shows the welcome line plus every step prompt, and no
+    // ASCII mascot banner (#2135: removed from init output in 0.0.24).
     assert!(printed.contains("Welcome to bitty"));
-    assert!(printed.contains("MMMMM"));
+    assert!(
+        !printed.contains("MMMMM"),
+        "init output must not carry the mascot banner, got:\n{printed}"
+    );
     assert!(printed.contains("Shell"));
     assert!(printed.contains("Theme"));
     assert!(printed.contains("Font family"));
@@ -4989,7 +4969,6 @@ fn init_interactive_custom_picks() {
     let (result, _) = drive_init_wizard(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
     );
     let answers = result.expect("custom picks accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
@@ -5010,33 +4989,29 @@ fn init_interactive_retries_then_aborts() {
     // Bad font size reprompts and then accepts the correction (then the
     // remaining seven steps take defaults).
     let (result, printed) =
-        drive_init_wizard("\n\n\nbanana\n14\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+        drive_init_wizard("\n\n\nbanana\n14\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
     assert!(printed.contains("try again"));
 
     // A bad decoration value also reprompts instead of aborting.
-    let (result, printed) =
-        drive_init_wizard("\n\n\n\n99\n4\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n99\n4\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
     assert!(printed.contains("try again"));
 
     // Three bad preset answers exhaust the bound and abort.
-    let (result, _) = drive_init_wizard(
-        "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
-        Some("/bin/bash"),
-        None,
-    );
+    let (result, _) =
+        drive_init_wizard("\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n", Some("/bin/bash"));
     assert!(result.is_err());
 
     // EOF up front aborts without guessing.
-    let (result, _) = drive_init_wizard("", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("", Some("/bin/bash"));
     assert!(result.is_err());
 
-    // A narrow window still wizards, with the text fallback greeting.
-    let (result, printed) =
-        drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), Some(20));
+    // A narrow window still wizards with the plain welcome line: no ASCII
+    // art and no fallback line (#2135 removed the init banner entirely).
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
-    assert!(printed.contains("too narrow"));
+    assert!(!printed.contains("too narrow"));
     assert!(!printed.contains("MMMMM"));
 }
 
@@ -5058,8 +5033,7 @@ fn init_interactive_overrides_skip_prompts() {
         with_components: None,
         print_shell_init: None,
     };
-    let (result, printed) =
-        drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), None, &overrides);
+    let (result, printed) = drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), &overrides);
     let answers = result.expect("overrides answer every overridden step");
     assert_eq!(answers.theme, "dark");
     assert_eq!(answers.font_family, "Fira Code");
@@ -5243,7 +5217,7 @@ fn init_wizard_kitty_csi_u_variants() {
 fn init_wizard_arrows_edit_in_prompt() {
     // End-to-end through one wizard prompt (font family): `ab`, Left,
     // `c` answers `acb`, with no escape bytes in the stored answer.
-    let (result, _) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("edited answer accepted");
     assert_eq!(answers.font_family, "acb");
     assert!(!answers.font_family.contains('\x1b'));
@@ -5255,7 +5229,7 @@ fn init_wizard_up_history_in_prompts() {
     // Pure Up now moves the option cursor (phase 1 of #1806); typed text
     // plus Up still recalls history through the shared decoder.
     let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_in, 10);
     assert_eq!(answers.gaps_out, 10);
@@ -5273,7 +5247,7 @@ fn init_wizard_up_history_in_prompts() {
 #[test]
 fn init_wizard_plain_input_redraws_nothing() {
     // Eleven Enters: no escape bytes anywhere, so no redraw marker.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(
         !printed.contains("(read as "),
@@ -5285,8 +5259,7 @@ fn init_wizard_plain_input_redraws_nothing() {
 fn init_wizard_redraw_shows_edited_answer() {
     // `ab`, Left, `c` submits `acb`; the redraw carries the submitted value
     // so the display matches it instead of the raw kernel echo.
-    let (result, printed) =
-        drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("edited answer accepted");
     assert_eq!(answers.font_family, "acb");
     assert!(
@@ -5301,7 +5274,7 @@ fn init_wizard_redraw_shows_recalled_history() {
     // value was never echoed by the kernel, so the redraw must show it.
     // (Pure Up now moves the option cursor instead.)
     let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_out, 10);
     assert!(
@@ -5315,7 +5288,7 @@ fn init_wizard_redraw_precedes_validation_retry() {
     // An edited but invalid font size redraws the decoded attempt before the
     // retry message, so the user sees what failed validation.
     let stdin = "\n\n\n1\x1b[Cx\n12\n\n\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("retry accepted");
     assert!((answers.font_size - 12.0).abs() < f32::EPSILON);
     assert!(
@@ -5385,7 +5358,7 @@ fn init_wizard_redraw_output_error_aborts() {
 
 #[test]
 fn init_option_list_renders_for_every_prompt() {
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(printed.contains("Shell"), "shell list, got:\n{printed}");
     assert!(printed.contains("Theme"), "theme list, got:\n{printed}");
@@ -5432,7 +5405,7 @@ fn init_option_list_j_navigates_theme() {
     // Shell default, theme `j` moves to tokyo-night then Enter selects it,
     // remaining prompts take defaults.
     let stdin = "\nj\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("navigated theme accepted");
     assert_eq!(answers.theme, "tokyo-night");
 }
@@ -5441,7 +5414,7 @@ fn init_option_list_j_navigates_theme() {
 fn init_option_list_arrow_down_navigates_theme() {
     // Down arrow behaves like `j` for the theme list.
     let stdin = "\n\x1b[B\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("arrow-navigated theme accepted");
     assert_eq!(answers.theme, "tokyo-night");
 }
@@ -5450,7 +5423,7 @@ fn init_option_list_arrow_down_navigates_theme() {
 fn init_option_list_k_wraps_theme_to_last() {
     // Up/`k` from the default wraps to the last preset (github-light).
     let stdin = "\nk\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("wrapped theme accepted");
     assert_eq!(answers.theme, "github-light");
 }
@@ -5458,7 +5431,7 @@ fn init_option_list_k_wraps_theme_to_last() {
 #[test]
 fn init_option_list_number_fast_path_still_selects_shell() {
     // Numbered fast path: `2` picks the second shell candidate in one read.
-    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("numbered shell accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
 }
@@ -5467,7 +5440,7 @@ fn init_option_list_number_fast_path_still_selects_shell() {
 fn init_option_list_typed_value_still_selects_size() {
     // Typed values need no navigation: `14` answers the size step directly.
     let stdin = "\n\n\n14\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("typed size accepted");
     assert!((answers.font_size - 14.0).abs() < f32::EPSILON);
 }
@@ -5476,7 +5449,7 @@ fn init_option_list_typed_value_still_selects_size() {
 fn init_option_list_invalid_retry_then_navigation() {
     // An unknown theme reprompts; `j` plus Enter then selects tokyo-night.
     let stdin = "\nnope\nj\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("retry plus navigation accepted");
     assert_eq!(answers.theme, "tokyo-night");
     assert!(
@@ -5488,7 +5461,7 @@ fn init_option_list_invalid_retry_then_navigation() {
 #[test]
 fn init_option_list_plain_output_has_no_escapes() {
     // Default harness color is off: piped/plain output carries no ANSI.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(
         !printed.contains("\u{1b}["),
@@ -5503,7 +5476,6 @@ fn init_option_list_color_previews_theme_and_marker() {
     let (result, printed) = drive_init_wizard_with_color(
         "\n\n\n\n\n\n\n\n\n\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         true,
     );
@@ -5593,7 +5565,6 @@ fn unified_gate_help_piped_is_plain_forced_still_colors() {
 fn drive_init_wizard_with_preview(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
     baseline: bitty_config::EffectiveConfig,
 ) -> (Result<InitAnswers, String>, String, InitPreview) {
@@ -5604,7 +5575,6 @@ fn drive_init_wizard_with_preview(
         &mut input,
         &mut output,
         shell_env,
-        columns,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
         false,
@@ -5629,7 +5599,6 @@ fn init_preview_applies_selections_mid_wizard() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline,
     );
@@ -5707,7 +5676,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5730,7 +5698,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\x1b\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5748,7 +5715,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5769,7 +5735,6 @@ fn init_preview_never_writes_config_file() {
     let (result, _, _) = drive_init_wizard_with_preview(
         "\n\n\n\n\n\n\n\n\n\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5783,7 +5748,6 @@ fn init_preview_never_writes_config_file() {
     let (result, _, _) = drive_init_wizard_with_preview(
         "\n\x1b\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline,
     );
@@ -5961,7 +5925,6 @@ fn init_preview_baseline_prefers_loaded_config() {
         shell: None,
         xdg_config_home: Some(&prof_root_s),
         home: None,
-        columns: None,
         stdin_is_tty: true,
     };
     let env_prof = crate::init::init_preview_baseline(&Args::new(), &bitty_env);
@@ -6057,7 +6020,6 @@ fn init_live_preview_maps_snapshots_per_step() {
     let (_, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -6188,7 +6150,6 @@ fn init_preview_push_live_maps_final_overlay() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -6238,7 +6199,6 @@ fn init_preview_echo_tracks_running_theme_with_color() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         true,
@@ -6313,7 +6273,6 @@ fn init_preview_echo_plain_without_color() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
@@ -6349,7 +6308,6 @@ fn init_preview_echo_absent_without_preview() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         true,
@@ -6388,7 +6346,6 @@ fn init_live_preview_hot_updates_per_step_unix() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
@@ -6450,7 +6407,6 @@ fn init_live_preview_esc_restores_baseline_unix() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
@@ -6834,7 +6790,6 @@ fn init_env<'a>(
         shell,
         xdg_config_home,
         home,
-        columns: None,
         stdin_is_tty,
     }
 }
@@ -7695,18 +7650,36 @@ fn consolidated_startup_assembly_matches_expected_layout_and_focus() {
 #[test]
 fn parse_mascot_flags_default_off() {
     let parsed = parse_args(&args_of(&["bitty"]));
-    assert!(!parsed.mascot);
     assert!(!parsed.no_splash);
 }
 
 #[test]
-fn parse_mascot_and_no_splash_flags() {
+fn parse_mascot_flag_removed_for_024() {
+    // #2135: `--mascot` is gone; it now parses as an unknown pre-`--` flag
+    // (main rejects it fail-closed with exit 2).
     let parsed = parse_args(&args_of(&["bitty", "--mascot"]));
-    assert!(parsed.mascot);
-    assert!(!parsed.no_splash);
+    assert_eq!(parsed.unknown_flag.as_deref(), Some("--mascot"));
     let parsed = parse_args(&args_of(&["bitty", "--no-splash"]));
-    assert!(!parsed.mascot);
+    assert!(parsed.unknown_flag.is_none());
     assert!(parsed.no_splash);
+}
+
+#[test]
+fn help_no_longer_advertises_mascot() {
+    // #2135: both help surfaces drop `--mascot`; `--no-splash` stays
+    // (first-run splash kept).
+    assert!(
+        !help_text().contains("--mascot"),
+        "long help must not list --mascot"
+    );
+    assert!(
+        !crate::cli::help_text_short(false).contains("--mascot"),
+        "short help must not list --mascot"
+    );
+    assert!(
+        help_text().contains("--no-splash"),
+        "long help keeps --no-splash"
+    );
 }
 
 #[test]
@@ -7716,18 +7689,6 @@ fn mascot_art_is_bounded_ascii() {
     assert!(MASCOT_ART.lines().count() <= MASCOT_MAX_LINES);
     let width = mascot_width();
     assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
-}
-
-#[test]
-fn mascot_art_width_selection_matches_init_greeting() {
-    // Splash and `bitty init` greeting agree by construction (aliases).
-    let width = mascot_width();
-    assert_eq!(mascot_art_for_width(None), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(80)), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(width as u16)), MASCOT_ART);
-    let narrow = mascot_art_for_width(Some(20));
-    assert!(narrow.contains("too narrow"));
-    assert_eq!(narrow.lines().count(), 1);
 }
 
 #[test]

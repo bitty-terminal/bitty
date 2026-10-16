@@ -1785,6 +1785,12 @@ impl TerminalApp {
     /// while the modal holds so no state mutates behind it. A broader
     /// taxonomy (panel focus, overlay-to-overlay) stays parked with its
     /// owner; this predicate covers the user focus chords that exist today.
+    ///
+    /// Issue #2172: `WorkspaceMove` is intentionally absent. A move
+    /// reparents layout (plus follow-focus), so it stays swallowed like the
+    /// other mutations: the overlay indicator survives panel moves exactly
+    /// like `Mod+T` (likewise absent), and the chord is queued as overlay
+    /// input instead of dismissing the surface.
     pub(crate) fn is_overlay_focus_switch(action: bitty_config::ChromeAction) -> bool {
         use bitty_config::ChromeAction as A;
         matches!(
@@ -1799,7 +1805,6 @@ impl TerminalApp {
                 | A::WorkspaceNextOccupied
                 | A::WorkspacePrevOccupied
                 | A::WorkspaceFocus(_)
-                | A::WorkspaceMove(_)
         )
     }
 

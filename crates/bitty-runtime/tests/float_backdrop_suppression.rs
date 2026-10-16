@@ -174,10 +174,15 @@ fn tiled_chrome_hidden_behind_detached_float_issue_2168() {
     // Round trip: restoring the float brings tiled chrome back.
     rt.float_restore(ViewId::new(1))
         .expect("restore must apply");
-    rt.tick().expect("restored frame must present");
+    let stats = rt.tick().expect("restored frame must present");
     assert!(
-        non_bg_count(&rt) > 0,
-        "tiled chrome returns once the float is restored"
+        stats.rounded_fills > 0,
+        "tiled rings return once the float is restored"
+    );
+    let (leaked, _) = tiled_edge_chrome_count(&rt, (0, 0, 0, 0));
+    assert!(
+        leaked > 0,
+        "tiled edge chrome returns once the float is restored"
     );
 }
 

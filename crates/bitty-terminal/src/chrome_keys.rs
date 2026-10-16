@@ -7537,6 +7537,49 @@ claims = []
         );
     }
 
+    #[test]
+    fn mod_shift_number_reuses_existing_position_after_workspace_gap() {
+        // Issue #2177: numbered keyboard moves use the current workspace
+        // position. After ws2 closes, Mod+Shift+2 must move into existing ws3
+        // instead of creating a new ws2.
+        let mut app = workspace_test_app();
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert!(app.runtime.workspace_close_at(1).is_ok(), "close ws2");
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+
+        let moved = ViewId::new(52);
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = app
+            .runtime
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(moved, 80, 24)),
+        ));
+        assert!(app.runtime.set_focus(moved));
+
+        assert!(drive_mod_char(&mut app, "@", false, true, true, false));
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.focused_view(), Some(moved));
+        assert!(app.runtime.layout().leaf_ids().contains(&moved));
+    }
+
     // Live-spawn: real POSIX shells in two workspaces. `#[cfg(unix)]` keeps it
     // off Windows CI; `require_pty!()` keeps the force-no-PTY simulation path.
     // ConPTY coverage lives in bitty-pty/tests/spawn_windows.rs (CTX-0268).

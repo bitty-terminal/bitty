@@ -2130,7 +2130,8 @@ impl Runtime {
     }
 
     /// Move the focused window to workspace `one_based` (1-based display
-    /// index, `key` + `ctl` path). Returns `(moved_id, from_1based, to_1based)`.
+    /// position used by the keyboard path). Returns
+    /// `(moved_id, from_1based, to_1based)`.
     /// Auto-creates target workspace if it does not exist (CTX-0945).
     pub fn workspace_move_focused_to_one_based(
         &mut self,
@@ -2142,8 +2143,21 @@ impl Runtime {
         if one_based > MAX_WORKSPACES as u64 {
             return Err(format!("workspace index exceeds maximum {MAX_WORKSPACES}"));
         }
+        // The keyboard binding addresses the current numbered/display slot.
+        // Stable `ws:N` ids remain the control-plane contract, but using the
+        // sequence lookup first here makes a closed slot appear to be a
+        // missing target and creates a duplicate workspace (issue #2177).
+        if one_based <= self.workspaces.len() as u64 {
+            let target_idx = (one_based - 1) as usize;
+            let from = self.active_workspace.saturating_add(1);
+            let moved = self.workspace_move_focused_to(target_idx)?;
+            return Ok((moved, from, one_based as usize));
+        }
+        // Preserve the sparse-workspace keyboard policy for numbers beyond
+        // the current slot count: an existing stable sequence is reused;
+        // otherwise the explicit auto-create path below creates that target.
         if let Some(target_idx) = self.workspace_index_by_seq(one_based) {
-            let from = self.workspace_seq_at(self.active_workspace).unwrap_or(1) as usize;
+            let from = self.active_workspace.saturating_add(1);
             let moved = self.workspace_move_focused_to(target_idx)?;
             return Ok((moved, from, one_based as usize));
         }
@@ -3804,13 +3818,92 @@ mod tests {
     }
 
     #[test]
+    fn key_move_reuses_existing_display_position_after_workspace_gap() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_new().expect("ws3");
+        assert!(rt.workspace_switch(0), "return to ws1");
+        assert!(rt.workspace_close_at(1).is_ok(), "close ws2");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+
+        let focused = rt.focused_view().expect("focus");
+        let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(probe),
+            LayoutNode::leaf(View::new(ViewId::new(50), 40, 24)),
+        ));
+        assert!(rt.set_focus(ViewId::new(50)));
+
+        let count_before = rt.workspace_count();
+        let (moved, from, target) = rt
+            .workspace_move_focused_to_one_based(2)
+            .expect("position 2 must reuse ws3");
+        assert_eq!(moved, ViewId::new(50));
+        assert_eq!(from, 1);
+        assert_eq!(target, 2, "report the existing display position");
+        assert_eq!(rt.workspace_count(), count_before);
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(50)));
+        assert_eq!(rt.layout().leaf_count(), 2);
+
+        let leaves_before = rt.layout().leaf_ids();
+        let count_before_repeat = rt.workspace_count();
+        let repeated = rt
+            .workspace_move_focused_to_one_based(2)
+            .expect("repeating the target move is a no-op");
+        assert_eq!(repeated.0, ViewId::new(50));
+        assert_eq!(rt.workspace_count(), count_before_repeat);
+        assert_eq!(rt.layout().leaf_ids(), leaves_before);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(50)));
+    }
+
+    #[test]
+    fn key_move_creates_only_when_display_position_is_missing() {
+        let mut rt = fresh();
+        let focused = rt.focused_view().expect("focus");
+        let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
+        let moved_id = ViewId::new(51);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(probe),
+            LayoutNode::leaf(View::new(moved_id, 40, 24)),
+        ));
+        assert!(rt.set_focus(moved_id));
+
+        let (moved, from, target) = rt
+            .workspace_move_focused_to_one_based(3)
+            .expect("missing position 3 follows the auto-create policy");
+        assert_eq!(moved, moved_id);
+        assert_eq!(from, 1);
+        assert_eq!(target, 3);
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.focused_view(), Some(moved_id));
+        assert!(rt.layout().leaf_ids().contains(&moved_id));
+    }
+
+    #[test]
     fn non_consecutive_workspaces_query_and_jump() {
         let mut rt = fresh();
         // Build gaps via multi-leaf moves (issue #1803 keeps multi-leaf
         // sources, so the count grows; singleton moves would remove the
         // source instead). Each iteration splits ws1 to two leaves, moves
         // one leaf out, and returns to ws1 for the next split.
-        for target_seq in [5u64, 9, 3] {
+        for target_seq in [5u64, 9, 15] {
             // Split the active ws1 into two leaves.
             let focused = rt.focused_view().expect("focus");
             let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
@@ -3851,31 +3944,31 @@ mod tests {
             let ws1_idx = rt.workspace_index_by_seq(1).expect("ws1 survives");
             assert!(rt.workspace_switch(ws1_idx));
         }
-        // Workspaces should be sorted by seq: 1, 3, 5, 9
+        // Workspaces should be sorted by seq: 1, 5, 9, 15.
         assert_eq!(rt.workspace_count(), 4);
         assert_eq!(
             rt.workspace_names(),
             vec![
                 String::from("ws1"),
-                String::from("ws3"),
                 String::from("ws5"),
-                String::from("ws9")
+                String::from("ws9"),
+                String::from("ws15")
             ]
         );
         // After the last move we switched back to ws1 (seq 1).
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 1);
 
-        // Jump to non-consecutive workspace 5
+        // Jump to non-consecutive workspace 5.
         let jumped = rt.workspace_focus_clamped(5);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 5);
-        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.active_workspace_index(), 1);
 
-        // Jump to non-consecutive workspace 9
+        // Jump to non-consecutive workspace 9.
         let jumped = rt.workspace_focus_clamped(9);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 9);
-        assert_eq!(rt.active_workspace_index(), 3);
+        assert_eq!(rt.active_workspace_index(), 2);
     }
 
     #[test]

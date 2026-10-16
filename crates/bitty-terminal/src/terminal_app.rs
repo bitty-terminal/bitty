@@ -2378,12 +2378,28 @@ impl TerminalApp {
                     closed_any = true;
                     continue;
                 }
-                self.restore_zoom();
+                // Issue #2167: the exited pane may live outside the live
+                // layout (an inactive workspace stash, the scratchpad, or
+                // stashed floats). Surgery on the active tree would refuse
+                // it, and the old unconditional session teardown then
+                // stranded a session-less erased tile (empty bordered
+                // panel, cursor only, unusable ghost). Remove the leaf from
+                // its owning container instead, and only tear the session
+                // down once the leaf was actually released (or deliberately
+                // kept as a singleton-stash tile). A leaf in no container
+                // keeps its session: never strand a session-less live tile.
                 let mut layout = self.runtime.layout().clone();
                 if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
+                    self.restore_zoom();
                     self.runtime.set_layout_closing(layout, view);
+                    self.runtime.close_pane_session(&view);
+                } else if self.runtime.remove_stashed_view(view) {
+                    self.runtime.close_pane_session(&view);
+                } else {
+                    eprintln!(
+                        "warning: pane shell {view:?} exited but its leaf is in no layout — session kept"
+                    );
                 }
-                self.runtime.close_pane_session(&view);
                 self.push_pending_exit(view.0, status.code());
                 closed_any = true;
             }

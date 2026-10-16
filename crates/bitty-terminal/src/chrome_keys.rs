@@ -603,42 +603,13 @@ pub(crate) fn split_focused_leaf(
 
 /// Remove the focused leaf, promoting its sibling. Refuses the last leaf so
 /// the layout is never stranded empty. Returns false when refused or missing.
+///
+/// Thin alias over [`bitty_runtime::remove_leaf`]: the single shared
+/// leaf-removal semantics for live close paths and stashed teardown
+/// (issue #2167) live in `bitty-ui`; this wrapper keeps existing call
+/// sites stable.
 pub(crate) fn close_focused_leaf(layout: &mut LayoutNode, focused: ViewId) -> bool {
-    match layout {
-        LayoutNode::Leaf(_) => false,
-        LayoutNode::Split { first, second, .. } => {
-            if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
-                let sibling = (**second).clone();
-                *layout = sibling;
-                true
-            } else if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
-                let sibling = (**first).clone();
-                *layout = sibling;
-                true
-            } else if close_focused_leaf(first, focused) {
-                true
-            } else {
-                close_focused_leaf(second, focused)
-            }
-        }
-        LayoutNode::Stack(children) => {
-            if let Some(pos) = children
-                .iter()
-                .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == focused))
-            {
-                if children.len() <= 1 {
-                    return false;
-                }
-                children.remove(pos);
-                true
-            } else {
-                children.iter_mut().any(|c| close_focused_leaf(c, focused))
-            }
-        }
-        LayoutNode::Overlay { base, overlay, .. } => {
-            close_focused_leaf(base, focused) || close_focused_leaf(overlay, focused)
-        }
-    }
+    bitty_runtime::remove_leaf(layout, focused)
 }
 
 /// Record a candidate resize target: path to the deepest split whose axis
@@ -976,13 +947,14 @@ impl TerminalApp {
             .zoom
             .backup_leaf_count(&self.runtime)
             .unwrap_or_else(|| self.runtime.window_leaf_count());
-        // Zoom backup counts layout leaves only; add live floats/pins that
-        // the backup predates (issue #2141). The non-zoom path already
-        // includes them via `window_leaf_count`.
+        // Zoom backup counts layout leaves only; add live floats/pins (and
+        // the scratchpad slot, issue #2167) that the backup predates. The
+        // non-zoom path already includes them via `window_leaf_count`.
         if self.chrome.zoom.backup_leaf_count(&self.runtime).is_some() {
             active
                 + self.runtime.floated_count()
                 + self.runtime.pinned_count()
+                + self.runtime.scratchpad_count()
                 + self.runtime.inactive_workspaces_leaf_count()
         } else {
             active

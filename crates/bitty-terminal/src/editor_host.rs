@@ -572,11 +572,19 @@ impl TerminalApp {
             // CTX-0359: an explicit close is the only layout change allowed
             // to re-home the primary owner.
             self.runtime.set_layout_closing(layout, session.view);
-        }
-        // CTX-0176: tear down the closed leaf's shell (drop kills + reaps
-        // the child; no-op when it never owned one).
-        if self.runtime.close_pane_session(&session.view) {
-            eprintln!("bitty: external editor pane {:?} torn down", session.view);
+            // CTX-0176: tear down the closed leaf's shell (drop kills + reaps
+            // the child; no-op when it never owned one). Guarded on the
+            // removal (issue #2167): tearing down a leaf the surgery refused
+            // would strand a session-less erased tile; the next reap pass
+            // releases it from its owning container instead.
+            if self.runtime.close_pane_session(&session.view) {
+                eprintln!("bitty: external editor pane {:?} torn down", session.view);
+            }
+        } else {
+            eprintln!(
+                "warning: external editor pane {:?} resisted layout removal — session kept for the reap pass",
+                session.view
+            );
         }
         if self
             .runtime

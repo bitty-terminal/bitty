@@ -11,13 +11,15 @@
 //!   `TERM_PROGRAM=bitty`, and caller additions via [`PtyBuilder::env`])
 //!   override.
 //! - **Graphics-fingerprint sanitization (CTX-0194).** Inherited markers that
-//!   claim graphics capabilities bitty lacks are stripped at spawn time (see
-//!   [`GRAPHICS_FINGERPRINT_PREFIXES`], [`GRAPHICS_FINGERPRINT_EXACT_KEYS`],
-//!   and [`should_strip_graphics_fingerprint`]); `TERM_PROGRAM` is overridden
-//!   to [`DEFAULT_TERM_PROGRAM`] so terminfo/term-DB probes (e.g. chafa)
-//!   fall back to symbols instead of emitting Kitty-graphics APC that bitty
-//!   renders blank. Caller-explicit [`PtyBuilder::env`] entries are applied
-//!   after sanitization and therefore win.
+//!   claim the *outer* terminal's graphics capabilities are stripped at spawn
+//!   time (see [`GRAPHICS_FINGERPRINT_PREFIXES`],
+//!   [`GRAPHICS_FINGERPRINT_EXACT_KEYS`], and
+//!   [`should_strip_graphics_fingerprint`]); `TERM_PROGRAM` is overridden
+//!   to [`DEFAULT_TERM_PROGRAM`] so detectors identify bitty itself and use
+//!   query-based capability detection (kitty `a=q`, XTWINOPS, DA1) instead
+//!   of attributing the outer terminal's graphics to the child.
+//!   Caller-explicit [`PtyBuilder::env`] entries are applied after
+//!   sanitization and therefore win.
 //! - **Bounded configuration.** Argument count/size and allowlist size/value
 //!   length are capped so a misconfigured caller cannot smuggle unbounded
 //!   data into spawn.
@@ -64,9 +66,11 @@ pub const DEFAULT_COLORTERM: &str = "truecolor";
 /// Default `TERM_PROGRAM` value set in the child environment.
 ///
 /// Overriding the inherited `TERM_PROGRAM` (e.g. `ghostty`, `kitty`,
-/// `WezTerm`) prevents term-DB probes from assuming Kitty-graphics support
-/// bitty lacks (CTX-0194, chafa blank). A caller-explicit
-/// `PtyBuilder::env("TERM_PROGRAM", …)` still wins.
+/// `WezTerm`) keeps detectors from attributing the outer terminal's identity
+/// and graphics to bitty children (CTX-0194): with `TERM_PROGRAM=bitty`,
+/// name-based term-DB probes see bitty itself while query-based probes
+/// (kitty `a=q`, XTWINOPS, DA1) detect bitty's own bounded kitty support.
+/// A caller-explicit `PtyBuilder::env("TERM_PROGRAM", …)` still wins.
 pub const DEFAULT_TERM_PROGRAM: &str = "bitty";
 
 /// Advisory IPC socket variable injected into PTY children (CTX-1117,
@@ -125,10 +129,11 @@ pub fn bitty_socket_inject_value_with_outer(
 
 /// Inherited key prefixes stripped at spawn time (CTX-0194).
 ///
-/// Every variable whose name starts with one of these prefixes claims a host
-/// terminal with graphics capabilities bitty does not implement, so keeping
-/// it would mislead term-DB probes (e.g. chafa term-DB matching `ghostty`
-/// over `xterm-256color` and emitting Kitty APC):
+/// Every variable whose name starts with one of these prefixes claims the
+/// outer terminal's graphics capabilities, so keeping it would mislead
+/// detectors into attributing outer capabilities to bitty children instead
+/// of detecting bitty's own (e.g. chafa term-DB matching `ghostty` over
+/// `xterm-256color` and emitting graphics for the outer terminal):
 ///
 /// - `GHOSTTY_*`: Ghostty resources / bin dir / shell-integration flags.
 /// - `WEZTERM_*`: WezTerm pane / socket / executable markers.
@@ -138,16 +143,18 @@ pub const GRAPHICS_FINGERPRINT_PREFIXES: &[&str] = &["GHOSTTY_", "WEZTERM_", "KI
 /// Inherited exact keys stripped at spawn time (CTX-0194).
 ///
 /// Documented, minimal, fail-safe: only keys proven (or directly companion
-/// to proven) to advertise graphics bitty lacks. Functional environment
-/// (`PATH`, `HOME`, `TERM`, `COLORTERM`, `SHELL`, `LANG`, …) is never listed.
+/// to proven) to advertise the outer terminal's graphics. Functional
+/// environment (`PATH`, `HOME`, `TERM`, `COLORTERM`, `SHELL`, `LANG`, …)
+/// is never listed.
 ///
 /// - `KITTY_PID`, `KITTY_WINDOW_ID`, `KITTY_LISTEN_ON`, `KITTY_PUBLIC_KEY`:
 ///   explicit Kitty markers (also covered by the `KITTY_` prefix; listed
 ///   here for auditability).
 /// - `VTE_VERSION`: VTE/VTE-based terminals advertise SIXEL in recent
-///   versions; bitty implements neither SIXEL nor Kitty-graphics.
+///   versions; bitty implements bounded Kitty-graphics and no SIXEL, so an
+///   inherited marker would misreport the child's graphics.
 /// - `ITERM_SESSION_ID`, `ITERM_PROFILE`: iTerm2 session markers (iTerm2
-///   supports inline images bitty lacks).
+///   announces inline images bitty does not implement).
 /// - `LC_TERMINAL`, `LC_TERMINAL_VERSION`: iTerm2 announces itself here;
 ///   not locale data (`LANG`/`LC_ALL`/`LC_CTYPE` stay untouched).
 /// - `TERM_PROGRAM_VERSION`: companion to `TERM_PROGRAM`; the parent

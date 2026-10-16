@@ -866,3 +866,49 @@ fn idle_runtime_holds_no_bytes_in_bounded_stores() {
         "no fx pulse armed at idle"
     );
 }
+
+/// #2131: yazi's KgpOld driver flow must display, paint, and erase through
+/// raw PTY bytes with no manual flags.
+///
+/// With an unknown brand yazi picks KgpOld and emits `a=T` transmit+display
+/// (`C=1` keeps the cursor, `q=2` stays quiet, `z=-1` sits behind text)
+/// followed by `a=d,d=A` erases. This pins the wire half of kitty-by-default:
+/// the probe battery (see `terminal_queries::yazi_probe_battery`) selects
+/// the driver, this test proves the driver paints.
+#[test]
+fn yazi_kgpold_display_paints_and_erases() {
+    let mut rt = make_runtime();
+    // yazi move_lock equivalent: cursor home before the transmit.
+    rt.handle_pty_bytes(b"\x1b[H");
+    // 2x2 opaque red RGBA (`f=32`) in two chunks, yazi's exact control keys.
+    rt.handle_pty_bytes(b"\x1b_Gq=2,a=T,z=-1,C=1,f=32,s=2,v=2,m=1;/wAA//8AAP//\x1b\\");
+    rt.handle_pty_bytes(b"\x1b_Gm=0;AAD//wAA/w==\x1b\\");
+    assert_eq!(rt.kitty_image_count(), 1, "a=T must store the image");
+    assert_eq!(rt.kitty_placement_count(), 1, "a=T must place it");
+    assert!(
+        rt.take_replies().is_empty(),
+        "q=2 must suppress transmit replies"
+    );
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        (cursor.col, cursor.row),
+        (0, 0),
+        "C=1 must keep the cursor home"
+    );
+    let stats = rt.tick().expect("display must force a present");
+    assert!(stats.images >= 1, "tick must paint the image");
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    let rgba = rt.headless_rgba().expect("frame must render");
+    assert!(
+        rgba.iter().any(|b| *b != 0),
+        "painted frame must contain image pixels"
+    );
+    // yazi image_erase for KgpOld: delete everything visible.
+    rt.handle_pty_bytes(b"\x1b_Gq=2,a=d,d=A\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 0, "erase-all must clear");
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "erase removes placement, keeps image"
+    );
+}

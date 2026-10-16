@@ -1930,10 +1930,14 @@ impl Runtime {
     /// post-commit echo deadline (CTX-0783).
     #[allow(clippy::explicit_counter_loop)]
     pub fn handle_ime_commit_at(&mut self, text: String, now: std::time::Instant) {
+        // CTX-1267 (#2142b): whether this commit ends a real composition.
+        // A commit with no composition behind it is unsolicited and owns no
+        // key; its trailing space (if any) is deliberate user input.
+        let was_armed = !matches!(self.ime_key_claim, ImeKeyClaim::Free);
         // Bounded before allocation (TXT-11)
         let bytes_len = text.len();
         let char_count = text.chars().count();
-        let bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
+        let mut bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
             let mut out = String::new();
             let mut bytes = 0usize;
             let mut chars = 0usize;
@@ -1950,6 +1954,15 @@ impl Runtime {
         } else {
             text
         };
+        // CTX-1267 (#2142b): fcitx5 Space-commit carries the committing
+        // Space inside the commit text on some builds, so every composed
+        // string arrives with a trailing ASCII space. Trim exactly one
+        // trailing space for real compositions (claim armed); unsolicited
+        // commits preserve verbatim (Terminal Truth: a deliberate trailing
+        // space inside the commit survives).
+        if was_armed && bounded.ends_with(' ') {
+            bounded.pop();
+        }
         // CTX-0783: a commit ends the gesture, and the raw copy of the key
         // that produced it is still in flight — hold the one-shot claim so it
         // cannot re-enter the PTY. Whether the commit carries text decides

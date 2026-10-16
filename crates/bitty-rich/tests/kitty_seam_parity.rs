@@ -418,3 +418,364 @@ fn seam_backend_is_stateless_and_shared() {
         Ok(img)
     );
 }
+
+#[test]
+fn seam_empty_payload_rejected_first() {
+    // Empty input fails closed before any format or dimension check, on
+    // both entry points and both spellings (trait + free `u32`).
+    let back = backend();
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Png, None, None, &[]),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgb, Some(1), Some(1), &[]),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+    assert_eq!(
+        back.decode_transmit_owned(
+            KittyTransmitFormat::Png,
+            None,
+            None,
+            Vec::new().into_boxed_slice()
+        ),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+    assert_eq!(
+        back.decode_transmit_owned(
+            KittyTransmitFormat::Rgba,
+            Some(1),
+            Some(1),
+            Vec::new().into_boxed_slice()
+        ),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+    assert_eq!(
+        decode_kitty_payload(100, None, None, &[]),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+    assert_eq!(
+        bitty_rich::kitty_decode::decode_kitty_payload_owned(
+            32,
+            Some(1),
+            Some(1),
+            Vec::new().into_boxed_slice()
+        ),
+        Err(KittyDecodeError::EmptyPayload)
+    );
+}
+
+#[test]
+fn seam_raw_requires_both_dimensions() {
+    // Raw formats need both `s` and `v`; anything less fails closed.
+    let back = backend();
+    let payload = [0_u8; 12];
+    for format in [KittyTransmitFormat::Rgb, KittyTransmitFormat::Rgba] {
+        assert_eq!(
+            back.decode_transmit(format, None, None, &payload),
+            Err(KittyDecodeError::MissingDimensions)
+        );
+        assert_eq!(
+            back.decode_transmit(format, Some(2), None, &payload),
+            Err(KittyDecodeError::MissingDimensions)
+        );
+        assert_eq!(
+            back.decode_transmit(format, None, Some(2), &payload),
+            Err(KittyDecodeError::MissingDimensions)
+        );
+    }
+    assert_eq!(
+        decode_kitty_payload(24, None, None, &payload),
+        Err(KittyDecodeError::MissingDimensions)
+    );
+    assert_eq!(
+        decode_kitty_payload(32, Some(2), None, &payload),
+        Err(KittyDecodeError::MissingDimensions)
+    );
+}
+
+#[test]
+fn seam_zero_dimension_rejected() {
+    // Zero in either axis fails closed (raw params and PNG `IHDR` share
+    // the variant); bounds run before the length check.
+    let back = backend();
+    let payload = [0_u8; 4];
+    for (w, h) in [(0, 1), (1, 0), (0, 0)] {
+        assert_eq!(
+            back.decode_transmit(KittyTransmitFormat::Rgba, Some(w), Some(h), &payload),
+            Err(KittyDecodeError::ZeroDimension),
+            "{w}x{h}"
+        );
+        assert_eq!(
+            decode_kitty_payload(32, Some(w), Some(h), &payload),
+            Err(KittyDecodeError::ZeroDimension),
+            "{w}x{h}"
+        );
+    }
+    assert_eq!(
+        back.decode_transmit_owned(
+            KittyTransmitFormat::Rgba,
+            Some(0),
+            Some(1),
+            vec![0_u8; 4].into_boxed_slice()
+        ),
+        Err(KittyDecodeError::ZeroDimension)
+    );
+}
+
+#[test]
+fn seam_oversize_side_rejected_before_alloc() {
+    // 100_000 x 100_000 would need tens of gigabytes; the side cap fires
+    // on a 4-byte payload, proving bounds run before allocation.
+    let back = backend();
+    assert_eq!(
+        back.decode_transmit(
+            KittyTransmitFormat::Rgb,
+            Some(100_000),
+            Some(100_000),
+            &[0; 4]
+        ),
+        Err(KittyDecodeError::DimensionsTooLarge {
+            width: 100_000,
+            height: 100_000,
+            cap: 8192,
+        })
+    );
+    assert_eq!(
+        decode_kitty_payload(24, Some(100_000), Some(100_000), &[0; 4]),
+        Err(KittyDecodeError::DimensionsTooLarge {
+            width: 100_000,
+            height: 100_000,
+            cap: 8192,
+        })
+    );
+    // The boundary itself is admitted: 8192 x 1 RGBA decodes from an
+    // exactly-sized payload, while 8193 x 1 is refused.
+    let wide = vec![0x7F_u8; 8192 * 4];
+    let img = back
+        .decode_transmit(KittyTransmitFormat::Rgba, Some(8192), Some(1), &wide)
+        .expect("8192-wide row admits");
+    assert_eq!((img.width, img.height), (8192, 1));
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgba, Some(8193), Some(1), &[0; 4]),
+        Err(KittyDecodeError::DimensionsTooLarge {
+            width: 8193,
+            height: 1,
+            cap: 8192,
+        })
+    );
+    assert_eq!(
+        back.decode_transmit_owned(
+            KittyTransmitFormat::Rgb,
+            Some(9000),
+            Some(1),
+            vec![0_u8; 4].into_boxed_slice()
+        ),
+        Err(KittyDecodeError::DimensionsTooLarge {
+            width: 9000,
+            height: 1,
+            cap: 8192,
+        })
+    );
+}
+
+#[test]
+fn seam_over_area_rejected_before_alloc() {
+    // 5000 x 5000 = 25M px > 16_777_216 cap; the area check fires on an
+    // 8-byte payload, before the length check could allocate.
+    let back = backend();
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgba, Some(5000), Some(5000), &[0; 8]),
+        Err(KittyDecodeError::TooManyPixels {
+            pixels: 25_000_000,
+            cap: 16_777_216,
+        })
+    );
+    assert_eq!(
+        decode_kitty_payload(32, Some(5000), Some(5000), &[0; 8]),
+        Err(KittyDecodeError::TooManyPixels {
+            pixels: 25_000_000,
+            cap: 16_777_216,
+        })
+    );
+    // The area boundary itself passes the area check: 8192 x 2048 is
+    // exactly 16_777_216 px, so a short payload falls through to the exact
+    // length check with the pinned expected size (67_108_864 bytes).
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgba, Some(8192), Some(2048), &[0; 4]),
+        Err(KittyDecodeError::LengthMismatch {
+            expected: 67_108_864,
+            actual: 4,
+        })
+    );
+}
+
+#[test]
+fn seam_length_mismatch_reports_exact_sizes() {
+    // 2x1 RGB needs exactly 6 bytes; short and long both fail closed with
+    // the exact sizes pinned.
+    let back = backend();
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgb, Some(2), Some(1), &[0; 5]),
+        Err(KittyDecodeError::LengthMismatch {
+            expected: 6,
+            actual: 5
+        })
+    );
+    assert_eq!(
+        back.decode_transmit(KittyTransmitFormat::Rgb, Some(2), Some(1), &[0; 7]),
+        Err(KittyDecodeError::LengthMismatch {
+            expected: 6,
+            actual: 7
+        })
+    );
+    assert_eq!(
+        decode_kitty_payload(24, Some(2), Some(1), &[0; 5]),
+        Err(KittyDecodeError::LengthMismatch {
+            expected: 6,
+            actual: 5
+        })
+    );
+}
+
+#[test]
+fn seam_owned_matches_borrowed() {
+    // RGB expansion is byte-identical across entry points.
+    let back = backend();
+    let raw_rgb = [10_u8, 20, 30, 40, 50, 60];
+    let borrowed = back
+        .decode_transmit(KittyTransmitFormat::Rgb, Some(2), Some(1), &raw_rgb)
+        .expect("borrowed rgb");
+    let owned = back
+        .decode_transmit_owned(
+            KittyTransmitFormat::Rgb,
+            Some(2),
+            Some(1),
+            raw_rgb.to_vec().into_boxed_slice(),
+        )
+        .expect("owned rgb");
+    assert_eq!(borrowed, owned);
+    assert_eq!(owned.rgba, vec![10, 20, 30, 0xFF, 40, 50, 60, 0xFF]);
+    // RGBA passthrough is byte-identical across entry points.
+    let raw_rgba = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+    let borrowed = back
+        .decode_transmit(KittyTransmitFormat::Rgba, Some(2), Some(1), &raw_rgba)
+        .expect("borrowed rgba");
+    let owned = back
+        .decode_transmit_owned(
+            KittyTransmitFormat::Rgba,
+            Some(2),
+            Some(1),
+            raw_rgba.to_vec().into_boxed_slice(),
+        )
+        .expect("owned rgba");
+    assert_eq!(borrowed, owned);
+    assert_eq!(owned.rgba, raw_rgba);
+    // PNG decodes identically through both entry points, and agrees with
+    // the free functions.
+    let borrowed_png = back
+        .decode_transmit(KittyTransmitFormat::Png, None, None, PNG_1X1_RGBA_RED)
+        .expect("borrowed png");
+    let owned_png = back
+        .decode_transmit_owned(
+            KittyTransmitFormat::Png,
+            None,
+            None,
+            PNG_1X1_RGBA_RED.to_vec().into_boxed_slice(),
+        )
+        .expect("owned png");
+    assert_eq!(borrowed_png, owned_png);
+    assert_eq!(
+        borrowed_png,
+        decode_kitty_payload(100, None, None, PNG_1X1_RGBA_RED).expect("free fn agrees")
+    );
+}
+
+#[test]
+fn seam_raster_fails_closed_extended() {
+    // Over-cap output is refused before allocation (9000x9000x4 = 324 MB).
+    let back = backend();
+    let image = solid_red_2x2();
+    let big = RectPx::new(0, 0, 9000, 9000);
+    assert_eq!(back.rasterize_placed(&image, big), None);
+    assert_eq!(rasterize_kitty(&image, big), None);
+    assert_eq!(back.rasterize_placed_clipped(&image, big, big), None);
+    assert_eq!(rasterize_kitty_clipped(&image, big, big), None);
+    // Corrupt carriers fail closed: short pixel buffer, zero dimensions.
+    let short = KittyPlacedImage {
+        id: KittyImageId(3),
+        generation: 1,
+        origin: None,
+        wire_image: 0,
+        width: 2,
+        height: 2,
+        rgba: vec![0xFF; 8],
+        frames: Vec::new(),
+        compressed_len: 8,
+    };
+    let full = RectPx::new(0, 0, 2, 2);
+    assert_eq!(back.rasterize_placed(&short, full), None);
+    assert_eq!(rasterize_kitty(&short, full), None);
+    let flat = KittyPlacedImage {
+        id: KittyImageId(4),
+        generation: 1,
+        origin: None,
+        wire_image: 0,
+        width: 0,
+        height: 0,
+        rgba: Vec::new(),
+        frames: Vec::new(),
+        compressed_len: 0,
+    };
+    assert_eq!(back.rasterize_placed(&flat, full), None);
+    // Visible outside full is a caller bug: nothing paints.
+    assert_eq!(
+        back.rasterize_placed_clipped(&image, full, RectPx::new(0, 2, 2, 2)),
+        None
+    );
+    assert_eq!(
+        back.rasterize_frame(0, 1, &image.rgba, full, RectPx::new(0, 0, 1, 1)),
+        None
+    );
+    assert_eq!(
+        back.rasterize_frame(2, 1, &[0xFF; 3], full, RectPx::new(0, 0, 1, 1)),
+        None
+    );
+}
+
+#[test]
+fn seam_end_to_end_decode_then_rasterize() {
+    // The host round trip through the seam: decode raw RGBA, store the
+    // carrier, rasterize the identity rect, get the decoded bytes back.
+    let back = backend();
+    let payload = [0x11_u8, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF];
+    let decoded = back
+        .decode_transmit(KittyTransmitFormat::Rgba, Some(2), Some(1), &payload)
+        .expect("decode 2x1 rgba");
+    assert_eq!((decoded.width, decoded.height), (2, 1));
+    let image = KittyPlacedImage {
+        id: KittyImageId(9),
+        generation: 1,
+        origin: None,
+        wire_image: 0,
+        width: decoded.width,
+        height: decoded.height,
+        rgba: decoded.rgba.clone(),
+        frames: Vec::new(),
+        compressed_len: payload.len(),
+    };
+    assert_eq!(image.id.as_u64(), 9);
+    let rect = RectPx::new(0, 0, 2, 1);
+    let blit = back
+        .rasterize_placed(&image, rect)
+        .expect("identity rasterizes");
+    assert_eq!(blit, payload);
+    assert_eq!(
+        back.rasterize_placed_clipped(&image, rect, rect),
+        Some(blit.clone())
+    );
+    assert_eq!(
+        back.rasterize_frame(2, 1, &decoded.rgba, rect, rect),
+        Some(blit)
+    );
+}

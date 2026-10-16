@@ -1977,9 +1977,9 @@ impl Runtime {
         // CTX-0248 / CTX-0254 / #1550: Kitty alternate-screen tracking across all
         // visible allocations. An alternate-screen transition on any visible origin
         // forces a full present even when the grid generation is unchanged, so
-        // entering alt clears that origin's painted images (and leaving alt repaints
+        // entering alt hides that origin's painted images (and leaving alt repaints
         // the restored grid) instead of idling on a stale frame. Other origins are
-        // untouched (CTX-0254 `clear_origin`).
+        // untouched (CTX-0254 per-origin latch).
         let mut current_alt_screens = std::collections::BTreeSet::new();
         for frame in &allocations {
             let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
@@ -2004,8 +2004,15 @@ impl Runtime {
         if current_alt_screens != self.kitty_alt_screens_latched {
             // Delete-wins sequencing (CTX-1110 fix pass, CodeRabbit Major):
             // bump once when an origin newly enters the alternate screen so
-            // a transmit pending across the enter cycle drops as stale (sync
-            // order stores, clears, then exits with absent). Never bump on
+            // a transmit pending across the enter cycle drops as stale.
+            // Placements are retained across the alt session (#2132):
+            // terminal truth scopes its alt switch to the alt screen, so
+            // main-screen placements (and the decoded images behind them,
+            // which stay inert under the store caps) survive underneath;
+            // the paint path below skips blits while alt is active, and
+            // every display seam suppresses new placements on alt
+            // (`SuppressedAlternateScreen`), so leaving alt repaints the
+            // retained mains with nothing stale to clear. Never bump on
             // every presented frame: while alt stays active each tick would
             // advance the epoch past an in-flight transmit's stamp and drop
             // every alt-screen local transmit silently.
@@ -2015,19 +2022,6 @@ impl Runtime {
                 .collect();
             for origin in entering {
                 self.bump_kitty_local_delete_epoch(origin);
-                // CTX-1231 review: clear the entering origin's placements
-                // at observation time (pre-gate), mirroring the paint-phase
-                // clear below. An enter+leave inside one coalescing
-                // interval never paints while alt is active, so a
-                // paint-phase-only clear would leave stale placements on
-                // the deadline frame. Idempotent: the paint-phase clear
-                // re-runs the same guard on presented alt frames.
-                if !self.kitty_images.placement_for_origin_is_empty(origin) {
-                    self.kitty_images.clear_origin(origin);
-                    // S6 (#1849): placements are gone, so their cached
-                    // blits are dead budget; drop them (images stay inert).
-                    self.invalidate_kitty_raster_cache();
-                }
             }
             self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
@@ -4212,22 +4206,15 @@ impl Runtime {
             };
 
             if alt_active {
-                // Delete-wins sequencing (CTX-1110 fix pass): alt entry
-                // clears this origin's placements, so a transmit pending
-                // across the enter cycle must not resurrect afterwards
-                // (sync order stores, clears, then exits with absent). The
-                // delete epoch is bumped once on alt entry in
-                // `collect_tick_basis` (latch diff), never here: bumping on
-                // every presented frame would advance past an in-flight
-                // alt-screen transmit's stamp and drop it silently.
-                // Unconditional clear: a pending transmit may exist while
-                // nothing is placed yet.
-                if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
-                    self.kitty_images.clear_origin(pane_origin);
-                    // S6 (#1849): placements are gone, so their cached
-                    // blits are dead budget; drop them (images stay inert).
-                    self.invalidate_kitty_raster_cache();
-                }
+                // #2132: while alt is active this origin paints no image
+                // blits (the fullscreen app owns the pixels), but its
+                // placements are retained: terminal truth scopes the alt
+                // switch to the alt screen, so main-screen placements stay
+                // valid underneath and repaint on leave. New placements
+                // cannot appear here: every display seam suppresses on alt
+                // (`SuppressedAlternateScreen`), and in-flight async
+                // transmits carry a pre-entry epoch stamp that the
+                // entry bump in `collect_tick_basis` already invalidated.
                 continue;
             }
 
@@ -5724,13 +5711,14 @@ mod present_coalescing_tests {
     }
 
     #[test]
-    fn alt_enter_leave_across_deferred_ticks_clears_placements() {
-        // CodeRabbit PR #2094 Minor: the alternate-screen entry placement
-        // clear used to live only in the paint phase. With entry observed
-        // on one deferred tick and the leave on the next, no tick ever
-        // paints while alt is active, so the deadline frame would show
-        // stale placements an uncoalesced run had cleared. The clear now
-        // runs at entry observation (pre-gate).
+    fn alt_enter_leave_across_deferred_ticks_retains_placements() {
+        // #2132: main-screen kitty placements survive an alternate-screen
+        // cycle. Terminal truth scopes its alt switch to the alt screen,
+        // so the rich placements stay valid underneath; the paint path
+        // skips blits while alt is active and repaints them on leave.
+        // With entry observed on one deferred tick and the leave on the
+        // next, no tick ever paints while alt is active, so the deadline
+        // frame must show the retained image, not a cleared plane.
         //
         // (Enter+leave inside a single PTY batch is latch-invisible with
         // or without coalescing — pre-existing parity, out of scope here.)
@@ -5748,8 +5736,8 @@ mod present_coalescing_tests {
         );
         assert_eq!(
             rt.kitty_placement_count(),
-            0,
-            "alt entry must clear placements even when the tick defers"
+            1,
+            "alt entry must retain main-screen placements"
         );
         rt.handle_pty_bytes(b"\x1b[?1049l");
         assert!(
@@ -5759,8 +5747,36 @@ mod present_coalescing_tests {
         let stats = rt
             .tick_at(t0 + INTERVAL)
             .expect("deadline tick must present");
-        assert_eq!(stats.images, 0, "deadline frame must paint no stale blit");
-        assert_eq!(rt.kitty_placement_count(), 0);
+        assert_eq!(stats.images, 1, "deadline frame must repaint the image");
+        assert_eq!(rt.kitty_placement_count(), 1);
+    }
+
+    #[test]
+    fn alt_cycle_hides_while_active_and_restores_on_leave() {
+        // #2132 repro shape (`chafa -f kitty` image, then a TUI app runs
+        // and exits): the image paints before, hides while the fullscreen
+        // app owns the pixels, and repaints after — never silently lost.
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        settle(&mut rt, t0);
+        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+            .expect("admissible payload must place");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(1))
+            .expect("image tick must present");
+        assert_eq!(stats.images, 1, "main-screen image must paint");
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(2))
+            .expect("alt-entry tick must present");
+        assert_eq!(stats.images, 0, "no blit while alt is active");
+        assert_eq!(rt.kitty_placement_count(), 1, "placements retained");
+        rt.handle_pty_bytes(b"\x1b[?1049l");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(3))
+            .expect("alt-leave tick must present");
+        assert_eq!(stats.images, 1, "image must survive the TUI cycle");
+        assert_eq!(rt.kitty_placement_count(), 1);
     }
 
     #[test]

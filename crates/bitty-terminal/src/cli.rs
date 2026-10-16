@@ -39,12 +39,6 @@ pub(crate) struct Args {
     /// with a non-zero exit code (CTX-0481, issue #762). The default keeps
     /// the documented fail-soft path where headless smoke still ticks.
     pub(crate) fail_loud: bool,
-    /// When true (`--mascot`) print the Bittie mascot art to stdout and
-    /// exit 0 (issue #1318, CTX-0729). Local class: no config, no
-    /// instance, no plugin VM, no network, no stdin read; also records
-    /// the first-run splash marker best-effort so a later normal launch
-    /// does not repeat the greeting.
-    pub(crate) mascot: bool,
     /// When true (`--no-splash`) suppress the first-run mascot splash for
     /// one normal launch without touching the marker file.
     pub(crate) no_splash: bool,
@@ -420,7 +414,6 @@ impl Args {
             test_mode: false,
             safe: false,
             fail_loud: false,
-            mascot: false,
             no_splash: false,
             help: false,
             version: false,
@@ -611,7 +604,6 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - `--fail-loud` → a failed requested startup step (shell spawn, pane
 ///   shells, IPC servo) aborts with a non-zero exit code instead of the
 ///   default fail-soft warning path (CTX-0481; also `BITTY_FAIL_LOUD=1`)
-/// - `--mascot` → print the Bittie mascot art and exit 0 (#1318)
 /// - `--no-splash` → suppress the first-run mascot splash for one launch
 /// - `--split [AXIS]` → split layout (AXIS = horizontal|h / vertical|v, default horizontal)
 /// - `--split=AXIS[:RATIO]` → split with optional ratio
@@ -1036,10 +1028,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--fail-loud" => {
                 out.fail_loud = true;
-                i += 1;
-            }
-            "--mascot" => {
-                out.mascot = true;
                 i += 1;
             }
             "--no-splash" => {
@@ -2024,7 +2012,6 @@ pub(crate) fn help_text() -> String {
                --fail-loud  Fail-loud startup: a failed shell/pane spawn or\n  \
                             IPC servo aborts with a non-zero exit code\n  \
                             instead of the default fail-soft warning path\n  \
-               --mascot      Print the Bittie mascot art and exit\n  \
                --no-splash   Suppress the first-run mascot splash once\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
@@ -2093,7 +2080,7 @@ pub(crate) fn help_text() -> String {
                              creates parents + starter when missing, never\n  \
                              overwrites existing content\n  \
              init [--yes] [--force] [VALUE FLAGS]  Opt-in guided setup wizard\n  \
-                              (never auto-runs): mascot greeting, shell/theme/\n  \
+                              (never auto-runs): shell/theme/\n  \
                               font family+size/decoration gaps+border+radius/\n  \
                               scrollback/close_confirm picks, vim keybinding\n  \
                               preset, writes init.lua with shipped keys only.\n  \
@@ -2278,7 +2265,6 @@ pub(crate) fn help_text_short(color: bool) -> String {
                --log-level LEVEL       Stderr level: error|warn|info|debug|trace (default warn)\n  \
                --headless              Run a single headless tick smoke and exit (CI)\n  \
                --safe                  Safe mode: no third-party plugins, built-in safe config\n  \
-               --mascot                Print the Bittie mascot art and exit\n  \
                --no-splash             Suppress the first-run mascot splash once\n  \
                --config PATH           Explicit user config file (init.lua)\n  \
                --profile NAME          Named profile layered under the user file\n  \

@@ -1,9 +1,9 @@
-//! Binary-level `--mascot` / `--no-splash` proof (issue #1318, CTX-0729).
+//! Binary-level `--no-splash` proof plus the #2135 `--mascot` removal proof.
 //!
-//! `--mascot` prints the vendored Bittie art to stdout and exits 0 without
-//! touching config, instances, or the plugin VM; it records the first-run
-//! splash marker best-effort. `--no-splash` parses and is advertised in
-//! `--help`. These tests drive the built `bitty` binary via
+//! `--no-splash` parses and is advertised in `--help`; the first-run splash
+//! itself is untouched. `--mascot` was removed in 0.0.24: the flag is now an
+//! unknown pre-`--` flag (rejected fail-closed, exit 2) and no help surface
+//! advertises it. These tests drive the built `bitty` binary via
 //! `CARGO_BIN_EXE_bitty` with an isolated `XDG_DATA_HOME`/`HOME` so the
 //! host marker state is never read or written.
 
@@ -16,7 +16,7 @@ const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
 /// Fresh isolated scratch root (data home + HOME).
 fn scratch_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "bitty-ctx0729-{tag}-{}-{}",
+        "bitty-ctx1265-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -27,8 +27,7 @@ fn scratch_root(tag: &str) -> PathBuf {
     dir
 }
 
-/// Runs `bitty <args>` with isolated data/config roots and no `COLUMNS`,
-/// so the full art (not the narrow fallback) is expected.
+/// Runs `bitty <args>` with isolated data/config roots and no `COLUMNS`.
 fn run_bitty(root: &Path, args: &[&str]) -> Output {
     Command::new(BITTY_BIN)
         .args(args)
@@ -47,36 +46,33 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
-fn mascot_flag_prints_art_exits_zero_and_records_marker() {
-    let root = scratch_root("mascot");
+fn mascot_flag_removed_rejected_as_unknown() {
+    // #2135: `--mascot` no longer exists; unknown pre-`--` flags fail
+    // closed with exit 2 and name the flag.
+    let root = scratch_root("mascot-removed");
     let output = run_bitty(&root, &["--mascot"]);
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "mascot must exit 0, stderr={:?}",
+        Some(2),
+        "--mascot must exit 2, stderr={:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = stdout(&output);
     assert!(
-        text.lines().count() > 1 && text.lines().count() <= 32,
-        "mascot prints the multi-line art, got {} lines",
-        text.lines().count()
-    );
-    assert!(text.is_ascii(), "mascot art is pure ASCII for pipe-safety");
-    let marker = root.join("bitty").join("splash-shown");
-    assert!(
-        marker.exists(),
-        "--mascot records the splash marker best-effort"
+        String::from_utf8_lossy(&output.stderr).contains("--mascot"),
+        "rejection names the flag"
     );
 }
 
 #[test]
-fn help_advertises_mascot_and_no_splash() {
+fn help_advertises_no_splash_without_mascot() {
     let root = scratch_root("help");
     let output = run_bitty(&root, &["--help"]);
     assert_eq!(output.status.code(), Some(0));
     let text = stdout(&output);
-    assert!(text.contains("--mascot"), "help lists --mascot");
+    assert!(
+        !text.contains("--mascot"),
+        "help must not list --mascot, got:\n{text}"
+    );
     assert!(text.contains("--no-splash"), "help lists --no-splash");
 }
 

@@ -2478,10 +2478,8 @@ impl TerminalApp {
                     // `Esc` cancels (revoke + consume, never forwarded,
                     // so no captured event reaches the terminal);
                     // focus-move chords revoke and fall through so focus
-                    // actually moves (workspace moves stay swallowed with
-                    // the indicator visible, issue #2172); every other
-                    // press is queued and swallowed (no action runs, no
-                    // PTY bytes).
+                    // actually moves; every other press is queued and
+                    // swallowed (no action runs, no PTY bytes).
                     if self.overlay_capture_active() {
                         use bitty_config::KeyName as OverlayKey;
                         if key.is_synthetic {
@@ -7979,66 +7977,94 @@ claims = []
     }
 
     #[test]
-    fn chrome_workspace_move_preserves_overlay_capture_like_new() {
-        // Issue #2172: with a capturing overlay open (the on-screen window-ID
-        // indicator surface), Mod+Shift+num must preserve the capture exactly
-        // like Mod+T does, so the indicator stays visible across both
-        // workspace operations instead of being dismissed by the move path.
+    fn chrome_workspace_move_releases_overlay_capture_after_real_move() {
+        // CTX-1289 / issue #2172: a valid Mod+Shift+num move is a focus
+        // switch, so it must execute through an active overlay capture and
+        // release that capture. The indicator surface follows the overlay
+        // lifecycle and disappears on the next application tick.
         let (mut app, root, data) = overlay_capture_test_app("issue-2172");
         assert!(app.overlay_capture_active(), "setup must hold capture");
-        // Reference behavior: Mod+T preserves the capture (the chord is
-        // queued as overlay input; no workspace is created behind the modal).
+        // Build a valid second target while the overlay is active. The
+        // programmatic setup avoids testing the modal's swallowed mutation
+        // path and leaves the real move chord as the behavior under test.
+        app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(app.runtime.workspace_switch(0));
+        let moved = ViewId::new(9);
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = app
+            .runtime
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf present");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(moved, 80, 24)),
+        ));
+        assert!(app.runtime.set_focus(moved));
+        assert!(app.overlay_capture_active(), "setup must retain capture");
+        let _ = app.drive_tick();
         assert!(
-            drive_mod_char(&mut app, "t", false, true, false, false),
-            "Mod+T stays chrome-owned"
+            app.runtime.plugin_overlay().is_some(),
+            "the active capture must surface the window-ID indicator"
         );
-        assert!(
-            app.overlay_capture_active(),
-            "Mod+T preserves the overlay capture"
-        );
-        assert_eq!(app.runtime.workspace_count(), 1);
+
         assert_eq!(
-            overlay_queued_len(&app),
-            1,
-            "Mod+T is queued as overlay input, not dispatched"
+            app.runtime.active_workspace_index(),
+            0,
+            "setup must start in the source workspace"
         );
-        // Issue #2172: Mod+Shift+2 (physical `@` with Shift held) must behave
-        // the same: preserved capture, nothing reparented behind the modal.
-        let queued_before = overlay_queued_len(&app);
+        // Physical Mod+Shift+2 is reported as `@` with Shift held.
         assert!(
             drive_mod_char(&mut app, "@", false, true, true, false),
-            "Mod+Shift+2 stays chrome-owned"
+            "the physical move gesture is chrome-owned"
         );
         assert!(
-            app.overlay_capture_active(),
-            "Mod+Shift+2 must preserve the overlay capture like Mod+T"
+            !app.overlay_capture_active(),
+            "a successful workspace move must release overlay capture"
         );
         assert_eq!(
-            app.runtime.workspace_names(),
-            vec![String::from("ws1")],
-            "the swallowed move must not reparent behind the modal"
+            app.runtime.active_workspace_index(),
+            1,
+            "the move must follow focus to the target workspace"
         );
         assert_eq!(
-            overlay_queued_len(&app),
-            queued_before + 1,
-            "the move chord is queued as overlay input like Mod+T"
+            app.runtime.focused_view(),
+            Some(moved),
+            "the moved pane must remain focused"
+        );
+        assert!(
+            app.runtime.layout().leaf_ids().contains(&moved),
+            "the focused pane must be reparented into the target"
+        );
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "surface removal follows the capture release on the next tick"
+        );
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_none(),
+            "the window-ID indicator must disappear after capture release"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
-    fn overlay_focus_switch_predicate_unifies_move_with_new() {
-        // Issue #2172: neither workspace-creation nor workspace-move ends the
-        // transient capture; both keep the overlay indicator visible.
+    fn overlay_focus_switch_predicate_keeps_move_with_focus_actions() {
+        // CTX-1289: workspace creation is a swallowed layout mutation, while
+        // workspace moves are focus switches and must release capture.
         use bitty_config::ChromeAction as A;
         assert!(
             !TerminalApp::is_overlay_focus_switch(A::WorkspaceNew),
-            "Mod+T preserves the overlay capture"
+            "Mod+T stays swallowed while capture is active"
         );
         assert!(
-            !TerminalApp::is_overlay_focus_switch(A::WorkspaceMove(2)),
-            "Mod+Shift+num preserves the overlay capture like Mod+T"
+            TerminalApp::is_overlay_focus_switch(A::WorkspaceMove(2)),
+            "Mod+Shift+num must release capture before moving the pane"
         );
         assert!(
             TerminalApp::is_overlay_focus_switch(A::WorkspaceFocus(2)),

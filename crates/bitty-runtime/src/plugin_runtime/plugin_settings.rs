@@ -416,7 +416,7 @@ fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, ConfigReadError> {
             }
             Err(error) => {
                 return Err(ConfigReadError::Rejected(format!(
-                    "unreadable plugin Lua config: {error}"
+                    "unreadable plugin config: {error}"
                 )));
             }
         }
@@ -445,7 +445,7 @@ fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, ConfigReadError> {
             }
             Err(error) => {
                 return Err(ConfigReadError::Rejected(format!(
-                    "unreadable plugin Lua config: {error}"
+                    "unreadable plugin config: {error}"
                 )));
             }
         }
@@ -468,25 +468,23 @@ fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, ConfigReadError> {
         "plugin Lua config loading is unsupported on this platform".to_string(),
     ));
 
-    let metadata = file.metadata().map_err(|error| {
-        ConfigReadError::Rejected(format!("unreadable plugin Lua config: {error}"))
-    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ConfigReadError::Rejected(format!("unreadable plugin config: {error}")))?;
     if !metadata.is_file() {
         return Err(ConfigReadError::Rejected(
-            "plugin Lua config must be a regular file".to_string(),
+            "plugin config must be a regular file".to_string(),
         ));
     }
     if metadata.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 {
         return Err(ConfigReadError::Rejected(
-            "plugin Lua config exceeds the byte ceiling".to_string(),
+            "plugin config exceeds the byte ceiling".to_string(),
         ));
     }
     let mut bytes = Vec::new();
     file.take(bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            ConfigReadError::Rejected(format!("unreadable plugin Lua config: {error}"))
-        })?;
+        .map_err(|error| ConfigReadError::Rejected(format!("unreadable plugin config: {error}")))?;
     if bytes.len() as u64 != metadata.len()
         || bytes.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES
     {
@@ -1130,18 +1128,22 @@ mod tests {
         assert!(loaded.file_error.is_some());
 
         std::fs::remove_dir(plugins.join("xuepoo.bar.lua")).expect("remove directory");
-        let fifo = plugins.join("xuepoo.bar.lua");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )
-        .expect("fifo");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
-        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
-        assert!(loaded.file_error.is_some());
 
-        std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove fifo");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let fifo = plugins.join("xuepoo.bar.lua");
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .expect("fifo");
+            let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+            assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+            assert!(loaded.file_error.is_some());
+            std::fs::remove_file(&fifo).expect("remove fifo");
+        }
+
         std::os::unix::fs::symlink(&target, plugins.join("xuepoo.bar.toml")).expect("toml symlink");
         let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));

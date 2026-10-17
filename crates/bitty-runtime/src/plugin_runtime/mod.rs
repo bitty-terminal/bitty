@@ -1647,8 +1647,17 @@ impl PluginRuntime {
             .iter()
             .chain(self.third_party_roots.iter())
             .all(|root| root.is_dir());
-        let store_available =
-            self.safe_mode || self.store_root.as_ref().is_none_or(|root| root.is_dir());
+        let store_available = match self.store_root.as_ref() {
+            // Without a configured store there is no unenumerated source that
+            // could introduce an alias collision.
+            None => true,
+            // Safe mode deliberately does not enumerate the configured store,
+            // so its records cannot be proven absent from the alias registry.
+            Some(_) if self.safe_mode => false,
+            // Normal discovery includes the configured store when its root is
+            // available; preserve the existing directory availability check.
+            Some(root) => root.is_dir(),
+        };
         self.settings_alias_registry = (roots_available && store_available)
             .then(|| Self::complete_discovery_ids(registry_ids, &results))
             .flatten();

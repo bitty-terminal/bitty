@@ -263,6 +263,35 @@ fn short_alias_fails_closed_when_registry_has_error_candidate() {
 }
 
 #[test]
+fn short_alias_fails_closed_in_safe_mode_with_configured_store() {
+    let root = temp_dir("root-safe-mode-configured-store");
+    write_bar_plugin(&root);
+    let store = temp_dir("store-safe-mode-configured-store");
+    let config = temp_dir("config-safe-mode-configured-store");
+    let plugins = config.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: true,
+        data_dir: Some(temp_dir("data-safe-mode-configured-store")),
+        store_root: Some(store),
+        bundled_roots: vec![root],
+        third_party_roots: Vec::new(),
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+    });
+    runtime.set_settings_dir(Some(config));
+    runtime.discover();
+    let id = PluginId::new(BAR_ID).expect("id");
+    runtime.activate(&id).expect("bar fixture must activate");
+    assert_eq!(
+        read_settings(&mut runtime),
+        "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
+    );
+}
+
+#[test]
 fn short_alias_fails_closed_for_disabled_installed_collision() {
     let root = temp_dir("root-disabled-installed-collision");
     write_bar_plugin(&root);

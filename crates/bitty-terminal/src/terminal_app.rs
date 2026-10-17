@@ -1561,6 +1561,12 @@ impl TerminalApp {
         command: &str,
         result: &bitty_runtime::plugin_runtime::LuaValue,
     ) {
+        // Presentation commands commonly return a boolean to report whether
+        // an action changed state. That acknowledgement is not user-facing
+        // content, so do not turn it into a notification banner.
+        if matches!(result, LuaValue::Bool(_)) {
+            return;
+        }
         let summary = lua_result_summary(result);
         let title = format!("{plugin_id}:{command}");
         let now = std::time::Instant::now();

@@ -9903,6 +9903,121 @@ events = []
 }
 
 #[test]
+fn successful_boolean_band_click_does_not_reach_banner() {
+    // CTX-1293: presentation commands such as `bar:focus` return a boolean
+    // acknowledgement. It is not user-visible result content and must not
+    // create a notification banner.
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1293-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx1293boolean";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-1293 boolean result"
+version = "0.1.0"
+description = "boolean band click result test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+
+[lazy]
+commands = ["{id}:focus"]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        bitty.commands.register({
+          id = "focus",
+          title = "Focus",
+          run = function(_args)
+            return true
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    let report = plugin_runtime.activate(&pid).expect("activate");
+    assert_eq!(
+        report.state,
+        bitty_runtime::plugin_runtime::LifecycleState::Active
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app = app.with_plugin_runtime(Some(plugin_runtime));
+
+    app.dispatch_band_click(bitty_runtime::BandClickRequest {
+        plugin_id: id.to_string(),
+        command: "focus".to_string(),
+        args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+    });
+    assert_eq!(
+        app.runtime.notification_banner(),
+        None,
+        "a boolean acknowledgement must not paint a banner"
+    );
+    assert_eq!(
+        app.runtime.pending_notification_count(),
+        0,
+        "a boolean acknowledgement must not queue a notification"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn band_scroll_dispatch_reaches_command_with_host_delta() {
     // CTX-1190 (issue #2008): a Core-routed band scroll runs the owning
     // plugin's command with the declared args plus the host-computed delta,

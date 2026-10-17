@@ -804,7 +804,8 @@ pub fn component_usage() -> String {
 /// Long help (`bitty extension --help`).
 #[must_use]
 pub fn component_help_text() -> String {
-    "bitty extension — CLI-first native binary extension management (local class, no execution)\n\
+    concat!(
+        "bitty extension — CLI-first native binary extension management (local class, no execution)\n\
      \n\
      usage: bitty extension <verb> [args] [flags]\n\
      \n\
@@ -891,14 +892,16 @@ pub fn component_help_text() -> String {
      \x20 distro (no --distribution flag). A selected distro with absent WSL\n\
      \x20 fails closed before any staging (exit 1): install WSL2 from\n\
      \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
-     \x20 without --distro. Path mapping (Windows to guest for spawn):\n\
-     \x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
+     \x20 without --distro. Path mapping (Windows to guest for spawn):\n",
+        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
+        "\x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
      \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n\
      \x20 to their launch distro (cross-distro exec fails closed); device\n\
      \x20 paths, drive-relative, relative, and other UNC spellings fail closed\n\
      \x20 (exit 2, no silent mangling). Backslash rewriting happens only inside\n\
-     \x20 path mapping; general argv elements pass through discrete with spaces\n\
-     \x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+     \x20 path mapping; general argv elements pass through discrete with spaces\n",
+        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
+        "\x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
      \x20 exists for diagnostics only; other guest paths have no Windows\n\
      \x20 spelling. Guest env is WSLENV-gated (forwarded proxy/TLS/locale\n\
      \x20 names only, secrets never, otherwise clean by design). Stdio and\n\
@@ -987,6 +990,7 @@ pub fn component_help_text() -> String {
      \x20 bitty extension remove net 0.0.1\n\
      \x20 bitty extension show-source net\n\
      \x20 bitty extension show-source net 0.0.1"
+    )
         .to_string()
 }
 
@@ -3362,6 +3366,32 @@ mod tests {
         assert_eq!(error, ComponentParseError::Help);
         let _ = buf;
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn help_path_mapping_lines_keep_original_bytes() {
+        let help = component_help_text();
+        let lines: Vec<&[u8]> = help
+            .split_inclusive('\n')
+            .filter(|line| {
+                line.contains("drive-absolute X:")
+                    || line.contains("\\\\wsl$\\")
+                    || line.contains("preserved and metacharacters inert.")
+            })
+            .map(str::as_bytes)
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                b"\x20\x20drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n"
+                    .as_slice(),
+                b"\x20\x20\\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n"
+                    .as_slice(),
+                b"\x20\x20preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n"
+                    .as_slice(),
+            ]
+        );
     }
 
     #[test]

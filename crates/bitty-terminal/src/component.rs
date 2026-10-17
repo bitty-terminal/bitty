@@ -894,14 +894,14 @@ pub fn component_help_text() -> String {
      \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
      \x20 without --distro. Path mapping (Windows to guest for spawn):\n",
         // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
-        "\x20drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
+        "\x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
      \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n\
      \x20 to their launch distro (cross-distro exec fails closed); device\n\
      \x20 paths, drive-relative, relative, and other UNC spellings fail closed\n\
      \x20 (exit 2, no silent mangling). Backslash rewriting happens only inside\n\
      \x20 path mapping; general argv elements pass through discrete with spaces\n",
         // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
-        "\x20preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+        "\x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
      \x20 exists for diagnostics only; other guest paths have no Windows\n\
      \x20 spelling. Guest env is WSLENV-gated (forwarded proxy/TLS/locale\n\
      \x20 names only, secrets never, otherwise clean by design). Stdio and\n\
@@ -3384,10 +3384,11 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                b"\x20drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n".as_slice(),
+                b"\x20\x20drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n"
+                    .as_slice(),
                 b"\x20\x20\\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n"
                     .as_slice(),
-                b"\x20preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n"
+                b"\x20\x20preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n"
                     .as_slice(),
             ]
         );

@@ -720,15 +720,15 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
             path_diagnostics = diagnostics;
             match read_bounded_regular_file(&canonical_path) {
                 Ok(bytes) => {
-                    if let Some(alias_path) = alias_path.as_deref()
-                        && std::fs::symlink_metadata(alias_path).is_ok()
-                    {
-                        let alias = alias_path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .unwrap_or_default();
-                        if !alias.is_empty() {
-                            canonical_shadow_alias = Some(alias.to_string());
+                    if let Some(alias_path) = alias_path.as_deref() {
+                        if std::fs::symlink_metadata(alias_path).is_ok() {
+                            let alias = alias_path
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or_default();
+                            if !alias.is_empty() {
+                                canonical_shadow_alias = Some(alias.to_string());
+                            }
                         }
                     }
                     Some(bytes)

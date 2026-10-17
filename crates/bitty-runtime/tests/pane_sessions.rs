@@ -13,6 +13,35 @@ use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId}
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether the specifically recorded test child's process is still present.
+/// On Linux this deliberately includes zombies: close must reap the recorded
+/// child, not merely deliver a kill signal.
+fn child_present(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::metadata(format!("/proc/{pid}")).is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+fn wait_until_child_absent(pid: u32) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while child_present(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recorded pane child {pid} was not reaped after close_pane_session"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn two_pane_runtime() -> Runtime {
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
     let layout = LayoutNode::split(
@@ -199,8 +228,15 @@ fn close_pane_session_tears_down_child() {
     let mut rt = two_pane_runtime();
     rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &[], 40, 12)
         .expect("spawn pane shell");
-    assert!(rt.pane_pid(&ViewId::new(2)).is_some());
+    let child_pid = rt
+        .pane_pid(&ViewId::new(2))
+        .expect("recorded pane child pid");
+    assert!(
+        child_present(child_pid),
+        "recorded pane child must be present"
+    );
     assert!(rt.close_pane_session(&ViewId::new(2)));
+    wait_until_child_absent(child_pid);
     assert!(!rt.has_pane_session(&ViewId::new(2)));
     assert_eq!(rt.pane_pid(&ViewId::new(2)), None);
     assert!(rt.pane_session_ids().is_empty());

@@ -253,7 +253,7 @@ pub fn ctl_usage() -> String {
          \x20 panel list\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
-         \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
+         \x20 workspace list (includes bounded memory diagnostics) | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
          \x20 workspace rename ws:N NAME | workspace move-panel POSITION\n\
          \x20 config reload\n\
          \x20 consent grant --scope S [--terminal T --family F] | consent revoke --scope S\n\
@@ -300,7 +300,7 @@ pub fn ctl_help_text() -> String {
             terminal text t:N             core.terminal.text (terminal.inspect; untrusted output)\n  \
             view split [--dir]            core.view.split (view.manage; default --right)\n  \
             view focus v:N                core.view.focus (view.manage)\n  \
-            workspace list                core.workspace.list (view.inspect)\n  \
+            workspace list                core.workspace.list (view.inspect; bounded memory diagnostics)\n  \
             workspace new                 core.workspace.new (view.manage)\n  \
             workspace close ws:N          core.workspace.close (terminal.manage, elevation; kills live sessions)\n  \
             workspace focus ws:N          core.workspace.focus (view.manage)\n  \

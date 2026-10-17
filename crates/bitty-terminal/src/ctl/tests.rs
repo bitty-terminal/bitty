@@ -15,6 +15,131 @@ use super::request::{
 };
 use super::{EXIT_CONFLICT, EXIT_GENERIC, EXIT_PERM, EXIT_RUNTIME};
 use bitty_ipc::ctl as ipc_ctl;
+use bitty_lua::LuaValue;
+use bitty_runtime::plugin_runtime::store::parse_json;
+
+fn object_field<'a>(object: &'a [(LuaValue, LuaValue)], key: &str) -> &'a LuaValue {
+    object
+        .iter()
+        .find_map(|(name, value)| match name {
+            LuaValue::String(name) if name == key => Some(value),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("terminal list JSON is missing {key:?}"))
+}
+
+fn string_field<'a>(object: &'a [(LuaValue, LuaValue)], key: &str) -> &'a str {
+    match object_field(object, key) {
+        LuaValue::String(value) => value,
+        other => panic!("terminal list JSON field {key:?} has wrong type: {other:?}"),
+    }
+}
+
+fn bool_field(object: &[(LuaValue, LuaValue)], key: &str) -> bool {
+    match object_field(object, key) {
+        LuaValue::Bool(value) => *value,
+        other => panic!("terminal list JSON field {key:?} has wrong type: {other:?}"),
+    }
+}
+
+fn nonnegative_integer_field(object: &[(LuaValue, LuaValue)], key: &str) -> u64 {
+    match object_field(object, key) {
+        LuaValue::Integer(value) if *value >= 0 => *value as u64,
+        other => panic!("terminal list JSON field {key:?} has wrong type/value: {other:?}"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedTerminalList {
+    entries: Vec<(String, bool)>,
+    total_lower_bound: u64,
+    truncated: bool,
+}
+
+fn parse_terminal_list(result_json: &str) -> ParsedTerminalList {
+    assert!(
+        result_json.len() <= bitty_ipc::MAX_FRAME_BYTES,
+        "terminal list result exceeds the IPC frame bound: {} bytes",
+        result_json.len()
+    );
+    let value = parse_json(result_json).expect("terminal list result must be one JSON value");
+    let LuaValue::Table(root) = value else {
+        panic!("terminal list result must be a JSON object");
+    };
+    let LuaValue::Table(terminals) = object_field(&root, "terminals") else {
+        panic!("terminal list terminals must be a JSON array");
+    };
+    let LuaValue::Table(diagnostics) = object_field(&root, "diagnostics") else {
+        panic!("terminal list diagnostics must be a JSON array");
+    };
+    let total_lower_bound = nonnegative_integer_field(&root, "total_lower_bound");
+    let truncated = bool_field(&root, "truncated");
+    assert_eq!(
+        terminals.len(),
+        diagnostics.len(),
+        "one diagnostics item is required for every listed terminal"
+    );
+    assert!(
+        total_lower_bound >= terminals.len() as u64,
+        "terminal list lower bound must include every listed terminal"
+    );
+    assert_eq!(
+        total_lower_bound,
+        terminals.len() as u64,
+        "terminal list lower bound must equal the returned prefix length"
+    );
+
+    let mut listed = Vec::with_capacity(terminals.len());
+    for (index, (_, terminal)) in terminals.iter().enumerate() {
+        let LuaValue::Table(terminal) = terminal else {
+            panic!("terminal list item {index} must be a JSON object");
+        };
+        let id = string_field(terminal, "id").to_owned();
+        assert!(id.starts_with("t:"), "terminal id must be t:N: {id:?}");
+        listed.push((id, bool_field(terminal, "has_pane_session")));
+    }
+
+    for (index, ((terminal_id, _has_pane_session), (_, diagnostic))) in
+        listed.iter().zip(diagnostics.iter()).enumerate()
+    {
+        let LuaValue::Table(diagnostic) = diagnostic else {
+            panic!("diagnostics item {index} must be a JSON object");
+        };
+        let diagnostic_terminal_id = string_field(diagnostic, "terminal_id");
+        let view_id = string_field(diagnostic, "view_id");
+        assert_eq!(diagnostic_terminal_id, terminal_id);
+        assert!(diagnostic_terminal_id.starts_with("t:"));
+        let terminal_number = diagnostic_terminal_id
+            .strip_prefix("t:")
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("diagnostic terminal_id must be t:N");
+        assert_eq!(view_id, format!("v:{terminal_number}"));
+        let has_session = bool_field(diagnostic, "has_session");
+        nonnegative_integer_field(diagnostic, "scrollback_lines");
+        nonnegative_integer_field(diagnostic, "retained_heap_bytes");
+        let child_pid = match object_field(diagnostic, "child_pid") {
+            LuaValue::Nil => None,
+            LuaValue::Integer(pid) if *pid > 0 => Some(*pid as u64),
+            other => panic!("diagnostics child_pid has wrong type/value: {other:?}"),
+        };
+        match string_field(diagnostic, "child_state") {
+            "unreaped" | "reaped" => assert!(
+                has_session,
+                "a non-absent child state requires a live terminal session"
+            ),
+            "absent" => {
+                assert!(!has_session, "an absent child requires no terminal session");
+                assert!(child_pid.is_none(), "an absent child cannot have a pid");
+            }
+            other => panic!("diagnostics child_state has invalid value: {other:?}"),
+        }
+    }
+    ParsedTerminalList {
+        entries: listed,
+        total_lower_bound,
+        truncated,
+    }
+}
 
 fn words(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
@@ -562,7 +687,14 @@ fn control_view_list_terminal_list_window_list_headless() {
     assert!(views.result_json.contains("v:1"));
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &cli);
     assert!(terms.ok, "terminal list must succeed: {terms:?}");
-    assert!(terms.result_json.contains("t:1"));
+    assert_eq!(
+        parse_terminal_list(&terms.result_json),
+        ParsedTerminalList {
+            entries: vec![("t:1".into(), false)],
+            total_lower_bound: 1,
+            truncated: false,
+        }
+    );
     let wins = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WINDOWS, None, &cli);
     assert!(wins.ok, "window list must succeed: {wins:?}");
     assert!(wins.result_json.contains("w:1"));
@@ -628,6 +760,57 @@ fn control_panel_list_mirrors_view_list_with_bounds_role_focused() {
     let denied = apply_control_envelope(&mut rt, METHOD_LIST_PANELS, None, &empty);
     assert!(!denied.ok);
     assert_eq!(denied.code, "ScopeDenied");
+}
+
+#[test]
+fn control_terminal_list_bounds_oversized_layout_without_bounding_panels() {
+    use bitty_runtime::{LayoutNode, View, ViewId};
+
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let oversized = bitty_runtime::MAX_TERMINALS + 128;
+    rt.set_layout(LayoutNode::stack(
+        (1..=oversized)
+            .map(|id| LayoutNode::leaf(View::new(ViewId::new(id as u64), 80, 24)))
+            .collect(),
+    ));
+
+    let panels = apply_control_envelope(&mut rt, METHOD_LIST_PANELS, None, &cli);
+    assert!(panels.ok, "panel list must succeed: {panels:?}");
+    let LuaValue::Table(panel_root) =
+        parse_json(&panels.result_json).expect("panel list must be valid JSON")
+    else {
+        panic!("panel list must be a JSON object");
+    };
+    let LuaValue::Table(panel_items) = object_field(&panel_root, "panels") else {
+        panic!("panel list panels must be an array");
+    };
+    assert_eq!(panel_items.len(), oversized);
+
+    let terminals = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &cli);
+    assert!(terminals.ok, "terminal list must succeed: {terminals:?}");
+    let listed = parse_terminal_list(&terminals.result_json);
+    assert_eq!(listed.entries.len(), bitty_runtime::MAX_TERMINALS);
+    assert_eq!(
+        listed.total_lower_bound,
+        bitty_runtime::MAX_TERMINALS as u64,
+        "truncated terminal list exposes the returned count as a lower bound"
+    );
+    assert!(listed.truncated);
+    assert_eq!(
+        listed.entries.first().map(|(id, _)| id.as_str()),
+        Some("t:1")
+    );
+    let last_id = format!("t:{}", bitty_runtime::MAX_TERMINALS);
+    assert_eq!(
+        listed.entries.last().map(|(id, _)| id.as_str()),
+        Some(last_id.as_str())
+    );
+    assert!(
+        terminals.result_json.len() <= bitty_ipc::MAX_FRAME_BYTES,
+        "terminal list envelope exceeds the IPC frame bound: {} bytes",
+        terminals.result_json.len()
+    );
 }
 
 #[test]
@@ -721,10 +904,13 @@ fn control_terminal_spawn_creates_observable_session() {
     );
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
     assert!(terms.ok, "terminal list: {terms:?}");
-    assert!(
-        terms
-            .result_json
-            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
+    assert_eq!(
+        parse_terminal_list(&terms.result_json),
+        ParsedTerminalList {
+            entries: vec![("t:1".into(), false), ("t:2".into(), true)],
+            total_lower_bound: 2,
+            truncated: false,
+        },
         "terminal list must show the live session: {terms:?}"
     );
 }
@@ -990,19 +1176,13 @@ fn control_terminal_list_reports_session_presence() {
     assert!(done.ok, "split must succeed: {done:?}");
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &cli);
     assert!(terms.ok, "terminal list must succeed: {terms:?}");
-    assert!(
-        terms
-            .result_json
-            .contains("{\"id\":\"t:1\",\"has_pane_session\":false}"),
-        "primary leaf stays session-less: {}",
-        terms.result_json
-    );
-    assert!(
-        terms
-            .result_json
-            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
-        "split leaf must report its live session: {}",
-        terms.result_json
+    assert_eq!(
+        parse_terminal_list(&terms.result_json),
+        ParsedTerminalList {
+            entries: vec![("t:1".into(), false), ("t:2".into(), true)],
+            total_lower_bound: 2,
+            truncated: false,
+        }
     );
 }
 
@@ -1123,10 +1303,13 @@ fn control_view_split_spawns_own_shell_and_accepts_input() {
     // `terminal list` agrees: t:2 is backed by a live session.
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
     assert!(terms.ok, "terminal list: {terms:?}");
-    assert!(
-        terms
-            .result_json
-            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
+    assert_eq!(
+        parse_terminal_list(&terms.result_json),
+        ParsedTerminalList {
+            entries: vec![("t:1".into(), false), ("t:2".into(), true)],
+            total_lower_bound: 2,
+            truncated: false,
+        },
         "t:2 must report a live session: {}",
         terms.result_json
     );
@@ -1251,16 +1434,14 @@ fn control_view_split_after_workspace_new_keeps_shells_isolated() {
     // leaf reports its own live session (before the fix it aliased ws2's t:2).
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
     assert!(terms.ok, "terminal list: {terms:?}");
-    assert!(
-        terms
-            .result_json
-            .contains("{\"id\":\"t:3\",\"has_pane_session\":true}"),
+    assert_eq!(
+        parse_terminal_list(&terms.result_json),
+        ParsedTerminalList {
+            entries: vec![("t:1".into(), false), ("t:3".into(), true)],
+            total_lower_bound: 2,
+            truncated: false,
+        },
         "the split leaf t:3 must report its own session: {}",
-        terms.result_json
-    );
-    assert!(
-        !terms.result_json.contains("t:2"),
-        "ws2's t:2 must not appear in ws1's list: {}",
         terms.result_json
     );
 
@@ -1723,6 +1904,22 @@ fn control_workspace_list_new_focus_close_headless() {
     let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
     assert!(list.ok, "workspace list must succeed: {list:?}");
     assert!(list.result_json.contains("\"count\":1"));
+    let LuaValue::Table(list_root) =
+        parse_json(&list.result_json).expect("workspace list must be JSON")
+    else {
+        panic!("workspace list must be an object");
+    };
+    let memory = object_field(&list_root, "memory");
+    let LuaValue::Table(memory) = memory else {
+        panic!("workspace list memory must be an object");
+    };
+    let LuaValue::Table(memory_aggregate) = object_field(memory, "aggregate") else {
+        panic!("workspace list memory aggregate must be an object");
+    };
+    assert_eq!(nonnegative_integer_field(memory_aggregate, "workspaces"), 1);
+    assert!(list.result_json.len() <= bitty_ipc::MAX_FRAME_BYTES);
+    assert!(!list.result_json.contains("cwd"));
+    assert!(!list.result_json.contains("pid"));
     assert!(
         list.result_json.contains("\"names\":[\"ws1\"]"),
         "names pinned: {list:?}"

@@ -1119,7 +1119,11 @@ impl GpuResources {
         dims: AtlasDims,
     ) -> Result<(), RenderError> {
         batch::validate_atlas_dims(dims)?;
-        let expected = dims.width as usize * dims.height as usize;
+        let Some(expected) = (dims.width as usize).checked_mul(dims.height as usize) else {
+            return Err(RenderError::InvalidInput {
+                reason: "atlas texel dimensions overflow the address space bound",
+            });
+        };
         if texels.len() != expected {
             return Err(RenderError::InvalidInput {
                 reason: "atlas texel length does not match its dimensions",
@@ -1208,7 +1212,11 @@ impl GpuResources {
         if plan.placements.is_empty() {
             return Ok(());
         }
-        let expected = plan.width as usize * plan.height as usize;
+        let Some(expected) = (plan.width as usize).checked_mul(plan.height as usize) else {
+            return Err(RenderError::InvalidInput {
+                reason: "inline texture dimensions overflow the address space bound",
+            });
+        };
         if plan.texels.len() != expected
             || plan.width != batch::INLINE_TEXTURE_SIZE
             || plan.height != batch::INLINE_TEXTURE_SIZE

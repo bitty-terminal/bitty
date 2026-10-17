@@ -1407,11 +1407,30 @@ impl Surface {
                                 if slot_h == 0 || slot_w == 0 {
                                     continue;
                                 }
-                                let mut mask = Vec::with_capacity(slot_w * slot_h);
+                                let Some(mask_len) = slot_w.checked_mul(slot_h) else {
+                                    continue;
+                                };
+                                let mut mask = Vec::with_capacity(mask_len);
                                 for row in 0..slot_h {
-                                    let start =
-                                        (usize::from(slot.y) + row) * stride + usize::from(slot.x);
-                                    mask.extend_from_slice(&texels[start..start + slot_w]);
+                                    let Some(start) = (usize::from(slot.y) + row)
+                                        .checked_mul(stride)
+                                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                                    else {
+                                        mask.clear();
+                                        break;
+                                    };
+                                    let Some(end) = start.checked_add(slot_w) else {
+                                        mask.clear();
+                                        break;
+                                    };
+                                    let Some(row_data) = texels.get(start..end) else {
+                                        mask.clear();
+                                        break;
+                                    };
+                                    mask.extend_from_slice(row_data);
+                                }
+                                if mask.len() != mask_len {
+                                    continue;
                                 }
                                 blend_coverage_mask_rgba(
                                     &mut rgba,
@@ -1727,10 +1746,30 @@ impl Surface {
                         if slot_w == 0 || slot_h == 0 {
                             continue;
                         }
-                        let mut mask = Vec::with_capacity(slot_w * slot_h);
+                        let Some(mask_len) = slot_w.checked_mul(slot_h) else {
+                            continue;
+                        };
+                        let mut mask = Vec::with_capacity(mask_len);
                         for row in 0..slot_h {
-                            let start = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
-                            mask.extend_from_slice(&texels[start..start + slot_w]);
+                            let Some(start) = (usize::from(slot.y) + row)
+                                .checked_mul(stride)
+                                .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                            else {
+                                mask.clear();
+                                break;
+                            };
+                            let Some(end) = start.checked_add(slot_w) else {
+                                mask.clear();
+                                break;
+                            };
+                            let Some(row_data) = texels.get(start..end) else {
+                                mask.clear();
+                                break;
+                            };
+                            mask.extend_from_slice(row_data);
+                        }
+                        if mask.len() != mask_len {
+                            continue;
                         }
                         blend_coverage_mask_rgba(
                             &mut rgba,
@@ -2143,8 +2182,13 @@ fn blend_coverage_mask_rgba(
     let Some(mask_w) = usize::try_from(mask_width).ok().filter(|w| *w > 0) else {
         return;
     };
-    let mask_h = usize::try_from(mask_height).unwrap_or(0);
-    if mask.len() < mask_w * mask_h {
+    let Some(mask_h) = usize::try_from(mask_height).ok().filter(|h| *h > 0) else {
+        return;
+    };
+    let Some(mask_len) = mask_w.checked_mul(mask_h) else {
+        return;
+    };
+    if mask.len() < mask_len {
         return;
     }
     let dst_left = i64::from(-x).max(0);
@@ -2158,9 +2202,24 @@ fn blend_coverage_mask_rgba(
     let [cr, cg, cb, ca] = color;
     for gy in dst_top..dst_bottom {
         for gx in dst_left..dst_right {
-            let sx = (i64::from(x) + gx) as usize;
-            let sy = (i64::from(y) + gy) as usize;
-            let mut coverage = u32::from(mask[gy as usize * mask_w + gx as usize]);
+            let sx = usize::try_from(i64::from(x) + gx).unwrap_or(usize::MAX);
+            let sy = usize::try_from(i64::from(y) + gy).unwrap_or(usize::MAX);
+            let Some(mask_index) = gy
+                .try_into()
+                .ok()
+                .and_then(|row: usize| row.checked_mul(mask_w))
+                .and_then(|offset| {
+                    gx.try_into()
+                        .ok()
+                        .and_then(|col: usize| offset.checked_add(col))
+                })
+            else {
+                return;
+            };
+            let Some(&mask_value) = mask.get(mask_index) else {
+                return;
+            };
+            let mut coverage = u32::from(mask_value);
             if coverage == 0 {
                 continue;
             }

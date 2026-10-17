@@ -263,6 +263,11 @@ pub use runtime::session::{
     SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot,
 };
 pub use runtime::submit_host::{TerminalSubmitOutcome, TerminalSubmitUnavailable};
+pub use runtime::workspace_memory::{
+    MAX_WORKSPACE_MEMORY_LEAVES, MAX_WORKSPACE_MEMORY_PANE_SESSIONS,
+    WORKSPACE_MEMORY_REPORT_JSON_MAX_BYTES, WorkspaceMemoryAggregate, WorkspaceMemoryReport,
+    WorkspaceMemoryRow, bounded_layout_leaf_ids,
+};
 pub use runtime::workspaces::{
     MAX_WORKSPACES, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary, WsCloseRequest,
 };
@@ -275,7 +280,7 @@ pub use runtime::{
     MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
     POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PTY_FORWARD_CAPACITY_CHUNKS,
     PanelAnimator, PresentStats, PtyWaker, QueuedFxPulse, ReducedMotionMode, Runtime,
-    SYNC_UPDATE_DEFER_TIMEOUT, UrlActivation,
+    SYNC_UPDATE_DEFER_TIMEOUT, TerminalDiagnostics, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

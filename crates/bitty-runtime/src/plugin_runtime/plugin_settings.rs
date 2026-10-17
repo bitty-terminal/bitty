@@ -46,9 +46,11 @@
 //! [`SettingsSource`]: super::services::SettingsSource
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::Path;
 
 use bitty_config::plugin_file::{self, ParsedPluginFile, PluginFileValue};
+use bitty_lua::{ConfigLuaVm, PlainConfigLimits, PlainConfigValue};
 use bitty_plugin_host::manifest::{SettingDecl, SettingDefault, SettingKind};
 
 use super::LuaValue;
@@ -263,6 +265,299 @@ pub struct LoadedPluginSettings {
     pub file_error: Option<String>,
 }
 
+fn plain_value_to_lua(value: &PlainConfigValue) -> Option<LuaValue> {
+    match value {
+        PlainConfigValue::Bool(value) => Some(LuaValue::Bool(*value)),
+        PlainConfigValue::Integer(value) => Some(LuaValue::Integer(*value)),
+        PlainConfigValue::String(value) => Some(LuaValue::String(value.clone())),
+        PlainConfigValue::Array(values)
+            if values
+                .iter()
+                .all(|value| matches!(value, PlainConfigValue::String(_))) =>
+        {
+            Some(LuaValue::array(
+                values
+                    .iter()
+                    .map(|value| match value {
+                        PlainConfigValue::String(value) => LuaValue::String(value.clone()),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ))
+        }
+        PlainConfigValue::Array(_) => None,
+        PlainConfigValue::Table(values) if values.is_empty() => Some(LuaValue::array(Vec::new())),
+        PlainConfigValue::Number(_) | PlainConfigValue::Table(_) => None,
+    }
+}
+
+fn plain_settings_to_lua(
+    value: PlainConfigValue,
+) -> Result<(BTreeMap<String, LuaValue>, Vec<String>), String> {
+    let PlainConfigValue::Table(values) = value else {
+        return Err("plugin configuration must return a table".to_string());
+    };
+    let mut output = BTreeMap::new();
+    let mut dropped = Vec::new();
+    for (key, value) in values {
+        if let Some(value) = plain_value_to_lua(&value) {
+            output.insert(key, value);
+        } else {
+            dropped.push(key);
+        }
+    }
+    Ok((output, dropped))
+}
+
+fn merge_lua_settings(
+    declared: &[SettingDecl],
+    lua: Option<&BTreeMap<String, LuaValue>>,
+    base: Option<&dyn SettingsSource>,
+) -> ResolvedPluginSettings {
+    let mut values = BTreeMap::new();
+    let mut dropped = BTreeSet::new();
+    for decl in declared {
+        let mut value = default_to_lua(&decl.default);
+        if let Some(source) = base {
+            if let Some(candidate) = source.get(&decl.key) {
+                if lua_value_matches_kind(&candidate, decl.kind) {
+                    value = candidate;
+                }
+            }
+        }
+        if let Some(source) = lua {
+            match source.get(&decl.key) {
+                Some(candidate) if lua_value_matches_kind(candidate, decl.kind) => {
+                    value = candidate.clone();
+                }
+                Some(_) => {
+                    dropped.insert(decl.key.clone());
+                }
+                None => {}
+            }
+        }
+        values.insert(decl.key.clone(), value);
+    }
+    if let Some(source) = lua {
+        for key in source.keys() {
+            if !values.contains_key(key) {
+                dropped.insert(key.clone());
+            }
+        }
+    }
+    ResolvedPluginSettings {
+        values,
+        dropped: dropped.into_iter().collect(),
+    }
+}
+
+fn lua_config_paths(
+    config_dir: &Path,
+    plugin_id: &str,
+    discovered_ids: Option<&[String]>,
+) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    if !plugin_file::valid_plugin_file_id(plugin_id) {
+        return None;
+    }
+    let plugins = config_dir.join(plugin_file::PLUGINS_DIR_NAME);
+    let canonical = plugins.join(format!("{plugin_id}.lua"));
+    let alias = discovered_ids.and_then(|ids| {
+        if ids.iter().any(|id| !plugin_file::valid_plugin_file_id(id)) {
+            return None;
+        }
+        if !ids.iter().any(|id| id == plugin_id) {
+            return None;
+        }
+        let (_, short_name) = plugin_id.split_once('.')?;
+        let owners: BTreeSet<&str> = ids
+            .iter()
+            .filter_map(|id| {
+                let (owner, name) = id.split_once('.')?;
+                (name == short_name && plugin_file::valid_plugin_file_id(id)).then_some(owner)
+            })
+            .collect();
+        (owners.len() == 1).then(|| plugins.join(format!("{short_name}.lua")))
+    });
+    Some((canonical, alias))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigReadError {
+    NotFound,
+    Rejected(String),
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, ConfigReadError> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let file = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        match result {
+            Ok(fd) => std::fs::File::from(fd),
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                return Err(ConfigReadError::NotFound);
+            }
+            Err(error) => {
+                return Err(ConfigReadError::Rejected(format!(
+                    "unreadable plugin Lua config: {error}"
+                )));
+            }
+        }
+    };
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    let file = {
+        let result = nix::fcntl::open(
+            path,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_NONBLOCK
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        );
+        match result {
+            Ok(fd) => std::fs::File::from(fd),
+            Err(error) if error == nix::errno::Errno::ENOENT => {
+                return Err(ConfigReadError::NotFound);
+            }
+            Err(error) => {
+                return Err(ConfigReadError::Rejected(format!(
+                    "unreadable plugin Lua config: {error}"
+                )));
+            }
+        }
+    };
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))
+    ))]
+    return Err(ConfigReadError::Rejected(
+        "plugin Lua config loading is unsupported on this platform".to_string(),
+    ));
+
+    let metadata = file.metadata().map_err(|error| {
+        ConfigReadError::Rejected(format!("unreadable plugin Lua config: {error}"))
+    })?;
+    if !metadata.is_file() {
+        return Err(ConfigReadError::Rejected(
+            "plugin Lua config must be a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 {
+        return Err(ConfigReadError::Rejected(
+            "plugin Lua config exceeds the byte ceiling".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ConfigReadError::Rejected(format!("unreadable plugin Lua config: {error}"))
+        })?;
+    if bytes.len() as u64 != metadata.len()
+        || bytes.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES
+    {
+        return Err(ConfigReadError::Rejected(
+            "plugin config changed while reading".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, ConfigReadError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ConfigReadError::NotFound
+            } else {
+                ConfigReadError::Rejected(format!("unreadable plugin config: {error}"))
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ConfigReadError::Rejected(format!("unreadable plugin config: {error}")))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ConfigReadError::Rejected(
+            "plugin config must be a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 {
+        return Err(ConfigReadError::Rejected(
+            "plugin config exceeds the byte ceiling".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigReadError::Rejected(format!("unreadable plugin config: {error}")))?;
+    if bytes.len() as u64 != metadata.len()
+        || bytes.len() > bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES
+    {
+        return Err(ConfigReadError::Rejected(
+            "plugin config changed while reading".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn read_bounded_regular_file(_path: &Path) -> Result<Vec<u8>, ConfigReadError> {
+    Err(ConfigReadError::Rejected(
+        "plugin config loading is unsupported on this platform".to_string(),
+    ))
+}
+
 /// Load and resolve one plugin's settings (file I/O at the boundary).
 ///
 /// `config_dir` is the `<config-root>/bitty` directory (env-derived by the
@@ -280,17 +575,97 @@ pub fn load_plugin_settings(
     declared: &[SettingDecl],
     base: Option<&dyn SettingsSource>,
 ) -> LoadedPluginSettings {
+    load_plugin_settings_with_plugins(config_dir, plugin_id, declared, base, None)
+}
+
+/// Load settings with the complete discovered-plugin map used for short-name
+/// alias admission. `None` deliberately disables aliases.
+pub fn load_plugin_settings_with_plugins(
+    config_dir: Option<&Path>,
+    plugin_id: &str,
+    declared: &[SettingDecl],
+    base: Option<&dyn SettingsSource>,
+    discovered_ids: Option<&[String]>,
+) -> LoadedPluginSettings {
     let path = match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
         // Validated ids match `owner.name` with no separators, so joining
         // the file name cannot escape the `plugins/` directory (fail-closed
         // `None` otherwise).
+        (Some(dir), true) => lua_config_paths(dir, plugin_id, discovered_ids),
+        _ => None,
+    };
+    let lua_bytes = match path {
+        Some((canonical_path, alias_path)) => match read_bounded_regular_file(&canonical_path) {
+            Ok(bytes) => Some(bytes),
+            Err(ConfigReadError::NotFound) => match alias_path {
+                Some(alias_path) => match read_bounded_regular_file(&alias_path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(ConfigReadError::NotFound) => None,
+                    Err(ConfigReadError::Rejected(error)) => {
+                        let resolved = merge_lua_settings(declared, None, base);
+                        return LoadedPluginSettings {
+                            source: PluginSettingsSource::new(resolved.values),
+                            dropped: resolved.dropped,
+                            file_error: Some(error),
+                        };
+                    }
+                },
+                None => None,
+            },
+            Err(ConfigReadError::Rejected(error)) => {
+                let resolved = merge_lua_settings(declared, None, base);
+                return LoadedPluginSettings {
+                    source: PluginSettingsSource::new(resolved.values),
+                    dropped: resolved.dropped,
+                    file_error: Some(error),
+                };
+            }
+        },
+        None => None,
+    };
+    if let Some(bytes) = lua_bytes {
+        let limits = PlainConfigLimits {
+            source_bytes: bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES,
+            ..PlainConfigLimits::default()
+        };
+        let lua_result = ConfigLuaVm::with_limits(plugin_id, limits)
+            .map_err(|error| error.to_string())
+            .and_then(|mut vm| {
+                let source = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+                vm.eval_plain_config(source)
+                    .map_err(|error| error.to_string())
+            });
+        match lua_result.and_then(plain_settings_to_lua) {
+            Ok((values, mut dropped)) => {
+                let resolved = merge_lua_settings(declared, Some(&values), base);
+                dropped.extend(resolved.dropped);
+                dropped.sort();
+                dropped.dedup();
+                return LoadedPluginSettings {
+                    source: PluginSettingsSource::new(resolved.values),
+                    dropped,
+                    file_error: None,
+                };
+            }
+            Err(error) => {
+                let resolved = merge_lua_settings(declared, None, base);
+                return LoadedPluginSettings {
+                    source: PluginSettingsSource::new(resolved.values),
+                    dropped: resolved.dropped,
+                    file_error: Some(format!("plugin Lua config rejected: {error}")),
+                };
+            }
+        }
+    }
+
+    let toml_path = match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
         (Some(dir), true) => Some(
             dir.join(plugin_file::PLUGINS_DIR_NAME)
                 .join(format!("{plugin_id}.toml")),
         ),
         _ => None,
     };
-    let Some(path) = path else {
+    let Some(path) = toml_path else {
         let resolved = resolve_plugin_settings(declared, None, base);
         return LoadedPluginSettings {
             source: PluginSettingsSource::new(resolved.values),
@@ -298,9 +673,9 @@ pub fn load_plugin_settings(
             file_error: None,
         };
     };
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_bounded_regular_file(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(ConfigReadError::NotFound) => {
             let resolved = resolve_plugin_settings(declared, None, base);
             return LoadedPluginSettings {
                 source: PluginSettingsSource::new(resolved.values),
@@ -308,12 +683,12 @@ pub fn load_plugin_settings(
                 file_error: None,
             };
         }
-        Err(error) => {
+        Err(ConfigReadError::Rejected(error)) => {
             let resolved = resolve_plugin_settings(declared, None, base);
             return LoadedPluginSettings {
                 source: PluginSettingsSource::new(resolved.values),
                 dropped: resolved.dropped,
-                file_error: Some(format!("unreadable plugin config: {error}")),
+                file_error: Some(error),
             };
         }
     };
@@ -601,6 +976,211 @@ mod tests {
             Some(LuaValue::array(vec![LuaValue::String("clock".to_string())]))
         );
         assert!(loaded.file_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_canonical_wins_over_toml_and_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-precedence-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = true\n").expect("toml");
+        std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+        std::fs::write(
+            plugins.join("xuepoo.bar.lua"),
+            b"return { show = true, edge = 'top' }\n",
+        )
+        .expect("canonical");
+        let ids = vec!["xuepoo.bar".to_string()];
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&ids),
+        );
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert_eq!(
+            loaded.source.get("edge"),
+            Some(LuaValue::String("top".to_string()))
+        );
+        assert!(loaded.file_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_alias_applies_and_collisions_disable_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-alias-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+        let unique = vec!["xuepoo.bar".to_string()];
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&unique),
+        );
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(false)));
+        let collision = vec!["xuepoo.bar".to_string(), "other.bar".to_string()];
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&collision),
+        );
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_lua_does_not_fall_through_to_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-invalid-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(plugins.join("xuepoo.bar.lua"), b"return io\n").expect("lua");
+        std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = false\n").expect("toml");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_declared_keys_and_types_are_strictly_filtered() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-types-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(
+            plugins.join("xuepoo.bar.lua"),
+            b"return { show = 'bad', edge = 'top', name_max_chars = 3.5, hidden = true }\n",
+        )
+        .expect("lua");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert_eq!(
+            loaded.source.get("edge"),
+            Some(LuaValue::String("top".to_string()))
+        );
+        assert_eq!(
+            loaded.source.get("name_max_chars"),
+            Some(LuaValue::Integer(32))
+        );
+        assert!(loaded.dropped.iter().any(|key| key == "hidden"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_plugin_id_never_constructs_a_config_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-path-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(plugins.join("escape.lua"), b"return { show = false }\n").expect("lua");
+        let loaded = load_plugin_settings(Some(&dir), "../escape", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_loader_rejects_symlink_directory_and_fifo() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-file-types-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+
+        let target = plugins.join("target.lua");
+        std::fs::write(&target, b"return { show = false }\n").expect("target");
+        std::os::unix::fs::symlink(&target, plugins.join("xuepoo.bar.lua")).expect("symlink");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_some());
+
+        std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove symlink");
+        std::fs::create_dir(plugins.join("xuepoo.bar.lua")).expect("directory");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_some());
+
+        std::fs::remove_dir(plugins.join("xuepoo.bar.lua")).expect("remove directory");
+        let fifo = plugins.join("xuepoo.bar.lua");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .expect("fifo");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_some());
+
+        std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove fifo");
+        std::os::unix::fs::symlink(&target, plugins.join("xuepoo.bar.toml")).expect("toml symlink");
+        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+        assert!(loaded.file_error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_fail_closed_without_a_complete_unique_registry() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-lua-alias-registry-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+
+        for ids in [None, Some(&[][..]), Some(&["other.bar".to_string()][..])] {
+            let loaded = load_plugin_settings_with_plugins(
+                Some(&dir),
+                "xuepoo.bar",
+                &bar_decls(),
+                None,
+                ids,
+            );
+            assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+            assert!(loaded.file_error.is_none());
+        }
+        let invalid = ["xuepoo.bar".to_string(), "bad/id".to_string()];
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&invalid),
+        );
+        assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

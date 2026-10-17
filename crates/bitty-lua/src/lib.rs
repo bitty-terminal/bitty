@@ -59,12 +59,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use phodopus::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
+use phodopus::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor, Value, Variadic};
 
 pub mod config;
 pub mod error;
 pub mod gate;
 pub mod host;
+pub mod plain_config;
 mod stdlib;
 pub mod store;
 pub mod ui;
@@ -96,6 +97,7 @@ pub use host::{
     env_key_shape_ok, parse_fs_write_append, parse_theme_table, validate_env_key,
     validate_fs_content, validate_fs_list_max, validate_fs_path, validate_image_path,
 };
+pub use plain_config::{ConfigLuaVm, PlainConfigError, PlainConfigLimits, PlainConfigValue};
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
@@ -624,10 +626,41 @@ impl LuaVm {
         // and not charged against the quota; `fuel_limit` stays unset so the
         // host `SLICE_FUEL` stepping loop remains the authoritative RC-1
         // instruction policy.
+        let lua = Self::build_plugin_lua(memory_limit);
+        Self::from_lua(
+            id,
+            instruction_budget,
+            wall_budget_ms,
+            warning_ms,
+            memory_limit,
+            lua,
+        )
+    }
+
+    fn build_plugin_lua(memory_limit: usize) -> Lua {
         let mut builder = Lua::builder();
         builder.memory_limit(memory_limit);
         let mut lua = builder.build();
         stdlib::install_retained_stdlib(&mut lua);
+        lua
+    }
+
+    pub(crate) fn build_config_lua(memory_limit: usize) -> Lua {
+        let mut builder = Lua::builder();
+        builder.memory_limit(memory_limit);
+        let mut lua = builder.build();
+        stdlib::install_config_stdlib(&mut lua);
+        lua
+    }
+
+    fn from_lua(
+        id: impl Into<String>,
+        instruction_budget: u64,
+        wall_budget_ms: u64,
+        warning_ms: u64,
+        memory_limit: usize,
+        lua: Lua,
+    ) -> Self {
         Self {
             id: id.into(),
             lua,
@@ -652,6 +685,58 @@ impl LuaVm {
             host_deadline_ms: host::DEFAULT_HOST_DEADLINE_MS,
             spawn_deadline_ms: Rc::new(Cell::new(host::SPAWN_TIMEOUT_MS)),
         }
+    }
+
+    pub(crate) fn with_config_budgets(
+        id: impl Into<String>,
+        instruction_budget: u64,
+        wall_budget_ms: u64,
+        warning_ms: u64,
+        memory_limit: usize,
+    ) -> Self {
+        assert!(instruction_budget > 0, "instruction budget must be > 0");
+        assert!(wall_budget_ms > 0, "wall budget must be > 0");
+        assert!(memory_limit > 0, "memory limit must be > 0");
+        let lua = Self::build_config_lua(memory_limit);
+        Self::from_lua(
+            id,
+            instruction_budget,
+            wall_budget_ms,
+            warning_ms,
+            memory_limit,
+            lua,
+        )
+    }
+
+    pub(crate) fn take_plain_result(
+        &mut self,
+        stashed: StashedExecutor,
+        limits: plain_config::PlainConfigLimits,
+    ) -> Result<plain_config::PlainConfigValue, plain_config::PlainConfigError> {
+        let mode = self.lua.enter(|ctx| ctx.fetch(&stashed).mode());
+        if mode != ExecutorMode::Result {
+            return Err(plain_config::PlainConfigError::Lua(
+                "configuration did not return a value".to_string(),
+            ));
+        }
+        self.lua.enter(|ctx| {
+            let exec = ctx.fetch(&stashed);
+            match exec.take_result::<Variadic<Vec<Value>>>(ctx) {
+                Ok(Ok(Variadic(values))) if values.len() == 1 => {
+                    if !matches!(values[0], Value::Table(_)) {
+                        return Err(plain_config::PlainConfigError::Shape(
+                            "configuration must return exactly one table".to_string(),
+                        ));
+                    }
+                    plain_config::capture_plain_value(ctx, values[0], limits)
+                }
+                Ok(Ok(Variadic(_))) => Err(plain_config::PlainConfigError::Shape(
+                    "configuration must return exactly one table".to_string(),
+                )),
+                Ok(Err(error)) => Err(plain_config::PlainConfigError::Lua(format!("{error}"))),
+                Err(error) => Err(plain_config::PlainConfigError::Lua(format!("{error:?}"))),
+            }
+        })
     }
 
     /// Plugin id.

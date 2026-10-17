@@ -503,11 +503,15 @@ impl Runtime {
             let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
         self.pending_input.clear();
+        if let Some(view) = self.primary_view {
+            self.drop_view_bindings_for(view);
+        }
         self.primary_view = None;
         self.primary_spawn = None;
         self.session_primary_cwd = None;
         self.kitty_assembler
             .discard_stream(super::bell::KittyStreamId::Primary);
+        self.sync_mode_caches_to_focus();
         self.pending_full_redraw = true;
         true
     }

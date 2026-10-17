@@ -15,7 +15,7 @@ use phodopus::{
     },
 };
 
-use crate::{DriveOutcome, LuaVm, VmError};
+use crate::{DriveOutcome, LuaVm, SuspendReason, VmError};
 
 /// Owned data accepted at the plugin configuration boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -98,13 +98,19 @@ impl PlainConfigLimits {
 pub enum PlainConfigError {
     /// Source exceeded the configured pre-compile cap.
     SourceTooLarge,
-    /// VM construction or budget failure.
+    /// VM construction failure.
+    ///
+    /// Budget exhaustion during evaluation is reported as
+    /// [`PlainConfigError::Limit`], not here.
     Vm(VmError),
     /// Lua compile/runtime failure.
     Lua(String),
     /// Returned value has an invalid shape or type.
     Shape(String),
-    /// Returned data exceeded an extraction bound.
+    /// Returned data or evaluation exceeded a declared configuration bound.
+    ///
+    /// Covers the extraction bounds (depth, key/value, string, aggregate) and
+    /// the resource budgets (instruction, wall-clock, memory).
     Limit(String),
 }
 
@@ -155,11 +161,34 @@ impl ConfigLuaVm {
         }
         reject_duplicate_literal_keys(source)?;
         match self.vm.drive_chunk(source).map_err(PlainConfigError::Vm)? {
+            // A resource-budget preemption is a declared-bound violation at the
+            // configuration boundary, so it fails closed as `Limit` exactly like
+            // the extraction bounds. Reporting it as anything else would make
+            // the rejection reason depend on how quickly the evaluation reaches
+            // the bound, which is timing-dependent under load.
             DriveOutcome::Suspended { reason, .. } => {
-                Err(PlainConfigError::Vm(VmError::Suspended { reason }))
+                Err(PlainConfigError::Limit(suspend_limit_message(&reason)))
             }
             DriveOutcome::Failed { message } => Err(PlainConfigError::Lua(message)),
             DriveOutcome::Ready { stashed } => self.vm.take_plain_result(stashed, self.limits),
+        }
+    }
+}
+
+/// Render a configuration-VM suspension reason as a `Limit` message.
+fn suspend_limit_message(reason: &SuspendReason) -> String {
+    match reason {
+        SuspendReason::InstructionBudgetExceeded { used, budget } => format!(
+            "configuration exceeded the instruction budget ({used} of {budget} instructions)"
+        ),
+        SuspendReason::WallClockExceeded {
+            elapsed_ms,
+            budget_ms,
+        } => format!(
+            "configuration exceeded the wall-clock budget ({elapsed_ms} ms of {budget_ms} ms)"
+        ),
+        SuspendReason::MemoryExceeded { used, limit } => {
+            format!("configuration exceeded the memory budget ({used} of {limit} bytes)")
         }
     }
 }

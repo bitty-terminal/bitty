@@ -155,6 +155,9 @@ fn plugin_full_lifecycle_live() {
     assert!(text.contains("Read structured terminal content"), "{text}");
 
     // Explicit enable is the only activation transition (grant kept).
+    let output = run_in(&home, &["plugin", "disable", PLUGIN], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("disabled"), "{}", stdout(&output));
     let output = run_in(&home, &["plugin", "enable", PLUGIN], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(stdout(&output).contains("enabled"), "{}", stdout(&output));
@@ -370,6 +373,37 @@ fn plugin_fresh_zero_capability_install_is_staged_until_explicit_enable() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn plugin_install_does_not_parse_or_execute_disabled_package_code() {
+    let home = scratch_dir("install-no-exec");
+    let source = write_zero_capability_fixture(
+        &home,
+        "source-invalid-lua",
+        "xuepoo.invalid-lua",
+        "1.0.0",
+        "unused",
+    );
+    // The package body is intentionally invalid Lua. Installation must only
+    // validate and stage untrusted bytes; parsing/execution belongs after the
+    // explicit enable boundary.
+    std::fs::write(source.join("lua/init.lua"), "this is not valid lua\n")
+        .expect("invalid fixture");
+    let source = source.display().to_string();
+    let store = data_store(&home);
+
+    let output = run_in(&home, &["plugin", "install", &source, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!load_index(&store).expect("store index")[0].enabled);
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        store_root: Some(store),
+        ..PluginRuntimeConfig::default()
+    });
+    assert!(runtime.discover().is_empty());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// As [`write_external_fixture`], with an explicit plugin id.
 fn write_external_fixture_with_id(
     home: &Path,
@@ -401,6 +435,47 @@ fn write_external_fixture_with_id(
         format!(
             "bitty.commands.register({{\n  id = \"greet\",\n  title = \"Greet\",\n  \
              run = function() return \"{greeting}\" end,\n}})\nreturn {{}}\n"
+        ),
+    )
+    .expect("fixture init");
+    dir
+}
+
+/// Write an external fixture with an explicit capability set.
+fn write_external_fixture_with_capabilities(
+    home: &Path,
+    dir_name: &str,
+    id: &str,
+    version: &str,
+    greeting: &str,
+    capabilities: &[&str],
+) -> PathBuf {
+    let dir = home.join(dir_name);
+    std::fs::create_dir_all(dir.join("lua")).expect("fixture lua dir");
+    let capability_lines = capabilities
+        .iter()
+        .map(|capability| format!("{capability} = true\n"))
+        .collect::<String>();
+    let manifest = format!(
+        "[plugin]\n\
+         id = \"{id}\"\n\
+         name = \"External CLI Fixture\"\n\
+         version = \"{version}\"\n\
+         description = \"externally authored CLI fixture\"\n\n\
+         [compat]\n\
+         bitty = \">=0.0.1,<1.0\"\n\
+         plugin-api = \"^1.0\"\n\n\
+         [capabilities]\n\
+         {capability_lines}\n\
+         [lazy]\n\
+         commands = [\"{id}:greet\"]\n\
+         events = []\n"
+    );
+    std::fs::write(dir.join("bitty-plugin.toml"), manifest).expect("fixture manifest");
+    std::fs::write(
+        dir.join("lua/init.lua"),
+        format!(
+            "bitty.commands.register({{\n  id = \"greet\",\n  title = \"Greet\",\n  run = function() return \"{greeting}\" end,\n}})\nreturn {{}}\n"
         ),
     )
     .expect("fixture init");
@@ -469,13 +544,8 @@ fn plugin_external_install_load_run_update_remove_live() {
         LuaValue::String("hello v1".to_string())
     );
 
-    // Disable/enable flip the desired state atomically in the store index.
-    let output = run_in(&home, &["plugin", "disable", "xuepoo.external"], None);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(!load_index(&store).expect("index")[0].enabled);
-
-    // Update: a second local source stages the new version, retains the old,
-    // and preserves the existing disabled desired state.
+    // Update while enabled: a second local source stages the new version,
+    // retains the old, and preserves enabled state without another enable.
     let source_v2 = write_external_fixture(&home, "source-v2", "2.0.0", "hello v2");
     let output = run_in(
         &home,
@@ -491,23 +561,44 @@ fn plugin_external_install_load_run_update_remove_live() {
     assert!(stdout(&output).contains("updated"), "{}", stdout(&output));
     assert!(store.join("packages/xuepoo.external/2.0.0").is_dir());
     assert!(store.join("packages/xuepoo.external/1.0.0").is_dir());
+    assert!(load_index(&store).expect("index")[0].enabled);
+
+    // Disable/enable flip the desired state atomically in the store index.
+    let output = run_in(&home, &["plugin", "disable", "xuepoo.external"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(!load_index(&store).expect("index")[0].enabled);
 
-    // Explicit enable remains required after the update.
-    let output = run_in(&home, &["plugin", "enable", "xuepoo.external"], None);
+    let source_v3 = write_external_fixture(&home, "source-v3", "3.0.0", "hello v3");
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "install",
+            &source_v3.display().to_string(),
+            "--yes",
+        ],
+        None,
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(load_index(&store).expect("index")[0].enabled);
+    assert!(stdout(&output).contains("updated"), "{}", stdout(&output));
+    assert!(!load_index(&store).expect("index")[0].enabled);
+    assert!(store.join("packages/xuepoo.external/3.0.0").is_dir());
+
     let mut updated_rt = PluginRuntime::new(PluginRuntimeConfig {
         store_root: Some(store.clone()),
         ..PluginRuntimeConfig::default()
     });
-    updated_rt.discover();
-    updated_rt.activate(&id).expect("activate v2");
+    assert!(updated_rt.discover().is_empty());
+    let output = run_in(&home, &["plugin", "enable", "xuepoo.external"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(load_index(&store).expect("index")[0].enabled);
+    assert_eq!(updated_rt.discover().len(), 1);
+    updated_rt.activate(&id).expect("activate v3");
     assert_eq!(
         updated_rt
             .dispatch_command(&id, "greet", &[])
             .expect("dispatch"),
-        LuaValue::String("hello v2".to_string())
+        LuaValue::String("hello v3".to_string())
     );
 
     // Remove requires --force and then deletes record plus tree.
@@ -527,6 +618,51 @@ fn plugin_external_install_load_run_update_remove_live() {
         "{}",
         stdout(&output)
     );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_capability_update_decline_and_eof_leave_index_and_grants_unchanged() {
+    let home = scratch_dir("external-capability-update");
+    let source_v1 = write_external_fixture(&home, "source-v1", "1.0.0", "hello v1");
+    let source_v1 = source_v1.display().to_string();
+    let store = data_store(&home);
+
+    let output = run_in(&home, &["plugin", "install", &source_v1, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let before_index = std::fs::read(store.join("current.json")).expect("index bytes");
+    let before_records = load_index(&store).expect("records");
+    let source_v2 = write_external_fixture_with_capabilities(
+        &home,
+        "source-v2",
+        "xuepoo.external",
+        "2.0.0",
+        "hello v2",
+        &["platform.notify", "terminal.semantic-read"],
+    );
+    let source_v2 = source_v2.display().to_string();
+
+    // A capability increase requires consent and must leave every committed
+    // index field and grant unchanged when declined.
+    let output = run_in(&home, &["plugin", "install", &source_v2], Some("n\n"));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(store.join("current.json")).expect("index bytes"),
+        before_index
+    );
+    assert_eq!(load_index(&store).expect("records"), before_records);
+    assert!(!store.join("packages/xuepoo.external/2.0.0").exists());
+
+    // EOF is also fail-closed with the same complete state preservation.
+    let output = run_in(&home, &["plugin", "install", &source_v2], Some(""));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(store.join("current.json")).expect("index bytes"),
+        before_index
+    );
+    assert_eq!(load_index(&store).expect("records"), before_records);
+    assert!(!store.join("packages/xuepoo.external/2.0.0").exists());
 
     let _ = std::fs::remove_dir_all(&home);
 }

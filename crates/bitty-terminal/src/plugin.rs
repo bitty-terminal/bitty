@@ -610,7 +610,9 @@ pub fn plugin_help_text() -> String {
      \x20 fall back to the plugin's shipped defaults). Installed packages\n\
      \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
      \x20 (fallback ~/.local/share/...).\n\
-     \x20 After a local `install`, the plugin is staged and disabled; enable it explicitly:\n\
+     \x20 After a fresh local, Git, or archive install, the plugin is staged and\n\
+     \x20 disabled; updates preserve the existing enabled/disabled state. Enable\n\
+     \x20 it explicitly with:\n\
      \x20 bitty plugin enable <id>\n\
      \x20 bitty plugin info <id>     # manifest, grants, and settings\n\
      \n\

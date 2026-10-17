@@ -1073,8 +1073,8 @@ impl Runtime {
             }
             // CTX-1147: the workspace-local detached floats are
             // layout-detached, so the pane loop above never sees them —
-            // capture every parked leaf in detach order (present-time paint
-            // order) with its live history. The stored view rebuilds
+            // capture every parked leaf in stable detach order with its live
+            // history. The stored view rebuilds
             // stripped (identity, geometry, floating mode) so origin never
             // persists, exactly like the pinned capture; the Alt+drag
             // re-anchor offset is presentation-only and is never captured
@@ -1236,7 +1236,8 @@ impl Runtime {
         for ws in &snap.workspaces {
             let focus = ws.focus.map_or_else(Focus::new, Focus::with_focus);
             // CTX-1147: per-workspace detached floats install with their
-            // slot, in snapshot detach order (present-time paint order).
+            // slot, in stable snapshot detach order. The active focused float
+            // is raised again when the live store is restored.
             let mut floats = FloatStore::new();
             for float in &ws.floats {
                 floats.restore_detached(float.view.clone());
@@ -1258,6 +1259,9 @@ impl Runtime {
         // Alt+drag re-anchor offsets reset like pins (presentation-only,
         // and restore already drops them).
         self.floats = self.workspaces[snap.active].floats.clone();
+        if let Some(focused) = self.focus.focused() {
+            self.floats.raise_to_top(focused);
+        }
         self.float_offsets.clear();
         // CTX-1082: a restore installs a whole new world, so the pinned
         // store is replaced wholesale in snapshot pin order (present-time

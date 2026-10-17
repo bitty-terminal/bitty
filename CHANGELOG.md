@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Kitty graphics support (CTX-1272, #2131):** bounded capability detection,
   image retention across alt-screen cycles, and related terminal-state and
   rendering coverage.
+- **Restricted Lua plugin settings (CTX-1294, #2192):** per-plugin settings
+  files use declared keys and strict types, with bounded reads and fail-closed
+  fallback; short-name aliases require complete discovery.
 
 ### Fixed
 
@@ -22,14 +25,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CTX-1285):** stale float/pin cleanup, detached-view scrolling and chrome
   occlusion, workspace-switch animation behavior, child-exit cleanup, and
   overlay indicator preservation.
+- **Last tiled-panel close (CTX-1297, CTX-1302, #2194, #2195):** closing a
+  workspace's last tiled panel prunes that workspace when another workspace
+  exists and it has no local floating panels; focus follows the surviving
+  workspace. A workspace with floating panels, or the sole workspace beside
+  a pinned panel, stays present while the closed tiled panel's shell is torn
+  down. Pruning honors busy-job confirmation, and closing a zoomed panel
+  preserves its tiled siblings.
+- **Focus after tiled-panel close (CTX-1300, #2196):** focus moves to the
+  previous panel in stable layout order, wrapping to the last survivor when
+  the first panel closes.
 - **PTY and input behavior (CTX-1254, CTX-1255, CTX-1267):** bounded
   FreeBSD flood respawn handling, fail-closed drain behavior, and fcitx5
   Shift-toggle input handling.
+- **Plugin command acknowledgements (CTX-1293, #2193):** boolean results from
+  presentation commands no longer create notification banners.
+- **Host-owned settings diagnostics (CTX-1303, #2198):** bounded diagnostics
+  on plugin entries report ambiguous or shadowed aliases, ignored entries,
+  and rejected settings files through host warning logs. Summaries omit
+  setting names and values and preserve the existing activation-report and
+  loaded-settings layouts and capability checks.
 
 ### Changed
 
 - **Release and installation tooling:** hardened Windows installer checks,
   immutable R2 rerun protection, and plugin-install next steps.
+
+### Removed
+
+- **Obsolete mascot splash (CTX-1301, #2197):** removed the first-run splash,
+  its marker-file writes, and the `--no-splash` flag from CLI parsing, help,
+  and shell completions.
+
+### Follow-ups (not in this release)
+
+- Native `net` and `graphics` extensions remain deferred; this Core changelog
+  does not claim an extension publication or installable native extension.
 
 ### Release engineering
 

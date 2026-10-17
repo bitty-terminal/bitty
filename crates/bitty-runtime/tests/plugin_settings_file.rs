@@ -25,9 +25,10 @@ use std::rc::Rc;
 
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir, set_enabled};
+use bitty_runtime::plugin_runtime::plugin_settings::PluginSettingsDiagnostic;
 use bitty_runtime::plugin_runtime::{
-    EmptySettings, LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
-    UnavailableSnapshot,
+    ActivationReport, EmptySettings, LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig,
+    SnapshotSource, UnavailableSnapshot,
 };
 
 const BAR_ID: &str = "bitty-terminal.bar";
@@ -139,6 +140,14 @@ fn write_user_file(config_dir: &Path, body: &[u8]) {
 }
 
 fn activate_bar(root: PathBuf, config_dir: Option<PathBuf>) -> PluginRuntime {
+    let (runtime, _) = activate_bar_with_report(root, config_dir);
+    runtime
+}
+
+fn activate_bar_with_report(
+    root: PathBuf,
+    config_dir: Option<PathBuf>,
+) -> (PluginRuntime, ActivationReport) {
     let data = temp_dir("data");
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
@@ -154,7 +163,7 @@ fn activate_bar(root: PathBuf, config_dir: Option<PathBuf>) -> PluginRuntime {
     let id = PluginId::new(BAR_ID).expect("id");
     let report = runtime.activate(&id).expect("bar fixture must activate");
     assert_eq!(report.state, LifecycleState::Active);
-    runtime
+    (runtime, report)
 }
 
 fn read_settings(runtime: &mut PluginRuntime) -> String {
@@ -196,6 +205,51 @@ fn user_file_overrides_per_key_end_to_end() {
 }
 
 #[test]
+fn canonical_lua_shadow_diagnostic_surfaces_on_activation() {
+    let root = temp_dir("root-canonical-shadow");
+    write_bar_plugin(&root);
+    let config = temp_dir("config-canonical-shadow");
+    let plugins = config.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(
+        plugins.join("bar.lua"),
+        b"return { show = false, edge = 'top' }\n",
+    )
+    .expect("alias");
+    std::fs::write(
+        plugins.join(format!("{BAR_ID}.lua")),
+        b"return { show = true, edge = 'top' }\n",
+    )
+    .expect("canonical");
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(temp_dir("data-canonical-shadow")),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root],
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+    });
+    runtime.set_settings_dir(Some(config));
+    runtime.discover();
+    let id = PluginId::new(BAR_ID).expect("id");
+    runtime.activate(&id).expect("bar fixture must activate");
+    assert_eq!(
+        runtime
+            .settings_diagnostics(&id)
+            .expect("diagnostics entry"),
+        vec![PluginSettingsDiagnostic::CanonicalShadowsAlias {
+            alias: "bar".to_string(),
+        }]
+    );
+    assert_eq!(
+        read_settings(&mut runtime),
+        "show=true;edge=top;show_single=false;name_max_chars=32;modules=workspaces"
+    );
+}
+
+#[test]
 fn hostile_file_fails_to_defaults_without_abort_end_to_end() {
     let root = temp_dir("root-hostile");
     write_bar_plugin(&root);
@@ -207,7 +261,14 @@ fn hostile_file_fails_to_defaults_without_abort_end_to_end() {
         &config,
         b"show = \"yes\"\nedge = 3.5\nshow_single = true\nname_max_chars = \"32\"\nmodules = \"clock\"\nfrobnicate = 7\n",
     );
-    let mut runtime = activate_bar(root, Some(config));
+    let (mut runtime, _) = activate_bar_with_report(root, Some(config));
+    let id = PluginId::new(BAR_ID).expect("id");
+    assert_eq!(
+        runtime
+            .settings_diagnostics(&id)
+            .expect("diagnostics entry"),
+        vec![PluginSettingsDiagnostic::DroppedEntries { count: 5 }]
+    );
     assert_eq!(
         read_settings(&mut runtime),
         "show=true;edge=bottom;show_single=true;name_max_chars=32;modules=workspaces"
@@ -223,7 +284,14 @@ fn malformed_file_keeps_plugin_alive_on_defaults_end_to_end() {
     // plugin still activates and serves defaults. A `[capabilities]`-looking
     // section grants nothing — it is not even parsed as config.
     write_user_file(&config, b"[capabilities]\nui.rich = true\n");
-    let mut runtime = activate_bar(root, Some(config));
+    let (mut runtime, _) = activate_bar_with_report(root, Some(config));
+    let id = PluginId::new(BAR_ID).expect("id");
+    assert_eq!(
+        runtime
+            .settings_diagnostics(&id)
+            .expect("diagnostics entry"),
+        vec![PluginSettingsDiagnostic::FileRejected]
+    );
     assert_eq!(
         read_settings(&mut runtime),
         "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
@@ -270,7 +338,11 @@ fn short_alias_fails_closed_in_safe_mode_with_configured_store() {
     let config = temp_dir("config-safe-mode-configured-store");
     let plugins = config.join("plugins");
     std::fs::create_dir_all(&plugins).expect("plugins dir");
-    std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+    std::fs::write(
+        plugins.join(format!("{BAR_ID}.toml")),
+        b"show = false\nedge = \"top\"\n",
+    )
+    .expect("external settings");
 
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: true,
@@ -284,7 +356,16 @@ fn short_alias_fails_closed_in_safe_mode_with_configured_store() {
     runtime.set_settings_dir(Some(config));
     runtime.discover();
     let id = PluginId::new(BAR_ID).expect("id");
-    runtime.activate(&id).expect("bar fixture must activate");
+    runtime
+        .activate(&id)
+        .expect("bundled bar fixture must activate");
+    assert!(
+        runtime
+            .settings_diagnostics(&id)
+            .expect("diagnostics entry")
+            .is_empty(),
+        "safe mode must not emit diagnostics for external settings it did not read"
+    );
     assert_eq!(
         read_settings(&mut runtime),
         "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
@@ -333,6 +414,15 @@ fn short_alias_fails_closed_for_disabled_installed_collision() {
     assert!(results.iter().all(|(_, result)| result.is_ok()));
     let id = PluginId::new(BAR_ID).expect("id");
     runtime.activate(&id).expect("bar fixture must activate");
+    assert_eq!(
+        runtime
+            .settings_diagnostics(&id)
+            .expect("diagnostics entry"),
+        vec![PluginSettingsDiagnostic::AmbiguousAlias {
+            alias: "bar".to_string(),
+            claimants: 2,
+        }]
+    );
     assert_eq!(
         read_settings(&mut runtime),
         "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"

@@ -1447,18 +1447,60 @@ impl TerminalApp {
                     }
                     return false;
                 }
+                // Keep the decision based on the real tree before restoring a
+                // zoom proxy. The proxy always has one live leaf, but a
+                // multi-pane backup must take the normal leaf-mutation path
+                // instead of pruning the whole workspace.
+                let close_last_tiled_panel = self
+                    .chrome
+                    .zoom
+                    .backup_leaf_count(&self.runtime)
+                    .map_or(self.runtime.leaf_count() <= 1, |count| count == 1);
+                let prune_last_tiled_workspace =
+                    close_last_tiled_panel && self.runtime.floated_count() == 0;
+                let zoom_backup_views = if prune_last_tiled_workspace {
+                    self.runtime
+                        .workspace_seq_at(self.runtime.active_workspace_index())
+                        .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let close_confirm_views = if prune_last_tiled_workspace {
+                    if zoom_backup_views.is_empty() {
+                        self.runtime
+                            .primary_view()
+                            .filter(|primary| self.runtime.layout().find_leaf(*primary).is_some())
+                            .into_iter()
+                            .collect()
+                    } else {
+                        zoom_backup_views
+                    }
+                } else {
+                    Vec::new()
+                };
                 // CTX-0370 close-confirm gate: a pane with a running
                 // foreground job never closes on one gesture (repeat the
                 // chord confirms, Esc cancels). The zoom restore and layout
                 // surgery below run only on the proceed path, so a cancel
                 // leaves the zoomed layout untouched.
-                match self.runtime.view_close_request(focused) {
+                let close_request = if close_confirm_views.is_empty() {
+                    self.runtime.view_close_request(focused)
+                } else {
+                    self.runtime
+                        .view_close_request_for_views(focused, &close_confirm_views)
+                };
+                match close_request {
                     ViewCloseRequest::Pending { summary } => {
                         eprintln!("bitty: keymap close_view PENDING -> {summary}");
                         return false;
                     }
                     ViewCloseRequest::Proceed => {}
                 }
+                // Restore only after the close-confirm gate proceeds. The
+                // last-panel workspace-prune path must close against every real
+                // leaf/session in the zoom backup; pending or cancelled closes
+                // keep zoom untouched.
                 self.restore_zoom();
                 // Issue #2141: a focused detached float or pinned panel
                 // lives outside the live layout. Tearing down only its
@@ -1478,21 +1520,30 @@ impl TerminalApp {
                     );
                     return false;
                 }
-                // CTX-1039 (#1843): the active workspace is down to its
-                // last panel but other workspaces still hold panels. Never
-                // exit: keep the emptied workspace selected, tear down the
-                // closed leaf's shell, and leave the tile session-less
-                // (a session-less tile renders empty, buffers input, and
-                // splits again like any fresh workspace leaf).
-                if self.runtime.leaf_count() <= 1 {
-                    if self.runtime.close_pane_session(&focused) {
+                // CTX-1297: do not strand an empty workspace after closing
+                // its last tiled panel. When another workspace owns the
+                // remaining panel(s), close this workspace and follow focus
+                // to the surviving workspace. The whole-window last-panel
+                // case returned above as the window-close gesture; this
+                // branch preserves that distinction without leaving a
+                // session-less ghost tile behind.
+                if close_last_tiled_panel {
+                    if prune_last_tiled_workspace {
+                        let workspace = self.runtime.active_workspace_index();
+                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                            eprintln!(
+                                "bitty: keymap close_view -> last panel closed, empty workspace pruned"
+                            );
+                        } else {
+                            eprintln!(
+                                "warning: keymap close_view could not prune empty workspace — ignoring"
+                            );
+                        }
+                    } else if self.runtime.close_pane_session(&focused) {
                         eprintln!(
-                            "bitty: keymap close_view tore down last pane shell {focused:?} (workspace kept)"
+                            "bitty: keymap close_view tore down last tiled panel shell {focused:?} (workspace kept for float)"
                         );
                     }
-                    eprintln!(
-                        "bitty: keymap close_view -> last panel of workspace closed, workspace kept selected"
-                    );
                     return false;
                 }
                 let mut layout = self.runtime.layout().clone();
@@ -3623,9 +3674,9 @@ mod tests {
         use bitty_config::ChromeAction;
         // CTX-1039 (issue #1843): with 2+ workspaces open, Mod+d
         // (`close_view`) on the current workspace's last panel must never
-        // exit the process. The emptied workspace stays selected with its
-        // tile session-less; only the last panel in the whole window is
-        // the window-close gesture (issue #1783).
+        // exit the process. The empty workspace is pruned and focus follows
+        // the surviving workspace; only the last panel in the whole window
+        // is the window-close gesture (issue #1783).
         let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
         app.runtime.workspace_new().expect("second workspace opens");
         assert_eq!(app.runtime.workspace_count(), 2);
@@ -3637,22 +3688,238 @@ mod tests {
             !app.runtime.has_pending_close_confirm(),
             "no window arm may pend when panels survive elsewhere"
         );
-        assert_eq!(app.runtime.workspace_count(), 2, "emptied workspace stays");
+        assert_eq!(
+            app.runtime.workspace_count(),
+            1,
+            "empty workspace is pruned"
+        );
         assert_eq!(
             app.effective_window_leaf_count(),
-            2,
-            "no panel lost window-wide"
+            1,
+            "the surviving workspace owns the remaining panel"
         );
-        assert_eq!(app.runtime.leaf_count(), 1, "workspace keeps its tile");
+        assert_eq!(app.runtime.active_workspace_index(), 0);
         assert!(
             app.runtime.focused_view().is_some(),
-            "focus stays in the emptied workspace"
+            "focus follows the surviving workspace"
         );
-        // The other workspace still holds its panel: switching back proves
-        // no unrelated workspace (or its PTY session bookkeeping) died.
-        assert!(app.runtime.workspace_switch(0));
+        // The surviving workspace still holds its panel and remains usable.
         assert_eq!(app.runtime.leaf_count(), 1);
         assert!(app.runtime.focused_view().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_zoomed_multi_pane_closes_only_focused_leaf() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("first workspace primary shell spawns");
+        let first = app.runtime.focused_view().expect("primary leaf focus");
+        let second = ViewId::new(2);
+        app.runtime
+            .spawn_shell_for_view(second, "/bin/sh", &[], 40, 12)
+            .expect("first workspace second shell spawns");
+        assert!(
+            app.runtime.set_focus(second),
+            "hidden sibling focus is valid"
+        );
+        app.runtime.write_input(b"sleep 30\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.runtime.pane_foreground_job(&second).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hidden sibling job never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        app.runtime.workspace_new().expect("second workspace opens");
+        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
+        assert!(
+            app.runtime.has_pane_session(&survivor),
+            "new workspace replays the primary shell recipe"
+        );
+        assert!(app.runtime.workspace_switch(0));
+        assert!(app.runtime.set_focus(first));
+
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "zoom installs one proxy leaf");
+        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(2));
+        assert_eq!(app.runtime.pane_session_ids(), vec![second, survivor]);
+        assert_eq!(app.runtime.primary_view(), Some(first));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(app.runtime.has_pane_session(&second));
+        assert!(app.runtime.has_pane_session(&survivor));
+        assert!(!app.runtime.has_pane_session(&first));
+        assert_eq!(app.runtime.primary_view(), Some(second));
+        assert_eq!(app.runtime.focused_view(), Some(second));
+
+        assert!(app.runtime.workspace_switch(1));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.focused_view(), Some(survivor));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_unzoomed_last_panel_confirms_busy_primary_before_pruning() {
+        use bitty_config::ChromeAction;
+
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell spawns");
+        let primary = app.runtime.primary_view().expect("primary owner exists");
+        app.runtime.write_input(b"sleep 30\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.runtime.primary_foreground_job().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "primary job never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        app.runtime.workspace_new().expect("second workspace opens");
+        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
+        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.focused_view(), Some(primary));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+
+        // The first CloseView must inspect the doomed workspace's primary
+        // shell, even though the focused leaf has no private pane session.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.pending_close_view(), Some(primary));
+        let summary = app
+            .runtime
+            .close_confirm_banner_text()
+            .expect("busy primary must arm a visible confirmation");
+        assert!(summary.contains("Running job:"), "{summary}");
+        assert!(summary.contains("close again to confirm"), "{summary}");
+
+        // Esc still cancels the pending focused target without pruning.
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.primary_view(), Some(primary));
+
+        // Re-arm the same target, then the repeated action confirms and
+        // prunes the now-doomed workspace.
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.runtime.has_pending_close_confirm());
+        app.apply_chrome_action(ChromeAction::CloseView);
+
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.primary_view(), Some(survivor));
+        assert_eq!(app.runtime.focused_view(), Some(survivor));
+        assert!(app.runtime.has_pane_session(&survivor));
+        assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_zoomed_single_panel_confirms_busy_primary_before_pruning() {
+        use bitty_config::ChromeAction;
+
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("first workspace primary shell spawns");
+        let first = app.runtime.focused_view().expect("primary leaf focus");
+        app.runtime.write_input(b"sleep 30\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.runtime.primary_foreground_job().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "primary job never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        app.runtime.workspace_new().expect("second workspace opens");
+        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
+        assert!(app.runtime.workspace_switch(0));
+        assert!(app.runtime.set_focus(first));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "zoom installs one proxy leaf");
+        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
+
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.pending_close_view(), app.runtime.focused_view());
+        let summary = app
+            .runtime
+            .close_confirm_banner_text()
+            .expect("busy primary backup must arm a visible confirmation");
+        assert!(summary.contains("Running job:"), "{summary}");
+        assert!(summary.contains("close again to confirm"), "{summary}");
+        assert!(summary.contains("Esc cancels"), "{summary}");
+        assert!(
+            summary.chars().count() <= bitty_runtime::CLOSE_CONFIRM_BANNER_MAX_CHARS,
+            "confirmation stays bounded: {summary}"
+        );
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.primary_view(), Some(first));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+
+        // Cancellation leaves the proxy and the backup session alive.
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_close_confirm());
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.runtime.primary_view(), Some(first));
+
+        // Re-arm the same target, then the repeated close confirms the prune.
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.runtime.has_pending_close_confirm());
+
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_ne!(app.runtime.primary_view(), Some(first));
+        assert!(app.runtime.has_pane_session(&survivor));
+        assert_eq!(app.runtime.primary_view(), Some(survivor));
+        assert_eq!(app.runtime.focused_view(), Some(survivor));
+        assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    #[test]
+    fn physical_close_view_exits_after_all_real_workspace_panels_close() {
+        // CTX-1297: the session-less tile retained by the multi-workspace
+        // last-panel path must not leave a later Mod+q trapped behind a
+        // ghost workspace. Once the remaining real panel closes, the event
+        // path must request window exit rather than require Mod+w first.
+        let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.workspace_new().expect("second workspace opens");
+        assert_eq!(app.runtime.workspace_count(), 2);
+
+        let mods = alt_mods_event();
+        assert!(!app.intercept_chrome_key(&mods));
+        let first_q = WindowEventKind::KeyboardInput(test_char_key("q"));
+        assert!(app.intercept_chrome_key(&first_q));
+        assert!(!app.take_chrome_exit_request());
+        assert_eq!(app.runtime.workspace_count(), 1);
+
+        let mut first_q_release = test_char_key("q");
+        first_q_release.state = PressState::Released;
+        assert!(!app.intercept_chrome_key(&WindowEventKind::KeyboardInput(first_q_release,)));
+        assert!(!app.intercept_chrome_key(&clear_mods_event()));
+        assert!(!app.intercept_chrome_key(&mods));
+        let second_q = WindowEventKind::KeyboardInput(test_char_key("q"));
+        assert!(app.intercept_chrome_key(&second_q));
+        assert!(app.take_chrome_exit_request());
+        assert_eq!(app.runtime.workspace_count(), 1);
     }
 
     #[test]

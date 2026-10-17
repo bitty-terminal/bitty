@@ -160,6 +160,21 @@ impl Runtime {
     /// - A stale arm for a different target is replaced by this explicit
     ///   request (loud, never silent).
     pub fn view_close_request(&mut self, view: ViewId) -> ViewCloseRequest {
+        self.view_close_request_for_views(view, std::slice::from_ref(&view))
+    }
+
+    /// Request close of `view` while also checking the other views that the
+    /// caller will destroy as part of the same operation.
+    ///
+    /// The pending target remains the focused `view`, so the existing repeat
+    /// gesture and cancellation semantics stay unchanged. This is used by
+    /// workspace-pruning paths where a focused zoom proxy represents several
+    /// real pane sessions.
+    pub fn view_close_request_for_views(
+        &mut self,
+        view: ViewId,
+        doomed_views: &[ViewId],
+    ) -> ViewCloseRequest {
         if let Some(pending) = self.pending_close_confirm.take() {
             if pending.target == CloseTarget::View(view) {
                 self.pending_full_redraw = true;
@@ -168,7 +183,25 @@ impl Runtime {
             // Explicit request for another target supersedes the stale arm.
             self.pending_full_redraw = true;
         }
-        let job = self.pane_foreground_job(&view);
+        let mut job = self.pane_foreground_job(&view);
+        if job.is_none() {
+            for doomed in doomed_views {
+                if *doomed == view {
+                    continue;
+                }
+                if let Some(candidate) = self.pane_foreground_job(doomed) {
+                    job = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if job.is_none()
+            && self
+                .primary_view
+                .is_some_and(|primary| doomed_views.contains(&primary))
+        {
+            job = self.primary_foreground_job();
+        }
         let needs_confirm = match self.config.close_confirm {
             CloseConfirmMode::Never => false,
             CloseConfirmMode::Always => true,
@@ -319,6 +352,35 @@ mod tests {
             ViewCloseRequest::Proceed
         );
         assert!(!rt.has_pending_close_confirm(), "idle shell never arms");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doomed_primary_view_job_arms_zoom_backup_close_confirmation() {
+        bitty_test_support::require_pty!();
+        let mut rt = idle_runtime(CloseConfirmMode::WhenBusy);
+        rt.set_layout(two_pane_layout());
+        rt.spawn_shell("/bin/sh").expect("primary shell spawns");
+        let primary = rt.primary_view().expect("primary owner exists");
+        assert_eq!(primary, ViewId::new(1));
+        rt.write_input(b"sleep 30\n");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while rt.primary_foreground_job().is_none() {
+            assert!(std::time::Instant::now() < deadline, "job never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(matches!(
+            rt.view_close_request_for_views(ViewId::new(2), &[primary, ViewId::new(2)]),
+            ViewCloseRequest::Pending { .. }
+        ));
+        assert_eq!(rt.pending_close_view(), Some(ViewId::new(2)));
+        assert!(
+            rt.close_confirm_banner_text()
+                .as_deref()
+                .is_some_and(|summary| summary.contains("Running job:"))
+        );
     }
 
     #[test]

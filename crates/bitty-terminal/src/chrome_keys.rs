@@ -3761,10 +3761,26 @@ mod tests {
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
         assert!(!app.runtime.has_pty(), "primary shell must be torn down");
-        assert_eq!(app.runtime.primary_view(), Some(primary));
+        assert!(!app.runtime.has_pty_reader());
+        assert!(!app.runtime.has_pty_writer());
+        assert_eq!(app.runtime.primary_view(), None);
+        assert_eq!(app.runtime.primary_spawn_recipe(), None);
         assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
         assert_eq!(app.runtime.pinned_views(), vec![pinned]);
         assert_eq!(app.runtime.workspace_count(), 1);
+        assert!(!app.runtime.workspace_is_occupied(0));
+        assert!(
+            !app.runtime.close_primary_session(),
+            "teardown is idempotent"
+        );
+
+        app.runtime.workspace_new().expect("empty workspace opens");
+        let fresh = app.runtime.focused_view().expect("fresh focus");
+        assert!(!app.runtime.has_pane_session(&fresh));
+        assert!(
+            !app.runtime.has_pty(),
+            "closed primary recipe must not replay"
+        );
     }
 
     #[test]

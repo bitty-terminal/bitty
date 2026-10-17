@@ -503,6 +503,9 @@ impl Runtime {
             let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
         self.pending_input.clear();
+        self.primary_view = None;
+        self.primary_spawn = None;
+        self.session_primary_cwd = None;
         self.kitty_assembler
             .discard_stream(super::bell::KittyStreamId::Primary);
         self.pending_full_redraw = true;

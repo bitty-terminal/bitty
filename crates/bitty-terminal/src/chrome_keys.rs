@@ -1456,8 +1456,9 @@ impl TerminalApp {
                     .zoom
                     .backup_leaf_count(&self.runtime)
                     .map_or(self.runtime.leaf_count() <= 1, |count| count == 1);
-                let prune_last_tiled_workspace =
-                    close_last_tiled_panel && self.runtime.floated_count() == 0;
+                let prune_last_tiled_workspace = close_last_tiled_panel
+                    && self.runtime.floated_count() == 0
+                    && self.runtime.workspace_count() > 1;
                 let zoom_backup_views = if prune_last_tiled_workspace {
                     self.runtime
                         .workspace_seq_at(self.runtime.active_workspace_index())
@@ -3706,6 +3707,29 @@ mod tests {
         // The surviving workspace still holds its panel and remains usable.
         assert_eq!(app.runtime.leaf_count(), 1);
         assert!(app.runtime.focused_view().is_some());
+    }
+
+    #[test]
+    fn close_view_keeps_sole_workspace_with_pinned_panel() {
+        use bitty_config::ChromeAction;
+
+        // A pinned panel is window-global, so closing the only tiled panel in
+        // the only workspace must keep that workspace and use the existing
+        // session-close fallback rather than replacing it.
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
     }
 
     #[test]

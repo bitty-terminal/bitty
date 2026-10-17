@@ -21,3 +21,9 @@ runner-check:
     shellcheck -S warning scripts/clipboard-isolated.sh scripts/tests/clipboard-isolated.test.sh
     shfmt -d scripts/clipboard-isolated.sh scripts/tests/clipboard-isolated.test.sh
     bash scripts/tests/clipboard-isolated.test.sh
+
+secrets-diff:
+    git diff HEAD | gitleaks stdin --redact --no-banner
+
+secrets-history base:
+    gitleaks git --log-opts="{{base}}..HEAD" --redact --no-banner

@@ -3,19 +3,20 @@
 set -euo pipefail
 readonly RUNNER=scripts/clipboard-isolated.sh
 BASH_BIN=$(command -v bash)
-TRUE_BIN=$(type -P true)
-readonly BASH_BIN TRUE_BIN
+readonly BASH_BIN
 scratch=$(mktemp -d "${TMPDIR:?set TMPDIR to an approved scratch directory}/clipboard-runner.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/bin"
-for tool in bwrap timeout; do
-  printf '#!/bin/sh\nexit 99\n' >"$scratch/bin/$tool"
+for tool in bwrap Xvfb timeout test-binary; do
+  printf '#!/bin/sh\n: > "$CLIPBOARD_REFUSAL_MARKER"\nexit 99\n' >"$scratch/bin/$tool"
   chmod +x "$scratch/bin/$tool"
 done
 status=0
-PATH="$scratch/bin" "$BASH_BIN" "$RUNNER" "$TRUE_BIN" >"$scratch/result" 2>&1 || status=$?
+PATH="$scratch/bin" CLIPBOARD_REFUSAL_MARKER="$scratch/launched" \
+  "$BASH_BIN" "$RUNNER" "$scratch/bin/test-binary" >"$scratch/result" 2>&1 || status=$?
 [[ $status == 77 ]]
-grep -q 'NOT EXECUTED (missing Xvfb)' "$scratch/result"
+[[ ! -e $scratch/launched ]]
+grep -q 'NOT EXECUTED (connection-bound disposable runner unavailable)' "$scratch/result"
 if grep -q 'verified-local' "$scratch/result"; then
   echo 'clipboard-runner-test: refusal incorrectly claimed native proof' >&2
   exit 1

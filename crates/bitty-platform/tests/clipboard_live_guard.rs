@@ -1,81 +1,115 @@
-//! Pure regressions for the live harness isolation precondition (PX-6838).
+//! Collector-level refusal regressions for PX-6898. No native backend calls.
 
 #[path = "support/clipboard_isolation.rs"]
 #[allow(dead_code)]
 mod clipboard_isolation;
 
-use clipboard_isolation::{IsolationEvidence, run_if_isolated, validate};
+use clipboard_isolation::{BLOCKED, Observation, ProcessIdentity, collect, run_if_isolated};
 
-fn isolated() -> IsolationEvidence {
-    IsolationEvidence {
-        linux: true,
-        display_number: Some(23),
-        wayland_present: false,
-        server_pid: Some(120),
-        display_lock_pid: Some(120),
-        server_parent: Some(100),
-        test_parent: Some(100),
-        server_is_xvfb: true,
-        server_uses_displayfd: true,
-        server_disables_tcp: true,
-        private_tmp: true,
-        private_run: true,
-        server_owns_display_socket: true,
+fn observation() -> Observation {
+    Observation {
+        namespaces: Some(["mnt-new".into(), "net-new".into(), "pid-new".into()]),
+        parent_namespaces: Some(["mnt-old".into(), "net-old".into(), "pid-old".into()]),
+        runner: Some(ProcessIdentity {
+            pid: 10,
+            start: 100,
+            parent: 1,
+        }),
+        server: Some(ProcessIdentity {
+            pid: 11,
+            start: 110,
+            parent: 10,
+        }),
+        mounts: vec![
+            "21 1 0:10 / /tmp rw - tmpfs tmpfs rw".into(),
+            "22 1 0:11 / /run rw - tmpfs tmpfs rw".into(),
+        ],
     }
 }
 
-#[test]
-fn isolated_xvfb_evidence_allows_native_access() {
-    assert_eq!(validate(&isolated()), Ok(()));
-}
-
-#[test]
-fn ordinary_gui_feature_or_opt_in_is_not_isolation() {
-    assert!(validate(&IsolationEvidence::default()).is_err());
-}
-
-#[test]
-fn every_isolation_requirement_is_checked_before_native_access() {
-    let mutations: &[fn(&mut IsolationEvidence)] = &[
-        |e| e.linux = false,
-        |e| e.display_number = None,
-        |e| e.wayland_present = true,
-        |e| e.server_pid = None,
-        |e| e.display_lock_pid = None,
-        |e| e.display_lock_pid = Some(121),
-        |e| e.server_parent = None,
-        |e| e.test_parent = None,
-        |e| e.server_parent = Some(101),
-        |e| e.server_is_xvfb = false,
-        |e| e.server_uses_displayfd = false,
-        |e| e.server_disables_tcp = false,
-        |e| e.private_tmp = false,
-        |e| e.private_run = false,
-        |e| e.server_owns_display_socket = false,
-    ];
-    for mutate in mutations {
-        let mut evidence = isolated();
-        mutate(&mut evidence);
-        let mut native_calls = 0;
-        assert!(
-            run_if_isolated(&evidence, || {
-                native_calls += 1;
-            })
-            .is_err()
-        );
-        assert_eq!(native_calls, 0, "invalid evidence: {evidence:?}");
-    }
-}
-
-#[test]
-fn valid_guard_executes_operation_once_and_propagates_panic() {
-    let mut calls = 0;
-    run_if_isolated(&isolated(), || calls += 1).unwrap();
-    assert_eq!(calls, 1);
-    assert!(
-        std::panic::catch_unwind(|| {
-            let _ = run_if_isolated(&isolated(), || panic!("native assertion failure"));
-        })
-        .is_err()
+fn assert_refused(before: Observation, after: Observation) {
+    let mut observations = [before, after].into_iter();
+    let evidence = collect(|| observations.next().expect("two collector snapshots"));
+    assert!(observations.next().is_none());
+    let mut native_calls = 0;
+    assert_eq!(
+        run_if_isolated(&evidence, || native_calls += 1),
+        Err(BLOCKED)
     );
+    assert_eq!(native_calls, 0);
+}
+
+#[test]
+fn host_tmpfs_and_sibling_server_cannot_authorize_native_access() {
+    let mut host = observation();
+    host.namespaces = host.parent_namespaces.clone();
+    assert_refused(host.clone(), host);
+}
+
+#[test]
+fn reused_server_cannot_authorize_native_access() {
+    let mut reused = observation();
+    reused.server.as_mut().unwrap().start = 90;
+    assert_refused(reused.clone(), reused);
+}
+
+#[test]
+fn stale_or_replaced_server_evidence_never_invokes_native_closure() {
+    let before = observation();
+    let mut replaced = before.clone();
+    replaced.server.as_mut().unwrap().start += 1;
+    assert_refused(before.clone(), replaced);
+    let mut stale = before.clone();
+    stale.server = None;
+    assert_refused(before, stale);
+}
+
+#[test]
+fn replaced_mount_or_network_namespace_never_invokes_native_closure() {
+    let before = observation();
+    let mut replaced = before.clone();
+    replaced.mounts[0] = "31 1 0:20 / /tmp rw - tmpfs tmpfs rw".into();
+    assert_refused(before.clone(), replaced);
+    let mut replaced = before.clone();
+    replaced.namespaces.as_mut().unwrap()[1] = "net-replaced".into();
+    assert_refused(before, replaced);
+}
+
+#[test]
+fn even_stable_fresh_looking_evidence_cannot_bind_future_connection() {
+    assert_refused(observation(), observation());
+    assert_refused(Observation::default(), Observation::default());
+}
+
+#[test]
+fn actual_collector_never_authorizes_native_operations() {
+    let mut calls = 0;
+    assert_eq!(
+        run_if_isolated(&clipboard_isolation::current(), || calls += 1),
+        Err(BLOCKED)
+    );
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn actual_collector_refuses_forged_environment_hints_in_child_processes() {
+    // Separate processes avoid modifying the parallel test harness environment.
+    // None of these child tests constructs a native clipboard or opens a display.
+    for pid in [
+        "invalid".to_owned(),
+        "0".into(),
+        std::process::id().to_string(),
+    ] {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "actual_collector_never_authorizes_native_operations",
+            ])
+            .env("BITTY_CLIPBOARD_XVFB_PID", pid)
+            .env("DISPLAY", ":0")
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    }
 }

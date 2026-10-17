@@ -1,143 +1,104 @@
-//! Test-only isolation gate. No clipboard calls, display connections or content reads.
+//! Test-only refusal gate. No display connections or clipboard content reads.
+//!
+//! Proc observations are diagnostics, never native authorization. Even stable
+//! namespace, PID/start-time and mount identities cannot bind the subsequent
+//! independent Clipboard::new connection to that observed server. Refuse until
+//! a reviewed connection-bound runner contract exists (PX-6898).
 
-#[derive(Debug, Default)]
+pub const BLOCKED: &str =
+    "native access not executed: connection-bound disposable runner unavailable";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start: u64,
+    pub parent: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observation {
+    // mnt, net, pid; namespace identifiers are opaque kernel identities.
+    pub namespaces: Option<[String; 3]>,
+    pub parent_namespaces: Option<[String; 3]>,
+    pub runner: Option<ProcessIdentity>,
+    pub server: Option<ProcessIdentity>,
+    // Full mountinfo rows preserve mount IDs and devices, not just tmpfs type.
+    pub mounts: Vec<String>,
+}
+
+#[derive(Debug)]
 pub struct IsolationEvidence {
-    pub linux: bool,
-    pub display_number: Option<u32>,
-    pub wayland_present: bool,
-    pub server_pid: Option<u32>,
-    pub display_lock_pid: Option<u32>,
-    pub server_parent: Option<u32>,
-    pub test_parent: Option<u32>,
-    pub server_is_xvfb: bool,
-    pub server_uses_displayfd: bool,
-    pub server_disables_tcp: bool,
-    pub private_tmp: bool,
-    pub private_run: bool,
-    pub server_owns_display_socket: bool,
+    // Private: callers cannot manufacture an authorized token from booleans.
+    _observed: Observation,
 }
 
-pub fn validate(e: &IsolationEvidence) -> Result<(), &'static str> {
-    if !e.linux
-        || e.display_number.is_none()
-        || e.wayland_present
-        || e.server_pid.is_none()
-        || e.server_pid != e.display_lock_pid
-        || e.server_parent.is_none()
-        || e.server_parent != e.test_parent
-        || !e.server_is_xvfb
-        || !e.server_uses_displayfd
-        || !e.server_disables_tcp
-        || !e.private_tmp
-        || !e.private_run
-        || !e.server_owns_display_socket
-    {
-        return Err("requires the disposable Xvfb namespace runner; native access not executed");
+/// The collector deliberately issues no positive authorization, including for
+/// consistent synthetic evidence. A second observation is not a TOCTOU fix.
+pub fn collect(mut observe: impl FnMut() -> Observation) -> IsolationEvidence {
+    let _before = observe();
+    IsolationEvidence {
+        _observed: observe(),
     }
-    Ok(())
 }
 
-pub fn run_if_isolated(e: &IsolationEvidence, run: impl FnOnce()) -> Result<(), &'static str> {
-    validate(e)?;
-    run();
-    Ok(())
+pub fn run_if_isolated(
+    _evidence: &IsolationEvidence,
+    _native: impl FnOnce(),
+) -> Result<(), &'static str> {
+    Err(BLOCKED)
 }
 
 #[cfg(target_os = "linux")]
 pub fn current() -> IsolationEvidence {
-    use std::{env, fs, os::unix::fs::FileTypeExt, path::Path};
+    use std::{env, fs};
 
-    fn parent(pid: u32) -> Option<u32> {
-        fs::read_to_string(format!("/proc/{pid}/status"))
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
-    }
-
-    // The marker is a discovery hint only. Every independent fact below is
-    // required before a native constructor may be called.
-    let Some(server_pid) = env::var("BITTY_CLIPBOARD_XVFB_PID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|pid| *pid > 1)
-    else {
-        return IsolationEvidence::default();
-    };
-    let display_number = env::var("DISPLAY").ok().and_then(|value| {
-        let number = value.strip_prefix(':')?;
-        number
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| number.parse().ok())
-            .flatten()
-    });
-    let args = fs::read(format!("/proc/{server_pid}/cmdline")).unwrap_or_default();
-    let args: Vec<_> = args.split(|byte| *byte == 0).collect();
-    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let private_mount = |path: &str| {
-        mounts.lines().any(|line| {
-            let Some((fields, kind)) = line.split_once(" - ") else {
-                return false;
-            };
-            let fields: Vec<_> = fields.split_whitespace().collect();
-            fields.get(3) == Some(&"/")
-                && fields.get(4) == Some(&path)
-                && kind.starts_with("tmpfs ")
+    fn identity(pid: u32) -> Option<ProcessIdentity> {
+        // comm can contain spaces and parentheses; fields after the final ')'
+        // start at stat field 3. Parent is field 4 and starttime is field 22.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, tail) = stat.rsplit_once(')')?;
+        let fields: Vec<_> = tail.split_whitespace().collect();
+        Some(ProcessIdentity {
+            pid,
+            parent: fields.get(1)?.parse().ok()?,
+            start: fields.get(19)?.parse().ok()?,
         })
-    };
-    IsolationEvidence {
-        linux: true,
-        display_number,
-        wayland_present: env::var_os("WAYLAND_DISPLAY").is_some()
-            || env::var_os("WAYLAND_SOCKET").is_some(),
-        server_pid: Some(server_pid),
-        display_lock_pid: display_number.and_then(|number| {
-            fs::read_to_string(format!("/tmp/.X{number}-lock"))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-        }),
-        server_parent: parent(server_pid),
-        test_parent: parent(std::process::id()),
-        server_is_xvfb: fs::read_link(format!("/proc/{server_pid}/exe"))
-            .ok()
-            .and_then(|path| path.file_name().map(|name| name == Path::new("Xvfb")))
-            .unwrap_or(false),
-        server_uses_displayfd: args.contains(&b"-displayfd".as_slice()),
-        server_disables_tcp: args
-            .windows(2)
-            .any(|pair| pair == [b"-nolisten".as_slice(), b"tcp".as_slice()]),
-        private_tmp: private_mount("/tmp"),
-        private_run: private_mount("/run"),
-        server_owns_display_socket: display_number.is_some_and(|number| {
-            let socket_path = format!("/tmp/.X11-unix/X{number}");
-            if !fs::symlink_metadata(&socket_path)
-                .is_ok_and(|metadata| metadata.file_type().is_socket())
-            {
-                return false;
-            }
-            let sockets = fs::read_to_string("/proc/net/unix").unwrap_or_default();
-            let Ok(descriptors) = fs::read_dir(format!("/proc/{server_pid}/fd")) else {
-                return false;
-            };
-            let owned: Vec<_> = descriptors
-                .flatten()
-                .filter_map(|entry| fs::read_link(entry.path()).ok())
-                .collect();
-            sockets.lines().any(|line| {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                fields.get(7) == Some(&socket_path.as_str())
-                    && fields
-                        .get(6)
-                        .is_some_and(|inode| owned.contains(&format!("socket:[{inode}]").into()))
-            })
-        }),
     }
+
+    fn namespaces(pid: u32) -> Option<[String; 3]> {
+        let read = |kind| {
+            fs::read_link(format!("/proc/{pid}/ns/{kind}"))
+                .ok()
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        Some([read("mnt")?, read("net")?, read("pid")?])
+    }
+
+    collect(|| {
+        let pid = std::process::id();
+        let runner = identity(pid).and_then(|process| identity(process.parent));
+        // An inherited PID is only a diagnostic hint, never authority. Do not
+        // open the display socket, display lock or clipboard to inspect it.
+        let server = env::var("BITTY_CLIPBOARD_XVFB_PID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .and_then(identity);
+        Observation {
+            namespaces: namespaces(pid),
+            parent_namespaces: runner.as_ref().and_then(|runner| namespaces(runner.pid)),
+            runner,
+            server,
+            mounts: fs::read_to_string("/proc/self/mountinfo")
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| matches!(line.split_whitespace().nth(4), Some("/tmp" | "/run")))
+                .map(str::to_owned)
+                .collect(),
+        }
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn current() -> IsolationEvidence {
-    // No disposable native backend runner has been established here yet.
-    IsolationEvidence::default()
+    collect(Observation::default)
 }

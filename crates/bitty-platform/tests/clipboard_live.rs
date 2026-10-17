@@ -10,10 +10,11 @@
 //!
 //! Ordinary `gui-tests` runs emit `skipped` before any native constructor,
 //! read or write. A green harness with skipped lines is NOT native proof.
-//! The test-only runner starts fresh Xvfb in private namespaces; the guard
-//! checks process, display-lock and mount evidence rather than trusting an
-//! environment opt-in. Other Tier-1 backends remain NOT EXECUTED until a
-//! disposable runner exists. R-004 stays open.
+//! Native execution is disabled pending a reviewed connection-bound disposable
+//! runner. Proc/mount observations cannot bind the later native connection;
+//! another precheck would not eliminate replacement races (PX-6898).
+//! The runner returns 77 before launching a display. All Tier-1 backends remain
+//! NOT EXECUTED. R-004 stays open.
 //!
 //! What is covered beyond the headless suites (`clipboard_sync.rs` and the
 //! `clipboard.rs` unit tests):
@@ -29,10 +30,9 @@
 //!   value is preserved) and bounded reads never exceed
 //!   `CLIPBOARD_MAX_BYTES`.
 //!
-//! These tests deliberately overwrite both selections on the disposable
-//! server. They do not read or attempt to restore owner clipboard content.
-//! The runner destroys the display namespace on failure or timeout as well
-//! as success. A mutex serializes native operations. Real-window
+//! The dormant scenario bodies would overwrite selections and must only be
+//! re-enabled with connection-bound isolation. No save/restore is attempted.
+//! Cleanup success/failure/timeout proof remains NOT EXECUTED. Real-window
 //! confirmation UX (paste banner present/focus/dismiss) stays manual smoke
 //! evidence per platform; it is not asserted here.
 

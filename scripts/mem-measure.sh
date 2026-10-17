@@ -374,14 +374,23 @@ process_tree_snapshot() {
         case "$seen" in
         *" $child "*) continue ;;
         esac
+        seen="$seen$child "
         member_count=$((member_count + 1))
-        if [ "$member_count" -gt "$PROCESS_TREE_MAX_MEMBERS" ]; then
-          echo "mem-measure: refusing process-tree cleanup: more than $PROCESS_TREE_MAX_MEMBERS members" >&2
+        if ! identity="$(capture_process_identity "$child")"; then
+          # A child can exit between process-table enumeration and identity
+          # capture. It is safe to omit only when the PID is now confirmed
+          # absent/zombie; a surviving or indeterminate child remains a
+          # fail-closed refusal.
+          if process_is_exited "$child"; then
+            member_count=$((member_count - 1))
+            echo "mem-measure: skipping exited process-tree member PID $child during discovery" >&2
+            continue
+          fi
+          echo "mem-measure: refusing process-tree cleanup: PID $child identity could not be proven" >&2
           return 1
         fi
-        seen="$seen$child "
-        if ! identity="$(capture_process_identity "$child")"; then
-          echo "mem-measure: refusing process-tree cleanup: PID $child identity could not be proven" >&2
+        if [ "$member_count" -gt "$PROCESS_TREE_MAX_MEMBERS" ]; then
+          echo "mem-measure: refusing process-tree cleanup: more than $PROCESS_TREE_MAX_MEMBERS members" >&2
           return 1
         fi
         IFS=$'\t' read -r child_pid child_start_time child_executable child_instance_id <<<"$identity"

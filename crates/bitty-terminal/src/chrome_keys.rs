@@ -1540,6 +1540,12 @@ impl TerminalApp {
                                 "warning: keymap close_view could not prune empty workspace — ignoring"
                             );
                         }
+                    } else if self.runtime.is_primary_view(&focused) {
+                        if self.runtime.close_primary_session() {
+                            eprintln!(
+                                "bitty: keymap close_view tore down primary shell {focused:?} (workspace kept for float)"
+                            );
+                        }
                     } else if self.runtime.close_pane_session(&focused) {
                         eprintln!(
                             "bitty: keymap close_view tore down last tiled panel shell {focused:?} (workspace kept for float)"
@@ -3730,6 +3736,35 @@ mod tests {
         assert_eq!(app.runtime.workspace_count(), 1);
         assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
         assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_view_tears_down_primary_with_sole_workspace_pinned_panel() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell spawns");
+        let primary = app.runtime.primary_view().expect("primary owner");
+        assert!(app.runtime.has_pty());
+
+        let pinned = ViewId::new(2);
+        assert!(app.runtime.set_focus(pinned));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.focused_view(), Some(primary));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert!(!app.runtime.has_pty(), "primary shell must be torn down");
+        assert_eq!(app.runtime.primary_view(), Some(primary));
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
+        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.workspace_count(), 1);
     }
 
     #[test]

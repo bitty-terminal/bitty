@@ -56,6 +56,9 @@ use bitty_plugin_host::manifest::{SettingDecl, SettingDefault, SettingKind};
 use super::LuaValue;
 use super::services::SettingsSource;
 
+/// Maximum number of settings diagnostics retained for one activation.
+pub const MAX_PLUGIN_SETTINGS_DIAGNOSTICS: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Type agreement (strict: no coercion, ever)
 // ---------------------------------------------------------------------------
@@ -265,6 +268,86 @@ pub struct LoadedPluginSettings {
     pub file_error: Option<String>,
 }
 
+/// Non-sensitive settings diagnostic surfaced by the activation report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSettingsDiagnostic {
+    /// A short alias has more than one plugin claimant and was not applied.
+    AmbiguousAlias { alias: String, claimants: usize },
+    /// A canonical Lua file was preferred over a present short-alias file.
+    CanonicalShadowsAlias { alias: String },
+    /// Some file entries were ignored because they were undeclared or had an
+    /// incompatible type. The entry names are intentionally not surfaced.
+    DroppedEntries { count: usize },
+    /// A settings file was rejected and lower-precedence settings were used.
+    FileRejected,
+}
+
+impl std::fmt::Display for PluginSettingsDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AmbiguousAlias { alias, claimants } => write!(
+                formatter,
+                "short settings alias '{alias}' is ambiguous across {claimants} plugins; alias ignored"
+            ),
+            Self::CanonicalShadowsAlias { alias } => write!(
+                formatter,
+                "canonical Lua settings take precedence over short alias '{alias}'"
+            ),
+            Self::DroppedEntries { count } => {
+                write!(formatter, "{count} plugin settings entries ignored")
+            }
+            Self::FileRejected => {
+                formatter.write_str("plugin settings file rejected; lower-precedence settings used")
+            }
+        }
+    }
+}
+
+fn push_diagnostic(
+    diagnostics: &mut Vec<PluginSettingsDiagnostic>,
+    diagnostic: PluginSettingsDiagnostic,
+) {
+    if diagnostics.len() < MAX_PLUGIN_SETTINGS_DIAGNOSTICS {
+        diagnostics.push(diagnostic);
+    }
+}
+
+fn diagnostics_for_loaded(
+    dropped: &[String],
+    file_error: Option<&str>,
+    mut diagnostics: Vec<PluginSettingsDiagnostic>,
+) -> Vec<PluginSettingsDiagnostic> {
+    if !dropped.is_empty() {
+        push_diagnostic(
+            &mut diagnostics,
+            PluginSettingsDiagnostic::DroppedEntries {
+                count: dropped.len(),
+            },
+        );
+    }
+    if file_error.is_some() {
+        push_diagnostic(&mut diagnostics, PluginSettingsDiagnostic::FileRejected);
+    }
+    diagnostics
+}
+
+fn loaded_settings(
+    resolved: ResolvedPluginSettings,
+    file_error: Option<String>,
+    diagnostics: Vec<PluginSettingsDiagnostic>,
+) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
+    let dropped = resolved.dropped;
+    let diagnostics = diagnostics_for_loaded(&dropped, file_error.as_deref(), diagnostics);
+    (
+        LoadedPluginSettings {
+            source: PluginSettingsSource::new(resolved.values),
+            dropped,
+            file_error,
+        },
+        diagnostics,
+    )
+}
+
 fn plain_value_to_lua(value: &PlainConfigValue) -> Option<LuaValue> {
     match value {
         PlainConfigValue::Bool(value) => Some(LuaValue::Bool(*value)),
@@ -355,12 +438,17 @@ fn lua_config_paths(
     config_dir: &Path,
     plugin_id: &str,
     discovered_ids: Option<&[String]>,
-) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+) -> Option<(
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    Vec<PluginSettingsDiagnostic>,
+)> {
     if !plugin_file::valid_plugin_file_id(plugin_id) {
         return None;
     }
     let plugins = config_dir.join(plugin_file::PLUGINS_DIR_NAME);
     let canonical = plugins.join(format!("{plugin_id}.lua"));
+    let mut diagnostics = Vec::new();
     let alias = discovered_ids.and_then(|ids| {
         if ids.iter().any(|id| !plugin_file::valid_plugin_file_id(id)) {
             return None;
@@ -376,9 +464,22 @@ fn lua_config_paths(
                 (name == short_name && plugin_file::valid_plugin_file_id(id)).then_some(owner)
             })
             .collect();
-        (owners.len() == 1).then(|| plugins.join(format!("{short_name}.lua")))
+        if owners.len() == 1 {
+            Some(plugins.join(format!("{short_name}.lua")))
+        } else {
+            if owners.len() > 1 {
+                push_diagnostic(
+                    &mut diagnostics,
+                    PluginSettingsDiagnostic::AmbiguousAlias {
+                        alias: short_name.to_string(),
+                        claimants: owners.len(),
+                    },
+                );
+            }
+            None
+        }
     });
-    Some((canonical, alias))
+    Some((canonical, alias, diagnostics))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -585,6 +686,26 @@ pub fn load_plugin_settings_with_plugins(
     base: Option<&dyn SettingsSource>,
     discovered_ids: Option<&[String]>,
 ) -> LoadedPluginSettings {
+    load_plugin_settings_with_plugins_and_diagnostics(
+        config_dir,
+        plugin_id,
+        declared,
+        base,
+        discovered_ids,
+    )
+    .0
+}
+
+/// Load settings and retain host diagnostics for the runtime observability
+/// path. This is intentionally crate-private: the public loader keeps the
+/// established [`LoadedPluginSettings`] layout source-compatible.
+pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
+    config_dir: Option<&Path>,
+    plugin_id: &str,
+    declared: &[SettingDecl],
+    base: Option<&dyn SettingsSource>,
+    discovered_ids: Option<&[String]>,
+) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
     let path = match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
         // Validated ids match `owner.name` with no separators, so joining
         // the file name cannot escape the `plugins/` directory (fail-closed
@@ -592,33 +713,49 @@ pub fn load_plugin_settings_with_plugins(
         (Some(dir), true) => lua_config_paths(dir, plugin_id, discovered_ids),
         _ => None,
     };
+    let mut path_diagnostics = Vec::new();
+    let mut canonical_shadow_alias = None;
     let lua_bytes = match path {
-        Some((canonical_path, alias_path)) => match read_bounded_regular_file(&canonical_path) {
-            Ok(bytes) => Some(bytes),
-            Err(ConfigReadError::NotFound) => match alias_path {
-                Some(alias_path) => match read_bounded_regular_file(&alias_path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(ConfigReadError::NotFound) => None,
-                    Err(ConfigReadError::Rejected(error)) => {
-                        let resolved = merge_lua_settings(declared, None, base);
-                        return LoadedPluginSettings {
-                            source: PluginSettingsSource::new(resolved.values),
-                            dropped: resolved.dropped,
-                            file_error: Some(error),
-                        };
+        Some((canonical_path, alias_path, diagnostics)) => {
+            path_diagnostics = diagnostics;
+            match read_bounded_regular_file(&canonical_path) {
+                Ok(bytes) => {
+                    if let Some(alias_path) = alias_path.as_deref() {
+                        if std::fs::symlink_metadata(alias_path).is_ok() {
+                            let alias = alias_path
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or_default();
+                            if !alias.is_empty() {
+                                canonical_shadow_alias = Some(alias.to_string());
+                            }
+                        }
                     }
+                    Some(bytes)
+                }
+                Err(ConfigReadError::NotFound) => match alias_path {
+                    Some(alias_path) => match read_bounded_regular_file(&alias_path) {
+                        Ok(bytes) => Some(bytes),
+                        Err(ConfigReadError::NotFound) => None,
+                        Err(ConfigReadError::Rejected(error)) => {
+                            return loaded_settings(
+                                merge_lua_settings(declared, None, base),
+                                Some(error),
+                                path_diagnostics,
+                            );
+                        }
+                    },
+                    None => None,
                 },
-                None => None,
-            },
-            Err(ConfigReadError::Rejected(error)) => {
-                let resolved = merge_lua_settings(declared, None, base);
-                return LoadedPluginSettings {
-                    source: PluginSettingsSource::new(resolved.values),
-                    dropped: resolved.dropped,
-                    file_error: Some(error),
-                };
+                Err(ConfigReadError::Rejected(error)) => {
+                    return loaded_settings(
+                        merge_lua_settings(declared, None, base),
+                        Some(error),
+                        path_diagnostics,
+                    );
+                }
             }
-        },
+        }
         None => None,
     };
     if let Some(bytes) = lua_bytes {
@@ -635,23 +772,31 @@ pub fn load_plugin_settings_with_plugins(
             });
         match lua_result.and_then(plain_settings_to_lua) {
             Ok((values, mut dropped)) => {
+                if let Some(alias) = canonical_shadow_alias {
+                    push_diagnostic(
+                        &mut path_diagnostics,
+                        PluginSettingsDiagnostic::CanonicalShadowsAlias { alias },
+                    );
+                }
                 let resolved = merge_lua_settings(declared, Some(&values), base);
                 dropped.extend(resolved.dropped);
                 dropped.sort();
                 dropped.dedup();
-                return LoadedPluginSettings {
-                    source: PluginSettingsSource::new(resolved.values),
-                    dropped,
-                    file_error: None,
-                };
+                return loaded_settings(
+                    ResolvedPluginSettings {
+                        values: resolved.values,
+                        dropped,
+                    },
+                    None,
+                    path_diagnostics,
+                );
             }
             Err(error) => {
-                let resolved = merge_lua_settings(declared, None, base);
-                return LoadedPluginSettings {
-                    source: PluginSettingsSource::new(resolved.values),
-                    dropped: resolved.dropped,
-                    file_error: Some(format!("plugin Lua config rejected: {error}")),
-                };
+                return loaded_settings(
+                    merge_lua_settings(declared, None, base),
+                    Some(format!("plugin Lua config rejected: {error}")),
+                    path_diagnostics,
+                );
             }
         }
     }
@@ -665,47 +810,27 @@ pub fn load_plugin_settings_with_plugins(
     };
     let Some(path) = toml_path else {
         let resolved = resolve_plugin_settings(declared, None, base);
-        return LoadedPluginSettings {
-            source: PluginSettingsSource::new(resolved.values),
-            dropped: resolved.dropped,
-            file_error: None,
-        };
+        return loaded_settings(resolved, None, path_diagnostics);
     };
     let bytes = match read_bounded_regular_file(&path) {
         Ok(bytes) => bytes,
         Err(ConfigReadError::NotFound) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            return LoadedPluginSettings {
-                source: PluginSettingsSource::new(resolved.values),
-                dropped: resolved.dropped,
-                file_error: None,
-            };
+            return loaded_settings(resolved, None, path_diagnostics);
         }
         Err(ConfigReadError::Rejected(error)) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            return LoadedPluginSettings {
-                source: PluginSettingsSource::new(resolved.values),
-                dropped: resolved.dropped,
-                file_error: Some(error),
-            };
+            return loaded_settings(resolved, Some(error), path_diagnostics);
         }
     };
     match plugin_file::parse_plugin_file(&bytes) {
         Ok(parsed) => {
             let resolved = resolve_plugin_settings(declared, Some(&parsed), base);
-            LoadedPluginSettings {
-                source: PluginSettingsSource::new(resolved.values),
-                dropped: resolved.dropped,
-                file_error: None,
-            }
+            loaded_settings(resolved, None, path_diagnostics)
         }
         Err(error) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            LoadedPluginSettings {
-                source: PluginSettingsSource::new(resolved.values),
-                dropped: resolved.dropped,
-                file_error: Some(error.to_string()),
-            }
+            loaded_settings(resolved, Some(error.to_string()), path_diagnostics)
         }
     }
 }
@@ -994,7 +1119,7 @@ mod tests {
         )
         .expect("canonical");
         let ids = vec!["xuepoo.bar".to_string()];
-        let loaded = load_plugin_settings_with_plugins(
+        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
             Some(&dir),
             "xuepoo.bar",
             &bar_decls(),
@@ -1007,6 +1132,12 @@ mod tests {
             Some(LuaValue::String("top".to_string()))
         );
         assert!(loaded.file_error.is_none());
+        assert_eq!(
+            diagnostics,
+            vec![PluginSettingsDiagnostic::CanonicalShadowsAlias {
+                alias: "bar".to_string()
+            }]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1030,7 +1161,7 @@ mod tests {
         );
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(false)));
         let collision = vec!["xuepoo.bar".to_string(), "other.bar".to_string()];
-        let loaded = load_plugin_settings_with_plugins(
+        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
             Some(&dir),
             "xuepoo.bar",
             &bar_decls(),
@@ -1039,6 +1170,13 @@ mod tests {
         );
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_none());
+        assert_eq!(
+            diagnostics,
+            vec![PluginSettingsDiagnostic::AmbiguousAlias {
+                alias: "bar".to_string(),
+                claimants: 2,
+            }]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1053,7 +1191,13 @@ mod tests {
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("xuepoo.bar.lua"), b"return io\n").expect("lua");
         std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = false\n").expect("toml");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        let (loaded, _diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            None,
+        );
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1073,7 +1217,13 @@ mod tests {
             b"return { show = 'bad', edge = 'top', name_max_chars = 3.5, hidden = true }\n",
         )
         .expect("lua");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            None,
+        );
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert_eq!(
             loaded.source.get("edge"),
@@ -1084,6 +1234,10 @@ mod tests {
             Some(LuaValue::Integer(32))
         );
         assert!(loaded.dropped.iter().any(|key| key == "hidden"));
+        assert_eq!(
+            diagnostics,
+            vec![PluginSettingsDiagnostic::DroppedEntries { count: 3 }]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

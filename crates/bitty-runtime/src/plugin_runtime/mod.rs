@@ -550,6 +550,7 @@ struct PluginEntry {
     vm: Option<Rc<RefCell<LuaVm>>>,
     services: Option<Rc<PluginServices>>,
     registrations: RegistrationCapture,
+    settings_diagnostics: Vec<plugin_settings::PluginSettingsDiagnostic>,
 }
 
 type DiscoveryResults = Vec<(PluginId, Result<(), PluginRuntimeError>)>;
@@ -1788,6 +1789,7 @@ impl PluginRuntime {
                 vm: None,
                 services: None,
                 registrations: RegistrationCapture::new(),
+                settings_diagnostics: Vec::new(),
             },
         );
         self.order.push(id);
@@ -1806,11 +1808,25 @@ impl PluginRuntime {
         result
     }
 
+    /// Return bounded settings diagnostics for the currently stored plugin
+    /// generation. Diagnostics stay on the host-owned entry rather than on
+    /// [`ActivationReport`], preserving source compatibility for downstream
+    /// exhaustive struct literals and destructuring.
+    #[must_use]
+    pub fn settings_diagnostics(
+        &self,
+        id: &PluginId,
+    ) -> Option<&[plugin_settings::PluginSettingsDiagnostic]> {
+        self.entries
+            .get(id)
+            .map(|entry| entry.settings_diagnostics.as_slice())
+    }
+
     fn activate_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (manifest, module_root, init_path, recorded_grant, source_class) = {
             let entry = self
                 .entries
-                .get(id)
+                .get_mut(id)
                 .ok_or_else(|| PluginRuntimeError::Lifecycle {
                     plugin: id.to_string(),
                     detail: "plugin not discovered".to_string(),
@@ -1824,6 +1840,7 @@ impl PluginRuntime {
                     detail: format!("cannot activate from state {:?}", entry.state),
                 });
             }
+            entry.settings_diagnostics.clear();
             // `--safe` is decided by discovery provenance, never by the
             // self-declared id: a third-party package cannot claim bundled
             // trust by naming itself `bitty.*` (RFC A.4 rule 6). This check
@@ -1990,6 +2007,7 @@ impl PluginRuntime {
                 return Err(error);
             }
         }
+        let settings_diagnostics;
         let plugin_services = {
             // CTX-1195 (issue #2010): per-generation settings — manifest
             // shipped defaults, then the old home (the shared host source),
@@ -1998,13 +2016,19 @@ impl PluginRuntime {
             // fails closed structurally and at the gate. A malformed file
             // resolves to lower layers (never aborts activation); grants are
             // untouched by construction (this path names no capability).
-            let loaded = plugin_settings::load_plugin_settings_with_plugins(
-                self.settings_dir.as_deref(),
+            let loaded = plugin_settings::load_plugin_settings_with_plugins_and_diagnostics(
+                if self.safe_mode {
+                    None
+                } else {
+                    self.settings_dir.as_deref()
+                },
                 id.as_str(),
                 &manifest.settings,
                 Some(&*self.settings),
                 self.settings_alias_registry.as_deref(),
             );
+            let (loaded, diagnostics) = loaded;
+            settings_diagnostics = diagnostics;
             let services = Rc::new(PluginServices::new(
                 id.as_str(),
                 store,
@@ -2284,6 +2308,7 @@ impl PluginRuntime {
             let entry = self.entries.get_mut(id).expect("entry exists");
             entry.vm = Some(vm.clone());
             entry.registrations = capture;
+            entry.settings_diagnostics = settings_diagnostics;
             entry.state = LifecycleState::Active;
             (
                 entry.package.source_class,

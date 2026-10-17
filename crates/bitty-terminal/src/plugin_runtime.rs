@@ -490,6 +490,9 @@ pub(crate) fn discover_with_roots(
                 });
             }
             Ok(report) => {
+                for diagnostic in runtime.settings_diagnostics(&id).unwrap_or_default() {
+                    crate::logging::warn(|| format!("bitty: plugin '{id}' settings: {diagnostic}"));
+                }
                 let verification = if report.unverified {
                     "unverified"
                 } else {

@@ -156,7 +156,7 @@ fn sample_cursor_cell(rt: &Runtime, lower: ViewId, row: u16, col: u16) -> [u8; 4
 }
 
 #[test]
-fn stacked_float_focused_lower_cursor_under_upper_stays_hidden() {
+fn stacked_float_focused_lower_cursor_raises_above_upper() {
     let mut rt = make_runtime();
     install(&mut rt, three_pane());
     rt.float_detach(ViewId::new(1))
@@ -167,18 +167,18 @@ fn stacked_float_focused_lower_cursor_under_upper_stays_hidden() {
     let (row, col) = find_covered_cell(&rt, ViewId::new(1), ViewId::new(2));
     move_cursor(&mut rt, row, col);
     rt.tick().expect("cursor frame must present");
-    assert_eq!(
+    assert_ne!(
         sample_cursor_cell(&rt, ViewId::new(1), row, col),
         THEME_BG,
-        "cursor cell under the upper float must stay theme background"
+        "focused lower float must raise above the former upper float"
     );
     let (row2, col2) = find_covered_cell(&rt, ViewId::new(1), ViewId::new(2));
     move_cursor(&mut rt, row2, col2);
     rt.tick().expect("second cursor frame must present");
-    assert_eq!(
+    assert_ne!(
         sample_cursor_cell(&rt, ViewId::new(1), row2, col2),
         THEME_BG,
-        "cursor must stay hidden across the retained reuse path"
+        "raised float cursor must remain visible across retained reuse"
     );
 }
 

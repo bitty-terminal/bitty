@@ -595,10 +595,10 @@ impl Runtime {
         !self.floats.is_empty()
     }
 
-    /// Detached floating leaf ids in detach order (present-time paint order).
+    /// Detached floating leaf ids in current paint order, back to front.
     #[must_use]
     pub fn floated_views(&self) -> Vec<ViewId> {
-        self.floats.ids()
+        self.floats.paint_ids()
     }
 
     /// Discards detached float `id` without restoring it (issue #2141).
@@ -1064,6 +1064,9 @@ impl Runtime {
             if let Some(first) = self.layout.leaf_ids().into_iter().next() {
                 self.focus = Focus::with_focus(first);
             }
+        }
+        if let Some(focused) = self.focus.focused() {
+            self.floats.raise_to_top(focused);
         }
         // CTX-0536 (#923): loading a slot is a layout install; cover ids that
         // entered through the workspace-new / empty-reset paths.

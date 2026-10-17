@@ -677,7 +677,7 @@ fn two_detached_floats_cascade_with_equal_size() {
 #[test]
 fn three_detached_floats_keep_cascading_in_detach_order() {
     // CTX-1166 (#1994): the cascade continues per depth — each new float
-    // steps further down-right — and paint order follows detach order so
+    // steps further down-right — and initial paint order follows detach order so
     // the newest stays topmost.
     let mut rt = make_runtime();
     install(&mut rt, four_pane());
@@ -708,7 +708,7 @@ fn three_detached_floats_keep_cascading_in_detach_order() {
     assert!(
         position_of(ViewId::new(1)) < position_of(ViewId::new(2))
             && position_of(ViewId::new(2)) < position_of(ViewId::new(3)),
-        "paint order follows detach order"
+        "initial paint order follows detach order"
     );
 }
 
@@ -785,7 +785,8 @@ fn detached_float_cascades_past_an_existing_pin() {
 #[test]
 fn stacked_floats_hit_test_topmost_first() {
     // CTX-1164 (#1992): stacked detached floats hit-test topmost-first.
-    // The newest detach paints last (present order follows detach order),
+    // The newest detach paints last initially (present order follows detach
+    // order until focus raises a float),
     // so a click in the overlap must focus the upper float, while a click
     // in the lower-only cascade strip must focus the lower one.
     let mut rt = Runtime::new(RuntimeConfig {
@@ -807,7 +808,7 @@ fn stacked_floats_hit_test_topmost_first() {
     };
     assert!(
         position_of(ViewId::new(1)) < position_of(ViewId::new(2)),
-        "paint order follows detach order"
+        "initial paint order follows detach order"
     );
     // Overlap: the center of the upper float lies inside the lower one
     // (the cascade step is far smaller than half a float frame).
@@ -841,19 +842,19 @@ fn stacked_floats_hit_test_topmost_first() {
         "clicking the lower-only region must focus the lower float"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
-    // Focus now sits on the lower float, but the stacking is unchanged:
-    // the overlap still hits the topmost float first.
+    // Focusing the lower float raises it above the other detached float while
+    // preserving both anchored geometries.
     assert_eq!(
         rt.cursor_to_present_cell(overlap).map(|(view, _)| view),
-        Some(ViewId::new(2)),
-        "after focusing the lower float, overlap must still hit topmost first"
+        Some(ViewId::new(1)),
+        "after focusing the lower float, overlap must hit the raised float"
     );
     rt.handle_cursor_moved(overlap);
     rt.handle_mouse_input(press(MouseButton::Left));
     assert_eq!(
         rt.focused_view(),
-        Some(ViewId::new(2)),
-        "clicking overlap again must refocus the upper float"
+        Some(ViewId::new(1)),
+        "clicking overlap again must keep the raised float focused"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
 }

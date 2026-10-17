@@ -107,6 +107,10 @@ impl std::error::Error for FloatError {}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FloatStore {
     entries: Vec<View>,
+    /// Detached ids in paint order. `entries` remains in detach order so
+    /// anchored geometry and focus-cycle order stay stable when a float is
+    /// raised.
+    paint_order: Vec<ViewId>,
 }
 
 impl FloatStore {
@@ -115,6 +119,7 @@ impl FloatStore {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            paint_order: Vec::new(),
         }
     }
 
@@ -149,10 +154,32 @@ impl FloatStore {
         self.entries.iter_mut().find(|view| view.id() == id)
     }
 
-    /// Detached leaf ids in detach order (present-time paint order).
+    /// Detached leaf ids in stable detach order.
     #[must_use]
     pub fn ids(&self) -> Vec<ViewId> {
         self.entries.iter().map(View::id).collect()
+    }
+
+    /// Detached leaf ids in present paint order, back to front.
+    #[must_use]
+    pub fn paint_ids(&self) -> Vec<ViewId> {
+        self.paint_order.clone()
+    }
+
+    /// Raises detached leaf `id` to the top of the detached-float tier.
+    ///
+    /// Only paint order changes: the detach order used for anchored geometry
+    /// remains stable, so focusing a float never moves it on screen.
+    pub fn raise_to_top(&mut self, id: ViewId) -> bool {
+        let Some(pos) = self.paint_order.iter().position(|entry| *entry == id) else {
+            return false;
+        };
+        if pos + 1 == self.paint_order.len() {
+            return false;
+        }
+        let id = self.paint_order.remove(pos);
+        self.paint_order.push(id);
+        true
     }
 
     /// Discards detached leaf `id` without restoring it to any tree
@@ -162,6 +189,7 @@ impl FloatStore {
     /// tree is never touched.
     pub fn discard(&mut self, id: ViewId) -> Option<View> {
         let pos = self.entries.iter().position(|view| view.id() == id)?;
+        self.paint_order.retain(|entry| *entry != id);
         Some(self.entries.remove(pos))
     }
 
@@ -172,7 +200,9 @@ impl FloatStore {
     /// The caller validates the snapshot first; like [`Self::detach`] this
     /// stays total and never fails.
     pub fn restore_detached(&mut self, view: View) {
+        let id = view.id();
         self.entries.push(view);
+        self.paint_order.push(id);
     }
 
     /// Detaches leaf `id` from `tree` and stamps it `Floating`.
@@ -217,6 +247,7 @@ impl FloatStore {
             });
         }
         self.entries.push(view);
+        self.paint_order.push(id);
         Ok(())
     }
 
@@ -247,10 +278,16 @@ impl FloatStore {
             .iter()
             .position(|view| view.id() == id)
             .ok_or(FloatError::NotDetached(id))?;
+        let paint_pos = self.paint_order.iter().position(|entry| *entry == id);
         let mut view = self.entries.remove(pos);
+        self.paint_order.retain(|entry| *entry != id);
         let from = view.presentation();
         if !PresentationMode::request_transition(&mut view, PresentationMode::Tiled) {
             self.entries.insert(pos.min(self.entries.len()), view);
+            if let Some(paint_pos) = paint_pos {
+                self.paint_order
+                    .insert(paint_pos.min(self.paint_order.len()), id);
+            }
             return Err(FloatError::Rejected {
                 from,
                 to: PresentationMode::Tiled,
@@ -635,5 +672,20 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert_eq!(store.ids(), vec![ViewId::new(3), ViewId::new(1)]);
         assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
+    }
+
+    #[test]
+    fn raising_changes_paint_order_without_changing_detach_order() {
+        let mut store = FloatStore::new();
+        store.restore_detached(View::new(ViewId::new(1), 80, 24));
+        store.restore_detached(View::new(ViewId::new(2), 80, 24));
+
+        assert_eq!(store.ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert_eq!(store.paint_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert!(store.raise_to_top(ViewId::new(1)));
+        assert_eq!(store.ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert_eq!(store.paint_ids(), vec![ViewId::new(2), ViewId::new(1)]);
+        assert!(store.discard(ViewId::new(1)).is_some());
+        assert_eq!(store.paint_ids(), vec![ViewId::new(2)]);
     }
 }

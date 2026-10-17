@@ -918,7 +918,7 @@ impl Runtime {
         //
         // CTX-1147 (#1975): the active workspace's detached floats composite
         // the same way, ahead of the pins: tiled base, in-tree mode floats,
-        // workspace detached floats in detach order, then pinned leaves in
+        // workspace detached floats in paint order, then pinned leaves in
         // pin order (sticky chrome stays topmost). Detached ids already
         // present in the base layout are skipped defensively, exactly like
         // pins.
@@ -930,7 +930,7 @@ impl Runtime {
             let mut layers: Vec<bitty_ui::OverlayLayer> = Vec::new();
             layers.extend(
                 self.floats
-                    .ids()
+                    .paint_ids()
                     .into_iter()
                     .filter(|id| !base_ids.contains(id))
                     .filter_map(|id| {
@@ -1387,7 +1387,7 @@ impl Runtime {
         // CTX-1164 (#1992): among stacked `Float`-tier frames the winner is
         // topmost-painted-first per the present composite order — window-global
         // pins in reverse pin order (pinned-above-float precedent), then
-        // workspace-detached floats in reverse detach order — not merely the
+        // workspace-detached floats in reverse paint order — not merely the
         // last frame in the slice. The slice order already matches today, so
         // this pins the invariant explicitly instead of relying on it; unknown
         // ids fall back to slice order and empty frames never win (fail-closed,
@@ -1423,7 +1423,7 @@ impl Runtime {
             if let Some(pinned) = hit {
                 pinned
             } else {
-                let float_order = self.floats.ids();
+                let float_order = self.floats.paint_ids();
                 let mut detached = None;
                 for id in float_order.iter().rev() {
                     if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
@@ -2235,9 +2235,12 @@ impl Runtime {
             || self.pinned.contains(id)
             || self.floats.contains(id)
         {
-            // Only dirty when the focus actually moves; re-selecting the
-            // focused pane is a no-op present-wise.
-            if self.focus.focused() != Some(id) {
+            // Focusing a detached float also raises its paint stack entry.
+            // The store keeps detach order separately, so this cannot alter
+            // the float's anchored geometry.
+            let raised = self.floats.raise_to_top(id);
+            // Only dirty when focus or paint order changes.
+            if self.focus.focused() != Some(id) || raised {
                 self.focus.set(id);
                 self.pending_full_redraw = true;
             }
@@ -2262,18 +2265,101 @@ impl Runtime {
     pub fn move_focus(&mut self, dir: FocusDirection) -> Option<ViewId> {
         // CTX-0334: a focus move abandons any pending hover dwell.
         self.clear_hover_pending();
-        let next = self
-            .focus
-            .advance_with_gaps(&self.layout, self.container, self.gaps(), dir);
+        let ids = self.focusable_view_ids();
+        let next = match dir {
+            FocusDirection::Next | FocusDirection::Prev => self.focus_cycle_neighbor(&ids, dir),
+            FocusDirection::Up
+            | FocusDirection::Down
+            | FocusDirection::Left
+            | FocusDirection::Right => self.focus_spatial_neighbor(&ids, dir),
+        };
         if let Some(id) = next {
-            if self.focus.focused() != Some(id) {
-                self.focus.set(id);
-                self.pending_full_redraw = true;
-            }
-            // CTX-0532: re-attribute the mode caches to the new pane.
-            self.sync_mode_caches_to_focus();
+            self.set_focus(id);
         }
         next
+    }
+
+    /// All panels participating in keyboard focus, in stable cycle order.
+    /// Tiled leaves retain layout order, detached floats retain detach order,
+    /// and pins remain the final window-global tier.
+    fn focusable_view_ids(&self) -> Vec<ViewId> {
+        self.layout
+            .leaf_ids()
+            .into_iter()
+            .chain(self.floats.ids())
+            .chain(self.pinned.ids())
+            .collect()
+    }
+
+    fn focus_cycle_neighbor(&self, ids: &[ViewId], dir: FocusDirection) -> Option<ViewId> {
+        if ids.is_empty() {
+            return None;
+        }
+        let step: isize = if dir == FocusDirection::Next { 1 } else { -1 };
+        let current = self
+            .focused_view()
+            .and_then(|id| ids.iter().position(|candidate| *candidate == id));
+        let index = match current {
+            Some(index) => ((index as isize + step).rem_euclid(ids.len() as isize)) as usize,
+            None if step > 0 => 0,
+            None => ids.len() - 1,
+        };
+        Some(ids[index])
+    }
+
+    /// Selects a directional panel from all presented frames. Anchored floats
+    /// are not layout leaves, so the generic layout adjacency cannot see them;
+    /// frame-center distance supplies deterministic spatial intent. Detached
+    /// floats and pins use the cycle ring as a fail-soft edge when every
+    /// presented panel overlaps; tiled leaves retain their layout-edge stop.
+    fn focus_spatial_neighbor(&self, ids: &[ViewId], dir: FocusDirection) -> Option<ViewId> {
+        let current = self.focused_view()?;
+        let frames = self.present_frames();
+        let current_frame = frames.iter().find(|frame| frame.view == current)?;
+        let current_center = (
+            current_frame.frame.x + current_frame.frame.width as i32 / 2,
+            current_frame.frame.y + current_frame.frame.height as i32 / 2,
+        );
+        let mut candidates: Vec<(ViewId, i64, i64)> = frames
+            .iter()
+            .filter(|frame| frame.view != current && ids.contains(&frame.view))
+            .filter_map(|frame| {
+                let center = (
+                    frame.frame.x + frame.frame.width as i32 / 2,
+                    frame.frame.y + frame.frame.height as i32 / 2,
+                );
+                let (primary, secondary) = match dir {
+                    FocusDirection::Up => (
+                        current_center.1 - center.1,
+                        (center.0 - current_center.0).abs(),
+                    ),
+                    FocusDirection::Down => (
+                        center.1 - current_center.1,
+                        (center.0 - current_center.0).abs(),
+                    ),
+                    FocusDirection::Left => (
+                        current_center.0 - center.0,
+                        (center.1 - current_center.1).abs(),
+                    ),
+                    FocusDirection::Right => (
+                        center.0 - current_center.0,
+                        (center.1 - current_center.1).abs(),
+                    ),
+                    FocusDirection::Next | FocusDirection::Prev => return None,
+                };
+                (primary > 0).then_some((frame.view, i64::from(primary), i64::from(secondary)))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, primary, secondary)| (*primary, *secondary));
+        candidates.first().map(|(id, _, _)| *id).or_else(|| {
+            // Preserve the pre-overlay behavior for tiled leaves: reaching a
+            // layout edge directionally does not jump around the focus ring.
+            // Detached floats and pins have no layout adjacency, so retain
+            // their cycle fallback when spatial intent has no candidate.
+            (!self.layout.leaf_ids().contains(&current))
+                .then(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
+                .flatten()
+        })
     }
 
     /// Container rect (cell coordinates) that the layout is reflowed into.

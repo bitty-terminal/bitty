@@ -4855,16 +4855,6 @@ fn init_step_parsers_accept_and_reject() {
     assert!(init_clean_shell(&"x".repeat(2000)).is_err());
 }
 
-#[test]
-fn init_columns_parse() {
-    assert_eq!(init_columns_from_env(None), None);
-    assert_eq!(init_columns_from_env(Some("80")), Some(80));
-    assert_eq!(init_columns_from_env(Some(" 100 ")), Some(100));
-    assert_eq!(init_columns_from_env(Some("0")), None);
-    assert_eq!(init_columns_from_env(Some("wide")), None);
-    assert_eq!(init_columns_from_env(Some("")), None);
-}
-
 /// Drives the interactive wizard with piped stdin; returns answers plus
 /// everything the wizard printed.
 fn drive_init_wizard(
@@ -4943,13 +4933,8 @@ fn init_interactive_all_defaults() {
     assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::WhenBusy);
     assert_eq!(answers.key_preset, InitKeyPreset::Default);
 
-    // Greeting shows the welcome line plus every step prompt, and no
-    // ASCII mascot banner (#2135: removed from init output in 0.0.24).
+    // Greeting shows the welcome line plus every step prompt.
     assert!(printed.contains("Welcome to bitty"));
-    assert!(
-        !printed.contains("MMMMM"),
-        "init output must not carry the mascot banner, got:\n{printed}"
-    );
     assert!(printed.contains("Shell"));
     assert!(printed.contains("Theme"));
     assert!(printed.contains("Font family"));
@@ -8001,96 +7986,6 @@ fn consolidated_startup_assembly_matches_expected_layout_and_focus() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Bittie mascot splash (issue #1318, CTX-0729)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn parse_mascot_flags_default_off() {
-    let parsed = parse_args(&args_of(&["bitty"]));
-    assert!(!parsed.no_splash);
-}
-
-#[test]
-fn parse_mascot_flag_removed_for_024() {
-    // #2135: `--mascot` is gone; it now parses as an unknown pre-`--` flag
-    // (main rejects it fail-closed with exit 2).
-    let parsed = parse_args(&args_of(&["bitty", "--mascot"]));
-    assert_eq!(parsed.unknown_flag.as_deref(), Some("--mascot"));
-    let parsed = parse_args(&args_of(&["bitty", "--no-splash"]));
-    assert!(parsed.unknown_flag.is_none());
-    assert!(parsed.no_splash);
-}
-
-#[test]
-fn help_no_longer_advertises_mascot() {
-    // #2135: both help surfaces drop `--mascot`; `--no-splash` stays
-    // (first-run splash kept).
-    assert!(
-        !help_text().contains("--mascot"),
-        "long help must not list --mascot"
-    );
-    assert!(
-        !crate::cli::help_text_short(false).contains("--mascot"),
-        "short help must not list --mascot"
-    );
-    assert!(
-        help_text().contains("--no-splash"),
-        "long help keeps --no-splash"
-    );
-}
-
-#[test]
-fn mascot_art_is_bounded_ascii() {
-    // Single-owned vendored asset: small, pure ASCII, fits 80 columns.
-    assert!(MASCOT_ART.is_ascii());
-    assert!(MASCOT_ART.lines().count() <= MASCOT_MAX_LINES);
-    let width = mascot_width();
-    assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
-}
-
-#[test]
-fn splash_marker_path_follows_data_root_policy() {
-    // Explicit XDG root wins; empty roots fall back to $HOME/.local/share.
-    let xdg = splash_marker_path(Some("/tmp/xdg-ctx0729"), Some("/home/u"));
-    assert_eq!(
-        xdg,
-        Some(std::path::PathBuf::from(format!(
-            "/tmp/xdg-ctx0729/bitty/{SPLASH_MARKER_FILE}"
-        )))
-    );
-    let home = splash_marker_path(None, Some("/home/u"));
-    assert_eq!(
-        home,
-        Some(std::path::PathBuf::from(format!(
-            "/home/u/.local/share/bitty/{SPLASH_MARKER_FILE}"
-        )))
-    );
-    assert_eq!(splash_marker_path(None, None), None);
-    assert_eq!(splash_marker_path(Some("  "), Some("")), None);
-}
-
-#[test]
-fn splash_show_policy_is_once_only_and_suppressible() {
-    let dir = std::env::temp_dir().join(format!("bitty-ctx0729-{}", std::process::id()));
-    let marker = dir.join("splash-shown");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // No marker yet: show; --no-splash suppresses without touching it.
-    assert!(should_show_splash(false, Some(&marker)));
-    assert!(!should_show_splash(true, Some(&marker)));
-    // No data root: fail closed (never splash every launch).
-    assert!(!should_show_splash(false, None));
-
-    // Recording is best-effort and idempotent; afterwards no splash.
-    record_splash_shown(&marker);
-    assert!(marker.exists(), "marker written");
-    assert!(!should_show_splash(false, Some(&marker)));
-    record_splash_shown(&marker);
-    assert!(!should_show_splash(false, Some(&marker)));
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
 // -- CTX-0731 (#982): panel-hosted `$EDITOR` round trip ------------------------
 
 fn editor_test_app() -> TerminalApp {

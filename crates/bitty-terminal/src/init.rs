@@ -24,12 +24,6 @@ pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
     "/bin/sh",
 ];
 
-/// Parses a `COLUMNS`-style width value. Pure over the injected string so
-/// tests never touch the environment; `None`/garbage/zero means unknown.
-pub(crate) fn init_columns_from_env(value: Option<&str>) -> Option<u16> {
-    value?.trim().parse::<u16>().ok().filter(|width| *width > 0)
-}
-
 /// Keybinding preset choice (the vim step, CTX-0149 owner note).
 ///
 /// The shipped defaults are already the Alt-as-Mod vim-style map (CTX-0178:

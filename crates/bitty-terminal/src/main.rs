@@ -252,7 +252,6 @@ mod storage_backends;
 mod version;
 
 mod list;
-mod mascot;
 mod plugin;
 mod run;
 mod shell_init;
@@ -294,23 +293,16 @@ use layout_cmd::{
 use terminal_app::window_title_for_theme;
 
 #[cfg(test)]
-use mascot::{
-    MASCOT_ART, MASCOT_MAX_LINES, MASCOT_MAX_WIDTH, SPLASH_MARKER_FILE, mascot_width,
-    record_splash_shown, should_show_splash, splash_marker_path,
-};
-
-#[cfg(test)]
 use init::{
     InitAnswers, InitEnv, InitKeyPreset, InitOverrides, InitPreview, InitWriteError,
-    init_bundled_plugin_components, init_clean_shell, init_columns_from_env,
-    init_detect_shell_for_handoff, init_lua_escape, init_parse_close_confirm_answer,
-    init_parse_decoration_answer, init_parse_font_family_answer, init_parse_font_size_answer,
-    init_parse_plugins_answer, init_parse_plugins_flag, init_parse_preset_answer,
-    init_parse_scrollback_answer, init_parse_shell_answer, init_parse_theme_answer,
-    init_parse_yes_no_answer, init_shell_candidates, init_shell_init_line,
-    init_shell_name_from_path, init_shell_source_hint, init_usage, init_yes_defaults,
-    render_init_lua, run_init_interactive, run_init_interactive_with_preview,
-    run_init_subcommand_with_io, write_init_config,
+    init_bundled_plugin_components, init_clean_shell, init_detect_shell_for_handoff,
+    init_lua_escape, init_parse_close_confirm_answer, init_parse_decoration_answer,
+    init_parse_font_family_answer, init_parse_font_size_answer, init_parse_plugins_answer,
+    init_parse_plugins_flag, init_parse_preset_answer, init_parse_scrollback_answer,
+    init_parse_shell_answer, init_parse_theme_answer, init_parse_yes_no_answer,
+    init_shell_candidates, init_shell_init_line, init_shell_name_from_path, init_shell_source_hint,
+    init_usage, init_yes_defaults, render_init_lua, run_init_interactive,
+    run_init_interactive_with_preview, run_init_subcommand_with_io, write_init_config,
 };
 
 #[cfg(test)]
@@ -818,22 +810,6 @@ fn main() {
     // closed (exit 4/8); parse failures are usage errors (exit 2).
     if args.x_word {
         std::process::exit(x::run_cli(&args));
-    }
-
-    // First-run Bittie splash (issue #1318, CTX-0729): once-only stdout
-    // greeting on the normal startup path only. Every subcommand returned
-    // above, and the machine flows (`--headless`, `--test-mode`) skip it
-    // to keep CI/stdout deterministic; `--no-splash` suppresses one
-    // launch. Best-effort only: a missing data root or a failed marker
-    // write never blocks shell spawn.
-    if !args.headless && !args.test_mode {
-        if let Some(marker) = mascot::splash_marker_path_live() {
-            if mascot::should_show_splash(args.no_splash, Some(&marker)) {
-                let columns = init::init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
-                mascot::print_mascot_art(columns);
-                mascot::record_splash_shown(&marker);
-            }
-        }
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a

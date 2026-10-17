@@ -30,6 +30,39 @@ pub(crate) fn install_retained_stdlib(lua: &mut Lua) {
     install_table_sort(lua);
 }
 
+/// Install only pure computation libraries for the dedicated configuration VM.
+/// The base loader itself includes dynamic loading and debug helpers, so the
+/// configuration surface is scrubbed after loading and before untrusted code
+/// runs. No retained `os` helpers or host callbacks are installed here.
+pub(crate) fn install_config_stdlib(lua: &mut Lua) {
+    lua.enter(|ctx| {
+        phodopus::stdlib::load_base(ctx);
+        phodopus::stdlib::load_string(ctx);
+        phodopus::stdlib::load_table(ctx);
+        phodopus::stdlib::load_math(ctx);
+        phodopus::stdlib::load_utf8(ctx);
+        if let Ok(math) = ctx.get_global::<Table>("math") {
+            math.set_field(ctx, "random", Value::Nil);
+            math.set_field(ctx, "randomseed", Value::Nil);
+        }
+        for name in [
+            "_G",
+            "debug",
+            "package",
+            "require",
+            "load",
+            "loadfile",
+            "dofile",
+            "io",
+            "os",
+            "coroutine",
+            "tonumber",
+        ] {
+            ctx.set_global(name, phodopus::Value::Nil);
+        }
+    });
+}
+
 /// Restricted `os` retained by the accepted baseline: `time`/`clock`/`date`
 /// only. `os.execute`, `os.getenv`, `os.remove`, `os.tmpname`, and the rest are
 /// deliberately absent (no process, environment, or filesystem authority).

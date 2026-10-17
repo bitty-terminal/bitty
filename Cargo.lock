@@ -348,6 +348,7 @@ dependencies = [
  "bitty-winjob",
  "nix 0.31.3",
  "rustix 1.1.5",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

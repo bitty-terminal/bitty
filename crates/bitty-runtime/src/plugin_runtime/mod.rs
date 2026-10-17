@@ -552,6 +552,8 @@ struct PluginEntry {
     registrations: RegistrationCapture,
 }
 
+type DiscoveryResults = Vec<(PluginId, Result<(), PluginRuntimeError>)>;
+
 /// Orchestrates discovery, activation, and dispatch for plugin VMs.
 ///
 /// The struct is `!Send` because it owns Phodopus VMs; callers use it on the
@@ -573,6 +575,10 @@ pub struct PluginRuntime {
     ///
     /// [`settings`]: PluginRuntime::settings
     settings_dir: Option<PathBuf>,
+    /// Complete discovery snapshot used for short-name settings aliases.
+    /// `None` means discovery was never completed or reported an error, so
+    /// aliases fail closed rather than being inferred from activated entries.
+    settings_alias_registry: Option<Vec<String>>,
     snapshot: Rc<dyn SnapshotSource>,
     notifications: Rc<RefCell<NotificationQueue>>,
     bundled_roots: Vec<PathBuf>,
@@ -770,6 +776,7 @@ impl PluginRuntime {
             host: PluginHost::new(DropPolicy::DropOldest, crate::DEFAULT_PLUGIN_SIDE_CAPACITY),
             settings: config.settings,
             settings_dir: None,
+            settings_alias_registry: None,
             snapshot: config.snapshot,
             notifications: Rc::new(RefCell::new(NotificationQueue::new(
                 NOTIFICATION_QUEUE_CAPACITY,
@@ -1630,16 +1637,43 @@ impl PluginRuntime {
     /// host never falls back to a different revision or to bundled content.
     /// Returns `(id, result)` pairs in discovery order.
     pub fn discover(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
-        let results = self.discover_inner();
+        // A new pass invalidates any previous alias snapshot immediately. It
+        // is restored only after this pass proves that every configured source
+        // was available and every candidate was resolved successfully.
+        self.settings_alias_registry = None;
+        let (results, registry_ids) = self.discover_inner();
+        let roots_available = self
+            .bundled_roots
+            .iter()
+            .chain(self.third_party_roots.iter())
+            .all(|root| root.is_dir());
+        let store_available = match self.store_root.as_ref() {
+            // Without a configured store there is no unenumerated source that
+            // could introduce an alias collision.
+            None => true,
+            // Safe mode deliberately does not enumerate the configured store,
+            // so its records cannot be proven absent from the alias registry.
+            Some(_) if self.safe_mode => false,
+            // Normal discovery includes the configured store when its root is
+            // available; preserve the existing directory availability check.
+            Some(root) => root.is_dir(),
+        };
+        self.settings_alias_registry = (roots_available && store_available)
+            .then(|| Self::complete_discovery_ids(registry_ids, &results))
+            .flatten();
         self.sync_debug_view();
         results
     }
 
-    fn discover_inner(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
+    fn discover_inner(&mut self) -> (DiscoveryResults, Vec<String>) {
         let mut results = Vec::new();
+        // This registry is intentionally independent of activation: disabled
+        // installed records still claim their short names and must participate
+        // in collision checks.
+        let mut registry_ids = Vec::new();
 
         for root in self.bundled_roots.clone() {
-            self.collect_dir_root(&root, SourceClass::Bundled, &mut results);
+            self.collect_dir_root(&root, SourceClass::Bundled, &mut results, &mut registry_ids);
         }
 
         // RFC A.4 rule 6 / R-009: `--safe` never reads the third-party store
@@ -1654,9 +1688,6 @@ impl PluginRuntime {
             match resolution::load_index(&store_root) {
                 Ok(records) => {
                     for record in records {
-                        if !record.enabled {
-                            continue;
-                        }
                         let Ok(id) = PluginId::new(&record.plugin_id) else {
                             results.push((
                                 invalid_plugin_id(),
@@ -1667,6 +1698,13 @@ impl PluginRuntime {
                             ));
                             continue;
                         };
+                        // A valid index record is a candidate even when its
+                        // desired state is disabled. Do not resolve disabled
+                        // packages merely to decide whether an alias exists.
+                        registry_ids.push(id.as_str().to_string());
+                        if !record.enabled {
+                            continue;
+                        }
                         if self.entries.contains_key(&id) {
                             continue;
                         }
@@ -1688,10 +1726,31 @@ impl PluginRuntime {
         }
 
         for root in self.third_party_roots.clone() {
-            self.collect_dir_root(&root, SourceClass::LocalPath, &mut results);
+            self.collect_dir_root(
+                &root,
+                SourceClass::LocalPath,
+                &mut results,
+                &mut registry_ids,
+            );
         }
 
-        results
+        (results, registry_ids)
+    }
+
+    /// Build the alias registry from one complete discovery pass.
+    ///
+    /// Failed or unavailable candidates remain in `results` as error rows, so
+    /// a short name is never declared unique from the successful subset.
+    fn complete_discovery_ids(
+        mut registry_ids: Vec<String>,
+        results: &DiscoveryResults,
+    ) -> Option<Vec<String>> {
+        if results.iter().any(|(_, result)| result.is_err()) {
+            return None;
+        }
+        registry_ids.sort();
+        registry_ids.dedup();
+        Some(registry_ids)
     }
 
     fn collect_dir_root(
@@ -1699,6 +1758,7 @@ impl PluginRuntime {
         root: &Path,
         source_class: SourceClass,
         results: &mut Vec<(PluginId, Result<(), PluginRuntimeError>)>,
+        registry_ids: &mut Vec<String>,
     ) {
         let packages = match discover_root(root, source_class) {
             Ok(packages) => packages,
@@ -1709,6 +1769,7 @@ impl PluginRuntime {
         };
         for package in packages {
             let id = package.manifest.id().clone();
+            registry_ids.push(id.as_str().to_string());
             if self.entries.contains_key(&id) {
                 continue;
             }
@@ -1937,11 +1998,12 @@ impl PluginRuntime {
             // fails closed structurally and at the gate. A malformed file
             // resolves to lower layers (never aborts activation); grants are
             // untouched by construction (this path names no capability).
-            let loaded = plugin_settings::load_plugin_settings(
+            let loaded = plugin_settings::load_plugin_settings_with_plugins(
                 self.settings_dir.as_deref(),
                 id.as_str(),
                 &manifest.settings,
                 Some(&*self.settings),
+                self.settings_alias_registry.as_deref(),
             );
             let services = Rc::new(PluginServices::new(
                 id.as_str(),
@@ -3767,6 +3829,7 @@ impl PluginRuntime {
     pub fn set_roots(&mut self, bundled_roots: Vec<PathBuf>, third_party_roots: Vec<PathBuf>) {
         self.bundled_roots = bundled_roots;
         self.third_party_roots = third_party_roots;
+        self.settings_alias_registry = None;
     }
 
     /// Trusted (`bundled`) discovery roots.
@@ -3784,6 +3847,7 @@ impl PluginRuntime {
     /// Replace the resolved plugin store root after construction.
     pub fn set_store_root(&mut self, store_root: Option<PathBuf>) {
         self.store_root = store_root;
+        self.settings_alias_registry = None;
     }
 
     /// Resolved plugin store root, if any.
@@ -4129,5 +4193,36 @@ mod tests {
             }
             other => panic!("expected LimitExceeded, got {other}"),
         }
+    }
+
+    #[test]
+    fn alias_registry_requires_complete_current_discovery() {
+        let first = PluginId::new("xuepoo.bar").expect("id");
+        let second = PluginId::new("other.bar").expect("id");
+        let complete = vec![(first.clone(), Ok(())), (second, Ok(()))];
+        assert_eq!(
+            PluginRuntime::complete_discovery_ids(
+                vec!["xuepoo.bar".to_string(), "other.bar".to_string()],
+                &complete,
+            ),
+            Some(vec!["other.bar".to_string(), "xuepoo.bar".to_string()])
+        );
+
+        let incomplete = vec![
+            (first, Ok(())),
+            (
+                invalid_plugin_id(),
+                Err(PluginRuntimeError::Io("index unavailable".to_string())),
+            ),
+        ];
+        assert_eq!(
+            PluginRuntime::complete_discovery_ids(vec!["xuepoo.bar".to_string()], &incomplete),
+            None
+        );
+        let empty: DiscoveryResults = Vec::new();
+        assert_eq!(
+            PluginRuntime::complete_discovery_ids(Vec::new(), &empty),
+            Some(Vec::new())
+        );
     }
 }

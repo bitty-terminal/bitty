@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_plugin_host::manifest::PluginId;
+use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir, set_enabled};
 use bitty_runtime::plugin_runtime::{
     EmptySettings, LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
     UnavailableSnapshot,
@@ -113,6 +114,21 @@ fn write_bar_plugin(root: &Path) {
     let plugin = root.join(BAR_ID);
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
     std::fs::write(plugin.join("bitty-plugin.toml"), BAR_MANIFEST).expect("manifest");
+    std::fs::write(plugin.join("lua/init.lua"), BAR_SRC).expect("init");
+}
+
+#[cfg(unix)]
+fn write_invalid_plugin_candidate(root: &Path) {
+    let plugin = root.join("other.bar");
+    std::fs::create_dir_all(&plugin).expect("candidate dir");
+    std::fs::write(plugin.join("bitty-plugin.toml"), b"[plugin\n").expect("invalid manifest");
+}
+
+fn write_collision_plugin(root: &Path) {
+    let plugin = root.join("other.bar");
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    let manifest = BAR_MANIFEST.replace("bitty-terminal.bar", "other.bar");
+    std::fs::write(plugin.join("bitty-plugin.toml"), manifest).expect("manifest");
     std::fs::write(plugin.join("lua/init.lua"), BAR_SRC).expect("init");
 }
 
@@ -208,6 +224,115 @@ fn malformed_file_keeps_plugin_alive_on_defaults_end_to_end() {
     // section grants nothing — it is not even parsed as config.
     write_user_file(&config, b"[capabilities]\nui.rich = true\n");
     let mut runtime = activate_bar(root, Some(config));
+    assert_eq!(
+        read_settings(&mut runtime),
+        "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn short_alias_fails_closed_when_registry_has_error_candidate() {
+    let root = temp_dir("root-alias-error-candidate");
+    write_bar_plugin(&root);
+    let error_root = temp_dir("root-alias-error-candidate-invalid");
+    write_invalid_plugin_candidate(&error_root);
+    let config = temp_dir("config-alias-error-candidate");
+    let plugins = config.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(temp_dir("data-alias-error-candidate")),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root, error_root],
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+    });
+    runtime.set_settings_dir(Some(config));
+    let results = runtime.discover();
+    assert!(results.iter().any(|(_, result)| result.is_err()));
+    let id = PluginId::new(BAR_ID).expect("id");
+    runtime.activate(&id).expect("bar fixture must activate");
+    assert_eq!(
+        read_settings(&mut runtime),
+        "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
+    );
+}
+
+#[test]
+fn short_alias_fails_closed_in_safe_mode_with_configured_store() {
+    let root = temp_dir("root-safe-mode-configured-store");
+    write_bar_plugin(&root);
+    let store = temp_dir("store-safe-mode-configured-store");
+    let config = temp_dir("config-safe-mode-configured-store");
+    let plugins = config.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: true,
+        data_dir: Some(temp_dir("data-safe-mode-configured-store")),
+        store_root: Some(store),
+        bundled_roots: vec![root],
+        third_party_roots: Vec::new(),
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+    });
+    runtime.set_settings_dir(Some(config));
+    runtime.discover();
+    let id = PluginId::new(BAR_ID).expect("id");
+    runtime.activate(&id).expect("bar fixture must activate");
+    assert_eq!(
+        read_settings(&mut runtime),
+        "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"
+    );
+}
+
+#[test]
+fn short_alias_fails_closed_for_disabled_installed_collision() {
+    let root = temp_dir("root-disabled-installed-collision");
+    write_bar_plugin(&root);
+    let source_root = temp_dir("source-disabled-installed-collision");
+    let source = source_root.join("other.bar");
+    write_collision_plugin(&source_root);
+    let store = temp_dir("store-disabled-installed-collision");
+    install_local_dir(
+        &store,
+        &source,
+        &LocalInstallOptions::default(),
+        &mut |_| Ok(true),
+    )
+    .expect("install")
+    .expect("approved");
+    assert!(set_enabled(&store, "other.bar", false).expect("disable"));
+
+    let config = temp_dir("config-disabled-installed-collision");
+    let plugins = config.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(temp_dir("data-disabled-installed-collision")),
+        store_root: Some(store),
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root],
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+    });
+    runtime.set_settings_dir(Some(config));
+    let results = runtime.discover();
+    assert_eq!(
+        results.len(),
+        1,
+        "disabled candidate must not activate: {results:?}"
+    );
+    assert!(results.iter().all(|(_, result)| result.is_ok()));
+    let id = PluginId::new(BAR_ID).expect("id");
+    runtime.activate(&id).expect("bar fixture must activate");
     assert_eq!(
         read_settings(&mut runtime),
         "show=true;edge=bottom;show_single=false;name_max_chars=32;modules=workspaces"

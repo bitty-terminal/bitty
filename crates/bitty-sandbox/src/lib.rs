@@ -673,6 +673,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir must build");
         let script = dir.join("probe.sh");
+        // pty-gate-exempt: inert script fixture for elf_interp; never executed.
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("fixture must write");
         assert_eq!(linux::elf_interp(&script), None);
         let _ = std::fs::remove_dir_all(&dir);

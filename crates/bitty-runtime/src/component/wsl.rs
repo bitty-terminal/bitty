@@ -351,9 +351,11 @@ pub fn windows_path_to_guest(windows: &str) -> Result<String, WslError> {
     {
         let drive = bytes[0].to_ascii_lowercase() as char;
         let remainder = windows[3..].replace('\\', "/");
+        // scratch-paths-exempt: intentional WSL guest contract path, not a host path.
         let guest = if remainder.is_empty() {
             format!("/mnt/{drive}")
         } else {
+            // scratch-paths-exempt: intentional WSL guest contract path, not a host path.
             format!("/mnt/{drive}/{remainder}")
         };
         if guest.len() > WSL_PATH_MAX_BYTES {
@@ -385,6 +387,7 @@ pub fn guest_mnt_to_windows(guest: &str) -> Result<String, WslError> {
             "unmappable guest path {guest:?} (want 1..={WSL_PATH_MAX_BYTES} bytes, no NUL or control characters)"
         )));
     }
+    // scratch-paths-exempt: intentional WSL guest contract path, not a host path.
     let Some(rest) = guest.strip_prefix("/mnt/") else {
         return Err(WslError::UnmappablePath(format!(
             "unmappable guest path {guest:?} (only /mnt/<drive>/... has a Windows spelling; use the Windows-to-guest direction for spawn)"
@@ -394,6 +397,7 @@ pub fn guest_mnt_to_windows(guest: &str) -> Result<String, WslError> {
     let drive = parts.next().unwrap_or("");
     let remainder = parts.next().unwrap_or("");
     if drive.len() != 1 || !drive.bytes().all(|b| b.is_ascii_lowercase()) {
+        // scratch-paths-exempt: intentional WSL guest contract path, not a host path.
         return Err(WslError::UnmappablePath(format!(
             "unmappable guest path {guest:?} (want /mnt/<lowercase-drive-letter>/...)"
         )));

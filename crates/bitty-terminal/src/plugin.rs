@@ -610,8 +610,8 @@ pub fn plugin_help_text() -> String {
      \x20 fall back to the plugin's shipped defaults). Installed packages\n\
      \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
      \x20 (fallback ~/.local/share/...).\n\
-     \x20 After `install`, the plugin is enabled; the copy-paste loop is:\n\
-     \x20 bitty plugin enable <id>   # (re-)enable after a disable\n\
+     \x20 After a local `install`, the plugin is staged and disabled; enable it explicitly:\n\
+     \x20 bitty plugin enable <id>\n\
      \x20 bitty plugin info <id>     # manifest, grants, and settings\n\
      \n\
      fetch:\n\
@@ -3387,7 +3387,10 @@ fn install_local_path(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
-    let options = LocalInstallOptions::default();
+    // Installation stages and records the package, but explicit `enable` is
+    // the authorization boundary for first execution. Keep the public
+    // library default unchanged for existing developer/runtime callers.
+    let options = LocalInstallOptions::staged_and_disabled();
     let approve_all = request.yes;
     // Consent is bound to the staged snapshot the installer reviewed: the
     // callback only decides, and the installer commits that same snapshot, so
@@ -3442,7 +3445,7 @@ fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Wri
     };
     let _ = writeln!(
         output,
-        "bitty plugin: {action} '{}' (version {}, {} source, manifest {}, {} capabilit{} granted, enabled)",
+        "bitty plugin: {action} '{}' (version {}, {} source, manifest {}, {} capabilit{} granted)",
         report.plugin_id,
         report.version,
         report.source_class.as_str(),

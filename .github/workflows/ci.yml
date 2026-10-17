@@ -121,6 +121,20 @@ jobs:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           components: rustfmt, clippy
 
+      # act lacks the Actions runtime cache credentials. Keep the compiler
+      # wrapper and use bounded disk caches under the persisted target mount;
+      # each shard owns a directory because disk caches support one server.
+      # A nonempty GHA namespace enables that backend even when disabled.
+      - name: Configure local sccache backend
+        if: env.ACT
+        run: |
+          {
+            echo "SCCACHE_GHA_ENABLED=false"
+            echo "SCCACHE_GHA_VERSION="
+            echo "SCCACHE_DIR=$CARGO_TARGET_DIR/sccache-${{ matrix.shard }}"
+            echo "SCCACHE_CACHE_SIZE=1G"
+          } >> "$GITHUB_ENV"
+
       # CTX-0971 R4: sccache server on the GHA backend (shares dep units with
       # the linux-x11/linux-wayland jobs via the same SCCACHE_GHA_VERSION
       # namespace). Kept alongside rust-cache below; posts stats automatically.
@@ -140,6 +154,10 @@ jobs:
       # CTX-0971 R4 sharding: lint/check steps run once (shard 1) so the two
       # shards do not duplicate clippy/fmt/packaging work. Test steps below
       # are partitioned or split across both shards.
+      - name: Check local Quality dispatch and cache setup
+        if: matrix.shard == 1
+        run: bash scripts/tests/ci-local.test.sh
+
       - name: Check Rust formatting
         if: matrix.shard == 1
         run: cargo fmt --all -- --check

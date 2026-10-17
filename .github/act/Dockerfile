@@ -14,7 +14,7 @@
 # Usage (real local CI, e.g. the Quality gates job):
 #   act -W .github/workflows/ci.yml -j quality \
 #     --container-architecture linux/amd64 \
-#     -P ubuntu-latest=bitty-act:latest
+#     -P ubuntu-24.04=bitty-act:latest
 #
 # Keep the Rust channel in sync with rust-toolchain.toml when it changes.
 FROM catthehacker/ubuntu:act-latest

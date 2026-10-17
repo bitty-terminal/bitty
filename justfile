@@ -127,14 +127,23 @@ ci-local *args:
     # Bind the persistent target dir at both CARGO_TARGET_DIR and the repo's
     # own target/ so gates that read target/debug/bitty see a container-built
     # binary instead of the host's (the host glibc is newer than the image's).
-    exec act -W .github/workflows/ci.yml -j quality \
-      --pull=false --bind --container-architecture linux/amd64 \
-      -P ubuntu-latest=bitty-act:latest \
-      --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
-      --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
-      --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
-      ${proxy_env[@]+"${proxy_env[@]}"} \
-      {{args}}
+    # Matrix entries share this bind mount, including external suite checkouts.
+    # act's --concurrent-jobs does not serialize entries of one matrix job;
+    # run each shard explicitly under the same repository lock instead.
+    for shard in 1 2; do
+      act -W .github/workflows/ci.yml -j quality --matrix "shard:$shard" \
+        --cache-server-addr 127.0.0.1 \
+        --pull=false --bind --container-architecture linux/amd64 \
+        -P ubuntu-24.04=bitty-act:latest \
+        --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
+        --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
+        --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
+        ${proxy_env[@]+"${proxy_env[@]}"} \
+        {{args}}
+    done
+
+ci-local-test:
+    bash scripts/tests/ci-local.test.sh
 
 pty-gate:
     ./scripts/check-pty-gated-tests.sh
@@ -313,7 +322,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

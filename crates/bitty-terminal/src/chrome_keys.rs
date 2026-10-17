@@ -612,6 +612,21 @@ pub(crate) fn close_focused_leaf(layout: &mut LayoutNode, focused: ViewId) -> bo
     bitty_runtime::remove_leaf(layout, focused)
 }
 
+/// Pick the tiled survivor that should receive focus after closing `focused`.
+///
+/// The layout's depth-first leaf order is stable across layout shapes. Focus
+/// the predecessor in that order, wrapping to the last surviving leaf when
+/// the first leaf is closed.
+fn previous_leaf_after_close(layout: &LayoutNode, focused: ViewId) -> Option<ViewId> {
+    let leaf_ids = layout.leaf_ids();
+    let position = leaf_ids.iter().position(|id| *id == focused)?;
+    if position > 0 {
+        Some(leaf_ids[position - 1])
+    } else {
+        leaf_ids.into_iter().rev().find(|id| *id != focused)
+    }
+}
+
 /// Record a candidate resize target: path to the deepest split whose axis
 /// matches the resize direction and whose subtree holds focus, plus its ratio
 /// and whether focus sits in its first child.
@@ -1548,6 +1563,13 @@ impl TerminalApp {
                 }
                 let mut layout = self.runtime.layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
+                    if let Some(previous) =
+                        previous_leaf_after_close(self.runtime.layout(), focused)
+                    {
+                        // Set focus before the closing layout is installed so
+                        // primary ownership re-homes to this same survivor.
+                        self.runtime.set_focus(previous);
+                    }
                     // CTX-0359: an explicit close is the only layout change
                     // allowed to re-home the primary owner; a plain
                     // `set_layout` (zoom, restore) must preserve it.
@@ -5224,6 +5246,54 @@ mod tests {
         assert!(!close_focused_leaf(&mut two, ViewId::new(9)));
         assert!(close_focused_leaf(&mut two, ViewId::new(2)));
         assert_eq!(two.leaf_count(), 1);
+    }
+
+    #[test]
+    fn chrome_close_view_focuses_previous_leaf_in_stable_order() {
+        use bitty_config::ChromeAction;
+
+        let mut app = workspace_test_app();
+        let layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            two_pane_layout(),
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+
+        app.apply_chrome_action(ChromeAction::CloseView);
+
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(3)]
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_close_view_wraps_first_leaf_focus_to_last_survivor() {
+        use bitty_config::ChromeAction;
+
+        let mut app = workspace_test_app();
+        let layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            two_pane_layout(),
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+
+        app.apply_chrome_action(ChromeAction::CloseView);
+
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(2), ViewId::new(3)]
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(3)));
     }
 
     // CTX-0257 workspace ops entry (DEC-0034): keys + tabline through the

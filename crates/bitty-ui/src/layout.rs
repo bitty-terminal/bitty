@@ -1619,6 +1619,56 @@ pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
     right.saturating_sub(left)
 }
 
+/// Removes leaf `id` from `tree`, promoting its sibling.
+///
+/// Split removal replaces the split with the surviving child; stacked
+/// removal drops the child unless it is the last one; overlay removal
+/// recurses into base and overlay. Refuses the last leaf (a singleton
+/// `Leaf` root or a single-child `Stack`) so the tree is never stranded
+/// empty, and returns `false` when refused or when `id` is absent.
+///
+/// Shared leaf-removal semantics for live close paths and stashed-container
+/// teardown (issue #2167): `bitty-terminal`'s close-view, reap, and
+/// external-editor flows must agree with the runtime stash surgery, so
+/// they all funnel through this function instead of forking the match.
+pub fn remove_leaf(tree: &mut LayoutNode, id: ViewId) -> bool {
+    match tree {
+        LayoutNode::Leaf(_) => false,
+        LayoutNode::Split { first, second, .. } => {
+            if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == id) {
+                let sibling = (**second).clone();
+                *tree = sibling;
+                true
+            } else if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == id) {
+                let sibling = (**first).clone();
+                *tree = sibling;
+                true
+            } else if remove_leaf(first, id) {
+                true
+            } else {
+                remove_leaf(second, id)
+            }
+        }
+        LayoutNode::Stack(children) => {
+            if let Some(pos) = children
+                .iter()
+                .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == id))
+            {
+                if children.len() <= 1 {
+                    return false;
+                }
+                children.remove(pos);
+                true
+            } else {
+                children.iter_mut().any(|c| remove_leaf(c, id))
+            }
+        }
+        LayoutNode::Overlay { base, overlay, .. } => {
+            remove_leaf(base, id) || remove_leaf(overlay, id)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,6 +1677,37 @@ mod tests {
 
     fn view(id: u64, cols: usize, rows: usize) -> View {
         View::new(ViewId::new(id), cols, rows)
+    }
+
+    #[test]
+    fn remove_leaf_promotes_sibling_and_refuses_last_issue_2167() {
+        // Shared leaf-removal semantics (issue #2167): split removal
+        // promotes the surviving child; a singleton or single-child stack
+        // refuses so the tree is never stranded empty.
+        let mut two = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 10, 10)),
+            LayoutNode::leaf(view(2, 10, 10)),
+        );
+        assert!(remove_leaf(&mut two, ViewId::new(2)));
+        assert_eq!(two.leaf_ids(), vec![ViewId::new(1)]);
+        assert!(!remove_leaf(&mut two, ViewId::new(1)));
+        assert!(!remove_leaf(&mut two, ViewId::new(404)));
+
+        let mut nested = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 10, 10)),
+                LayoutNode::leaf(view(2, 10, 10)),
+            ),
+            LayoutNode::leaf(view(3, 10, 10)),
+        );
+        assert!(remove_leaf(&mut nested, ViewId::new(1)));
+        assert_eq!(nested.leaf_ids().len(), 2);
     }
 
     #[test]

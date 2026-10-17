@@ -603,42 +603,13 @@ pub(crate) fn split_focused_leaf(
 
 /// Remove the focused leaf, promoting its sibling. Refuses the last leaf so
 /// the layout is never stranded empty. Returns false when refused or missing.
+///
+/// Thin alias over [`bitty_runtime::remove_leaf`]: the single shared
+/// leaf-removal semantics for live close paths and stashed teardown
+/// (issue #2167) live in `bitty-ui`; this wrapper keeps existing call
+/// sites stable.
 pub(crate) fn close_focused_leaf(layout: &mut LayoutNode, focused: ViewId) -> bool {
-    match layout {
-        LayoutNode::Leaf(_) => false,
-        LayoutNode::Split { first, second, .. } => {
-            if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
-                let sibling = (**second).clone();
-                *layout = sibling;
-                true
-            } else if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
-                let sibling = (**first).clone();
-                *layout = sibling;
-                true
-            } else if close_focused_leaf(first, focused) {
-                true
-            } else {
-                close_focused_leaf(second, focused)
-            }
-        }
-        LayoutNode::Stack(children) => {
-            if let Some(pos) = children
-                .iter()
-                .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == focused))
-            {
-                if children.len() <= 1 {
-                    return false;
-                }
-                children.remove(pos);
-                true
-            } else {
-                children.iter_mut().any(|c| close_focused_leaf(c, focused))
-            }
-        }
-        LayoutNode::Overlay { base, overlay, .. } => {
-            close_focused_leaf(base, focused) || close_focused_leaf(overlay, focused)
-        }
-    }
+    bitty_runtime::remove_leaf(layout, focused)
 }
 
 /// Record a candidate resize target: path to the deepest split whose axis
@@ -975,8 +946,19 @@ impl TerminalApp {
             .chrome
             .zoom
             .backup_leaf_count(&self.runtime)
-            .unwrap_or_else(|| self.runtime.leaf_count());
-        active + self.runtime.inactive_workspaces_leaf_count()
+            .unwrap_or_else(|| self.runtime.window_leaf_count());
+        // Zoom backup counts layout leaves only; add live floats/pins (and
+        // the scratchpad slot, issue #2167) that the backup predates. The
+        // non-zoom path already includes them via `window_leaf_count`.
+        if self.chrome.zoom.backup_leaf_count(&self.runtime).is_some() {
+            active
+                + self.runtime.floated_count()
+                + self.runtime.pinned_count()
+                + self.runtime.scratchpad_count()
+                + self.runtime.inactive_workspaces_leaf_count()
+        } else {
+            active
+        }
     }
 
     /// Occupied workspace indices in index order for the occupied cycle
@@ -1208,8 +1190,14 @@ impl TerminalApp {
         // CTX-1100: the occupied cycle revokes only after a successful
         // switch (see its arms below); a refused cycle (<2 occupied)
         // preserves the capture, so it is deferred here.
-        let defer_capture_revoke =
-            matches!(&action, A::WorkspaceNextOccupied | A::WorkspacePrevOccupied);
+        // CTX-1289: `WorkspaceMove` is deferred the same way. A refused move
+        // (no focused pane, invalid/over-capacity target, view-kind conflict)
+        // must preserve the transient capture so the window-ID indicator
+        // stays up — the move only releases it after a real reparent.
+        let defer_capture_revoke = matches!(
+            &action,
+            A::WorkspaceNextOccupied | A::WorkspacePrevOccupied | A::WorkspaceMove(_)
+        );
         if !defer_capture_revoke && Self::is_overlay_focus_switch(action.clone()) {
             self.revoke_overlay_capture();
         }
@@ -1472,6 +1460,24 @@ impl TerminalApp {
                     ViewCloseRequest::Proceed => {}
                 }
                 self.restore_zoom();
+                // Issue #2141: a focused detached float or pinned panel
+                // lives outside the live layout. Tearing down only its
+                // session would leave the empty bordered panel behind
+                // (unkillable). Discard the floating view instead so the
+                // panel disappears and focus returns to tiling.
+                if self.runtime.floated_views().contains(&focused)
+                    || self.runtime.pinned_views().contains(&focused)
+                {
+                    if self.runtime.discard_floating_view(focused) {
+                        eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
+                    }
+                    eprintln!(
+                        "bitty: keymap close_view -> leafs={} focused={:?}",
+                        self.runtime.leaf_count(),
+                        self.runtime.focused_view()
+                    );
+                    return false;
+                }
                 // CTX-1039 (#1843): the active workspace is down to its
                 // last panel but other workspaces still hold panels. Never
                 // exit: keep the emptied workspace selected, tear down the
@@ -1743,10 +1749,17 @@ impl TerminalApp {
                 // the real tiled tree, not the zoom proxy.
                 self.restore_zoom();
                 match self.runtime.workspace_move_focused_to_one_based(n) {
-                    Ok((moved, from, to)) => eprintln!(
-                        "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
-                        self.runtime.workspace_names().join(" ")
-                    ),
+                    Ok((moved, from, to)) => {
+                        // CTX-1289: release the transient capture only after a
+                        // real move landed. A refused move leaves the overlay
+                        // (window-ID indicator) up, mirroring the occupied
+                        // cycle contract.
+                        self.revoke_overlay_capture();
+                        eprintln!(
+                            "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
+                            self.runtime.workspace_names().join(" ")
+                        )
+                    }
                     Err(err) => eprintln!(
                         "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
                         self.runtime.workspace_names().join(" ")
@@ -2500,7 +2513,8 @@ impl TerminalApp {
                         match &matched {
                             Some(
                                 bitty_config::ChromeAction::WorkspaceNextOccupied
-                                | bitty_config::ChromeAction::WorkspacePrevOccupied,
+                                | bitty_config::ChromeAction::WorkspacePrevOccupied
+                                | bitty_config::ChromeAction::WorkspaceMove(_),
                             ) => {
                                 // CTX-1100: eligible for focus-switch dispatch
                                 // (falls through below like the other
@@ -2510,6 +2524,9 @@ impl TerminalApp {
                                 // (<2 occupied) preserves it (CodeRabbit
                                 // PR #1917). No queue, no swallow: the chord
                                 // must reach dispatch, never the overlay.
+                                // CTX-1289: `WorkspaceMove` defers the same
+                                // way — a refused move keeps the indicator
+                                // up, only a real reparent releases it.
                             }
                             Some(action) if Self::is_overlay_focus_switch(action.clone()) => {
                                 self.revoke_overlay_capture();
@@ -4201,6 +4218,27 @@ mod tests {
             PresentationMode::Tiled,
             "restore returns to tiling"
         );
+    }
+
+    #[test]
+    fn chrome_close_view_discards_focused_float_issue_2141() {
+        // Issue #2141: a focused detached float is outside the live layout,
+        // so the tiled close path would warn and leave the empty bordered
+        // panel behind. CloseView must discard it instead.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        app.runtime.float_detach(focused).expect("detach");
+        assert!(app.runtime.floated_views().contains(&focused));
+        assert!(app.runtime.set_focus(focused));
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(
+            !app.runtime.floated_views().contains(&focused),
+            "dead float must disappear, never linger empty"
+        );
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_ne!(app.runtime.focused_view(), Some(focused));
     }
 
     #[test]
@@ -7514,6 +7552,49 @@ claims = []
         );
     }
 
+    #[test]
+    fn mod_shift_number_reuses_existing_position_after_workspace_gap() {
+        // Issue #2177: numbered keyboard moves use the current workspace
+        // position. After ws2 closes, Mod+Shift+2 must move into existing ws3
+        // instead of creating a new ws2.
+        let mut app = workspace_test_app();
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert!(app.runtime.workspace_close_at(1).is_ok(), "close ws2");
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+
+        let moved = ViewId::new(52);
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = app
+            .runtime
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(moved, 80, 24)),
+        ));
+        assert!(app.runtime.set_focus(moved));
+
+        assert!(drive_mod_char(&mut app, "@", false, true, true, false));
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(
+            app.runtime.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.focused_view(), Some(moved));
+        assert!(app.runtime.layout().leaf_ids().contains(&moved));
+    }
+
     // Live-spawn: real POSIX shells in two workspaces. `#[cfg(unix)]` keeps it
     // off Windows CI; `require_pty!()` keeps the force-no-PTY simulation path.
     // ConPTY coverage lives in bitty-pty/tests/spawn_windows.rs (CTX-0268).
@@ -7952,6 +8033,145 @@ claims = []
             fallback.resize_step,
             bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
             "bad startup value must fall back to default"
+        );
+    }
+
+    #[test]
+    fn chrome_workspace_move_releases_overlay_capture_after_real_move() {
+        // CTX-1289 / issue #2172: a valid Mod+Shift+num move is a focus
+        // switch, so it must execute through an active overlay capture and
+        // release that capture. The indicator surface follows the overlay
+        // lifecycle and disappears on the next application tick.
+        let (mut app, root, data) = overlay_capture_test_app("issue-2172");
+        assert!(app.overlay_capture_active(), "setup must hold capture");
+        // Build a valid second target while the overlay is active. The
+        // programmatic setup avoids testing the modal's swallowed mutation
+        // path and leaves the real move chord as the behavior under test.
+        app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(app.runtime.workspace_switch(0));
+        let moved = ViewId::new(9);
+        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let old = app
+            .runtime
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("ws1 leaf present");
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(moved, 80, 24)),
+        ));
+        assert!(app.runtime.set_focus(moved));
+        assert!(app.overlay_capture_active(), "setup must retain capture");
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the active capture must surface the window-ID indicator"
+        );
+
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            0,
+            "setup must start in the source workspace"
+        );
+        // Physical Mod+Shift+2 is reported as `@` with Shift held.
+        assert!(
+            drive_mod_char(&mut app, "@", false, true, true, false),
+            "the physical move gesture is chrome-owned"
+        );
+        assert!(
+            !app.overlay_capture_active(),
+            "a successful workspace move must release overlay capture"
+        );
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            1,
+            "the move must follow focus to the target workspace"
+        );
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(moved),
+            "the moved pane must remain focused"
+        );
+        assert!(
+            app.runtime.layout().leaf_ids().contains(&moved),
+            "the focused pane must be reparented into the target"
+        );
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "surface removal follows the capture release on the next tick"
+        );
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_none(),
+            "the window-ID indicator must disappear after capture release"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn refused_workspace_move_preserves_overlay_capture() {
+        // CTX-1289: a refused Mod+Shift+num move must NOT release the
+        // transient capture — the window-ID indicator stays up until a real
+        // reparent lands. Mirrors the CTX-1100 occupied-cycle contract, which
+        // revokes only after a successful switch. Pre-change the revoke ran
+        // unconditionally before dispatch, so these assertions failed.
+        use bitty_config::ChromeAction as A;
+        let (mut app, root, data) = overlay_capture_test_app("ctx1289-refused");
+        assert!(app.overlay_capture_active(), "setup must hold capture");
+        let _ = app.drive_tick();
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the active capture must surface the window-ID indicator"
+        );
+        let leaves_before = app.runtime.layout().leaf_ids();
+        let ws_before = app.runtime.workspace_count();
+        // Index 0 fails closed at the top of the move path.
+        let _ = app.apply_chrome_action(A::WorkspaceMove(0));
+        // Beyond the workspace cap also fails closed.
+        let _ = app.apply_chrome_action(A::WorkspaceMove(17));
+        assert!(
+            app.overlay_capture_active(),
+            "a refused workspace move must preserve overlay capture"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            leaves_before,
+            "a refused move must not touch the layout"
+        );
+        assert_eq!(
+            app.runtime.workspace_count(),
+            ws_before,
+            "a refused move must not create a workspace"
+        );
+        assert!(
+            app.runtime.plugin_overlay().is_some(),
+            "the window-ID indicator must remain visible after a refused move"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn overlay_focus_switch_predicate_keeps_move_with_focus_actions() {
+        // CTX-1289: workspace creation is a swallowed layout mutation, while
+        // workspace moves are focus switches and must release capture.
+        use bitty_config::ChromeAction as A;
+        assert!(
+            !TerminalApp::is_overlay_focus_switch(A::WorkspaceNew),
+            "Mod+T stays swallowed while capture is active"
+        );
+        assert!(
+            TerminalApp::is_overlay_focus_switch(A::WorkspaceMove(2)),
+            "Mod+Shift+num must release capture before moving the pane"
+        );
+        assert!(
+            TerminalApp::is_overlay_focus_switch(A::WorkspaceFocus(2)),
+            "pure focus jumps still end the capture"
         );
     }
 }

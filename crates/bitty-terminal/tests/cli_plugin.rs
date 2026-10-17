@@ -438,6 +438,95 @@ fn plugin_external_install_load_run_update_remove_live() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Post-install next steps for store installs (CTX-1268, bitty#2144).
+///
+/// Golden: `install`/`enable` success prints the enable command, the store
+/// package root, the per-plugin config path with a minimal snippet derived
+/// from declared `[settings]`, the manifest's `[hints] next_steps`, and the
+/// `info` pointer. Data-driven: hints and the snippet come from the
+/// manifest, everything else is the generic shape.
+#[test]
+fn plugin_store_install_and_enable_print_next_steps() {
+    let home = scratch_dir("next-steps");
+    let dir = home.join("source-onboard");
+    std::fs::create_dir_all(dir.join("lua")).expect("fixture lua dir");
+    let manifest = "[plugin]\n\
+         id = \"xuepoo.onboard\"\n\
+         name = \"Onboarding Fixture\"\n\
+         version = \"1.0.0\"\n\
+         description = \"next-steps fixture\"\n\n\
+         [compat]\n\
+         bitty = \">=0.0.1,<1.0\"\n\
+         plugin-api = \"^1.0\"\n\n\
+         [capabilities]\n\
+         platform.notify = true\n\n\
+         [lazy]\n\
+         commands = [\"xuepoo.onboard:greet\"]\n\
+         events = []\n\n\
+         [settings]\n\
+         show = { type = \"bool\", default = true }\n\
+         edge = { type = \"string\", default = \"bottom\" }\n\n\
+         [hints]\n\
+         next_steps = [\"Pin the bar module in your config, then restart bitty.\"]\n";
+    std::fs::write(dir.join("bitty-plugin.toml"), manifest).expect("fixture manifest");
+    std::fs::write(
+        dir.join("lua/init.lua"),
+        "bitty.commands.register({\n  id = \"greet\",\n  title = \"Greet\",\n  \
+         run = function() return \"hi\" end,\n})\nreturn {}\n",
+    )
+    .expect("fixture init");
+
+    // Install success prints manifest-driven next steps.
+    let output = run_in(
+        &home,
+        &["plugin", "install", &dir.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("installed"), "{text}");
+    assert!(text.contains("Next steps for 'xuepoo.onboard':"), "{text}");
+    assert!(
+        text.contains("enable: bitty plugin enable xuepoo.onboard"),
+        "{text}"
+    );
+    // Path separators are platform-native (`\` on Windows): normalize
+    // before matching the store/config layout.
+    let portable = text.replace('\\', "/");
+    assert!(portable.contains("packages/xuepoo.onboard/1.0.0"), "{text}");
+    assert!(portable.contains("plugins/xuepoo.onboard.toml"), "{text}");
+    assert!(text.contains("show = true"), "{text}");
+    assert!(text.contains("edge = \"bottom\""), "{text}");
+    assert!(
+        text.contains("- Pin the bar module in your config, then restart bitty."),
+        "{text}"
+    );
+    assert!(
+        text.contains("more: bitty plugin info xuepoo.onboard"),
+        "{text}"
+    );
+
+    // Store enable success (after a disable) prints them again.
+    let output = run_in(&home, &["plugin", "disable", "xuepoo.onboard"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(&home, &["plugin", "enable", "xuepoo.onboard"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("enabled"), "{text}");
+    assert!(text.contains("Next steps for 'xuepoo.onboard':"), "{text}");
+    assert!(
+        text.contains("enable: bitty plugin enable xuepoo.onboard"),
+        "{text}"
+    );
+    assert!(text.contains("edge = \"bottom\""), "{text}");
+    assert!(
+        text.contains("more: bitty plugin info xuepoo.onboard"),
+        "{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn plugin_external_install_requires_consent() {
     let home = scratch_dir("external-consent");

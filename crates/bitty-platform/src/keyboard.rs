@@ -796,6 +796,13 @@ pub fn encode_key_event_kitty_protocol(
             return kitty_key_frame(32, None, modifiers, event_type, embed, b'u');
         }
         if let Some(code) = ext_modifier_key(*named, event.location) {
+            // CTX-1267 (#2142a): Shift alone is the fcitx5 IME toggle and
+            // must always reach the IME, never the PTY — even under
+            // report-all-keys. Other modifiers still report under
+            // report-all; Shift never does.
+            if *named == NamedKey::Shift {
+                return None;
+            }
             if !report_all {
                 return None;
             }
@@ -823,11 +830,17 @@ pub fn encode_key_event_kitty_protocol(
             if *named == NamedKey::Escape && !disambiguate && !report_all {
                 return None;
             }
-            // Bare Enter/Tab/Backspace keep their legacy bytes under
+            // Bare Enter/Tab/Backspace/Delete keep their legacy bytes under
             // disambiguate/report-events; report-all-keys encodes them. The
             // exception covers the main keys only, never numpad substitutes.
+            // CTX-1267 (#2142c): Delete joins the exception so a bare
+            // release never reports `CSI 3;1:3~` — one tap deletes exactly
+            // once (Backspace already behaved this way).
             let legacy_exception = !is_keypad
-                && matches!(named, NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace);
+                && matches!(
+                    named,
+                    NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace | NamedKey::Delete
+                );
             if legacy_exception && !report_all && modifiers == 0 {
                 return None;
             }

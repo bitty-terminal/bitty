@@ -4865,44 +4865,22 @@ fn init_columns_parse() {
     assert_eq!(init_columns_from_env(Some("")), None);
 }
 
-#[test]
-fn init_mascot_is_bounded_with_text_fallback() {
-    // The vendored art is small, pure ASCII, and bounded.
-    let width = init_mascot_width();
-    assert!(width > 0 && width <= 80, "art width {width}");
-    assert!(INIT_MASCOT_ART.lines().count() <= 32);
-    assert!(INIT_MASCOT_ART.is_ascii());
-
-    // Unknown or roomy widths print the full art (headless-safe).
-    assert_eq!(init_greeting_art(None), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(80)), INIT_MASCOT_ART);
-    assert_eq!(init_greeting_art(Some(width as u16)), INIT_MASCOT_ART);
-
-    // A tiny window fails closed to one honest line (pure-text fallback).
-    let narrow = init_greeting_art(Some(20));
-    assert_eq!(narrow, INIT_MASCOT_FALLBACK);
-    assert_eq!(narrow.lines().count(), 1);
-    assert!(init_greeting_art(Some(1)).contains("too narrow"));
-}
-
 /// Drives the interactive wizard with piped stdin; returns answers plus
 /// everything the wizard printed.
 fn drive_init_wizard(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
 ) -> (Result<InitAnswers, String>, String) {
-    drive_init_wizard_with_overrides(stdin_lines, shell_env, columns, &InitOverrides::default())
+    drive_init_wizard_with_overrides(stdin_lines, shell_env, &InitOverrides::default())
 }
 
 /// [`drive_init_wizard`] with explicit value-flag overrides (skipped steps).
 fn drive_init_wizard_with_overrides(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
 ) -> (Result<InitAnswers, String>, String) {
-    drive_init_wizard_with_color(stdin_lines, shell_env, columns, overrides, false)
+    drive_init_wizard_with_color(stdin_lines, shell_env, overrides, false)
 }
 
 /// [`drive_init_wizard`] with an explicit option-list color decision.
@@ -4911,7 +4889,6 @@ fn drive_init_wizard_with_overrides(
 fn drive_init_wizard_with_color(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
     color: bool,
 ) -> (Result<InitAnswers, String>, String) {
@@ -4921,10 +4898,10 @@ fn drive_init_wizard_with_color(
         &mut input,
         &mut output,
         shell_env,
-        columns,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
         color,
+        false,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed)
@@ -4934,7 +4911,7 @@ fn drive_init_wizard_with_color(
 fn init_interactive_all_defaults() {
     // Eleven Enters: default shell, theme, family, size, gaps_in, gaps_out,
     // border, radius, scrollback, close_confirm, keys.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("defaults accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/bash"));
     assert_eq!(answers.theme, "dark");
@@ -4966,9 +4943,13 @@ fn init_interactive_all_defaults() {
     assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::WhenBusy);
     assert_eq!(answers.key_preset, InitKeyPreset::Default);
 
-    // Greeting shows the mascot plus every step prompt.
+    // Greeting shows the welcome line plus every step prompt, and no
+    // ASCII mascot banner (#2135: removed from init output in 0.0.24).
     assert!(printed.contains("Welcome to bitty"));
-    assert!(printed.contains("MMMMM"));
+    assert!(
+        !printed.contains("MMMMM"),
+        "init output must not carry the mascot banner, got:\n{printed}"
+    );
     assert!(printed.contains("Shell"));
     assert!(printed.contains("Theme"));
     assert!(printed.contains("Font family"));
@@ -4989,7 +4970,6 @@ fn init_interactive_custom_picks() {
     let (result, _) = drive_init_wizard(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
     );
     let answers = result.expect("custom picks accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
@@ -5010,33 +4990,29 @@ fn init_interactive_retries_then_aborts() {
     // Bad font size reprompts and then accepts the correction (then the
     // remaining seven steps take defaults).
     let (result, printed) =
-        drive_init_wizard("\n\n\nbanana\n14\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+        drive_init_wizard("\n\n\nbanana\n14\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
     assert!(printed.contains("try again"));
 
     // A bad decoration value also reprompts instead of aborting.
-    let (result, printed) =
-        drive_init_wizard("\n\n\n\n99\n4\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n99\n4\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
     assert!(printed.contains("try again"));
 
     // Three bad preset answers exhaust the bound and abort.
-    let (result, _) = drive_init_wizard(
-        "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
-        Some("/bin/bash"),
-        None,
-    );
+    let (result, _) =
+        drive_init_wizard("\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n", Some("/bin/bash"));
     assert!(result.is_err());
 
     // EOF up front aborts without guessing.
-    let (result, _) = drive_init_wizard("", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("", Some("/bin/bash"));
     assert!(result.is_err());
 
-    // A narrow window still wizards, with the text fallback greeting.
-    let (result, printed) =
-        drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), Some(20));
+    // A narrow window still wizards with the plain welcome line: no ASCII
+    // art and no fallback line (#2135 removed the init banner entirely).
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     assert!(result.is_ok());
-    assert!(printed.contains("too narrow"));
+    assert!(!printed.contains("too narrow"));
     assert!(!printed.contains("MMMMM"));
 }
 
@@ -5058,8 +5034,7 @@ fn init_interactive_overrides_skip_prompts() {
         with_components: None,
         print_shell_init: None,
     };
-    let (result, printed) =
-        drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), None, &overrides);
+    let (result, printed) = drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), &overrides);
     let answers = result.expect("overrides answer every overridden step");
     assert_eq!(answers.theme, "dark");
     assert_eq!(answers.font_family, "Fira Code");
@@ -5243,7 +5218,7 @@ fn init_wizard_kitty_csi_u_variants() {
 fn init_wizard_arrows_edit_in_prompt() {
     // End-to-end through one wizard prompt (font family): `ab`, Left,
     // `c` answers `acb`, with no escape bytes in the stored answer.
-    let (result, _) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("edited answer accepted");
     assert_eq!(answers.font_family, "acb");
     assert!(!answers.font_family.contains('\x1b'));
@@ -5255,7 +5230,7 @@ fn init_wizard_up_history_in_prompts() {
     // Pure Up now moves the option cursor (phase 1 of #1806); typed text
     // plus Up still recalls history through the shared decoder.
     let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_in, 10);
     assert_eq!(answers.gaps_out, 10);
@@ -5273,7 +5248,7 @@ fn init_wizard_up_history_in_prompts() {
 #[test]
 fn init_wizard_plain_input_redraws_nothing() {
     // Eleven Enters: no escape bytes anywhere, so no redraw marker.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(
         !printed.contains("(read as "),
@@ -5285,8 +5260,7 @@ fn init_wizard_plain_input_redraws_nothing() {
 fn init_wizard_redraw_shows_edited_answer() {
     // `ab`, Left, `c` submits `acb`; the redraw carries the submitted value
     // so the display matches it instead of the raw kernel echo.
-    let (result, printed) =
-        drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\nab\x1b[Dc\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("edited answer accepted");
     assert_eq!(answers.font_family, "acb");
     assert!(
@@ -5301,7 +5275,7 @@ fn init_wizard_redraw_shows_recalled_history() {
     // value was never echoed by the kernel, so the redraw must show it.
     // (Pure Up now moves the option cursor instead.)
     let stdin = "\n\n\n\n10\n1\x1b[A\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("history recall accepted");
     assert_eq!(answers.gaps_out, 10);
     assert!(
@@ -5315,7 +5289,7 @@ fn init_wizard_redraw_precedes_validation_retry() {
     // An edited but invalid font size redraws the decoded attempt before the
     // retry message, so the user sees what failed validation.
     let stdin = "\n\n\n1\x1b[Cx\n12\n\n\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("retry accepted");
     assert!((answers.font_size - 12.0).abs() < f32::EPSILON);
     assert!(
@@ -5385,7 +5359,7 @@ fn init_wizard_redraw_output_error_aborts() {
 
 #[test]
 fn init_option_list_renders_for_every_prompt() {
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(printed.contains("Shell"), "shell list, got:\n{printed}");
     assert!(printed.contains("Theme"), "theme list, got:\n{printed}");
@@ -5432,7 +5406,7 @@ fn init_option_list_j_navigates_theme() {
     // Shell default, theme `j` moves to tokyo-night then Enter selects it,
     // remaining prompts take defaults.
     let stdin = "\nj\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("navigated theme accepted");
     assert_eq!(answers.theme, "tokyo-night");
 }
@@ -5441,7 +5415,7 @@ fn init_option_list_j_navigates_theme() {
 fn init_option_list_arrow_down_navigates_theme() {
     // Down arrow behaves like `j` for the theme list.
     let stdin = "\n\x1b[B\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("arrow-navigated theme accepted");
     assert_eq!(answers.theme, "tokyo-night");
 }
@@ -5450,7 +5424,7 @@ fn init_option_list_arrow_down_navigates_theme() {
 fn init_option_list_k_wraps_theme_to_last() {
     // Up/`k` from the default wraps to the last preset (github-light).
     let stdin = "\nk\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("wrapped theme accepted");
     assert_eq!(answers.theme, "github-light");
 }
@@ -5458,7 +5432,7 @@ fn init_option_list_k_wraps_theme_to_last() {
 #[test]
 fn init_option_list_number_fast_path_still_selects_shell() {
     // Numbered fast path: `2` picks the second shell candidate in one read.
-    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     let answers = result.expect("numbered shell accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
 }
@@ -5467,7 +5441,7 @@ fn init_option_list_number_fast_path_still_selects_shell() {
 fn init_option_list_typed_value_still_selects_size() {
     // Typed values need no navigation: `14` answers the size step directly.
     let stdin = "\n\n\n14\n\n\n\n\n\n\n\n";
-    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("typed size accepted");
     assert!((answers.font_size - 14.0).abs() < f32::EPSILON);
 }
@@ -5476,7 +5450,7 @@ fn init_option_list_typed_value_still_selects_size() {
 fn init_option_list_invalid_retry_then_navigation() {
     // An unknown theme reprompts; `j` plus Enter then selects tokyo-night.
     let stdin = "\nnope\nj\n\n\n\n\n\n\n\n\n\n\n";
-    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard(stdin, Some("/bin/bash"));
     let answers = result.expect("retry plus navigation accepted");
     assert_eq!(answers.theme, "tokyo-night");
     assert!(
@@ -5488,7 +5462,7 @@ fn init_option_list_invalid_retry_then_navigation() {
 #[test]
 fn init_option_list_plain_output_has_no_escapes() {
     // Default harness color is off: piped/plain output carries no ANSI.
-    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
     result.expect("defaults accepted");
     assert!(
         !printed.contains("\u{1b}["),
@@ -5503,7 +5477,6 @@ fn init_option_list_color_previews_theme_and_marker() {
     let (result, printed) = drive_init_wizard_with_color(
         "\n\n\n\n\n\n\n\n\n\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         true,
     );
@@ -5523,6 +5496,357 @@ fn init_option_list_color_previews_theme_and_marker() {
     assert!(
         printed.contains("tokyo-night"),
         "labels stay greppable, got:\n{printed}"
+    );
+}
+
+// -- `bitty init` picker key loop: single-keypress navigation (#2136) -----
+//
+// The TTY picker responds to single keypresses without Enter (j/k and
+// arrows move, Enter selects). These tests drive
+// [`crate::init::init_picker_key_loop`] directly with injected bytes plus
+// an EOF-terminated wait closure (no TTY needed): the injected bytes stand
+// in for single keypresses exactly as the raw TTY delivers them.
+
+/// Drives one three-option key-loop picker headlessly; returns the selected
+/// value plus everything the picker printed plus the history it recorded.
+fn drive_picker_key_loop(
+    stdin_bytes: &[u8],
+    numbered: bool,
+) -> (Result<String, String>, String, Vec<String>) {
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "gamma".to_string(),
+            value_text: "gamma".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(stdin_bytes);
+    let mut output = Vec::new();
+    let mut history = Vec::new();
+    // EOF-terminated: no more bytes means the escape (if any) is bare.
+    // Production passes a poll-based closure over the real stdin instead.
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        numbered,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        false,
+        &mut wait,
+    );
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    (result, printed, history)
+}
+
+#[test]
+fn init_escape_burst_complete_cases() {
+    use crate::init::init_escape_burst_complete;
+    // Bare ESC needs more bytes (or a timeout) to disambiguate.
+    assert!(!init_escape_burst_complete(b"\x1b"));
+    // CSI introducer without a final byte is truncated.
+    assert!(!init_escape_burst_complete(b"\x1b["));
+    assert!(!init_escape_burst_complete(b"\x1b[1"));
+    assert!(!init_escape_burst_complete(b"\x1b[1;5"));
+    // Arrows, Home/End, and kitty `CSI u` forms are complete.
+    assert!(init_escape_burst_complete(b"\x1b[B"));
+    assert!(init_escape_burst_complete(b"\x1b[A"));
+    assert!(init_escape_burst_complete(b"\x1b[H"));
+    assert!(init_escape_burst_complete(b"\x1b[1;5B"));
+    assert!(init_escape_burst_complete(b"\x1b[13u"));
+    // SS3 needs its third byte.
+    assert!(!init_escape_burst_complete(b"\x1bO"));
+    assert!(init_escape_burst_complete(b"\x1bOB"));
+    // Alt prefixes (`ESC` + printable) are complete single keys.
+    assert!(init_escape_burst_complete(b"\x1bx"));
+    // OSC without a terminator is truncated; BEL-terminated is complete.
+    assert!(!init_escape_burst_complete(b"\x1b]8;;http://x"));
+    assert!(init_escape_burst_complete(b"\x1b]8;;http://x\x07"));
+}
+
+#[test]
+fn init_key_loop_j_moves_then_enter_selects() {
+    // Single `j` (no Enter) moves the cursor; Enter selects beta.
+    let (result, printed, _) = drive_picker_key_loop(b"j\r", true);
+    assert_eq!(result.expect("j plus Enter selects beta"), "beta");
+    assert!(
+        printed.contains("> 2) beta"),
+        "moved marker, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_k_wraps_to_last() {
+    // Single `k` from the default wraps to gamma.
+    let (result, _, _) = drive_picker_key_loop(b"k\r", true);
+    assert_eq!(result.expect("wrapped pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_arrow_down_moves() {
+    // Down-arrow escape plus Enter behaves like `j`.
+    let (result, _, _) = drive_picker_key_loop(b"\x1b[B\r", true);
+    assert_eq!(result.expect("arrow-navigated pick accepted"), "beta");
+}
+
+#[test]
+fn init_key_loop_arrow_up_wraps() {
+    // Up-arrow escape from the default wraps to gamma.
+    let (result, _, _) = drive_picker_key_loop(b"\x1b[A\r", true);
+    assert_eq!(result.expect("wrapped arrow pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_enter_selects_default() {
+    let (result, _, _) = drive_picker_key_loop(b"\r", true);
+    assert_eq!(result.expect("Enter selects the default"), "alpha");
+}
+
+#[test]
+fn init_key_loop_number_fast_path() {
+    // Numbered lists keep the digit fast path: `3` plus Enter picks gamma.
+    let (result, _, _) = drive_picker_key_loop(b"3\r", true);
+    assert_eq!(result.expect("numbered pick accepted"), "gamma");
+}
+
+#[test]
+fn init_key_loop_typed_value_submits() {
+    // Unnumbered lists accept typed values exactly like the line loop.
+    let (result, printed, history) = drive_picker_key_loop(b"custom\r", false);
+    assert_eq!(result.expect("typed value accepted"), "custom");
+    assert_eq!(history, vec!["custom".to_string()]);
+    assert!(
+        printed.contains("(typed: custom)"),
+        "typed echo, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_j_inside_buffer_appends() {
+    // `j` navigates only from an empty buffer; mid-value it is text.
+    let (result, _, _) = drive_picker_key_loop(b"aj\r", false);
+    assert_eq!(result.expect("buffered j accepted"), "aj");
+}
+
+#[test]
+fn init_key_loop_uppercase_j_types() {
+    // Uppercase `J` is typed text (the hint advertises lowercase j/k), so
+    // values like `JetBrains` stay enterable without the arrow keys.
+    let (result, _, _) = drive_picker_key_loop(b"JetBrains\r", false);
+    assert_eq!(result.expect("uppercase value accepted"), "JetBrains");
+}
+
+#[test]
+fn init_key_loop_esc_cancels() {
+    let (result, _, _) = drive_picker_key_loop(b"\x1b", true);
+    assert_eq!(
+        result.expect_err("bare Esc must cancel"),
+        "bitty init: aborted (cancelled)"
+    );
+}
+
+#[test]
+fn init_key_loop_ctrl_d_aborts() {
+    let (result, _, _) = drive_picker_key_loop(b"\x04", true);
+    assert_eq!(
+        result.expect_err("Ctrl-D must abort"),
+        "bitty init: aborted (end of input)"
+    );
+}
+
+#[test]
+fn init_key_loop_backspace_edits() {
+    let (result, _, _) = drive_picker_key_loop(b"ab\x7f\r", false);
+    assert_eq!(result.expect("edited value accepted"), "a");
+}
+
+#[test]
+fn init_key_loop_invalid_retries_then_succeeds() {
+    let options = vec![crate::init::InitOptionItem {
+        label: "alpha".to_string(),
+        value_text: "alpha".to_string(),
+        style_fg: None,
+        style_bg: None,
+    }];
+    let mut input = std::io::BufReader::new(b"bad\r\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        false,
+        |line: &str| {
+            if line == "bad" {
+                Err("nope".to_string())
+            } else {
+                Ok(line.to_string())
+            }
+        },
+        &mut history,
+        false,
+        &mut wait,
+    );
+    // A rejected value reprompts (buffer cleared); empty Enter then takes
+    // the cursor default.
+    assert_eq!(result.expect("retry accepted"), "alpha");
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    assert!(
+        printed.contains("nope — try again"),
+        "retry message, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_key_loop_too_many_invalid_aborts() {
+    let options = vec![crate::init::InitOptionItem {
+        label: "alpha".to_string(),
+        value_text: "alpha".to_string(),
+        style_fg: None,
+        style_bg: None,
+    }];
+    let mut input = std::io::BufReader::new(b"bad\rbad\rbad\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result: Result<String, String> = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        false,
+        |_: &str| Err("nope".to_string()),
+        &mut history,
+        false,
+        &mut wait,
+    );
+    assert!(
+        result
+            .expect_err("three strikes must abort")
+            .contains("too many"),
+        "attempt bound"
+    );
+}
+
+#[test]
+fn init_ask_option_falls_back_to_line_without_raw_tty() {
+    use std::io::IsTerminal as _;
+    // The raw key loop needs a real TTY stdin; under an interactive
+    // `cargo test` the harness stdin may be that TTY, which would steal the
+    // developer's terminal modes. Skip there; CI (piped stdin) runs it.
+    if std::io::stdin().is_terminal() {
+        return;
+    }
+    // `tty_interactive` with no raw-capable stdin keeps the line loop
+    // byte-identical: `j` plus Enter moves, Enter selects.
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(b"j\n\n".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let result: Result<String, String> = crate::init::init_ask_option(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        true,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        true,
+    );
+    assert_eq!(result.expect("line fallback accepted"), "beta");
+}
+
+#[test]
+fn init_key_loop_inplace_repaints_with_cursor_up() {
+    // In-place frames repaint over the previous frame (cursor-up plus
+    // clear-line) and hide the cursor while looping.
+    let options = vec![
+        crate::init::InitOptionItem {
+            label: "alpha".to_string(),
+            value_text: "alpha".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+        crate::init::InitOptionItem {
+            label: "beta".to_string(),
+            value_text: "beta".to_string(),
+            style_fg: None,
+            style_bg: None,
+        },
+    ];
+    let mut input = std::io::BufReader::new(b"j\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result: Result<String, String> = crate::init::init_picker_key_loop(
+        &mut input,
+        &mut output,
+        "Pick:",
+        &options,
+        0,
+        false,
+        true,
+        |line: &str| Ok(line.to_string()),
+        &mut history,
+        true,
+        &mut wait,
+    );
+    assert_eq!(result.expect("inplace pick accepted"), "beta");
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    // One frame is prompt plus two entries plus hint plus typed line.
+    assert!(
+        printed.contains("\x1b[5A"),
+        "cursor-up repaint, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("\x1b[?25l") && printed.contains("\x1b[?25h"),
+        "cursor hide/show, got:\n{printed}"
     );
 }
 
@@ -5593,7 +5917,6 @@ fn unified_gate_help_piped_is_plain_forced_still_colors() {
 fn drive_init_wizard_with_preview(
     stdin_lines: &str,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     overrides: &InitOverrides,
     baseline: bitty_config::EffectiveConfig,
 ) -> (Result<InitAnswers, String>, String, InitPreview) {
@@ -5604,12 +5927,12 @@ fn drive_init_wizard_with_preview(
         &mut input,
         &mut output,
         shell_env,
-        columns,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         overrides,
         false,
         Some(&mut preview),
         None,
+        false,
     );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed, preview)
@@ -5629,7 +5952,6 @@ fn init_preview_applies_selections_mid_wizard() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline,
     );
@@ -5707,7 +6029,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5730,7 +6051,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\x1b\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5748,7 +6068,6 @@ fn init_preview_cancel_restores_baseline() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5769,7 +6088,6 @@ fn init_preview_never_writes_config_file() {
     let (result, _, _) = drive_init_wizard_with_preview(
         "\n\n\n\n\n\n\n\n\n\n\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -5783,7 +6101,6 @@ fn init_preview_never_writes_config_file() {
     let (result, _, _) = drive_init_wizard_with_preview(
         "\n\x1b\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline,
     );
@@ -5961,7 +6278,6 @@ fn init_preview_baseline_prefers_loaded_config() {
         shell: None,
         xdg_config_home: Some(&prof_root_s),
         home: None,
-        columns: None,
         stdin_is_tty: true,
     };
     let env_prof = crate::init::init_preview_baseline(&Args::new(), &bitty_env);
@@ -6057,7 +6373,6 @@ fn init_live_preview_maps_snapshots_per_step() {
     let (_, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -6188,7 +6503,6 @@ fn init_preview_push_live_maps_final_overlay() {
     let (result, _, preview) = drive_init_wizard_with_preview(
         "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
         Some("/bin/bash"),
-        None,
         &InitOverrides::default(),
         baseline.clone(),
     );
@@ -6238,12 +6552,12 @@ fn init_preview_echo_tracks_running_theme_with_color() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         true,
         Some(&mut preview),
         None,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6313,12 +6627,12 @@ fn init_preview_echo_plain_without_color() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
         Some(&mut preview),
         None,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6349,10 +6663,10 @@ fn init_preview_echo_absent_without_preview() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         true,
+        false,
     );
     result.expect("custom picks accepted");
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
@@ -6388,12 +6702,12 @@ fn init_live_preview_hot_updates_per_step_unix() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
         Some(&mut preview),
         Some(&mut live),
+        false,
     );
     let answers = result.expect("custom picks accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
@@ -6450,12 +6764,12 @@ fn init_live_preview_esc_restores_baseline_unix() {
         &mut input,
         &mut output,
         Some("/bin/bash"),
-        None,
         &|p| p == "/bin/bash" || p == "/bin/sh",
         &InitOverrides::default(),
         false,
         Some(&mut preview),
         Some(&mut live),
+        false,
     );
     let err = result.expect_err("Esc cancels");
     assert!(err.contains("cancelled"), "unexpected: {err}");
@@ -6834,7 +7148,6 @@ fn init_env<'a>(
         shell,
         xdg_config_home,
         home,
-        columns: None,
         stdin_is_tty,
     }
 }
@@ -7695,18 +8008,36 @@ fn consolidated_startup_assembly_matches_expected_layout_and_focus() {
 #[test]
 fn parse_mascot_flags_default_off() {
     let parsed = parse_args(&args_of(&["bitty"]));
-    assert!(!parsed.mascot);
     assert!(!parsed.no_splash);
 }
 
 #[test]
-fn parse_mascot_and_no_splash_flags() {
+fn parse_mascot_flag_removed_for_024() {
+    // #2135: `--mascot` is gone; it now parses as an unknown pre-`--` flag
+    // (main rejects it fail-closed with exit 2).
     let parsed = parse_args(&args_of(&["bitty", "--mascot"]));
-    assert!(parsed.mascot);
-    assert!(!parsed.no_splash);
+    assert_eq!(parsed.unknown_flag.as_deref(), Some("--mascot"));
     let parsed = parse_args(&args_of(&["bitty", "--no-splash"]));
-    assert!(!parsed.mascot);
+    assert!(parsed.unknown_flag.is_none());
     assert!(parsed.no_splash);
+}
+
+#[test]
+fn help_no_longer_advertises_mascot() {
+    // #2135: both help surfaces drop `--mascot`; `--no-splash` stays
+    // (first-run splash kept).
+    assert!(
+        !help_text().contains("--mascot"),
+        "long help must not list --mascot"
+    );
+    assert!(
+        !crate::cli::help_text_short(false).contains("--mascot"),
+        "short help must not list --mascot"
+    );
+    assert!(
+        help_text().contains("--no-splash"),
+        "long help keeps --no-splash"
+    );
 }
 
 #[test]
@@ -7716,18 +8047,6 @@ fn mascot_art_is_bounded_ascii() {
     assert!(MASCOT_ART.lines().count() <= MASCOT_MAX_LINES);
     let width = mascot_width();
     assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
-}
-
-#[test]
-fn mascot_art_width_selection_matches_init_greeting() {
-    // Splash and `bitty init` greeting agree by construction (aliases).
-    let width = mascot_width();
-    assert_eq!(mascot_art_for_width(None), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(80)), MASCOT_ART);
-    assert_eq!(mascot_art_for_width(Some(width as u16)), MASCOT_ART);
-    let narrow = mascot_art_for_width(Some(20));
-    assert!(narrow.contains("too narrow"));
-    assert_eq!(narrow.lines().count(), 1);
 }
 
 #[test]
@@ -8366,6 +8685,480 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
     assert!(app.runtime.workspace_switch(1));
     assert_eq!(app.runtime.active_workspace_index(), 1);
     assert_eq!(app.runtime.focused_view(), Some(active_view));
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_shell_in_inactive_workspace_leaves_no_ghost_issue_2167() {
+    // Issue #2167: a tiled pane whose child exits while its workspace is in
+    // the background must be released from its stash, never stranded as a
+    // session-less erased tile (empty bordered panel + cursor, unusable).
+    // Before the fix the reap path ran layout surgery against the *active*
+    // tree (refused: the view lives elsewhere) and still tore the session
+    // down, so switching back showed the ghost.
+    require_pty!();
+    let mut app = editor_test_app();
+    let exited_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    // Immediately-exiting child in pane 2; no reap runs before the switch,
+    // so the exit status is still pending while the workspace goes inactive.
+    let script = write_fake_editor("exit-bg-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exited_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.has_pane_session(&exited_view));
+
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "background pane exit must close the pane, never the app"
+    );
+
+    // Switching back must show the survivor only: no session-less ghost.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(
+        !app.runtime.has_pane_session(&exited_view),
+        "exited background pane must be fully torn down"
+    );
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
+    // Issue #2167: a scratchpad-parked panel whose child exits must leave
+    // the slot empty, never a dead parked leaf that restores as a ghost.
+    require_pty!();
+    let mut app = editor_test_app();
+    let parked_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    let script = write_fake_editor("exit-parked-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(parked_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    app.runtime
+        .scratchpad_hide(parked_view)
+        .expect("parked panel hides");
+    assert!(app.runtime.scratchpad_occupied());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "parked pane exit must close the pane, never the app"
+    );
+    assert!(
+        !app.runtime.scratchpad_occupied(),
+        "no dead parked leaf may linger"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&parked_view),
+        "exited parked pane must be fully torn down"
+    );
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
+    // Issue #2169: typing `exit` in a floating panel must dismiss the
+    // float and return focus — never hard-freeze the terminal. The float
+    // is focused here (the user is typing in it), unlike the #2141
+    // detach path where focus already moved to the survivor.
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    // Keep a live shell behind the float so the post-reap focus and input
+    // route are observable, rather than treating a session-less tile as a
+    // survivor.
+    app.runtime
+        .spawn_shell_for_view_in(survivor, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .expect("spawn survivor shell");
+
+    // The float owns an interactive shell. The test sends the exact bytes a
+    // user types through Runtime's focused input router below.
+    app.runtime
+        .spawn_shell_for_view_in(float_view, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn float shell");
+    assert!(app.runtime.has_pane_session(&float_view));
+
+    // Detach pane 2 into a float, then focus it (user clicks the float).
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.floated_views().contains(&float_view));
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+
+    assert!(
+        app.runtime.push_input_bytes(b"exit\r"),
+        "typed exit must reach the focused floating shell"
+    );
+
+    // Poll until reap_exited_shells observes the exit. A deadline breach
+    // here is the #2169 hang (reap never returns / never observes).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "exiting float must dismiss the panel, never the app (and never hang)"
+    );
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "dead float must be discarded"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "float session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(survivor),
+        "focus must return to the surviving tile"
+    );
+    assert_eq!(app.effective_window_leaf_count(), 1);
+
+    // The terminal stays responsive: ticks present and input routes to
+    // the survivor instead of a dead float.
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert!(
+        app.runtime.has_pane_session(&survivor),
+        "survivor shell must remain alive after float reap"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"echo survivor\r"),
+        "survivor shell must remain the live input owner after float reap"
+    );
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+}
+
+#[cfg(unix)]
+fn reap_until_change_2169(app: &mut TerminalApp, secs: u64) -> terminal_app::ShellExitOutcome {
+    // Bounded reap helper for the #2169 float-exit matrix. A deadline
+    // breach surfaces as NoExit (the hang signature) instead of blocking
+    // the test runner forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    outcome
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_focused_pin_dismisses_without_freeze_issue_2169() {
+    // Exiting shell in a focused PINNED panel (window-global sticky
+    // float) must dismiss without hanging.
+    require_pty!();
+    let mut app = editor_test_app();
+    let pin_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-pin", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pin_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pin shell");
+    assert!(app.runtime.set_focus(pin_view));
+    app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned);
+    assert!(app.runtime.pinned_views().contains(&pin_view));
+    assert!(app.runtime.set_focus(pin_view), "pin must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert!(!app.runtime.pinned_views().contains(&pin_view));
+    assert!(!app.runtime.has_pane_session(&pin_view));
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    let _ = app.drive_tick();
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_focused_float_dismisses_while_zoomed_issue_2169() {
+    // Zoom engaged on the survivor while the focused float's shell
+    // exits (reap runs restore_zoom before discard).
+    require_pty!();
+    let mut app = editor_test_app();
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-zoomfloat", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.set_focus(survivor));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert!(!app.runtime.floated_views().contains(&float_view));
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert!(app.runtime.focused_view().is_some(), "focus must be live");
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_inactive_workspace_float_discards_without_freeze_issue_2169() {
+    // The float lives on the INACTIVE workspace when its shell exits
+    // (sibling #2167 ghost family — must not hang either). With the
+    // stashed-container release, the parked float is discarded from its
+    // home slot instead of stranding a session-less ghost there.
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+    let script = write_fake_editor("exit-inactive", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "inactive-workspace float exit must close the pane (no hang, no app exit)"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "parked float session must be torn down"
+    );
+    // Switching back must show the survivor only: no session-less ghost.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "parked float must be discarded from its home slot"
+    );
+    let _ = app.drive_tick();
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_owner_float_dismisses_while_zoomed_issue_2169() {
+    // Zoom engaged, then the PRIMARY-OWNER float's shell exits
+    // (primary_exit_status + floated branch, which carries no restore_zoom).
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    let float_view = ViewId::new(1);
+    let survivor = ViewId::new(2);
+    let pane_script = write_fake_editor("keep-pane", "#!/bin/sh\nsleep 30\n");
+    let pane_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, pane_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    let prim_script = write_fake_editor("exit-prim", "#!/bin/sh\nexit 0\n");
+    let prim_arg = prim_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(prim_arg.as_str())
+        .expect("spawn primary shell");
+    // Detach the primary FIRST (zoom collapses the tree to a proxy, and a
+    // leaf living only in the zoom backup is not detachable).
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach primary to float");
+    assert!(app.runtime.set_focus(survivor));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "primary-owner float exit must dismiss, never hang or exit the app"
+    );
+    assert!(!app.runtime.floated_views().contains(&float_view));
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert!(app.runtime.focused_view().is_some(), "focus must be live");
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&prim_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_float_after_refocus_keeps_survivor_focus_issue_2169() {
+    // Issue #2169 race branch (CTX-1284 headed `refocusrace` variant):
+    // the user types `exit` in the float, then focus moves to the
+    // surviving tile BEFORE the reap observes the exit. The discard must
+    // keep the survivor focus (never clear it) and the terminal must stay
+    // responsive: ticks present and input still routes to the survivor.
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let float_view = ViewId::new(2);
+    let survivor = ViewId::new(1);
+
+    let script = write_fake_editor("exit-float-race", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn float shell");
+    assert!(app.runtime.has_pane_session(&float_view));
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
+        .expect("detach to float");
+    assert!(app.runtime.floated_views().contains(&float_view));
+    // Focus leaves the dying float before the reap runs.
+    assert!(app.runtime.set_focus(survivor));
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "float exit with focus elsewhere must still dismiss the pane"
+    );
+    assert!(
+        !app.runtime.floated_views().contains(&float_view),
+        "dead float must be discarded"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&float_view),
+        "float session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(survivor),
+        "survivor keeps focus, never cleared"
+    );
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
+    // Issue #2167 (CodeRabbit on PR #2170): while zoomed the live layout
+    // is a single-leaf proxy and the exited leaf hides in the zoom backup.
+    // Surgery must run against the real tree (restore_zoom first), or the
+    // dead leaf survives in the backup and ghosts on unzoom.
+    require_pty!();
+    let mut app = editor_test_app();
+    let exiting = ViewId::new(2);
+
+    let script = write_fake_editor("exit-zoomed-bg", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+    assert!(app.runtime.set_focus(ViewId::new(1)));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert_eq!(
+        app.runtime.leaf_count(),
+        1,
+        "zoom collapses the live layout to a proxy"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "zoomed backup exit must close the pane, never the app"
+    );
+    // The dead leaf must be gone from the real tree (session torn down),
+    // never parked in the zoom backup to ghost on unzoom.
+    assert!(
+        !app.runtime.has_pane_session(&exiting),
+        "exited backup leaf must be fully torn down"
+    );
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert!(
+        !app.runtime.layout().leaf_ids().contains(&exiting),
+        "unzoom must not resurrect the dead leaf"
+    );
     let _ = std::fs::remove_file(&script);
 }
 

@@ -601,6 +601,177 @@ impl Runtime {
         self.floats.ids()
     }
 
+    /// Discards detached float `id` without restoring it (issue #2141).
+    ///
+    /// Drops the stored [`View`](bitty_ui::View), its Alt+drag re-anchor
+    /// offset, and any in-flight drag/resize grab on it; tears down its
+    /// pane session; moves focus off it onto the first live leaf and
+    /// re-homes a dead primary owner. Returns `true` when a detached float
+    /// was removed.
+    pub fn discard_floated(&mut self, id: ViewId) -> bool {
+        if self.floats.discard(id).is_none() {
+            return false;
+        }
+        self.float_offsets.remove(&id);
+        if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
+            self.alt_drag = None;
+        }
+        if self.float_resize.is_some_and(|resize| resize.leaf == id) {
+            self.float_resize = None;
+        }
+        self.close_pane_session(&id);
+        if self.focus.focused() == Some(id) {
+            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                self.focus = Focus::with_focus(first);
+            } else {
+                self.focus.clear();
+            }
+        }
+        if self.primary_view == Some(id) {
+            self.primary_view = self.focus.focused();
+        }
+        self.clear_hover_pending();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Discards pinned leaf `id` without restoring it (issue #2141).
+    ///
+    /// Same teardown as [`Self::discard_floated`] for the window-global
+    /// pinned store. Returns `true` when a pinned leaf was removed.
+    pub fn discard_pinned(&mut self, id: ViewId) -> bool {
+        if self.pinned.discard(id).is_none() {
+            return false;
+        }
+        self.pinned_offsets.remove(&id);
+        if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
+            self.alt_drag = None;
+        }
+        if self.float_resize.is_some_and(|resize| resize.leaf == id) {
+            self.float_resize = None;
+        }
+        self.close_pane_session(&id);
+        if self.focus.focused() == Some(id) {
+            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                self.focus = Focus::with_focus(first);
+            } else {
+                self.focus.clear();
+            }
+        }
+        if self.primary_view == Some(id) {
+            self.primary_view = self.focus.focused();
+        }
+        self.clear_hover_pending();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Discards `id` from whichever floating store holds it (issue #2141).
+    ///
+    /// Returns `true` when `id` was a detached float or pinned leaf.
+    pub fn discard_floating_view(&mut self, id: ViewId) -> bool {
+        if self.floats.contains(id) {
+            return self.discard_floated(id);
+        }
+        if self.pinned.contains(id) {
+            return self.discard_pinned(id);
+        }
+        false
+    }
+
+    /// Removes `id` from whichever non-live container holds it (issue #2167):
+    /// an inactive workspace's stashed layout (sibling-promoting removal) or
+    /// stashed detached floats, or the window-global scratchpad slot.
+    ///
+    /// The live layout, live floats, and pins are never touched: their
+    /// teardown carries focus/primary fixups that only make sense for the
+    /// visible tree (see [`Self::discard_floating_view`]).
+    ///
+    /// A singleton stash keeps its tile: like the foreground CTX-1039
+    /// branch, the emptied workspace stays with a session-less tile rather
+    /// than stranding an empty layout. Returns `true` when a session
+    /// teardown for `id` is now safe (leaf removed, or deliberately kept
+    /// tile); `false` when `id` lives in no stashed container.
+    pub fn remove_stashed_view(&mut self, id: ViewId) -> bool {
+        // CTX-0567 (#992): retirement is an explicit boundary — fold every
+        // live id into the high-water before mutating so a retired leaf's id
+        // can never be re-issued, even when it was the maximum.
+        self.raise_view_id_high_water();
+        let active = self.active_workspace;
+        for (index, slot) in self.workspaces.iter_mut().enumerate() {
+            if index == active {
+                continue;
+            }
+            if slot.floats.discard(id).is_some() {
+                self.float_offsets.remove(&id);
+                if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
+                    self.alt_drag = None;
+                }
+                if self.float_resize.is_some_and(|resize| resize.leaf == id) {
+                    self.float_resize = None;
+                }
+                self.after_stashed_removal(id);
+                return true;
+            }
+            if slot.layout.leaf_ids().contains(&id) {
+                if slot.layout.leaf_count() > 1
+                    && !bitty_ui::layout::remove_leaf(&mut slot.layout, id)
+                {
+                    // Nested singleton stack (or overlay miss): no sibling
+                    // to promote without restructuring the tree. Keep the
+                    // tile session-less like a singleton stash — never
+                    // strand a half-removed tree, never leave a ghost.
+                }
+                if slot.focus.focused() == Some(id) && !slot.layout.leaf_ids().contains(&id) {
+                    slot.focus = slot
+                        .layout
+                        .leaf_ids()
+                        .into_iter()
+                        .next()
+                        .map(Focus::with_focus)
+                        .unwrap_or_default();
+                }
+                self.after_stashed_removal(id);
+                return true;
+            }
+        }
+        if self.scratchpad.discard(id).is_some() {
+            if self
+                .scratchpad_primary_owner
+                .is_some_and(|(owner, _)| owner == id)
+            {
+                self.scratchpad_primary_owner = None;
+            }
+            self.after_stashed_removal(id);
+            return true;
+        }
+        false
+    }
+
+    /// Shared bookkeeping after a stashed-container removal for `id`
+    /// (issue #2167): drops restore/cwd state, view bindings, and re-homes
+    /// a globally vanished primary owner. No geometry sync: stash surgery
+    /// never moves live boundaries.
+    fn after_stashed_removal(&mut self, id: ViewId) {
+        self.session_pending.remove(&id);
+        if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(id) {
+            self.session_primary_cwd = None;
+        }
+        self.drop_view_bindings_for(id);
+        if self.primary_view == Some(id) && !self.live_view_raws().contains(&id.0) {
+            self.primary_view = self.focus.focused();
+        }
+        self.pending_full_redraw = true;
+    }
+
     /// Shared post-edit fixups after the live layout lost or gained a leaf
     /// through the scratchpad slot (CTX-0954), the pinned store (CTX-1077),
     /// or the detached-float store (CTX-1147).
@@ -808,7 +979,11 @@ impl Runtime {
     }
 
     /// Raw ids of every live leaf: the live layout plus all stashed slots.
-    fn live_view_raws(&self) -> Vec<u64> {
+    ///
+    /// Allocation high-water only: coverage errs on including a stale
+    /// active-slot copy (an id is never re-issued). The present close-fade
+    /// gate uses [`Self::live_view_raws_excluding_active_slot`] instead.
+    pub(super) fn live_view_raws(&self) -> Vec<u64> {
         let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
         for slot in &self.workspaces {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
@@ -829,6 +1004,30 @@ impl Runtime {
         for slot in &self.workspaces {
             raws.extend(slot.floats.ids().iter().map(|id| id.0));
         }
+        raws
+    }
+
+    /// Raw ids of every live leaf except the active slot's stashed copy.
+    ///
+    /// Close-fade gate (#2134): the active slot is refreshed only on
+    /// switch-away, so between a `set_layout_closing` and the next switch
+    /// it still names a destroyed leaf. The live layout plus the inactive
+    /// slots decide whether a removed view was destroyed or merely hidden;
+    /// window-owned parked/pinned/detached leaves count as live either way.
+    pub(super) fn live_view_raws_excluding_active_slot(&self) -> Vec<u64> {
+        let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
+        for (index, slot) in self.workspaces.iter().enumerate() {
+            if index == self.active_workspace {
+                continue;
+            }
+            raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
+            raws.extend(slot.floats.ids().iter().map(|id| id.0));
+        }
+        if let Some(parked) = self.scratchpad.peek() {
+            raws.push(parked.id().0);
+        }
+        raws.extend(self.pinned.ids().iter().map(|id| id.0));
+        raws.extend(self.floats.ids().iter().map(|id| id.0));
         raws
     }
 
@@ -1307,8 +1506,28 @@ impl Runtime {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != self.active_workspace)
-            .map(|(_, slot)| slot.layout.leaf_ids().len())
+            .map(|(_, slot)| slot.layout.leaf_ids().len() + slot.floats.len())
             .sum()
+    }
+
+    /// Window-wide live panel count: active layout plus active detached
+    /// floats plus window-global pins and the scratchpad slot, plus every
+    /// inactive slot's layout and detached floats (issue #2141).
+    ///
+    /// The pre-#2141 `leaf_count` + `inactive_workspaces_leaf_count` sum
+    /// missed floats and pins, so a dead float could read as the last panel
+    /// (spurious app exit) or a live float could be ignored (stuck empty
+    /// panel). Issue #2167 adds the scratchpad the same way: a parked panel
+    /// is a live panel, so its exit must close the pane (PaneClosed), never
+    /// end the session while other tiles remain. This is the single
+    /// window-close denominator.
+    #[must_use]
+    pub fn window_leaf_count(&self) -> usize {
+        self.layout.leaf_ids().len()
+            + self.floats.len()
+            + self.pinned.len()
+            + self.scratchpad_count()
+            + self.inactive_workspaces_leaf_count()
     }
 
     /// Kill every pane session owned by workspace `index`'s leaves.
@@ -1911,7 +2130,8 @@ impl Runtime {
     }
 
     /// Move the focused window to workspace `one_based` (1-based display
-    /// index, `key` + `ctl` path). Returns `(moved_id, from_1based, to_1based)`.
+    /// position used by the keyboard path). Returns
+    /// `(moved_id, from_1based, to_1based)`.
     /// Auto-creates target workspace if it does not exist (CTX-0945).
     pub fn workspace_move_focused_to_one_based(
         &mut self,
@@ -1923,8 +2143,21 @@ impl Runtime {
         if one_based > MAX_WORKSPACES as u64 {
             return Err(format!("workspace index exceeds maximum {MAX_WORKSPACES}"));
         }
+        // The keyboard binding addresses the current numbered/display slot.
+        // Stable `ws:N` ids remain the control-plane contract, but using the
+        // sequence lookup first here makes a closed slot appear to be a
+        // missing target and creates a duplicate workspace (issue #2177).
+        if one_based <= self.workspaces.len() as u64 {
+            let target_idx = (one_based - 1) as usize;
+            let from = self.active_workspace.saturating_add(1);
+            let moved = self.workspace_move_focused_to(target_idx)?;
+            return Ok((moved, from, one_based as usize));
+        }
+        // Preserve the sparse-workspace keyboard policy for numbers beyond
+        // the current slot count: an existing stable sequence is reused;
+        // otherwise the explicit auto-create path below creates that target.
         if let Some(target_idx) = self.workspace_index_by_seq(one_based) {
-            let from = self.workspace_seq_at(self.active_workspace).unwrap_or(1) as usize;
+            let from = self.active_workspace.saturating_add(1);
             let moved = self.workspace_move_focused_to(target_idx)?;
             return Ok((moved, from, one_based as usize));
         }
@@ -3585,13 +3818,92 @@ mod tests {
     }
 
     #[test]
+    fn key_move_reuses_existing_display_position_after_workspace_gap() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        rt.workspace_new().expect("ws3");
+        assert!(rt.workspace_switch(0), "return to ws1");
+        assert!(rt.workspace_close_at(1).is_ok(), "close ws2");
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+
+        let focused = rt.focused_view().expect("focus");
+        let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(probe),
+            LayoutNode::leaf(View::new(ViewId::new(50), 40, 24)),
+        ));
+        assert!(rt.set_focus(ViewId::new(50)));
+
+        let count_before = rt.workspace_count();
+        let (moved, from, target) = rt
+            .workspace_move_focused_to_one_based(2)
+            .expect("position 2 must reuse ws3");
+        assert_eq!(moved, ViewId::new(50));
+        assert_eq!(from, 1);
+        assert_eq!(target, 2, "report the existing display position");
+        assert_eq!(rt.workspace_count(), count_before);
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(50)));
+        assert_eq!(rt.layout().leaf_count(), 2);
+
+        let leaves_before = rt.layout().leaf_ids();
+        let count_before_repeat = rt.workspace_count();
+        let repeated = rt
+            .workspace_move_focused_to_one_based(2)
+            .expect("repeating the target move is a no-op");
+        assert_eq!(repeated.0, ViewId::new(50));
+        assert_eq!(rt.workspace_count(), count_before_repeat);
+        assert_eq!(rt.layout().leaf_ids(), leaves_before);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(50)));
+    }
+
+    #[test]
+    fn key_move_creates_only_when_display_position_is_missing() {
+        let mut rt = fresh();
+        let focused = rt.focused_view().expect("focus");
+        let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
+        let moved_id = ViewId::new(51);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(probe),
+            LayoutNode::leaf(View::new(moved_id, 40, 24)),
+        ));
+        assert!(rt.set_focus(moved_id));
+
+        let (moved, from, target) = rt
+            .workspace_move_focused_to_one_based(3)
+            .expect("missing position 3 follows the auto-create policy");
+        assert_eq!(moved, moved_id);
+        assert_eq!(from, 1);
+        assert_eq!(target, 3);
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(
+            rt.workspace_names(),
+            vec![String::from("ws1"), String::from("ws3")]
+        );
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.focused_view(), Some(moved_id));
+        assert!(rt.layout().leaf_ids().contains(&moved_id));
+    }
+
+    #[test]
     fn non_consecutive_workspaces_query_and_jump() {
         let mut rt = fresh();
         // Build gaps via multi-leaf moves (issue #1803 keeps multi-leaf
         // sources, so the count grows; singleton moves would remove the
         // source instead). Each iteration splits ws1 to two leaves, moves
         // one leaf out, and returns to ws1 for the next split.
-        for target_seq in [5u64, 9, 3] {
+        for target_seq in [5u64, 9, 15] {
             // Split the active ws1 into two leaves.
             let focused = rt.focused_view().expect("focus");
             let probe = rt.layout().find_leaf(focused).cloned().expect("leaf");
@@ -3632,31 +3944,31 @@ mod tests {
             let ws1_idx = rt.workspace_index_by_seq(1).expect("ws1 survives");
             assert!(rt.workspace_switch(ws1_idx));
         }
-        // Workspaces should be sorted by seq: 1, 3, 5, 9
+        // Workspaces should be sorted by seq: 1, 5, 9, 15.
         assert_eq!(rt.workspace_count(), 4);
         assert_eq!(
             rt.workspace_names(),
             vec![
                 String::from("ws1"),
-                String::from("ws3"),
                 String::from("ws5"),
-                String::from("ws9")
+                String::from("ws9"),
+                String::from("ws15")
             ]
         );
         // After the last move we switched back to ws1 (seq 1).
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 1);
 
-        // Jump to non-consecutive workspace 5
+        // Jump to non-consecutive workspace 5.
         let jumped = rt.workspace_focus_clamped(5);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 5);
-        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.active_workspace_index(), 1);
 
-        // Jump to non-consecutive workspace 9
+        // Jump to non-consecutive workspace 9.
         let jumped = rt.workspace_focus_clamped(9);
         assert!(jumped.is_some());
         assert_eq!(rt.workspaces[rt.active_workspace].seq, 9);
-        assert_eq!(rt.active_workspace_index(), 3);
+        assert_eq!(rt.active_workspace_index(), 2);
     }
 
     #[test]
@@ -3996,5 +4308,249 @@ mod tests {
             !leaf_row_has_ink(&rt, new_owner),
             "no grid is duplicated onto the new owner"
         );
+    }
+
+    #[test]
+    fn discard_floated_removes_dead_float_issue_2141() {
+        // Issue #2141: a detached float whose child exits must disappear,
+        // never linger as an empty unkillable panel.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        assert!(rt.floated_views().contains(&first));
+        assert_eq!(rt.window_leaf_count(), 2);
+        // Focus moved off the float onto the survivor at detach.
+        assert_eq!(rt.focused_view(), Some(second));
+        // Dismiss the dead float (child exited): store + offsets cleared,
+        // focus stays on the survivor, layout untouched.
+        assert!(rt.discard_floated(first));
+        assert!(!rt.floated_views().contains(&first));
+        assert!(!rt.discard_floated(first));
+        assert!(!rt.discard_floated(ViewId::new(404)));
+        assert_eq!(rt.window_leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(second));
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+    }
+
+    #[test]
+    fn discard_pinned_removes_dead_pin_issue_2141() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.pin_floating(first).expect("pin");
+        assert!(rt.pinned_views().contains(&first));
+        assert_eq!(rt.window_leaf_count(), 2);
+        assert!(rt.discard_pinned(first));
+        assert!(!rt.pinned_views().contains(&first));
+        assert!(!rt.discard_pinned(first));
+        assert_eq!(rt.window_leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(second));
+    }
+
+    #[test]
+    fn window_leaf_count_covers_floats_pins_and_inactive_floats_issue_2141() {
+        let mut rt = fresh();
+        assert_eq!(rt.window_leaf_count(), 1);
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert_eq!(rt.window_leaf_count(), 2);
+        rt.float_detach(first).expect("detach");
+        assert_eq!(rt.window_leaf_count(), 2);
+        rt.workspace_new().expect("ws2");
+        assert_eq!(rt.window_leaf_count(), 3);
+    }
+
+    #[test]
+    fn window_leaf_count_covers_scratchpad_issue_2167() {
+        // Issue #2167: a parked panel is a live panel. The window-close
+        // denominator must count the scratchpad slot, so a parked exit
+        // closes the pane (PaneClosed) instead of ending the session
+        // while other tiles remain.
+        let mut rt = fresh();
+        assert_eq!(rt.window_leaf_count(), 1);
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        assert_eq!(rt.window_leaf_count(), 2);
+        rt.scratchpad_hide(second).expect("park");
+        assert_eq!(
+            rt.window_leaf_count(),
+            2,
+            "live tile plus parked panel keeps the denominator at 2"
+        );
+    }
+
+    #[test]
+    fn scroll_focused_page_reaches_detached_float_issue_2139() {
+        // Issue #2139: Mod+U/I must scroll a focused float, not report
+        // no-focused-pane. The view lookup has to cover detached floats
+        // (and pins), not just tiled leaves.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        assert!(rt.set_focus(first), "detached float stays focusable");
+        assert!(
+            rt.scroll_focused_page(true),
+            "focused float must accept page scroll"
+        );
+        assert!(
+            rt.scroll_focused_page(false),
+            "focused float must accept page scroll down"
+        );
+    }
+
+    #[test]
+    fn remove_stashed_view_releases_multi_leaf_stash_issue_2167() {
+        // Issue #2167: a pane child that exits while its workspace is in
+        // the background must not strand a session-less erased tile. The
+        // stash releases the leaf so the session teardown has somewhere to
+        // go; switching back shows the surviving leaf only.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.workspace_new().expect("ws2");
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert!(
+            rt.remove_stashed_view(second),
+            "background stash leaf must be releasable"
+        );
+        assert!(rt.workspace_switch(0));
+        assert_eq!(
+            rt.layout().leaf_ids(),
+            vec![first],
+            "no ghost tile may survive the switch back"
+        );
+    }
+
+    #[test]
+    fn remove_stashed_view_keeps_singleton_stash_tile_issue_2167() {
+        // A singleton stash mirrors the foreground CTX-1039 branch: the
+        // emptied workspace keeps its tile (the session teardown happens
+        // on top) instead of stranding an empty layout.
+        let mut rt = fresh();
+        let only = rt.focused_view().expect("focus");
+        rt.workspace_new().expect("ws2");
+        assert!(
+            rt.remove_stashed_view(only),
+            "singleton stash must resolve (kept tile)"
+        );
+        assert!(rt.workspace_switch(0));
+        assert_eq!(
+            rt.layout().leaf_ids(),
+            vec![only],
+            "emptied background workspace keeps its tile"
+        );
+    }
+
+    #[test]
+    fn remove_stashed_view_never_touches_live_tree_issue_2167() {
+        // Live layout, live floats, and pins keep their own teardown with
+        // focus/primary fixups; the stash surgery must refuse them.
+        let mut rt = fresh();
+        let live = rt.focused_view().expect("focus");
+        assert!(
+            !rt.remove_stashed_view(live),
+            "live leaf must not resolve as stashed"
+        );
+        assert!(
+            !rt.remove_stashed_view(ViewId::new(404)),
+            "unknown view must not resolve"
+        );
+        assert_eq!(rt.layout().leaf_ids(), vec![live]);
+    }
+
+    #[test]
+    fn remove_stashed_view_discards_stash_float_issue_2167() {
+        // A detached float whose child exits while its workspace is in the
+        // background must vanish, never linger as a dead float on return.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        rt.workspace_new().expect("ws2");
+        assert!(
+            rt.remove_stashed_view(first),
+            "stashed float must be discardable"
+        );
+        assert!(rt.workspace_switch(0));
+        assert!(
+            !rt.floated_views().contains(&first),
+            "no dead float may survive the switch back"
+        );
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+    }
+
+    #[test]
+    fn remove_stashed_view_discards_scratchpad_issue_2167() {
+        // A parked panel whose child exits must leave the slot empty, never
+        // a dead parked leaf that restores as a ghost.
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.scratchpad_hide(second).expect("park");
+        assert!(rt.scratchpad_occupied());
+        assert!(
+            rt.remove_stashed_view(second),
+            "parked leaf must be discardable"
+        );
+        assert!(!rt.scratchpad_occupied(), "no dead parked leaf may linger");
+        assert_eq!(rt.layout().leaf_ids(), vec![first]);
     }
 }

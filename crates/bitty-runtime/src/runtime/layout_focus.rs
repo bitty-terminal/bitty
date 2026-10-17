@@ -568,8 +568,10 @@ impl Runtime {
     /// current one and arms the matching animations (CTX-0341).
     ///
     /// Called once per present before the idle short-circuit. Open/close are
-    /// derived from the View-set delta (a new View fades in, a removed one
-    /// fades out through a retained [`ClosingFrame`]); focus from the focused
+    /// derived from the View-set delta (a new View fades in, a destroyed one
+    /// fades out through a retained [`ClosingFrame`]; a View that merely
+    /// left the visible set but stays live — workspace stash, scratchpad,
+    /// pin, detach — fades nothing, #2134). Focus from the focused
     /// View change; workspace from the active index change. Move/resize/drag
     /// (CTX-0967) are NOT detected here — a move or resize keeps the same
     /// `View` set, so those paths trigger their transition directly at the
@@ -614,8 +616,22 @@ impl Runtime {
         }
         if policy.animates(AnimationKind::Close) {
             let previous = self.last_presented_allocations.clone();
+            // #2134: only a destroyed view fades its ring out. Views that
+            // merely left the visible set but stay live (stashed in an
+            // inactive workspace slot, scratchpad, pin, detach) are not
+            // closed: retaining their rings would ghost the previous
+            // workspace over the new one on every switch. The active
+            // slot is excluded: it refreshes only on switch-away, so it
+            // can still name a leaf an explicit close just destroyed.
+            let live: std::collections::HashSet<u64> = self
+                .live_view_raws_excluding_active_slot()
+                .into_iter()
+                .collect();
             for old in &previous {
                 if new_ids.contains(&old.view) {
+                    continue;
+                }
+                if live.contains(&old.view.0) {
                     continue;
                 }
                 if self.closing_frames.iter().any(|c| c.view == old.view) {
@@ -1505,11 +1521,35 @@ impl Runtime {
         )
     }
 
-    /// Scroll offset of leaf `view` in the active layout (`0` when absent).
-    pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {
+    /// Shared view lookup across layout, detached floats, and pins
+    /// (issue #2139: float scroll must address the focused float, not just
+    /// tiled leaves).
+    pub(super) fn find_view(&self, id: ViewId) -> Option<&View> {
         self.layout
-            .find_leaf(view)
-            .map_or(0, |leaf| leaf.scroll_offset())
+            .find_leaf(id)
+            .or_else(|| self.floats.get(id))
+            .or_else(|| self.pinned.get(id))
+    }
+
+    /// Mutable shared view lookup across layout, detached floats, and pins
+    /// (issue #2139).
+    pub(super) fn find_view_mut(&mut self, id: ViewId) -> Option<&mut View> {
+        if let Some(leaf) = self.layout.find_leaf_mut(id) {
+            return Some(leaf);
+        }
+        if let Some(stored) = self.floats.find_mut(id) {
+            return Some(stored);
+        }
+        if let Some(stored) = self.pinned.find_mut(id) {
+            return Some(stored);
+        }
+        None
+    }
+
+    /// Scroll offset of leaf `view` in the active layout, detached floats,
+    /// or pins (`0` when absent).
+    pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {
+        self.find_view(view).map_or(0, |leaf| leaf.scroll_offset())
     }
 
     /// Whether `view` currently shows a scrolled history viewport (CTX-1021,
@@ -1544,7 +1584,7 @@ impl Runtime {
             return None;
         }
         let state = self.live_view_state(view)?;
-        let leaf = self.layout.find_leaf(view)?;
+        let leaf = self.find_view(view)?;
         let cells = leaf.visible_cells(state);
         let base = state.snapshot();
         Some(Snapshot {
@@ -1585,7 +1625,7 @@ impl Runtime {
     ) -> Option<CellPos> {
         if self.is_viewport_scrolled(owner) {
             let viewport = self.viewport_snapshot_for(owner)?;
-            let leaf = self.layout.find_leaf(owner)?;
+            let leaf = self.find_view(owner)?;
             let max_row = leaf.rows().saturating_sub(1);
             let max_col = leaf.cols().saturating_sub(1);
             let row = local.row.min(max_row);

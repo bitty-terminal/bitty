@@ -177,6 +177,7 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
             claims: Vec::new(),
         },
         settings: Vec::new(),
+        next_steps: Vec::new(),
         raw_bytes_len: 512,
     }
 }

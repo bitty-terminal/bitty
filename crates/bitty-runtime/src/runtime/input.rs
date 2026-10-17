@@ -664,7 +664,7 @@ impl Runtime {
         let Some(fid) = self.focus.focused() else {
             return;
         };
-        let Some(view) = self.layout.find_leaf_mut(fid) else {
+        let Some(view) = self.find_view_mut(fid) else {
             return;
         };
         if view.scroll_offset() != 0 {
@@ -1175,6 +1175,7 @@ impl Runtime {
         // resize and consumes the event (no selection starts). Runs before
         // the interior move so edges win over interiors; interiors and
         // anchored floats fail soft here and fall through to the move below.
+        // Alt-only: Super is the compositor's window-drag Mod (issue #2140).
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
@@ -1188,7 +1189,8 @@ impl Runtime {
         // grab fails soft on tiled leaves (the Mod tiled-drag path below
         // owns them) and under Shift (which forces the selection path per
         // the CTX-0181 precedent) — both fall through, so Alt+drag never
-        // breaks selection.
+        // breaks selection. Alt-only: Super is the compositor's
+        // window-drag Mod (issue #2140).
         if !shift_override
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
@@ -1653,22 +1655,21 @@ impl Runtime {
                             let max = self.scrollback_len();
                             let scrolled_view = self.focused_view().or(Some(ViewId::new(1)));
                             let old_offset = scrolled_view
-                                .and_then(|id| self.layout.find_leaf(id))
+                                .and_then(|id| self.find_view(id))
                                 .map_or(0, |view| view.scroll_offset());
                             if let Some(view_id) = self.focused_view() {
-                                if let Some(view) = self.layout.find_leaf_mut(view_id) {
+                                if let Some(view) = self.find_view_mut(view_id) {
                                     view.scroll_by(lines_y, max);
                                 }
                             } else {
                                 // Single-window fallback: find leaf 1
-                                if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
+                                if let Some(view) = self.find_view_mut(ViewId::new(1)) {
                                     view.scroll_by(lines_y, max);
                                 }
                             }
                             if let Some(view_id) = scrolled_view {
                                 let new_offset = self
-                                    .layout
-                                    .find_leaf(view_id)
+                                    .find_view(view_id)
                                     .map_or(old_offset, |view| view.scroll_offset());
                                 let delta = new_offset as isize - old_offset as isize;
                                 if delta != 0 {
@@ -1725,10 +1726,9 @@ impl Runtime {
             None => return false,
         };
         let old_offset = self
-            .layout
-            .find_leaf(target)
+            .find_view(target)
             .map_or(0, |view| view.scroll_offset());
-        let scrolled = match self.layout.find_leaf_mut(target) {
+        let scrolled = match self.find_view_mut(target) {
             Some(view) => {
                 let page = usize::from(view.rows()).max(1) as isize;
                 view.scroll_by(if up { page } else { -page }, max);
@@ -1738,8 +1738,7 @@ impl Runtime {
         };
         if scrolled {
             let new_offset = self
-                .layout
-                .find_leaf(target)
+                .find_view(target)
                 .map_or(old_offset, |view| view.scroll_offset());
             // CTX-1021 (#1807): page scrolls move the viewport under a
             // scrolled selection the same way wheel scrolls do.
@@ -1912,12 +1911,12 @@ impl Runtime {
     /// composition and commit"). The preedit overlay clears first so a cancel
     /// of a stale composition can never paint after the commit.
     ///
-    /// The commit string is passed through **verbatim** — never trimmed. A
-    /// trailing space that an input method genuinely appends is user input
-    /// (Terminal Truth); the synthetic one from issue #1449 is a raw key
-    /// re-inserted after the commit, which
-    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press) consumes, not a
-    /// byte the commit path adds.
+    /// Unsolicited commits are passed through **verbatim**. For an armed IME
+    /// claim, one trailing ASCII space is removed when present because fcitx5
+    /// can include the committing Space in the commit text. The raw key
+    /// re-inserted after the commit is consumed by
+    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press), not added by
+    /// the commit path.
     ///
     /// `handle_ime_commit` delegates with `Instant::now()` via
     /// [`Self::handle_ime_commit_at`], the clock seam the rest of the runtime
@@ -1930,10 +1929,14 @@ impl Runtime {
     /// post-commit echo deadline (CTX-0783).
     #[allow(clippy::explicit_counter_loop)]
     pub fn handle_ime_commit_at(&mut self, text: String, now: std::time::Instant) {
+        // CTX-1267 (#2142b): whether this commit ends a real composition.
+        // A commit with no composition behind it is unsolicited and owns no
+        // key; its trailing space (if any) is deliberate user input.
+        let was_armed = !matches!(self.ime_key_claim, ImeKeyClaim::Free);
         // Bounded before allocation (TXT-11)
         let bytes_len = text.len();
         let char_count = text.chars().count();
-        let bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
+        let mut bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
             let mut out = String::new();
             let mut bytes = 0usize;
             let mut chars = 0usize;
@@ -1950,6 +1953,15 @@ impl Runtime {
         } else {
             text
         };
+        // CTX-1267 (#2142b): fcitx5 Space-commit carries the committing
+        // Space inside the commit text on some builds, so every composed
+        // string arrives with a trailing ASCII space. Trim exactly one
+        // trailing space for real compositions (claim armed); unsolicited
+        // commits preserve verbatim (Terminal Truth: a deliberate trailing
+        // space inside the commit survives).
+        if was_armed && bounded.ends_with(' ') {
+            bounded.pop();
+        }
         // CTX-0783: a commit ends the gesture, and the raw copy of the key
         // that produced it is still in flight — hold the one-shot claim so it
         // cannot re-enter the PTY. Whether the commit carries text decides

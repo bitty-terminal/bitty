@@ -191,6 +191,19 @@ impl PinnedStore {
         self.entries.iter().map(|entry| entry.view.id()).collect()
     }
 
+    /// Discards pinned leaf `id` without restoring it to any tree
+    /// (issue #2141: dead-pin teardown after its child exits).
+    ///
+    /// Returns the removed [`View`] when present, `None` otherwise. The
+    /// tree is never touched.
+    pub fn discard(&mut self, id: ViewId) -> Option<View> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|entry| entry.view.id() == id)?;
+        Some(self.entries.remove(pos).view)
+    }
+
     /// The recorded restore anchor of pinned leaf `id`, if pinned: the
     /// neighboring leaf id at pin time plus which side the leaf returns
     /// to (`None` outer for an unknown id).
@@ -604,6 +617,21 @@ mod tests {
         assert!(view.reflow_to_rect(Rect::new(0, 0, 10, 8)));
         assert_eq!(store.get(ViewId::new(1)).expect("parked").cols(), 10);
         assert!(store.find_mut(ViewId::new(404)).is_none());
+    }
+
+    #[test]
+    fn discard_removes_without_touching_tree_issue_2141() {
+        let mut tree = pair();
+        let mut store = PinnedStore::new();
+        store.pin(&mut tree, ViewId::new(1)).expect("pin");
+        let before = tree.clone();
+        let removed = store.discard(ViewId::new(1)).expect("discard returns view");
+        assert_eq!(removed.id(), ViewId::new(1));
+        assert!(store.is_empty());
+        assert!(!store.contains(ViewId::new(1)));
+        assert_eq!(tree, before, "discard never touches the tree");
+        assert!(store.discard(ViewId::new(1)).is_none());
+        assert!(store.discard(ViewId::new(404)).is_none());
     }
 
     #[test]

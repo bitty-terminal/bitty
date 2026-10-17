@@ -2946,10 +2946,13 @@ impl State {
         let removed = self
             .screens_active_mut()
             .remove_lines_up(top, bottom, n as usize, &erase);
-        // Lines enter scrollback only when scrolling under a region whose
-        // bottom is the screen bottom (invariant 4). Wrap flags travel with
-        // their rows so reflow can unwrap logical lines later.
-        if self.scroll_region_bottom as usize == self.height - 1 {
+        // Lines enter scrollback only when scrolling the main screen under a
+        // region whose bottom is the screen bottom (invariant 4). The
+        // alternate screen owns no scrollback of its own (same policy as
+        // the `ED 2` guard): alt-screen rows scrolled off the bottom are
+        // discarded, never appended to primary history (#2133). Wrap flags
+        // travel with their rows so reflow can unwrap logical lines later.
+        if !self.alt_screen_active() && self.scroll_region_bottom as usize == self.height - 1 {
             for (line, wrapped) in removed {
                 let (id, evicted) = self.scrollback.push_with_wrap(line, wrapped);
                 self.batch_scroll_events.push((id, 1));

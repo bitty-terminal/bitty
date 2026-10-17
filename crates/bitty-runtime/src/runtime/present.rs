@@ -296,6 +296,22 @@ struct RingFrameContext {
     workspace_factor: f32,
     now: std::time::Instant,
     pad_px: i32,
+    /// CTX-1280 (#2168): a detached float is presented this frame, so
+    /// background leaves suppress their Core-owned chrome (clean backdrop).
+    /// Read with the leaf tier inside the push helpers; the float itself
+    /// and higher tiers (Popup/Messages foreground UI) are exempt.
+    detached_float_up: bool,
+}
+
+impl RingFrameContext {
+    /// Whether a leaf on `tier` hides its Core-owned chrome (shadow, glow,
+    /// ring) while a detached float is up (CTX-1280). Only background tiers
+    /// hide: `None` tiled leaves and `Editor` base chrome, both strictly
+    /// below `Float` (`Option` ordering puts `None` first). The float keeps
+    /// its own chrome and higher-tier foreground UI is untouched.
+    fn suppress_backdrop_chrome(&self, tier: Option<OverlayTier>) -> bool {
+        self.detached_float_up && tier < Some(OverlayTier::Float)
+    }
 }
 
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
@@ -1220,7 +1236,10 @@ impl Runtime {
     /// inner content clip for its glyphs (CTX-0311, moved verbatim from the
     /// leaf loop under CTX-0386 so a reused retained leaf still owns a live
     /// ring). `border == 0` paints nothing; the returned clip is `None` for
-    /// square or zero-size frames.
+    /// square or zero-size frames. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) skips the ring push but still
+    /// returns the clip, so it keeps glyph clipping while painting no
+    /// outline.
     fn push_leaf_ring(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1259,7 +1278,7 @@ impl Runtime {
                     .width_idle
                     .map_or(frame.border, |w| self.outline_width_physical(w))
             };
-            if ring_border > 0 {
+            if ring_border > 0 && !ctx.suppress_backdrop_chrome(frame.tier) {
                 let outline_color = if is_focused_view {
                     view_outline.focused
                 } else {
@@ -1334,7 +1353,9 @@ impl Runtime {
             }
             // The content clip is tied to the geometry border (not the
             // outline width) so the content grid and glyph clipping are
-            // unchanged by a focused/idle width override.
+            // unchanged by a focused/idle width override — and by a
+            // CTX-1280 suppression: the ring push above is skipped but the
+            // clip still applies, so suppressed leaves keep glyph clipping.
             frame_clip =
                 bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
         }
@@ -1393,7 +1414,9 @@ impl Runtime {
     /// background blits composite above. Paint-only:
     /// cell metrics, insets, and clip rects are untouched. Returns whether a
     /// shadow was pushed. An unset shadow color pushes nothing, so unstyled
-    /// configs present exactly as before.
+    /// configs present exactly as before. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
+    /// `false`.
     fn push_leaf_shadow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1406,6 +1429,9 @@ impl Runtime {
             return false;
         };
         if frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let color = bitty_render::grid::scale_alpha(
@@ -1454,7 +1480,9 @@ impl Runtime {
     /// envelope, so the default pulse envelope differs from the styled one
     /// exactly by its style contribution. With no style halo and no live
     /// pulse nothing is pushed, so unstyled steady-state configs present
-    /// exactly as before.
+    /// exactly as before. A background-tier leaf under
+    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
+    /// `false`.
     fn push_leaf_glow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1465,6 +1493,9 @@ impl Runtime {
         combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
     ) -> bool {
         if frame.frame.width == 0 || frame.frame.height == 0 {
+            return false;
+        }
+        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let mut motion_factor = 1.0f32;
@@ -1977,9 +2008,9 @@ impl Runtime {
         // CTX-0248 / CTX-0254 / #1550: Kitty alternate-screen tracking across all
         // visible allocations. An alternate-screen transition on any visible origin
         // forces a full present even when the grid generation is unchanged, so
-        // entering alt clears that origin's painted images (and leaving alt repaints
+        // entering alt hides that origin's painted images (and leaving alt repaints
         // the restored grid) instead of idling on a stale frame. Other origins are
-        // untouched (CTX-0254 `clear_origin`).
+        // untouched (CTX-0254 per-origin latch).
         let mut current_alt_screens = std::collections::BTreeSet::new();
         for frame in &allocations {
             let pane_origin: Option<u64> = if self.pane_sessions.contains_key(&frame.view) {
@@ -2004,8 +2035,15 @@ impl Runtime {
         if current_alt_screens != self.kitty_alt_screens_latched {
             // Delete-wins sequencing (CTX-1110 fix pass, CodeRabbit Major):
             // bump once when an origin newly enters the alternate screen so
-            // a transmit pending across the enter cycle drops as stale (sync
-            // order stores, clears, then exits with absent). Never bump on
+            // a transmit pending across the enter cycle drops as stale.
+            // Placements are retained across the alt session (#2132):
+            // terminal truth scopes its alt switch to the alt screen, so
+            // main-screen placements (and the decoded images behind them,
+            // which stay inert under the store caps) survive underneath;
+            // the paint path below skips blits while alt is active, and
+            // every display seam suppresses new placements on alt
+            // (`SuppressedAlternateScreen`), so leaving alt repaints the
+            // retained mains with nothing stale to clear. Never bump on
             // every presented frame: while alt stays active each tick would
             // advance the epoch past an in-flight transmit's stamp and drop
             // every alt-screen local transmit silently.
@@ -2015,19 +2053,6 @@ impl Runtime {
                 .collect();
             for origin in entering {
                 self.bump_kitty_local_delete_epoch(origin);
-                // CTX-1231 review: clear the entering origin's placements
-                // at observation time (pre-gate), mirroring the paint-phase
-                // clear below. An enter+leave inside one coalescing
-                // interval never paints while alt is active, so a
-                // paint-phase-only clear would leave stale placements on
-                // the deadline frame. Idempotent: the paint-phase clear
-                // re-runs the same guard on presented alt frames.
-                if !self.kitty_images.placement_for_origin_is_empty(origin) {
-                    self.kitty_images.clear_origin(origin);
-                    // S6 (#1849): placements are gone, so their cached
-                    // blits are dead budget; drop them (images stay inert).
-                    self.invalidate_kitty_raster_cache();
-                }
             }
             self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
@@ -2173,11 +2198,30 @@ impl Runtime {
             .animation_progress(AnimationKind::Workspace, None, now)
             .map(|p| p.clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        // CTX-1280 (#2168): a detached float owns the backdrop. While one is
+        // presented, the tiled leaves behind it paint no Core-owned chrome
+        // (shadow/glow/ring): the surface already clears to theme background
+        // in the gap bands, so suppressing chrome leaves a clean backdrop
+        // instead of divider/outline bands around the float. HIDE, not dim:
+        // no new primitive, no alpha policy, and tiled text stays live. The
+        // float keeps its own chrome; the gate is detached-only
+        // (`FloatStore`, not the pinned store): pinned overlays share the
+        // Float tier but must not restyle the workspace they annotate.
+        // Empty float frames never trigger, and the tiled baseline (no
+        // detached float) is unchanged. Loop-invariant, so it rides in the
+        // ring context; the push helpers pair it with the leaf tier.
+        let detached_float_up = allocations.iter().any(|frame| {
+            frame.tier == Some(OverlayTier::Float)
+                && frame.frame.width > 0
+                && frame.frame.height > 0
+                && self.floats.contains(frame.view)
+        });
         let ring_ctx = RingFrameContext {
             focused_id: self.focus.focused(),
             workspace_factor,
             now,
             pad_px,
+            detached_float_up,
         };
 
         // CTX-0367: recompute the IME caret for this frame; `paint_cursor`
@@ -2337,6 +2381,45 @@ impl Runtime {
                                 && leaf.fade_factor == fade
                         });
 
+                // CTX-1148 (#1978) + CTX-1271 (#2138): detached floats
+                // must paint opaque. The grid fills cover only the content
+                // rect; the decoration frame (border plus content-inset
+                // band, sub-cell remainder) would otherwise show tiled
+                // content beneath (siblings refill the container after
+                // detach, unlike the keep-slot model). One theme-bg fill
+                // covering the float frame occludes the base beneath the
+                // cell fills. The `DrawList` order paints fills before
+                // rounded fills, so lower leaves' rings/shadows/glows would
+                // still draw over that fill (#2138): a second solid
+                // rounded cover (same frame, `border: 0`) occludes lower
+                // chrome in the rounded pass too, ahead of this float's
+                // own shadow/glow/ring below. Float tier only, so the tiled
+                // baseline is unchanged. Empty frames skip fail-closed.
+                // Bounded: one fill plus one rounded cover per float frame.
+                if frame.tier == Some(OverlayTier::Float)
+                    && frame.frame.width > 0
+                    && frame.frame.height > 0
+                {
+                    let bg = self.renderer.theme_palette().background;
+                    let cover = bitty_render::geometry::RectPx::new(
+                        px_add(pad_px, frame.frame.x),
+                        px_add(pad_px, frame.frame.y),
+                        frame.frame.width,
+                        frame.frame.height,
+                    );
+                    built.fills.push(bitty_render::grid::FillRect {
+                        rect: cover,
+                        color: bg,
+                    });
+                    built.rounded.push(bitty_render::grid::RoundedFill {
+                        frame: cover,
+                        border: 0,
+                        radius: frame.radius,
+                        color: bg,
+                    });
+                    built.needs_draw = true;
+                }
+
                 // CTX-0311 ring (+ CTX-1162 S3 shadow/glow): shared by the
                 // reuse and re-render paths so a retained leaf still paints
                 // its live focus/open chrome. Back-to-front in
@@ -2360,32 +2443,6 @@ impl Runtime {
                     &mut built.rounded,
                 );
                 built.needs_draw |= shadow_painted || glow_painted || ring_painted;
-
-                // CTX-1148 (#1978): detached floats must paint opaque. The
-                // grid fills cover only the content rect; the decoration
-                // frame (border plus content-inset band, sub-cell remainder)
-                // would otherwise show tiled content beneath (siblings refill
-                // the container after detach, unlike the keep-slot model).
-                // One theme-bg fill covering the float frame occludes the base
-                // beneath the cell fills; the chrome ring still paints above.
-                // Float tier only, so the tiled baseline is unchanged. Empty
-                // frames skip fail-closed. Bounded: one fill per float frame.
-                if frame.tier == Some(OverlayTier::Float)
-                    && frame.frame.width > 0
-                    && frame.frame.height > 0
-                {
-                    let bg = self.renderer.theme_palette().background;
-                    built.fills.push(bitty_render::grid::FillRect {
-                        rect: bitty_render::geometry::RectPx::new(
-                            px_add(pad_px, frame.frame.x),
-                            px_add(pad_px, frame.frame.y),
-                            frame.frame.width,
-                            frame.frame.height,
-                        ),
-                        color: bg,
-                    });
-                    built.needs_draw = true;
-                }
 
                 // CTX-0347 (RFC-0001/OQ-042): the resolved per-`View` background
                 // image paints inside the content rect, above cell backgrounds
@@ -4212,22 +4269,15 @@ impl Runtime {
             };
 
             if alt_active {
-                // Delete-wins sequencing (CTX-1110 fix pass): alt entry
-                // clears this origin's placements, so a transmit pending
-                // across the enter cycle must not resurrect afterwards
-                // (sync order stores, clears, then exits with absent). The
-                // delete epoch is bumped once on alt entry in
-                // `collect_tick_basis` (latch diff), never here: bumping on
-                // every presented frame would advance past an in-flight
-                // alt-screen transmit's stamp and drop it silently.
-                // Unconditional clear: a pending transmit may exist while
-                // nothing is placed yet.
-                if !self.kitty_images.placement_for_origin_is_empty(pane_origin) {
-                    self.kitty_images.clear_origin(pane_origin);
-                    // S6 (#1849): placements are gone, so their cached
-                    // blits are dead budget; drop them (images stay inert).
-                    self.invalidate_kitty_raster_cache();
-                }
+                // #2132: while alt is active this origin paints no image
+                // blits (the fullscreen app owns the pixels), but its
+                // placements are retained: terminal truth scopes the alt
+                // switch to the alt screen, so main-screen placements stay
+                // valid underneath and repaint on leave. New placements
+                // cannot appear here: every display seam suppresses on alt
+                // (`SuppressedAlternateScreen`), and in-flight async
+                // transmits carry a pre-entry epoch stamp that the
+                // entry bump in `collect_tick_basis` already invalidated.
                 continue;
             }
 
@@ -5724,13 +5774,14 @@ mod present_coalescing_tests {
     }
 
     #[test]
-    fn alt_enter_leave_across_deferred_ticks_clears_placements() {
-        // CodeRabbit PR #2094 Minor: the alternate-screen entry placement
-        // clear used to live only in the paint phase. With entry observed
-        // on one deferred tick and the leave on the next, no tick ever
-        // paints while alt is active, so the deadline frame would show
-        // stale placements an uncoalesced run had cleared. The clear now
-        // runs at entry observation (pre-gate).
+    fn alt_enter_leave_across_deferred_ticks_retains_placements() {
+        // #2132: main-screen kitty placements survive an alternate-screen
+        // cycle. Terminal truth scopes its alt switch to the alt screen,
+        // so the rich placements stay valid underneath; the paint path
+        // skips blits while alt is active and repaints them on leave.
+        // With entry observed on one deferred tick and the leave on the
+        // next, no tick ever paints while alt is active, so the deadline
+        // frame must show the retained image, not a cleared plane.
         //
         // (Enter+leave inside a single PTY batch is latch-invisible with
         // or without coalescing — pre-existing parity, out of scope here.)
@@ -5748,8 +5799,8 @@ mod present_coalescing_tests {
         );
         assert_eq!(
             rt.kitty_placement_count(),
-            0,
-            "alt entry must clear placements even when the tick defers"
+            1,
+            "alt entry must retain main-screen placements"
         );
         rt.handle_pty_bytes(b"\x1b[?1049l");
         assert!(
@@ -5759,8 +5810,36 @@ mod present_coalescing_tests {
         let stats = rt
             .tick_at(t0 + INTERVAL)
             .expect("deadline tick must present");
-        assert_eq!(stats.images, 0, "deadline frame must paint no stale blit");
-        assert_eq!(rt.kitty_placement_count(), 0);
+        assert_eq!(stats.images, 1, "deadline frame must repaint the image");
+        assert_eq!(rt.kitty_placement_count(), 1);
+    }
+
+    #[test]
+    fn alt_cycle_hides_while_active_and_restores_on_leave() {
+        // #2132 repro shape (`chafa -f kitty` image, then a TUI app runs
+        // and exits): the image paints before, hides while the fullscreen
+        // app owns the pixels, and repaints after — never silently lost.
+        let t0 = Instant::now();
+        let mut rt = runtime();
+        settle(&mut rt, t0);
+        rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, 0, &red_2x2(), 0)
+            .expect("admissible payload must place");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(1))
+            .expect("image tick must present");
+        assert_eq!(stats.images, 1, "main-screen image must paint");
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(2))
+            .expect("alt-entry tick must present");
+        assert_eq!(stats.images, 0, "no blit while alt is active");
+        assert_eq!(rt.kitty_placement_count(), 1, "placements retained");
+        rt.handle_pty_bytes(b"\x1b[?1049l");
+        let stats = rt
+            .tick_at(t0 + Duration::from_millis(3))
+            .expect("alt-leave tick must present");
+        assert_eq!(stats.images, 1, "image must survive the TUI cycle");
+        assert_eq!(rt.kitty_placement_count(), 1);
     }
 
     #[test]

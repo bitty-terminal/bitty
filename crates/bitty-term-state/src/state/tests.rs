@@ -269,6 +269,57 @@ fn scroll_under_screen_bottom_captures_scrollback() {
     assert_eq!(s.scrollback_len(), before);
 }
 
+/// #2133: scrolling the alternate screen must never capture into the main
+/// scrollback. The alternate screen owns no scrollback of its own (same
+/// policy as the `ED 2` guard): rows scrolled off the alt bottom are
+/// discarded, never appended to primary history, so exiting a TUI leaves
+/// no stray blank (or stale UI) lines behind in scrollback.
+#[test]
+fn alt_screen_scroll_never_captures_scrollback() {
+    let mut s = State::new();
+    prints(&mut s, "main-content");
+    for _ in 0..(GRID_ROWS + 3) {
+        s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+    let baseline = s.scrollback_len();
+    assert!(
+        baseline > 0,
+        "main scrolls must capture before the alt cycle"
+    );
+
+    // Enter alt and scroll it hard (btop-shaped full-region indexing).
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    assert!(s.alt_screen_active());
+    for _ in 0..(GRID_ROWS * 2) {
+        prints(&mut s, "alt-ui-row");
+        s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+    assert_eq!(
+        s.scrollback_len(),
+        baseline,
+        "alt-screen indexing must discard, never capture"
+    );
+    // Explicit scroll-up on alt must not capture either.
+    s.apply(&TerminalAction::ScrollUp { n: Count(3) });
+    assert_eq!(
+        s.scrollback_len(),
+        baseline,
+        "alt-screen SU must discard, never capture"
+    );
+
+    // Leave alt: main grid and scrollback intact, no alt rows leaked.
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert!(!s.alt_screen_active());
+    assert_eq!(s.scrollback_len(), baseline);
+    assert!(s.check_invariants().is_ok());
+}
+
 #[test]
 fn scroll_up_emits_copy_motion_not_full_region() {
     // CTX-1207: a region scroll records a copy motion; the full-region

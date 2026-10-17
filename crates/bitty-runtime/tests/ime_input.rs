@@ -499,20 +499,22 @@ fn idle_after_commit_does_not_absorb_the_next_keystroke() {
 }
 
 #[test]
-fn commit_text_is_never_trimmed() {
-    // Terminal Truth: the commit string is user input. Some input methods
-    // deliberately append a space, and that space is not the #1449 defect —
-    // trimming the commit would be a different, equally wrong "fix".
+fn unsolicited_commit_text_is_not_trimmed() {
+    // Terminal Truth, refined by CTX-1267 (#2142b): a trailing space inside
+    // an *unsolicited* commit (no composition, claim Free) is deliberate
+    // user input and survives verbatim. For a *real* composition (claim
+    // armed) fcitx5 Space-commit carries the committing Space inside the
+    // commit text on some builds, so exactly one trailing ASCII space is
+    // trimmed as the committing key, not user input.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
 
-    feed_typing_key(&mut rt, "ni", "n");
-    feed_commit(&mut rt, "\u{4f60} ", None);
+    rt.handle_ime_commit("你 ".to_string());
     rt.tick();
 
     assert_eq!(
         std::str::from_utf8(&rt.drain_pending_input()),
-        Ok("\u{4f60} "),
-        "a trailing space inside the commit survives verbatim"
+        Ok("你 "),
+        "a trailing space inside an unsolicited commit survives verbatim"
     );
 }
 

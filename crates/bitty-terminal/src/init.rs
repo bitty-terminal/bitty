@@ -5,26 +5,6 @@ use std::io::IsTerminal as _;
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
-/// Wizard greeting art: thin alias over the single-owned mascot module
-/// ([`crate::mascot`], issue #1318) so the `bitty init` greeting and the
-/// startup splash can never disagree. The art stays vendored byte-identical
-/// from the workspace asset `recording/bitty-mascot/ascii/bitty_ascii.txt`
-/// (DEC-0002): pure text so it renders anywhere stdout goes, including
-/// piped headless runs; the sixel/block variants stay out of the binary.
-/// (Test-only: the wizard itself goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_ART as INIT_MASCOT_ART;
-/// One-line fallback when the window is too narrow for the art: fail closed
-/// with an honest line instead of a wrapped mess (see [`crate::mascot`]).
-#[cfg(test)]
-pub(crate) use crate::mascot::MASCOT_FALLBACK as INIT_MASCOT_FALLBACK;
-/// Greeting art for a known-or-unknown window width (see [`crate::mascot`]).
-pub(crate) use crate::mascot::mascot_art_for_width as init_greeting_art;
-/// Width of the vendored art in columns (see [`crate::mascot`]).
-/// (Test-only: runtime code goes through [`init_greeting_art`].)
-#[cfg(test)]
-pub(crate) use crate::mascot::mascot_width as init_mascot_width;
-
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
 /// garbage or a stuck key can never spin the wizard forever.
 pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
@@ -1303,6 +1283,479 @@ fn init_option_nav(raw: &[u8], trimmed: &str) -> Option<InitOptionNav> {
     }
 }
 
+/// How long the TTY key loop waits for the rest of an `ESC`-led burst
+/// before treating a lone `ESC` as cancel (Unix TTY only; headless tests
+/// terminate on EOF instead so they never sleep).
+#[cfg(unix)]
+pub(crate) const INIT_KEY_WAIT_MS: u16 = 50;
+
+/// Whether an `ESC`-led byte run is a complete key sequence versus a
+/// truncated prefix that needs more bytes.
+///
+/// Grammar mirror of [`init_parse_escape_at`] (same introducers, same
+/// terminators): CSI is complete once a final byte (`0x40..=0x7e`) arrives
+/// past the introducer, SS3 needs its third byte, OSC/DCS/SOS/PM/APC need
+/// `BEL` or `ESC \`, charset introductions need three bytes, and anything
+/// else (`ESC` plus one printable Alt prefix) is one complete key. Bare
+/// `ESC` is never complete: the caller waits (poll timeout on a TTY, EOF
+/// headlessly) before treating it as cancel.
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_escape_burst_complete(raw: &[u8]) -> bool {
+    if raw.is_empty() || raw[0] != 0x1b {
+        return true;
+    }
+    if raw.len() == 1 {
+        return false;
+    }
+    match raw[1] {
+        b'[' => {
+            // CSI: complete once a final byte arrives past the introducer;
+            // parameters and intermediates alone are truncated.
+            raw[2..].iter().any(|byte| (0x40..=0x7e).contains(byte))
+        }
+        b'O' => raw.len() >= 3,
+        b']' | b'P' | b'X' | b'^' | b'_' => {
+            // Complete on `BEL` or `ESC \` like the escape parser.
+            raw.windows(2).any(|pair| pair == [0x1b, b'\\']) || raw.contains(&0x07)
+        }
+        b'(' | b')' | b'#' | b'%' => raw.len() >= 3,
+        // Alt prefix: `ESC` plus one character is a complete key.
+        _ => true,
+    }
+}
+
+/// Unix TTY cbreak guard for the single-keypress picker loop (#2136).
+///
+/// Disables canonical mode and echo on stdin while keeping `ISIG`, so keys
+/// arrive immediately and `Ctrl-C` still kills exactly like the line loop.
+/// Also takes stdin `O_NONBLOCK` so the loop's buffer peek never blocks:
+/// `StdinLock` buffers ahead of the kernel queue (one `read` can swallow a
+/// whole escape burst), and every readiness check must see buffered bytes
+/// first. Restores modes and flags on drop, including on early returns.
+#[cfg(unix)]
+pub(crate) struct InitRawGuard {
+    original_termios: nix::sys::termios::Termios,
+    original_flags: nix::fcntl::OFlag,
+}
+
+/// Enters cbreak mode on stdin. `None` when stdin has no termios to take
+/// (piped, closed, or setup failed): the caller keeps the line loop. A
+/// half-applied setup restores what it changed before returning `None`.
+#[cfg(unix)]
+pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
+    use std::os::unix::io::AsFd as _;
+    let stdin = std::io::stdin();
+    let fd = stdin.as_fd();
+    let original_termios = nix::sys::termios::tcgetattr(fd).ok()?;
+    let mut single = original_termios.clone();
+    single
+        .local_flags
+        .remove(nix::sys::termios::LocalFlags::ICANON | nix::sys::termios::LocalFlags::ECHO);
+    nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSADRAIN, &single).ok()?;
+    let flags_raw = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).ok()?;
+    let original_flags = nix::fcntl::OFlag::from_bits_truncate(flags_raw);
+    if nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(original_flags | nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .is_err()
+    {
+        let _ = nix::sys::termios::tcsetattr(
+            fd,
+            nix::sys::termios::SetArg::TCSADRAIN,
+            &original_termios,
+        );
+        return None;
+    }
+    Some(InitRawGuard {
+        original_termios,
+        original_flags,
+    })
+}
+
+#[cfg(unix)]
+impl Drop for InitRawGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsFd as _;
+        let stdin = std::io::stdin();
+        let fd = stdin.as_fd();
+        let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(self.original_flags));
+        let _ = nix::sys::termios::tcsetattr(
+            fd,
+            nix::sys::termios::SetArg::TCSADRAIN,
+            &self.original_termios,
+        );
+    }
+}
+
+/// Whether stdin has a key waiting, blocking at most `timeout` (Unix only).
+///
+/// Buffered bytes count before the kernel queue: `StdinLock` reads ahead,
+/// so a readiness poll alone misses a swallowed escape burst. With the
+/// guard's `O_NONBLOCK` the buffer peek never blocks.
+#[cfg(unix)]
+pub(crate) fn init_stdin_poll_ready(
+    input: &mut dyn std::io::BufRead,
+    timeout: nix::poll::PollTimeout,
+) -> bool {
+    if matches!(input.fill_buf(), Ok(buf) if !buf.is_empty()) {
+        return true;
+    }
+    use std::os::unix::io::AsFd as _;
+    let stdin = std::io::stdin();
+    let mut fds = [nix::poll::PollFd::new(
+        stdin.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    matches!(nix::poll::poll(&mut fds, timeout), Ok(count) if count > 0)
+}
+
+/// Reads one stdin byte for the key loop, waiting as long as needed.
+/// `None` on EOF or fatal I/O error.
+///
+/// Unix TTY stdin is `O_NONBLOCK` under the raw guard, so an empty moment
+/// surfaces as `WouldBlock`: park in `poll` instead of spinning or (worse)
+/// mistaking a thinking user for EOF.
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
+    let mut byte = [0u8; 1];
+    loop {
+        match input.read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => return Some(byte[0]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(unix)]
+                if !init_stdin_poll_ready(input, nix::poll::PollTimeout::NONE) {
+                    return None;
+                }
+                #[cfg(not(unix))]
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Renders one key-loop picker frame: `prompt`, every entry with the cursor
+/// marker, the navigation hint, and the typed line. The typed line is always
+/// present (even empty) so in-place repaints keep a constant frame height.
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_picker_block(
+    prompt: &str,
+    options: &[InitOptionItem],
+    cursor: usize,
+    color: bool,
+    numbered: bool,
+    typed: &str,
+    notice: Option<&str>,
+) -> Vec<String> {
+    let mut block = Vec::with_capacity(options.len() + 4);
+    block.push(prompt.to_string());
+    for (index, item) in options.iter().enumerate() {
+        let selected = index == cursor;
+        let marker = if selected {
+            if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
+        } else {
+            " "
+        };
+        let label = init_style_label(item, selected, color);
+        if numbered {
+            block.push(format!("{marker} {}) {label}", index + 1));
+        } else {
+            block.push(format!("{marker} {label}"));
+        }
+    }
+    if numbered {
+        block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
+    } else {
+        block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+    }
+    if let Some(message) = notice {
+        block.push(message.to_string());
+    }
+    block.push(format!("  (typed: {typed})"));
+    block
+}
+
+/// Runs one key-loop submit: the typed buffer wins, else the cursor entry;
+/// numbered lists resolve a typed `1..=N` to its entry exactly like the line
+/// loop. Returns `Some` on success or abort (the loop returns it) and `None`
+/// on a repromptable failure (buffer cleared, notice set, loop continues).
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn init_picker_submit<T>(
+    output: &mut dyn std::io::Write,
+    options: &[InitOptionItem],
+    cursor: usize,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    typed: &mut String,
+    failures: &mut usize,
+    notice: &mut Option<String>,
+) -> Option<Result<T, String>> {
+    let candidate: String = if typed.is_empty() {
+        options[cursor].value_text.clone()
+    } else if numbered {
+        match typed.parse::<usize>() {
+            Ok(number) if number >= 1 && number <= options.len() => {
+                options[number - 1].value_text.clone()
+            }
+            _ => typed.clone(),
+        }
+    } else {
+        typed.clone()
+    };
+    match parse(&candidate) {
+        Ok(value) => {
+            if !typed.is_empty() {
+                history.push(std::mem::take(typed));
+            }
+            Some(Ok(value))
+        }
+        Err(err) => {
+            *failures += 1;
+            typed.clear();
+            if *failures >= INIT_MAX_ATTEMPTS {
+                Some(Err(format!(
+                    "bitty init: aborted (too many invalid answers, limit {INIT_MAX_ATTEMPTS})"
+                )))
+            } else {
+                *notice = Some(format!(
+                    "  ({err} — try again [{failures}/{INIT_MAX_ATTEMPTS}])"
+                ));
+                let _ = output.flush();
+                None
+            }
+        }
+    }
+}
+
+/// Asks one wizard step with single-keypress navigation (TTY picker behind
+/// [`init_ask_option`], #2136).
+///
+/// Renders the same prompt, entries, marker, and hint as the line loop plus
+/// a `(typed: …)` line, then reads keys immediately (the caller holds the
+/// cbreak guard; no Enter needed to move):
+/// - `j`/`Down` and `k`/`Up` move the cursor (wrapping); arrows carry any
+///   modifiers and application-cursor variants via [`init_parse_escape_at`].
+/// - `Enter` submits: the typed buffer when non-empty (numbered fast path
+///   and value parsing behave exactly like the line loop), else the cursor
+///   entry.
+/// - Printable input accumulates into the typed buffer (`Backspace` erases);
+///   lowercase `j`/`k` navigate only from an empty buffer so values starting
+///   with other letters type naturally, and uppercase `J`/`K` are always
+///   text (the hint advertises lowercase) so names like `JetBrains` stay
+///   enterable. A pasted burst decodes through [`init_decode_line_bytes`]
+///   like a line-loop line.
+/// - `Esc` cancels, `Ctrl-D`/EOF aborts, other controls are ignored.
+/// - Navigation never consumes an attempt; [`INIT_MAX_ATTEMPTS`]
+///   repromptable failures abort like the line loop.
+///
+/// `inplace` repaints the frame in place (cursor-up plus clear-line, cursor
+/// hidden while looping) for live TTYs; otherwise every frame appends so
+/// piped output stays a plain transcript. `wait_for_more` decides whether an
+/// `ESC`-led prefix has more bytes coming (poll timeout on a TTY,
+/// EOF-terminated headlessly).
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_picker_key_loop<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<T, String> {
+    assert!(!options.is_empty(), "option list must not be empty");
+    let mut cursor = default_index.min(options.len() - 1);
+    let mut typed = String::new();
+    let mut notice: Option<String> = None;
+    let mut failures: usize = 0;
+    if inplace {
+        let _ = write!(output, "\x1b[?25l");
+    }
+    let mut rendered: usize = 0;
+    let result = loop {
+        let block = init_picker_block(
+            prompt,
+            options,
+            cursor,
+            color,
+            numbered,
+            &typed,
+            notice.as_deref(),
+        );
+        if inplace && rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A");
+        }
+        for line in &block {
+            if inplace {
+                let _ = write!(output, "\r\x1b[K{line}\n");
+            } else {
+                let _ = writeln!(output, "{line}");
+            }
+        }
+        let _ = output.flush();
+        rendered = block.len();
+        // One key: a lone byte, or an `ESC`-led burst.
+        let Some(first) = init_key_read_byte(&mut *input) else {
+            break Err("bitty init: aborted (end of input)".to_string());
+        };
+        if first == 0x1b {
+            let mut key = vec![0x1b];
+            loop {
+                if init_escape_burst_complete(&key) {
+                    break;
+                }
+                if key.len() >= 64 {
+                    break;
+                }
+                if !wait_for_more(&mut *input) {
+                    break;
+                }
+                match init_key_read_byte(&mut *input) {
+                    Some(next) => key.push(next),
+                    None => break,
+                }
+            }
+            if key == [0x1b] {
+                break Err("bitty init: aborted (cancelled)".to_string());
+            }
+            let (action, consumed) = init_parse_escape_at(&key, 0);
+            if consumed == key.len() {
+                match action {
+                    InitEscapeAction::Up => {
+                        cursor = (cursor + options.len() - 1) % options.len();
+                        notice = None;
+                        continue;
+                    }
+                    InitEscapeAction::Down => {
+                        cursor = (cursor + 1) % options.len();
+                        notice = None;
+                        continue;
+                    }
+                    InitEscapeAction::Submit => {
+                        if let Some(done) = init_picker_submit(
+                            output,
+                            options,
+                            cursor,
+                            numbered,
+                            &parse,
+                            history,
+                            &mut typed,
+                            &mut failures,
+                            &mut notice,
+                        ) {
+                            break done;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let decoded = init_decode_line_bytes(&key, &[]);
+                        if decoded.is_empty() {
+                            continue;
+                        }
+                        typed.push_str(&decoded);
+                        notice = None;
+                        continue;
+                    }
+                }
+            }
+            let decoded = init_decode_line_bytes(&key, &[]);
+            if !decoded.is_empty() {
+                typed.push_str(&decoded);
+                notice = None;
+            }
+            continue;
+        }
+        match first {
+            b'\r' | b'\n' => {
+                if let Some(done) = init_picker_submit(
+                    output,
+                    options,
+                    cursor,
+                    numbered,
+                    &parse,
+                    history,
+                    &mut typed,
+                    &mut failures,
+                    &mut notice,
+                ) {
+                    break done;
+                }
+            }
+            0x04 => break Err("bitty init: aborted (end of input)".to_string()),
+            0x7f | 0x08 => {
+                if typed.pop().is_some() {
+                    notice = None;
+                }
+            }
+            b'j' if typed.is_empty() => {
+                cursor = (cursor + 1) % options.len();
+                notice = None;
+            }
+            b'k' if typed.is_empty() => {
+                cursor = (cursor + options.len() - 1) % options.len();
+                notice = None;
+            }
+            byte if byte < 0x20 => {
+                // Remaining C0 controls carry no input: ignore.
+            }
+            byte => {
+                // One printable byte or one UTF-8 character (continuations
+                // arrive with their lead; a waiting read stays exact).
+                let mut seq = vec![byte];
+                if byte >= 0xc0 {
+                    let width = if byte >= 0xf0 {
+                        4
+                    } else if byte >= 0xe0 {
+                        3
+                    } else {
+                        2
+                    };
+                    for _ in 1..width {
+                        match init_key_read_byte(&mut *input) {
+                            Some(next) => seq.push(next),
+                            None => break,
+                        }
+                    }
+                }
+                let decoded = init_decode_line_bytes(&seq, &[]);
+                if !decoded.is_empty() {
+                    typed.push_str(&decoded);
+                    notice = None;
+                }
+            }
+        }
+    };
+    if inplace {
+        let _ = write!(output, "\x1b[?25h");
+        let _ = output.flush();
+    }
+    result
+}
+
 /// Asks one wizard step from a visible option list (phase 1 of #1806).
 ///
 /// Renders `prompt` plus every entry with a visible cursor line and
@@ -1326,6 +1779,11 @@ fn init_option_nav(raw: &[u8], trimmed: &str) -> Option<InitOptionNav> {
 /// Line decoding, history recall for non-navigation input, and the
 /// display-vs-submitted redraw ([`init_line_needs_redraw`]) behave as in
 /// [`init_ask`]: `history` is appended on successful parses only.
+///
+/// `tty_interactive` selects single-keypress navigation (#2136): when true
+/// and stdin is a Unix TTY, the step runs [`init_picker_key_loop`] under a
+/// cbreak guard (no Enter needed to move); piped runs, failed raw setup,
+/// and non-Unix setups keep the line loop byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init_ask_option<T>(
     input: &mut dyn std::io::BufRead,
@@ -1337,8 +1795,33 @@ pub(crate) fn init_ask_option<T>(
     numbered: bool,
     parse: impl Fn(&str) -> Result<T, String>,
     history: &mut Vec<String>,
+    tty_interactive: bool,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
+    // Single-keypress navigation when both ends are live TTYs (Unix raw
+    // mode); every other setup keeps the line loop byte-identical.
+    #[cfg(unix)]
+    if tty_interactive {
+        if let Some(_raw) = init_raw_guard() {
+            return init_picker_key_loop(
+                input,
+                output,
+                prompt,
+                options,
+                default_index,
+                color,
+                numbered,
+                parse,
+                history,
+                // `tty_interactive` implies stdout is a TTY (see the dispatch
+                // in `run_init_subcommand_with_io`), so repaint in place.
+                true,
+                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into()),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tty_interactive;
     let mut cursor = default_index.min(options.len() - 1);
     let mut failures: usize = 0;
     loop {
@@ -1807,10 +2290,10 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     let _ = writeln!(output, "{}", init_style_label(&item, false, color));
 }
 
-/// Runs the interactive wizard: mascot greeting, then shell / theme / font
+/// Runs the interactive wizard: shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
-/// `input`, `output`, `shell_env`, `columns`, `shell_exists`,
+/// `input`, `output`, `shell_env`, `shell_exists`,
 /// `overrides`, and `color`, so the whole flow is headless-testable with
 /// piped stdin.
 ///
@@ -1836,12 +2319,12 @@ pub(crate) fn run_init_interactive_with_preview(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
     preview: Option<&mut InitPreview>,
     live: Option<&mut bitty_runtime::Runtime>,
+    tty_interactive: bool,
 ) -> Result<InitAnswers, String> {
     // Rollback guard: any abort below restores the exact previous config
     // before the error propagates, so Esc/cancel/EOF can never leave a
@@ -1861,12 +2344,12 @@ pub(crate) fn run_init_interactive_with_preview(
         input,
         output,
         shell_env,
-        columns,
         shell_exists,
         overrides,
         color,
         inner_preview,
         inner_live,
+        tty_interactive,
     );
     if result.is_err() {
         if let Some(active) = preview.as_mut() {
@@ -1884,25 +2367,26 @@ pub(crate) fn run_init_interactive_with_preview(
 /// Retained for the no-preview contract; the TTY dispatch now previews
 /// through [`run_init_interactive_with_preview`].
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_init_interactive(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
+    tty_interactive: bool,
 ) -> Result<InitAnswers, String> {
     run_init_interactive_with_preview(
         input,
         output,
         shell_env,
-        columns,
         shell_exists,
         overrides,
         color,
         None,
         None,
+        tty_interactive,
     )
 }
 
@@ -1916,14 +2400,13 @@ fn run_init_interactive_impl(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
-    columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
     overrides: &InitOverrides,
     color: bool,
     mut preview: Option<&mut InitPreview>,
     mut live: Option<&mut bitty_runtime::Runtime>,
+    tty_interactive: bool,
 ) -> Result<InitAnswers, String> {
-    let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
         output,
         "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
@@ -1969,6 +2452,7 @@ fn run_init_interactive_impl(
         true,
         |line| init_parse_shell_answer(line, &candidates),
         &mut history,
+        tty_interactive,
     )?;
     if let Some(active) = preview.as_mut() {
         active.apply_shell(shell.as_deref());
@@ -2028,6 +2512,7 @@ fn run_init_interactive_impl(
                 false,
                 init_parse_theme_answer,
                 &mut history,
+                tty_interactive,
             )
             .inspect(|theme| {
                 if let Some(active) = preview.as_mut() {
@@ -2084,6 +2569,7 @@ fn run_init_interactive_impl(
                 false,
                 init_parse_font_family_answer,
                 &mut history,
+                tty_interactive,
             )
             .inspect(|family| {
                 if let Some(active) = preview.as_mut() {
@@ -2145,6 +2631,7 @@ fn run_init_interactive_impl(
                 false,
                 init_parse_font_size_answer,
                 &mut history,
+                tty_interactive,
             )
             .inspect(|size| {
                 if let Some(active) = preview.as_mut() {
@@ -2213,6 +2700,7 @@ fn run_init_interactive_impl(
                     )
                 },
                 &mut history,
+                tty_interactive,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -2277,6 +2765,7 @@ fn run_init_interactive_impl(
                     )
                 },
                 &mut history,
+                tty_interactive,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -2340,6 +2829,7 @@ fn run_init_interactive_impl(
                     )
                 },
                 &mut history,
+                tty_interactive,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -2404,6 +2894,7 @@ fn run_init_interactive_impl(
                     )
                 },
                 &mut history,
+                tty_interactive,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -2454,6 +2945,7 @@ fn run_init_interactive_impl(
                 false,
                 init_parse_scrollback_answer,
                 &mut history,
+                tty_interactive,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -2508,6 +3000,7 @@ fn run_init_interactive_impl(
                 true,
                 init_parse_close_confirm_answer,
                 &mut history,
+                tty_interactive,
             )
             .inspect(|mode| {
                 if let Some(active) = preview.as_mut() {
@@ -2549,6 +3042,7 @@ fn run_init_interactive_impl(
         true,
         init_parse_preset_answer,
         &mut history,
+        tty_interactive,
     )?;
     if let Some(active) = preview.as_mut() {
         active.apply_key_preset(key_preset);
@@ -2679,7 +3173,7 @@ pub(crate) fn write_init_config(
 pub(crate) fn init_usage() -> String {
     "usage: bitty init [--yes] [--force] [VALUE FLAGS] [--config PATH]\n\
      \n\
-     Opt-in setup wizard (never auto-runs): mascot greeting, then shell /\n\
+     Opt-in setup wizard (never auto-runs): shell /\n\
      theme / font family+size / decoration (gaps_in, gaps_out, border,\n\
      radius) / scrollback / close_confirm / keybinding-preset picks, then\n\
      writes the config file with shipped keys only (no secrets, no network).\n\
@@ -2732,8 +3226,6 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) xdg_config_home: Option<&'a str>,
     /// Stands in for `HOME` (XDG fallback root).
     pub(crate) home: Option<&'a str>,
-    /// Stands in for `COLUMNS` (greeting width).
-    pub(crate) columns: Option<u16>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,
 }
@@ -2751,7 +3243,7 @@ pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
 }
 
 /// [`run_init_subcommand`] with injected `BITTY_CONFIG`/`SHELL` values; the
-/// remaining environment (XDG root, `BITTY_PROFILE`, COLUMNS, TTY-ness) is
+/// remaining environment (XDG root, `BITTY_PROFILE`, TTY-ness) is
 /// read live. Tests use [`run_init_subcommand_with_io`] for full hermeticity.
 pub(crate) fn run_init_subcommand_with_env(
     args: &Args,
@@ -2761,14 +3253,12 @@ pub(crate) fn run_init_subcommand_with_env(
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
     let profile = std::env::var("BITTY_PROFILE").ok();
-    let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
     let env = InitEnv {
         bitty_config: bitty_config_env,
         bitty_profile: profile.as_deref(),
         shell: shell_env,
         xdg_config_home: xdg.as_deref(),
         home: home.as_deref(),
-        columns,
         stdin_is_tty: std::io::stdin().is_terminal(),
     };
     let stdin = std::io::stdin();
@@ -3021,12 +3511,15 @@ pub(crate) fn run_init_subcommand_with_io(
             input,
             output,
             env.shell,
-            env.columns,
             &|path| std::path::Path::new(path).exists(),
             &overrides,
             color,
             Some(&mut preview),
             live_runtime.as_mut(),
+            // Single-keypress picker navigation needs both ends live: a TTY
+            // stdin for immediate keys plus a TTY stdout for in-place
+            // repaints (#2136). Anything else keeps the line loop.
+            env.stdin_is_tty && std::io::stdout().is_terminal(),
         ) {
             Ok(answers) => answers,
             Err(message) => {

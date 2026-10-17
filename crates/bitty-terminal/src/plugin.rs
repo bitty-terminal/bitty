@@ -47,6 +47,12 @@
 //!   with source, state (`enabled`/`disabled`/`available`), pin status, and
 //!   granted/requested capability counts. `info` shows one plugin's manifest
 //!   plus the recorded grants and their plain-language effect statements.
+//! - `install` and `enable` success prints post-install next steps (CTX-1268,
+//!   issue #2144): the enable command, where the plugin landed, the
+//!   per-plugin config file path with a minimal snippet derived from the
+//!   manifest's declared `[settings]` defaults, manifest-provided `[hints]`
+//!   lines when declared, and the `info` pointer. Display-only: no grants,
+//!   no state, no plugin code runs.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
 //!   code is ever loaded or executed**; safe-mode clean).
 //!
@@ -100,10 +106,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use bitty_config::plugin_file::{PLUGIN_FILE_EXTENSION, PLUGINS_DIR_NAME};
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
 use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
-use bitty_plugin_host::manifest::{PluginId, PluginManifest};
+use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl};
 use bitty_runtime::plugin_runtime::{
     load_index, manifest_toml,
     package::{self, LocalInstallOptions, PackageOpError},
@@ -590,6 +597,22 @@ pub fn plugin_help_text() -> String {
      \x20 archives (source class `local-path`), are stored under\n\
      \x20 packages/<id>/<version>/ with an owner-only mode, and load as\n\
      \x20 visibly unverified third-party packages.\n\
+     \n\
+     wiring (where things land, what to edit next):\n\
+     \x20 The managed manifest lives beside the config file:\n\
+     \x20 $XDG_CONFIG_HOME/bitty/bitty-plugins.toml (fallback\n\
+     \x20 ~/.config/bitty/...; an explicit --config path selects its own\n\
+     \x20 directory). Never hand-edit it: it is the grant ledger, and a\n\
+     \x20 malformed file fails closed.\n\
+     \x20 Per-plugin user files live next to it, one TOML file per plugin:\n\
+     \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.toml (flat\n\
+     \x20 `key = value` lines only; unknown keys are ignored, bad values\n\
+     \x20 fall back to the plugin's shipped defaults). Installed packages\n\
+     \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
+     \x20 (fallback ~/.local/share/...).\n\
+     \x20 After `install`, the plugin is enabled; the copy-paste loop is:\n\
+     \x20 bitty plugin enable <id>   # (re-)enable after a disable\n\
+     \x20 bitty plugin info <id>     # manifest, grants, and settings\n\
      \n\
      fetch:\n\
      \x20 Git and archive installs stage under an exclusive temp dir and run\n\
@@ -1982,6 +2005,10 @@ pub fn run_plugin_subcommand(
     };
     // Resolved once from injected environment values (never process env here).
     let store_root = crate::plugin_runtime::store_root_for(context.xdg_data_home, context.home);
+    // Config dir for next-steps display (CTX-1268): the parent of the
+    // managed manifest, so an explicit `--config`/`BITTY_CONFIG` selects
+    // its own `plugins/` directory for the copy-paste path.
+    let config_dir: Option<PathBuf> = path.parent().map(Path::to_path_buf);
 
     match request.verb {
         PluginVerb::List => match rows_from_state(&state, store_root.as_deref()) {
@@ -2022,10 +2049,33 @@ pub fn run_plugin_subcommand(
         PluginVerb::Install => {
             let operand = request.id.as_deref().expect("install requires an operand");
             if is_source_operand(operand) {
-                return install_source(&request, operand, store_root.as_deref(), input, output);
+                return install_source(
+                    &request,
+                    operand,
+                    store_root.as_deref(),
+                    config_dir.as_deref(),
+                    input,
+                    output,
+                );
             }
             match op_install(&mut state, operand, request.yes, input, output) {
-                Ok(result) => finish_mutation(&path, state, result, output),
+                Ok(result) => {
+                    let code = finish_mutation(&path, state, result, output);
+                    if code == EXIT_OK {
+                        // Bundled success: the manifest is in the catalog
+                        // (op_install just used it), so a lookup miss falls
+                        // back to generic next steps, never to an error.
+                        let manifest = bundled_manifest(operand).ok();
+                        write_next_steps(
+                            output,
+                            operand,
+                            manifest.as_ref(),
+                            config_dir.as_deref(),
+                            None,
+                        );
+                    }
+                    code
+                }
                 Err(failure) => {
                     eprintln!("{}", failure.message);
                     failure.exit
@@ -2036,14 +2086,27 @@ pub fn run_plugin_subcommand(
             let id = request.id.as_deref().expect("enable requires an id");
             if is_managed_operand(&state, id) {
                 match op_enable(&mut state, id) {
-                    Ok(result) => finish_mutation(&path, state, result, output),
+                    Ok(result) => {
+                        let code = finish_mutation(&path, state, result, output);
+                        if code == EXIT_OK {
+                            let manifest = bundled_manifest(id).ok();
+                            write_next_steps(
+                                output,
+                                id,
+                                manifest.as_ref(),
+                                config_dir.as_deref(),
+                                None,
+                            );
+                        }
+                        code
+                    }
                     Err(failure) => {
                         eprintln!("{}", failure.message);
                         failure.exit
                     }
                 }
             } else {
-                set_store_enabled(&store_root, id, true, output)
+                set_store_enabled(&store_root, id, true, config_dir.as_deref(), output)
             }
         }
         PluginVerb::Disable => {
@@ -2057,7 +2120,7 @@ pub fn run_plugin_subcommand(
                     }
                 }
             } else {
-                set_store_enabled(&store_root, id, false, output)
+                set_store_enabled(&store_root, id, false, config_dir.as_deref(), output)
             }
         }
         PluginVerb::Remove => {
@@ -3101,6 +3164,7 @@ fn install_source(
     request: &PluginRequest,
     source: &str,
     store_root: Option<&Path>,
+    config_dir: Option<&Path>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
@@ -3110,7 +3174,7 @@ fn install_source(
     };
     // Git spellings (allowlist) clone first, then share the local pipeline.
     if let Some(url) = normalize_git_source(source) {
-        return install_git_source(request, source, &url, store_root, input, output);
+        return install_git_source(request, source, &url, store_root, config_dir, input, output);
     }
     // A URL-looking operand that is not an allowed git spelling fails closed
     // with a naming diagnostic (http downgrade, file escape, ssh without
@@ -3119,13 +3183,16 @@ fn install_source(
         return reject_fetch_scheme(source);
     }
     if let Some(kind) = classify_archive_kind(source) {
-        return install_archive_source(request, source, kind, store_root, input, output);
+        return install_archive_source(
+            request, source, kind, store_root, config_dir, input, output,
+        );
     }
     install_local_path(
         request,
         source,
         Path::new(source),
         store_root,
+        config_dir,
         input,
         output,
     )
@@ -3193,6 +3260,7 @@ fn install_git_source(
     display: &str,
     url: &str,
     store_root: &Path,
+    config_dir: Option<&Path>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
@@ -3208,7 +3276,9 @@ fn install_git_source(
         eprintln!("{message}");
         return EXIT_GENERIC;
     }
-    install_local_path(request, display, &checkout, store_root, input, output)
+    install_local_path(
+        request, display, &checkout, store_root, config_dir, input, output,
+    )
 }
 
 /// Install from a local archive file: unpack into exclusive temp staging,
@@ -3218,6 +3288,7 @@ fn install_archive_source(
     display: &str,
     kind: ArchiveKind,
     store_root: &Path,
+    config_dir: Option<&Path>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
@@ -3298,7 +3369,9 @@ fn install_archive_source(
         return EXIT_GENERIC;
     }
     let root = find_plugin_root(&extract_dir);
-    install_local_path(request, display, &root, store_root, input, output)
+    install_local_path(
+        request, display, &root, store_root, config_dir, input, output,
+    )
 }
 
 /// Shared local-path pipeline tail: consent bound to the staged snapshot,
@@ -3310,6 +3383,7 @@ fn install_local_path(
     display: &str,
     source: &Path,
     store_root: &Path,
+    config_dir: Option<&Path>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
@@ -3334,6 +3408,19 @@ fn install_local_path(
     match outcome {
         Ok(Some(report)) => {
             report_install(&report, output);
+            // Post-install next steps (CTX-1268): the installer verified
+            // `source/bitty-plugin.toml`, so re-read that body best-effort
+            // for settings/hints; a concurrent replace falls back to
+            // generic next steps, never to an error.
+            let installed_under = store_root.join(&report.root);
+            let manifest = read_source_manifest_for_next_steps(source);
+            write_next_steps(
+                output,
+                &report.plugin_id,
+                manifest.as_ref(),
+                config_dir,
+                Some(&installed_under),
+            );
             EXIT_OK
         }
         Ok(None) => {
@@ -3383,11 +3470,188 @@ fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Wri
     }
 }
 
+// ---------------------------------------------------------------------------
+// Post-install next steps (CTX-1268, bitty#2144)
+// ---------------------------------------------------------------------------
+
+/// How many declared `[settings]` defaults the next-steps snippet shows
+/// before truncating with a count line (keeps install output bounded).
+const NEXT_STEPS_SNIPPET_SETTINGS: usize = 3;
+
+/// Escape one string for a TOML basic string in next-steps snippets.
+///
+/// Manifest string defaults are bounded but attacker-controlled; raw control
+/// characters (including an ESC the settings grammar tolerates inside a
+/// default) must never reach the terminal unescaped. Emits valid TOML basic
+/// strings: `\\`, `\"`, `\n`, `\r`, `\t`, and `\uXXXX` for other C0/C1
+/// controls and DEL; every other character passes through unchanged.
+fn escape_toml_basic(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render one declared setting as a minimal TOML config line
+/// (`key = default`) for the next-steps snippet.
+fn setting_snippet_line(decl: &SettingDecl) -> String {
+    use bitty_plugin_host::manifest::SettingDefault;
+    let rendered = match &decl.default {
+        SettingDefault::Bool(value) => value.to_string(),
+        SettingDefault::Int(value) => value.to_string(),
+        SettingDefault::String(value) => format!("\"{}\"", escape_toml_basic(value)),
+        SettingDefault::Strings(items) => {
+            let quoted: Vec<String> = items
+                .iter()
+                .map(|item| format!("\"{}\"", escape_toml_basic(item)))
+                .collect();
+            format!("[{}]", quoted.join(", "))
+        }
+    };
+    format!("{} = {rendered}", decl.key)
+}
+
+/// Render post-install next steps for one plugin (CTX-1268, bitty#2144).
+///
+/// Data-driven and display-only: the enable command, the per-plugin config
+/// file path, a minimal snippet derived from the manifest's declared
+/// `[settings]` defaults, and the `bitty plugin info <id>` pointer always
+/// render; manifest-provided `[hints] next_steps` lines append when the
+/// manifest declares them, otherwise the output stays clean generic.
+/// `installed_under` names the store package root for external installs
+/// (`None` for bundled plugins, which ship with bitty). Nothing here grants
+/// authority, writes state, or runs plugin code.
+fn format_next_steps(
+    id: &str,
+    settings: &[SettingDecl],
+    next_steps: &[String],
+    config_file: Option<&Path>,
+    installed_under: Option<&Path>,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Next steps for '{id}':");
+    let _ = writeln!(out, "  enable: bitty plugin enable {id}");
+    match installed_under {
+        Some(root) => {
+            let _ = writeln!(out, "  installed: {}", root.display());
+        }
+        None => {
+            let _ = writeln!(out, "  installed: bundled with bitty (no package tree)");
+        }
+    }
+    match config_file {
+        Some(path) => {
+            let _ = writeln!(out, "  configure: {}", path.display());
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  configure: <config-dir>/bitty/plugins/{id}.toml (no config root resolved)"
+            );
+        }
+    }
+    let shown: Vec<String> = settings
+        .iter()
+        .take(NEXT_STEPS_SNIPPET_SETTINGS)
+        .map(setting_snippet_line)
+        .collect();
+    if shown.is_empty() {
+        out.push_str("    # (no settings declared; nothing to configure)\n");
+    } else {
+        out.push_str("    # minimal example (create the file if absent):\n");
+        for line in &shown {
+            let _ = writeln!(out, "    {line}");
+        }
+        let rest = settings.len() - shown.len();
+        if rest > 0 {
+            let _ = writeln!(
+                out,
+                "    # (... {rest} more setting{} declared)",
+                if rest == 1 { "" } else { "s" }
+            );
+        }
+        out.push_str("    # (undeclared keys are ignored)\n");
+    }
+    if !next_steps.is_empty() {
+        out.push_str("  hints:\n");
+        for hint in next_steps {
+            let _ = writeln!(out, "    - {hint}");
+        }
+    }
+    let _ = writeln!(out, "  more: bitty plugin info {id}");
+    out
+}
+
+/// Display path of one plugin's user config file
+/// (`<config-dir>/plugins/<owner>.<name>.toml`, CTX-1195).
+///
+/// The id is already validated (`PluginId` grammar: one dot, no separators),
+/// so the join cannot escape the `plugins/` directory; it is display-only
+/// (no I/O happens here).
+fn plugin_config_file_display(config_dir: Option<&Path>, id: &str) -> Option<PathBuf> {
+    config_dir.map(|dir| {
+        dir.join(PLUGINS_DIR_NAME)
+            .join(format!("{id}.{PLUGIN_FILE_EXTENSION}"))
+    })
+}
+
+/// Best-effort manifest read for next-steps rendering (store installs).
+///
+/// The installer already verified this body; a read/parse failure here (a
+/// concurrent replace between commit and render) falls back to generic
+/// next steps without settings or hints, never to an error.
+fn read_source_manifest_for_next_steps(source: &Path) -> Option<PluginManifest> {
+    let bytes = std::fs::read(source.join(package::MANIFEST_FILE_NAME)).ok()?;
+    manifest_toml::parse_manifest(&bytes).ok()
+}
+
+/// Write next steps for one successful install/enable (display-only).
+///
+/// `manifest` carries the verified manifest when at hand (bundled catalog or
+/// the just-installed source body); `None` renders the clean generic shape
+/// (no snippet, no hints) without failing the command.
+fn write_next_steps(
+    output: &mut dyn std::io::Write,
+    id: &str,
+    manifest: Option<&PluginManifest>,
+    config_dir: Option<&Path>,
+    installed_under: Option<&Path>,
+) {
+    let config_file = plugin_config_file_display(config_dir, id);
+    let (settings, next_steps): (&[SettingDecl], &[String]) = match manifest {
+        Some(manifest) => (&manifest.settings, &manifest.next_steps),
+        None => (&[], &[]),
+    };
+    let _ = writeln!(
+        output,
+        "{}",
+        format_next_steps(
+            id,
+            settings,
+            next_steps,
+            config_file.as_deref(),
+            installed_under
+        )
+    );
+}
+
 /// Toggle one installed store record.
 fn set_store_enabled(
     store_root: &Option<PathBuf>,
     id: &str,
     enabled: bool,
+    config_dir: Option<&Path>,
     output: &mut dyn std::io::Write,
 ) -> i32 {
     let Some(store_root) = store_root else {
@@ -3406,6 +3670,30 @@ fn set_store_enabled(
                     format!("already {state}")
                 }
             );
+            if enabled {
+                // Best-effort store manifest for next steps (a missing index
+                // entry or an unreadable body falls back to generic next
+                // steps, never to an error).
+                let record = load_index(store_root)
+                    .ok()
+                    .and_then(|records| records.into_iter().find(|record| record.plugin_id == id));
+                let (manifest, installed_under) = match record.as_ref() {
+                    Some(record) => (
+                        read_store_manifest(store_root, record),
+                        bitty_runtime::plugin_runtime::resolution::store_package_root(
+                            store_root, record,
+                        ),
+                    ),
+                    None => (None, None),
+                };
+                write_next_steps(
+                    output,
+                    id,
+                    manifest.as_ref(),
+                    config_dir,
+                    installed_under.as_deref(),
+                );
+            }
             EXIT_OK
         }
         Err(error) => {
@@ -4752,6 +5040,174 @@ mod tests {
             "",
         );
         assert_eq!(code, EXIT_OK, "{out}");
+    }
+
+    // ── post-install next steps (CTX-1268, bitty#2144) ─────────────────────
+
+    fn next_steps_setting(
+        key: &str,
+        kind: bitty_plugin_host::manifest::SettingKind,
+        default: bitty_plugin_host::manifest::SettingDefault,
+    ) -> SettingDecl {
+        SettingDecl::new(key.to_string(), kind, default).expect("fixture setting validates")
+    }
+
+    #[test]
+    fn next_steps_generic_shape_is_stable() {
+        // Golden: no settings, no hints, no config root, bundled install.
+        let text = format_next_steps("xuepoo.demo", &[], &[], None, None);
+        assert!(text.contains("Next steps for 'xuepoo.demo':"), "{text}");
+        assert!(
+            text.contains("enable: bitty plugin enable xuepoo.demo"),
+            "{text}"
+        );
+        assert!(
+            text.contains("installed: bundled with bitty (no package tree)"),
+            "{text}"
+        );
+        assert!(text.contains("no config root resolved"), "{text}");
+        assert!(
+            text.contains("(no settings declared; nothing to configure)"),
+            "{text}"
+        );
+        assert!(!text.contains("hints:"), "{text}");
+        assert!(
+            text.contains("more: bitty plugin info xuepoo.demo"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn next_steps_snippet_renders_settings_with_safe_escaping() {
+        use bitty_plugin_host::manifest::{SettingDefault, SettingKind};
+        let settings = vec![
+            next_steps_setting("show", SettingKind::Bool, SettingDefault::Bool(true)),
+            next_steps_setting("name_max_chars", SettingKind::Int, SettingDefault::Int(32)),
+            next_steps_setting(
+                "edge",
+                SettingKind::String,
+                SettingDefault::String("bot\"tom\nline".to_string()),
+            ),
+            next_steps_setting(
+                "modules",
+                SettingKind::StringArray,
+                SettingDefault::Strings(vec!["workspaces".to_string(), "a\\b".to_string()]),
+            ),
+        ];
+        let text = format_next_steps(
+            "bitty-terminal.bar",
+            &settings,
+            &[],
+            Some(Path::new(
+                "/home/u/.config/bitty/plugins/bitty-terminal.bar.toml",
+            )),
+            Some(Path::new(
+                "/home/u/.local/share/bitty/plugins/packages/bitty-terminal.bar/0.1.0",
+            )),
+        );
+        assert!(
+            text.contains("configure: /home/u/.config/bitty/plugins/bitty-terminal.bar.toml"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "installed: /home/u/.local/share/bitty/plugins/packages/bitty-terminal.bar/0.1.0"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("show = true"), "{text}");
+        assert!(text.contains("name_max_chars = 32"), "{text}");
+        // Quotes and newlines are escaped: valid TOML, no raw control bytes.
+        assert!(text.contains("edge = \"bot\\\"tom\\nline\""), "{text}");
+        assert!(!text.contains("bot\"tom\n"), "{text}");
+        // Snippet truncates at three settings with a count line: the fourth
+        // (`modules`) is counted, not shown.
+        assert!(!text.contains("modules = "), "{text}");
+        assert!(text.contains("(... 1 more setting declared)"), "{text}");
+        assert!(text.contains("(undeclared keys are ignored)"), "{text}");
+    }
+
+    #[test]
+    fn next_steps_hints_append_and_escape_helpers_hold() {
+        // Manifest hints render under `hints:`; absent hints stay generic.
+        let text = format_next_steps(
+            "xuepoo.demo",
+            &[],
+            &["Add `modules = [\"clock\"]` to your bar config.".to_string()],
+            None,
+            None,
+        );
+        assert!(text.contains("hints:"), "{text}");
+        assert!(text.contains("- Add `modules = [\"clock\"]`"), "{text}");
+
+        // Escaping never emits raw controls or bare quotes.
+        assert_eq!(escape_toml_basic("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_toml_basic("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(
+            escape_toml_basic("nul\x00esc\x1bdel\x7f"),
+            "nul\\u0000esc\\u001Bdel\\u007F"
+        );
+        assert_eq!(escape_toml_basic("caf\u{e9}\u{2014}"), "caf\u{e9}\u{2014}");
+    }
+
+    #[test]
+    fn install_and_enable_print_next_steps() {
+        let dir = scratch_dir("next-steps");
+        let target = dir.join("init.lua");
+        let config = target.display().to_string();
+
+        // Install success prints the generic next steps (bundled manifest
+        // declares no settings and no hints).
+        let (code, out, _) = run(
+            &["install", "bitty-terminal.shell-integration", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("installed"), "{out}");
+        assert!(
+            out.contains("Next steps for 'bitty-terminal.shell-integration':"),
+            "{out}"
+        );
+        assert!(
+            out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
+            "{out}"
+        );
+        // Path separators are platform-native (`\` on Windows): normalize
+        // before matching the managed `plugins/` layout.
+        let portable = out.replace('\\', "/");
+        assert!(
+            portable.contains("plugins/bitty-terminal.shell-integration.toml"),
+            "{out}"
+        );
+        assert!(
+            out.contains("more: bitty plugin info bitty-terminal.shell-integration"),
+            "{out}"
+        );
+
+        // Enable success (after a disable) prints them again.
+        let (code, _, _) = run(
+            &["disable", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK);
+        let (code, out, _) = run(
+            &["enable", "bitty-terminal.shell-integration"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("enabled"), "{out}");
+        assert!(
+            out.contains("Next steps for 'bitty-terminal.shell-integration':"),
+            "{out}"
+        );
+        assert!(
+            out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

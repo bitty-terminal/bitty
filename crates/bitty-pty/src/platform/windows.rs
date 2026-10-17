@@ -14,10 +14,11 @@
 //!   here routes through a shell.
 //! - **Inherited session environment with overrides plus graphics
 //!   sanitization.** Children inherit the session environment by default
-//!   (DEC-0017, Ghostty/Alacritty reference). Inherited markers claiming
-//!   graphics capabilities bitty lacks (CTX-0194: `GHOSTTY_*`, `WEZTERM_*`,
-//!   `KITTY_*`, `VTE_VERSION`, iTerm markers, `TERM_PROGRAM_VERSION`) are
-//!   removed before exec; explicit builder entries (`TERM`, `COLORTERM`,
+//!   (DEC-0017, Ghostty/Alacritty reference). Inherited markers claiming the
+//!   outer terminal's graphics capabilities (CTX-0194: `GHOSTTY_*`,
+//!   `WEZTERM_*`, `KITTY_*`, `VTE_VERSION`, iTerm markers,
+//!   `TERM_PROGRAM_VERSION`) are removed before exec so detectors identify
+//!   bitty itself; explicit builder entries (`TERM`, `COLORTERM`,
 //!   `TERM_PROGRAM=bitty`, and caller additions) are applied after that
 //!   removal and therefore win. Key matching is case-insensitive (Windows
 //!   environment semantics), exactly as `portable-pty` 0.9 did.

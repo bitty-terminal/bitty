@@ -15,6 +15,7 @@ use bitty_runtime::ai_helper::{
     HELPER_COMPONENT_NAME, HelperConfig, HelperError, HelperEvent, HelperState, ResidentHelper,
     StopOutcome,
 };
+use bitty_runtime::ai_request::AiRequestProducer;
 use bitty_runtime::component::{
     COMPONENT_CRASH_LIMIT, COMPONENT_IDLE_TIMEOUT, ComponentEnv, ResolveError,
 };
@@ -190,6 +191,73 @@ fn resident_helper_spawns_and_round_trips_a_frame() {
         "{events:?}"
     );
     assert_eq!(helper.status().state, HelperState::Stopped);
+}
+
+#[test]
+fn request_producer_injects_snapshot_version_before_submit() {
+    let scratch = Scratch::new("producer");
+    install(&scratch.0, "echo");
+    let mut helper = helper(&scratch.0);
+    let now = Instant::now();
+    helper.ensure_running(now).expect("spawn");
+
+    let mut producer = AiRequestProducer::new();
+    let publication = producer.publish_metadata();
+    producer
+        .acknowledge_local_metadata(&publication)
+        .expect("initial metadata publication");
+    producer
+        .submit(&mut helper, 41, "ai.provider_list", br#"{"unknown":true}"#)
+        .expect("submit through shared producer");
+    let echoed = until_frame(&mut helper, now);
+    let mut expected = b"ai-fixture:".to_vec();
+    expected.extend_from_slice(
+        br#"{"v":1,"id":41,"method":"ai.provider_list","params":{"unknown":true,"snapshot_version":0}}"#,
+    );
+    assert_eq!(echoed, expected);
+    helper.shutdown();
+}
+
+#[test]
+fn request_producer_submits_refreshed_and_invalidated_versions() {
+    let scratch = Scratch::new("producer-version");
+    install(&scratch.0, "echo");
+    let mut helper = helper(&scratch.0);
+    let now = Instant::now();
+    helper.ensure_running(now).expect("spawn");
+
+    let mut producer = AiRequestProducer::new();
+    let metadata = bitty_runtime::ai_request::ServiceMetadata::try_new("provider", "v1", &[])
+        .expect("metadata");
+    producer
+        .metadata_mut()
+        .refresh(&[metadata])
+        .expect("refresh");
+    let publication = producer.publish_metadata();
+    producer
+        .acknowledge_local_metadata(&publication)
+        .expect("refreshed metadata publication");
+    producer
+        .submit(&mut helper, 42, "ai.provider_list", b"{}")
+        .expect("submit refreshed version");
+    let refreshed = until_frame(&mut helper, now);
+    assert!(refreshed.ends_with(
+        br#"{"v":1,"id":42,"method":"ai.provider_list","params":{"snapshot_version":1}}"#
+    ));
+
+    producer.metadata_mut().invalidate();
+    let publication = producer.publish_metadata();
+    producer
+        .acknowledge_local_metadata(&publication)
+        .expect("invalidated metadata publication");
+    producer
+        .submit(&mut helper, 43, "ai.provider_list", b"{}")
+        .expect("submit invalidated version");
+    let invalidated = until_frame(&mut helper, now);
+    assert!(invalidated.ends_with(
+        br#"{"v":1,"id":43,"method":"ai.provider_list","params":{"snapshot_version":2}}"#
+    ));
+    helper.shutdown();
 }
 
 #[test]

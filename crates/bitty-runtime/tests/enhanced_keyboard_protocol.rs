@@ -433,10 +433,12 @@ fn report_all_keys_encodes_functional_and_modifier_keys() {
         rt.handle_key_event_ref(&named_key(NamedKey::Space, PressState::Pressed)),
         Some(b"\x1b[32u".to_vec())
     );
-    // Left Shift reports its dedicated Private-Use code and modifier bit.
+    // CTX-1267 (#2142a): Shift alone is the fcitx5 IME toggle and must
+    // always reach the IME, never the PTY — even under report-all-keys.
     assert_eq!(
         rt.handle_key_event_ref(&named_key(NamedKey::Shift, PressState::Pressed)),
-        Some(b"\x1b[57441;2u".to_vec())
+        None,
+        "Shift alone is IME-owned under report-all (#2142a)"
     );
 }
 

@@ -48,6 +48,25 @@ fn three_pane() -> LayoutNode {
     )
 }
 
+fn four_pane() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(4), 80, 24)),
+            ),
+        ),
+    )
+}
+
 fn install(rt: &mut Runtime, layout: LayoutNode) {
     rt.set_layout(layout);
     rt.set_container(UiRect::new(0, 0, 80, 24));
@@ -182,7 +201,7 @@ fn raised_float_paints_focused_chrome_and_other_float_idle_chrome_issue_2173() {
 #[test]
 fn focus_next_cycles_through_floats_issue_2173() {
     // The focus-cycle shortcuts must reach every panel: tiled leaves plus
-    // detached floats in paint order with wrap.
+    // detached floats in stable detach order with wrap.
     let mut rt = make_runtime();
     install(&mut rt, three_pane());
     rt.float_detach(ViewId::new(2)).expect("detach 2");
@@ -211,6 +230,29 @@ fn focus_next_cycles_through_floats_issue_2173() {
 }
 
 #[test]
+fn directional_focus_from_tiled_edge_does_not_cycle_into_overlays_issue_2173() {
+    // A directional move from a tiled edge must preserve the layout behavior:
+    // with no candidate in that direction, focus stays put instead of
+    // jumping to another tile, detached float, or pin.
+    let mut rt = make_runtime();
+    install(&mut rt, four_pane());
+    rt.float_detach(ViewId::new(3)).expect("detach 3");
+    rt.pin_floating(ViewId::new(4)).expect("pin 4");
+    assert!(rt.set_focus(ViewId::new(1)), "tiled leaf focusable");
+
+    assert_eq!(
+        rt.move_focus(FocusDirection::Left),
+        None,
+        "directional focus at a tiled edge must not cycle into an overlay"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "a tiled edge move must leave focus on the tiled leaf"
+    );
+}
+
+#[test]
 fn directional_focus_from_float_reaches_tile_issue_2173() {
     // Directional focus movement must never strand on a float: hjkl/arrows
     // from a focused float land on a tile instead of returning None.
@@ -218,13 +260,13 @@ fn directional_focus_from_float_reaches_tile_issue_2173() {
     install(&mut rt, three_pane());
     rt.float_detach(ViewId::new(2)).expect("detach 2");
     rt.float_detach(ViewId::new(3)).expect("detach 3");
-    assert!(rt.set_focus(ViewId::new(2)), "float focusable");
     for dir in [
         FocusDirection::Up,
         FocusDirection::Down,
         FocusDirection::Left,
         FocusDirection::Right,
     ] {
+        assert!(rt.set_focus(ViewId::new(2)), "float focusable");
         assert!(
             rt.move_focus(dir).is_some(),
             "directional focus {dir:?} from a float must land somewhere (issue #2173)"

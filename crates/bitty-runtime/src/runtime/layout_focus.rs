@@ -2309,8 +2309,9 @@ impl Runtime {
 
     /// Selects a directional panel from all presented frames. Anchored floats
     /// are not layout leaves, so the generic layout adjacency cannot see them;
-    /// frame-center distance supplies deterministic spatial intent and the
-    /// cycle ring is the fail-soft edge when every panel overlaps.
+    /// frame-center distance supplies deterministic spatial intent. Detached
+    /// floats and pins use the cycle ring as a fail-soft edge when every
+    /// presented panel overlaps; tiled leaves retain their layout-edge stop.
     fn focus_spatial_neighbor(&self, ids: &[ViewId], dir: FocusDirection) -> Option<ViewId> {
         let current = self.focused_view()?;
         let frames = self.present_frames();
@@ -2350,10 +2351,15 @@ impl Runtime {
             })
             .collect();
         candidates.sort_by_key(|(_, primary, secondary)| (*primary, *secondary));
-        candidates
-            .first()
-            .map(|(id, _, _)| *id)
-            .or_else(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
+        candidates.first().map(|(id, _, _)| *id).or_else(|| {
+            // Preserve the pre-overlay behavior for tiled leaves: reaching a
+            // layout edge directionally does not jump around the focus ring.
+            // Detached floats and pins have no layout adjacency, so retain
+            // their cycle fallback when spatial intent has no candidate.
+            (!self.layout.leaf_ids().contains(&current))
+                .then(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
+                .flatten()
+        })
     }
 
     /// Container rect (cell coordinates) that the layout is reflowed into.

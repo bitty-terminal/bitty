@@ -1471,8 +1471,9 @@ impl TerminalApp {
                     .zoom
                     .backup_leaf_count(&self.runtime)
                     .map_or(self.runtime.leaf_count() <= 1, |count| count == 1);
-                let prune_last_tiled_workspace =
-                    close_last_tiled_panel && self.runtime.floated_count() == 0;
+                let prune_last_tiled_workspace = close_last_tiled_panel
+                    && self.runtime.floated_count() == 0
+                    && self.runtime.workspace_count() > 1;
                 let zoom_backup_views = if prune_last_tiled_workspace {
                     self.runtime
                         .workspace_seq_at(self.runtime.active_workspace_index())
@@ -1552,6 +1553,12 @@ impl TerminalApp {
                         } else {
                             eprintln!(
                                 "warning: keymap close_view could not prune empty workspace — ignoring"
+                            );
+                        }
+                    } else if self.runtime.is_primary_view(&focused) {
+                        if self.runtime.close_primary_session() {
+                            eprintln!(
+                                "bitty: keymap close_view tore down primary shell {focused:?} (workspace kept for float)"
                             );
                         }
                     } else if self.runtime.close_pane_session(&focused) {
@@ -3728,6 +3735,74 @@ mod tests {
         // The surviving workspace still holds its panel and remains usable.
         assert_eq!(app.runtime.leaf_count(), 1);
         assert!(app.runtime.focused_view().is_some());
+    }
+
+    #[test]
+    fn close_view_keeps_sole_workspace_with_pinned_panel() {
+        use bitty_config::ChromeAction;
+
+        // A pinned panel is window-global, so closing the only tiled panel in
+        // the only workspace must keep that workspace and use the existing
+        // session-close fallback rather than replacing it.
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_view_tears_down_primary_with_sole_workspace_pinned_panel() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell spawns");
+        let primary = app.runtime.primary_view().expect("primary owner");
+        assert!(app.runtime.has_pty());
+
+        let pinned = ViewId::new(2);
+        assert!(app.runtime.set_focus(pinned));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.focused_view(), Some(primary));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert!(!app.runtime.has_pty(), "primary shell must be torn down");
+        assert!(!app.runtime.has_pty_reader());
+        assert!(!app.runtime.has_pty_writer());
+        assert_eq!(app.runtime.primary_view(), None);
+        assert_eq!(app.runtime.primary_spawn_recipe(), None);
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
+        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert!(!app.runtime.workspace_is_occupied(0));
+        assert!(
+            !app.runtime.close_primary_session(),
+            "teardown is idempotent"
+        );
+
+        app.runtime.workspace_new().expect("empty workspace opens");
+        let fresh = app.runtime.focused_view().expect("fresh focus");
+        assert!(!app.runtime.has_pane_session(&fresh));
+        assert!(
+            !app.runtime.has_pty(),
+            "closed primary recipe must not replay"
+        );
     }
 
     #[test]

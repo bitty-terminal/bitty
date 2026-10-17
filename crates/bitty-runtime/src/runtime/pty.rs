@@ -478,6 +478,44 @@ impl Runtime {
         self.pty.is_some()
     }
 
+    /// Tears down the runtime-global primary shell without removing its live
+    /// layout leaf. The retained leaf becomes session-less and can continue
+    /// to hold focus while another workspace-global view remains pinned.
+    ///
+    /// Unlike [`Runtime::close_pane_session`], this drops the primary PTY,
+    /// reader, writer, and forwarder while preserving the shared waker used
+    /// by any remaining pane sessions.
+    pub fn close_primary_session(&mut self) -> bool {
+        let had_session = self.pty.is_some()
+            || self.pty_reader.is_some()
+            || self.pty_writer.is_some()
+            || self.pty_forward_rx.is_some()
+            || self.pty_forward_handle.is_some();
+        if !had_session {
+            return false;
+        }
+        self.pty_forward_rx = None;
+        self.pty_reader = None;
+        self.pty_writer = None;
+        let forward_handle = self.pty_forward_handle.take();
+        drop(self.pty.take());
+        if let Some(handle) = forward_handle {
+            let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
+        }
+        self.pending_input.clear();
+        if let Some(view) = self.primary_view {
+            self.drop_view_bindings_for(view);
+        }
+        self.primary_view = None;
+        self.primary_spawn = None;
+        self.session_primary_cwd = None;
+        self.kitty_assembler
+            .discard_stream(super::bell::KittyStreamId::Primary);
+        self.sync_mode_caches_to_focus();
+        self.pending_full_redraw = true;
+        true
+    }
+
     /// Whether a PTY reader channel is currently owned (implies [`has_pty`]).
     ///
     /// True while either the direct pump reader or the wakeup-forwarder

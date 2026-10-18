@@ -30,6 +30,13 @@
 //! slice enforces the same numbers per plugin generation, which is a strict
 //! subset of the terminal-wide budget. The terminal-wide aggregation across
 //! generations is owned by the host composer and is not part of this slice.
+//!
+//! The local `SCN-4` aggregate charges every retained string in a mounted
+//! subtree, not only `Text` content: theme tokens, click/scroll command
+//! identifiers, argument keys, and string argument values are all retained
+//! host-side and count against the same 2 MiB number (CTX-1340). This is a
+//! strict superset of the old text-only measurement and invents no new
+//! ceiling.
 
 use phodopus::Value;
 
@@ -136,8 +143,12 @@ pub const UI_MAX_TEXT_BYTES: usize = 256 * 1024;
 /// enforced here per generation as a strict subset).
 pub const UI_MAX_BLOCKS: usize = 64;
 
-/// Maximum aggregated text bytes per plugin generation (`SCN-4` per terminal,
-/// enforced here per generation as a strict subset).
+/// Maximum aggregated retained string bytes per plugin generation (`SCN-4`
+/// per terminal, enforced here per generation as a strict subset).
+///
+/// The name keeps the accepted `SCN-4` "text" dimension, but the local
+/// accounting charges every retained string (see
+/// [`UiNode::retained_string_bytes`]); the 2 MiB number is unchanged.
 pub const UI_MAX_AGGREGATED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum click command identifier length (CTX-0890).
@@ -148,6 +159,15 @@ pub const UI_CLICK_MAX_ARGS: usize = 16;
 
 /// Maximum click command argument value length (CTX-0890).
 pub const UI_CLICK_MAX_ARG_BYTES: usize = 256;
+
+/// Maximum click/scroll command argument key length (CTX-1340).
+///
+/// Argument keys are identifiers on the same command surface as the command
+/// identifier, so they reuse [`UI_CLICK_MAX_COMMAND_BYTES`] instead of being
+/// uncapped: this introduces no new numeric ceiling. Values keep their
+/// separate [`UI_CLICK_MAX_ARG_BYTES`] bound, and both bounds feed the existing
+/// aggregate rather than adding a dimension to it.
+pub const UI_CLICK_MAX_ARG_KEY_BYTES: usize = UI_CLICK_MAX_COMMAND_BYTES;
 
 /// Maximum theme token name length (CTX-0890).
 pub const UI_MAX_THEME_TOKEN_BYTES: usize = 32;
@@ -200,6 +220,26 @@ pub enum ClickArg {
 }
 
 impl Eq for ClickArg {}
+
+impl ClickCommand {
+    /// Bytes of the retained command identifier, argument keys, and string
+    /// argument values. Numeric and boolean argument values retain no string
+    /// bytes, but their keys are still charged.
+    fn retained_string_bytes(&self) -> usize {
+        self.command.len()
+            + self
+                .args
+                .iter()
+                .map(|(key, value)| {
+                    key.len()
+                        + match value {
+                            ClickArg::String(text) => text.len(),
+                            ClickArg::Number(_) | ClickArg::Bool(_) => 0,
+                        }
+                })
+                .sum::<usize>()
+    }
+}
 
 /// One validated v1 declarative node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +408,9 @@ impl UiNode {
     }
 
     /// Text bytes in the subtree (`SCN-3`).
+    ///
+    /// This stays the per-component text measure; the per-generation aggregate
+    /// charges [`Self::retained_string_bytes`] instead.
     #[must_use]
     pub fn text_bytes(&self) -> usize {
         match self {
@@ -375,6 +418,57 @@ impl UiNode {
             Self::Row { children, .. }
             | Self::Column { children, .. }
             | Self::List { children, .. } => children.iter().map(Self::text_bytes).sum(),
+        }
+    }
+
+    /// Bytes of every retained string in the subtree (`SCN-4` local subset).
+    ///
+    /// Counts `Text` content, `fg`/`bg` theme tokens, command identifiers, and
+    /// click/scroll argument keys plus string argument values. This is the
+    /// accounting unit for the per-generation 2 MiB aggregate: identifiers are
+    /// retained host-side exactly like text, so charging only text would leave
+    /// a budget hole (CTX-1340).
+    #[must_use]
+    pub fn retained_string_bytes(&self) -> usize {
+        match self {
+            Self::Text {
+                text,
+                fg,
+                bg,
+                on_click,
+                on_scroll,
+                ..
+            } => text.len() + retained_style_bytes(fg, bg, on_click, on_scroll),
+            Self::Row {
+                children,
+                fg,
+                bg,
+                on_click,
+                on_scroll,
+                ..
+            }
+            | Self::Column {
+                children,
+                fg,
+                bg,
+                on_click,
+                on_scroll,
+                ..
+            }
+            | Self::List {
+                children,
+                fg,
+                bg,
+                on_click,
+                on_scroll,
+                ..
+            } => {
+                children
+                    .iter()
+                    .map(Self::retained_string_bytes)
+                    .sum::<usize>()
+                    + retained_style_bytes(fg, bg, on_click, on_scroll)
+            }
         }
     }
 
@@ -515,6 +609,23 @@ impl UiNode {
     }
 }
 
+/// Bytes of the strings retained by one node's style and bindings (CTX-1340).
+fn retained_style_bytes(
+    fg: &Option<String>,
+    bg: &Option<String>,
+    on_click: &Option<ClickCommand>,
+    on_scroll: &Option<ClickCommand>,
+) -> usize {
+    fg.as_ref().map_or(0, String::len)
+        + bg.as_ref().map_or(0, String::len)
+        + on_click
+            .as_ref()
+            .map_or(0, ClickCommand::retained_string_bytes)
+        + on_scroll
+            .as_ref()
+            .map_or(0, ClickCommand::retained_string_bytes)
+}
+
 /// Whether `slot` is a member of the accepted closed slot set.
 #[must_use]
 pub fn is_ui_slot(slot: &str) -> bool {
@@ -632,7 +743,14 @@ fn extract_command_binding(
             let mut result = Vec::with_capacity(pairs.len());
             for (arg_key, val) in pairs {
                 let key_str = match arg_key {
-                    LuaValue::String(s) => s.clone(),
+                    LuaValue::String(s) => {
+                        if s.len() > UI_CLICK_MAX_ARG_KEY_BYTES {
+                            return Err(component_invalid(format!(
+                                "{key}.args keys must be at most {UI_CLICK_MAX_ARG_KEY_BYTES} bytes",
+                            )));
+                        }
+                        s.clone()
+                    }
                     _ => {
                         return Err(component_invalid(format!(
                             "{key}.args keys must be strings"
@@ -753,6 +871,93 @@ mod tests {
         assert_eq!(node.count_nodes(), 6);
         assert_eq!(node.depth(), 3);
         assert_eq!(node.text_bytes(), 6);
+        assert_eq!(node.retained_string_bytes(), 6);
+    }
+
+    #[test]
+    fn retained_string_bytes_charges_identifiers_not_only_text() {
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Column".to_string())),
+            ("fg", LuaValue::String("accent".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("workspace.switch".to_string())),
+                    (
+                        "args",
+                        LuaValue::table([
+                            ("id", LuaValue::String("dev".to_string())),
+                            ("focus", LuaValue::Bool(true)),
+                            ("index", LuaValue::Integer(2)),
+                        ]),
+                    ),
+                ]),
+            ),
+            (
+                "children",
+                LuaValue::array(vec![LuaValue::table([
+                    ("kind", LuaValue::String("Text".to_string())),
+                    ("text", LuaValue::String("body".to_string())),
+                    ("bg", LuaValue::String("surface.1".to_string())),
+                    (
+                        "on_scroll",
+                        LuaValue::table([
+                            ("command", LuaValue::String("bar.scroll".to_string())),
+                            ("args", LuaValue::table([("step", LuaValue::Integer(1))])),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let node = UiNode::from_lua_value(&value).expect("valid component");
+        let expected = "accent".len()
+            + "workspace.switch".len()
+            + "id".len()
+            + "dev".len()
+            + "focus".len()
+            + "index".len()
+            + "body".len()
+            + "surface.1".len()
+            + "bar.scroll".len()
+            + "step".len();
+        assert_eq!(node.retained_string_bytes(), expected);
+        // The SCN-3 per-component measure stays text-only.
+        assert_eq!(node.text_bytes(), "body".len());
+    }
+
+    #[test]
+    fn click_arg_keys_are_capped_and_charged() {
+        let with_key = |key: &str| {
+            LuaValue::table([
+                ("kind", LuaValue::String("Text".to_string())),
+                ("text", LuaValue::String("t".to_string())),
+                (
+                    "on_click",
+                    LuaValue::table([
+                        ("command", LuaValue::String("cmd".to_string())),
+                        (
+                            "args",
+                            LuaValue::table([(key, LuaValue::String("v".to_string()))]),
+                        ),
+                    ]),
+                ),
+            ])
+        };
+        let at_cap = "k".repeat(UI_CLICK_MAX_ARG_KEY_BYTES);
+        assert_eq!(
+            UI_CLICK_MAX_ARG_KEY_BYTES, UI_CLICK_MAX_COMMAND_BYTES,
+            "the key cap reuses the command-identifier bound; no new ceiling"
+        );
+        let node = UiNode::from_lua_value(&with_key(&at_cap)).expect("64-byte key accepted");
+        assert_eq!(
+            node.retained_string_bytes(),
+            "t".len() + "cmd".len() + at_cap.len() + "v".len()
+        );
+
+        let over = "k".repeat(UI_CLICK_MAX_ARG_KEY_BYTES + 1);
+        let error = UiNode::from_lua_value(&with_key(&over)).expect_err("65-byte key rejected");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("args keys must be at most"));
     }
 
     #[test]

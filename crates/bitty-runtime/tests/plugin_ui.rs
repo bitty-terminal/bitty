@@ -651,6 +651,62 @@ fn oversized_component_is_rejected_before_any_mount() {
 }
 
 #[test]
+fn click_arg_keys_are_capped_at_the_bridge() {
+    // CTX-1340: argument keys are identifiers on the command surface and get
+    // the same 64-byte bound as the command identifier. The at-cap key is
+    // accepted; one byte more fails closed before anything is mounted.
+    let fixture = Fixture::activate(
+        "argkey",
+        "bitty-featured.uiargkey",
+        &["ui.rich"],
+        &[],
+        r#"
+        local at_cap = string.rep("k", 64)
+        local ok, handle = pcall(bitty.ui.mount, "bottom", {
+          kind = "Text",
+          text = "t",
+          on_click = { command = "cmd", args = { [at_cap] = "v" } },
+        })
+        bitty.store.set("ok", ok)
+        bitty.store.set("handle", ok and handle or -1)
+
+        local over = string.rep("k", 65)
+        local over_ok, err = pcall(bitty.ui.mount, "bottom", {
+          kind = "Text",
+          text = "t",
+          on_click = { command = "cmd", args = { [over] = "v" } },
+        })
+        bitty.store.set("over_ok", over_ok)
+        bitty.store.set("over_code", over_ok and "NONE" or err.code)
+        return {}
+        "#,
+    );
+
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "ok"),
+        Some(LuaValue::Bool(true)),
+        "a 64-byte argument key is at the cap and must mount"
+    );
+    match store_value(&fixture.runtime, &fixture.id, "handle") {
+        Some(LuaValue::Integer(handle)) => assert!(handle > 0),
+        other => panic!("at-cap mount must return a handle, got {other:?}"),
+    }
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "over_ok"),
+        Some(LuaValue::Bool(false))
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "over_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+}
+
+#[test]
 fn reload_starts_the_next_generation_with_a_fresh_registry() {
     let mut fixture = Fixture::activate_with_commands(
         "reload",

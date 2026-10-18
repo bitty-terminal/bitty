@@ -774,13 +774,18 @@ impl UiBlock {
 /// the accepted `SCN-4`/`SCN-5` budgets are terminal-wide (all plugins), and
 /// the terminal-wide accounting is owned by the host composer. Exceeding a
 /// registry cap fails closed with `E_UI_BLOCK_BUDGET` (`budget` class), a host
-/// diagnostic pending an accepted stable plugin-visible code.
+/// diagnostic pending an accepted stable plugin-visible code. The `SCN-4`
+/// aggregate charges every retained string in a subtree (text, theme tokens,
+/// command identifiers, argument keys, and string argument values), because
+/// all of them stay resident in the registry (CTX-1340).
 #[derive(Debug)]
 pub struct UiBlocks {
     blocks: Vec<(i64, UiBlock)>,
     epoch: u32,
     next_counter: u32,
-    aggregated_text_bytes: usize,
+    /// Retained string bytes across every block (`Text` content, theme tokens,
+    /// command identifiers, argument keys, and string argument values).
+    aggregated_retained_bytes: usize,
 }
 
 /// Bits of the handle reserved for the generation epoch. Capped at 31 so every
@@ -805,7 +810,7 @@ impl UiBlocks {
             blocks: Vec::new(),
             epoch: 0,
             next_counter: 1,
-            aggregated_text_bytes: 0,
+            aggregated_retained_bytes: 0,
         }
     }
 
@@ -823,7 +828,7 @@ impl UiBlocks {
     /// the clear can never alias one minted after it.
     fn clear(&mut self) {
         self.blocks.clear();
-        self.aggregated_text_bytes = 0;
+        self.aggregated_retained_bytes = 0;
     }
 
     /// Compose the next generation-owned handle, or fail closed when this
@@ -874,18 +879,18 @@ impl UiBlocks {
                 format!("ui block registry is full ({UI_MAX_BLOCKS} blocks)"),
             ));
         }
-        let bytes = node.text_bytes();
-        let total = self.aggregated_text_bytes.saturating_add(bytes);
+        let bytes = node.retained_string_bytes();
+        let total = self.aggregated_retained_bytes.saturating_add(bytes);
         if total > UI_MAX_AGGREGATED_TEXT_BYTES {
             return Err(BridgeError::new(
                 "budget",
                 "E_UI_BLOCK_BUDGET",
-                "ui block text budget exceeded (2 MiB aggregated)",
+                "ui block retained-string budget exceeded (2 MiB aggregated)",
             ));
         }
         let handle = self.next_handle()?;
         self.next_counter = self.next_counter.saturating_add(1);
-        self.aggregated_text_bytes = total;
+        self.aggregated_retained_bytes = total;
         self.blocks.push((
             handle,
             UiBlock {
@@ -906,26 +911,26 @@ impl UiBlocks {
         else {
             return Ok(false);
         };
-        let old_bytes = self.blocks[position].1.node.text_bytes();
+        let old_bytes = self.blocks[position].1.node.retained_string_bytes();
         let total = self
-            .aggregated_text_bytes
+            .aggregated_retained_bytes
             .saturating_sub(old_bytes)
-            .saturating_add(node.text_bytes());
+            .saturating_add(node.retained_string_bytes());
         if total > UI_MAX_AGGREGATED_TEXT_BYTES {
             return Err(BridgeError::new(
                 "budget",
                 "E_UI_BLOCK_BUDGET",
-                "ui block text budget exceeded (2 MiB aggregated)",
+                "ui block retained-string budget exceeded (2 MiB aggregated)",
             ));
         }
-        self.aggregated_text_bytes = total;
+        self.aggregated_retained_bytes = total;
         let block = &mut self.blocks[position].1;
         block.node = node;
         block.version = block.version.saturating_add(1);
         Ok(true)
     }
 
-    /// Drop one block by handle, releasing its text budget.
+    /// Drop one block by handle, releasing its retained-string budget.
     ///
     /// Used to roll back a spec-acquired surface when capture acquisition
     /// fails, so a denied acquire leaves no orphan block behind. Returns
@@ -940,9 +945,9 @@ impl UiBlocks {
             return false;
         };
         let (_, block) = self.blocks.remove(position);
-        self.aggregated_text_bytes = self
-            .aggregated_text_bytes
-            .saturating_sub(block.node.text_bytes());
+        self.aggregated_retained_bytes = self
+            .aggregated_retained_bytes
+            .saturating_sub(block.node.retained_string_bytes());
         true
     }
 }
@@ -2303,7 +2308,7 @@ impl PluginServices {
         self.spec_overlay_handles.borrow_mut().clear();
     }
 
-    /// Drop one block by handle, releasing its text budget.
+    /// Drop one block by handle, releasing its retained-string budget.
     ///
     /// Rolls back a spec-acquired surface when capture acquisition fails, so
     /// a denied acquire leaves no orphan block behind.
@@ -4155,7 +4160,9 @@ mod tests {
     use crate::plugin_runtime::store::PluginStore;
     use bitty_lua::E_UI_ALREADY_CAPTURED;
     use bitty_lua::ENV_KEY_MAX_BYTES;
-    use bitty_lua::ui::UI_MAX_TEXT_BYTES;
+    use bitty_lua::ui::{
+        ClickArg, ClickCommand, UI_CLICK_MAX_ARGS, UI_MAX_NODES, UI_MAX_TEXT_BYTES,
+    };
     use std::time::Duration;
 
     fn services() -> PluginServices {
@@ -6137,6 +6144,130 @@ mod tests {
                 blocks.len(),
                 UI_MAX_AGGREGATED_TEXT_BYTES / UI_MAX_TEXT_BYTES
             )
+        });
+    }
+
+    /// A node whose retained strings span text, tokens, commands, arg keys,
+    /// and a string arg value (CTX-1340).
+    fn retained_string_node(text_len: usize) -> UiNode {
+        UiNode::Text {
+            text: "x".repeat(text_len),
+            fg: Some("accent".to_string()),
+            bg: Some("surface.1".to_string()),
+            bold: None,
+            on_click: Some(ClickCommand {
+                command: "workspace.switch".to_string(),
+                args: vec![
+                    ("id".to_string(), ClickArg::String("dev".to_string())),
+                    ("focus".to_string(), ClickArg::Bool(true)),
+                ],
+            }),
+            on_scroll: Some(ClickCommand {
+                command: "bar.scroll".to_string(),
+                args: vec![("step".to_string(), ClickArg::Number(1.0))],
+            }),
+        }
+    }
+
+    #[test]
+    fn aggregated_retained_budget_counts_every_string() {
+        let overhead = retained_string_node(0).retained_string_bytes();
+        assert!(
+            overhead < UI_MAX_TEXT_BYTES,
+            "the mixed-string overhead must leave room for text"
+        );
+        let node = retained_string_node(UI_MAX_TEXT_BYTES - overhead);
+        assert_eq!(
+            node.retained_string_bytes(),
+            UI_MAX_TEXT_BYTES,
+            "text + tokens + identifiers must fill exactly one 256 KiB slice"
+        );
+        assert!(
+            node.text_bytes() < node.retained_string_bytes(),
+            "the aggregate must charge more than the text-only measure"
+        );
+
+        let services = ui_services(rich_only());
+        for _ in 0..(UI_MAX_AGGREGATED_TEXT_BYTES / UI_MAX_TEXT_BYTES) {
+            services
+                .ui_mount("bottom", &node)
+                .expect("exactly at the retained-string aggregate cap");
+        }
+        let error = services
+            .ui_mount("bottom", &UiNode::text("x"))
+            .expect_err("one byte over the aggregate cap must fail closed");
+        assert_eq!(error.code, "E_UI_BLOCK_BUDGET");
+        assert_eq!(error.class, "budget");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.len(),
+                UI_MAX_AGGREGATED_TEXT_BYTES / UI_MAX_TEXT_BYTES
+            )
+        });
+    }
+
+    /// A node with no text whose click argument keys alone exceed 2 MiB.
+    ///
+    /// 2047 leaf nodes (the `Row` makes the subtree exactly `UI_MAX_NODES`)
+    /// each carry one command with 16 distinct 64-byte keys and no string
+    /// values, so text bytes stay zero and only keys can drive the budget.
+    fn large_key_node() -> UiNode {
+        let args = (0..UI_CLICK_MAX_ARGS)
+            .map(|index| (format!("{index:064}"), ClickArg::Bool(true)))
+            .collect::<Vec<_>>();
+        let child = UiNode::Text {
+            text: String::new(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: Some(ClickCommand {
+                command: "c".to_string(),
+                args,
+            }),
+            on_scroll: None,
+        };
+        UiNode::Row {
+            children: (0..(UI_MAX_NODES - 1)).map(|_| child.clone()).collect(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+        }
+    }
+
+    #[test]
+    fn large_click_arg_keys_are_charged_and_fail_closed() {
+        let payload = large_key_node();
+        assert_eq!(payload.text_bytes(), 0, "the payload carries no text");
+        assert!(
+            payload.retained_string_bytes() > UI_MAX_AGGREGATED_TEXT_BYTES,
+            "argument keys alone must exceed the aggregate"
+        );
+
+        let services = ui_services(rich_only());
+        let handle = services
+            .ui_mount("bottom", &UiNode::text("seed"))
+            .expect("seed mount");
+        let update = services
+            .ui_update(handle, &payload)
+            .expect_err("key-heavy update must fail closed");
+        assert_eq!(update.code, "E_UI_BLOCK_BUDGET");
+        assert_eq!(update.class, "budget");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(
+                blocks.get(handle).expect("seed retained").node(),
+                &UiNode::text("seed"),
+                "a rejected update must leave the old block intact"
+            );
+        });
+
+        let mount = services
+            .ui_mount("bottom", &payload)
+            .expect_err("key-heavy mount must fail closed");
+        assert_eq!(mount.code, "E_UI_BLOCK_BUDGET");
+        services.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "a rejected mount must not be retained");
         });
     }
 

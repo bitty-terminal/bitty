@@ -1526,8 +1526,29 @@ impl TerminalApp {
                 if self.runtime.floated_views().contains(&focused)
                     || self.runtime.pinned_views().contains(&focused)
                 {
+                    // CTX-1336 (#2221): a float can be the active
+                    // workspace's last live view (its tiled base closed).
+                    // Discarding it must not strand a view-less slot: prune
+                    // the emptied workspace exactly like the CTX-1297
+                    // last-tiled-panel path, so focus follows a live
+                    // workspace instead of a blank surface.
+                    let prune_after_discard = self.runtime.floated_views() == vec![focused]
+                        && self.runtime.layout().leaf_count() == 0
+                        && self.runtime.workspace_count() > 1;
                     if self.runtime.discard_floating_view(focused) {
                         eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
+                    }
+                    if prune_after_discard {
+                        let workspace = self.runtime.active_workspace_index();
+                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                            eprintln!(
+                                "bitty: keymap close_view -> last float closed, empty workspace pruned"
+                            );
+                        } else {
+                            eprintln!(
+                                "warning: keymap close_view could not prune empty workspace — ignoring"
+                            );
+                        }
                     }
                     eprintln!(
                         "bitty: keymap close_view -> leafs={} focused={:?}",
@@ -1555,6 +1576,43 @@ impl TerminalApp {
                                 "warning: keymap close_view could not prune empty workspace — ignoring"
                             );
                         }
+                    } else if self.runtime.floated_count() > 0 {
+                        // CTX-1336 (#2221): a detached float survives in
+                        // this workspace, so the closed tiled host is a
+                        // pane close. Tearing down only its session kept a
+                        // session-less leaf that stayed focused: the empty
+                        // leaf painted a cursor ghost in the vacated region
+                        // and input was silently dropped (no focused writer,
+                        // no primary owner). Remove the leaf and hand focus
+                        // to the live float instead.
+                        let was_primary = self.runtime.is_primary_view(&focused);
+                        if was_primary {
+                            if self.runtime.close_primary_session() {
+                                eprintln!(
+                                    "bitty: keymap close_view tore down primary shell {focused:?} (float base drained)"
+                                );
+                            }
+                        } else if self.runtime.close_pane_session(&focused) {
+                            eprintln!(
+                                "bitty: keymap close_view tore down last tiled panel shell {focused:?} (float base drained)"
+                            );
+                        }
+                        // A bare last leaf must go: the tiling-first helper
+                        // refuses it, the layout-level remove yields the
+                        // empty base that the float composite expects
+                        // (G1/DEC-0099: the float stays a float).
+                        let mut layout = self.runtime.layout().clone();
+                        if layout.remove_leaf(focused).is_some() {
+                            self.runtime.set_layout_closing(layout, focused);
+                        }
+                        if let Some(survivor) = self.runtime.floated_views().last().copied() {
+                            self.runtime.set_focus(survivor);
+                        }
+                        eprintln!(
+                            "bitty: keymap close_view -> float base drained, leafs={} focused={:?}",
+                            self.runtime.leaf_count(),
+                            self.runtime.focused_view()
+                        );
                     } else if self.runtime.is_primary_view(&focused) {
                         if self.runtime.close_primary_session() {
                             eprintln!(

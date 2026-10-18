@@ -9546,6 +9546,299 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
     let _ = std::fs::remove_file(&script);
 }
 
+/// Issue #2221 / CTX-1336: closing the last tiled host while a detached
+/// float survives must remove the host leaf instead of leaving a
+/// session-less tile focused. The old path tore the primary session down
+/// but kept its leaf, so the empty focused leaf painted a cursor ghost in
+/// the vacated region and swallowed keyboard input until `ctrl+tab`.
+#[test]
+#[cfg(unix)]
+fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert_eq!(app.runtime.focused_view(), Some(host));
+
+    // Present once so the headless surface holds the pre-close frame; the
+    // host content origin is the exact cell that used to paint the ghost
+    // cursor after teardown.
+    let _ = app.drive_tick();
+    let host_frame = app
+        .runtime
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == host)
+        .expect("host frame before close");
+    let pad = usize::try_from(app.runtime.window_padding_physical()).expect("pad fits");
+    let origin_x = usize::try_from(host_frame.content.x).expect("x fits") + pad;
+    let origin_y = usize::try_from(host_frame.content.y).expect("y fits") + pad;
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "host teardown with a surviving float is a pane close, not a window close"
+    );
+
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "the closed host leaf must be removed, never left session-less"
+    );
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(float),
+        "focus must follow the surviving float"
+    );
+    assert_ne!(
+        app.runtime.primary_view(),
+        Some(host),
+        "primary ownership must not point at the closed leaf"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"probe"),
+        "input must route to the surviving float shell"
+    );
+
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime
+            .present_frames()
+            .iter()
+            .all(|frame| frame.view != host),
+        "no frame may remain for the closed host view"
+    );
+    let rgba = app.runtime.headless_rgba().expect("headless frame");
+    let width =
+        usize::try_from(app.runtime.config().window_extent().width()).expect("width fits usize");
+    let bg = bitty_render::grid::DEFAULT_BG;
+    assert_eq!(
+        probe_rgba(&rgba, width, origin_x, origin_y),
+        bg,
+        "the vacated host cell must repaint to background, never a ghost cursor"
+    );
+}
+
+/// Issue #2221 / CTX-1336: closing the last live view (the surviving float)
+/// must be the window-close gesture. It must never discard the float into a
+/// session-less view that paints blank and drops input while the process
+/// stays alive.
+#[test]
+fn close_last_live_float_requests_window_close_not_dead_view_issue_2221() {
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert!(app.runtime.set_focus(host));
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "host teardown with a surviving float is a pane close"
+    );
+    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.focused_view(), Some(float));
+
+    // No PTY and no primary shell: `close_confirm = when_busy` proceeds.
+    assert!(
+        app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "closing the last live view must request window close, never fall through"
+    );
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "no session-less replacement leaf may be created"
+    );
+    assert!(
+        !app.runtime
+            .primary_view()
+            .is_some_and(|view| !app.runtime.floated_views().contains(&view)),
+        "primary ownership must never dangle on a non-live view"
+    );
+}
+
+/// Issue #2221 / CTX-1336: a workspace whose only live view was a float
+/// (its tiled base already closed) must be pruned when the float closes,
+/// exactly like CTX-1297 does for the last tiled panel. Leaving the slot
+/// behind strands a view-less workspace that paints nothing and accepts
+/// no input.
+#[test]
+fn close_last_float_prunes_emptied_workspace_issue_2221() {
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert!(app.runtime.set_focus(host));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.workspace_count(), 1);
+
+    // A second workspace keeps a live panel, so the float-only workspace
+    // is prunable rather than the whole window's last view.
+    app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert!(app.runtime.workspace_switch(0));
+    assert!(
+        app.runtime.set_focus(float),
+        "the float must be focusable after the switch back"
+    );
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "closing the emptied workspace's last float is a pane close"
+    );
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the view-less workspace must be pruned, never stranded"
+    );
+    assert!(app.runtime.floated_views().is_empty());
+    let focused = app
+        .runtime
+        .focused_view()
+        .expect("focus must land on the surviving workspace's panel");
+    assert!(
+        app.runtime.layout().leaf_ids().contains(&focused),
+        "focus must be a live member of the surviving layout"
+    );
+}
+
+#[cfg(unix)]
+fn probe_rgba(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+    let idx = (y * width + x) * 4;
+    [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+}
+
+/// Issue #2221 / CTX-1336: with an empty tiled base and two detached
+/// floats, closing the focused float must land focus on the surviving
+/// float. Clearing focus because the layout has no leaves would silently
+/// drop input while a visible, typable panel remains.
+#[test]
+#[cfg(unix)]
+fn close_float_on_empty_base_focuses_surviving_float_issue_2221() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let left = ViewId::new(2);
+    let right = ViewId::new(3);
+    app.runtime.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(host, 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(left, 80, 24)),
+            LayoutNode::leaf(View::new(right, 80, 24)),
+        ),
+    ));
+    for view in [left, right] {
+        app.runtime
+            .spawn_shell_for_view_in(view, "/bin/sh", &[], 80, 24, None)
+            .expect("spawn float shell");
+        app.runtime
+            .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(view))
+            .expect("detach float");
+    }
+    assert_eq!(app.runtime.floated_views(), vec![left, right]);
+    assert!(app.runtime.set_focus(host));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(right),
+        "the topmost surviving float must take focus after the base drains"
+    );
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "closing one of two floats is a pane close"
+    );
+    assert_eq!(app.runtime.floated_views(), vec![left]);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(left),
+        "focus must move to the remaining float, never clear"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"probe"),
+        "input must route to the surviving float shell"
+    );
+}
+
+/// Issue #2221 / CTX-1336: the owner's exact report after the float is the
+/// last live view: typing `exit` in it must not leave a blank slot.
+#[test]
+#[cfg(unix)]
+fn reap_exited_last_float_prunes_emptied_workspace_issue_2221() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert!(app.runtime.set_focus(host));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.focused_view(), Some(float));
+
+    // A second workspace keeps a live leaf, so the float exit is a pane
+    // close (PaneClosed) instead of the whole-window close gesture.
+    app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert!(app.runtime.workspace_switch(0));
+    assert!(app.runtime.set_focus(float));
+
+    assert!(
+        app.runtime.push_input_bytes(b"exit\n"),
+        "typed exit must reach the float shell"
+    );
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "float exit with another workspace live is a pane close"
+    );
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the emptied float-only workspace must be pruned, never left blank"
+    );
+    assert!(app.runtime.floated_views().is_empty());
+    let focused = app
+        .runtime
+        .focused_view()
+        .expect("focus must land on the surviving workspace's panel");
+    assert!(
+        app.runtime.layout().leaf_ids().contains(&focused),
+        "focus must be a live member of the surviving layout, never a dead slot"
+    );
+    assert!(
+        app.runtime.primary_view().is_none_or(|view| app
+            .runtime
+            .layout()
+            .leaf_ids()
+            .contains(&view)),
+        "primary ownership must not dangle"
+    );
+}
+
 #[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key

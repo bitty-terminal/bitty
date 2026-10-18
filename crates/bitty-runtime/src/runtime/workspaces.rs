@@ -623,6 +623,12 @@ impl Runtime {
         if self.focus.focused() == Some(id) {
             if let Some(first) = self.layout.leaf_ids().into_iter().next() {
                 self.focus = Focus::with_focus(first);
+            } else if let Some(next) = self.floats.paint_ids().last().copied() {
+                // CTX-1336 (#2221): an empty tiled base can still composite
+                // other detached floats. Never clear focus while a live
+                // float remains: clearing would drop keyboard routing even
+                // though a visible, typable panel survives.
+                self.focus = Focus::with_focus(next);
             } else {
                 self.focus.clear();
             }
@@ -1661,6 +1667,11 @@ impl Runtime {
         };
         self.active_workspace = active;
         self.load_slot(active);
+        // CTX-1336 (#2221): closing a workspace installs a different slot.
+        // Like `workspace_switch`, that is a layout/focus change with no PTY
+        // damage of its own, so force the next frame; otherwise the closed
+        // workspace's last frame stays on screen until unrelated input.
+        self.pending_full_redraw = true;
         self.mru_front(active);
         // CTX-0873: dropping to one workspace releases the bar band.
         self.refresh_chrome_band();

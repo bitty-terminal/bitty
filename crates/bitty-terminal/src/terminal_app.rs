@@ -1274,6 +1274,12 @@ impl TerminalApp {
         // Cold-tick only, never the input hot path (P0-AC-015); no-op
         // without a plugin runtime or armed timers.
         self.pump_plugin_timers();
+        // CTX-1327 (issue #2213, P0-AC-015): deliver Core-routed plugin band
+        // clicks/scrolls queued by the input callback. `handle_event` only
+        // enqueues into the runtime's bounded band queues; the owning-VM
+        // dispatch runs here on the cold tick, never on the input hot path,
+        // so input never enters a plugin VM synchronously.
+        self.deliver_band_input();
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -1952,6 +1958,31 @@ impl TerminalApp {
                 });
             }
         }
+    }
+
+    /// Delivers Core-routed plugin band clicks and scrolls queued by input
+    /// (CTX-1327, issue #2213).
+    ///
+    /// The runtime owns the geometry (which band row, which declared
+    /// command/scroll target); the input callback only enqueues into its
+    /// bounded band queues. This cold pump drains them (at most the bounded
+    /// capacity, in press/tick order) and dispatches each through the normal
+    /// [`Self::dispatch_band_click`] / [`Self::dispatch_band_scroll`] path,
+    /// where registration and capability gates fail closed as usual.
+    /// Cold-tick only, never the input hot path (P0-AC-015), so an enabled
+    /// plugin VM is never entered synchronously from input. Returns the number
+    /// of requests delivered.
+    pub(crate) fn deliver_band_input(&mut self) -> usize {
+        let clicks = self.runtime.drain_band_clicks();
+        let scrolls = self.runtime.drain_band_scrolls();
+        let delivered = clicks.len().saturating_add(scrolls.len());
+        for click in clicks {
+            self.dispatch_band_click(click);
+        }
+        for scroll in scrolls {
+            self.dispatch_band_scroll(scroll);
+        }
+        delivered
     }
 
     /// Empty args value for argument-free host-mediated invocations
@@ -2823,23 +2854,15 @@ impl AppHandler for TerminalApp {
         // else the focused pane's `OSC 22` shape, else `Default`.
         // Change-gated inside, so steady hover costs no OS call.
         self.sync_cursor_icon();
-        // CTX-0946 C1: Core-routed plugin band clicks. The runtime owns the
-        // geometry (which band row, which declared command); the application
-        // dispatches each through the normal `PluginRuntime::dispatch_command`
-        // path, where registration and capability gates fail closed as
-        // usual. Dispatch failures are loud (user-paced gestures, never a
-        // hot loop) and never disturb terminal state.
-        for click in self.runtime.drain_band_clicks() {
-            self.dispatch_band_click(click);
-        }
-        // CTX-1190 (#2008): Core-routed plugin band scrolls. Same posture
-        // as clicks — the runtime owns the geometry and the host-computed
-        // delta; the application dispatches each through the normal
-        // `PluginRuntime::dispatch_command` path, where registration and
-        // capability gates fail closed as usual.
-        for scroll in self.runtime.drain_band_scrolls() {
-            self.dispatch_band_scroll(scroll);
-        }
+        // CTX-1327 (issue #2213, P0-AC-015): Core-routed plugin band clicks
+        // (CTX-0946 C1) and scrolls (CTX-1190 / #2008) are queued by the
+        // runtime here but deliberately NOT dispatched from this input
+        // callback. Routing already resolved the band owner and declared
+        // command into the runtime's bounded, fail-closed queues; the owning
+        // plugin VM is entered only on the cold tick pump
+        // ([`Self::deliver_band_input`], called from [`Self::drive_tick`]).
+        // This keeps the input hot path free of synchronous owning-VM
+        // execution: the invariant issue #2213 flags.
         // CTX-0370: a window-close request that did not exit armed a bounded
         // confirmation (or was superseded by one); report it loudly so the
         // pending gate is never silent in the log. `AboutToWait` presents the

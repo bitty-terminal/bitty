@@ -13,6 +13,10 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Read-only VM accounting and safe construction for the explicit regression.
+input-vm-test-support = []
+
 # CTX-0906: hermetic native-component test fixture. Speaks wire protocol v1
 # over stdio so the broker integration tests spawn a real coprocess without
 # any network access; never installed or packaged (publish = false, and the

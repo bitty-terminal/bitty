@@ -17,6 +17,495 @@ fn args_of(words: &[&str]) -> Vec<String> {
     words.iter().map(|s| (*s).to_string()).collect()
 }
 
+// CTX-1327 / P0-AC-015: exercise the real application input callback through
+// `AppHandler::handle_event` with a headless `EventContext` and a read-only
+// owning-VM entry counter. The regression proves the accepted input path
+// enqueues the resolved band request without entering the plugin VM, and that
+// the deferred dispatch happens exactly once on the distinct cold pump.
+#[cfg(feature = "input-vm-test-support")]
+mod input_vm_boundary {
+    use super::*;
+    use bitty_platform::app::RecordingOperation;
+    use bitty_platform::{
+        AppHandler, CursorPosition, EventContext, ModifiersState, MouseButton, MouseEvent,
+        PressState, ScrollDelta, WindowId,
+    };
+    use bitty_plugin_host::manifest::PluginId;
+    use bitty_runtime::plugin_runtime::{
+        LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig, VmExecutionCountError,
+    };
+    use std::cell::RefCell;
+
+    const PLUGIN: &str = "bitty-featured.input-boundary";
+    const BOUND_COLUMN: u16 = 1;
+    const UNBOUND_COLUMN: u16 = 7;
+    const WHEEL_NOTCH: f32 = 1.0;
+    const EXTRA_SCROLLBACK_LINES: usize = 8;
+
+    struct Fixture {
+        app: TerminalApp,
+        id: PluginId,
+        root: std::path::PathBuf,
+        operations: RefCell<Vec<RecordingOperation>>,
+    }
+
+    impl Fixture {
+        fn new(case: &str) -> Self {
+            // Only fixture-owned files are touched. No user configuration,
+            // startup path, native clipboard, window, watcher, or PTY exists.
+            let root = std::env::temp_dir().join(format!("ctx1327-{}-{case}", std::process::id()));
+            std::fs::create_dir(&root).expect("fresh fixture directory");
+            let plugin = root.join(PLUGIN);
+            std::fs::create_dir_all(plugin.join("lua")).expect("fixture module directory");
+            std::fs::write(
+                plugin.join("bitty-plugin.toml"),
+                format!(
+                    r#"[plugin]
+id = "{PLUGIN}"
+name = "Input boundary fixture"
+version = "0.0.1"
+description = "Finite application input boundary regression"
+[compat]
+plugin-api = "^1.0"
+[capabilities]
+ui.rich = true
+[lazy]
+commands = ["{PLUGIN}:step", "{PLUGIN}:read"]
+events = []
+"#
+                ),
+            )
+            .expect("fixture manifest");
+            std::fs::write(
+                plugin.join("lua/init.lua"),
+                r#"
+local count = 0
+bitty.commands.register({ id = "step", title = "Step", run = function(args)
+  count = count + 1
+  return tostring(count)
+end })
+bitty.commands.register({ id = "read", title = "Read", run = function(args)
+  return count
+end })
+bitty.ui.mount("bottom", { kind = "Row", children = {
+  { kind = "Text", text = "bound", on_click = { command = "step" },
+    on_scroll = { command = "step" } },
+  { kind = "Text", text = " free" }
+} })
+return {}
+"#,
+            )
+            .expect("finite local fixture source");
+            let mut plugins = PluginRuntime::new(PluginRuntimeConfig {
+                third_party_roots: vec![root.clone()],
+                ..PluginRuntimeConfig::default()
+            });
+            let id = PluginId::new(PLUGIN).expect("fixture identity");
+            assert_eq!(
+                plugins.vm_total_executions(&id),
+                Err(VmExecutionCountError::MissingVm)
+            );
+            let discovery = plugins.discover();
+            assert_eq!(discovery.len(), 1);
+            assert!(discovery[0].1.is_ok(), "{discovery:?}");
+            let activation = plugins.activate(&id).expect("fixture activation");
+            assert_eq!(activation.state, LifecycleState::Active);
+            assert_eq!(activation.commands, 2);
+            assert_eq!(activation.events, 0);
+            assert_eq!(plugins.ui_blocks().len(), 1, "real authorized mount");
+            assert!(plugins.timer_deadline().is_none());
+
+            let rt = Runtime::for_input_vm_regression().expect("safe construction");
+            assert!(rt.is_headless());
+            assert!(!rt.is_crossfont());
+            assert!(rt.clipboard().is_headless());
+            assert_eq!(rt.pty_size(), None);
+            assert!(!rt.has_pty_writer());
+            assert_eq!(rt.background_loads(), 0);
+            let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("default in-memory keymap");
+            let mut app = TerminalApp::with_theme(
+                rt,
+                bitty_config::theme::DEFAULT_THEME_NAME,
+                "fixture",
+                maps,
+                SpawnSpec::default(),
+            )
+            .with_plugin_runtime(Some(plugins));
+            app.set_session_persistence(false);
+            // Present the actual mounted tree without invoking startup or
+            // the application cold pump (no delivery mechanism is selected).
+            let blocks = app.plugin_runtime.as_ref().expect("plugins").ui_blocks();
+            let (bands, unplaced) = bitty_runtime::ChromeBands::from_mounts(
+                blocks
+                    .into_iter()
+                    .map(|(id, slot, node, version)| (id.to_string(), slot, node, version)),
+            );
+            assert_eq!(unplaced, 0);
+            app.runtime.set_chrome_bands(bands);
+            app.runtime
+                .tick()
+                .expect("deterministic mount presentation");
+            let fixture = Self {
+                app,
+                id,
+                root,
+                operations: RefCell::new(Vec::new()),
+            };
+            fixture.assert_no_sinks();
+            println!(
+                "{case}: baseline after activation/mount={}",
+                fixture.entries()
+            );
+            fixture
+        }
+
+        fn entries(&self) -> u64 {
+            self.app
+                .plugin_runtime
+                .as_ref()
+                .expect("plugins")
+                .vm_total_executions(&self.id)
+                .expect("owning VM must exist and be idle")
+        }
+
+        fn event(&mut self, kind: WindowEventKind) -> u64 {
+            let before = self.entries();
+            let event = PlatformEvent::Window {
+                window_id: WindowId::from_raw_public(1),
+                kind,
+            };
+            let mut context = EventContext::recording(&self.operations);
+            <TerminalApp as AppHandler>::handle_event(&mut self.app, &mut context, event);
+            let after = self.entries();
+            self.assert_no_sinks();
+            after.checked_sub(before).expect("monotonic VM counter")
+        }
+
+        fn cursor(&mut self, column: u16) {
+            let rt = &self.app.runtime;
+            let row = rt
+                .plugin_band_row(bitty_runtime::BandEdge::Bottom, 0)
+                .expect("mounted bottom row");
+            let (cw, ch) = rt.live_cell_size();
+            let pad = f64::from(rt.window_padding_physical());
+            let delta = self.event(WindowEventKind::CursorMoved(CursorPosition {
+                x: pad + (f64::from(column) + 0.5) * f64::from(cw),
+                y: pad + (f64::from(row) + 0.5) * f64::from(ch),
+            }));
+            assert_eq!(delta, 0, "cursor input must not enter a VM");
+        }
+
+        fn mouse(&mut self, state: PressState) -> u64 {
+            self.event(WindowEventKind::MouseInput(MouseEvent::new(
+                MouseButton::Left,
+                state,
+            )))
+        }
+
+        fn assert_no_sinks(&self) {
+            assert!(self.app.window.handle.is_none());
+            assert!(self.app.window.os_title_sink.is_none());
+            assert!(self.app.window.os_cursor_sink.is_none());
+            assert!(self.app.pty_rx.is_none());
+            assert!(self.app._pty_thread.is_none());
+            assert_eq!(self.app.runtime.pty_size(), None);
+            assert!(!self.app.runtime.has_pty_writer());
+            assert!(self.operations.borrow().is_empty());
+        }
+
+        fn read_marker(&mut self) -> i64 {
+            let before = self.entries();
+            let result = self
+                .app
+                .plugin_runtime
+                .as_mut()
+                .expect("plugins")
+                .dispatch_command(&self.id, "read", &[])
+                .expect("separate marker read");
+            assert_eq!(self.entries() - before, 1, "marker read counted separately");
+            let LuaValue::Integer(marker) = result else {
+                panic!("bounded integer marker expected: {result:?}");
+            };
+            marker
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).expect("remove only owned fixture files");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Gesture {
+        ClickRelease,
+        Wheel,
+    }
+
+    fn input_must_not_enter_vm(gesture: Gesture) {
+        let mut fixture = Fixture::new(match gesture {
+            Gesture::ClickRelease => "release",
+            Gesture::Wheel => "wheel",
+        });
+        // Mouse reporting makes an orphan release observable in pending PTY
+        // bytes, without starting a process or attaching a writer.
+        fixture
+            .app
+            .runtime
+            .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        fixture.cursor(BOUND_COLUMN);
+        fixture.app.runtime.start_selection(Default::default());
+        let mut selected = fixture.app.runtime.selection().expect("selection anchor");
+        selected.focus.col = 1;
+        fixture.app.runtime.set_selection(selected);
+        assert!(fixture.app.runtime.has_selection());
+        fixture
+            .app
+            .runtime
+            .handle_ime_preedit(Some("composing".to_string()), Some(2));
+        let focus = fixture.app.runtime.focused_view();
+        let window_focus = fixture.app.runtime.is_window_focused();
+        let selection = fixture.app.runtime.selection();
+        let ime = fixture.app.runtime.ime_preedit().map(str::to_string);
+        let ime_area = fixture.app.runtime.ime_cursor_area();
+        let window_ime_area = fixture.app.window.ime_cursor_area;
+        let before = fixture.entries();
+        let delta = match gesture {
+            Gesture::ClickRelease => {
+                assert_eq!(fixture.mouse(PressState::Pressed), 0);
+                assert!(fixture.app.runtime.band_release_armed());
+                let delta = fixture.mouse(PressState::Released);
+                assert!(!fixture.app.runtime.band_release_armed());
+                assert_eq!(fixture.app.runtime.band_host_stats().clicks_routed, 1);
+                delta
+            }
+            Gesture::Wheel => {
+                let delta = fixture.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
+                    0.0,
+                    WHEEL_NOTCH,
+                )));
+                assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 1);
+                delta
+            }
+        };
+        // (a) ZERO owning-VM entries during input: the accepted gesture routed
+        // a bounded request into the runtime queue without entering the VM.
+        assert_eq!(
+            delta, 0,
+            "P0-AC-015: input callback must not enter owning VM"
+        );
+        assert_eq!(fixture.entries(), before, "no owning-VM entry during input");
+        assert!(
+            fixture.app.runtime.pending_input().is_empty(),
+            "no PTY report"
+        );
+        assert_eq!(fixture.app.runtime.focused_view(), focus);
+        assert_eq!(fixture.app.runtime.is_window_focused(), window_focus);
+        assert_eq!(fixture.app.runtime.selection(), selection);
+        assert_eq!(fixture.app.runtime.ime_preedit(), ime.as_deref());
+        assert_eq!(fixture.app.runtime.ime_cursor_area(), ime_area);
+        assert_eq!(fixture.app.window.ime_cursor_area, window_ime_area);
+        println!(
+            "{gesture:?}: owning VM input delta={delta}; routing accepted; PTY/selection/focus/IME unchanged"
+        );
+        // (b) exactly-once later cold delivery: the distinct cold pump enters
+        // the VM once and the queued command's bounded result surfaces.
+        assert_eq!(
+            fixture.app.deliver_band_input(),
+            1,
+            "one bounded request queued by the accepted input"
+        );
+        assert_eq!(
+            fixture.entries(),
+            before + 1,
+            "exactly one owning-VM entry on the cold pump"
+        );
+        fixture.assert_no_sinks();
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.input-boundary:step: 1"),
+            "the deferred command's bounded result surfaced"
+        );
+        // A second pump must not replay the already-consumed request.
+        assert_eq!(
+            fixture.app.deliver_band_input(),
+            0,
+            "cold pump delivers exactly once"
+        );
+        assert_eq!(
+            fixture.entries(),
+            before + 1,
+            "no replay on a second cold pump"
+        );
+        // (c) the deferred command ran exactly once: the plugin's own counter,
+        // read through a separate VM entry, matches one delivery.
+        let marker = fixture.read_marker();
+        assert_eq!(marker, 1, "deferred command ran exactly once");
+        println!("{gesture:?}: separate marker read delta=1, marker={marker}");
+    }
+
+    #[test]
+    fn input_vm_boundary_click_release_excludes_vm_entry() {
+        input_must_not_enter_vm(Gesture::ClickRelease);
+    }
+
+    #[test]
+    fn input_vm_boundary_wheel_excludes_vm_entry() {
+        input_must_not_enter_vm(Gesture::Wheel);
+    }
+
+    #[test]
+    fn input_vm_boundary_cold_pump_delivers_exactly_once() {
+        // (b) exactly-once later cold delivery, isolated: a bound wheel queues
+        // one bounded request; the distinct cold pump enters the owning VM
+        // exactly once and never replays the consumed request.
+        let mut fixture = Fixture::new("coldpump");
+        fixture.cursor(BOUND_COLUMN);
+        let before = fixture.entries();
+        assert_eq!(
+            fixture.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
+                0.0,
+                WHEEL_NOTCH
+            ))),
+            0,
+            "input must not enter the owning VM"
+        );
+        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 1);
+        assert_eq!(fixture.entries(), before, "no VM entry during input");
+        assert_eq!(fixture.app.deliver_band_input(), 1, "one deferred delivery");
+        assert_eq!(fixture.entries(), before + 1, "exactly one VM entry");
+        assert_eq!(fixture.app.deliver_band_input(), 0, "no replay");
+        assert_eq!(fixture.entries(), before + 1, "still exactly one");
+        assert_eq!(fixture.read_marker(), 1);
+        println!("coldpump: input delta=0; cold pump delta=1 exactly once; marker=1");
+    }
+
+    #[test]
+    fn input_vm_boundary_direct_command_positive_control() {
+        let mut fixture = Fixture::new("direct");
+        let before = fixture.entries();
+        let result = fixture
+            .app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugins")
+            .dispatch_command(&fixture.id, "step", &[])
+            .expect("valid direct command");
+        assert_eq!(fixture.entries() - before, 1);
+        assert_eq!(result, LuaValue::String("1".to_string()));
+        assert_eq!(fixture.read_marker(), 1);
+        println!(
+            "direct: one VM entry, bounded result 1; separate marker read: one VM entry, marker 1"
+        );
+    }
+
+    #[test]
+    fn input_vm_boundary_unbound_and_shift_fallthrough_controls() {
+        let mut fixture = Fixture::new("fallthrough");
+        let seed_lines = fixture.app.runtime.snapshot().height + EXTRA_SCROLLBACK_LINES;
+        fixture
+            .app
+            .runtime
+            .handle_pty_bytes(&b"fixture\r\n".repeat(seed_lines));
+        fixture
+            .app
+            .runtime
+            .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        fixture.cursor(UNBOUND_COLUMN);
+        let before = fixture.entries();
+        assert_eq!(
+            fixture.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
+                0.0,
+                WHEEL_NOTCH
+            ))),
+            0
+        );
+        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_unclaimed, 1);
+        assert!(
+            !fixture.app.runtime.pending_input().is_empty(),
+            "unbound wheel reaches mouse reporting"
+        );
+        fixture.app.runtime.drain_pending_input();
+        fixture.cursor(BOUND_COLUMN);
+        assert_eq!(
+            fixture.event(WindowEventKind::ModifiersChanged(ModifiersState {
+                shift: true,
+                control: false,
+                alt: false,
+                super_pressed: false,
+            })),
+            0
+        );
+        assert_eq!(fixture.mouse(PressState::Pressed), 0);
+        assert!(
+            !fixture.app.runtime.band_release_armed(),
+            "Shift selects terminal escape"
+        );
+        assert_eq!(fixture.mouse(PressState::Released), 0);
+        assert_eq!(
+            fixture.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
+                0.0,
+                WHEEL_NOTCH
+            ))),
+            0
+        );
+        assert_eq!(fixture.app.runtime.band_host_stats().clicks_routed, 0);
+        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 0);
+        let focused = fixture.app.runtime.focused_view().expect("focused leaf");
+        assert!(
+            fixture
+                .app
+                .runtime
+                .layout()
+                .find_leaf(focused)
+                .expect("live leaf")
+                .scroll_offset()
+                > 0,
+            "Shift wheel reaches the terminal scrollback viewport"
+        );
+        assert!(
+            fixture.app.runtime.pending_input().is_empty(),
+            "Shift emits no mouse report"
+        );
+        assert_eq!(fixture.entries(), before);
+        assert_eq!(
+            fixture.app.deliver_band_input(),
+            0,
+            "fall-through queued nothing for the cold pump"
+        );
+        assert_eq!(fixture.read_marker(), 0);
+        println!(
+            "fallthrough: unbound wheel reports to in-memory terminal input; Shift scrolls the terminal viewport; zero input VM entries; marker 0"
+        );
+    }
+
+    #[test]
+    fn input_vm_boundary_recording_context_refuses_windows() {
+        let operations = RefCell::new(Vec::new());
+        let mut context = EventContext::recording(&operations);
+        assert!(matches!(
+            context.create_window(bitty_platform::WindowConfig::new()),
+            Err(bitty_platform::PlatformError::WindowCreation(_))
+        ));
+        context.set_poll();
+        context.set_wait();
+        let deadline = std::time::Instant::now();
+        context.set_wait_until(deadline);
+        context.exit();
+        assert_eq!(
+            *operations.borrow(),
+            vec![
+                RecordingOperation::WindowCreationRefused,
+                RecordingOperation::Poll,
+                RecordingOperation::Wait,
+                RecordingOperation::WaitUntil(deadline),
+                RecordingOperation::Exit,
+            ]
+        );
+    }
+}
+
 #[test]
 fn parse_no_args_yields_defaults() {
     let raw = args_of(&["bitty"]);

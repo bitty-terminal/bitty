@@ -22,6 +22,8 @@ gui-tests = []
 # (`App::run` -> DisplayUnavailable) without requiring a window system.
 # CI never enables gui-tests; the default run proves headless still works.
 headless = []
+# In-memory EventContext backend; never enabled by default release builds.
+input-vm-test-support = []
 
 # Runs as a plain process entry point (`harness = false`) because winit
 # requires event-loop creation on the OS main thread; see the file header.

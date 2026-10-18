@@ -125,11 +125,47 @@ fn map_loop_error(error: EventLoopError) -> PlatformError {
 /// Borrowed per callback; methods are cheap and never block.
 #[derive(Debug)]
 pub struct EventContext<'a> {
-    event_loop: &'a ActiveEventLoop,
-    registry: &'a mut Registry,
+    backend: EventContextBackend<'a>,
+}
+
+#[derive(Debug)]
+enum EventContextBackend<'a> {
+    Live {
+        event_loop: &'a ActiveEventLoop,
+        registry: &'a mut Registry,
+    },
+    #[cfg(feature = "input-vm-test-support")]
+    Recording(&'a std::cell::RefCell<Vec<RecordingOperation>>),
+}
+
+/// Loop requests recorded without constructing an OS event loop or window.
+#[cfg(feature = "input-vm-test-support")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordingOperation {
+    /// Window creation was requested and refused with `WindowCreation`.
+    WindowCreationRefused,
+    /// Finish the event loop.
+    Exit,
+    /// Busy-poll.
+    Poll,
+    /// Wait indefinitely.
+    Wait,
+    /// Wait until the given monotonic deadline.
+    WaitUntil(std::time::Instant),
 }
 
 impl EventContext<'_> {
+    /// Constructs an in-memory context for explicitly opted-in handler tests.
+    /// This creates no registry, window, OS loop, proxy, or desktop sink.
+    #[cfg(feature = "input-vm-test-support")]
+    #[doc(hidden)]
+    pub fn recording(operations: &std::cell::RefCell<Vec<RecordingOperation>>) -> EventContext<'_> {
+        EventContext {
+            backend: EventContextBackend::Recording(operations),
+        }
+    }
+
     /// Creates a window according to `config`.
     ///
     /// # Errors
@@ -137,10 +173,24 @@ impl EventContext<'_> {
     /// Returns [`PlatformError::WindowCreation`] when the platform refuses
     /// the request; the upstream diagnostic text is preserved.
     pub fn create_window(&mut self, config: WindowConfig) -> Result<WindowHandle, PlatformError> {
+        let (event_loop, registry) = match &mut self.backend {
+            EventContextBackend::Live {
+                event_loop,
+                registry,
+            } => (event_loop, registry),
+            #[cfg(feature = "input-vm-test-support")]
+            EventContextBackend::Recording(operations) => {
+                operations
+                    .borrow_mut()
+                    .push(RecordingOperation::WindowCreationRefused);
+                return Err(PlatformError::WindowCreation(
+                    "recording context refuses native window creation".to_string(),
+                ));
+            }
+        };
         let blur_radius = config.blur_radius();
         let attributes = config.into_attributes();
-        let window = self
-            .event_loop
+        let window = event_loop
             .create_window(attributes)
             .map_err(|error| PlatformError::WindowCreation(error.to_string()))?;
 
@@ -149,7 +199,7 @@ impl EventContext<'_> {
             crate::blur::apply_blur(&window, blur_radius);
         }
 
-        let id = self.registry.register(&window.id());
+        let id = registry.register(&window.id());
         Ok(WindowHandle {
             id,
             window: Arc::new(window),
@@ -158,17 +208,23 @@ impl EventContext<'_> {
 
     /// Requests that the event loop finish after the current iteration.
     pub fn exit(&self) {
-        self.event_loop.exit();
+        match &self.backend {
+            EventContextBackend::Live { event_loop, .. } => event_loop.exit(),
+            #[cfg(feature = "input-vm-test-support")]
+            EventContextBackend::Recording(operations) => {
+                operations.borrow_mut().push(RecordingOperation::Exit);
+            }
+        }
     }
 
     /// Puts the loop into busy-polling mode (continuous redraw loops).
     pub fn set_poll(&self) {
-        self.event_loop.set_control_flow(ControlFlow::Poll);
+        self.set_control_flow(ControlFlow::Poll);
     }
 
     /// Puts the loop back into energy-saving wait mode (default).
     pub fn set_wait(&self) {
-        self.event_loop.set_control_flow(ControlFlow::Wait);
+        self.set_control_flow(ControlFlow::Wait);
     }
 
     /// Waits until `deadline` and then delivers
@@ -178,8 +234,23 @@ impl EventContext<'_> {
     /// busy-polling — the hover dwell delay uses it so focus still applies
     /// when the pointer stops moving and no further input events arrive.
     pub fn set_wait_until(&self, deadline: std::time::Instant) {
-        self.event_loop
-            .set_control_flow(ControlFlow::WaitUntil(deadline));
+        self.set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
+
+    fn set_control_flow(&self, control_flow: ControlFlow) {
+        match &self.backend {
+            EventContextBackend::Live { event_loop, .. } => {
+                event_loop.set_control_flow(control_flow)
+            }
+            #[cfg(feature = "input-vm-test-support")]
+            EventContextBackend::Recording(operations) => {
+                operations.borrow_mut().push(match control_flow {
+                    ControlFlow::Poll => RecordingOperation::Poll,
+                    ControlFlow::Wait => RecordingOperation::Wait,
+                    ControlFlow::WaitUntil(deadline) => RecordingOperation::WaitUntil(deadline),
+                });
+            }
+        }
     }
 }
 
@@ -567,8 +638,10 @@ impl<H: AppHandler> Adapter<H> {
     fn dispatch(&mut self, event_loop: &ActiveEventLoop, event: PlatformEvent) {
         let Self { handler, registry } = self;
         let mut ctx = EventContext {
-            event_loop,
-            registry,
+            backend: EventContextBackend::Live {
+                event_loop,
+                registry,
+            },
         };
         handler.handle_event(&mut ctx, event);
     }

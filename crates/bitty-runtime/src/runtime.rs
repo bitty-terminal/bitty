@@ -1535,6 +1535,7 @@ impl Runtime {
             pipeline_capacity,
             side_capacity,
             false,
+            Clipboard::new,
         )
     }
 
@@ -1563,6 +1564,28 @@ impl Runtime {
             DEFAULT_PLUGIN_PIPELINE_CAPACITY,
             DEFAULT_PLUGIN_SIDE_CAPACITY,
             true,
+            Clipboard::new,
+        )
+    }
+
+    /// Builds only the finite input/VM regression's in-memory runtime.
+    /// Default configuration has no image paths or roots; deterministic glyphs,
+    /// software surface, and headless clipboard are selected before creation.
+    /// Ordinary constructors retain their original backend selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation/render errors as [`Self::new`].
+    #[cfg(feature = "input-vm-test-support")]
+    #[doc(hidden)]
+    pub fn for_input_vm_regression() -> Result<Self, RuntimeError> {
+        Self::with_plugin_host_capacity_and_rasterizer(
+            RuntimeConfig::default(),
+            DEFAULT_PLUGIN_DROP_POLICY,
+            DEFAULT_PLUGIN_PIPELINE_CAPACITY,
+            DEFAULT_PLUGIN_SIDE_CAPACITY,
+            true,
+            Clipboard::new_headless,
         )
     }
 
@@ -1572,6 +1595,7 @@ impl Runtime {
         pipeline_capacity: usize,
         side_capacity: usize,
         deterministic_rasterizer: bool,
+        make_clipboard: fn() -> Clipboard,
     ) -> Result<Self, RuntimeError> {
         config.validate()?;
         if pipeline_capacity == 0 || side_capacity == 0 {
@@ -1666,7 +1690,7 @@ impl Runtime {
             layout,
             focus,
             container,
-            clipboard: Clipboard::new(),
+            clipboard: make_clipboard(),
             selection_state: None,
             click_tracker: ClickTracker::new(),
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,

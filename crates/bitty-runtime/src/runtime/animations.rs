@@ -925,7 +925,14 @@ mod tests {
 
     fn bounds(x: i32, y: i32, w: u32, h: u32) -> PanelBounds {
         let frame = bitty_render::geometry::RectPx::new(x, y, w, h);
-        let content = bitty_render::geometry::RectPx::new(x + 2, y + 2, w - 4, h - 4);
+        // Saturating so degenerate fixtures (`0x0`) stay valid under the CI
+        // profile's overflow checks instead of panicking in the helper.
+        let content = bitty_render::geometry::RectPx::new(
+            x.saturating_add(2),
+            y.saturating_add(2),
+            w.saturating_sub(4),
+            h.saturating_sub(4),
+        );
         PanelBounds { frame, content }
     }
 

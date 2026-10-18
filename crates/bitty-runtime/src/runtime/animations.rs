@@ -12,18 +12,28 @@
 //!
 //! Split open/close, single-pane zoom, and workspace switches (CTX-1078,
 //! issue #1755) ride this same contract: the layout commits its final state
-//! immediately (geometry and terminal content are never interpolated) and
-//! only the Core-owned decoration ring fades over the configured duration
-//! with a smooth cubic easing (`ease_in_out` smoothstep is degree-3, the
-//! `spring` name resolves to it with zero overshoot). They are detected from
-//! the `View`-set delta and the active-workspace index on the next present
-//! with a virtual-clock seam, so tests advance time deterministically.
+//! immediately (terminal truth, PTY size, and hit-testing are final on the
+//! first frame) and the Core-owned decoration ring fades over the configured
+//! duration with a smooth cubic easing (`ease_in_out` smoothstep is degree-3,
+//! the `spring` name resolves to it with zero overshoot). They are detected
+//! from the `View`-set delta and the active-workspace index on the next
+//! present with a virtual-clock seam, so tests advance time deterministically.
+//!
+//! CTX-1335 (issue #2113) adds paint-only panel-bounds interpolation on the
+//! same seam: when a live `View`'s frame/content changes, the committed start
+//! and end [`PanelBounds`] are captured and the painting path interpolates
+//! between them over the existing duration/easing. The logical layout,
+//! terminal grid, cursor, selection, scrollback, input hit-testing, and plugin
+//! execution phase never observe the interpolated values. Instant, reduced
+//! motion, safe mode, and capacity overflow all paint the committed end state
+//! immediately.
 //!
 //! Move/resize/drag (CTX-0967, issue #1696) are Hyprland-style geometry gestures:
 //! the layout commits its final state immediately (terminal content is never
-//! interpolated) and only the Core-owned decoration ring fades over the
-//! configured duration. They are triggered directly from the gesture paths
-//! (Alt-drag float move, border-drag ratio change, keyboard resize, panel
+//! interpolated) and the Core-owned decoration ring fades over the configured
+//! duration; CTX-1335 also interpolates their painted bounds when the tracked
+//! start/end rects are available. They are triggered directly from the gesture
+//! paths (Alt-drag float move, border-drag ratio change, keyboard resize, panel
 //! reparent) rather than detected from the `View`-set delta, because a move or
 //! resize keeps the same `View` set.
 //!
@@ -245,6 +255,85 @@ impl AnimationPolicy {
     }
 }
 
+/// Panel bounds that may be interpolated across a transition (CTX-1335).
+///
+/// Both rectangles are presentation-only: the layout, PTY size, hit-testing,
+/// and terminal truth commit once at the transition start. Only these painted
+/// bounds move between the committed start and end snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelBounds {
+    /// Decoration-inclusive frame rectangle, physical px.
+    pub frame: bitty_render::geometry::RectPx,
+    /// Painted content rectangle inside the border, physical px.
+    pub content: bitty_render::geometry::RectPx,
+}
+
+impl PanelBounds {
+    /// Interpolates `from` toward `to` at eased progress `p` (clamped).
+    ///
+    /// Rounds each edge independently with deterministic integer math, so
+    /// tests on a virtual clock observe the exact same rectangles on every
+    /// platform. Sizes saturate at zero rather than wrapping when a shrinking
+    /// rectangle crosses its end.
+    #[must_use]
+    pub fn lerp(from: Self, to: Self, p: f32) -> Self {
+        let p = if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) };
+        Self {
+            frame: lerp_rect(from.frame, to.frame, p),
+            content: lerp_rect(from.content, to.content, p),
+        }
+    }
+
+    /// Translates both rectangles by `(dx, dy)` pixels.
+    #[must_use]
+    pub fn translated(self, dx: i32, dy: i32) -> Self {
+        Self {
+            frame: translate_rect(self.frame, dx, dy),
+            content: translate_rect(self.content, dx, dy),
+        }
+    }
+}
+
+/// Deterministic integer interpolation of one axis value.
+fn lerp_axis(from: i64, to: i64, p: f32) -> i64 {
+    let delta = (to as f64) - (from as f64);
+    let value = (from as f64) + delta * f64::from(p);
+    // `as i64` saturates, so hostile values cannot wrap.
+    value.round() as i64
+}
+
+/// Interpolates two rectangles without overflow.
+fn lerp_rect(
+    from: bitty_render::geometry::RectPx,
+    to: bitty_render::geometry::RectPx,
+    p: f32,
+) -> bitty_render::geometry::RectPx {
+    let x = lerp_axis(i64::from(from.x), i64::from(to.x), p);
+    let y = lerp_axis(i64::from(from.y), i64::from(to.y), p);
+    let width = lerp_axis(i64::from(from.width), i64::from(to.width), p).max(0);
+    let height = lerp_axis(i64::from(from.height), i64::from(to.height), p).max(0);
+    bitty_render::geometry::RectPx::new(
+        i32::try_from(x).unwrap_or(if x < 0 { i32::MIN } else { i32::MAX }),
+        i32::try_from(y).unwrap_or(if y < 0 { i32::MIN } else { i32::MAX }),
+        u32::try_from(width).unwrap_or(u32::MAX),
+        u32::try_from(height).unwrap_or(u32::MAX),
+    )
+}
+
+/// Translates one rectangle with saturating arithmetic.
+fn translate_rect(
+    rect: bitty_render::geometry::RectPx,
+    dx: i32,
+    dy: i32,
+) -> bitty_render::geometry::RectPx {
+    bitty_render::geometry::RectPx::new(
+        rect.x.saturating_add(dx),
+        rect.y.saturating_add(dy),
+        rect.width,
+        rect.height,
+    )
+}
+
 /// One active animation on a surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveAnimation {
@@ -253,6 +342,15 @@ struct ActiveAnimation {
     surface: Option<ViewId>,
     started: Instant,
     duration: Duration,
+    /// CTX-1335: painted bounds captured when the transition armed. `None`
+    /// for ring-only transitions (open/close/focus), so geometry stays at the
+    /// committed final state exactly as before.
+    bounds: Option<(PanelBounds, PanelBounds)>,
+    /// Whether the entry owns an independent ring fade armed through
+    /// [`PanelAnimator::trigger`]. A bounds-only entry (`false`) is removed
+    /// outright when its geometry is cancelled; a ring entry keeps fading
+    /// with its bounds cleared.
+    ring: bool,
 }
 
 impl ActiveAnimation {
@@ -322,9 +420,22 @@ impl PanelAnimator {
             self.clear_surface(surface);
             return false;
         }
-        // Restart (bounded) any existing animation on the same surface.
-        self.active
-            .retain(|a| !(a.kind == kind && a.surface == surface));
+        // Restart (bounded) any existing animation of the same kind on the
+        // surface. Close and the gesture kinds also drop an in-flight bounds
+        // tween on that surface (the surface is going away, or the gesture
+        // re-arms its own geometry on the next present). Focus/Open/Workspace
+        // leave bounds interpolation untouched: they share the same surface
+        // without conflicting with its painted geometry (CTX-1335).
+        let replaces_bounds = matches!(
+            kind,
+            AnimationKind::Close
+                | AnimationKind::Move
+                | AnimationKind::Resize
+                | AnimationKind::Drag
+        );
+        self.active.retain(|a| {
+            !(a.surface == surface && (a.kind == kind || (replaces_bounds && a.bounds.is_some())))
+        });
         if self.active.len() >= MAX_CONCURRENT_ANIMATIONS {
             // Capacity exceeded: commit the end state immediately. Drop an
             // existing finished animation first so a stale entry cannot
@@ -339,8 +450,229 @@ impl PanelAnimator {
             surface,
             started: now,
             duration,
+            bounds: None,
+            ring: true,
         });
         true
+    }
+
+    /// Arms a geometry transition for `surface` from `from` to `to` at `now`.
+    ///
+    /// Returns `true` when the painted bounds are now interpolating, or
+    /// `false` when the policy resolves to an instant cut (zero duration) or
+    /// the bounded capacity is exhausted; in both cases the caller paints the
+    /// committed end state immediately. The transition uses `kind`'s accepted
+    /// duration and easing, except when it rides an in-flight drag gesture
+    /// (which keeps that gesture's accepted clock), and replaces any other
+    /// in-flight geometry transition on the same surface so two bounds
+    /// animations never blend.
+    pub fn trigger_bounds(
+        &mut self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        from: PanelBounds,
+        to: PanelBounds,
+        now: Instant,
+    ) -> bool {
+        self.trigger_bounds_at(kind, surface, from, to, now, now)
+    }
+
+    /// Arms a geometry transition whose clock started at `started`.
+    ///
+    /// Gesture paths arm their ring transition before the next present; the
+    /// present-time detector reuses that start so the bounds do not restart
+    /// half-way through the gesture's accepted duration.
+    pub fn trigger_bounds_at(
+        &mut self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        from: PanelBounds,
+        to: PanelBounds,
+        started: Instant,
+        now: Instant,
+    ) -> bool {
+        let duration = self.policy.duration(kind);
+        if duration.is_zero() {
+            self.cancel_bounds(surface);
+            return false;
+        }
+        // One geometry transition per surface: reuse the same-kind slot, or
+        // attach to an in-flight Alt+drag gesture entry (CTX-1335 F3). The
+        // drag ring already owns the surface's accepted duration, so its
+        // bounds ride that entry instead of consuming a second budget slot
+        // and multiplying the ring alpha.
+        if let Some(index) = self.bounds_host(kind, surface, now) {
+            let mut entry = self.active.remove(index);
+            self.active
+                .retain(|a| !(a.surface == surface && a.bounds.is_some()));
+            if entry.kind == kind {
+                entry.started = started;
+                entry.duration = duration;
+            }
+            entry.bounds = Some((from, to));
+            self.active.push(entry);
+            return true;
+        }
+        // No reusable slot: replace any stale bounds entry deterministically
+        // (a different kind must never keep painting its old end rectangle).
+        self.active
+            .retain(|a| !(a.surface == surface && a.bounds.is_some()));
+        if self.active.len() >= MAX_CONCURRENT_ANIMATIONS {
+            self.active.retain(|a| !a.done(now));
+            if self.active.len() >= MAX_CONCURRENT_ANIMATIONS {
+                return false;
+            }
+        }
+        self.active.push(ActiveAnimation {
+            kind,
+            surface,
+            started,
+            duration,
+            bounds: Some((from, to)),
+            ring: false,
+        });
+        true
+    }
+
+    /// Index of the entry that can host a bounds tween for `kind` on
+    /// `surface`: a same-kind slot, or an in-flight Alt+drag gesture entry
+    /// (CTX-1335 F3).
+    fn bounds_host(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> Option<usize> {
+        let mut drag_host = None;
+        for (index, animation) in self.active.iter().enumerate() {
+            if animation.surface != surface || animation.done(now) {
+                continue;
+            }
+            if animation.kind == kind {
+                return Some(index);
+            }
+            if animation.kind == AnimationKind::Drag
+                && matches!(kind, AnimationKind::Move | AnimationKind::Resize)
+            {
+                drag_host = Some(index);
+            }
+        }
+        drag_host
+    }
+
+    /// Whether [`Self::trigger_bounds_at`] would reuse an existing entry
+    /// instead of consuming a new budget slot.
+    #[must_use]
+    pub(crate) fn has_bounds_host(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> bool {
+        self.bounds_host(kind, surface, now).is_some()
+    }
+
+    /// Cancels the bounds tween on `surface` without touching an independent
+    /// ring fade. Returns whether anything was cancelled.
+    ///
+    /// A bounds-only entry is removed (nothing else would paint); a ring
+    /// entry keeps its accepted fade with `bounds: None`, so the next paint
+    /// uses the committed end rectangle immediately (CTX-1335 F1/F2).
+    pub(crate) fn cancel_bounds(&mut self, surface: Option<ViewId>) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.active.len() {
+            let animation = self.active[index];
+            if animation.surface == surface && animation.bounds.is_some() {
+                changed = true;
+                if animation.ring {
+                    self.active[index].bounds = None;
+                    index += 1;
+                } else {
+                    self.active.remove(index);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        changed
+    }
+
+    /// Start instant of an active animation of `kind` on `surface`, if any.
+    #[must_use]
+    pub fn active_started(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.active
+            .iter()
+            .find(|a| a.kind == kind && a.surface == surface && !a.done(now))
+            .map(|a| a.started)
+    }
+
+    /// Earliest start instant among active gesture geometry transitions
+    /// (move/resize/drag, any surface), if any.
+    ///
+    /// A gesture that reparents one panel also changes its siblings' bounds;
+    /// those siblings join the gesture's clock instead of starting a fresh
+    /// transition on the next present.
+    #[must_use]
+    pub fn earliest_geometry_started(&self, now: Instant) -> Option<Instant> {
+        self.active
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    AnimationKind::Move | AnimationKind::Resize | AnimationKind::Drag
+                ) && !a.done(now)
+            })
+            .map(|a| a.started)
+            .min()
+    }
+
+    /// The eased, interpolated bounds of the active geometry transition on
+    /// `surface`, or `None` when it is not animating (caller paints the
+    /// committed end state).
+    #[must_use]
+    pub fn interpolated_bounds(
+        &self,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> Option<PanelBounds> {
+        self.active
+            .iter()
+            .find(|a| a.surface == surface && a.bounds.is_some() && !a.done(now))
+            .and_then(|a| {
+                let (from, to) = a.bounds?;
+                let progress = self.policy.curve(a.kind).eval(a.progress(now));
+                Some(PanelBounds::lerp(from, to, progress))
+            })
+    }
+
+    /// Whether at least one geometry transition is currently interpolating.
+    #[must_use]
+    pub fn bounds_active(&self, now: Instant) -> bool {
+        self.active
+            .iter()
+            .any(|a| a.bounds.is_some() && !a.done(now))
+    }
+
+    /// Drops one in-flight bounds transition to make room for a ring
+    /// transition at the shared capacity bound.
+    ///
+    /// Geometry interpolation is additive presentation (CTX-1335); the
+    /// accepted open/close/focus/move ring transitions keep priority when a
+    /// hostile trigger storm reaches [`MAX_CONCURRENT_ANIMATIONS`]. The
+    /// dropped surface paints its committed end state immediately.
+    pub fn drop_one_bounds(&mut self, now: Instant) -> bool {
+        self.active.retain(|a| !a.done(now));
+        if let Some(index) = self.active.iter().position(|a| a.bounds.is_some()) {
+            self.active.remove(index);
+            return true;
+        }
+        false
     }
 
     /// Drops any animation for `surface` of any kind (e.g. the surface was
@@ -591,6 +923,257 @@ mod tests {
         assert!(anim.tick(end));
     }
 
+    fn bounds(x: i32, y: i32, w: u32, h: u32) -> PanelBounds {
+        let frame = bitty_render::geometry::RectPx::new(x, y, w, h);
+        // Saturating so degenerate fixtures (`0x0`) stay valid under the CI
+        // profile's overflow checks instead of panicking in the helper.
+        let content = bitty_render::geometry::RectPx::new(
+            x.saturating_add(2),
+            y.saturating_add(2),
+            w.saturating_sub(4),
+            h.saturating_sub(4),
+        );
+        PanelBounds { frame, content }
+    }
+
+    #[test]
+    fn panel_bounds_interpolation_is_exact_at_endpoints_and_monotone() {
+        let from = bounds(10, 20, 100, 60);
+        let to = bounds(50, 40, 200, 120);
+        assert_eq!(PanelBounds::lerp(from, to, 0.0), from);
+        assert_eq!(PanelBounds::lerp(from, to, 1.0), to);
+        // Deterministic midpoint: every edge is the rounded average.
+        let mid = PanelBounds::lerp(from, to, 0.5);
+        assert_eq!(mid.frame.x, 30);
+        assert_eq!(mid.frame.y, 30);
+        assert_eq!(mid.frame.width, 150);
+        assert_eq!(mid.frame.height, 90);
+        assert_eq!(mid.content.x, 32);
+        assert_eq!(mid.content.width, 146);
+        // Out-of-range and non-finite progress clamp instead of extrapolating.
+        assert_eq!(PanelBounds::lerp(from, to, -1.0), from);
+        assert_eq!(PanelBounds::lerp(from, to, 2.0), to);
+        assert_eq!(PanelBounds::lerp(from, to, f32::NAN), from);
+        // A shrinking rectangle never reports a wrapped span.
+        let empty = PanelBounds::lerp(bounds(0, 0, 4, 4), bounds(0, 0, 0, 0), 0.5);
+        assert_eq!(empty.frame.width, 2);
+        assert_eq!(empty.frame.height, 2);
+    }
+
+    #[test]
+    fn bounds_transition_interpolates_and_closes_the_wakeup_gate() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(21);
+        let from = bounds(0, 0, 80, 40);
+        let to = bounds(80, 40, 160, 80);
+        assert!(anim.trigger_bounds(AnimationKind::Move, Some(view), from, to, now));
+        assert!(anim.bounds_active(now));
+        assert_eq!(anim.interpolated_bounds(Some(view), now), Some(from));
+        let mid = now + Duration::from_millis(75);
+        let mid_bounds = anim
+            .interpolated_bounds(Some(view), mid)
+            .expect("mid bounds");
+        assert_ne!(mid_bounds, from);
+        assert_ne!(mid_bounds, to);
+        // The same transition also drives the existing ring fade slot and the
+        // frame-on-demand deadline.
+        assert!(
+            anim.progress(AnimationKind::Move, Some(view), mid)
+                .is_some()
+        );
+        assert!(anim.next_deadline(mid).is_some());
+        let end = now + Duration::from_millis(150);
+        assert!(!anim.bounds_active(end));
+        assert_eq!(anim.interpolated_bounds(Some(view), end), None);
+        assert_eq!(anim.next_deadline(end), None);
+        assert!(anim.tick(end));
+    }
+
+    #[test]
+    fn instant_bounds_trigger_cuts_immediately_and_never_accumulates() {
+        let now = t0();
+        for policy in [
+            AnimationPolicy {
+                enabled: false,
+                ..AnimationPolicy::default()
+            },
+            AnimationPolicy {
+                reduced_motion: ReducedMotionMode::Always,
+                ..AnimationPolicy::default()
+            },
+            AnimationPolicy {
+                safe_mode: true,
+                ..AnimationPolicy::default()
+            },
+            AnimationPolicy {
+                duration_ms: [0; AnimationKind::COUNT],
+                ..AnimationPolicy::default()
+            },
+        ] {
+            let mut anim = PanelAnimator::new(policy);
+            let view = ViewId::new(22);
+            assert!(
+                !anim.trigger_bounds(
+                    AnimationKind::Move,
+                    Some(view),
+                    bounds(0, 0, 10, 10),
+                    bounds(20, 20, 30, 30),
+                    now,
+                ),
+                "{policy:?} must cut geometry instantly"
+            );
+            assert!(!anim.bounds_active(now), "{policy:?}");
+            assert_eq!(anim.interpolated_bounds(Some(view), now), None);
+            assert_eq!(anim.next_deadline(now), None);
+        }
+    }
+
+    #[test]
+    fn bounds_transitions_share_the_concurrent_surface_cap() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        for i in 0..MAX_CONCURRENT_ANIMATIONS {
+            let view = ViewId::new(i as u64 + 1);
+            assert!(anim.trigger_bounds(
+                AnimationKind::Move,
+                Some(view),
+                bounds(0, 0, 10, 10),
+                bounds(10, 10, 20, 20),
+                now,
+            ));
+        }
+        // One past the cap commits the end state immediately (no queue).
+        assert!(!anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(ViewId::new(999)),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), MAX_CONCURRENT_ANIMATIONS);
+    }
+
+    #[test]
+    fn bounds_reuse_same_kind_and_drag_slots_without_double_counting() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let moved = ViewId::new(30);
+        let dragged = ViewId::new(31);
+
+        // A same-kind ring slot is reused instead of consuming another
+        // budget entry (CTX-1335 F4).
+        assert!(anim.trigger(AnimationKind::Move, Some(moved), now));
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(moved),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(anim.has_bounds_host(AnimationKind::Move, Some(moved), now));
+
+        // An in-flight Alt+drag gesture hosts the per-view move bounds: one
+        // surface, one budget entry, one ring alpha factor (CTX-1335 F3).
+        assert!(anim.trigger(AnimationKind::Drag, Some(dragged), now));
+        assert!(anim.has_bounds_host(AnimationKind::Move, Some(dragged), now));
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(dragged),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 2);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some()
+        );
+        assert!(
+            anim.progress(AnimationKind::Move, Some(dragged), now)
+                .is_none(),
+            "bounds must ride the drag entry, not add a second Move entry"
+        );
+
+        // Cancelling geometry keeps the independent drag ring fade.
+        assert!(anim.cancel_bounds(Some(dragged)));
+        assert_eq!(anim.interpolated_bounds(Some(dragged), now), None);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some()
+        );
+        assert!(!anim.cancel_bounds(Some(dragged)));
+    }
+
+    #[test]
+    fn different_kind_bounds_are_replaced_not_blended_and_cancel_cleans_up() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(32);
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(40, 20, 50, 40),
+            now,
+        ));
+        let mid = now + Duration::from_millis(60);
+        let moved = anim
+            .interpolated_bounds(Some(view), mid)
+            .expect("move tween");
+        // A different kind replaces the in-flight tween deterministically.
+        assert!(anim.trigger_bounds(
+            AnimationKind::Resize,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(60, 30, 70, 50),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 1, "one bounds entry per surface");
+        assert!(
+            anim.progress(AnimationKind::Move, Some(view), mid)
+                .is_none()
+        );
+        assert!(
+            anim.progress(AnimationKind::Resize, Some(view), mid)
+                .is_some()
+        );
+        assert_ne!(anim.interpolated_bounds(Some(view), mid), Some(moved));
+        // A bounds-only entry disappears on cancel: nothing else paints.
+        assert!(anim.cancel_bounds(Some(view)));
+        assert_eq!(anim.active_count(now), 0);
+        assert!(!anim.bounds_active(now));
+        assert!(!anim.cancel_bounds(Some(view)));
+    }
+
+    #[test]
+    fn overflow_drops_bounds_before_ring_transitions() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(33);
+        let focused = ViewId::new(34);
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert!(anim.trigger(AnimationKind::Focus, Some(focused), now));
+        assert!(anim.drop_one_bounds(now));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(anim.interpolated_bounds(Some(view), now).is_none());
+        assert!(
+            anim.progress(AnimationKind::Focus, Some(focused), now)
+                .is_some()
+        );
+        assert!(
+            !anim.drop_one_bounds(now),
+            "nothing left to drop: no bounds entry"
+        );
+    }
+
     #[test]
     fn instant_policy_never_arms_and_reports_inactive() {
         let now = t0();
@@ -761,8 +1344,9 @@ mod tests {
         // config layer resolves `spring` to `ease_in_out`. The resolved curve
         // never overshoots: every sample stays in `0..=1`, so the overshoot
         // bound is zero and a settled value always lands exactly on target.
-        // Geometry and content are never interpolated; only the chrome ring
-        // fades, so there is no spring displacement to bound beyond this.
+        // CTX-1335 interpolates painted bounds with this same resolved curve,
+        // so a spring-named transition still has zero overshoot: every edge
+        // stays between its committed start and end rectangles.
         let resolved = AnimationCurve::EaseInOut;
         let mut max = 0.0_f32;
         let mut min = 1.0_f32;

@@ -1,21 +1,29 @@
 #![forbid(unsafe_code)]
 //! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag;
-//! CTX-1078 splits/zoom/workspaces).
+//! CTX-1078 splits/zoom/workspaces; CTX-1335 paint geometry).
 //!
 //! Pins the runtime wiring of the accepted contract:
 //! - a new split `View` arms a bounded open transition and presents extra
 //!   frames while active; when it completes the present path idles again
 //!   (frame-on-demand, PB-7: zero wakeups after completion);
 //! - single-pane zoom engage/disengage arms bounded close/open transitions
-//!   through the same chrome-ring fade (geometry and content commit
-//!   immediately, never interpolated);
+//!   through the same chrome-ring fade; the logical layout, PTY size,
+//!   content, and hit-test frames commit immediately (CTX-1335 adds
+//!   paint-only bounds interpolation);
 //! - workspace switches (new/switch/prev/next/last) arm the bounded
-//!   workspace transition with the same virtual-clock seam;
+//!   workspace cross-fade and slide the committed incoming bounds in with
+//!   the same virtual-clock seam;
 //! - panel move (same-workspace reposition, cross-workspace reparent),
 //!   panel resize (border-drag divider, keyboard step), and panel drag
 //!   (Alt+drag float move) arm their own bounded transitions from the
 //!   gesture paths; the layout commits immediately and only Core-owned
-//!   chrome fades (terminal content is never interpolated);
+//!   chrome fades plus the painted bounds interpolate (terminal content is
+//!   never interpolated);
+//! - CTX-1335 geometry interpolation is paint-only: start/mid/end painted
+//!   bounds run on the virtual clock while `present_frames()` stays final;
+//!   instant/reduced/safe policies paint the end bounds on the first frame,
+//!   and float detach/restore (tier changes) fail closed to instant bounds
+//!   so the opaque float cover never bleeds the base beneath it;
 //! - the `now`-parameterized `tick_at` seam lets tests advance virtual time
 //!   deterministically, so no wall-clock sleeps are needed;
 //! - `enabled = false`, `reduced_motion = "always"`, `safe_mode`, and `0` ms
@@ -30,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
 use bitty_runtime::{
-    AnimationCurve, AnimationKind, AnimationPolicy, LayoutNode, ReducedMotionMode, Runtime,
-    RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+    AnimationCurve, AnimationKind, AnimationPolicy, LayoutNode, MAX_CONCURRENT_ANIMATIONS,
+    OverlayTier, ReducedMotionMode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
 
 fn runtime_with(policy: AnimationPolicy) -> Runtime {
@@ -551,6 +559,592 @@ fn terminal_grid_is_never_interpolated() {
     assert_eq!(row, "GRID-TRUTH", "grid content is never animated");
 }
 
+// ── CTX-1335: paint-only panel-bounds interpolation ──────────────────────
+
+fn frame_for(frames: &[bitty_runtime::PresentFrame], view: ViewId) -> bitty_runtime::PresentFrame {
+    *frames
+        .iter()
+        .find(|frame| frame.view == view)
+        .expect("view must be present")
+}
+
+#[test]
+fn split_resizes_interpolate_pane_bounds_on_the_virtual_clock() {
+    // A split commits the final layout, PTY size, and hit-test geometry on
+    // the first frame; only the painted bounds move from the committed start
+    // to the committed end over the accepted Resize duration.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none());
+    let before = frame_for(&rt.present_frames(), ViewId::new(1));
+
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let logical = rt.present_frames();
+    let target = frame_for(&logical, ViewId::new(1));
+    assert_ne!(before.frame, target.frame, "split resizes the kept pane");
+
+    // Frame zero paints the committed start bounds; hit-testing already sees
+    // the committed end bounds.
+    let painted_start = frame_for(&rt.paint_frames_at(start), ViewId::new(1));
+    assert_eq!(painted_start.frame, before.frame);
+    assert_eq!(painted_start.content, before.content);
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "logical/hit-test frames never animate"
+    );
+
+    let mid = start + Duration::from_millis(60);
+    rt.tick_at(mid).expect("mid frame presents");
+    let painted_mid = frame_for(&rt.paint_frames_at(mid), ViewId::new(1));
+    assert_ne!(painted_mid.frame, before.frame, "mid must have moved");
+    assert_ne!(painted_mid.frame, target.frame, "mid must not be final");
+    // The kept pane shrinks: its width interpolates monotonically between the
+    // committed start and end spans.
+    let lo = before.frame.width.min(target.frame.width);
+    let hi = before.frame.width.max(target.frame.width);
+    assert!(
+        (lo..=hi).contains(&painted_mid.frame.width),
+        "mid width {} must lie between {lo} and {hi}",
+        painted_mid.frame.width
+    );
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "hit-testing stays final during the animation"
+    );
+
+    // Open is 150 ms, so the whole split settles by then; the final frame is
+    // the exact committed end state and the present path idles.
+    let end = start + Duration::from_millis(150);
+    rt.tick_at(end).expect("final frame commits");
+    let painted_end = frame_for(&rt.paint_frames_at(end), ViewId::new(1));
+    assert_eq!(painted_end.frame, target.frame);
+    assert_eq!(painted_end.content, target.content);
+    assert!(!rt.animations_active());
+    assert!(rt.tick_at(end).is_none());
+    assert_eq!(rt.animation_deadline(), None);
+}
+
+#[test]
+fn instant_reduced_and_safe_paths_skip_bounds_interpolation() {
+    // First-class instant paths: disabled, reduced motion, safe mode, and
+    // zero durations all paint the committed end bounds on the first frame
+    // and produce no extra animation wakeups.
+    for policy in [
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: [0; AnimationKind::COUNT],
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let _ = rt.tick_at(start).expect("baseline presents");
+        rt.set_layout(two_pane_split());
+        let _ = rt.tick_at(start).expect("split presents");
+        let logical = rt.present_frames();
+        let paint = rt.paint_frames_at(start);
+        assert_eq!(
+            paint, logical,
+            "instant path must use final bounds: {policy:?}"
+        );
+        assert!(!rt.animations_active(), "{policy:?}");
+        assert!(rt.tick_at(start).is_none(), "{policy:?}");
+        assert_eq!(rt.animation_deadline(), None, "{policy:?}");
+    }
+}
+
+#[test]
+fn workspace_switch_slides_committed_bounds_without_touching_hits() {
+    // A workspace switch stashes the outgoing workspace and slides the
+    // committed incoming bounds in from the direction of travel alongside
+    // the accepted cross-fade.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none());
+
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(start).expect("switch presents");
+    let logical = rt.present_frames();
+    let target = logical
+        .first()
+        .expect("incoming workspace frame")
+        .to_owned();
+
+    let painted_start = frame_for(&rt.paint_frames_at(start), target.view);
+    assert!(
+        painted_start.frame.x > target.frame.x,
+        "next workspace slides in from the right: {} must start right of {}",
+        painted_start.frame.x,
+        target.frame.x
+    );
+    assert_eq!(painted_start.frame.width, target.frame.width);
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "workspace switch hit-test geometry is final"
+    );
+
+    let mid = start + Duration::from_millis(100);
+    rt.tick_at(mid).expect("mid frame presents");
+    let painted_mid = frame_for(&rt.paint_frames_at(mid), target.view);
+    assert!(
+        painted_mid.frame.x < painted_start.frame.x && painted_mid.frame.x > target.frame.x,
+        "mid slide {} must lie between {} and {}",
+        painted_mid.frame.x,
+        painted_start.frame.x,
+        target.frame.x
+    );
+    assert_eq!(rt.present_frames(), logical);
+
+    let end = start + Duration::from_millis(200);
+    rt.tick_at(end).expect("final frame commits");
+    let painted_end = frame_for(&rt.paint_frames_at(end), target.view);
+    assert_eq!(painted_end.frame, target.frame);
+    assert_eq!(painted_end.content, target.content);
+    assert!(!rt.animations_active());
+    assert!(rt.tick_at(end).is_none());
+}
+
+#[test]
+fn workspace_slide_is_instant_under_reduced_motion() {
+    for policy in [
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let _ = rt.tick_at(start).expect("baseline presents");
+        rt.workspace_new().expect("new workspace");
+        let _ = rt.tick_at(start).expect("switch presents");
+        assert_eq!(
+            rt.paint_frames_at(start),
+            rt.present_frames(),
+            "reduced/instant workspace must paint final bounds: {policy:?}"
+        );
+        assert!(!rt.animations_active(), "{policy:?}");
+        assert!(rt.tick_at(start).is_none(), "{policy:?}");
+    }
+}
+
+/// Physical cursor position at fractional (`fx`, `fy`) offsets inside
+/// `view`'s committed present frame, derived from public geometry only.
+fn point_in_frame(rt: &Runtime, view: ViewId, fx: f64, fy: f64) -> CursorPosition {
+    let frame = frame_for(&rt.present_frames(), view);
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.frame.x) + f64::from(frame.frame.width) * fx,
+        y: pad + f64::from(frame.frame.y) + f64::from(frame.frame.height) * fy,
+    }
+}
+
+#[test]
+fn float_tier_changes_cut_a_mid_tween_bounds_tween() {
+    // CTX-1335 F1: a detach or restore during an in-flight geometry tween
+    // must cancel it, not merely decline to re-arm. The painted frame is the
+    // committed rect on the first present after the tier flips, so the float
+    // cover/occluders can never own an obsolete rectangle.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let mid = start + Duration::from_millis(30);
+    rt.tick_at(mid).expect("mid tween frame presents");
+    assert!(
+        rt.paint_frames_at(mid) != rt.present_frames(),
+        "a split resize tween is actually in flight"
+    );
+
+    rt.toggle_floating(Some(ViewId::new(1)))
+        .expect("detach view 1");
+    let after = start + Duration::from_millis(40);
+    let _ = rt.tick_at(after);
+    let target = frame_for(&rt.present_frames(), ViewId::new(1));
+    assert_eq!(target.tier, Some(OverlayTier::Float));
+    let painted = frame_for(&rt.paint_frames_at(after), ViewId::new(1));
+    assert_eq!(painted.tier, target.tier, "float tier committed");
+    assert_eq!(
+        painted.frame, target.frame,
+        "detach must cut the stale tween and paint the committed float frame"
+    );
+    assert_eq!(painted.content, target.content);
+    assert_eq!(painted.cols, target.cols);
+    assert_eq!(painted.rows, target.rows);
+
+    // Restore direction: move the detached float (arming a live drag/move
+    // bounds tween), then restore mid-tween.
+    let settled = after + Duration::from_millis(200);
+    rt.tick_at(settled);
+    let grab = point_in_frame(&rt, ViewId::new(1), 0.5, 0.5);
+    rt.handle_cursor_moved(grab);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        rt.alt_drag_active(),
+        "Alt+press on the detached float grabs"
+    );
+    let t = Instant::now();
+    let moved = CursorPosition {
+        x: grab.x + 18.0,
+        y: grab.y + 38.0,
+    };
+    assert!(rt.update_alt_drag_at(moved, t), "drag motion must apply");
+    let _ = rt.tick_at(t).expect("drag present attaches bounds");
+    let drag_mid = t + Duration::from_millis(30);
+    rt.tick_at(drag_mid).expect("drag mid frame presents");
+    assert!(
+        rt.paint_frames_at(drag_mid) != rt.present_frames(),
+        "float move tween is in flight before restore"
+    );
+
+    rt.toggle_floating(Some(ViewId::new(1)))
+        .expect("restore view 1");
+    let restored_at = drag_mid + Duration::from_millis(5);
+    let _ = rt.tick_at(restored_at);
+    let target = frame_for(&rt.present_frames(), ViewId::new(1));
+    assert_eq!(
+        target.tier, None,
+        "restore returns the leaf to the tiled base"
+    );
+    let painted = frame_for(&rt.paint_frames_at(restored_at), ViewId::new(1));
+    assert_eq!(painted.tier, target.tier, "tiled tier committed");
+    assert_eq!(
+        painted.frame, target.frame,
+        "restore must cut the stale float tween and paint the committed tiled frame"
+    );
+    assert_eq!(painted.content, target.content);
+    assert_eq!(painted.cols, target.cols);
+    assert_eq!(painted.rows, target.rows);
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn non_animating_kind_cancels_a_different_kind_bounds_tween() {
+    // CTX-1335 F2: with move animated and resize instant, a move tween in
+    // flight followed by a size-only delta must cut the stale move tween and
+    // paint the committed end bounds.
+    let mut rt = runtime_with(AnimationPolicy {
+        duration_ms: [150, 120, 100, 200, 150, 0, 150],
+        ..AnimationPolicy::default()
+    });
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "settled baseline");
+
+    let t = Instant::now();
+    rt.workspace_move_focused_to_position_at(1, t)
+        .expect("reposition must succeed");
+    let _ = rt.tick_at(t).expect("move present attaches bounds");
+    let mid = t + Duration::from_millis(30);
+    rt.tick_at(mid).expect("move mid frame presents");
+    assert_ne!(
+        frame_for(&rt.paint_frames_at(mid), ViewId::new(1)).frame,
+        frame_for(&rt.present_frames(), ViewId::new(1)).frame,
+        "move tween is painting"
+    );
+
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.6,
+        LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+    ));
+    let after = t + Duration::from_millis(40);
+    let _ = rt.tick_at(after);
+    let target = frame_for(&rt.present_frames(), ViewId::new(1));
+    let painted = frame_for(&rt.paint_frames_at(after), ViewId::new(1));
+    assert_eq!(
+        painted.frame, target.frame,
+        "non-animating resize must cut the stale move tween"
+    );
+    assert_eq!(painted.content, target.content);
+}
+
+#[test]
+fn capacity_refused_bounds_paint_the_committed_end() {
+    // CTX-1335 F2/F4: with the shared budget full, a surface with no
+    // reusable slot refuses its bounds tween and paints the committed end
+    // bounds on that frame.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "settled baseline");
+
+    let t = Instant::now();
+    rt.handle_cursor_moved(border_cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active(), "border press must grab");
+    assert!(rt.update_border_drag_at(border_cell_pixels(45, 12), t));
+    for i in 0..(MAX_CONCURRENT_ANIMATIONS - 1) {
+        assert!(rt.trigger_animation(AnimationKind::Open, Some(ViewId::new(100 + i as u64)), t));
+    }
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.7,
+        LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+    ));
+    let after = t + Duration::from_millis(20);
+    let _ = rt.tick_at(after);
+    assert_eq!(
+        rt.paint_frames_at(after),
+        rt.present_frames(),
+        "capacity-refused bounds must paint the committed geometry"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn retargeting_starts_from_the_currently_painted_bounds() {
+    // CTX-1335 F4: a live gesture update retargets from the painted frame at
+    // that instant, so the next present is continuous (no jump back to the
+    // previous committed start).
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "settled baseline");
+
+    let t = Instant::now();
+    rt.handle_cursor_moved(border_cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.update_border_drag_at(border_cell_pixels(45, 12), t));
+    let _ = rt.tick_at(t).expect("first resize present");
+    let mid = t + Duration::from_millis(40);
+    rt.tick_at(mid).expect("resize mid frame presents");
+
+    let t2 = mid + Duration::from_millis(1);
+    assert!(rt.update_border_drag_at(border_cell_pixels(51, 12), t2));
+    let continuity = frame_for(&rt.paint_frames_at(t2), ViewId::new(1)).frame;
+    let _ = rt.tick_at(t2).expect("retarget present");
+    let retargeted = frame_for(&rt.paint_frames_at(t2), ViewId::new(1)).frame;
+    assert_eq!(
+        retargeted, continuity,
+        "retarget must restart from the currently painted bounds"
+    );
+    let target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+    assert_ne!(
+        retargeted, target,
+        "retargeted tween has not already settled"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn alt_drag_float_keeps_one_animation_entry_under_a_full_budget() {
+    // CTX-1335 F3: an Alt-drag float holds the Drag ring; the per-view move
+    // bounds ride that entry instead of consuming a second budget slot. With
+    // the shared budget otherwise full, interpolation still works and the
+    // ring alpha is multiplied once.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    rt.toggle_floating(Some(ViewId::new(1)))
+        .expect("detach view 1");
+    let detach_settled = settled + Duration::from_millis(200);
+    rt.tick_at(detach_settled);
+    let detach_idle = detach_settled + Duration::from_millis(200);
+    rt.tick_at(detach_idle);
+    assert!(rt.tick_at(detach_idle).is_none(), "detach settled");
+
+    let grab = point_in_frame(&rt, ViewId::new(1), 0.5, 0.5);
+    rt.handle_cursor_moved(grab);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        rt.alt_drag_active(),
+        "Alt+press on the detached float grabs"
+    );
+    // Commit the pointer focus change before filling the budget so this
+    // present does not also arm a focus fade that would legitimately evict a
+    // bounds entry at the shared cap.
+    let focus_settled = Instant::now();
+    rt.tick_at(focus_settled);
+    let focus_idle = focus_settled + Duration::from_millis(200);
+    rt.tick_at(focus_idle);
+    assert!(rt.tick_at(focus_idle).is_none(), "focus settled");
+    let old_frame = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+    let t = Instant::now();
+    let moved = CursorPosition {
+        x: grab.x + 18.0,
+        y: grab.y + 38.0,
+    };
+    assert!(rt.update_alt_drag_at(moved, t));
+    let target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+    assert_ne!(old_frame, target, "drag moved the committed float frame");
+    for i in 0..(MAX_CONCURRENT_ANIMATIONS - 1) {
+        assert!(rt.trigger_animation(AnimationKind::Open, Some(ViewId::new(200 + i as u64)), t));
+    }
+    let _ = rt.tick_at(t).expect("drag present attaches bounds");
+    assert_eq!(
+        frame_for(&rt.paint_frames_at(t), ViewId::new(1)).frame,
+        old_frame,
+        "attached tween starts at the committed previous bounds"
+    );
+    let mid = t + Duration::from_millis(75);
+    rt.tick_at(mid).expect("drag mid frame presents");
+    let painted = frame_for(&rt.paint_frames_at(mid), ViewId::new(1)).frame;
+    assert_ne!(painted, old_frame, "mid drag must have moved");
+    assert_ne!(
+        painted, target,
+        "a full budget must not refuse the drag's own bounds slot"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Move, Some(ViewId::new(1)), mid)
+            .is_none(),
+        "bounds ride the drag entry, not a second move entry"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Drag, Some(ViewId::new(1)), mid)
+            .is_some()
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn pinned_overlay_does_not_slide_with_the_workspace() {
+    // CTX-1335 F5: pins are window-global chrome; the incoming workspace
+    // slides beneath them instead of dragging them in from off-screen.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    rt.pin_floating(ViewId::new(1)).expect("pin view 1");
+    let pinned_settled = settled + Duration::from_millis(200);
+    rt.tick_at(pinned_settled);
+
+    let t = Instant::now();
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(t).expect("workspace switch presents");
+    let target = frame_for(&rt.present_frames(), ViewId::new(1));
+    let painted = frame_for(&rt.paint_frames_at(t), ViewId::new(1));
+    assert_eq!(
+        painted.frame, target.frame,
+        "pinned chrome must stay anchored during the workspace slide"
+    );
+    assert_eq!(painted.content, target.content);
+}
+
+#[test]
+fn unrelated_focus_fade_does_not_tween_an_appearance_reflow() {
+    // CTX-1335 F8: geometry interpolation needs a causal accepted transition;
+    // an unrelated focus fade must not turn a decoration/container reflow
+    // into a bounds tween.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    assert!(rt.tick_at(settled).is_none(), "settled baseline");
+
+    let t = Instant::now();
+    assert!(rt.trigger_animation(AnimationKind::Focus, Some(ViewId::new(1)), t));
+    rt.set_container(UiRect::new(0, 0, 90, 24));
+    let after = t + Duration::from_millis(20);
+    let _ = rt.tick_at(after);
+    assert_eq!(
+        rt.paint_frames_at(after),
+        rt.present_frames(),
+        "appearance reflow stays instant while an unrelated focus fades"
+    );
+}
+
+#[test]
+fn zero_duration_trigger_does_not_evict_a_live_bounds_tween() {
+    // CTX-1335 F7: a refused ring trigger must not drop another surface's
+    // geometry before discovering its own duration is zero.
+    let mut rt = runtime_with(AnimationPolicy {
+        duration_ms: [150, 120, 0, 200, 150, 120, 150],
+        ..AnimationPolicy::default()
+    });
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    assert!(
+        rt.animation_progress(AnimationKind::Resize, Some(ViewId::new(1)), start)
+            .is_some(),
+        "split armed a resize bounds slot"
+    );
+    for i in 0..(MAX_CONCURRENT_ANIMATIONS - 2) {
+        assert!(rt.trigger_animation(
+            AnimationKind::Open,
+            Some(ViewId::new(300 + i as u64)),
+            start
+        ));
+    }
+    let now = Instant::now();
+    assert!(
+        !rt.trigger_animation(AnimationKind::Focus, Some(ViewId::new(999)), now),
+        "zero-duration focus never arms"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Resize, Some(ViewId::new(1)), now)
+            .is_some(),
+        "the live bounds tween survives a refused zero-duration trigger"
+    );
+}
+
 // ── CTX-0967: move/resize/drag transitions ───────────────────────────────
 
 /// Cursor pixels landing on container cell (col, row) under the default
@@ -894,10 +1488,11 @@ fn zoom_engage_arms_close_and_disengage_arms_open() {
 }
 
 #[test]
-fn zoom_never_interpolates_grid_or_geometry() {
-    // CTX-1078: zoom commits geometry and content at once. The leaf count
-    // changes at the mutation (not at animation end), and a grid byte
-    // written mid-zoom reads back verbatim.
+fn zoom_commits_grid_and_hit_geometry_immediately() {
+    // CTX-1078 / CTX-1335: zoom commits the logical layout, PTY size, and
+    // hit-test geometry at the mutation (not at animation end). Only the
+    // paint bounds interpolate, and a grid byte written mid-zoom reads back
+    // verbatim.
     let mut rt = runtime_with(AnimationPolicy::default());
     let start = Instant::now();
     let _ = rt.tick_at(start);

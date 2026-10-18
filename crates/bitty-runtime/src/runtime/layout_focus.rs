@@ -490,13 +490,58 @@ impl Runtime {
         surface: Option<ViewId>,
         now: std::time::Instant,
     ) -> bool {
+        // CTX-1335 F7: a zero-duration kind never admits an entry, so evict a
+        // bounds tween only after the duration gate. Otherwise a refused ring
+        // trigger would still discard another surface's geometry for nothing.
+        if self.animator.policy().duration(kind).is_zero() {
+            return self.animator.trigger(kind, surface, now);
+        }
         if self.animator.active_count(now) + self.fx.active_count(now) >= MAX_CONCURRENT_ANIMATIONS
         {
-            return false;
+            // CTX-1335: bounds interpolation yields to the accepted ring
+            // transitions at the shared cap. Dropping one paints that
+            // surface's committed end state immediately; no queue grows.
+            if !self.animator.drop_one_bounds(now) {
+                return false;
+            }
         }
         let armed = self.animator.trigger(kind, surface, now);
         if armed {
             // A new animation needs a frame even when no PTY bytes moved.
+            self.pending_full_redraw = true;
+        }
+        armed
+    }
+
+    /// CTX-1335: arms a paint-only bounds transition with the same shared
+    /// capacity rule as [`Self::trigger_animation`]. Refusal commits the end
+    /// state immediately; nothing is queued.
+    fn trigger_bounds_animation(
+        &mut self,
+        kind: AnimationKind,
+        surface: ViewId,
+        from: PanelBounds,
+        to: PanelBounds,
+        started: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        // A same-kind slot or an in-flight drag entry is reused by
+        // `trigger_bounds_at`, so it does not consume another budget entry.
+        let reuses_slot = self.animator.has_bounds_host(kind, Some(surface), now);
+        if !reuses_slot
+            && self.animator.active_count(now) + self.fx.active_count(now)
+                >= MAX_CONCURRENT_ANIMATIONS
+        {
+            // CTX-1335 F2: a refused tween must not leave the surface's old
+            // geometry painting. Drop it so this frame is the committed end
+            // bounds.
+            self.animator.cancel_bounds(Some(surface));
+            return false;
+        }
+        let armed = self
+            .animator
+            .trigger_bounds_at(kind, Some(surface), from, to, started, now);
+        if armed {
             self.pending_full_redraw = true;
         }
         armed
@@ -564,6 +609,61 @@ impl Runtime {
         self.animator.progress(kind, surface, now)
     }
 
+    /// CTX-1335: painted frames at `now`, with active panel-bounds
+    /// interpolation applied.
+    ///
+    /// Presentation-only. `crate::PresentFrame` consumers that route input,
+    /// hit-test, resize a PTY, or commit layout must keep using
+    /// [`Self::present_frames`]: those values are final on the first frame of
+    /// a transition. The returned frames differ only in their painted
+    /// `frame`/`content` rectangles (and the grid dims derived from them), and
+    /// they are exactly the committed logical frames whenever no geometry
+    /// transition is active (instant, reduced-motion, safe, or complete).
+    #[must_use]
+    pub fn paint_frames_at(&self, now: std::time::Instant) -> Vec<PresentFrame> {
+        let frames = self.present_frames();
+        self.paint_frames_from(&frames, now).unwrap_or(frames)
+    }
+
+    /// Applies active geometry interpolation to already-computed logical
+    /// frames (CTX-1335). Pure: reads the animator only. `None` when no
+    /// geometry transition is active, so the present path reuses the logical
+    /// allocations without copying them.
+    #[must_use]
+    pub(super) fn paint_frames_from(
+        &self,
+        frames: &[PresentFrame],
+        now: std::time::Instant,
+    ) -> Option<Vec<PresentFrame>> {
+        if !self.animator.bounds_active(now) {
+            return None;
+        }
+        let live = self.live_cell_metrics();
+        let max_dim = u32::try_from(bitty_term_state::MAX_GRID_DIM).unwrap_or(u32::MAX);
+        Some(
+            frames
+                .iter()
+                .map(|frame| {
+                    let Some(bounds) = self.animator.interpolated_bounds(Some(frame.view), now)
+                    else {
+                        return *frame;
+                    };
+                    let mut painted = *frame;
+                    painted.frame = bounds.frame;
+                    painted.content = bounds.content;
+                    // The renderer paints the committed grid into the animated
+                    // viewport: dims follow the painted content, never the other
+                    // way around, so terminal truth and PTY size stay final.
+                    painted.cols =
+                        (bounds.content.width / live.width.max(1)).clamp(1, max_dim) as u16;
+                    painted.rows =
+                        (bounds.content.height / live.height.max(1)).clamp(1, max_dim) as u16;
+                    painted
+                })
+                .collect(),
+        )
+    }
+
     /// Detects RFC-0002 transitions between the last presented frame and the
     /// current one and arms the matching animations (CTX-0341).
     ///
@@ -592,10 +692,15 @@ impl Runtime {
             return;
         }
         let policy = self.config.animations;
+        // CTX-1335 F8: geometry interpolation rides a *causal* accepted
+        // transition (split/zoom open or close, workspace switch, or an
+        // in-flight gesture), never an unrelated focus fade.
+        let mut accepted_transition = false;
 
         if policy.animates(AnimationKind::Workspace)
             && active_workspace != self.last_presented_workspace
         {
+            accepted_transition = true;
             self.trigger_animation(AnimationKind::Workspace, None, now);
         }
 
@@ -610,6 +715,7 @@ impl Runtime {
         if policy.animates(AnimationKind::Open) {
             for frame in allocations {
                 if !old_ids.contains(&frame.view) {
+                    accepted_transition = true;
                     self.trigger_animation(AnimationKind::Open, Some(frame.view), now);
                 }
             }
@@ -664,9 +770,141 @@ impl Runtime {
                     radius: old.radius,
                     color,
                 });
+                accepted_transition = true;
                 self.trigger_animation(AnimationKind::Close, Some(old.view), now);
             }
         }
+        // CTX-1335 (issue #2113): a live View whose painted bounds changed
+        // between presents interpolates from the committed previous bounds to
+        // the committed current bounds. The logical layout already holds the
+        // end state, so only the paint path reads these captured rectangles.
+        // A repeat change re-arms from the currently painted bounds, which
+        // avoids a jump when a gesture updates geometry mid-transition.
+        let old_by_view: std::collections::HashMap<ViewId, PresentFrame> = self
+            .last_presented_allocations
+            .iter()
+            .map(|frame| (frame.view, *frame))
+            .collect();
+        let gesture_active = self.animator.earliest_geometry_started(now).is_some();
+        for frame in allocations {
+            let Some(old) = old_by_view.get(&frame.view) else {
+                // A brand-new View uses the open transition, not a bounds
+                // tween; there is no committed start rectangle to move from.
+                // Drop a stale entry defensively when a retired id is reused.
+                self.animator.cancel_bounds(Some(frame.view));
+                continue;
+            };
+            if old.frame == frame.frame && old.content == frame.content {
+                continue;
+            }
+            // Geometry interpolation rides an accepted panel transition:
+            // open/close (split/zoom), workspace, or a gesture kind already
+            // armed before this present. A bare appearance-driven reflow
+            // (decoration, DPI, direct layout edit) keeps its established
+            // instant behavior. A tier change (float detach/restore) also
+            // fails closed to the committed end bounds: the float's opaque
+            // cover must own its final frame on the first present, never an
+            // interpolated one that could bleed the base beneath it.
+            if old.tier != frame.tier {
+                // CTX-1335 F1: only arming no new tween is not enough — the
+                // surface's old tween would keep painting an obsolete rect
+                // under the float cover/occluders. Cut it before painting.
+                self.animator.cancel_bounds(Some(frame.view));
+                continue;
+            }
+            if !accepted_transition
+                && !gesture_active
+                && self
+                    .animator
+                    .interpolated_bounds(Some(frame.view), now)
+                    .is_none()
+            {
+                continue;
+            }
+            let size_changed =
+                old.frame.width != frame.frame.width || old.frame.height != frame.frame.height;
+            let kind = if size_changed {
+                AnimationKind::Resize
+            } else {
+                AnimationKind::Move
+            };
+            if !policy.animates(kind) {
+                // CTX-1335 F2: a non-animating kind must not leave a
+                // different-kind tween painting its old end rectangle.
+                self.animator.cancel_bounds(Some(frame.view));
+                continue;
+            }
+            // Re-targeting an in-flight tween starts from the currently
+            // painted bounds at this present, so a later gesture update never
+            // jumps ahead. Otherwise reuse the gesture's accepted start
+            // (Alt-drag/resize/reparent arm the ring before the next present)
+            // or start at this present.
+            let in_flight = self.animator.interpolated_bounds(Some(frame.view), now);
+            let from = in_flight.unwrap_or(PanelBounds {
+                frame: old.frame,
+                content: old.content,
+            });
+            let to = PanelBounds {
+                frame: frame.frame,
+                content: frame.content,
+            };
+            let started = if in_flight.is_some() {
+                now
+            } else {
+                self.animator
+                    .active_started(kind, Some(frame.view), now)
+                    .or_else(|| self.animator.earliest_geometry_started(now))
+                    .unwrap_or(now)
+            };
+            self.trigger_bounds_animation(kind, frame.view, from, to, started, now);
+        }
+
+        // CTX-1335: a workspace switch slides the newly visible workspace in
+        // from the direction of travel. The outgoing workspace is stashed (no
+        // retained ghost, #2134); only the committed new bounds translate, so
+        // the animation never depends on stale content. The accepted
+        // cross-fade (`AnimationKind::Workspace` on the global surface) still
+        // runs alongside this geometry.
+        if active_workspace != self.last_presented_workspace
+            && policy.animates(AnimationKind::Workspace)
+        {
+            let live = self.live_cell_metrics();
+            let distance =
+                i32::try_from(u32::from(self.container.width).saturating_mul(live.width))
+                    .unwrap_or(i32::MAX);
+            if distance > 0 {
+                let direction: i32 = if active_workspace > self.last_presented_workspace {
+                    1
+                } else {
+                    -1
+                };
+                let dx = direction.saturating_mul(distance);
+                for frame in allocations {
+                    // CTX-1335 F5: pins are window-global chrome, not part of
+                    // the incoming workspace; they stay anchored while the
+                    // workspace slides beneath them.
+                    if self.pinned.contains(frame.view) {
+                        continue;
+                    }
+                    let to = PanelBounds {
+                        frame: frame.frame,
+                        content: frame.content,
+                    };
+                    let from = to.translated(dx, 0);
+                    if !self.trigger_bounds_animation(
+                        AnimationKind::Workspace,
+                        frame.view,
+                        from,
+                        to,
+                        now,
+                        now,
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+
         if focused != self.last_presented_focus {
             if let Some(fid) = focused {
                 if policy.animates(AnimationKind::Focus) {

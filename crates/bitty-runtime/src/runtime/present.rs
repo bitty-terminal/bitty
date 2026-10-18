@@ -2128,6 +2128,10 @@ impl Runtime {
             // change: force the full per-leaf path for this frame.
             pending_full = true;
         }
+        // CTX-1335: apply paint-only bounds interpolation. The logical
+        // `allocations` below stay final (hit-testing, PTY size, and terminal
+        // truth never observe the animated rectangles).
+        let paint_allocations = self.paint_frames_from(&allocations, now);
 
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).
@@ -2236,6 +2240,7 @@ impl Runtime {
         Some(TickBasis {
             snapshot,
             allocations,
+            paint_allocations,
             focused,
             full_frame,
             current_gen,
@@ -2256,7 +2261,10 @@ impl Runtime {
     /// [`FrameLayers`] with the overlay and image layers still empty.
     fn build_leaf_primitives(&mut self, basis: &TickBasis, now: std::time::Instant) -> FrameLayers {
         let snapshot = &basis.snapshot;
-        let allocations = &basis.allocations;
+        // CTX-1335: leaf painting reads the interpolated bounds. Every other
+        // consumer of `basis.allocations` (hit-testing, PTY, damage identity)
+        // keeps the committed logical geometry.
+        let allocations = basis.painted_allocations();
         let view_map = &basis.view_map;
         let pad_px = basis.pad_px;
         let current_gen = basis.current_gen;
@@ -3058,21 +3066,20 @@ impl Runtime {
         layers: &mut FrameLayers,
     ) {
         self.paint_closing_rings(basis.pad_px, now, layers);
-        self.paint_selection_highlight(&basis.allocations, &basis.view_map, basis.pad_px, layers);
-        self.paint_plaintext_hover(&basis.allocations, basis.pad_px, layers);
+        // CTX-1335: overlays anchored to a leaf follow its interpolated paint
+        // bounds so content, cursor, and selection never tear apart during a
+        // geometry transition. Their logical state and hit-testing remain
+        // final.
+        let paint = basis.painted_allocations();
+        self.paint_selection_highlight(paint, &basis.view_map, basis.pad_px, layers);
+        self.paint_plaintext_hover(paint, basis.pad_px, layers);
         self.paint_ime_preedit(layers);
-        self.paint_pending_banners(
-            &basis.allocations,
-            &basis.view_map,
-            basis.pad_px,
-            now,
-            layers,
-        );
-        self.paint_hyperlink_hover(&basis.allocations, basis.pad_px, layers);
-        self.paint_help_overlay(&basis.allocations, &basis.view_map, basis.pad_px, layers);
-        self.paint_bell_and_notification(&basis.allocations, basis.pad_px, now, layers);
+        self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
+        self.paint_hyperlink_hover(paint, basis.pad_px, layers);
+        self.paint_help_overlay(paint, &basis.view_map, basis.pad_px, layers);
+        self.paint_bell_and_notification(paint, basis.pad_px, now, layers);
         self.paint_scrollbar_overlay(layers);
-        self.paint_hint_overlay(&basis.allocations, basis.pad_px, layers);
+        self.paint_hint_overlay(paint, basis.pad_px, layers);
     }
 
     /// CTX-0577 (M1-16): the bounded visual bell flash and the single
@@ -4190,7 +4197,8 @@ impl Runtime {
 
     fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
         let snapshot = &basis.snapshot;
-        let allocations = &basis.allocations;
+        // CTX-1335: image blits follow the interpolated leaf bounds.
+        let allocations = basis.painted_allocations();
         let view_map = &basis.view_map;
 
         let live = self.live_cell_metrics();
@@ -4662,8 +4670,13 @@ impl Runtime {
 struct TickBasis {
     /// Grid snapshot backing the primary origin and the overlays.
     snapshot: Snapshot,
-    /// Decorated leaf allocations for this frame.
+    /// Decorated leaf allocations for this frame (logical, final geometry).
     allocations: Vec<layout_focus::PresentFrame>,
+    /// Paint-only allocations with active bounds interpolation applied
+    /// (CTX-1335). `None` whenever no geometry transition is active, in which
+    /// case painting reuses `allocations`; never consumed by hit-testing or
+    /// terminal-truth paths.
+    paint_allocations: Option<Vec<layout_focus::PresentFrame>>,
     /// Focused leaf at collection time.
     focused: Option<ViewId>,
     /// Whether any full-invalidation source armed a full frame.
@@ -4682,6 +4695,16 @@ struct TickBasis {
     glyphs_before: u64,
     /// Mounted band versions for this frame (CTX-0946 C2).
     band_versions: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
+}
+
+impl TickBasis {
+    /// Leaf allocations used for painting: interpolated when a geometry
+    /// transition is active, otherwise the committed logical frames.
+    fn painted_allocations(&self) -> &[layout_focus::PresentFrame] {
+        self.paint_allocations
+            .as_deref()
+            .unwrap_or(&self.allocations)
+    }
 }
 
 /// Combined draw layers assembled by the present phases (CTX-0474).

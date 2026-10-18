@@ -2396,8 +2396,36 @@ impl TerminalApp {
                 if self.runtime.floated_views().contains(&view)
                     || self.runtime.pinned_views().contains(&view)
                 {
+                    let was_float = self.runtime.floated_views().contains(&view);
                     self.restore_zoom();
                     self.runtime.discard_floating_view(view);
+                    // CTX-1336 (#2221): the exited float may have been the
+                    // active workspace's last live view (its tiled base
+                    // already closed). Leaving the slot with no layout
+                    // leaves and no floats strands a blank, dead workspace
+                    // until the user switches away or closes it. Prune it
+                    // exactly like the CTX-1297/close_view paths; a single
+                    // remaining workspace keeps the window-close gesture
+                    // handled by the effective-window-count gate above.
+                    if was_float
+                        && self.runtime.layout().leaf_count() == 0
+                        && self.runtime.floated_views().is_empty()
+                        && self.runtime.workspace_count() > 1
+                    {
+                        let workspace = self.runtime.active_workspace_index();
+                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: pane shell {view:?} exited — empty workspace pruned"
+                                )
+                            });
+                        } else {
+                            crate::logging::warn(|| {
+                                "bitty: could not prune empty workspace after float exit"
+                                    .to_string()
+                            });
+                        }
+                    }
                     self.push_pending_exit(view.0, status.code());
                     closed_any = true;
                     continue;

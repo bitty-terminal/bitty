@@ -9777,6 +9777,67 @@ fn close_float_on_empty_base_focuses_surviving_float_issue_2221() {
     );
 }
 
+/// Issue #2221 / CTX-1336: the owner's exact report after the float is the
+/// last live view: typing `exit` in it must not leave a blank slot.
+#[test]
+#[cfg(unix)]
+fn reap_exited_last_float_prunes_emptied_workspace_issue_2221() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert!(app.runtime.set_focus(host));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.focused_view(), Some(float));
+
+    // A second workspace keeps a live leaf, so the float exit is a pane
+    // close (PaneClosed) instead of the whole-window close gesture.
+    app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert!(app.runtime.workspace_switch(0));
+    assert!(app.runtime.set_focus(float));
+
+    assert!(
+        app.runtime.push_input_bytes(b"exit\n"),
+        "typed exit must reach the float shell"
+    );
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "float exit with another workspace live is a pane close"
+    );
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the emptied float-only workspace must be pruned, never left blank"
+    );
+    assert!(app.runtime.floated_views().is_empty());
+    let focused = app
+        .runtime
+        .focused_view()
+        .expect("focus must land on the surviving workspace's panel");
+    assert!(
+        app.runtime.layout().leaf_ids().contains(&focused),
+        "focus must be a live member of the surviving layout, never a dead slot"
+    );
+    assert!(
+        app.runtime.primary_view().is_none_or(|view| app
+            .runtime
+            .layout()
+            .leaf_ids()
+            .contains(&view)),
+        "primary ownership must not dangle"
+    );
+}
+
 #[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key

@@ -1667,6 +1667,11 @@ impl Runtime {
         };
         self.active_workspace = active;
         self.load_slot(active);
+        // CTX-1336 (#2221): closing a workspace installs a different slot.
+        // Like `workspace_switch`, that is a layout/focus change with no PTY
+        // damage of its own, so force the next frame; otherwise the closed
+        // workspace's last frame stays on screen until unrelated input.
+        self.pending_full_redraw = true;
         self.mru_front(active);
         // CTX-0873: dropping to one workspace releases the bar band.
         self.refresh_chrome_band();

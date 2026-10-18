@@ -1054,6 +1054,80 @@ fn alt_drag_float_keeps_one_animation_entry_under_a_full_budget() {
 }
 
 #[test]
+fn consecutive_alt_drag_updates_carry_painted_bounds_forward() {
+    // CodeRabbit PR #2231 finding 1: re-arming the Drag ring on a second
+    // motion must start from the currently painted frame, not from the last
+    // committed target, so continuous Alt+drag never snaps.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let settled = start + Duration::from_millis(200);
+    rt.tick_at(settled);
+    rt.toggle_floating(Some(ViewId::new(1)))
+        .expect("detach view 1");
+    let detach_settled = settled + Duration::from_millis(200);
+    rt.tick_at(detach_settled);
+    let detach_idle = detach_settled + Duration::from_millis(200);
+    rt.tick_at(detach_idle);
+    assert!(rt.tick_at(detach_idle).is_none(), "detach settled");
+
+    let grab = point_in_frame(&rt, ViewId::new(1), 0.5, 0.5);
+    rt.handle_cursor_moved(grab);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(
+        rt.alt_drag_active(),
+        "Alt+press on the detached float grabs"
+    );
+    let focus_settled = Instant::now();
+    rt.tick_at(focus_settled);
+    let focus_idle = focus_settled + Duration::from_millis(200);
+    rt.tick_at(focus_idle);
+    assert!(rt.tick_at(focus_idle).is_none(), "focus settled");
+
+    let t0 = Instant::now();
+    let first = CursorPosition {
+        x: grab.x + 18.0,
+        y: grab.y + 38.0,
+    };
+    assert!(rt.update_alt_drag_at(first, t0));
+    let _ = rt.tick_at(t0).expect("first drag present attaches bounds");
+    let first_target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+
+    let mid = t0 + Duration::from_millis(40);
+    rt.tick_at(mid).expect("mid drag frame presents");
+    let continuity = frame_for(&rt.paint_frames_at(mid), ViewId::new(1)).frame;
+    assert_ne!(continuity, first_target, "mid tween is not at its target");
+
+    // A second motion re-arms the same Drag entry. Its carried start must be
+    // the painted mid frame, so the present at the same instant is continuous.
+    let second = CursorPosition {
+        x: first.x + 18.0,
+        y: first.y + 38.0,
+    };
+    assert!(rt.update_alt_drag_at(second, mid));
+    let second_target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+    assert_ne!(second_target, first_target, "second motion moved further");
+    let _ = rt.tick_at(mid).expect("second drag present retargets");
+    let retargeted = frame_for(&rt.paint_frames_at(mid), ViewId::new(1)).frame;
+    assert_eq!(
+        retargeted, continuity,
+        "the retarget must not snap back to the previous committed target"
+    );
+
+    let later = mid + Duration::from_millis(40);
+    rt.tick_at(later).expect("later drag frame presents");
+    let later_paint = frame_for(&rt.paint_frames_at(later), ViewId::new(1)).frame;
+    assert_ne!(later_paint, continuity, "the retargeted tween advances");
+    assert_ne!(later_paint, second_target, "and has not already settled");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
 fn pinned_overlay_does_not_slide_with_the_workspace() {
     // CTX-1335 F5: pins are window-global chrome; the incoming workspace
     // slides beneath them instead of dragging them in from off-screen.

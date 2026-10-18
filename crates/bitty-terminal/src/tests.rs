@@ -9715,6 +9715,7 @@ fn close_last_float_prunes_emptied_workspace_issue_2221() {
     );
 }
 
+#[cfg(unix)]
 fn probe_rgba(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
     let idx = (y * width + x) * 4;
     [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]

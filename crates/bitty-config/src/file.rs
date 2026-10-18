@@ -567,16 +567,29 @@ impl CliOverrides {
 
     /// Validates the CTX-0180 appearance raws without needing layers.
     ///
-    /// Checks `--font-family` length and parses `--font-size`/`--opacity`
-    /// through the same typed validators the merge uses, so range violations
-    /// fail closed with the dotted field path. `theme` is intentionally NOT
-    /// checked here (CTX-0169 merge-time behavior stays untouched).
+    /// Checks `--font-family` length, parses `--font-size`/`--opacity`
+    /// through the same typed validators the merge uses, and validates
+    /// `--theme` against the preset registry, so every violation fails
+    /// closed with the dotted field path before any layer merge.
+    ///
+    /// CTX-1339: `theme` used to be checked only at merge time. Validating it
+    /// here keeps an invalid `--theme` attributable to the CLI layer even when
+    /// a valid user file is also present, so startup never treats the file as
+    /// the cause and never falls back to built-ins for a CLI usage error.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::validation`] at `font.family` / `font.size` /
-    /// `window.opacity` for overlong/unparseable/out-of-range values.
+    /// [`ConfigError::validation`] at `appearance.theme` / `font.family` /
+    /// `font.size` / `window.opacity` for unknown or overlong theme names,
+    /// overlong/unparseable/out-of-range values.
     pub fn validate_appearance_overrides(&self) -> Result<(), ConfigError> {
+        if let Some(theme) = cli_present(self.theme.as_deref()) {
+            AppearanceConfig {
+                theme: Some(theme),
+                ..Default::default()
+            }
+            .validate()?;
+        }
         if let Some(family) = cli_present(self.font_family.as_deref()) {
             if family.len() > MAX_FONT_FAMILY_LEN {
                 return Err(ConfigError::validation(
@@ -5113,6 +5126,17 @@ mod tests {
                 font_family: Some("x".repeat(MAX_FONT_FAMILY_LEN + 1)),
                 ..Default::default()
             },
+            // CTX-1339: `--theme` is pre-validated before merge, so an
+            // unknown or malformed name fails with its dotted field even
+            // when a valid user file also participates.
+            CliOverrides {
+                theme: Some("not-a-theme".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                theme: Some("light:dracula".to_string()),
+                ..Default::default()
+            },
         ] {
             assert!(!cli.is_empty());
             let err = resolve_effective_full(Some(file_layer_with_appearance()), None, &cli)
@@ -5121,7 +5145,8 @@ mod tests {
             assert!(
                 msg.contains("font.size")
                     || msg.contains("window.opacity")
-                    || msg.contains("font.family"),
+                    || msg.contains("font.family")
+                    || msg.contains("appearance.theme"),
                 "must name the field: {msg}"
             );
         }

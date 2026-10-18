@@ -57,6 +57,71 @@ pub(crate) struct LoadedConfig {
     pub(crate) profile_path: Option<std::path::PathBuf>,
 }
 
+/// A config-load failure plus whether the first-start fallback may absorb it.
+///
+/// Only a *present* user config file that cannot be loaded or merged is
+/// recoverable (`broken`). Explicitly missing `--config`/`BITTY_CONFIG` paths,
+/// missing or invalid profiles, CLI usage errors, and an invalid built-in
+/// plan stay fail-closed (`fatal`), matching `lua-and-xdg.md` §Layers.
+struct LoadFailure {
+    /// User-facing message; unchanged from the pre-fallback behavior.
+    message: String,
+    /// True only for a present-but-unusable external user file.
+    fallback_allowed: bool,
+}
+
+impl LoadFailure {
+    /// A present external layer is unusable; first start may use built-ins.
+    fn broken(message: String) -> Self {
+        Self {
+            message,
+            fallback_allowed: true,
+        }
+    }
+
+    /// Missing input, usage error, profile selection, or internal defect.
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            fallback_allowed: false,
+        }
+    }
+
+    fn into_message(self) -> String {
+        self.message
+    }
+}
+
+/// Attributes a merge failure to the layer that actually caused it.
+///
+/// `user_file_causal` is the outcome of re-merging without the user layer:
+/// when that re-merge succeeds, the user file's contribution is what makes
+/// the combined config invalid, so first start may fall back. When it still
+/// fails, a profile or CLI layer owns the error and startup stays
+/// fail-closed (CTX-1339 review finding: file presence alone is not causal).
+fn classify_merge_failure(
+    err: &bitty_config::ConfigError,
+    user_path: Option<&std::path::Path>,
+    profile_path: Option<&std::path::Path>,
+    user_file_causal: bool,
+) -> LoadFailure {
+    if user_file_causal {
+        if let Some(path) = user_path {
+            return LoadFailure::broken(format!(
+                "bitty: invalid config '{}': {err}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(path) = profile_path {
+        return LoadFailure::fatal(format!(
+            "bitty: invalid profile '{}': {err}",
+            path.display()
+        ));
+    }
+    LoadFailure::fatal(format!("bitty: invalid --theme: {err}"))
+}
+
 /// Builds the single CLI override input from parsed [`Args`] (CTX-0180).
 ///
 /// Pure over `args` so the wiring stays hermetic: trims each raw and treats
@@ -94,10 +159,11 @@ pub(crate) fn cli_overrides_from_args(args: &Args) -> bitty_config::file::CliOve
 }
 
 /// Names the CLI flag behind an appearance-override validation error for the
-/// fail-closed message. `theme` keeps its CTX-0169 merge-time path and never
-/// reaches here; anything unexpected falls back to the flag group.
+/// fail-closed message. `theme` is pre-validated by CTX-1339 (it used to fail
+/// only at merge); any unexpected field falls back to the flag group.
 pub(crate) fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
     match field {
+        Some("appearance.theme") => "--theme",
         Some("font.family") => "--font-family",
         Some("font.size") => "--font-size",
         Some("window.opacity") => "--opacity",
@@ -131,6 +197,11 @@ pub(crate) fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
 /// profile identity. impure (filesystem + env); total (all failures become
 /// `Err(String)`).
 pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
+    resolve_merged_config(args).map_err(LoadFailure::into_message)
+}
+
+/// Classified form of [`load_merged_config`] for the startup fallback.
+fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
     // CTX-0346 `--safe` (R-009/P0-AC-019, spec rule 5): select the built-in
     // safe effective config and do not read any external layer. User files,
     // `BITTY_CONFIG`, profiles, and CLI appearance overrides are ignored —
@@ -140,8 +211,9 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
     // user config can never abort safe startup or validation. Non-safe
     // behavior is unchanged.
     if args.safe {
-        let merged = bitty_config::safe_merged()
-            .map_err(|err| format!("bitty: invalid built-in safe config: {err}"))?;
+        let merged = bitty_config::safe_merged().map_err(|err| {
+            LoadFailure::fatal(format!("bitty: invalid built-in safe config: {err}"))
+        })?;
         return Ok(LoadedConfig {
             merged,
             probed: None,
@@ -172,23 +244,23 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
                     file_layer = Some(layer);
                 }
                 Err(err) => {
-                    return Err(format!(
+                    return Err(LoadFailure::broken(format!(
                         "bitty: invalid config file '{}': {err}",
                         probe.path.display()
-                    ));
+                    )));
                 }
             }
         } else if probe.explicit {
             if explicit_from_cli {
-                return Err(format!(
+                return Err(LoadFailure::fatal(format!(
                     "bitty: --config '{}' not found",
                     probe.path.display()
-                ));
+                )));
             }
-            return Err(format!(
+            return Err(LoadFailure::fatal(format!(
                 "bitty: BITTY_CONFIG '{}' not found",
                 probe.path.display()
-            ));
+            )));
         }
     }
     // Named profile (fail-closed): validate, resolve under the user-level
@@ -206,22 +278,22 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
     if let Some(requested) = profile_request.clone() {
         let resolved = bitty_config::file::profile_file_path(&requested).map_err(|err| {
             if profile_from_cli {
-                format!("bitty: invalid --profile '{requested}': {err}")
+                LoadFailure::fatal(format!("bitty: invalid --profile '{requested}': {err}"))
             } else {
-                format!("bitty: invalid BITTY_PROFILE '{requested}': {err}")
+                LoadFailure::fatal(format!("bitty: invalid BITTY_PROFILE '{requested}': {err}"))
             }
         })?;
         if !resolved.exists() {
             if profile_from_cli {
-                return Err(format!(
+                return Err(LoadFailure::fatal(format!(
                     "bitty: --profile '{requested}' not found ('{}')",
                     resolved.display()
-                ));
+                )));
             }
-            return Err(format!(
+            return Err(LoadFailure::fatal(format!(
                 "bitty: BITTY_PROFILE '{requested}' not found ('{}')",
                 resolved.display()
-            ));
+            )));
         }
         // CTX-0759 (#1366): resolve the single-parent `extends` chain
         // (base-first `Profile` layers); the child overrides the base per
@@ -233,10 +305,10 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
                 profile_layers = layers;
             }
             Err(err) => {
-                return Err(format!(
+                return Err(LoadFailure::fatal(format!(
                     "bitty: invalid profile file '{}': {err}",
                     resolved.display()
-                ));
+                )));
             }
         }
         // `--config` + `--profile` together: both layers stay loaded; the
@@ -251,25 +323,40 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
     }
     // CTX-0180: one Cli layer for every present appearance flag (`--theme`
     // plus `--font-family`/`--font-size`/`--opacity`). Invalid appearance
-    // raws fail closed here with usage (exit 2 at the caller); the merge
-    // then only sees valid CLI input, so later merge errors stay
-    // file/profile-caused and keep their existing messages.
+    // raws (including an unknown `--theme`, CTX-1339) fail closed here with
+    // usage (exit 2 at the caller), so later merge errors are attributable
+    // to the merged layers rather than to CLI input.
     let cli = cli_overrides_from_args(args);
     if let Err(err) = cli.validate_appearance_overrides() {
         let flag = appearance_flag_for_field(err.field());
-        return Err(format!("bitty: invalid {flag}: {err}\n{}", help_text()));
+        return Err(LoadFailure::fatal(format!(
+            "bitty: invalid {flag}: {err}\n{}",
+            help_text()
+        )));
     }
+    // CTX-1339: a user file is only blameable for a merge failure when the
+    // merge succeeds without it. Re-merging without the user layer (profiles
+    // and CLI only) distinguishes a broken file from a profile/CLI error that
+    // merely surfaced while a valid file was present. The retry only runs on
+    // the failure path and only when a user file actually participated.
+    let retry_profiles = used_path.as_ref().map(|_| profile_layers.clone());
     let merged =
-        bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli)
-            .map_err(|err| {
-                if let Some(p) = &used_path {
-                    format!("bitty: invalid config '{}': {err}", p.display())
-                } else if let Some(p) = &profile_path {
-                    format!("bitty: invalid profile '{}': {err}", p.display())
-                } else {
-                    format!("bitty: invalid --theme: {err}")
-                }
-            })?;
+        match bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli)
+        {
+            Ok(merged) => merged,
+            Err(err) => {
+                let user_file_causal = retry_profiles.is_some_and(|profiles| {
+                    bitty_config::file::resolve_effective_with_profiles(None, profiles, &cli)
+                        .is_ok()
+                });
+                return Err(classify_merge_failure(
+                    &err,
+                    used_path.as_deref(),
+                    profile_path.as_deref(),
+                    user_file_causal,
+                ));
+            }
+        };
     Ok(LoadedConfig {
         merged,
         probed,
@@ -296,7 +383,12 @@ pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
 /// impure (filesystem reads + env vars XDG/HOME/BITTY_*); total (all failures
 /// become `Err(String)`).
 pub(crate) fn load_app_config(args: &Args) -> Result<AppConfig, String> {
-    let loaded = load_merged_config(args)?;
+    resolve_app_config(args).map_err(LoadFailure::into_message)
+}
+
+/// Classified form of [`load_app_config`] for the startup fallback.
+fn resolve_app_config(args: &Args) -> Result<AppConfig, LoadFailure> {
+    let loaded = resolve_merged_config(args)?;
     let merged = loaded.merged;
     let probed = loaded.probed;
     let profile_request = loaded.profile_name;
@@ -366,6 +458,104 @@ pub(crate) fn load_app_config(args: &Args) -> Result<AppConfig, String> {
         theme,
         resolution,
         source,
+    })
+}
+
+/// Result of the process-startup config resolution (CTX-1339, issue #2225).
+pub(crate) struct StartupConfig {
+    /// The config startup continues with.
+    pub(crate) app: AppConfig,
+    /// User-facing diagnostics to print before startup proceeds; `None` when
+    /// the external configuration loaded normally.
+    pub(crate) diagnostics: Option<String>,
+}
+
+/// Whether this process has no last-good config plan (R-009 first start).
+///
+/// The predicate is existing state, not a launch counter: the reload context
+/// owns the last-good plan and is installed only after a successful startup
+/// load (`config_reload::install`). At startup `current_effective()` is
+/// `None`, so there is no plan to retain and the first-start fallback applies.
+/// Once the context exists, every later failure keeps `engine.current()`
+/// (`reload_into` reports `load-error` without replacing the plan), so the
+/// fallback never runs there.
+fn is_first_start() -> bool {
+    crate::config_reload::current_effective().is_none()
+}
+
+/// Resolve the startup config, degrading to [`bitty_config::LayerKind::CoreDefaults`]
+/// on first start.
+///
+/// Pure over the classified load result and the predicate so both branches are
+/// deterministically testable. `first_start` is [`is_first_start`] in
+/// production; a later failure (an installed last-good plan) stays fail-closed
+/// and returns the original message unchanged.
+///
+/// Only a present-but-unusable user config file is recoverable. Explicitly
+/// missing `--config`/`BITTY_CONFIG` paths, profile selection failures, CLI
+/// usage errors, and an invalid built-in plan keep their fail-closed exit.
+///
+/// The fallback is the unmodified built-in plan: no file, profile, CLI, or
+/// safe-mode decoration participates, so startup never exits on unusable
+/// external configuration and never claims values the user did not provide.
+///
+/// # Errors
+///
+/// Returns the original load message when no first-start fallback applies, or
+/// a diagnostic if the built-in plan itself is invalid (defense in depth).
+fn resolve_startup_config(
+    loaded: Result<AppConfig, LoadFailure>,
+    first_start: bool,
+) -> Result<StartupConfig, String> {
+    match loaded {
+        Ok(app) => Ok(StartupConfig {
+            app,
+            diagnostics: None,
+        }),
+        Err(failure) if first_start && failure.fallback_allowed => Ok(StartupConfig {
+            app: builtin_app_config()?,
+            diagnostics: Some(format!(
+                "{}\nbitty: first start with unusable configuration; continuing with the built-in defaults (fix the configuration and restart; 'bitty config check' reports details)",
+                failure.message
+            )),
+        }),
+        Err(failure) => Err(failure.message),
+    }
+}
+
+/// Loads the config for the process-startup path, applying the R-009
+/// first-start fallback.
+///
+/// Startup-only: the reload resolver keeps calling [`load_app_config`], so a
+/// later broken reload retains its last-good plan instead of replacing it with
+/// built-ins.
+///
+/// # Errors
+///
+/// Same as [`resolve_startup_config`].
+pub(crate) fn load_startup_config(args: &Args) -> Result<StartupConfig, String> {
+    resolve_startup_config(resolve_app_config(args), is_first_start())
+}
+
+/// Builds the unmodified `CoreDefaults` plan used by the first-start fallback.
+fn builtin_app_config() -> Result<AppConfig, String> {
+    // An empty layer stack merges to built-in defaults with `CoreDefaults`
+    // attribution and runs the same validation as the normal merge.
+    let merged = bitty_config::merge_layers(Vec::new())
+        .map_err(|err| format!("bitty: invalid built-in config: {err}"))?;
+    let effective = merged.effective;
+    let (theme, resolution) = bitty_config::theme::resolve_selection_with_status(
+        effective.appearance.theme.as_deref(),
+        startup_prefer_light(),
+    );
+    Ok(AppConfig {
+        effective,
+        file_path: None,
+        profile_name: None,
+        profile_path: None,
+        theme,
+        resolution,
+        source: "default",
     })
 }
 
@@ -1726,5 +1916,218 @@ fn animation_policy_from_effective(
         reduced_motion: reduced,
         safe_mode: false,
         platform_reduced: false,
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use bitty_config::EffectiveConfig;
+
+    /// Builds the app bundle for a valid-config control without touching the
+    /// filesystem or process environment.
+    fn app_config(effective: EffectiveConfig) -> AppConfig {
+        let (theme, resolution) = bitty_config::theme::resolve_selection_with_status(
+            effective.appearance.theme.as_deref(),
+            false,
+        );
+        AppConfig {
+            effective,
+            file_path: None,
+            profile_name: None,
+            profile_path: None,
+            theme,
+            resolution,
+            source: "default",
+        }
+    }
+
+    /// Unique scratch directory for classifier tests (no sleeps).
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1339-unit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn first_start_broken_config_uses_builtin_defaults_and_reports_diagnostics() {
+        let broken = String::from("bitty: invalid config file '/xdg/bitty/init.lua': syntax error");
+        let startup = resolve_startup_config(Err(LoadFailure::broken(broken.clone())), true)
+            .expect("first start must proceed with the built-in config");
+
+        assert_eq!(
+            startup.app.effective,
+            EffectiveConfig::default(),
+            "the fallback must be the unmodified CoreDefaults plan"
+        );
+        assert_eq!(startup.app.source, "default");
+        assert!(startup.app.file_path.is_none());
+        assert!(startup.app.profile_name.is_none());
+        let diagnostics = startup
+            .diagnostics
+            .expect("fallback must report diagnostics");
+        assert!(diagnostics.contains(&broken), "diagnostics: {diagnostics}");
+        assert!(
+            diagnostics.contains("first start"),
+            "diagnostics: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("built-in defaults"),
+            "diagnostics: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn later_failure_with_a_last_good_plan_stays_fail_closed() {
+        let broken = String::from("bitty: invalid config file '/xdg/bitty/init.lua': syntax error");
+        match resolve_startup_config(Err(LoadFailure::broken(broken.clone())), false) {
+            Ok(_) => panic!("an existing plan must be retained, never replaced by built-ins"),
+            Err(error) => assert_eq!(error, broken),
+        }
+    }
+
+    #[test]
+    fn first_start_fatal_load_errors_stay_fail_closed() {
+        // Classification, not a fabricated LoadFailure: a CLI-layer merge
+        // error stays fatal even though first start has no last-good plan.
+        let err = bitty_config::ConfigError::validation("appearance.theme", "unknown theme 'x'");
+        let failure = classify_merge_failure(&err, None, None, false);
+        let message = failure.message.clone();
+        match resolve_startup_config(Err(failure), true) {
+            Ok(_) => panic!("a CLI-layer failure must never fall back to built-ins"),
+            Err(error) => assert_eq!(error, message),
+        }
+    }
+
+    #[test]
+    fn merge_failure_attribution_never_blames_a_valid_user_file() {
+        let err = bitty_config::ConfigError::validation("appearance.theme", "unknown theme 'x'");
+        let file = std::path::Path::new("/xdg/bitty/init.lua");
+        let profile = std::path::Path::new("/xdg/bitty/profiles/bad.lua");
+
+        // CLI error while a valid file participates: file is not causal.
+        let cli = classify_merge_failure(&err, Some(file), None, false);
+        assert!(!cli.fallback_allowed, "{}", cli.message);
+        assert!(
+            cli.message.starts_with("bitty: invalid --theme:"),
+            "{}",
+            cli.message
+        );
+
+        // Profile error while a valid file participates: attributed to the
+        // profile, never to the file.
+        let profile_failure = classify_merge_failure(&err, Some(file), Some(profile), false);
+        assert!(
+            !profile_failure.fallback_allowed,
+            "{}",
+            profile_failure.message
+        );
+        assert!(
+            profile_failure.message.contains("invalid profile"),
+            "{}",
+            profile_failure.message
+        );
+        assert!(
+            profile_failure.message.contains("profiles/bad.lua"),
+            "{}",
+            profile_failure.message
+        );
+
+        // A re-merge without the user layer succeeded: the file is causal.
+        let broken = classify_merge_failure(&err, Some(file), None, true);
+        assert!(broken.fallback_allowed, "{}", broken.message);
+        assert!(broken.message.contains("init.lua"), "{}", broken.message);
+    }
+
+    #[test]
+    fn classifier_marks_a_present_broken_file_recoverable() {
+        let dir = scratch_dir("broken-file");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { font = }\n").expect("write broken init.lua");
+        let mut args = Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("a present-but-broken file must fail to load");
+        assert!(failure.fallback_allowed, "{}", failure.message);
+        assert!(
+            failure.message.contains("invalid config file"),
+            "{}",
+            failure.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifier_keeps_a_missing_explicit_path_fatal() {
+        let dir = scratch_dir("missing-path");
+        let mut args = Args::new();
+        args.config_path = Some(dir.join("missing.lua").to_string_lossy().into_owned());
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("an explicitly missing path must fail");
+        assert!(!failure.fallback_allowed, "{}", failure.message);
+        assert!(failure.message.contains("not found"), "{}", failure.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifier_keeps_invalid_cli_theme_fatal_with_a_valid_file() {
+        let dir = scratch_dir("bad-theme");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { appearance = { theme = \"dracula\" } }\n")
+            .expect("write valid init.lua");
+        let mut args = Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        args.theme = Some(String::from("not-a-theme"));
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("an unknown --theme must fail closed");
+        assert!(!failure.fallback_allowed, "{}", failure.message);
+        assert!(
+            failure.message.contains("invalid --theme"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("appearance.theme"),
+            "{}",
+            failure.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_config_is_returned_unchanged() {
+        let mut effective = EffectiveConfig::default();
+        effective.font.size = 15.0;
+        let startup = resolve_startup_config(Ok(app_config(effective.clone())), true)
+            .expect("valid config must load");
+        assert_eq!(startup.app.effective, effective);
+        assert!(startup.diagnostics.is_none());
+    }
+
+    #[test]
+    fn first_start_predicate_tracks_the_installed_last_good_plan() {
+        crate::config_reload::clear();
+        assert!(is_first_start(), "startup has no plan to retain");
+
+        let plan = EffectiveConfig::default();
+        crate::config_reload::install_with(plan, Box::new(|| Err(String::from("unused"))), None);
+        assert!(
+            !is_first_start(),
+            "an installed last-good plan means later failures retain it"
+        );
+        crate::config_reload::clear();
     }
 }

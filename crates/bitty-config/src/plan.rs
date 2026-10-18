@@ -332,8 +332,8 @@ impl ConfigPlan {
 /// Distribution < Profile < User < TrustedLocal < Cli`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LayerKind {
-    /// Built-in minimal configuration; used for `--safe` and first-start
-    /// fallback per R-009.
+    /// Built-in minimal configuration; the first-start fallback per R-009
+    /// uses it unmodified, while `--safe` applies safe-mode decoration on top.
     CoreDefaults,
     /// System defaults (e.g. `/etc/xdg/bitty/defaults.lua`). Trusted only
     /// after source verification.

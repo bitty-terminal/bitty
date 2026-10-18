@@ -1538,6 +1538,34 @@ mod tests {
     }
 
     #[test]
+    fn broken_reload_retains_the_last_good_plan() {
+        // CTX-1339 (#2225): startup fell back to built-ins; a later broken
+        // reload must keep that last-good plan instead of replacing it.
+        let mut baseline = bitty_config::EffectiveConfig::default();
+        baseline.font.size = 13.5;
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(|| {
+                Err(String::from(
+                    "bitty: invalid config file '/xdg/bitty/init.lua': syntax error",
+                ))
+            }),
+            None,
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "load-error");
+        assert!(!info.applied);
+        assert_eq!(
+            current_effective(),
+            Some(baseline),
+            "a broken reload must retain the last good plan"
+        );
+        clear();
+    }
+
+    #[test]
     fn classification_marks_font_size_live() {
         // Guard the assumption the engine relies on: font.size is a live field
         // (so `engine_applies_a_live_field` exercises the apply path).

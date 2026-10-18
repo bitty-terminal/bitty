@@ -265,7 +265,7 @@ use cli::{
     help_valid_commands, parse_args,
 };
 use config_cli::{
-    config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective_for,
+    config_usage, load_startup_config, run_config_subcommand, runtime_config_from_effective_for,
     startup_prefer_light,
 };
 use init::run_init_subcommand;
@@ -812,15 +812,23 @@ fn main() {
         std::process::exit(x::run_cli(&args));
     }
 
-    // User config first (fail-closed): invalid files exit non-zero with a
-    // clear stderr message; missing default-path files yield defaults.
-    let app_config = match load_app_config(&args) {
-        Ok(cfg) => cfg,
+    // User config first. CTX-1339 (#2225, R-009): first start with unusable
+    // configuration proceeds on the unmodified built-in `CoreDefaults` plan
+    // and reports diagnostics; there is no last-good plan to retain yet. Once
+    // `config_reload::install` seeds a plan, later failures keep it and never
+    // reach this startup fallback. A non-first-start error stays fail-closed.
+    // Missing default-path files still yield defaults.
+    let startup = match load_startup_config(&args) {
+        Ok(startup) => startup,
         Err(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
         }
     };
+    if let Some(diagnostics) = &startup.diagnostics {
+        eprintln!("{diagnostics}");
+    }
+    let app_config = startup.app;
     logging::info(|| {
         format!(
             "bitty: theme '{}' (resolution={:?} source={})",

@@ -555,6 +555,17 @@ struct PluginEntry {
 
 type DiscoveryResults = Vec<(PluginId, Result<(), PluginRuntimeError>)>;
 
+/// A failed read-only owning-VM counter observation (never a zero fallback).
+#[cfg(feature = "input-vm-test-support")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmExecutionCountError {
+    /// No entry or no VM for this plugin.
+    MissingVm,
+    /// A mutable VM borrow is active on the owning thread.
+    Busy,
+}
+
 /// Orchestrates discovery, activation, and dispatch for plugin VMs.
 ///
 /// The struct is `!Send` because it owns Phodopus VMs; callers use it on the
@@ -760,6 +771,24 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
+    /// Reads actual owning-VM entries under a short, shared owning-thread borrow.
+    /// No VM/reference escapes and no execution or dispatch occurs.
+    ///
+    /// # Errors
+    ///
+    /// Distinguishes missing VM from a busy mutable borrow.
+    #[cfg(feature = "input-vm-test-support")]
+    #[doc(hidden)]
+    pub fn vm_total_executions(&self, id: &PluginId) -> Result<u64, VmExecutionCountError> {
+        let vm = self
+            .entries
+            .get(id)
+            .and_then(|entry| entry.vm.as_ref())
+            .ok_or(VmExecutionCountError::MissingVm)?;
+        let vm = vm.try_borrow().map_err(|_| VmExecutionCountError::Busy)?;
+        Ok(vm.total_executions())
+    }
+
     /// Create an empty runtime.
     #[must_use]
     pub fn new(config: PluginRuntimeConfig) -> Self {
@@ -3885,6 +3914,55 @@ impl PluginRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "input-vm-test-support")]
+    #[test]
+    fn input_vm_boundary_counter_distinguishes_missing_busy_and_zero() {
+        // Constructor-only control: no Lua source is evaluated or dispatched.
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        let manifest = manifest_toml::parse_manifest(
+            br#"[plugin]
+id = "bitty-featured.input-counter"
+name = "Input counter fixture"
+version = "0.0.1"
+description = "Read-only owning-VM accounting"
+[compat]
+plugin-api = "^1.0"
+"#,
+        )
+        .expect("in-memory manifest");
+        let id = manifest.id().clone();
+        assert_eq!(
+            runtime.vm_total_executions(&id),
+            Err(VmExecutionCountError::MissingVm)
+        );
+        runtime.insert_package(
+            id.clone(),
+            PluginPackage {
+                manifest,
+                module_root: PathBuf::new(),
+                source_class: SourceClass::LocalPath,
+                unverified: true,
+                granted: None,
+            },
+        );
+        assert_eq!(
+            runtime.vm_total_executions(&id),
+            Err(VmExecutionCountError::MissingVm)
+        );
+        let vm = Rc::new(RefCell::new(
+            build_plugin_vm(id.as_str(), Some(VmBudgets::default())).expect("bounded pure VM"),
+        ));
+        runtime.entries.get_mut(&id).expect("entry").vm = Some(vm.clone());
+        assert_eq!(runtime.vm_total_executions(&id), Ok(0));
+        let busy = vm.borrow_mut();
+        assert_eq!(
+            runtime.vm_total_executions(&id),
+            Err(VmExecutionCountError::Busy)
+        );
+        drop(busy);
+        assert_eq!(runtime.vm_total_executions(&id), Ok(0));
+    }
 
     #[test]
     fn runtime_error_taxonomy_codes_and_classes() {

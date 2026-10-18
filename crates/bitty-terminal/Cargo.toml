@@ -58,6 +58,8 @@ default = []
 # Enables `bitty dev capture|synthesize|dump|overlay` (CTX-0922): developer
 # headless captures, dumps, and overlay proofs stay out of release builds.
 dev-tools = []
+# Explicit, default-off application boundary regression infrastructure.
+input-vm-test-support = ["bitty-platform/input-vm-test-support", "bitty-runtime/input-vm-test-support"]
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).

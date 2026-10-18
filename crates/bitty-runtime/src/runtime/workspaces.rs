@@ -623,6 +623,12 @@ impl Runtime {
         if self.focus.focused() == Some(id) {
             if let Some(first) = self.layout.leaf_ids().into_iter().next() {
                 self.focus = Focus::with_focus(first);
+            } else if let Some(next) = self.floats.paint_ids().last().copied() {
+                // CTX-1336 (#2221): an empty tiled base can still composite
+                // other detached floats. Never clear focus while a live
+                // float remains: clearing would drop keyboard routing even
+                // though a visible, typable panel survives.
+                self.focus = Focus::with_focus(next);
             } else {
                 self.focus.clear();
             }

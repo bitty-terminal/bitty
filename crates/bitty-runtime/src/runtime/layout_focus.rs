@@ -490,6 +490,12 @@ impl Runtime {
         surface: Option<ViewId>,
         now: std::time::Instant,
     ) -> bool {
+        // CTX-1335 F7: a zero-duration kind never admits an entry, so evict a
+        // bounds tween only after the duration gate. Otherwise a refused ring
+        // trigger would still discard another surface's geometry for nothing.
+        if self.animator.policy().duration(kind).is_zero() {
+            return self.animator.trigger(kind, surface, now);
+        }
         if self.animator.active_count(now) + self.fx.active_count(now) >= MAX_CONCURRENT_ANIMATIONS
         {
             // CTX-1335: bounds interpolation yields to the accepted ring
@@ -519,16 +525,17 @@ impl Runtime {
         started: std::time::Instant,
         now: std::time::Instant,
     ) -> bool {
-        // A same-kind ring slot is reused by `trigger_bounds_at`, so it does
-        // not consume another budget entry.
-        let reuses_slot = self
-            .animator
-            .active_started(kind, Some(surface), now)
-            .is_some();
+        // A same-kind slot or an in-flight drag entry is reused by
+        // `trigger_bounds_at`, so it does not consume another budget entry.
+        let reuses_slot = self.animator.has_bounds_host(kind, Some(surface), now);
         if !reuses_slot
             && self.animator.active_count(now) + self.fx.active_count(now)
                 >= MAX_CONCURRENT_ANIMATIONS
         {
+            // CTX-1335 F2: a refused tween must not leave the surface's old
+            // geometry painting. Drop it so this frame is the committed end
+            // bounds.
+            self.animator.cancel_bounds(Some(surface));
             return false;
         }
         let armed = self
@@ -685,10 +692,15 @@ impl Runtime {
             return;
         }
         let policy = self.config.animations;
+        // CTX-1335 F8: geometry interpolation rides a *causal* accepted
+        // transition (split/zoom open or close, workspace switch, or an
+        // in-flight gesture), never an unrelated focus fade.
+        let mut accepted_transition = false;
 
         if policy.animates(AnimationKind::Workspace)
             && active_workspace != self.last_presented_workspace
         {
+            accepted_transition = true;
             self.trigger_animation(AnimationKind::Workspace, None, now);
         }
 
@@ -703,6 +715,7 @@ impl Runtime {
         if policy.animates(AnimationKind::Open) {
             for frame in allocations {
                 if !old_ids.contains(&frame.view) {
+                    accepted_transition = true;
                     self.trigger_animation(AnimationKind::Open, Some(frame.view), now);
                 }
             }
@@ -757,6 +770,7 @@ impl Runtime {
                     radius: old.radius,
                     color,
                 });
+                accepted_transition = true;
                 self.trigger_animation(AnimationKind::Close, Some(old.view), now);
             }
         }
@@ -771,10 +785,13 @@ impl Runtime {
             .iter()
             .map(|frame| (frame.view, *frame))
             .collect();
+        let gesture_active = self.animator.earliest_geometry_started(now).is_some();
         for frame in allocations {
             let Some(old) = old_by_view.get(&frame.view) else {
                 // A brand-new View uses the open transition, not a bounds
                 // tween; there is no committed start rectangle to move from.
+                // Drop a stale entry defensively when a retired id is reused.
+                self.animator.cancel_bounds(Some(frame.view));
                 continue;
             };
             if old.frame == frame.frame && old.content == frame.content {
@@ -788,7 +805,20 @@ impl Runtime {
             // fails closed to the committed end bounds: the float's opaque
             // cover must own its final frame on the first present, never an
             // interpolated one that could bleed the base beneath it.
-            if old.tier != frame.tier || !self.animator.is_active(now) {
+            if old.tier != frame.tier {
+                // CTX-1335 F1: only arming no new tween is not enough — the
+                // surface's old tween would keep painting an obsolete rect
+                // under the float cover/occluders. Cut it before painting.
+                self.animator.cancel_bounds(Some(frame.view));
+                continue;
+            }
+            if !accepted_transition
+                && !gesture_active
+                && self
+                    .animator
+                    .interpolated_bounds(Some(frame.view), now)
+                    .is_none()
+            {
                 continue;
             }
             let size_changed =
@@ -799,6 +829,9 @@ impl Runtime {
                 AnimationKind::Move
             };
             if !policy.animates(kind) {
+                // CTX-1335 F2: a non-animating kind must not leave a
+                // different-kind tween painting its old end rectangle.
+                self.animator.cancel_bounds(Some(frame.view));
                 continue;
             }
             // Re-targeting an in-flight tween starts from the currently
@@ -847,6 +880,12 @@ impl Runtime {
                 };
                 let dx = direction.saturating_mul(distance);
                 for frame in allocations {
+                    // CTX-1335 F5: pins are window-global chrome, not part of
+                    // the incoming workspace; they stay anchored while the
+                    // workspace slides beneath them.
+                    if self.pinned.contains(frame.view) {
+                        continue;
+                    }
                     let to = PanelBounds {
                         frame: frame.frame,
                         content: frame.content,

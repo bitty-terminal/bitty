@@ -346,6 +346,11 @@ struct ActiveAnimation {
     /// for ring-only transitions (open/close/focus), so geometry stays at the
     /// committed final state exactly as before.
     bounds: Option<(PanelBounds, PanelBounds)>,
+    /// Whether the entry owns an independent ring fade armed through
+    /// [`PanelAnimator::trigger`]. A bounds-only entry (`false`) is removed
+    /// outright when its geometry is cancelled; a ring entry keeps fading
+    /// with its bounds cleared.
+    ring: bool,
 }
 
 impl ActiveAnimation {
@@ -446,6 +451,7 @@ impl PanelAnimator {
             started: now,
             duration,
             bounds: None,
+            ring: true,
         });
         true
     }
@@ -456,8 +462,10 @@ impl PanelAnimator {
     /// `false` when the policy resolves to an instant cut (zero duration) or
     /// the bounded capacity is exhausted; in both cases the caller paints the
     /// committed end state immediately. The transition uses `kind`'s accepted
-    /// duration and easing, and replaces any in-flight geometry transition on
-    /// the same surface so two bounds animations never blend.
+    /// duration and easing, except when it rides an in-flight drag gesture
+    /// (which keeps that gesture's accepted clock), and replaces any other
+    /// in-flight geometry transition on the same surface so two bounds
+    /// animations never blend.
     pub fn trigger_bounds(
         &mut self,
         kind: AnimationKind,
@@ -485,28 +493,30 @@ impl PanelAnimator {
     ) -> bool {
         let duration = self.policy.duration(kind);
         if duration.is_zero() {
-            self.active
-                .retain(|a| !(a.surface == surface && a.bounds.is_some()));
+            self.cancel_bounds(surface);
             return false;
         }
-        // One geometry transition per surface: replace the in-flight one
-        // instead of blending, including a different kind on the same surface.
-        // A same-kind ring slot is reused (one surface, one budget entry).
-        let mut attached = false;
-        for animation in &mut self.active {
-            if animation.surface == surface && animation.kind == kind {
-                animation.bounds = Some((from, to));
-                animation.started = started;
-                animation.duration = duration;
-                attached = true;
-                break;
+        // One geometry transition per surface: reuse the same-kind slot, or
+        // attach to an in-flight Alt+drag gesture entry (CTX-1335 F3). The
+        // drag ring already owns the surface's accepted duration, so its
+        // bounds ride that entry instead of consuming a second budget slot
+        // and multiplying the ring alpha.
+        if let Some(index) = self.bounds_host(kind, surface, now) {
+            let mut entry = self.active.remove(index);
+            self.active
+                .retain(|a| !(a.surface == surface && a.bounds.is_some()));
+            if entry.kind == kind {
+                entry.started = started;
+                entry.duration = duration;
             }
-        }
-        self.active
-            .retain(|a| !(a.surface == surface && a.bounds.is_some() && a.kind != kind));
-        if attached {
+            entry.bounds = Some((from, to));
+            self.active.push(entry);
             return true;
         }
+        // No reusable slot: replace any stale bounds entry deterministically
+        // (a different kind must never keep painting its old end rectangle).
+        self.active
+            .retain(|a| !(a.surface == surface && a.bounds.is_some()));
         if self.active.len() >= MAX_CONCURRENT_ANIMATIONS {
             self.active.retain(|a| !a.done(now));
             if self.active.len() >= MAX_CONCURRENT_ANIMATIONS {
@@ -519,8 +529,73 @@ impl PanelAnimator {
             started,
             duration,
             bounds: Some((from, to)),
+            ring: false,
         });
         true
+    }
+
+    /// Index of the entry that can host a bounds tween for `kind` on
+    /// `surface`: a same-kind slot, or an in-flight Alt+drag gesture entry
+    /// (CTX-1335 F3).
+    fn bounds_host(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> Option<usize> {
+        let mut drag_host = None;
+        for (index, animation) in self.active.iter().enumerate() {
+            if animation.surface != surface || animation.done(now) {
+                continue;
+            }
+            if animation.kind == kind {
+                return Some(index);
+            }
+            if animation.kind == AnimationKind::Drag
+                && matches!(kind, AnimationKind::Move | AnimationKind::Resize)
+            {
+                drag_host = Some(index);
+            }
+        }
+        drag_host
+    }
+
+    /// Whether [`Self::trigger_bounds_at`] would reuse an existing entry
+    /// instead of consuming a new budget slot.
+    #[must_use]
+    pub(crate) fn has_bounds_host(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: Instant,
+    ) -> bool {
+        self.bounds_host(kind, surface, now).is_some()
+    }
+
+    /// Cancels the bounds tween on `surface` without touching an independent
+    /// ring fade. Returns whether anything was cancelled.
+    ///
+    /// A bounds-only entry is removed (nothing else would paint); a ring
+    /// entry keeps its accepted fade with `bounds: None`, so the next paint
+    /// uses the committed end rectangle immediately (CTX-1335 F1/F2).
+    pub(crate) fn cancel_bounds(&mut self, surface: Option<ViewId>) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.active.len() {
+            let animation = self.active[index];
+            if animation.surface == surface && animation.bounds.is_some() {
+                changed = true;
+                if animation.ring {
+                    self.active[index].bounds = None;
+                    index += 1;
+                } else {
+                    self.active.remove(index);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        changed
     }
 
     /// Start instant of an active animation of `kind` on `surface`, if any.
@@ -970,6 +1045,126 @@ mod tests {
             now,
         ));
         assert_eq!(anim.active_count(now), MAX_CONCURRENT_ANIMATIONS);
+    }
+
+    #[test]
+    fn bounds_reuse_same_kind_and_drag_slots_without_double_counting() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let moved = ViewId::new(30);
+        let dragged = ViewId::new(31);
+
+        // A same-kind ring slot is reused instead of consuming another
+        // budget entry (CTX-1335 F4).
+        assert!(anim.trigger(AnimationKind::Move, Some(moved), now));
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(moved),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(anim.has_bounds_host(AnimationKind::Move, Some(moved), now));
+
+        // An in-flight Alt+drag gesture hosts the per-view move bounds: one
+        // surface, one budget entry, one ring alpha factor (CTX-1335 F3).
+        assert!(anim.trigger(AnimationKind::Drag, Some(dragged), now));
+        assert!(anim.has_bounds_host(AnimationKind::Move, Some(dragged), now));
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(dragged),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 2);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some()
+        );
+        assert!(
+            anim.progress(AnimationKind::Move, Some(dragged), now)
+                .is_none(),
+            "bounds must ride the drag entry, not add a second Move entry"
+        );
+
+        // Cancelling geometry keeps the independent drag ring fade.
+        assert!(anim.cancel_bounds(Some(dragged)));
+        assert_eq!(anim.interpolated_bounds(Some(dragged), now), None);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some()
+        );
+        assert!(!anim.cancel_bounds(Some(dragged)));
+    }
+
+    #[test]
+    fn different_kind_bounds_are_replaced_not_blended_and_cancel_cleans_up() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(32);
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(40, 20, 50, 40),
+            now,
+        ));
+        let mid = now + Duration::from_millis(60);
+        let moved = anim
+            .interpolated_bounds(Some(view), mid)
+            .expect("move tween");
+        // A different kind replaces the in-flight tween deterministically.
+        assert!(anim.trigger_bounds(
+            AnimationKind::Resize,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(60, 30, 70, 50),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 1, "one bounds entry per surface");
+        assert!(
+            anim.progress(AnimationKind::Move, Some(view), mid)
+                .is_none()
+        );
+        assert!(
+            anim.progress(AnimationKind::Resize, Some(view), mid)
+                .is_some()
+        );
+        assert_ne!(anim.interpolated_bounds(Some(view), mid), Some(moved));
+        // A bounds-only entry disappears on cancel: nothing else paints.
+        assert!(anim.cancel_bounds(Some(view)));
+        assert_eq!(anim.active_count(now), 0);
+        assert!(!anim.bounds_active(now));
+        assert!(!anim.cancel_bounds(Some(view)));
+    }
+
+    #[test]
+    fn overflow_drops_bounds_before_ring_transitions() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let view = ViewId::new(33);
+        let focused = ViewId::new(34);
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(view),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert!(anim.trigger(AnimationKind::Focus, Some(focused), now));
+        assert!(anim.drop_one_bounds(now));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(anim.interpolated_bounds(Some(view), now).is_none());
+        assert!(
+            anim.progress(AnimationKind::Focus, Some(focused), now)
+                .is_some()
+        );
+        assert!(
+            !anim.drop_one_bounds(now),
+            "nothing left to drop: no bounds entry"
+        );
     }
 
     #[test]

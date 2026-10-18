@@ -664,6 +664,13 @@ impl Runtime {
         if self.focus.focused() == Some(id) {
             if let Some(first) = self.layout.leaf_ids().into_iter().next() {
                 self.focus = Focus::with_focus(first);
+            } else if let Some(next) = self.pinned.ids().last().copied() {
+                // CTX-1337 (#2222): discarding one pin over an empty base
+                // must hand focus to the topmost surviving pin. Clearing
+                // focus here left a painted pin untypable.
+                self.focus = Focus::with_focus(next);
+            } else if let Some(next) = self.floats.paint_ids().last().copied() {
+                self.focus = Focus::with_focus(next);
             } else {
                 self.focus.clear();
             }
@@ -1091,17 +1098,42 @@ impl Runtime {
         }
         // CTX-1077: the stashed focus may name a leaf that left every layout
         // since (pinned, then unpinned into another workspace, then switched
-        // back here). Clamp to the first live leaf so focus never dangles
-        // behind the read guard; a still-pinned focus is kept as-is.
+        // back here). Clamp to a live view of this slot so focus never
+        // dangles behind the read guard; a still-pinned focus is kept as-is.
         // CTX-1147: a focus naming a detached float of the loaded slot is
         // kept the same way (floats ride the slot like layout leaves).
-        if self.focus.focused().is_some_and(|id| {
-            !self.layout.leaf_ids().contains(&id)
-                && !self.pinned.contains(id)
-                && !self.floats.contains(id)
+        // CTX-1337 (#2222): an empty base can legitimately hold only a pin,
+        // but once that pin was unpinned into another workspace it is no
+        // longer live here. Clear the stale focus and the primary ownership
+        // it carried; otherwise input from the empty surface would route
+        // into a hidden foreign shell.
+        if let Some(focused) = self.focus.focused().filter(|id| {
+            !self.layout.leaf_ids().contains(id)
+                && !self.pinned.contains(*id)
+                && !self.floats.contains(*id)
         }) {
-            if let Some(first) = self.layout.leaf_ids().into_iter().next() {
-                self.focus = Focus::with_focus(first);
+            let replacement = self
+                .layout
+                .leaf_ids()
+                .into_iter()
+                .next()
+                .or_else(|| self.floats.paint_ids().last().copied())
+                .or_else(|| self.pinned.ids().last().copied());
+            match replacement {
+                Some(next) => {
+                    self.focus = Focus::with_focus(next);
+                    if self.primary_view == Some(focused) {
+                        self.primary_view = Some(next);
+                    }
+                }
+                None => {
+                    self.focus.clear();
+                    // No live view is left in this slot, so the runtime-global
+                    // primary has no surface to paint here. Leaving it on a
+                    // foreign leaf would make `route_input_bytes` fall back
+                    // into a hidden shell from the empty surface.
+                    self.primary_view = None;
+                }
             }
         }
         if let Some(focused) = self.focus.focused() {
@@ -4452,6 +4484,114 @@ mod tests {
             rt.retire_sole_tiled_leaf_for_pinned(host).is_none(),
             "already retired: no second mutation"
         );
+    }
+
+    #[test]
+    fn load_empty_base_clears_foreign_focus_after_cross_workspace_unpin_issue_2222() {
+        // Issue #2222 review F1: the pin-only base in ws1 names the pin as
+        // focus. Unpinning it into ws2 makes it a ws2 leaf; switching back to
+        // ws1 must not keep focus/primary on that foreign view, or empty-
+        // surface input would route into the hidden ws2 shell.
+        let mut rt = fresh();
+        let host = rt.focused_view().expect("focus");
+        let pinned = ViewId::new(2);
+        let leaf = rt.layout().find_leaf(host).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(pinned, 40, 24)),
+        ));
+        assert!(rt.set_focus(pinned));
+        rt.pin_floating(pinned).expect("pin");
+        assert_eq!(rt.layout().leaf_ids(), vec![host]);
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_pinned(host),
+            Some(pinned),
+            "ws1 reaches the pin-only empty base"
+        );
+        assert_eq!(rt.layout().leaf_ids(), Vec::new());
+        assert_eq!(rt.focused_view(), Some(pinned));
+        assert_eq!(rt.primary_view(), Some(pinned));
+
+        rt.workspace_new().expect("second workspace opens");
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert!(rt.set_focus(pinned), "the composited pin is focusable");
+        assert_eq!(rt.unpin_floating(pinned), Ok(pinned));
+        assert!(rt.layout().leaf_ids().contains(&pinned));
+        assert!(rt.pinned_views().is_empty());
+
+        assert!(rt.workspace_switch(0));
+        assert_eq!(
+            rt.layout().leaf_ids(),
+            Vec::new(),
+            "ws1 still holds the pin-only empty base"
+        );
+        assert_eq!(rt.focused_view(), None, "foreign pin leaves no focus");
+        assert_eq!(
+            rt.primary_view(),
+            None,
+            "empty surface must not keep a foreign primary owner"
+        );
+        assert!(
+            !rt.push_input_bytes(b"x"),
+            "empty-surface input must not reach the hidden ws2 shell"
+        );
+    }
+
+    #[test]
+    fn discard_pinned_falls_back_to_surviving_pin_on_empty_base_issue_2222() {
+        // Issue #2222 review F2: with two pins over an empty base, closing
+        // the focused pin must hand focus and primary to the topmost survivor
+        // instead of clearing both and leaving a painted pin untypable.
+        let mut rt = fresh();
+        let host = rt.focused_view().expect("focus");
+        let first_pin = ViewId::new(2);
+        let second_pin = ViewId::new(3);
+        let leaf = rt.layout().find_leaf(host).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(first_pin, 40, 24)),
+                LayoutNode::leaf(View::new(second_pin, 40, 24)),
+            ),
+        ));
+        assert!(rt.set_focus(first_pin));
+        rt.pin_floating(first_pin).expect("first pin");
+        assert!(rt.set_focus(second_pin));
+        rt.pin_floating(second_pin).expect("second pin");
+        assert_eq!(rt.pinned_views(), vec![first_pin, second_pin]);
+        assert_eq!(rt.layout().leaf_ids(), vec![host]);
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_pinned(host),
+            Some(second_pin),
+            "topmost pin owns the empty base"
+        );
+        assert_eq!(rt.focused_view(), Some(second_pin));
+        assert_eq!(rt.primary_view(), Some(second_pin));
+
+        assert!(rt.discard_pinned(second_pin));
+        assert_eq!(rt.pinned_views(), vec![first_pin]);
+        assert_eq!(
+            rt.focused_view(),
+            Some(first_pin),
+            "the surviving pin must keep focus"
+        );
+        assert_eq!(
+            rt.primary_view(),
+            Some(first_pin),
+            "the surviving pin must keep primary ownership"
+        );
+
+        assert!(rt.discard_pinned(first_pin));
+        assert!(rt.layout().leaf_ids().is_empty());
+        assert_eq!(rt.focused_view(), None, "no live view remains");
+        assert_eq!(rt.primary_view(), None);
     }
 
     #[test]

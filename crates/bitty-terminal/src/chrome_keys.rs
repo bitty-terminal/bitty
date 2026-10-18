@@ -1471,8 +1471,14 @@ impl TerminalApp {
                     .zoom
                     .backup_leaf_count(&self.runtime)
                     .map_or(self.runtime.leaf_count() <= 1, |count| count == 1);
+                // CTX-1337 (#2222): a pinned panel is window-global and
+                // survives an emptied workspace, so its composited base
+                // keeps the workspace meaningful; never prune it away from
+                // the pin. Floats stay workspace-local, so they still prune
+                // exactly like the CTX-1297 path.
                 let prune_last_tiled_workspace = close_last_tiled_panel
                     && self.runtime.floated_count() == 0
+                    && self.runtime.pinned_count() == 0
                     && self.runtime.workspace_count() > 1;
                 let zoom_backup_views = if prune_last_tiled_workspace {
                     self.runtime
@@ -1610,6 +1616,44 @@ impl TerminalApp {
                         }
                         eprintln!(
                             "bitty: keymap close_view -> float base drained, leafs={} focused={:?}",
+                            self.runtime.leaf_count(),
+                            self.runtime.focused_view()
+                        );
+                    } else if self.runtime.pinned_count() > 0 {
+                        // CTX-1337 (#2222): a pinned panel survives outside
+                        // the live layout, so the closed tiled host is a
+                        // pane close. Unlike a float the pin never covers
+                        // the dead leaf: leaving it behind painted a ghost
+                        // cursor in the vacated region and swallowed input
+                        // (no focused writer, no primary owner). Tear down
+                        // the shell, retire the leaf, and hand focus plus
+                        // primary ownership to the pin.
+                        let was_primary = self.runtime.is_primary_view(&focused);
+                        if was_primary {
+                            if self.runtime.close_primary_session() {
+                                eprintln!(
+                                    "bitty: keymap close_view tore down primary shell {focused:?} (pinned base drained)"
+                                );
+                            }
+                        } else if self.runtime.close_pane_session(&focused) {
+                            eprintln!(
+                                "bitty: keymap close_view tore down last tiled panel shell {focused:?} (pinned base drained)"
+                            );
+                        }
+                        if let Some(survivor) =
+                            self.runtime.retire_sole_tiled_leaf_for_pinned(focused)
+                        {
+                            eprintln!(
+                                "bitty: keymap close_view -> pinned base drained, {survivor:?} focused/primary"
+                            );
+                        } else {
+                            eprintln!(
+                                "warning: keymap close_view could not retire pinned base leaf {focused:?} — ignoring"
+                            );
+                        }
+                        eprintln!(
+                            "bitty: keymap close_view -> pins={} leafs={} focused={:?}",
+                            self.runtime.pinned_count(),
                             self.runtime.leaf_count(),
                             self.runtime.focused_view()
                         );
@@ -3800,8 +3844,9 @@ mod tests {
         use bitty_config::ChromeAction;
 
         // A pinned panel is window-global, so closing the only tiled panel in
-        // the only workspace must keep that workspace and use the existing
-        // session-close fallback rather than replacing it.
+        // the only workspace must keep that workspace. CTX-1337 (#2222): the
+        // dead tiled leaf retires and the pin takes focus plus primary
+        // ownership; the stale session-less leaf must never survive.
         let mut app = workspace_test_app();
         app.runtime.set_layout(two_pane_layout());
         assert!(app.runtime.set_focus(ViewId::new(1)));
@@ -3814,8 +3859,43 @@ mod tests {
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
         assert_eq!(app.runtime.workspace_count(), 1);
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
         assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn close_view_keeps_pinned_empty_base_across_workspaces_issue_2222() {
+        use bitty_config::ChromeAction;
+
+        // CTX-1337 (#2222): a pin is window-global, so its composited base
+        // is never pruned away from it. Closing the last tiled panel keeps
+        // the workspace and hands focus/primary to the pin even when another
+        // workspace exists (unlike a workspace-local float, which dies with
+        // its pruned workspace).
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        app.runtime.workspace_new().expect("second workspace opens");
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+
+        assert_eq!(
+            app.runtime.workspace_count(),
+            2,
+            "a pin-owning base must not be pruned"
+        );
+        assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -3843,10 +3923,19 @@ mod tests {
         assert!(!app.runtime.has_pty(), "primary shell must be torn down");
         assert!(!app.runtime.has_pty_reader());
         assert!(!app.runtime.has_pty_writer());
-        assert_eq!(app.runtime.primary_view(), None);
+        assert_eq!(
+            app.runtime.primary_view(),
+            Some(pinned),
+            "CTX-1337 (#2222): the surviving pin owns the empty base"
+        );
         assert_eq!(app.runtime.primary_spawn_recipe(), None);
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            Vec::new(),
+            "the dead primary leaf retires instead of staying session-less"
+        );
         assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.focused_view(), Some(pinned));
         assert_eq!(app.runtime.workspace_count(), 1);
         assert!(!app.runtime.workspace_is_occupied(0));
         assert!(

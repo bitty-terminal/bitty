@@ -58,9 +58,11 @@ pub enum UiSlot {
     Top,
     /// `bottom` — bottom edge band.
     Bottom,
-    /// `left` — left edge band.
+    /// `left` — left edge band slot (no vertical band host yet; the mount
+    /// gate fails closed with `E_UI_UNAVAILABLE`).
     Left,
-    /// `right` — right edge band.
+    /// `right` — right edge band slot (no vertical band host yet; the mount
+    /// gate fails closed with `E_UI_UNAVAILABLE`).
     Right,
     /// `tabline` — exclusive-claim tab strip (reserved for panel tabs).
     Tabline,

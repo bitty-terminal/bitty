@@ -578,8 +578,9 @@ impl Runtime {
     ///
     /// Counts visible bands only, clamped by the degradation budget
     /// ([`Self::plugin_band_budget`]): `0` when the window cannot hold the
-    /// bands above the content floor, or for a vertical edge (vertical
-    /// bands are stored, never painted).
+    /// bands above the content floor, or for a vertical edge (this build has
+    /// no vertical band host, so mounts to `left`/`right` fail closed and no
+    /// vertical band can exist).
     #[must_use]
     pub fn visible_band_count(&self, edge: BandEdge) -> u16 {
         let (top, bottom) = self.plugin_band_budget();

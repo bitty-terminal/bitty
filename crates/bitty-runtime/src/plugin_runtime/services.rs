@@ -2835,7 +2835,8 @@ impl HostServices for PluginServices {
         // CTX-0923: an accepted slot this host does not present fails closed
         // here, after the capability and claim gates, through the same
         // placement policy the band routing uses, so nothing is admitted and
-        // then silently dropped at render time.
+        // then silently dropped at render time. CTX-1341: this includes
+        // `left`/`right`, which have no vertical band host yet.
         if let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(ui_slot) {
             return Err(unsupported_slot_error(ui_slot, reason));
         }
@@ -6012,8 +6013,9 @@ mod tests {
                 }
             }
         }
-        // top, bottom, left, right, overlay
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 5));
+        // top, bottom, overlay; left/right/tabline/terminal fail closed
+        // (CTX-1341: no vertical band host, so no vertical block is retained).
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 3));
     }
 
     #[test]

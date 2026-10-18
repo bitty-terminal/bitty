@@ -421,11 +421,12 @@ impl PanelAnimator {
             return false;
         }
         // Restart (bounded) any existing animation of the same kind on the
-        // surface. Close and the gesture kinds also drop an in-flight bounds
-        // tween on that surface (the surface is going away, or the gesture
-        // re-arms its own geometry on the next present). Focus/Open/Workspace
-        // leave bounds interpolation untouched: they share the same surface
-        // without conflicting with its painted geometry (CTX-1335).
+        // surface. Close drops an in-flight bounds tween (the surface is going
+        // away); the gesture kinds replace it but carry its painted frame
+        // forward, because the gesture re-arms its own geometry on the next
+        // present. Focus/Open/Workspace leave bounds interpolation untouched:
+        // they share the same surface without conflicting with its painted
+        // geometry (CTX-1335).
         let replaces_bounds = matches!(
             kind,
             AnimationKind::Close
@@ -433,6 +434,25 @@ impl PanelAnimator {
                 | AnimationKind::Resize
                 | AnimationKind::Drag
         );
+        // A gesture re-arm replaces its bounds entry, but the painted frame
+        // must not jump back to the last committed target before the next
+        // present retargets. Carry the current interpolated frame forward as
+        // the new start, keeping the previous destination until the detector
+        // supplies the freshly committed one (CodeRabbit PR #2231, finding 1).
+        let carried_bounds = if matches!(
+            kind,
+            AnimationKind::Move | AnimationKind::Resize | AnimationKind::Drag
+        ) {
+            let destination = self
+                .active
+                .iter()
+                .find(|a| a.surface == surface && a.bounds.is_some() && !a.done(now))
+                .and_then(|a| a.bounds)
+                .map(|(_, to)| to);
+            self.interpolated_bounds(surface, now).zip(destination)
+        } else {
+            None
+        };
         self.active.retain(|a| {
             !(a.surface == surface && (a.kind == kind || (replaces_bounds && a.bounds.is_some())))
         });
@@ -450,7 +470,7 @@ impl PanelAnimator {
             surface,
             started: now,
             duration,
-            bounds: None,
+            bounds: carried_bounds,
             ring: true,
         });
         true
@@ -668,7 +688,15 @@ impl PanelAnimator {
     /// dropped surface paints its committed end state immediately.
     pub fn drop_one_bounds(&mut self, now: Instant) -> bool {
         self.active.retain(|a| !a.done(now));
-        if let Some(index) = self.active.iter().position(|a| a.bounds.is_some()) {
+        // Only bounds-only entries free a budget slot. A reused ring slot
+        // (Move or the Alt-drag Drag entry) hosts bounds too; removing it
+        // would delete the accepted fade this priority rule protects
+        // (CodeRabbit PR #2231, finding 2).
+        if let Some(index) = self
+            .active
+            .iter()
+            .position(|a| a.bounds.is_some() && !a.ring)
+        {
             self.active.remove(index);
             return true;
         }
@@ -1172,6 +1200,56 @@ mod tests {
             !anim.drop_one_bounds(now),
             "nothing left to drop: no bounds entry"
         );
+    }
+
+    #[test]
+    fn overflow_preserves_a_ring_entry_that_hosts_bounds() {
+        let now = t0();
+        let mut anim = PanelAnimator::new(AnimationPolicy::default());
+        let dragged = ViewId::new(35);
+        let bounds_only = ViewId::new(36);
+
+        // The Alt-drag ring hosts its own bounds (one surface, one entry).
+        assert!(anim.trigger(AnimationKind::Drag, Some(dragged), now));
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(dragged),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        // A separate bounds-only tween is the only safe eviction candidate.
+        assert!(anim.trigger_bounds(
+            AnimationKind::Move,
+            Some(bounds_only),
+            bounds(0, 0, 10, 10),
+            bounds(10, 10, 20, 20),
+            now,
+        ));
+        assert_eq!(anim.active_count(now), 2);
+
+        assert!(anim.drop_one_bounds(now));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some(),
+            "the accepted drag ring survives"
+        );
+        assert!(
+            anim.interpolated_bounds(Some(dragged), now).is_some(),
+            "the ring's hosted bounds survive with it"
+        );
+        assert_eq!(anim.interpolated_bounds(Some(bounds_only), now), None);
+
+        // Only a ring-hosted tween remains: no slot can be freed without
+        // deleting the ring, so the trigger must be refused.
+        assert!(!anim.drop_one_bounds(now));
+        assert_eq!(anim.active_count(now), 1);
+        assert!(
+            anim.progress(AnimationKind::Drag, Some(dragged), now)
+                .is_some()
+        );
+        assert!(anim.interpolated_bounds(Some(dragged), now).is_some());
     }
 
     #[test]

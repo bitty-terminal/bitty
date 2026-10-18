@@ -164,7 +164,7 @@ pub mod workspaces;
 
 pub use self::animations::{
     AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame, MAX_CONCURRENT_ANIMATIONS,
-    PanelAnimator, ReducedMotionMode,
+    PanelAnimator, PanelBounds, ReducedMotionMode,
 };
 pub use self::fx::{
     FX_PULSE_DURATION_MS, FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, FxPulseTracker, QueuedFxPulse,

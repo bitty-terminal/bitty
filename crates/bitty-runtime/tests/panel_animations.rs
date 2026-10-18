@@ -1,21 +1,29 @@
 #![forbid(unsafe_code)]
 //! Renderer-side panel animations (RFC-0002, CTX-0341; CTX-0967 move/resize/drag;
-//! CTX-1078 splits/zoom/workspaces).
+//! CTX-1078 splits/zoom/workspaces; CTX-1335 paint geometry).
 //!
 //! Pins the runtime wiring of the accepted contract:
 //! - a new split `View` arms a bounded open transition and presents extra
 //!   frames while active; when it completes the present path idles again
 //!   (frame-on-demand, PB-7: zero wakeups after completion);
 //! - single-pane zoom engage/disengage arms bounded close/open transitions
-//!   through the same chrome-ring fade (geometry and content commit
-//!   immediately, never interpolated);
+//!   through the same chrome-ring fade; the logical layout, PTY size,
+//!   content, and hit-test frames commit immediately (CTX-1335 adds
+//!   paint-only bounds interpolation);
 //! - workspace switches (new/switch/prev/next/last) arm the bounded
-//!   workspace transition with the same virtual-clock seam;
+//!   workspace cross-fade and slide the committed incoming bounds in with
+//!   the same virtual-clock seam;
 //! - panel move (same-workspace reposition, cross-workspace reparent),
 //!   panel resize (border-drag divider, keyboard step), and panel drag
 //!   (Alt+drag float move) arm their own bounded transitions from the
 //!   gesture paths; the layout commits immediately and only Core-owned
-//!   chrome fades (terminal content is never interpolated);
+//!   chrome fades plus the painted bounds interpolate (terminal content is
+//!   never interpolated);
+//! - CTX-1335 geometry interpolation is paint-only: start/mid/end painted
+//!   bounds run on the virtual clock while `present_frames()` stays final;
+//!   instant/reduced/safe policies paint the end bounds on the first frame,
+//!   and float detach/restore (tier changes) fail closed to instant bounds
+//!   so the opaque float cover never bleeds the base beneath it;
 //! - the `now`-parameterized `tick_at` seam lets tests advance virtual time
 //!   deterministically, so no wall-clock sleeps are needed;
 //! - `enabled = false`, `reduced_motion = "always"`, `safe_mode`, and `0` ms
@@ -551,6 +559,203 @@ fn terminal_grid_is_never_interpolated() {
     assert_eq!(row, "GRID-TRUTH", "grid content is never animated");
 }
 
+// ── CTX-1335: paint-only panel-bounds interpolation ──────────────────────
+
+fn frame_for(frames: &[bitty_runtime::PresentFrame], view: ViewId) -> bitty_runtime::PresentFrame {
+    *frames
+        .iter()
+        .find(|frame| frame.view == view)
+        .expect("view must be present")
+}
+
+#[test]
+fn split_resizes_interpolate_pane_bounds_on_the_virtual_clock() {
+    // A split commits the final layout, PTY size, and hit-test geometry on
+    // the first frame; only the painted bounds move from the committed start
+    // to the committed end over the accepted Resize duration.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none());
+    let before = frame_for(&rt.present_frames(), ViewId::new(1));
+
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("split presents");
+    let logical = rt.present_frames();
+    let target = frame_for(&logical, ViewId::new(1));
+    assert_ne!(before.frame, target.frame, "split resizes the kept pane");
+
+    // Frame zero paints the committed start bounds; hit-testing already sees
+    // the committed end bounds.
+    let painted_start = frame_for(&rt.paint_frames_at(start), ViewId::new(1));
+    assert_eq!(painted_start.frame, before.frame);
+    assert_eq!(painted_start.content, before.content);
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "logical/hit-test frames never animate"
+    );
+
+    let mid = start + Duration::from_millis(60);
+    rt.tick_at(mid).expect("mid frame presents");
+    let painted_mid = frame_for(&rt.paint_frames_at(mid), ViewId::new(1));
+    assert_ne!(painted_mid.frame, before.frame, "mid must have moved");
+    assert_ne!(painted_mid.frame, target.frame, "mid must not be final");
+    // The kept pane shrinks: its width interpolates monotonically between the
+    // committed start and end spans.
+    let lo = before.frame.width.min(target.frame.width);
+    let hi = before.frame.width.max(target.frame.width);
+    assert!(
+        (lo..=hi).contains(&painted_mid.frame.width),
+        "mid width {} must lie between {lo} and {hi}",
+        painted_mid.frame.width
+    );
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "hit-testing stays final during the animation"
+    );
+
+    // Open is 150 ms, so the whole split settles by then; the final frame is
+    // the exact committed end state and the present path idles.
+    let end = start + Duration::from_millis(150);
+    rt.tick_at(end).expect("final frame commits");
+    let painted_end = frame_for(&rt.paint_frames_at(end), ViewId::new(1));
+    assert_eq!(painted_end.frame, target.frame);
+    assert_eq!(painted_end.content, target.content);
+    assert!(!rt.animations_active());
+    assert!(rt.tick_at(end).is_none());
+    assert_eq!(rt.animation_deadline(), None);
+}
+
+#[test]
+fn instant_reduced_and_safe_paths_skip_bounds_interpolation() {
+    // First-class instant paths: disabled, reduced motion, safe mode, and
+    // zero durations all paint the committed end bounds on the first frame
+    // and produce no extra animation wakeups.
+    for policy in [
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: [0; AnimationKind::COUNT],
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let _ = rt.tick_at(start).expect("baseline presents");
+        rt.set_layout(two_pane_split());
+        let _ = rt.tick_at(start).expect("split presents");
+        let logical = rt.present_frames();
+        let paint = rt.paint_frames_at(start);
+        assert_eq!(
+            paint, logical,
+            "instant path must use final bounds: {policy:?}"
+        );
+        assert!(!rt.animations_active(), "{policy:?}");
+        assert!(rt.tick_at(start).is_none(), "{policy:?}");
+        assert_eq!(rt.animation_deadline(), None, "{policy:?}");
+    }
+}
+
+#[test]
+fn workspace_switch_slides_committed_bounds_without_touching_hits() {
+    // A workspace switch stashes the outgoing workspace and slides the
+    // committed incoming bounds in from the direction of travel alongside
+    // the accepted cross-fade.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none());
+
+    rt.workspace_new().expect("new workspace");
+    let _ = rt.tick_at(start).expect("switch presents");
+    let logical = rt.present_frames();
+    let target = logical
+        .first()
+        .expect("incoming workspace frame")
+        .to_owned();
+
+    let painted_start = frame_for(&rt.paint_frames_at(start), target.view);
+    assert!(
+        painted_start.frame.x > target.frame.x,
+        "next workspace slides in from the right: {} must start right of {}",
+        painted_start.frame.x,
+        target.frame.x
+    );
+    assert_eq!(painted_start.frame.width, target.frame.width);
+    assert_eq!(
+        rt.present_frames(),
+        logical,
+        "workspace switch hit-test geometry is final"
+    );
+
+    let mid = start + Duration::from_millis(100);
+    rt.tick_at(mid).expect("mid frame presents");
+    let painted_mid = frame_for(&rt.paint_frames_at(mid), target.view);
+    assert!(
+        painted_mid.frame.x < painted_start.frame.x && painted_mid.frame.x > target.frame.x,
+        "mid slide {} must lie between {} and {}",
+        painted_mid.frame.x,
+        painted_start.frame.x,
+        target.frame.x
+    );
+    assert_eq!(rt.present_frames(), logical);
+
+    let end = start + Duration::from_millis(200);
+    rt.tick_at(end).expect("final frame commits");
+    let painted_end = frame_for(&rt.paint_frames_at(end), target.view);
+    assert_eq!(painted_end.frame, target.frame);
+    assert_eq!(painted_end.content, target.content);
+    assert!(!rt.animations_active());
+    assert!(rt.tick_at(end).is_none());
+}
+
+#[test]
+fn workspace_slide_is_instant_under_reduced_motion() {
+    for policy in [
+        AnimationPolicy {
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let _ = rt.tick_at(start).expect("baseline presents");
+        rt.workspace_new().expect("new workspace");
+        let _ = rt.tick_at(start).expect("switch presents");
+        assert_eq!(
+            rt.paint_frames_at(start),
+            rt.present_frames(),
+            "reduced/instant workspace must paint final bounds: {policy:?}"
+        );
+        assert!(!rt.animations_active(), "{policy:?}");
+        assert!(rt.tick_at(start).is_none(), "{policy:?}");
+    }
+}
+
 // ── CTX-0967: move/resize/drag transitions ───────────────────────────────
 
 /// Cursor pixels landing on container cell (col, row) under the default
@@ -894,10 +1099,11 @@ fn zoom_engage_arms_close_and_disengage_arms_open() {
 }
 
 #[test]
-fn zoom_never_interpolates_grid_or_geometry() {
-    // CTX-1078: zoom commits geometry and content at once. The leaf count
-    // changes at the mutation (not at animation end), and a grid byte
-    // written mid-zoom reads back verbatim.
+fn zoom_commits_grid_and_hit_geometry_immediately() {
+    // CTX-1078 / CTX-1335: zoom commits the logical layout, PTY size, and
+    // hit-test geometry at the mutation (not at animation end). Only the
+    // paint bounds interpolate, and a grid byte written mid-zoom reads back
+    // verbatim.
     let mut rt = runtime_with(AnimationPolicy::default());
     let start = Instant::now();
     let _ = rt.tick_at(start);

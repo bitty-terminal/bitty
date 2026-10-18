@@ -2438,6 +2438,22 @@ impl TerminalApp {
                     && self.runtime.leaf_count() <= 1
                 {
                     self.restore_zoom();
+                    // CTX-1337 (#2222): a pinned panel survives outside the
+                    // live layout, so the exited last tiled pane must not
+                    // keep its session-less leaf focused. Retire the leaf
+                    // and hand focus plus primary ownership to the pin,
+                    // exactly like the close_view path.
+                    if self.runtime.pinned_count() > 0
+                        && self.runtime.floated_count() == 0
+                        && self
+                            .runtime
+                            .retire_sole_tiled_leaf_for_pinned(view)
+                            .is_some()
+                    {
+                        crate::logging::info(|| {
+                            format!("bitty: pane shell {view:?} exited — pinned base leaf retired")
+                        });
+                    }
                     self.runtime.close_pane_session(&view);
                     self.push_pending_exit(view.0, status.code());
                     closed_any = true;
@@ -2514,6 +2530,22 @@ impl TerminalApp {
                     || self.runtime.pinned_views().contains(&primary_view)
                 {
                     self.runtime.discard_floating_view(primary_view);
+                } else if self.runtime.pinned_count() > 0
+                    && self.runtime.floated_count() == 0
+                    && self
+                        .runtime
+                        .retire_sole_tiled_leaf_for_pinned(primary_view)
+                        .is_some()
+                {
+                    // CTX-1337 (#2222): the last tiled primary shell exited
+                    // while a pinned panel survives. Retire the dead leaf and
+                    // leave the pin as focus plus primary owner instead of a
+                    // session-less ghost tile.
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: primary shell {primary_view:?} exited — pinned base leaf retired"
+                        )
+                    });
                 } else {
                     let mut layout = self.runtime.layout().clone();
                     if crate::chrome_keys::close_focused_leaf(&mut layout, primary_view) {

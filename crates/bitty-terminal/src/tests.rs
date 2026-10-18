@@ -9843,6 +9843,189 @@ fn reap_exited_last_float_prunes_emptied_workspace_issue_2221() {
     );
 }
 
+/// Issue #2222 / CTX-1337: closing the last tiled host while a pinned panel
+/// survives must remove the host leaf instead of leaving a session-less
+/// focused tile. The pinned store lives outside every layout, so unlike a
+/// float it never covers the dead leaf: focus and primary ownership must
+/// hand to the pin.
+#[test]
+#[cfg(unix)]
+fn close_host_with_pinned_panel_hands_focus_and_primary_to_pin_issue_2222() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let pinned = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn pinned shell");
+    assert!(app.runtime.set_focus(pinned));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
+    assert!(app.runtime.set_focus(host), "host must hold focus");
+
+    let _ = app.drive_tick();
+    let host_frame = app
+        .runtime
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == host)
+        .expect("host frame before close");
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "host teardown with a surviving pin is a pane close, not a window close"
+    );
+
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "the closed host leaf must be removed, never left session-less"
+    );
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(pinned),
+        "focus must follow the surviving pinned view"
+    );
+    assert_eq!(
+        app.runtime.primary_view(),
+        Some(pinned),
+        "primary ownership must hand to the surviving pinned view"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"probe"),
+        "input must route to the surviving pinned shell"
+    );
+
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime
+            .present_frames()
+            .iter()
+            .all(|frame| frame.view != host),
+        "no frame may remain for the closed host view"
+    );
+    assert_eq!(host_frame.view, host, "pre-close frame was the host");
+}
+
+/// Issue #2222 / CTX-1337: the owner-visible reap variant. Typing `exit` in
+/// the last tiled primary shell while a pinned panel survives must drop the
+/// dead leaf and leave the pinned view as focus and primary owner.
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_with_pinned_survivor_hands_focus_and_primary_issue_2222() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let pinned = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn pinned shell");
+    assert!(app.runtime.set_focus(pinned));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
+    assert!(app.runtime.set_focus(host));
+
+    let script = write_fake_editor("exit-pinned-survivor", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(script_arg.as_str())
+        .expect("spawn primary shell");
+
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "primary exit with a pinned survivor is a pane close"
+    );
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "the exited host leaf must be removed, never left session-less"
+    );
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(pinned),
+        "focus must follow the surviving pinned view"
+    );
+    assert_eq!(
+        app.runtime.primary_view(),
+        Some(pinned),
+        "primary ownership must hand to the surviving pinned view"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"probe"),
+        "input must route to the surviving pinned shell"
+    );
+
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime
+            .present_frames()
+            .iter()
+            .all(|frame| frame.view != host),
+        "no frame may remain for the exited host view"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
+/// Issue #2222 / CTX-1337: the pane-session reap variant of the pinned
+/// survivor. A tiled pane shell (not the primary) exits last while a pinned
+/// pane remains; the dead leaf must retire instead of staying session-less.
+#[test]
+#[cfg(unix)]
+fn reap_exited_last_tiled_pane_with_pinned_survivor_issue_2222() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let pinned = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn pinned shell");
+    assert!(app.runtime.set_focus(pinned));
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
+
+    let script = write_fake_editor("exit-pinned-pane", "#!/bin/sh\nexit 0\n");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(host, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn tiled pane shell");
+
+    let outcome = reap_until_change_2169(&mut app, 10);
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "tiled pane exit with a pinned survivor is a pane close"
+    );
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "the exited tiled leaf must be removed, never left session-less"
+    );
+    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(pinned),
+        "focus must follow the surviving pinned view"
+    );
+    assert_eq!(
+        app.runtime.primary_view(),
+        Some(pinned),
+        "primary ownership must hand to the surviving pinned view"
+    );
+    assert!(
+        app.runtime.push_input_bytes(b"probe"),
+        "input must route to the surviving pinned shell"
+    );
+
+    let _ = std::fs::remove_file(&script);
+}
+
 #[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key

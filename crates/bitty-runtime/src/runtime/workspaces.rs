@@ -680,6 +680,39 @@ impl Runtime {
         true
     }
 
+    /// Retires the live layout's sole tiled leaf after its shell closed while
+    /// a pinned panel survives (issue #2222 / CTX-1337).
+    ///
+    /// Pinned panels are window-global and live outside every workspace
+    /// layout (CTX-1077), so unlike a workspace-local float they never cover
+    /// the tiled base. A closed last tiled panel therefore leaves an empty
+    /// base that the pin composites over; keeping the session-less leaf
+    /// would strand a ghost cursor and drop input (the #2221 family). Remove
+    /// the leaf and bind both focus and primary-grid ownership to the
+    /// topmost pin — the accepted focus/primary states for a composited view
+    /// outside the layout (`Runtime::set_focus`, `discard_pinned`).
+    ///
+    /// Returns the surviving pin, or `None` with state untouched when
+    /// `closed` is not the sole live leaf or no pin survives.
+    pub fn retire_sole_tiled_leaf_for_pinned(&mut self, closed: ViewId) -> Option<ViewId> {
+        let leaves = self.layout.leaf_ids();
+        if leaves.len() != 1 || leaves[0] != closed {
+            return None;
+        }
+        let survivor = self.pinned.ids().last().copied()?;
+        let mut layout = self.layout.clone();
+        layout.remove_leaf(closed)?;
+        // Install the empty base through the explicit-close funnel: it
+        // re-homes the primary owner that left the tree and clears the
+        // layout-derived focus. The pin is re-bound immediately below.
+        self.set_layout_closing(layout, closed);
+        let focused = self.set_focus(survivor);
+        debug_assert!(focused, "pinned survivor must be focusable");
+        self.primary_view = Some(survivor);
+        self.sync_primary_geometry();
+        Some(survivor)
+    }
+
     /// Discards `id` from whichever floating store holds it (issue #2141).
     ///
     /// Returns `true` when `id` was a detached float or pinned leaf.
@@ -4374,6 +4407,51 @@ mod tests {
         assert!(!rt.discard_pinned(first));
         assert_eq!(rt.window_leaf_count(), 1);
         assert_eq!(rt.focused_view(), Some(second));
+    }
+
+    #[test]
+    fn retire_sole_tiled_leaf_for_pinned_issue_2222() {
+        // Issue #2222: an empty tiled base with a surviving pin is a valid
+        // composited state. The dead leaf retires and the pin becomes both
+        // focus and primary owner; without a pin the call is a no-op.
+        let mut rt = fresh();
+        let host = rt.focused_view().expect("focus");
+        assert!(
+            rt.retire_sole_tiled_leaf_for_pinned(host).is_none(),
+            "no pin survivor: state untouched"
+        );
+        assert_eq!(rt.layout().leaf_ids(), vec![host]);
+
+        let pinned = ViewId::new(2);
+        let leaf = rt.layout().find_leaf(host).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(pinned, 40, 24)),
+        ));
+        assert!(rt.set_focus(pinned));
+        rt.pin_floating(pinned).expect("pin");
+        assert_eq!(rt.pinned_views(), vec![pinned]);
+        assert_eq!(rt.layout().leaf_ids(), vec![host]);
+        assert_eq!(rt.focused_view(), Some(host));
+        assert_eq!(rt.primary_view(), Some(host));
+
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_pinned(host),
+            Some(pinned),
+            "the pin survives as the empty base's owner"
+        );
+        assert!(
+            rt.layout().leaf_ids().is_empty(),
+            "the dead host leaf must be removed"
+        );
+        assert_eq!(rt.focused_view(), Some(pinned));
+        assert_eq!(rt.primary_view(), Some(pinned));
+        assert!(
+            rt.retire_sole_tiled_leaf_for_pinned(host).is_none(),
+            "already retired: no second mutation"
+        );
     }
 
     #[test]

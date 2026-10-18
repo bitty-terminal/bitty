@@ -1526,6 +1526,127 @@ fn pinned_store_round_trips_through_v3_file() {
     );
 }
 
+/// #2230 / CTX-1337 (#2222): a pin-only empty tiled base is a valid live
+/// state — the window-global pin composites over the empty base and owns
+/// focus plus primary. The v3 file codec (bitty-storage) cannot encode an
+/// empty workspace yet, so capture must refuse it with an explicit typed
+/// diagnostic that names the state, never `session file corrupt`.
+#[test]
+fn pin_only_empty_tiled_base_refuses_capture_with_typed_diagnostic() {
+    let mut rt = present_runtime();
+    feed_lines(&mut rt, 30);
+    let host = rt.focused_view().expect("focus");
+    let pinned = ViewId::new(2);
+    let host_leaf = rt.layout().find_leaf(host).cloned().expect("host leaf");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(host_leaf),
+        LayoutNode::leaf(View::new(pinned, 40, 24)),
+    ));
+    assert!(rt.set_focus(pinned));
+    rt.pin_floating(pinned).expect("pin the second leaf");
+    assert_eq!(
+        rt.retire_sole_tiled_leaf_for_pinned(host),
+        Some(pinned),
+        "the empty tiled base keeps the pin as focus and primary"
+    );
+    assert!(rt.layout().leaf_ids().is_empty());
+    assert_eq!(rt.focused_view(), Some(pinned));
+    assert_eq!(rt.primary_view(), Some(pinned));
+
+    // Capture reads the live state faithfully; saving is what refuses.
+    let snap = rt.capture_session_snapshot();
+    assert!(
+        snap.workspaces[0].layout.leaf_ids().is_empty(),
+        "the tiled base is empty"
+    );
+    assert!(snap.workspaces[0].panes.is_empty());
+    assert_eq!(snap.workspaces[0].focus, Some(pinned));
+    assert_eq!(snap.pinned.len(), 1, "the surviving pin is captured");
+    assert_eq!(snap.pinned[0].view.id(), pinned);
+    assert_eq!(snap.pinned[0].attach, PaneAttachment::Primary);
+
+    let dir = scratch_dir("pin-only-empty-base");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("session");
+    let err = rt
+        .save_session_to_path(&path)
+        .expect_err("pin-only empty base must refuse capture");
+    assert_eq!(
+        err,
+        SessionError::PinOnlyEmptyBase,
+        "typed refusal, not a generic validation failure"
+    );
+    let message = format!("{err}");
+    assert!(
+        message.contains("pin-only"),
+        "diagnostic names the pin-only state: {message}"
+    );
+    assert!(
+        !message.contains("corrupt"),
+        "valid live state must never be reported as file corruption: {message}"
+    );
+    assert!(
+        !path.exists(),
+        "refused capture must not write a session file"
+    );
+
+    // A previous complete session stays authoritative: write a normal
+    // workspace first, then prove the refusal leaves it byte-identical.
+    let good = present_runtime();
+    good.save_session_to_path(&path).expect("normal save works");
+    let before = std::fs::read(&path).expect("saved bytes");
+    let err = rt
+        .save_session_to_path(&path)
+        .expect_err("pin-only save still refuses");
+    assert_eq!(err, SessionError::PinOnlyEmptyBase);
+    assert_eq!(
+        std::fs::read(&path).expect("saved bytes"),
+        before,
+        "refusal leaves the previous complete session untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #2230 regression guard: a normal tiled workspace with a pinned panel
+/// still round-trips unchanged (layout, focus, primary owner, pin order).
+#[test]
+fn normal_workspace_with_pins_round_trips_unchanged() {
+    let mut rt = present_runtime();
+    feed_lines(&mut rt, 5);
+    let host = rt.focused_view().expect("focus");
+    let pinned = ViewId::new(2);
+    let host_leaf = rt.layout().find_leaf(host).cloned().expect("host leaf");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(host_leaf),
+        LayoutNode::leaf(View::new(pinned, 40, 24)),
+    ));
+    assert!(rt.set_focus(pinned));
+    rt.pin_floating(pinned).expect("pin the second leaf");
+
+    let snap = rt.capture_session_snapshot();
+    assert_eq!(snap.workspaces[0].layout.leaf_ids(), vec![host]);
+    assert_eq!(snap.workspaces[0].focus, Some(host));
+    assert_eq!(snap.pinned.len(), 1);
+    assert_eq!(snap.pinned[0].view.id(), pinned);
+
+    let bytes = backend().encode_snapshot(&snap).expect("v3 encodes");
+    let back = backend().decode_snapshot(&bytes).expect("v3 decodes");
+    assert_eq!(back, snap, "normal workspace with pins round-trips");
+
+    let mut fresh = present_runtime();
+    fresh
+        .apply_session_snapshot(&back)
+        .expect("normal workspace with pins applies");
+    assert_eq!(fresh.layout().leaf_ids(), vec![host]);
+    assert_eq!(fresh.focused_view(), Some(host));
+    assert_eq!(fresh.primary_view(), Some(host));
+    assert_eq!(fresh.pinned_views(), vec![pinned]);
+}
+
 /// CTX-1147: workspace-local detached floats ride the in-memory snapshot
 /// only — the v3 file carries no floats block, so file encode rejects a
 /// snapshot with detached floats fail-closed (never a silent drop), while a

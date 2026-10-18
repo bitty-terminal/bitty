@@ -92,6 +92,36 @@ impl LoadFailure {
     }
 }
 
+/// Attributes a merge failure to the layer that actually caused it.
+///
+/// `user_file_causal` is the outcome of re-merging without the user layer:
+/// when that re-merge succeeds, the user file's contribution is what makes
+/// the combined config invalid, so first start may fall back. When it still
+/// fails, a profile or CLI layer owns the error and startup stays
+/// fail-closed (CTX-1339 review finding: file presence alone is not causal).
+fn classify_merge_failure(
+    err: &bitty_config::ConfigError,
+    user_path: Option<&std::path::Path>,
+    profile_path: Option<&std::path::Path>,
+    user_file_causal: bool,
+) -> LoadFailure {
+    if user_file_causal {
+        if let Some(path) = user_path {
+            return LoadFailure::broken(format!(
+                "bitty: invalid config '{}': {err}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(path) = profile_path {
+        return LoadFailure::fatal(format!(
+            "bitty: invalid profile '{}': {err}",
+            path.display()
+        ));
+    }
+    LoadFailure::fatal(format!("bitty: invalid --theme: {err}"))
+}
+
 /// Builds the single CLI override input from parsed [`Args`] (CTX-0180).
 ///
 /// Pure over `args` so the wiring stays hermetic: trims each raw and treats
@@ -129,10 +159,11 @@ pub(crate) fn cli_overrides_from_args(args: &Args) -> bitty_config::file::CliOve
 }
 
 /// Names the CLI flag behind an appearance-override validation error for the
-/// fail-closed message. `theme` keeps its CTX-0169 merge-time path and never
-/// reaches here; anything unexpected falls back to the flag group.
+/// fail-closed message. `theme` is pre-validated by CTX-1339 (it used to fail
+/// only at merge); any unexpected field falls back to the flag group.
 pub(crate) fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
     match field {
+        Some("appearance.theme") => "--theme",
         Some("font.family") => "--font-family",
         Some("font.size") => "--font-size",
         Some("window.opacity") => "--opacity",
@@ -292,9 +323,9 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
     }
     // CTX-0180: one Cli layer for every present appearance flag (`--theme`
     // plus `--font-family`/`--font-size`/`--opacity`). Invalid appearance
-    // raws fail closed here with usage (exit 2 at the caller); the merge
-    // then only sees valid CLI input, so later merge errors stay
-    // file/profile-caused and keep their existing messages.
+    // raws (including an unknown `--theme`, CTX-1339) fail closed here with
+    // usage (exit 2 at the caller), so later merge errors are attributable
+    // to the merged layers rather than to CLI input.
     let cli = cli_overrides_from_args(args);
     if let Err(err) = cli.validate_appearance_overrides() {
         let flag = appearance_flag_for_field(err.field());
@@ -303,17 +334,29 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
             help_text()
         )));
     }
+    // CTX-1339: a user file is only blameable for a merge failure when the
+    // merge succeeds without it. Re-merging without the user layer (profiles
+    // and CLI only) distinguishes a broken file from a profile/CLI error that
+    // merely surfaced while a valid file was present. The retry only runs on
+    // the failure path and only when a user file actually participated.
+    let retry_profiles = used_path.as_ref().map(|_| profile_layers.clone());
     let merged =
-        bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli)
-            .map_err(|err| {
-                if let Some(p) = &used_path {
-                    LoadFailure::broken(format!("bitty: invalid config '{}': {err}", p.display()))
-                } else if let Some(p) = &profile_path {
-                    LoadFailure::fatal(format!("bitty: invalid profile '{}': {err}", p.display()))
-                } else {
-                    LoadFailure::fatal(format!("bitty: invalid --theme: {err}"))
-                }
-            })?;
+        match bitty_config::file::resolve_effective_with_profiles(file_layer, profile_layers, &cli)
+        {
+            Ok(merged) => merged,
+            Err(err) => {
+                let user_file_causal = retry_profiles.is_some_and(|profiles| {
+                    bitty_config::file::resolve_effective_with_profiles(None, profiles, &cli)
+                        .is_ok()
+                });
+                return Err(classify_merge_failure(
+                    &err,
+                    used_path.as_deref(),
+                    profile_path.as_deref(),
+                    user_file_causal,
+                ));
+            }
+        };
     Ok(LoadedConfig {
         merged,
         probed,
@@ -1899,6 +1942,20 @@ mod startup_tests {
         }
     }
 
+    /// Unique scratch directory for classifier tests (no sleeps).
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1339-unit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
     #[test]
     fn first_start_broken_config_uses_builtin_defaults_and_reports_diagnostics() {
         let broken = String::from("bitty: invalid config file '/xdg/bitty/init.lua': syntax error");
@@ -1938,11 +1995,116 @@ mod startup_tests {
 
     #[test]
     fn first_start_fatal_load_errors_stay_fail_closed() {
-        let missing = String::from("bitty: --config '/xdg/bitty/missing.lua' not found");
-        match resolve_startup_config(Err(LoadFailure::fatal(missing.clone())), true) {
-            Ok(_) => panic!("an explicitly missing path must never fall back to built-ins"),
-            Err(error) => assert_eq!(error, missing),
+        // Classification, not a fabricated LoadFailure: a CLI-layer merge
+        // error stays fatal even though first start has no last-good plan.
+        let err = bitty_config::ConfigError::validation("appearance.theme", "unknown theme 'x'");
+        let failure = classify_merge_failure(&err, None, None, false);
+        let message = failure.message.clone();
+        match resolve_startup_config(Err(failure), true) {
+            Ok(_) => panic!("a CLI-layer failure must never fall back to built-ins"),
+            Err(error) => assert_eq!(error, message),
         }
+    }
+
+    #[test]
+    fn merge_failure_attribution_never_blames_a_valid_user_file() {
+        let err = bitty_config::ConfigError::validation("appearance.theme", "unknown theme 'x'");
+        let file = std::path::Path::new("/xdg/bitty/init.lua");
+        let profile = std::path::Path::new("/xdg/bitty/profiles/bad.lua");
+
+        // CLI error while a valid file participates: file is not causal.
+        let cli = classify_merge_failure(&err, Some(file), None, false);
+        assert!(!cli.fallback_allowed, "{}", cli.message);
+        assert!(
+            cli.message.starts_with("bitty: invalid --theme:"),
+            "{}",
+            cli.message
+        );
+
+        // Profile error while a valid file participates: attributed to the
+        // profile, never to the file.
+        let profile_failure = classify_merge_failure(&err, Some(file), Some(profile), false);
+        assert!(
+            !profile_failure.fallback_allowed,
+            "{}",
+            profile_failure.message
+        );
+        assert!(
+            profile_failure.message.contains("invalid profile"),
+            "{}",
+            profile_failure.message
+        );
+        assert!(
+            profile_failure.message.contains("profiles/bad.lua"),
+            "{}",
+            profile_failure.message
+        );
+
+        // A re-merge without the user layer succeeded: the file is causal.
+        let broken = classify_merge_failure(&err, Some(file), None, true);
+        assert!(broken.fallback_allowed, "{}", broken.message);
+        assert!(broken.message.contains("init.lua"), "{}", broken.message);
+    }
+
+    #[test]
+    fn classifier_marks_a_present_broken_file_recoverable() {
+        let dir = scratch_dir("broken-file");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { font = }\n").expect("write broken init.lua");
+        let mut args = Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("a present-but-broken file must fail to load");
+        assert!(failure.fallback_allowed, "{}", failure.message);
+        assert!(
+            failure.message.contains("invalid config file"),
+            "{}",
+            failure.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifier_keeps_a_missing_explicit_path_fatal() {
+        let dir = scratch_dir("missing-path");
+        let mut args = Args::new();
+        args.config_path = Some(dir.join("missing.lua").to_string_lossy().into_owned());
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("an explicitly missing path must fail");
+        assert!(!failure.fallback_allowed, "{}", failure.message);
+        assert!(failure.message.contains("not found"), "{}", failure.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifier_keeps_invalid_cli_theme_fatal_with_a_valid_file() {
+        let dir = scratch_dir("bad-theme");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { appearance = { theme = \"dracula\" } }\n")
+            .expect("write valid init.lua");
+        let mut args = Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        args.theme = Some(String::from("not-a-theme"));
+
+        let failure = resolve_app_config(&args)
+            .err()
+            .expect("an unknown --theme must fail closed");
+        assert!(!failure.fallback_allowed, "{}", failure.message);
+        assert!(
+            failure.message.contains("invalid --theme"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("appearance.theme"),
+            "{}",
+            failure.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

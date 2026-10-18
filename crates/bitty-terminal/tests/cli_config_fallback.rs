@@ -22,7 +22,7 @@ fn scratch_root(tag: &str) -> PathBuf {
             .expect("clock after epoch")
             .as_nanos()
     ));
-    std::fs::create_dir_all(dir.join("bitty")).expect("config dir");
+    std::fs::create_dir_all(dir.join("bitty").join("profiles")).expect("config dir");
     dir
 }
 
@@ -31,9 +31,26 @@ fn write_init(root: &Path, body: &str) {
     std::fs::write(root.join("bitty").join("init.lua"), body).expect("write init.lua");
 }
 
+/// Writes `$XDG_CONFIG_HOME/bitty/profiles/<name>.lua` with the given body.
+fn write_profile(root: &Path, name: &str, body: &str) {
+    std::fs::write(
+        root.join("bitty")
+            .join("profiles")
+            .join(format!("{name}.lua")),
+        body,
+    )
+    .expect("write profile");
+}
+
 /// Runs `bitty <args>` under the isolated root.
 fn run_bitty(root: &Path, args: &[&str]) -> Output {
-    Command::new(BITTY_BIN)
+    run_bitty_with_env(root, args, &[])
+}
+
+/// Runs `bitty <args>` under the isolated root with extra environment values.
+fn run_bitty_with_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(BITTY_BIN);
+    command
         .args(args)
         .env("XDG_CONFIG_HOME", root)
         .env("XDG_STATE_HOME", root.join("state"))
@@ -41,7 +58,11 @@ fn run_bitty(root: &Path, args: &[&str]) -> Output {
         .env("HOME", root)
         .env("NO_COLOR", "1")
         .env_remove("BITTY_CONFIG")
-        .env_remove("BITTY_PROFILE")
+        .env_remove("BITTY_PROFILE");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
         .output()
         .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
 }
@@ -127,6 +148,99 @@ fn missing_explicit_config_still_fails_closed() {
     assert!(
         !err.contains("built-in defaults"),
         "an explicit missing path is not a first-start fallback, stderr={err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn missing_bitty_config_env_still_fails_closed() {
+    let root = scratch_root("env-missing");
+    let missing = root.join("missing.lua");
+    let missing = missing.to_str().expect("utf-8 scratch path");
+
+    let output = run_bitty_with_env(&root, &["--headless"], &[("BITTY_CONFIG", missing)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an explicitly missing BITTY_CONFIG must stay fail-closed, stderr={:?}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("BITTY_CONFIG"), "stderr={err:?}");
+    assert!(err.contains("not found"), "stderr={err:?}");
+    assert!(
+        !err.contains("built-in defaults"),
+        "an explicit missing path is not a first-start fallback, stderr={err:?}"
+    );
+    assert!(
+        !stdout(&output).contains("bitty headless:"),
+        "startup must not proceed with built-ins"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn invalid_theme_with_valid_file_stays_fail_closed() {
+    let root = scratch_root("invalid-theme");
+    write_init(&root, "return { appearance = { theme = \"dracula\" } }\n");
+
+    let output = run_bitty(&root, &["--theme", "not-a-theme", "--headless"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unknown --theme is a CLI usage error, stderr={:?}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("invalid --theme"), "stderr={err:?}");
+    assert!(err.contains("appearance.theme"), "stderr={err:?}");
+    assert!(
+        !err.contains("built-in defaults"),
+        "a valid user file must not absorb a CLI error, stderr={err:?}"
+    );
+    assert!(
+        !stdout(&output).contains("bitty headless:"),
+        "startup must not proceed with built-ins"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn invalid_profile_with_valid_file_stays_fail_closed() {
+    let root = scratch_root("invalid-profile");
+    write_init(&root, "return { appearance = { theme = \"dracula\" } }\n");
+    // Passes profile-layer parsing/validation but fails the merged outline
+    // contrast contract (AC-1) on the default dark background.
+    write_profile(
+        &root,
+        "bad",
+        "return { decoration = { border_color_focused = \"#000000\" } }\n",
+    );
+
+    let output = run_bitty(&root, &["--profile", "bad", "--headless"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an invalid profile must stay fail-closed, stderr={:?}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("invalid profile"), "stderr={err:?}");
+    assert!(err.contains("bad.lua"), "stderr={err:?}");
+    assert!(
+        !err.contains("init.lua"),
+        "the valid user file must not be blamed, stderr={err:?}"
+    );
+    assert!(
+        !err.contains("built-in defaults"),
+        "a valid user file must not absorb a profile error, stderr={err:?}"
+    );
+    assert!(
+        !stdout(&output).contains("bitty headless:"),
+        "startup must not proceed with built-ins"
     );
 
     let _ = std::fs::remove_dir_all(&root);

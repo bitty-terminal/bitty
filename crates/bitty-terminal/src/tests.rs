@@ -2919,6 +2919,10 @@ fn cli_overrides_from_args_trims_and_passes_raws() {
     assert!(cli.is_empty());
     assert!(cli.validate_appearance_overrides().is_ok());
     // Flag naming for the fail-closed message.
+    assert_eq!(
+        appearance_flag_for_field(Some("appearance.theme")),
+        "--theme"
+    );
     assert_eq!(appearance_flag_for_field(Some("font.size")), "--font-size");
     assert_eq!(
         appearance_flag_for_field(Some("window.opacity")),

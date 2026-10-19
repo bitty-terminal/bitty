@@ -620,19 +620,25 @@ mod tests {
         }
     }
 
-    /// Fixture deadline for tests that assert the entry/byte caps, not time.
+    /// Fixture deadline for tests that assert behavior other than time.
     ///
     /// The production [`FsListBackend::list`] budget is the accepted RC-1
-    /// 50 ms; a saturated CI runner needs longer than that to resolve a
-    /// thousand entries, so cap/containment tests would fail on
-    /// `E_TIMEOUT` before ever reaching the cap they assert. They therefore
-    /// run under this deadline, which no fixture scan can reach, while
-    /// [`large_directory_aborts_near_the_scan_deadline`] keeps proving the
-    /// deadline path (production budget and explicit tiny expiries).
+    /// 50 ms, spent on the whole call: grant resolution, canonicalization,
+    /// `read_dir`, then the walk. A saturated CI runner can burn that budget
+    /// before the first deadline check, so cap/containment/security tests
+    /// would fail on `E_TIMEOUT` before reaching the property they assert.
+    /// They therefore run under this deadline, which no fixture scan can
+    /// reach, while [`large_directory_aborts_near_the_scan_deadline`] stays
+    /// the only test that exercises wall-clock expiry (expired deadline plus
+    /// an explicit tiny live budget).
     const FIXTURE_SCAN_DEADLINE: Duration = Duration::from_secs(60);
 
-    /// Listing with [`FIXTURE_SCAN_DEADLINE`], i.e. cap assertions are
-    /// decided by entries/bytes rather than runner speed.
+    /// Listing with [`FIXTURE_SCAN_DEADLINE`], i.e. every assertion is decided
+    /// by entries/bytes rather than runner speed.
+    ///
+    /// Non-timing tests must go through this helper; calling
+    /// [`FsListBackend::list`] directly reintroduces a wall-clock race against
+    /// the production budget.
     fn list_with_generous_deadline(
         backend: &FsListBackend,
         granted: &[String],
@@ -665,8 +671,7 @@ mod tests {
     fn non_absolute_home_makes_every_grant_unusable() {
         for home in ["", "relative-home", "."] {
             let backend = FsListBackend::new(home);
-            let error = backend
-                .list(&grant("~/docs/**"), "~/docs", 16)
+            let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
                 .expect_err("non-absolute home must fail closed");
             assert_eq!(error.code, "E_FS_MISSING_GRANT", "home {home:?}");
         }
@@ -681,8 +686,7 @@ mod tests {
         std::fs::create_dir_all(home.join("other")).expect("other dir");
         let backend = FsListBackend::new(&home);
 
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
 
         // Name order, directories and files mixed; the out-of-grant `other`
@@ -694,8 +698,7 @@ mod tests {
         assert!(entries.iter().all(|entry| !entry.name.contains("other")));
 
         // Trailing separators and `.` segments normalize to the same page.
-        let again = backend
-            .list(&grant("~/docs/**"), "~/docs//./", 16)
+        let again = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs//./", 16)
             .expect("normalized listing");
         assert_eq!(again, entries);
     }
@@ -707,31 +710,32 @@ mod tests {
         std::fs::create_dir_all(home.join("outside")).expect("outside dir");
         let backend = FsListBackend::new(&home);
 
-        let error = backend
-            .list(&grant("~/docs/**"), "~/outside", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/outside", 16)
             .expect_err("out-of-grant prefix must deny");
         assert_eq!(error.code, "E_FS_SCOPE_MISMATCH");
 
-        let error = backend
-            .list(&[], "~/docs", 16)
+        let error = list_with_generous_deadline(&backend, &[], "~/docs", 16)
             .expect_err("no grant must deny");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // A write grant never authorizes a listing.
-        let error = backend
-            .list(&["fs.write:~/docs/**".to_string()], "~/docs", 16)
-            .expect_err("write grant must not list");
+        let error = list_with_generous_deadline(
+            &backend,
+            &["fs.write:~/docs/**".to_string()],
+            "~/docs",
+            16,
+        )
+        .expect_err("write grant must not list");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // Traversal is hostile before any filesystem call.
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/../outside", 16)
-            .expect_err("traversal must deny");
+        let error =
+            list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/../outside", 16)
+                .expect_err("traversal must deny");
         assert_eq!(error.code, "E_FS_HOSTILE_PATTERN");
 
         // Absolute paths are never home-rooted.
-        let error = backend
-            .list(&grant("~/docs/**"), "/etc", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "/etc", 16)
             .expect_err("absolute prefix must deny");
         assert_eq!(error.code, "E_FS_HOSTILE_PATTERN");
     }
@@ -749,14 +753,12 @@ mod tests {
         let backend = FsListBackend::new(&home);
 
         // Resolving the symlinked directory must not escape the grant.
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/escape", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/escape", 16)
             .expect_err("symlink directory escape must deny");
         assert_eq!(error.code, "E_FS_SCOPE_MISMATCH");
 
         // The listing itself silently skips both escaping symlinks.
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["~/docs/inside.txt"]);
@@ -781,12 +783,10 @@ mod tests {
         std::os::unix::fs::symlink(home.join("docs2"), home.join("docs/escape")).expect("symlink");
         let backend = FsListBackend::new(&home);
 
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/escape", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/escape", 16)
             .expect_err("sibling-prefix escape must deny");
         assert_eq!(error.code, "E_FS_SCOPE_MISMATCH");
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         assert_eq!(
             entries
@@ -806,16 +806,14 @@ mod tests {
             .expect("symlink");
         let backend = FsListBackend::new(&home);
 
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         assert!(
             entries
                 .iter()
                 .any(|entry| { entry.name == "~/docs/alias" && entry.kind == "dir" })
         );
-        let nested = backend
-            .list(&grant("~/docs/**"), "~/docs/alias", 16)
+        let nested = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/alias", 16)
             .expect("inside-grant symlink listing");
         assert_eq!(
             nested
@@ -858,9 +856,13 @@ mod tests {
         assert_eq!(small[7].name, "~/docs/file-0007.txt");
 
         // The bridge ceiling is enforced, not silently clamped.
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs", FS_LIST_MAX_ENTRIES + 1)
-            .expect_err("oversized page must fail");
+        let error = list_with_generous_deadline(
+            &backend,
+            &grant("~/docs/**"),
+            "~/docs",
+            FS_LIST_MAX_ENTRIES + 1,
+        )
+        .expect_err("oversized page must fail");
         assert_eq!(error.code, "E_DEF_LIMIT");
 
         // The byte ceiling bounds the returned name bytes even below the
@@ -886,9 +888,9 @@ mod tests {
         let home = temp_home("missing");
         std::fs::create_dir_all(home.join("docs")).expect("docs");
         let backend = FsListBackend::new(&home);
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/missing", 16)
-            .expect_err("missing directory must fail");
+        let error =
+            list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/missing", 16)
+                .expect_err("missing directory must fail");
         assert_eq!(error.code, "E_NOT_FOUND");
     }
 
@@ -904,20 +906,28 @@ mod tests {
         std::os::unix::fs::symlink(&outside, home.join("docs/escape")).expect("symlink");
         let backend = FsListBackend::new(&home);
 
-        let hit = backend
-            .list(&grant("~/docs/**"), "~/docs/escape/exists.txt", 16)
-            .expect_err("existing outside target must deny");
+        let hit = list_with_generous_deadline(
+            &backend,
+            &grant("~/docs/**"),
+            "~/docs/escape/exists.txt",
+            16,
+        )
+        .expect_err("existing outside target must deny");
         assert_eq!(hit.code, "E_FS_SCOPE_MISMATCH");
-        let miss = backend
-            .list(&grant("~/docs/**"), "~/docs/escape/missing-xyz", 16)
-            .expect_err("missing outside target must deny the same");
+        let miss = list_with_generous_deadline(
+            &backend,
+            &grant("~/docs/**"),
+            "~/docs/escape/missing-xyz",
+            16,
+        )
+        .expect_err("missing outside target must deny the same");
         assert_eq!(miss.code, "E_FS_SCOPE_MISMATCH");
 
         // A genuine in-grant absence stays typed: the nearest existing
         // ancestor (`~/docs`) is inside the canonical grant root.
-        let in_grant = backend
-            .list(&grant("~/docs/**"), "~/docs/missing-xyz", 16)
-            .expect_err("in-grant absence must stay typed");
+        let in_grant =
+            list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/missing-xyz", 16)
+                .expect_err("in-grant absence must stay typed");
         assert_eq!(in_grant.code, "E_NOT_FOUND");
 
         let _ = std::fs::remove_dir_all(&outside);
@@ -942,8 +952,7 @@ mod tests {
             "~/docs/alias",
             "~/docs/alias/authorized_keys",
         ] {
-            let error = backend
-                .list(&grant("~/docs/**"), request, 16)
+            let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), request, 16)
                 .expect_err("sensitive resolved component must deny");
             assert_eq!(
                 error.code, "E_FS_SENSITIVE_PATH",
@@ -953,8 +962,7 @@ mod tests {
 
         // Entries naming sensitive locations are suppressed from a page,
         // including the resolved symlink alias.
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         assert_eq!(
             entries
@@ -986,8 +994,7 @@ mod tests {
             "~/docs/escape/shadow",
             "~/docs/escape/missing",
         ] {
-            let error = backend
-                .list(&grant("~/docs/**"), request, 16)
+            let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), request, 16)
                 .expect_err("out-of-grant target must deny");
             assert_eq!(
                 error.code, "E_FS_SCOPE_MISMATCH",
@@ -995,8 +1002,7 @@ mod tests {
             );
         }
 
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/shadow", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/shadow", 16)
             .expect_err("in-grant sensitive path must deny");
         assert_eq!(error.code, "E_FS_SENSITIVE_PATH");
     }
@@ -1013,8 +1019,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, home.join("docs")).expect("root symlink");
         let backend = FsListBackend::new(&home);
 
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect_err("symlinked grant root must not resolve");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
@@ -1025,9 +1030,9 @@ mod tests {
         std::fs::create_dir_all(home.join("plain")).expect("plain");
         std::fs::create_dir_all(outside.join("docs")).expect("outside docs target");
         std::os::unix::fs::symlink(&outside, home.join("link")).expect("segment symlink");
-        let error = backend
-            .list(&grant("~/link/docs/**"), "~/link/docs", 16)
-            .expect_err("symlinked intermediate segment must not resolve");
+        let error =
+            list_with_generous_deadline(&backend, &grant("~/link/docs/**"), "~/link/docs", 16)
+                .expect_err("symlinked intermediate segment must not resolve");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         let _ = std::fs::remove_dir_all(&outside);
@@ -1053,8 +1058,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_home, &link).expect("home symlink");
         let backend = FsListBackend::new(&link);
 
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("symlinked home must resolve");
         assert_eq!(
             entries
@@ -1077,8 +1081,7 @@ mod tests {
         touch(&home, "docs/sub/file.txt", "x");
         let backend = FsListBackend::new(&home);
 
-        let entries = backend
-            .list(&grant("~/docs/*"), "~/docs/sub", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/*"), "~/docs/sub", 16)
             .expect("in-scope directory lists");
         assert_eq!(entries, Vec::new());
     }
@@ -1095,8 +1098,7 @@ mod tests {
         }
         let backend = FsListBackend::new(&home);
 
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         assert_eq!(
             entries
@@ -1116,6 +1118,14 @@ mod tests {
             std::fs::File::create(home.join(format!("docs/f{index:05}"))).expect("entry");
         }
         let backend = FsListBackend::new(&home);
+
+        // Guard the production side of the split: the default direct-call
+        // budget must stay the accepted RC-1 wall clock, so cap tests opt out
+        // of the deadline instead of the backend loosening it.
+        assert_eq!(
+            LIST_SCAN_BUDGET,
+            Duration::from_millis(bitty_lua::RC1_WALL_CLOCK_BUDGET_MS)
+        );
 
         // A past deadline aborts deterministically at the first check.
         let error = backend
@@ -1153,8 +1163,7 @@ mod tests {
         touch(&home, "docs/notes.txt", "n");
         let backend = FsListBackend::new(&home);
 
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", 16)
+        let entries = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 16)
             .expect("granted listing");
         assert_eq!(
             entries
@@ -1164,8 +1173,7 @@ mod tests {
             vec!["~/docs/notes.txt"]
         );
 
-        let error = backend
-            .list(&grant("~/docs/**"), "~/docs/.env", 16)
+        let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs/.env", 16)
             .expect_err("sensitive prefix must deny");
         assert_eq!(error.code, "E_FS_SENSITIVE_PATH");
     }
@@ -1177,21 +1185,25 @@ mod tests {
         let backend = FsListBackend::new(&home);
 
         // A relative grant has no stable real-path base.
-        let error = backend
-            .list(&["fs.read:docs/**".to_string()], "~/docs", 16)
-            .expect_err("relative grant must not map");
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:docs/**".to_string()], "~/docs", 16)
+                .expect_err("relative grant must not map");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // An overbroad home grant is hostile at grant construction.
-        let error = backend
-            .list(&["fs.read:~/**".to_string()], "~/docs", 16)
-            .expect_err("overbroad grant must not map");
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:~/**".to_string()], "~/docs", 16)
+                .expect_err("overbroad grant must not map");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // A malformed pattern is skipped, never widened.
-        let error = backend
-            .list(&["fs.read:~/docs/../**".to_string()], "~/docs", 16)
-            .expect_err("traversal grant must not map");
+        let error = list_with_generous_deadline(
+            &backend,
+            &["fs.read:~/docs/../**".to_string()],
+            "~/docs",
+            16,
+        )
+        .expect_err("traversal grant must not map");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
     }
 }

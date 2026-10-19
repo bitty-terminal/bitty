@@ -2104,8 +2104,11 @@ impl Runtime {
         // CTX-0946 C2: a plugin mount/update/unmount with a quiet grid
         // still needs a frame (band damage only; geometry reflows through
         // the exclusive-zone budget in `refresh_chrome_band` above).
-        let band_versions = self.chrome_band_versions();
-        if band_versions != self.last_presented_bands {
+        // CTX-1332 C-D4/F7: origin+geometry identity, including the band edge,
+        // so an edge move at an unchanged version and a version-1 replacement
+        // both force a frame.
+        let band_identity = self.band_frame_identity();
+        if band_identity != self.last_presented_bands {
             pending_full = true;
         }
 
@@ -2249,7 +2252,7 @@ impl Runtime {
             ring_ctx,
             cells_before,
             glyphs_before,
-            band_versions,
+            band_identity,
         })
     }
     /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
@@ -4453,7 +4456,7 @@ impl Runtime {
             current_gen,
             cells_before,
             glyphs_before,
-            band_versions,
+            band_identity,
             ..
         } = basis;
         self.pending_full_redraw = false;
@@ -4471,7 +4474,9 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bands = band_versions;
+            // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
+            // executable origin and does not advance the presented-band
+            // identity (the next tick keeps trying to commit a real frame).
             return None;
         }
 
@@ -4587,7 +4592,9 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
-            self.last_presented_bands = band_versions;
+            // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
+            // executable origin and does not advance the presented-band
+            // identity (the next tick keeps trying to commit a real frame).
             return None;
         }
 
@@ -4622,7 +4629,10 @@ impl Runtime {
         self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
-        self.last_presented_bands = band_versions;
+        // CTX-1332 C-D4: eligible publication boundary. Only a frame that
+        // actually presented commits its origins as executable.
+        self.last_presented_bands = band_identity;
+        self.published_band_origins = self.pending_band_origins.clone();
         self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
         // digesting — only while a digest grant is live (zero clone cost
@@ -4697,8 +4707,8 @@ struct TickBasis {
     cells_before: u64,
     /// Renderer glyphs-emitted counter baseline for the stats delta.
     glyphs_before: u64,
-    /// Mounted band versions for this frame (CTX-0946 C2).
-    band_versions: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
+    /// Mounted band identity for this frame (CTX-0946 C2, CTX-1332 C-D4/F7).
+    band_identity: Vec<crate::runtime::band_host::BandFrameIdentity>,
 }
 
 impl TickBasis {

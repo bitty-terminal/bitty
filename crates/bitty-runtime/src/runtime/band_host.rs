@@ -44,8 +44,10 @@
 //! with the overlay/capture conventions (CTX-0941: Core holds the switch,
 //! the application moves the bytes).
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use super::band_slots::BandEdge;
-use super::{BandContent, Runtime};
+use super::{BandContent, ChromeBands, Runtime};
 use bitty_lua::host::LuaValue;
 use bitty_lua::ui::{ClickArg, ClickCommand, UI_SCROLL_DELTA_ARG, UiNode, UiSlot};
 use bitty_platform::CursorPosition;
@@ -66,6 +68,16 @@ pub const BAND_CLICK_QUEUE_MAX: usize = 8;
 /// the application has not drained yet. Overflow drops the newest request
 /// fail-closed and counts [`BandHostStats::scroll_queue_drops`].
 pub const BAND_SCROLL_QUEUE_MAX: usize = 8;
+
+/// Maximum cold-phase admissions selected per pump pass (CTX-1332, C-D9/C-D10).
+///
+/// The accepted bound is the literal `16`, derived as
+/// `BAND_CLICK_QUEUE_MAX + BAND_SCROLL_QUEUE_MAX` rather than invented. It is a
+/// selection bound over the combined click/scroll/keyboard/invalid-retry work:
+/// one pass selects at most this many entries and leaves the unselected tail
+/// queued (never `mem::take`). It is deliberately not a byte ceiling, a global
+/// budget, or a wall-time quantum; those numeric policies remain deferred.
+pub const COLD_ADMISSION_SELECTION_MAX: usize = BAND_CLICK_QUEUE_MAX + BAND_SCROLL_QUEUE_MAX;
 
 /// ANSI index resolving the `accent` band token (CTX-0946 C2).
 ///
@@ -241,6 +253,97 @@ pub fn resolve_band_token(token: &str, palette: &ThemePalette) -> Option<Rgba8> 
     }
 }
 
+/// Core-owned plain-data origin captured at an eligible presentation
+/// (CTX-1332, C-D4).
+///
+/// The origin is the fencing identity of one painted band: the exact owning
+/// plugin generation, mount handle, accepted slot, tree version, edge, and
+/// painted geometry. It is captured from the live mount registry when the
+/// band snapshot is built and becomes executable only when the frame that
+/// carried it was actually presented. Admission never reconstructs it at
+/// drain time.
+///
+/// Additive Rust-only API in the 0.0.x line: `#[doc(hidden)]` and not part of
+/// the Lua/SDK wire contract. A missing origin can never mint an executable
+/// action; [`Runtime::band_origin_is_current`] and
+/// `PluginRuntime::dispatch_ui_command` both fail closed.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandOrigin {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Plugin activation generation the mount belongs to.
+    pub generation: u32,
+    /// Generation-owned mount handle from the UI block registry.
+    pub handle: i64,
+    /// Accepted slot the block was mounted into.
+    pub slot: UiSlot,
+    /// Exact tree version at capture time.
+    pub version: u32,
+    /// Edge the band was placed on.
+    pub edge: BandEdge,
+    /// Visible-band index on that edge (hidden bands take no index).
+    pub visible_index: u16,
+    /// Painted window row at capture time.
+    pub row: u16,
+}
+
+/// One live mount projected for origin capture (CTX-1332, C-D4).
+///
+/// `TerminalApp` projects the plugin runtime's mounted blocks into this plain
+/// shape; [`Runtime::set_chrome_bands_with_mounts`] joins it with the band
+/// placement and geometry. Kept separate from [`BandContent`] so the public
+/// band snapshot type and `ChromeBands::from_mounts` are unchanged.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandMount {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Accepted slot the block was mounted into.
+    pub slot: UiSlot,
+    /// Exact tree version at capture time.
+    pub version: u32,
+    /// Plugin activation generation the mount belongs to.
+    pub generation: u32,
+    /// Generation-owned mount handle from the UI block registry.
+    pub handle: i64,
+}
+
+/// Damage identity of one mounted band for the present gate (CTX-1332, F7).
+///
+/// Includes the band edge (F7: an edge move at an unchanged version must not
+/// compare equal) and, for painted bands, the full [`BandOrigin`] so a
+/// replacement mount whose version restarts at 1 still forces a frame and
+/// still refuses stale actions.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandFrameIdentity {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Accepted slot the block was mounted into.
+    pub slot: UiSlot,
+    /// Exact tree version.
+    pub version: u32,
+    /// Edge the band is placed on.
+    pub edge: BandEdge,
+    /// Executable origin for painted bands; `None` for hidden or vertical
+    /// bands, which are never clickable.
+    pub origin: Option<BandOrigin>,
+}
+
+/// One selected cold-phase admission (CTX-1332, C-D9/C-D10).
+///
+/// The runtime selects at most [`COLD_ADMISSION_SELECTION_MAX`] entries per
+/// pump pass and leaves the unselected tail queued.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BandAdmission {
+    /// One Core-routed band click.
+    Click(BandClickRequest),
+    /// One Core-routed band scroll.
+    Scroll(BandScrollRequest),
+}
+
 /// One Core-routed band click: owner, verb, and declared args (CTX-0946 C1).
 ///
 /// The plugin never sees pointer coordinates — only this declared triple,
@@ -254,6 +357,19 @@ pub struct BandClickRequest {
     pub command: String,
     /// Declared `on_click.args` in declaration order.
     pub args: Vec<(String, ClickArg)>,
+    /// Presentation-captured origin (CTX-1332, C-D4).
+    ///
+    /// Stamped when the gesture is armed from the last eligible presented
+    /// frame. A request without one is legacy/test-only and is refused by the
+    /// cold pump, so it can never mint an executable action.
+    #[doc(hidden)]
+    pub origin: Option<BandOrigin>,
+    /// Monotonic admission sequence assigned when the gesture is queued.
+    ///
+    /// `0` on unqueued/test-only requests. Counter exhaustion fails closed at
+    /// admission (never wraps).
+    #[doc(hidden)]
+    pub admission_seq: u64,
 }
 
 /// Extracts the dispatch verb from a declared `on_click.command` (CTX-0946 C1).
@@ -329,6 +445,8 @@ pub fn resolve_click_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> 
         plugin_id: owner.to_string(),
         command: verb,
         args: click.args.clone(),
+        origin: None,
+        admission_seq: 0,
     })
 }
 
@@ -363,6 +481,12 @@ pub struct BandScrollRequest {
     pub args: Vec<(String, ClickArg)>,
     /// Host-computed signed line step for this request.
     pub delta: i32,
+    /// Presentation-captured origin (CTX-1332, C-D4).
+    #[doc(hidden)]
+    pub origin: Option<BandOrigin>,
+    /// Monotonic admission sequence assigned when the gesture is queued.
+    #[doc(hidden)]
+    pub admission_seq: u64,
 }
 
 /// Converts declared scroll args plus the host-computed delta to the single
@@ -416,6 +540,9 @@ pub struct BandScrollTarget {
     pub command: String,
     /// Declared `on_scroll.args` in declaration order.
     pub args: Vec<(String, ClickArg)>,
+    /// Presentation-captured origin (CTX-1332, C-D4).
+    #[doc(hidden)]
+    pub origin: Option<BandOrigin>,
 }
 
 /// Resolves a flattened-text column into its scroll outcome (CTX-1190).
@@ -440,6 +567,7 @@ pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) ->
         plugin_id: owner.to_string(),
         command: verb,
         args: scroll.args.clone(),
+        origin: None,
     })
 }
 
@@ -840,6 +968,13 @@ impl Runtime {
                     // Unreachable (a Hit always owns a run); fail closed.
                     return PressedBandTarget::NoClaim;
                 };
+                // CTX-1332 C-D4: capture the presentation-published origin now
+                // (the press and release both resolve against the same live
+                // band); the cold pump refuses a request without one.
+                let mut request = request;
+                request.origin = self
+                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .cloned();
                 PressedBandTarget::Hit {
                     edge: row_hit.edge,
                     visible_index: row_hit.visible_index,
@@ -858,6 +993,243 @@ impl Runtime {
         self.band_release_swallow = false;
         self.band_press_target = None;
     }
+
+    /// Assigns the next monotonic admission sequence, failing closed at
+    /// `u64::MAX` (CTX-1332, C-D4).
+    fn next_admission_seq(&mut self) -> Option<u64> {
+        let next = self.admission_seq.checked_add(1)?;
+        self.admission_seq = next;
+        Some(next)
+    }
+
+    /// Returns the last presented origin for a painted band, if any
+    /// (CTX-1332, C-D4/C-D5).
+    ///
+    /// The origin must match the live band identity *and* the live geometry;
+    /// a replacement mount, version reset, edge move, or resize therefore
+    /// refuses the gesture instead of retargeting it.
+    fn published_band_origin(&self, edge: BandEdge, visible_index: usize) -> Option<&BandOrigin> {
+        let index = u16::try_from(visible_index).ok()?;
+        let row = self.visible_band_row(edge, visible_index)?;
+        let bands = self.visible_edge_bands(edge);
+        let band = bands.get(visible_index)?;
+        self.published_band_origins.iter().find(|origin| {
+            origin.edge == edge
+                && origin.visible_index == index
+                && origin.row == row
+                && origin.plugin_id == band.plugin_id
+                && origin.slot == band.slot
+                && origin.version == band.version
+        })
+    }
+
+    /// Whether `origin` is still the last presented origin for its live band
+    /// (CTX-1332, C-D4/C-D5).
+    ///
+    /// `false` when the origin was never published, the band moved, a
+    /// replacement mount restarted the version, or the geometry changed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn band_origin_is_current(&self, origin: &BandOrigin) -> bool {
+        // The origin must still be the live capture for this band (pending
+        // origins follow the live mount projection) *and* the last published
+        // executable origin. A remount or edge move invalidates immediately,
+        // even before the next frame commits.
+        if !self
+            .pending_band_origins
+            .iter()
+            .any(|pending| pending == origin)
+        {
+            return false;
+        }
+        self.published_band_origin(origin.edge, usize::from(origin.visible_index))
+            .is_some_and(|current| current == origin)
+    }
+
+    /// Origins published by the last successfully presented frame
+    /// (CTX-1332, C-D4). Read-only diagnostic/test accessor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn published_band_origins(&self) -> &[BandOrigin] {
+        &self.published_band_origins
+    }
+
+    /// Damage identity of every mounted band, including edges and executable
+    /// origins (CTX-1332, C-D4/F7).
+    ///
+    /// Painted bands carry their pending [`BandOrigin`]; hidden and vertical
+    /// bands carry `None` (they are never clickable) but still participate in
+    /// damage identity through plugin id, slot, version, and edge.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn band_frame_identity(&self) -> Vec<BandFrameIdentity> {
+        let mut identities = Vec::new();
+        let mut used = BTreeSet::new();
+        for edge in [
+            BandEdge::Top,
+            BandEdge::Bottom,
+            BandEdge::Left,
+            BandEdge::Right,
+        ] {
+            for band in self.chrome_bands.edge(edge) {
+                let origin = if band_is_visible(&band.root) {
+                    self.pending_band_origins
+                        .iter()
+                        .enumerate()
+                        .find(|(index, origin)| {
+                            !used.contains(index)
+                                && origin.edge == edge
+                                && origin.plugin_id == band.plugin_id
+                                && origin.slot == band.slot
+                                && origin.version == band.version
+                        })
+                        .map(|(index, origin)| {
+                            used.insert(index);
+                            origin.clone()
+                        })
+                } else {
+                    None
+                };
+                identities.push(BandFrameIdentity {
+                    plugin_id: band.plugin_id.clone(),
+                    slot: band.slot,
+                    version: band.version,
+                    edge,
+                    origin,
+                });
+            }
+        }
+        identities
+    }
+
+    /// Selects at most `max` queued admissions, leaving the unselected tail
+    /// queued (CTX-1332, C-D9/C-D10).
+    ///
+    /// This replaces a `mem::take` drain for the cold pump: a partial batch
+    /// never silently drops work. Order preserves the existing click-then-
+    /// scroll queue order (cross-owner chronological ordering remains a
+    /// separate proposal, C-D7).
+    #[doc(hidden)]
+    pub fn drain_band_admissions(&mut self, max: usize) -> Vec<BandAdmission> {
+        let mut admissions = Vec::with_capacity(
+            max.min(
+                self.band_click_queue
+                    .len()
+                    .saturating_add(self.band_scroll_queue.len()),
+            ),
+        );
+        let click_take = max.min(self.band_click_queue.len());
+        for request in self.band_click_queue.drain(..click_take) {
+            admissions.push(BandAdmission::Click(request));
+        }
+        let scroll_take = max
+            .saturating_sub(admissions.len())
+            .min(self.band_scroll_queue.len());
+        for request in self.band_scroll_queue.drain(..scroll_take) {
+            admissions.push(BandAdmission::Scroll(request));
+        }
+        admissions
+    }
+
+    /// Sets chrome bands together with the live mount projection used to
+    /// capture origins (CTX-1332, C-D4).
+    ///
+    /// Additive `#[doc(hidden)]` entry: `set_chrome_bands` and
+    /// `ChromeBands::from_mounts` keep their existing public shapes.
+    #[doc(hidden)]
+    pub fn set_chrome_bands_with_mounts(&mut self, bands: ChromeBands, mounts: Vec<BandMount>) {
+        self.chrome_bands = bands;
+        self.rebuild_pending_band_origins(mounts);
+    }
+
+    /// Recomputes pending origins from the current bands and live mounts,
+    /// then eagerly cancels queued/armed admissions whose origin is no longer
+    /// live (CTX-1332, C-D4/C-D5).
+    fn rebuild_pending_band_origins(&mut self, mounts: Vec<BandMount>) {
+        let mut by_key: BTreeMap<(String, UiSlot, u32), VecDeque<(u32, i64)>> = BTreeMap::new();
+        for mount in mounts {
+            by_key
+                .entry((mount.plugin_id, mount.slot, mount.version))
+                .or_default()
+                .push_back((mount.generation, mount.handle));
+        }
+
+        let mut pending = Vec::new();
+        for edge in [
+            BandEdge::Top,
+            BandEdge::Bottom,
+            BandEdge::Left,
+            BandEdge::Right,
+        ] {
+            let bands: Vec<(String, UiSlot, u32, bool)> = self
+                .chrome_bands
+                .edge(edge)
+                .iter()
+                .map(|band| {
+                    (
+                        band.plugin_id.clone(),
+                        band.slot,
+                        band.version,
+                        band_is_visible(&band.root),
+                    )
+                })
+                .collect();
+            let mut visible_index = 0u16;
+            for (plugin_id, slot, version, visible) in bands {
+                let mount = by_key
+                    .get_mut(&(plugin_id.clone(), slot, version))
+                    .and_then(VecDeque::pop_front);
+                if !visible {
+                    continue;
+                }
+                if let Some((generation, handle)) = mount {
+                    // C-D4 counter/version exhaustion fails closed: never
+                    // issue an origin whose version can no longer advance.
+                    if version != u32::MAX && generation != 0 {
+                        if let Some(row) = self.visible_band_row(edge, usize::from(visible_index)) {
+                            pending.push(BandOrigin {
+                                plugin_id,
+                                generation,
+                                handle,
+                                slot,
+                                version,
+                                edge,
+                                visible_index,
+                                row,
+                            });
+                        }
+                    }
+                }
+                visible_index = visible_index.saturating_add(1);
+            }
+        }
+        self.pending_band_origins = pending;
+        let live = self.pending_band_origins.clone();
+        self.retain_live_band_admissions(&live);
+    }
+
+    /// Eagerly cancels queued and armed admissions whose origin is not in the
+    /// live set (CTX-1332, C-D5).
+    ///
+    /// Deliberately does **not** call [`Self::clear_band_press`]: physical
+    /// release swallowing stays owned by the existing press state, so an
+    /// invalidated action still consumes its release.
+    pub(super) fn retain_live_band_admissions(&mut self, live: &[BandOrigin]) {
+        let live_origin = |origin: &Option<BandOrigin>| {
+            origin.as_ref().is_some_and(|origin| live.contains(origin))
+        };
+        self.band_click_queue
+            .retain(|request| live_origin(&request.origin));
+        self.band_scroll_queue
+            .retain(|request| live_origin(&request.origin));
+        if let Some(PressedBandTarget::Hit { request, .. }) = &self.band_press_target {
+            if !live_origin(&request.origin) {
+                // Cancel the armed target but keep the release swallow.
+                self.band_press_target = None;
+            }
+        }
+    }
+
     /// Resolves the release paired with a band-consumed press (CTX-0946 C1).
     ///
     /// Returns `true` (consume the release) when the swallow is armed.
@@ -903,6 +1275,22 @@ impl Runtime {
                 && run == release_run
                 && request == release_request =>
             {
+                let mut request = request;
+                // CTX-1332 C-D4/C-D5: the press-captured origin must still be
+                // the live published origin and the live band identity.
+                if let Some(origin) = request.origin.clone() {
+                    if !self.band_origin_is_current(&origin) {
+                        self.band_stats.clicks_denied =
+                            self.band_stats.clicks_denied.saturating_add(1);
+                        return true;
+                    }
+                }
+                // C-D4 exhaustion fails closed: never wrap the sequence.
+                let Some(seq) = self.next_admission_seq() else {
+                    self.band_stats.clicks_denied = self.band_stats.clicks_denied.saturating_add(1);
+                    return true;
+                };
+                request.admission_seq = seq;
                 if self.band_click_queue.len() >= BAND_CLICK_QUEUE_MAX {
                     self.band_stats.queue_drops = self.band_stats.queue_drops.saturating_add(1);
                 } else {
@@ -952,11 +1340,28 @@ impl Runtime {
         let outcome = self.scroll_target_at_cursor();
         match outcome {
             ScrollTargetOutcome::Hit(target) => {
+                // CTX-1332 C-D4/C-D5: the captured origin must still be the
+                // live published origin and the live band identity.
+                if let Some(origin) = target.origin.clone() {
+                    if !self.band_origin_is_current(&origin) {
+                        self.band_stats.scrolls_denied =
+                            self.band_stats.scrolls_denied.saturating_add(1);
+                        return true;
+                    }
+                }
+                // C-D4 exhaustion fails closed: never wrap the sequence.
+                let Some(seq) = self.next_admission_seq() else {
+                    self.band_stats.scrolls_denied =
+                        self.band_stats.scrolls_denied.saturating_add(1);
+                    return true;
+                };
                 self.queue_band_scroll(BandScrollRequest {
                     plugin_id: target.plugin_id,
                     command: target.command,
                     args: target.args,
                     delta,
+                    origin: target.origin,
+                    admission_seq: seq,
                 });
                 true
             }
@@ -995,7 +1400,12 @@ impl Runtime {
             return ScrollTargetOutcome::Unclaimed;
         };
         match resolve_scroll_in_band(&owner, &runs, hit.char_idx) {
-            BandScrollOutcome::Hit(target) => ScrollTargetOutcome::Hit(target),
+            BandScrollOutcome::Hit(mut target) => {
+                target.origin = self
+                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .cloned();
+                ScrollTargetOutcome::Hit(target)
+            }
             BandScrollOutcome::Denied => ScrollTargetOutcome::Denied,
             BandScrollOutcome::NoClaim => ScrollTargetOutcome::Unclaimed,
         }
@@ -1017,6 +1427,7 @@ impl Runtime {
             if back.plugin_id == request.plugin_id
                 && back.command == request.command
                 && back.args == request.args
+                && back.origin == request.origin
             {
                 back.delta = back.delta.saturating_add(request.delta);
                 self.band_stats.scrolls_coalesced =
@@ -1050,16 +1461,15 @@ impl Runtime {
         self.band_release_swallow
     }
 
-    /// Version snapshot of every mounted band, in stacking order (CTX-0946 C2).
+    /// Version snapshot of every mounted band, in stacking order, including
+    /// the band edge (CTX-0946 C2, CTX-1332 F7).
     ///
-    /// The present path compares this against the last presented frame: a
-    /// mount, update, or unmount forces a frame on a quiet grid (band damage
-    /// only — geometry reflows separately through the exclusive-zone
-    /// budget). Versions come from the mount registry (1 at mount,
-    /// incremented by update), so content-equal rewrites still present once
-    /// rather than risking a stale band.
+    /// The present path compares a richer origin+geometry identity
+    /// ([`Self::band_frame_identity`]); this tuple form remains for callers
+    /// that need the plain version snapshot. The edge is part of the tuple so
+    /// an edge move at an unchanged version does not compare equal.
     #[must_use]
-    pub fn chrome_band_versions(&self) -> Vec<(String, UiSlot, u32)> {
+    pub fn chrome_band_versions(&self) -> Vec<(String, UiSlot, u32, BandEdge)> {
         let mut versions = Vec::new();
         for edge in [
             BandEdge::Top,
@@ -1068,7 +1478,7 @@ impl Runtime {
             BandEdge::Right,
         ] {
             for band in self.chrome_bands.edge(edge) {
-                versions.push((band.plugin_id.clone(), band.slot, band.version));
+                versions.push((band.plugin_id.clone(), band.slot, band.version, edge));
             }
         }
         versions
@@ -1311,6 +1721,8 @@ mod tests {
             command: "scroll".to_string(),
             args: vec![("step".to_string(), ClickArg::Number(2.0))],
             delta: 3,
+            origin: None,
+            admission_seq: 0,
         };
         for _ in 0..100 {
             rt.queue_band_scroll(target());
@@ -1472,5 +1884,48 @@ mod tests {
         assert_eq!(pairs[0].1, LuaValue::Number(3.0));
         assert_eq!(pairs[1].1, LuaValue::String("ws".to_string()));
         assert_eq!(pairs[2].1, LuaValue::Bool(true));
+    }
+
+    #[test]
+    fn cold_selection_bound_is_sixteen_and_leaves_the_tail_queued() {
+        // CTX-1332 C-D9/C-D10: the bound is the literal 16 derived from the
+        // existing click+scroll caps and is a selection bound, never a
+        // mem::take drain. Queue one over the bound and prove the tail stays.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let origin = BandOrigin {
+            plugin_id: "test-bar".to_string(),
+            generation: 1,
+            handle: 1,
+            slot: UiSlot::Top,
+            version: 1,
+            edge: BandEdge::Top,
+            visible_index: 0,
+            row: 0,
+        };
+        for seq in 0..COLD_ADMISSION_SELECTION_MAX {
+            rt.band_click_queue.push(BandClickRequest {
+                plugin_id: "test-bar".to_string(),
+                command: format!("click-{seq}"),
+                args: Vec::new(),
+                origin: Some(origin.clone()),
+                admission_seq: seq as u64,
+            });
+        }
+        rt.band_click_queue.push(BandClickRequest {
+            plugin_id: "test-bar".to_string(),
+            command: "click-over".to_string(),
+            args: Vec::new(),
+            origin: Some(origin),
+            admission_seq: COLD_ADMISSION_SELECTION_MAX as u64,
+        });
+        assert_eq!(rt.band_click_queue.len(), COLD_ADMISSION_SELECTION_MAX + 1);
+        let selected = rt.drain_band_admissions(COLD_ADMISSION_SELECTION_MAX);
+        assert_eq!(selected.len(), COLD_ADMISSION_SELECTION_MAX);
+        assert_eq!(
+            rt.band_click_queue.len(),
+            1,
+            "one-over work stays queued, never dropped"
+        );
+        assert_eq!(rt.band_click_queue[0].command, "click-over");
     }
 }

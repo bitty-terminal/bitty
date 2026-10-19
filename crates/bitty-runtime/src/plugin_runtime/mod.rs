@@ -1037,6 +1037,41 @@ impl PluginRuntime {
         result
     }
 
+    /// Iterate over all mounted UI blocks with their generation-owned handle
+    /// and activation generation (CTX-1332, C-D4).
+    ///
+    /// Additive `#[doc(hidden)]` projection used by the application to
+    /// capture a [`crate::BandOrigin`] at presentation. Order is discovery
+    /// order, identical to [`Self::ui_blocks`]. No VM is entered and no
+    /// reference escapes.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn ui_blocks_with_handles(
+        &self,
+    ) -> Vec<(PluginId, bitty_lua::ui::UiSlot, UiNode, u32, u32, i64)> {
+        let mut result = Vec::new();
+        for id in &self.order {
+            if let Some(entry) = self.entries.get(id) {
+                if let Some(svc) = &entry.services {
+                    let generation = entry.generation;
+                    svc.with_ui_blocks(|blocks| {
+                        for (handle, block) in blocks.iter() {
+                            result.push((
+                                id.clone(),
+                                block.ui_slot(),
+                                block.node().clone(),
+                                block.version(),
+                                generation,
+                                handle,
+                            ));
+                        }
+                    });
+                }
+            }
+        }
+        result
+    }
+
     /// Drain accepted notifications (async hand-off side).
     pub fn drain_notifications(&mut self) -> Vec<Notification> {
         self.notifications.borrow_mut().drain()
@@ -2722,6 +2757,98 @@ impl PluginRuntime {
             }
         }
         Ok(result)
+    }
+
+    /// Dispatch one command admitted from a presented band origin
+    /// (CTX-1332, C-D5/C-D6).
+    ///
+    /// Host-only, additive, `#[doc(hidden)]` entry for the cold delivery
+    /// phase. It (1) requires the owning generation to be `Active`, (2)
+    /// re-validates the supplied [`crate::BandOrigin`] against the live mount
+    /// registry (generation, handle, slot placement, exact version), and
+    /// (3) **delegates** to [`Self::dispatch_command`] so registration, args
+    /// schema, result schema, busy containment, VM budget, and downstream
+    /// capability checks stay on the single existing body. Generic
+    /// `dispatch_command`/`invoke_command` semantics — including the
+    /// deliberate `Suspended` probe allowance — are unchanged.
+    ///
+    /// No new error variant is introduced: every refusal reuses the existing
+    /// [`PluginRuntimeError::Lifecycle`] class.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginRuntimeError::Lifecycle`] when the origin is missing from the
+    /// live registry, the generation/handle/version/slot changed, or the
+    /// plugin is not `Active`; otherwise the delegated
+    /// [`dispatch_command`](Self::dispatch_command) errors.
+    pub fn dispatch_ui_command(
+        &mut self,
+        id: &PluginId,
+        command_id: &str,
+        args: &[LuaValue],
+        origin: &crate::BandOrigin,
+    ) -> Result<LuaValue, PluginRuntimeError> {
+        self.validate_ui_origin(id, origin)?;
+        self.dispatch_command(id, command_id, args)
+    }
+
+    /// Live origin/authorization re-query immediately before the VM borrow
+    /// (CTX-1332, C-D5).
+    ///
+    /// The "authorization currently true" check is this live registry query
+    /// plus the registration/schema checks `dispatch_command` performs at call
+    /// time; it is never a cached boolean. Persistent-store edits are **not**
+    /// treated as live revocation: only app-observed lifecycle transitions
+    /// (suspend, dispose, reload, unmount, replacement) invalidate a
+    /// generation.
+    fn validate_ui_origin(
+        &self,
+        id: &PluginId,
+        origin: &crate::BandOrigin,
+    ) -> Result<(), PluginRuntimeError> {
+        if origin.plugin_id != id.as_str() {
+            return Err(lifecycle_error(
+                id,
+                "band origin does not match the command owner",
+            ));
+        }
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or_else(|| lifecycle_error(id, "not found"))?;
+        if entry.state != LifecycleState::Active {
+            return Err(lifecycle_error(id, "plugin is not active"));
+        }
+        if entry.generation != origin.generation {
+            return Err(lifecycle_error(id, "band origin generation is stale"));
+        }
+        let services = entry
+            .services
+            .as_ref()
+            .ok_or_else(|| lifecycle_error(id, "no services"))?;
+        let live = services.with_ui_blocks(|blocks| {
+            blocks
+                .get(origin.handle)
+                .map(|block| (block.ui_slot(), block.version()))
+        });
+        let Some((slot, version)) = live else {
+            return Err(lifecycle_error(
+                id,
+                "band origin handle is no longer mounted",
+            ));
+        };
+        if slot != origin.slot {
+            return Err(lifecycle_error(id, "band origin slot changed"));
+        }
+        if version != origin.version {
+            return Err(lifecycle_error(id, "band origin version is stale"));
+        }
+        if crate::runtime::band_slots::ui_slot_placement(slot)
+            != crate::runtime::band_slots::UiSlotPlacement::Band(origin.edge)
+        {
+            return Err(lifecycle_error(id, "band origin placement changed"));
+        }
+        Ok(())
     }
 
     /// Invoke one command by qualified name (`owner:command`, CTX-1035).

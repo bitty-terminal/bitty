@@ -452,3 +452,40 @@ fn bottom_band_paints_on_the_window_edge() {
         );
     }
 }
+
+/// CTX-1332 F7: `chrome_band_versions()` includes the band edge, so an edge
+/// move at an unchanged version does not compare equal.
+#[test]
+fn chrome_band_versions_include_the_band_edge() {
+    let mut rt = minimal_runtime();
+    let band = BandContent {
+        plugin_id: "edge-test".to_string(),
+        slot: UiSlot::Top,
+        root: UiNode::text("edge"),
+        version: 1,
+    };
+
+    rt.set_chrome_bands(ChromeBands {
+        top: vec![band.clone()],
+        ..Default::default()
+    });
+    let top_versions = rt.chrome_band_versions();
+    let top_identity = rt.band_frame_identity();
+
+    // Same plugin, slot, and version; different edge.
+    rt.set_chrome_bands(ChromeBands {
+        bottom: vec![band],
+        ..Default::default()
+    });
+    let bottom_versions = rt.chrome_band_versions();
+    let bottom_identity = rt.band_frame_identity();
+
+    assert_ne!(
+        top_versions, bottom_versions,
+        "the edge is part of the version identity"
+    );
+    assert_ne!(
+        top_identity, bottom_identity,
+        "the edge is part of the frame identity"
+    );
+}

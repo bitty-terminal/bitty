@@ -12,7 +12,9 @@
 //! 2. **Place**: every cell covered by a planned dirty rectangle is
 //!    examined. Backgrounds merge into maximal horizontal same-color runs
 //!    per row (CTX-0471) and, with text decorations, become [`FillRect`]s;
-//!    printable characters become [`GlyphInstance`]s.
+//!    a printable base scalar, plus each visible combining mark in the
+//!    cell's bounded `zerowidth` buffer (CR-TERM-01), becomes a
+//!    [`GlyphInstance`].
 //!    Underline paint is style-faithful (CTX-0583, refined CTX-1007):
 //!    `Single`/`Double` are full-width bars, while `Curly`/`Dotted`/`Dashed`
 //!    decompose into bounded, deterministic rectangle patterns anchored to
@@ -58,8 +60,9 @@
 //!   invented here.
 //! - **Scrollback viewport rendering**: this surface is the active screen.
 //! - **Shaped clusters, color fonts, synthetic bold**: await the text RFC
-//!   named by ADR-0004. One glyph per cell (the leading Unicode scalar),
-//!   placed on a metric-aware baseline with a fixed-rule fallback (see
+//!   named by ADR-0004. One glyph per base scalar plus its visible
+//!   combining marks (positioned by their own bearings, no GPOS), placed on
+//!   a metric-aware baseline with a fixed-rule fallback (see
 //!   [`BASELINE_NUMERATOR`] and [`resolve_baseline_offset`]).
 //! - **Subpixel RGB antialiasing policy**: upstream coverage is averaged to
 //!   luminance exactly like [`crate::software::SurfaceRgba::blend_glyph`]
@@ -2878,13 +2881,41 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let decorations = self.emit_decorations(term_cell, row, col, span_cols, fg, list);
         if term_cell.style.attributes.invisible {
             self.counters.invisible_cells_skipped += 1;
-        } else if term_cell.glyph != ' ' {
-            self.emit_glyph(term_cell.glyph, row, col, span_cols, fg, list);
-        } else if decorations == 0 {
-            self.counters.blank_cells_skipped += 1;
-            return;
+        } else {
+            // Base glyph first: its rasterized advance is the pen origin the
+            // font positioned the cell's combining marks against
+            // (CR-TERM-01). A blank base keeps the grid advance so a mark on
+            // a space still lands inside its own cell.
+            let mut drew = false;
+            let pen_advance = if term_cell.glyph == ' ' {
+                self.grid_advance(span_cols)
+            } else {
+                let (emitted, advance) =
+                    self.emit_glyph(term_cell.glyph, row, col, span_cols, fg, list);
+                drew |= emitted;
+                advance
+            };
+            drew |= self.emit_zerowidth_marks(term_cell, row, col, pen_advance, fg, list);
+            if !drew && decorations == 0 {
+                // Exactly one classification per visited cell: nothing drew
+                // it (blank base, dropped marks, or a failed rasterize), so
+                // it is the cell's single blank skip. `emit_glyph` never
+                // counts failures itself, which keeps a cell that painted
+                // only a mark or a decoration out of both buckets.
+                self.counters.blank_cells_skipped += 1;
+                return;
+            }
         }
         self.counters.cells_drawn += 1;
+    }
+
+    /// Grid advance in pixels for a cell spanning `span_cols` columns.
+    ///
+    /// Used as the pen origin for combining marks over a blank base (and for
+    /// tofu fallbacks) where no rasterized glyph advance exists.
+    fn grid_advance(&self, span_cols: usize) -> i32 {
+        let pixels = u64::from(self.cell.width).saturating_mul(span_cols as u64);
+        i32::try_from(pixels).unwrap_or(i32::MAX)
     }
 
     /// Emits underline/strikethrough bars; returns how many were pushed.
@@ -2958,6 +2989,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// When the rasterizer reports no drawable representation (no loaded face
     /// covers the scalar), the cell paints the RFC missing-glyph tofu box
     /// instead of staying blank (CTX-0368).
+    ///
+    /// Returns `(emitted, pen_advance)`: whether an instance was pushed (tofu
+    /// counts) and the advance the font gives this glyph in pixels, which is
+    /// the pen origin a following combining mark was drawn against. A blank
+    /// or failed scalar reports the grid advance instead so marks still land
+    /// inside their own cell.
+    ///
+    /// Counter ownership lives with the caller: `emit_glyph` never touches
+    /// `blank_cells_skipped`, so a cell is classified exactly once from the
+    /// per-cell result (glyph or decoration drawn vs. nothing drawn).
     fn emit_glyph(
         &mut self,
         character: char,
@@ -2966,12 +3007,12 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         span_cols: usize,
         color: Rgba8,
         list: &mut DrawList,
-    ) {
+    ) -> (bool, i32) {
+        let grid_advance = self.grid_advance(span_cols);
         let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
             // The point size was validated at construction, so this is
             // unreachable; treating it as "nothing to draw" stays safe.
-            self.counters.blank_cells_skipped += 1;
-            return;
+            return (false, grid_advance);
         };
         let bitmap = match self.cache.cached_glyph(key) {
             Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
@@ -2980,56 +3021,122 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 // loaded face covers the scalar; paint the visible RFC tofu
                 // box and count it so missing glyphs never read as blank.
                 self.emit_missing_glyph(row, col, span_cols, color, list);
-                return;
+                return (true, grid_advance);
             }
             Err(_) => {
                 // Rasterizer failure: skip this glyph instead of failing
                 // the whole frame. The failure stays observable through
                 // GlyphCache miss counters and upstream diagnostics.
-                self.counters.blank_cells_skipped += 1;
-                return;
+                return (false, grid_advance);
             }
         };
-
         let metrics = bitmap.metrics();
-        let source = self.atlas.ensure_cached(key, bitmap);
         let dest_x = col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
         let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
         let dest_y = baseline - i64::from(metrics.top);
-
-        let instance = match source {
-            GlyphSource::Atlas { slot } => GlyphInstance {
-                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
-                size: [
-                    saturating_u32(u64::try_from(metrics.width.max(0)).unwrap_or(u64::MAX)),
-                    saturating_u32(u64::try_from(metrics.height.max(0)).unwrap_or(u64::MAX)),
-                ],
-                uv: slot.uv(self.atlas.dims()),
-                color,
-                // Cell glyphs overhang by construction; only the runtime's
-                // decorated frames set a rounded content clip (CTX-0311).
-                clip: None,
-                source: GlyphSource::Atlas { slot },
-            },
-            GlyphSource::Inline {
-                mask,
-                width,
-                height,
-            } => GlyphInstance {
-                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
-                size: [width, height],
-                uv: [0.0; 4],
-                color,
-                clip: None,
-                source: GlyphSource::Inline {
-                    mask,
-                    width,
-                    height,
-                },
-            },
+        push_cached_glyph(
+            &mut self.atlas,
+            &mut self.counters,
+            key,
+            bitmap,
+            dest_x,
+            dest_y,
+            color,
+            list,
+        );
+        let advance = if metrics.advance[0] > 0 {
+            metrics.advance[0]
+        } else {
+            grid_advance
         };
-        list.glyphs.push(instance);
-        self.counters.glyphs_emitted += 1;
+        (true, advance)
+    }
+
+    /// Emits a cell's zero-width scalars over their base glyph (CR-TERM-01).
+    ///
+    /// `Cell::zerowidth` carries combining marks, joiners, and selectors
+    /// attached to the base cell. The unshaped paint path used to drop the
+    /// whole buffer, so a base + mark cell — for example the `e` + U+0301
+    /// corpus line in the #2264 report — painted as a bare `e`. Painting
+    /// each visible mark at the pen position the font expects restores the
+    /// diacritic without touching Terminal Truth: the cell keeps its base
+    /// scalar and mark buffer, so selection, copy, search, and accessibility
+    /// text stay byte-identical. (A genuinely precomposed U+00E9 cell was
+    /// already painted correctly; this closes the equivalent decomposed
+    /// encoding, which is what the reported corpus stores.)
+    ///
+    /// Join controls (ZWNJ/ZWJ), variation selectors, and tag scalars carry
+    /// no glyph of their own; they are skipped rather than rasterized (a
+    /// missing glyph would otherwise paint a tofu box over the base).
+    /// Returns whether any mark produced an instance.
+    fn emit_zerowidth_marks(
+        &mut self,
+        term_cell: &bitty_term_state::Cell,
+        row: usize,
+        col: usize,
+        mut pen_advance: i32,
+        color: Rgba8,
+        list: &mut DrawList,
+    ) -> bool {
+        let mut drew = false;
+        for mark in term_cell.zerowidth.iter().copied() {
+            if !is_paintable_zerowidth(mark) {
+                continue;
+            }
+            if let Some(advance) = self.emit_mark(mark, row, col, pen_advance, color, list) {
+                drew = true;
+                pen_advance = pen_advance.saturating_add(advance);
+            }
+        }
+        drew
+    }
+
+    /// Emits one combining mark bitmap at `pen_advance` past the cell origin.
+    ///
+    /// The rasterizer returns mark bearings relative to the pen position
+    /// *after* the preceding glyph, so the mark's left bearing already
+    /// accounts for the base advance; adding the cell origin and
+    /// `pen_advance` places the mark exactly where the font drew the
+    /// precomposed equivalent. A mark with no drawable glyph is dropped
+    /// silently (never a tofu box over its base). Returns the mark's own
+    /// advance so stacked marks keep the font's pen order.
+    fn emit_mark(
+        &mut self,
+        mark: char,
+        row: usize,
+        col: usize,
+        pen_advance: i32,
+        color: Rgba8,
+        list: &mut DrawList,
+    ) -> Option<i32> {
+        let key = RasterKey::new(mark, self.font, self.point_size).ok()?;
+        // A mark without a drawable bitmap (blank or rasterizer failure) is
+        // dropped, never promoted to a tofu box over its base. It is not a
+        // *cell* skip, so `blank_cells_skipped` stays cell-accurate.
+        let bitmap = match self.cache.cached_glyph(key) {
+            Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
+            Ok(CachedGlyphRef::Blank) | Err(_) => return None,
+        };
+        let metrics = bitmap.metrics();
+        if metrics.width <= 0 || metrics.height <= 0 {
+            return None;
+        }
+        let dest_x = col as i64 * i64::from(self.cell.width)
+            + i64::from(pen_advance)
+            + i64::from(metrics.left);
+        let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
+        let dest_y = baseline - i64::from(metrics.top);
+        push_cached_glyph(
+            &mut self.atlas,
+            &mut self.counters,
+            key,
+            bitmap,
+            dest_x,
+            dest_y,
+            color,
+            list,
+        );
+        Some(metrics.advance[0].max(0))
     }
 
     /// Emits one ASCII-candidate run through the char-keyed cached-glyph
@@ -3072,7 +3179,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             }
-            self.emit_glyph(ch, row, abs_col, 1, fg, list);
+            let (emitted, _) = self.emit_glyph(ch, row, abs_col, 1, fg, list);
+            if !emitted {
+                self.counters.blank_cells_skipped += 1;
+            }
         }
         self.counters.ascii_fast_path_runs = self.counters.ascii_fast_path_runs.saturating_add(1);
         vec![(dirty_start, dirty_end - dirty_start)]
@@ -3792,10 +3902,90 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         let mut col = abs_col;
         for ch in slice.chars() {
             let width = usize::from(bitty_term_state::char_cell_width(ch)).max(1);
-            self.emit_glyph(ch, row, col, width, fg, list);
+            let (emitted, _) = self.emit_glyph(ch, row, col, width, fg, list);
+            if !emitted {
+                self.counters.blank_cells_skipped += 1;
+            }
             col += width;
         }
     }
+}
+
+/// Pushes one cached glyph bitmap as an atlas- or inline-sourced instance.
+///
+/// Shared by base glyphs and combining marks so both keep the same atlas
+/// policy, overhang placement (`baseline - metrics.top`, never clipped to the
+/// cell), and inline fallback behavior. A free function (not a method) keeps
+/// the `GlyphCache` borrow in the caller disjoint from the atlas/counter
+/// borrows.
+#[allow(clippy::too_many_arguments)]
+fn push_cached_glyph(
+    atlas: &mut GlyphAtlas,
+    counters: &mut RenderCounters,
+    key: RasterKey,
+    bitmap: &CachedBitmap,
+    dest_x: i64,
+    dest_y: i64,
+    color: Rgba8,
+    list: &mut DrawList,
+) {
+    let metrics = bitmap.metrics();
+    let source = atlas.ensure_cached(key, bitmap);
+    let instance = match source {
+        GlyphSource::Atlas { slot } => GlyphInstance {
+            dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+            size: [
+                saturating_u32(u64::try_from(metrics.width.max(0)).unwrap_or(u64::MAX)),
+                saturating_u32(u64::try_from(metrics.height.max(0)).unwrap_or(u64::MAX)),
+            ],
+            uv: slot.uv(atlas.dims()),
+            color,
+            // Cell glyphs overhang by construction; only the runtime's
+            // decorated frames set a rounded content clip (CTX-0311).
+            clip: None,
+            source: GlyphSource::Atlas { slot },
+        },
+        GlyphSource::Inline {
+            mask,
+            width,
+            height,
+        } => GlyphInstance {
+            dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+            size: [width, height],
+            uv: [0.0; 4],
+            color,
+            clip: None,
+            source: GlyphSource::Inline {
+                mask,
+                width,
+                height,
+            },
+        },
+    };
+    list.glyphs.push(instance);
+    counters.glyphs_emitted += 1;
+}
+
+/// Whether a zero-width scalar attached to a cell has a visible mark shape.
+///
+/// `Grapheme_Extend` covers combining marks (and emoji modifiers, which are
+/// wide scalars stored in their own cells, so they never reach the mark
+/// buffer in practice). Join controls and selectors/tags carry no mark shape;
+/// they are skipped so a missing-glyph tofu box can never be painted over
+/// their base.
+#[must_use]
+fn is_paintable_zerowidth(ch: char) -> bool {
+    let cp = ch as u32;
+    if matches!(
+        cp,
+        0x200C..=0x200D // ZWNJ / ZWJ
+            | 0xFE00..=0xFE0F // variation selectors
+            | 0xE0020..=0xE007F // tag scalars
+            | 0xE0100..=0xE01EF // variation selectors supplement
+    ) {
+        return false;
+    }
+    bitty_term_state::is_grapheme_extend(cp)
 }
 
 /// Destination x for one shaped glyph instance (Phase C hardening).

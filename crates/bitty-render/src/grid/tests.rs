@@ -3040,3 +3040,353 @@ fn ascii_fast_path_empty_dirty_emits_nothing() {
     assert!(list.glyphs.is_empty());
     assert_eq!(grid.counters().ascii_fast_path_runs, 0);
 }
+
+// ---------------------------------------------------------------------------
+// CR-TERM-01 / CTX-1371: base + combining-mark cells paint their diacritic
+// ---------------------------------------------------------------------------
+//
+// The unshaped paint path used to emit only `Cell::glyph`, dropping the
+// bounded `Cell::zerowidth` buffer. A cell holding `e` + U+0301 therefore
+// painted a bare `e` (issue #2264's "precomposed é paints as e" report: the
+// reported corpus line is stored as base + mark), while a genuinely
+// precomposed U+00E9 cell already painted correctly. These golden-frame
+// tests pin both encodings to the same pixels and prove Terminal Truth is
+// untouched.
+
+/// Minimal deterministic font model with a real base + mark shape.
+///
+/// Chosen metrics mirror the live JetBrains Mono 12pt truth: base advance 8,
+/// base bitmap at left 1 / top 6, precomposed é as one 6x10 bitmap whose 2x4
+/// accent sits at bitmap x 3..4 / y 0..3, and U+0301 as a 2x4 mark at
+/// left -4 / top 10 / zero advance (its bearings are relative to the pen
+/// after the base, so `0 + 8 - 4 = 4` lands exactly on the precomposed
+/// accent). CJK/emoji are 14x10 wide scalars with advance 16.
+struct MarksRasterizer {
+    next_id: u64,
+}
+
+impl MarksRasterizer {
+    fn new() -> Self {
+        Self { next_id: 0 }
+    }
+
+    fn solid(
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+        advance: i32,
+        coverage: u8,
+    ) -> GlyphBitmap {
+        let data = vec![coverage; (width as usize) * (height as usize) * 3];
+        GlyphBitmap::try_new(
+            GlyphMetrics {
+                left,
+                top,
+                width,
+                height,
+                advance: [advance, 0],
+            },
+            BitmapFormat::Rgb,
+            data,
+        )
+        .expect("fake glyph invariants")
+    }
+
+    fn wide() -> GlyphBitmap {
+        GlyphBitmap::try_new(
+            GlyphMetrics {
+                left: 0,
+                top: 10,
+                width: 14,
+                height: 10,
+                advance: [16, 0],
+            },
+            BitmapFormat::Rgb,
+            vec![0xC0; 14 * 10 * 3],
+        )
+        .expect("fake wide glyph invariants")
+    }
+
+    fn eacute() -> GlyphBitmap {
+        let mut data = vec![0u8; 6 * 10 * 3];
+        for y in 0..10 {
+            for x in 0..6 {
+                let ink = if y < 4 { (3..5).contains(&x) } else { true };
+                if ink {
+                    let i = (y * 6 + x) * 3;
+                    data[i] = 0xFF;
+                    data[i + 1] = 0xFF;
+                    data[i + 2] = 0xFF;
+                }
+            }
+        }
+        GlyphBitmap::try_new(
+            GlyphMetrics {
+                left: 1,
+                top: 10,
+                width: 6,
+                height: 10,
+                advance: [8, 0],
+            },
+            BitmapFormat::Rgb,
+            data,
+        )
+        .expect("fake precomposed glyph invariants")
+    }
+}
+
+impl GlyphRasterizer for MarksRasterizer {
+    fn load_font(&mut self, _query: &FontQuery) -> Result<FontId, RenderError> {
+        Ok(FontId::next(&mut self.next_id))
+    }
+
+    fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+        Ok(match key.character {
+            // Spaces stay blank; join controls and selectors have no shape.
+            ' ' | '\t' | '\u{200D}' | '\u{FE0F}' => None,
+            'e' => Some(Self::solid(1, 6, 6, 6, 8, 0xFF)),
+            '\u{00E9}' => Some(Self::eacute()),
+            '\u{0301}' => Some(GlyphBitmap::try_new(
+                GlyphMetrics {
+                    left: -4,
+                    top: 10,
+                    width: 2,
+                    height: 4,
+                    advance: [0, 0],
+                },
+                BitmapFormat::Rgb,
+                vec![0xFF; 2 * 4 * 3],
+            )?),
+            '\u{4F60}' | '\u{597D}' | '\u{1F468}' | '\u{1F469}' | '\u{1F467}' | '\u{1F466}' => {
+                Some(Self::wide())
+            }
+            _ => Some(Self::solid(1, 6, 6, 6, 8, 0x40)),
+        })
+    }
+}
+
+fn marks_renderer() -> GridRenderer<MarksRasterizer> {
+    GridRenderer::new(
+        MarksRasterizer::new(),
+        &FontQuery {
+            family: "Marks Fake".into(),
+            style: FontStyle::Normal,
+            point_size: 12.0,
+        },
+        CellMetrics::new(8, 16).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Composites every glyph instance from the renderer's atlas/inline masks
+/// into a coverage frame (`0` background .. `255` full ink).
+fn glyph_frame(
+    renderer: &GridRenderer<MarksRasterizer>,
+    list: &crate::grid::DrawList,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let dims = renderer.atlas_dims();
+    let texels = renderer.atlas_texels();
+    let mut frame = vec![0u8; (width * height) as usize];
+    for glyph in &list.glyphs {
+        let (gw, gh) = (glyph.size[0], glyph.size[1]);
+        for y in 0..gh {
+            for x in 0..gw {
+                let coverage = match &glyph.source {
+                    GlyphSource::Atlas { slot } => {
+                        let sx = u32::from(slot.x) + x;
+                        let sy = u32::from(slot.y) + y;
+                        texels[(sy * u32::from(dims.width) + sx) as usize]
+                    }
+                    GlyphSource::Inline { mask, width, .. } => mask[(y * width + x) as usize],
+                };
+                let dx = glyph.dest[0] + x as i32;
+                let dy = glyph.dest[1] + y as i32;
+                if dx >= 0 && dy >= 0 && (dx as u32) < width && (dy as u32) < height {
+                    let index = (dy as u32 * width + dx as u32) as usize;
+                    frame[index] = frame[index].max(coverage);
+                }
+            }
+        }
+    }
+    frame
+}
+
+fn render_script(script: &[TerminalAction]) -> (Vec<u8>, crate::grid::RenderCounters, usize) {
+    let state = state_from(script);
+    let snapshot = state.snapshot();
+    let damage = full_damage(&state);
+    let mut renderer = marks_renderer();
+    let list = renderer.render(&snapshot, &damage).expect("render");
+    let (width, height) = (snapshot.width as u32 * 8, snapshot.height as u32 * 16);
+    let frame = glyph_frame(&renderer, &list, width, height);
+    (frame, renderer.counters(), list.glyphs.len())
+}
+
+/// Bytes of one 8x16 cell out of a full-grid coverage frame.
+fn cell_bytes(frame: &[u8], stride: u32, row: usize, col: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 * 16);
+    for y in 0..16u32 {
+        let base = ((row as u32 * 16 + y) * stride + col as u32 * 8) as usize;
+        out.extend_from_slice(&frame[base..base + 8]);
+    }
+    out
+}
+
+fn newline_actions() -> [TerminalAction; 2] {
+    [
+        TerminalAction::PrintControl(bitty_vt::ControlChar(0x0D)),
+        TerminalAction::PrintControl(bitty_vt::ControlChar(0x0A)),
+    ]
+}
+
+#[test]
+fn combining_eacute_paints_the_same_frame_as_precomposed_eacute() {
+    let stride = 80 * 8;
+    let precomposed = render_script(&[print('\u{00E9}')]);
+    let combining = render_script(&[print('e'), print('\u{0301}')]);
+    assert_eq!(
+        cell_bytes(&precomposed.0, stride, 0, 0),
+        cell_bytes(&combining.0, stride, 0, 0),
+        "e + U+0301 must paint exactly the U+00E9 cell"
+    );
+
+    // The diacritic really is present: the precomposed/combining cell has
+    // ink in the accent band (above the base x-height) that `e` lacks.
+    let accent_rows = |frame: &[u8]| {
+        cell_bytes(frame, stride, 0, 0)
+            .chunks_exact(8)
+            .take(6)
+            .filter(|row| row.iter().any(|&px| px > 0))
+            .count()
+    };
+    let base_e = render_script(&[print('e')]);
+    assert_eq!(accent_rows(&base_e.0), 0, "plain e has no accent band");
+    assert_eq!(accent_rows(&precomposed.0), 4, "é paints a 4-row accent");
+    assert_ne!(
+        cell_bytes(&base_e.0, stride, 0, 0),
+        cell_bytes(&precomposed.0, stride, 0, 0),
+        "é must differ from e"
+    );
+    assert_eq!(combining.2, 2, "base glyph plus one mark instance");
+    assert_eq!(precomposed.2, 1, "one precomposed glyph instance");
+}
+
+#[test]
+fn four_line_paste_state_keeps_the_diacritic() {
+    let mut script = vec![print('a'), print('b'), print('c')];
+    script.extend(newline_actions());
+    script.extend([print('\u{4F60}'), print('\u{597D}')]);
+    script.extend(newline_actions());
+    script.push(print('\u{00E9}'));
+    script.extend(newline_actions());
+    script.extend([
+        print('\u{1F468}'),
+        print('\u{200D}'),
+        print('\u{1F469}'),
+        print('\u{200D}'),
+        print('\u{1F467}'),
+        print('\u{200D}'),
+        print('\u{1F466}'),
+    ]);
+    let (frame, counters, glyphs) = render_script(&script);
+    let stride = 80 * 8;
+    // 3 ASCII + 2 CJK leaders + 1 é + 4 ZWJ-family people = 10 instances;
+    // ZWJ never rasterizes.
+    assert_eq!(glyphs, 10);
+    assert_eq!(counters.missing_glyphs, 0);
+
+    let single = render_script(&[print('\u{00E9}')]);
+    assert_eq!(
+        cell_bytes(&frame, stride, 2, 0),
+        cell_bytes(&single.0, stride, 0, 0),
+        "row 3 must paint the same é glyph as the single-line paste"
+    );
+    assert!(
+        cell_bytes(&frame, stride, 1, 0).iter().any(|&px| px > 0),
+        "CJK row still paints"
+    );
+    assert!(
+        cell_bytes(&frame, stride, 3, 0).iter().any(|&px| px > 0),
+        "emoji row still paints"
+    );
+}
+
+#[test]
+fn four_line_paste_state_combining_eacute_matches_precomposed() {
+    let mut script = vec![print('a'), print('b'), print('c')];
+    script.extend(newline_actions());
+    script.extend([print('\u{4F60}'), print('\u{597D}')]);
+    script.extend(newline_actions());
+    script.extend([print('e'), print('\u{0301}')]);
+    script.extend(newline_actions());
+    script.extend([print('\u{1F468}'), print('\u{200D}'), print('\u{1F466}')]);
+    let (frame, counters, glyphs) = render_script(&script);
+    let single = render_script(&[print('\u{00E9}')]);
+    let stride = 80 * 8;
+    assert_eq!(
+        cell_bytes(&frame, stride, 2, 0),
+        cell_bytes(&single.0, stride, 0, 0),
+        "decomposed row 3 must paint the precomposed é frame"
+    );
+    assert_eq!(counters.missing_glyphs, 0);
+    // 3 ASCII + 2 CJK + base e + mark + 2 people = 9 instances.
+    assert_eq!(glyphs, 9);
+}
+
+#[test]
+fn join_controls_and_selectors_emit_no_glyph() {
+    // A lone ZWJ and a variation selector have no shape of their own; the
+    // base must not gain a tofu box or a phantom glyph.
+    let (_, counters, glyphs) = render_script(&[
+        print('A'),
+        print('\u{FE0F}'),
+        print('\u{1F468}'),
+        print('\u{200D}'),
+    ]);
+    assert_eq!(glyphs, 2, "A plus the emoji; selector/joiner skipped");
+    assert_eq!(counters.missing_glyphs, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Counter ownership: one classification per visited cell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blank_base_with_only_an_undrawn_mark_counts_one_skipped_cell() {
+    // A space whose only mark is a joiner paints nothing. It must still land
+    // in exactly one bucket: a blank skip, never in neither.
+    let state = state_from(&[print(' '), print('\u{200D}')]);
+    let damage = damage_all(&state);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    assert!(list.glyphs.is_empty());
+    let counters = grid.counters();
+    assert!(counters.cells_examined >= 1);
+    assert_eq!(counters.cells_drawn, 0);
+    assert_eq!(
+        counters.blank_cells_skipped, counters.cells_examined,
+        "every visited cell is a blank skip, including the marked space"
+    );
+}
+
+#[test]
+fn failed_base_with_a_drawn_mark_is_not_counted_blank() {
+    // The base scalar cannot rasterize but its mark does: the cell painted
+    // something, so it is drawn and must not also count as a blank skip.
+    let state = state_from(&[print('Q'), print('\u{0301}')]);
+    let damage = damage_all(&state);
+    let mut fake = FakeRasterizer::new();
+    fake.fail_next = true;
+    let mut grid = GridRenderer::new(fake, &font_query(), cell_metrics()).unwrap();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    assert_eq!(list.glyphs.len(), 1, "only the mark painted");
+    let counters = grid.counters();
+    assert_eq!(counters.glyphs_emitted, 1);
+    assert_eq!(counters.cells_drawn, 1);
+    assert_eq!(counters.blank_cells_skipped, 0);
+}

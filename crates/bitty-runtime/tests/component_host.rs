@@ -11,15 +11,19 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use bitty_network_wire::Method;
+use bitty_network_wire::{ErrorKind, Method};
 use bitty_plugin_host::manifest::NetworkEgress;
 use bitty_plugin_host::{
     CapabilityId, CapabilityRequests, Compat, GrantRecord, LazyTriggers, PluginId, PluginIdentity,
     PluginManifest,
 };
 use bitty_runtime::Runtime;
-use bitty_runtime::component::{ComponentRequest, ComponentWarnSink, executable_file_name};
+use bitty_runtime::component::{
+    BrokerEventKind, COMPONENT_HANDSHAKE_TIMEOUT, ComponentRequest, ComponentState,
+    ComponentWarnSink, StopOutcome, executable_file_name,
+};
 use bitty_terminal::component::{ComponentContext, run_component_subcommand};
 use bitty_terminal::component_host::install_with_roots;
 
@@ -160,14 +164,26 @@ fn plugin_manifest(id: &str, network_capability: Option<&str>) -> PluginManifest
     }
 }
 
+fn network_capability() -> CapabilityId {
+    CapabilityId::parse(&format!("network.connect:{HOST}")).expect("capability")
+}
+
 fn register_granted(runtime: &mut Runtime) -> String {
     let manifest = plugin_manifest(PLUGIN, Some(&format!("network.connect:{HOST}")));
     let hash = manifest.manifest_hash();
     let plugin_id = PluginId::new(PLUGIN).expect("valid id");
     runtime.register_plugin(manifest).expect("register plugin");
     let mut granted = BTreeSet::new();
-    granted.insert(CapabilityId::parse(&format!("network.connect:{HOST}")).expect("capability"));
-    runtime.insert_grant(GrantRecord::granted(plugin_id, hash.clone(), granted, 1));
+    granted.insert(network_capability());
+    runtime.insert_grant(GrantRecord::granted(
+        plugin_id.clone(),
+        hash.clone(),
+        granted,
+        1,
+    ));
+    runtime
+        .activate_plugin(&plugin_id)
+        .expect("activate plugin after grant");
     hash
 }
 
@@ -216,10 +232,15 @@ fn missing_capability_grant_denies_before_spawn() {
     let manifest = plugin_manifest(PLUGIN, None);
     let hash = manifest.manifest_hash();
     runtime.register_plugin(manifest).expect("register plugin");
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    // No declared authority: activation needs no grant.
+    runtime
+        .activate_plugin(&plugin_id)
+        .expect("activate plugin");
     // A real (non-denied) record with an empty capability set reaches the
     // grant computation and must still be denied as offline.
     runtime.insert_grant(GrantRecord::granted(
-        PluginId::new(PLUGIN).expect("valid id"),
+        plugin_id,
         hash.clone(),
         BTreeSet::new(),
         1,
@@ -283,6 +304,235 @@ fn mutated_digest_is_untrusted_and_never_spawns() {
     let status = runtime.component_status(NAME).expect("status slot");
     assert_eq!(status.spawns, 0);
     assert!(status.pid.is_none());
+}
+
+fn assert_no_spawn(runtime: &Runtime, component: &str) {
+    let spawns = runtime
+        .component_status(component)
+        .map_or(0, |status| status.spawns);
+    assert_eq!(spawns, 0, "component '{component}' must not spawn");
+}
+
+#[test]
+fn revoked_capability_is_denied_even_after_record_reinsert() {
+    let scratch = Scratch::new("revoked");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    let capability = network_capability();
+
+    runtime
+        .revoke_grant(&plugin_id, Some(&capability))
+        .expect("revoke capability");
+    // The grant API explicitly allows re-inserting a record; the per-capability
+    // denial must still win in `is_granted`.
+    let mut granted = BTreeSet::new();
+    granted.insert(capability.clone());
+    runtime.insert_grant(GrantRecord::granted(
+        plugin_id.clone(),
+        hash.clone(),
+        granted,
+        2,
+    ));
+    assert!(
+        !runtime.is_capability_granted(&plugin_id, &hash, &capability),
+        "revoked capability must stay denied after re-insert"
+    );
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("revoked capability must deny");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn registered_plugin_is_denied() {
+    let scratch = Scratch::new("registered");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let manifest = plugin_manifest(PLUGIN, Some(&format!("network.connect:{HOST}")));
+    let hash = manifest.manifest_hash();
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    runtime.register_plugin(manifest).expect("register plugin");
+    let mut granted = BTreeSet::new();
+    granted.insert(network_capability());
+    runtime.insert_grant(GrantRecord::granted(plugin_id, hash.clone(), granted, 1));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("registered plugin must deny");
+    assert_eq!(error.class(), "plugin_not_active");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn suspended_plugin_is_denied() {
+    let scratch = Scratch::new("suspended");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    runtime
+        .suspend_plugin(&plugin_id)
+        .expect("suspend activated plugin");
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("suspended plugin must deny");
+    assert_eq!(error.class(), "plugin_not_active");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn caller_manifest_hash_mismatch_is_denied() {
+    let scratch = Scratch::new("hash-mismatch");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let _ = register_granted(&mut runtime);
+    let wrong = "0".repeat(64);
+
+    let error = runtime
+        .component_request(PLUGIN, &wrong, NAME, request())
+        .expect_err("wrong caller hash must deny");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn denied_grant_record_is_denied() {
+    let scratch = Scratch::new("denied-record");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    runtime.insert_grant(GrantRecord::denied(
+        PluginId::new(PLUGIN).expect("valid id"),
+        hash.clone(),
+        2,
+    ));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("denied record must deny");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn grant_bound_to_foreign_hash_is_denied() {
+    let scratch = Scratch::new("foreign-hash");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let mut granted = BTreeSet::new();
+    granted.insert(network_capability());
+    runtime.insert_grant(GrantRecord::granted(
+        PluginId::new(PLUGIN).expect("valid id"),
+        "foreign-manifest-hash",
+        granted,
+        2,
+    ));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("foreign-hash record must deny");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn undeclared_capability_is_denied() {
+    let scratch = Scratch::new("undeclared");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    // Declares no authority and no egress, so activation needs no grant.
+    let manifest = plugin_manifest(PLUGIN, None);
+    let hash = manifest.manifest_hash();
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    runtime.register_plugin(manifest).expect("register plugin");
+    runtime
+        .activate_plugin(&plugin_id)
+        .expect("activate plugin");
+    let mut granted = BTreeSet::new();
+    granted.insert(network_capability());
+    runtime.insert_grant(GrantRecord::granted(plugin_id, hash.clone(), granted, 1));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("undeclared capability must deny");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+}
+
+#[test]
+fn tick_at_drives_handshake_timeout_without_an_explicit_poll() {
+    let scratch = Scratch::new("tick-timeout");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    // The fixture reads `fixture-mode` from its version directory; `mute`
+    // never answers the handshake.
+    std::fs::write(
+        scratch.path().join(NAME).join(VERSION).join("fixture-mode"),
+        "mute",
+    )
+    .expect("fixture mode");
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let id = runtime
+        .submit_component_request(PLUGIN, &hash, NAME, request())
+        .expect("submit");
+    assert_eq!(
+        runtime.component_status(NAME).map(|status| status.state),
+        Some(ComponentState::Handshaking)
+    );
+
+    let now = Instant::now() + COMPONENT_HANDSHAKE_TIMEOUT + Duration::from_secs(1);
+    runtime.tick_at(now);
+
+    let events = runtime.take_component_events();
+    assert!(
+        events.iter().any(|event| {
+            event.id == id
+                && matches!(
+                    event.kind,
+                    BrokerEventKind::Failed {
+                        kind: ErrorKind::ComponentLost,
+                        ..
+                    }
+                )
+        }),
+        "tick_at must surface the handshake-timeout failure: {events:?}"
+    );
+    let status = runtime.component_status(NAME).expect("status");
+    assert_eq!(status.state, ComponentState::Stopped);
+    assert_eq!(status.last_stop, Some(StopOutcome::Crashed));
+}
+
+#[test]
+fn tick_at_retains_response_events_for_the_embedder() {
+    let scratch = Scratch::new("tick-delivery");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let id = runtime
+        .submit_component_request(PLUGIN, &hash, NAME, request())
+        .expect("submit");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut terminal = false;
+    while Instant::now() < deadline {
+        runtime.tick_at(Instant::now());
+        let events = runtime.take_component_events();
+        if events
+            .iter()
+            .any(|event| event.id == id && event.is_terminal())
+        {
+            terminal = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(terminal, "tick_at discarded the response events");
 }
 
 /// Real `bitty-net` proof. Not part of the default suite: the component lives
@@ -349,14 +599,18 @@ fn real_bitty_net_request() {
     };
     let hash = manifest.manifest_hash();
     runtime.register_plugin(manifest).expect("register plugin");
+    let plugin_id = PluginId::new(plugin).expect("valid id");
     runtime.insert_grant(GrantRecord::granted(
-        PluginId::new(plugin).expect("valid id"),
+        plugin_id.clone(),
         hash.clone(),
         [CapabilityId::parse(&capability).expect("capability")]
             .into_iter()
             .collect(),
         1,
     ));
+    runtime
+        .activate_plugin(&plugin_id)
+        .expect("activate plugin after grant");
 
     let response = runtime
         .component_request(

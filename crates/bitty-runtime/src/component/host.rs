@@ -14,6 +14,7 @@
 //! convenience over `submit` + `wait` for callers that do not own an event
 //! loop.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,10 @@ use super::{COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_REQUEST_DEADLINE_GRACE, effec
 
 /// Real-time slice one [`ComponentHost::request`] blocks in `wait`.
 pub const COMPONENT_HOST_WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// Events observed by [`ComponentHost::request`] for other request ids that
+/// are retained for a later [`ComponentHost::poll`] (oldest dropped first).
+pub const COMPONENT_HOST_DEFERRED_MAX_EVENTS: usize = 256;
 
 /// Assembled response for one successful component request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +69,13 @@ pub enum ComponentHostError {
         /// Redacted detail.
         message: String,
     },
+    /// The plugin is not in the `Activated` lifecycle state.
+    PluginNotActive {
+        /// Requesting plugin id.
+        plugin: String,
+        /// Current lifecycle state (`Registered`, `Suspended`, ...).
+        state: String,
+    },
     /// The component did not finish before the Core deadline.
     Timeout,
 }
@@ -94,6 +106,7 @@ impl ComponentHostError {
                 BrokerError::BodyTooLarge => "component_body_too_large",
                 BrokerError::Spawn(_) => "component_spawn_failed",
             },
+            Self::PluginNotActive { .. } => "plugin_not_active",
             Self::RequestFailed { .. } => "component_request_failed",
             Self::Timeout => "component_timeout",
         }
@@ -112,6 +125,10 @@ impl fmt::Display for ComponentHostError {
             }
             Self::Grant(error) => write!(f, "component grant invalid: {error}"),
             Self::Broker(error) => write!(f, "{error}"),
+            Self::PluginNotActive { plugin, state } => write!(
+                f,
+                "component request denied for plugin '{plugin}': state {state} is not Activated"
+            ),
             Self::RequestFailed { kind, message } => {
                 write!(f, "component request failed ({kind:?}): {message}")
             }
@@ -137,6 +154,10 @@ impl From<GrantError> for ComponentHostError {
 /// One Bitty instance's native-component host.
 pub struct ComponentHost {
     broker: ComponentBroker,
+    /// Events for other request ids observed while a synchronous `request`
+    /// waited; handed back by the next `poll`.
+    deferred: VecDeque<BrokerEvent>,
+    deferred_dropped: u64,
 }
 
 impl fmt::Debug for ComponentHost {
@@ -151,7 +172,11 @@ impl ComponentHost {
     /// Host over an already-configured broker.
     #[must_use]
     pub fn new(broker: ComponentBroker) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            deferred: VecDeque::new(),
+            deferred_dropped: 0,
+        }
     }
 
     /// Host over the DIR-030 broker configuration.
@@ -192,9 +217,13 @@ impl ComponentHost {
     /// Submit one request and wait (real time) for its terminal event.
     ///
     /// The wait bound is the broker's effective request timeout plus the
-    /// deadline grace and handshake allowance. The component still enforces
-    /// its own deadline first; this bound only guarantees the caller cannot
-    /// wait forever on a silent process.
+    /// deadline grace and handshake allowance (up to 310 s). This call blocks
+    /// and must never run on the runtime owner/UI thread; use `submit` plus
+    /// `poll` there until an asynchronous delivery surface lands.
+    ///
+    /// Events for other in-flight request ids are retained (bounded) and
+    /// returned by the next [`Self::poll`], so mixing this call with
+    /// non-blocking submitters does not lose their responses.
     pub fn request(
         &mut self,
         component: &str,
@@ -222,6 +251,7 @@ impl ComponentHost {
             let events = self.broker.wait(Instant::now(), wait);
             for event in events {
                 if event.id != id {
+                    self.defer(event);
                     continue;
                 }
                 match event.kind {
@@ -246,9 +276,28 @@ impl ComponentHost {
         }
     }
 
+    fn defer(&mut self, event: BrokerEvent) {
+        if self.deferred.len() >= COMPONENT_HOST_DEFERRED_MAX_EVENTS {
+            let _ = self.deferred.pop_front();
+            self.deferred_dropped = self.deferred_dropped.saturating_add(1);
+        }
+        self.deferred.push_back(event);
+    }
+
     /// Process pending component output and lifecycle policy at `now`.
+    ///
+    /// Events retained by an earlier synchronous [`Self::request`] come
+    /// first, then newly polled events.
     pub fn poll(&mut self, now: Instant) -> Vec<BrokerEvent> {
-        self.broker.poll(now)
+        let mut events: Vec<BrokerEvent> = self.deferred.drain(..).collect();
+        events.extend(self.broker.poll(now));
+        events
+    }
+
+    /// Events dropped from the bounded deferred queue.
+    #[must_use]
+    pub fn deferred_dropped(&self) -> u64 {
+        self.deferred_dropped
     }
 
     /// Diagnostic snapshot for a component this host has used.

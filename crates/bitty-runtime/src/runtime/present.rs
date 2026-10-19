@@ -1807,7 +1807,7 @@ impl Runtime {
         // CTX-1361: drive native-component lifecycle (handshake deadlines,
         // request deadlines, idle stop, crash backoff) on the same owner
         // thread that owns the runtime and its broker.
-        let _ = self.poll_component_events(now);
+        self.pump_component_events(now);
         // CTX-0783: the embedder ticks once per dispatched event batch
         // (`ApplicationHandler::about_to_wait`), which is the boundary a
         // compositor may or may not put the commit and its echoing key in. Age

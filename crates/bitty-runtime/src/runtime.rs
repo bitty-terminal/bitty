@@ -472,6 +472,11 @@ pub struct Runtime {
     /// [`crate::component::ComponentBroker`] and every recorded child, and
     /// [`Runtime::shutdown_with_timeout`] stops them gracefully.
     component_host: Option<crate::component::ComponentHost>,
+    /// Component events polled by `tick_at` and not yet taken by the
+    /// embedder (CTX-1361 F5). Bounded; oldest dropped first.
+    component_events: std::collections::VecDeque<crate::component::BrokerEvent>,
+    /// Events dropped from the bounded component delivery queue.
+    component_events_dropped: u64,
     last_presented_generation: u64,
     /// Per-leaf retained present primitives, keyed by visible [`ViewId`]
     /// (CTX-0386).
@@ -1711,6 +1716,8 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             component_host: None,
+            component_events: std::collections::VecDeque::new(),
+            component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
@@ -1981,6 +1988,8 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             component_host: None,
+            component_events: std::collections::VecDeque::new(),
+            component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,

@@ -28,8 +28,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # calendar components rather than parsing calendar text, so no RFC 2822 string
 # can reach the vulnerable parser. The fix in time 0.3.47 requires rustc 1.88,
 # above the workspace MSRV 1.85; adding a direct dependency-adoption decision
-# is out of scope for CTX-1373. Re-check when the MSRV moves to 1.88: then
-# remove this ignore and raise `time` to >= 0.3.47.
+# is out of scope for CTX-1373. Time bound (P0-AC-034): review by 2027-03-31 or
+# earlier when the MSRV moves to 1.88; then remove this ignore and raise `time`
+# to >= 0.3.47. Any extension needs a dated ADR-0004 revision.
 ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436", "RUSTSEC-2026-0009"]
 
 [bans]

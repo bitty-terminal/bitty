@@ -4,8 +4,9 @@
 //! unsafe to deliver silently requires explicit confirmation. There is no
 //! silent delivery path: `request_paste` stores a pending paste when
 //! inspection triggers and delivery happens only via explicit confirmation —
-//! `confirm_pending_paste(true)`, repeating the identical paste while pending
-//! (CTX-0186: second chord/right-click press with unchanged clipboard), or the
+//! `confirm_pending_paste(true)`, `Enter` while the banner is up (CTX-1372),
+//! repeating the identical paste while pending (CTX-0186: second
+//! chord/right-click press with unchanged clipboard), or the
 //! equivalent bracketed delivery after such confirmation. `Esc` while pending
 //! cancels without delivery and without leaking `Esc` to the PTY. The pending
 //! paste is always visible via `Runtime::pending_paste_summary` (bounded line

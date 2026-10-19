@@ -1854,7 +1854,8 @@ impl TerminalApp {
                 // (line count, byte size, reasons, preview) is logged loudly
                 // with confirm/cancel instructions; repeating the identical
                 // chord with an unchanged clipboard confirms delivery, Esc
-                // cancels.
+                // cancels. CTX-1372: a bare Enter press also confirms through
+                // the runtime's `confirm_pending_paste` seam (identical bytes).
                 match self.runtime.paste_from_clipboard() {
                     Ok(Some(true)) => {
                         let summary = self
@@ -3571,6 +3572,17 @@ mod tests {
             text: None,
             location: bitty_platform::KeyLocation::Standard,
             state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        })
+    }
+
+    fn named_release(named: NamedKey) -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Named(named),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Released,
             repeat: false,
             is_synthetic: false,
         })
@@ -6797,6 +6809,59 @@ claims = []
         assert!(drive_chrome(&mut app, char_press("V", "V", false)));
         assert!(!app.runtime.has_pending_paste());
         assert_eq!(app.runtime.drain_pending_input(), b"line1\nline2");
+    }
+
+    #[test]
+    fn paste_pending_enter_confirms_once_without_cr_leak() {
+        // CTX-1372: Enter confirms the banner through the same runtime seam
+        // as paste-again. It is not chrome-bound, so the press falls through
+        // the intercept into `Runtime::handle_key_event`, which consumes it
+        // and delivers only the pending bytes.
+        let mut app = paste_test_app("line1\nline2");
+        app.runtime.set_layout(two_pane_layout());
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        // Drop the chord's modifier latch and release so Enter is a plain
+        // press (the runtime accept gesture, not a remapped chord).
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
+        assert!(!app.runtime.has_pending_paste());
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"line1\nline2",
+            "exactly the pending paste bytes, no CR leak"
+        );
+        assert_eq!(app.runtime.leaf_count(), 2, "layout untouched");
+        // Release is byte-free.
+        assert!(!drive_chrome(&mut app, named_release(NamedKey::Enter)));
+        assert!(app.runtime.drain_pending_input().is_empty());
+        // No gate now: Enter keeps its ordinary single-CR binding.
+        assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
+        assert_eq!(app.runtime.drain_pending_input(), b"\r");
+        assert!(!drive_chrome(&mut app, named_release(NamedKey::Enter)));
+    }
+
+    #[test]
+    fn paste_pending_enter_matches_paste_again_bytes() {
+        // Acceptance pin (CTX-1372): the Enter path and the paste-again
+        // path deliver identical bytes for the same gated clipboard.
+        let text = "alpha\nbeta";
+        let mut via_enter = paste_test_app(text);
+        press_paste_chord(&mut via_enter);
+        assert!(via_enter.runtime.has_pending_paste());
+        assert!(!drive_chrome(&mut via_enter, named_press(NamedKey::Enter)));
+        let enter_bytes = via_enter.runtime.drain_pending_input();
+
+        let mut via_repeat = paste_test_app(text);
+        press_paste_chord(&mut via_repeat);
+        assert!(via_repeat.runtime.has_pending_paste());
+        assert!(!drive_chrome(&mut via_repeat, char_release("V")));
+        assert!(drive_chrome(&mut via_repeat, char_press("V", "V", false)));
+        let repeat_bytes = via_repeat.runtime.drain_pending_input();
+        assert_eq!(enter_bytes, repeat_bytes);
+        assert_eq!(enter_bytes, text.as_bytes());
     }
 
     #[test]

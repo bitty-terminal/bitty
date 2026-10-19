@@ -495,11 +495,11 @@ fn ctx0186_multiline_chord_paste_is_visible_and_repeat_confirms() {
         "CTX-0369: a normal multi-line paste must not be labelled a C0 control: {summary:?}"
     );
     assert!(
-        summary.contains("paste again to confirm"),
+        summary.contains("Enter to confirm"),
         "summary must name the confirm gesture: {summary:?}"
     );
     assert!(
-        summary.contains("Esc cancels"),
+        summary.contains("Esc to cancel"),
         "summary must name the cancel gesture: {summary:?}"
     );
     // Explicit repeat of the identical paste confirms and delivers.
@@ -563,6 +563,146 @@ fn ctx0186_esc_cancels_pending_without_delivery_or_esc_leak() {
     );
     assert!(!rt.has_pending_paste());
     assert_eq!(rt.pending_input(), b"", "cancel must not deliver");
+}
+
+// ── CTX-1372: Enter confirms the pending paste ────────────────────────
+
+fn enter_key(state: bitty_platform::PressState) -> bitty_platform::KeyEvent {
+    use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey};
+    KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Enter),
+        text: None,
+        location: KeyLocation::Standard,
+        state,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+#[test]
+fn ctx1372_enter_confirms_with_identical_bytes_to_paste_again() {
+    use bitty_platform::PressState;
+    let text = "line1\nline2";
+
+    // Reference path: repeating the identical paste confirms.
+    let mut repeat = make_runtime();
+    repeat.clipboard_mut().set_text(text.to_string()).unwrap();
+    repeat.drain_pending_input();
+    assert!(repeat.paste_from_clipboard().unwrap().unwrap());
+    assert!(!repeat.paste_from_clipboard().unwrap().unwrap());
+    assert!(!repeat.has_pending_paste());
+    let repeat_bytes = repeat.pending_input().to_vec();
+
+    // Enter path: same confirmation seam, no extra CR behind the gate.
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text(text.to_string()).unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"", "no silent delivery");
+    assert_eq!(
+        rt.handle_key_event(enter_key(PressState::Pressed)),
+        None,
+        "confirming Enter is consumed, never PTY input"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(
+        rt.pending_input(),
+        text.as_bytes(),
+        "exactly the pending paste bytes, no trailing CR"
+    );
+    assert_eq!(
+        rt.pending_input(),
+        repeat_bytes.as_slice(),
+        "Enter and paste-again must deliver identical bytes"
+    );
+    // The release produces nothing either.
+    assert_eq!(rt.handle_key_event(enter_key(PressState::Released)), None);
+    assert_eq!(rt.pending_input(), text.as_bytes());
+
+    // Gate consumed: a second Enter is the ordinary CR, exactly once.
+    assert_eq!(
+        rt.handle_key_event(enter_key(PressState::Pressed)),
+        Some(b"\r".to_vec())
+    );
+    assert_eq!(rt.pending_input(), b"line1\nline2\r");
+}
+
+#[test]
+fn ctx1372_enter_with_no_pending_paste_is_unchanged() {
+    use bitty_platform::PressState;
+    let mut rt = make_runtime();
+    rt.drain_pending_input();
+    assert_eq!(
+        rt.handle_key_event(enter_key(PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "no gate: Enter keeps its normal CR encoding"
+    );
+    assert_eq!(rt.pending_input(), b"\r");
+}
+
+#[test]
+fn ctx1372_every_trigger_class_still_requires_the_gate() {
+    use bitty_platform::PressState;
+    // Every P0-AC-008 class still holds the paste pending (no silent
+    // delivery) and only Enter/confirm releases it.
+    let cases: &[(&str, &str)] = &[
+        ("a\0b", "NUL"),
+        ("a\x1bb", "ESC"),
+        ("a\rb", "CR"),
+        ("a\nb", "newline"),
+        ("a\x07b", "C0"),
+        ("a\u{0080}b", "unicode-control"),
+        ("a\u{202E}b", "bidi"),
+    ];
+    for (text, reason) in cases {
+        let mut rt = make_runtime();
+        rt.clipboard_mut().set_text((*text).to_string()).unwrap();
+        rt.drain_pending_input();
+        assert!(
+            rt.paste_from_clipboard().unwrap().unwrap(),
+            "{reason}: paste must need confirmation"
+        );
+        assert!(rt.has_pending_paste(), "{reason}: must stay pending");
+        assert_eq!(rt.pending_input(), b"", "{reason}: no silent delivery");
+        assert_eq!(
+            rt.handle_key_event(enter_key(PressState::Pressed)),
+            None,
+            "{reason}: Enter is consumed by the gate"
+        );
+        assert!(!rt.has_pending_paste(), "{reason}: Enter clears the gate");
+        assert_eq!(rt.pending_input(), text.as_bytes(), "{reason}: exact bytes");
+    }
+}
+
+#[test]
+fn ctx1372_esc_still_cancels_even_with_enter_available() {
+    use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text("one\ntwo".to_string()).unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert_eq!(
+        rt.handle_key_event(KeyEvent {
+            logical_key: LogicalKey::Named(NamedKey::Escape),
+            text: None,
+            location: KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        }),
+        None,
+        "Esc cancel stays consumed"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"", "Esc must not deliver");
+    // After the cancel, Enter is normal input again (no stale gate).
+    assert_eq!(
+        rt.handle_key_event(enter_key(PressState::Pressed)),
+        Some(b"\r".to_vec())
+    );
+    assert_eq!(rt.pending_input(), b"\r");
 }
 
 #[test]
@@ -670,11 +810,11 @@ fn ctx0192_pending_summary_is_compact_single_line_bounded() {
         "normal multi-line paste is not a C0 control: {summary:?}"
     );
     assert!(
-        summary.contains("paste again to confirm"),
+        summary.contains("Enter to confirm"),
         "banner names the confirm gesture: {summary:?}"
     );
     assert!(
-        summary.contains("Esc cancels"),
+        summary.contains("Esc to cancel"),
         "banner names the cancel gesture: {summary:?}"
     );
     // Long hostile paste stays bounded too.

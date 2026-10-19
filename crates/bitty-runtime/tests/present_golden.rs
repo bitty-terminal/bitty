@@ -36,6 +36,10 @@
 //! The digests were re-recorded under CTX-0838 (#1441): the lone-workspace
 //! in-grid status bar never presents (compositor already shows it), so every
 //! single-workspace frame in this matrix carries no bar row.
+//!
+//! The paste-banner digests were re-recorded under CTX-1372 (#2265): the full
+//! summary and collapsed flash now name `Enter` as the confirm gesture
+//! alongside `Esc` as cancel.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -170,7 +174,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(false),
         "banner must still be in the full phase"
     );
-    assert_digest("paste_full", &rt, &full, 0xb5e8_4cca_54ec_82ad);
+    assert_digest("paste_full", &rt, &full, 0x3f31_5b86_7c46_0139);
     // Issue #1438 (CTX-0843): the paste-confirm timeout (default 30s) is
     // shorter than PASTE_BANNER_FULL_DURATION + 30s, so the timer cancels
     // the pending paste first. Test the collapse at full-duration + 1s
@@ -182,7 +186,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(true),
         "banner must have collapsed to the flash"
     );
-    assert_digest("paste_flash", &rt, &flash, 0x86c7_ec16_7061_ec42);
+    assert_digest("paste_flash", &rt, &flash, 0x68bc_ba92_6035_7fc8);
     assert!(
         rt.tick_at(flash_at + Duration::from_millis(200)).is_none(),
         "banner phase is steady -> idle"

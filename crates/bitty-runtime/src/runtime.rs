@@ -357,10 +357,11 @@ pub const PASTE_BANNER_FULL_DURATION: std::time::Duration = std::time::Duration:
 
 /// Auto-cancel timeout for pending paste confirmation (issue #1438).
 ///
-/// A gated paste that has not been confirmed (by repeating the paste gesture)
-/// or cancelled (via Esc) within this duration is automatically cancelled.
-/// This prevents indefinite paste-pending state and provides a bounded UX.
-/// Default is 30 seconds; configurable via runtime config.
+/// A gated paste that has not been confirmed (`Enter` while the banner is up,
+/// or repeating the paste gesture) or cancelled (via Esc) within this duration
+/// is automatically cancelled. This prevents indefinite paste-pending state
+/// and provides a bounded UX. Default is 30 seconds; configurable via runtime
+/// config.
 pub const DEFAULT_PASTE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Maximum time presentation defers frames while synchronized updates
@@ -377,10 +378,10 @@ pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
 ///
-/// CTX-0369: wording names the confirm gesture in plain language. Repeating
-/// the paste (the chord or right-click gesture that armed the gate) is the
-/// confirm action; `Esc` cancels.
-pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (paste again to confirm, Esc cancels)";
+/// CTX-0369: wording names the confirm gesture in plain language. `Enter`
+/// (CTX-1372) or repeating the paste (the chord or right-click gesture that
+/// armed the gate) confirms; `Esc` cancels.
+pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (Enter to confirm, Esc to cancel)";
 
 /// Plugin-mounted chrome bands per edge (CTX-0890, part of #1431).
 ///

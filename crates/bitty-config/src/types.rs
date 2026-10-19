@@ -2710,10 +2710,10 @@ impl TerminalConfig {
 /// (CTX-1352, issue #2247).
 ///
 /// Both switches default to `false`: nothing terminal-derived enters the
-/// bounded in-memory history ring until the user opts in. A disabled switch
-/// serves an empty page, never a typed capture denial, because the provider
-/// itself is available and the gate remains authoritative for grants,
-/// scopes, safe mode, bounds, and budgets.
+/// bounded in-memory history ring until the user opts in. A disabled
+/// transcript switch keeps the source available but makes the gate deny with
+/// the accepted `E_HISTORY_CAPTURE_DISABLED` category; the gate remains
+/// authoritative for grants, scopes, safe mode, bounds, and budgets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistoryConfig {
     /// Capture switches for the terminal-derived sources.

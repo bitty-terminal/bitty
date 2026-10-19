@@ -2774,7 +2774,8 @@ impl HostServices for PluginServices {
         // implementation (command history today). That is typed
         // unavailability for that source only, never a fabricated empty
         // page. Capture opt-in is a separate axis handled by the gate: an
-        // available transcript with capture disabled serves an empty page.
+        // available transcript with capture disabled denies with
+        // E_HISTORY_CAPTURE_DISABLED.
         if !provider.source_available(core_source) {
             return Err(history_unavailable());
         }
@@ -8552,20 +8553,20 @@ mod history_tests {
     }
 
     #[test]
-    fn live_transcript_capture_off_serves_empty_page_not_denial() {
+    fn live_transcript_capture_off_denies_capture_disabled() {
         let services = services();
         grant(&services, HistoryQuerySource::Transcript);
         services.set_history_provider(Some(Rc::new(
             crate::plugin_runtime::history::TranscriptHistory::new(false, false),
         )));
-        let page = services
+        let error = services
             .history_query(
                 HistoryQuerySource::Transcript,
                 &request(HistoryQueryOp::List),
             )
-            .expect("capture off is an empty page for the live provider");
-        assert_eq!(page.get("ok"), Some(&LuaValue::Bool(true)));
-        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(0)));
+            .expect_err("capture off must deny with the taxonomy category");
+        assert_eq!(error.code, "E_HISTORY_CAPTURE_DISABLED");
+        assert!(!error.message.contains("transcript"));
     }
 
     #[test]

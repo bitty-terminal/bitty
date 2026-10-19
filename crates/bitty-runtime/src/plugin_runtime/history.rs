@@ -85,7 +85,8 @@ pub trait HistoryProvider {
     /// tracked). That source denies with the typed
     /// `E_HISTORY_UNAVAILABLE`; it is never served as a fabricated empty
     /// page. Capture opt-in is a separate axis: an available transcript
-    /// source with capture disabled is an empty page, not a denial.
+    /// source with capture disabled denies with the accepted
+    /// `E_HISTORY_CAPTURE_DISABLED` taxonomy category.
     fn source_available(&self, _source: HistorySource) -> bool {
         true
     }
@@ -212,13 +213,14 @@ impl BoundedHistory {
 /// redacted in-memory ring. There is no persistence, PTY hook, streaming, or
 /// cursor: callers ask for a point-in-time page through the Core gate.
 ///
-/// Capture is opt-in by configuration. When the opt-in is off the provider
-/// still answers with a successful empty page (the owner directive for this
-/// slice); the gate remains authoritative for grants, scopes, safe mode,
-/// bounds, and budgets. Command history has no backing source yet (the
-/// terminal tracks OSC 133 boundaries but not submitted command spans), so it
-/// denies with the typed `E_HISTORY_UNAVAILABLE` instead of inventing rows.
-/// KV stays unavailable in this slice for the same reason.
+/// Capture is opt-in by configuration and defaults off. When the opt-in is
+/// off, the transcript source remains available but the gate denies with the
+/// accepted `E_HISTORY_CAPTURE_DISABLED` category; no rows are captured. The
+/// gate remains authoritative for grants, scopes, safe mode, bounds, and
+/// budgets. Command history has no backing source yet (the terminal tracks
+/// OSC 133 boundaries but not submitted command spans), so it denies with the
+/// typed `E_HISTORY_UNAVAILABLE` instead of inventing rows. KV stays
+/// unavailable in this slice for the same reason.
 #[derive(Debug)]
 pub struct TranscriptHistory {
     history: BoundedHistory,
@@ -320,11 +322,17 @@ impl HistoryProvider for TranscriptHistory {
         self.history.snapshot()
     }
 
-    /// Terminal capture opt-ins do not gate availability for this provider:
-    /// a disabled setting yields an empty page. The rows themselves only
-    /// enter the ring while capture is enabled.
+    /// Terminal capture opt-ins gate the gate's capture check. With the
+    /// transcript opt-in off the source stays available (`source_available`
+    /// is true) but this returns false, so the gate denies with the accepted
+    /// `E_HISTORY_CAPTURE_DISABLED` category instead of serving an empty
+    /// page. Rows only enter the ring while capture is enabled.
     fn capture_enabled(&self, source: HistorySource) -> bool {
-        matches!(source, HistorySource::Transcript)
+        match source {
+            HistorySource::Transcript => self.capture_transcript,
+            HistorySource::CommandHistory => self.capture_commands,
+            HistorySource::PluginKv => true,
+        }
     }
 
     fn source_available(&self, source: HistorySource) -> bool {
@@ -699,13 +707,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_off_serves_an_available_empty_snapshot() {
+    fn capture_off_keeps_the_source_available_but_disables_capture() {
         let provider = TranscriptHistory::new(false, false);
         let state = state_with_lines(30);
         assert_eq!(provider.capture_state(&state, "1", "7"), 0);
         let snapshot = provider.snapshot().expect("provider is available");
         assert!(snapshot.is_empty());
-        assert!(provider.capture_enabled(HistorySource::Transcript));
+        assert!(provider.source_available(HistorySource::Transcript));
+        assert!(!provider.capture_enabled(HistorySource::Transcript));
     }
 
     #[test]
@@ -797,8 +806,10 @@ mod tests {
     fn command_history_reports_typed_unavailability_while_transcript_serves() {
         let provider = TranscriptHistory::new(true, true);
         assert!(provider.source_available(HistorySource::Transcript));
+        // Configured capture does not make an unimplemented source
+        // available: command history still denies typed-unavailable.
+        assert!(provider.capture_enabled(HistorySource::CommandHistory));
         assert!(!provider.source_available(HistorySource::CommandHistory));
-        assert!(!provider.capture_enabled(HistorySource::CommandHistory));
         assert!(!provider.source_available(HistorySource::PluginKv));
         assert!(provider.capture_commands());
     }

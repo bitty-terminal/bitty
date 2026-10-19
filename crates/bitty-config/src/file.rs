@@ -154,9 +154,10 @@
 //!   booleans opt the bounded in-memory plugin history ring into
 //!   terminal-derived capture; an absent table means "this layer says
 //!   nothing", and wrong shapes/unknown keys fail closed with the field path.
-//!   A disabled transcript opt-in serves an empty page, never a capture
-//!   denial; command history remains typed-unavailable until submitted
-//!   command spans are tracked.
+//!   A disabled transcript opt-in keeps the source available but denies with
+//!   the accepted `E_HISTORY_CAPTURE_DISABLED` category; capture defaults to
+//!   `false`, so users must opt in for a real transcript. Command history
+//!   remains typed-unavailable until submitted command spans are tracked.
 //!   `layout` follows the same fully-optional pattern: absent table/key means
 //!   "this layer says nothing"; when the table is present, omitted keys
 //!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,

@@ -110,13 +110,25 @@ fn paste_banner_dismissal_repaints_the_underlying_row() {
     assert!(armed.request_paste("one\ntwo".to_string()));
     let _ = armed.tick().expect("banner frame presents");
     assert!(armed.has_pending_paste());
-    assert!(armed.confirm_pending_paste(true));
-    let _ = armed.tick().expect("dismissal frame presents");
 
     // Reference: identical PTY state, banner never armed.
     let mut plain = runtime();
     plain.handle_pty_bytes(b"\x1b[24;1H> ready");
     let _ = plain.tick();
+
+    // Non-vacuous oracle: the armed frame must actually differ from the
+    // never-armed frame *before* dismissal. `has_pending_paste()` is state,
+    // not pixels, and `tick()` returning stats only proves a frame presented;
+    // without this check the equality below would also hold if the banner
+    // never painted at all.
+    assert_ne!(
+        armed.headless_rgba(),
+        plain.headless_rgba(),
+        "arming the paste must paint the confirmation banner"
+    );
+
+    assert!(armed.confirm_pending_paste(true));
+    let _ = armed.tick().expect("dismissal frame presents");
 
     assert_eq!(
         armed.headless_rgba(),

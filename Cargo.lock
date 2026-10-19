@@ -263,8 +263,12 @@ name = "bitty-platform"
 version = "0.0.24"
 dependencies = [
  "arboard",
+ "clipboard-win",
+ "nix 0.31.3",
  "raw-window-handle",
  "winit",
+ "wl-clipboard-rs",
+ "x11rb",
 ]
 
 [[package]]

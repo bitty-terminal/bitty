@@ -44,6 +44,30 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 # pinned and re-exported; see crate-level ownership rules and src/surface.rs.
 raw-window-handle = "=0.6.2"
 
+# CTX-1315 (R-004): bounded Wayland text acquisition lives in
+# `src/clipboard_bounded.rs`. `wl-clipboard-rs` and `nix` are already in the
+# lockfile (the former transitively through `arboard 3.6.1` at 0.9.3, the
+# latter through the PTY/runtime crates), so this declares the direct surface
+# the bound needs without adding or upgrading a crate version. The direct
+# import exists because `arboard` exposes no bounded or deadline-aware read;
+# its own private Wayland module is not copied. X11/Windows/macOS stay on the
+# `arboard` path and are recorded as residual in the module docs.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dependencies]
+wl-clipboard-rs = "0.9"
+nix = { workspace = true, features = ["poll"] }
+# CTX-1366: bounded X11 acquisition replaces the unbounded `arboard` property /
+# INCR read. `x11rb` 0.13.2 is already in the lockfile through `arboard` and
+# `winit`, so this declares the direct surface the bounded client needs without
+# adding or upgrading a crate version.
+x11rb = { version = "0.13", default-features = false }
+
+# CTX-1366: bounded Windows read uses the safe `clipboard-win::raw` wrappers
+# (`size` is `GlobalSize` before any copy; `get` copies into a caller-sized
+# slice). The crate is already in the lockfile through `arboard 3.6.1` at
+# 5.4.1.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "5.4", features = ["std"] }
+
 
 [[test]]
 name = "headless_run"

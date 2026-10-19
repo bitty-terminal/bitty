@@ -41,6 +41,31 @@
 //!   used by the paste and OSC 52 reply seams, clip an over-limit system
 //!   value at a UTF-8 char boundary instead of rejecting it, so an oversized
 //!   clipboard never pastes (or answers) nothing (CTX-0478 review).
+//! - Native text acquisition is bounded **before** the foreign value is
+//!   materialized on every implemented desktop path (CTX-1315/CTX-1366 /
+//!   R-004):
+//!   - **Linux Wayland**: the data-control transfer pipe is consumed
+//!     incrementally under one absolute monotonic deadline, with a fixed
+//!     `CLIPBOARD_MAX_BYTES + 4` native window and a typed fail-closed error
+//!     (`PlatformError::ClipboardAcquisitionTimeout` for the deadline);
+//!   - **Linux X11**: a dedicated `x11rb` client requests at most the ceiling
+//!     (rounded to one four-byte X11 unit), caps INCR accumulation, and
+//!     rejects an over-cap property with `PlatformError::ClipboardPayloadTooLarge`
+//!     instead of delivering a partial value;
+//!   - **Windows**: `GlobalSize` is checked before the `CF_UNICODETEXT` copy,
+//!     an allocation above `2 * (CLIPBOARD_MAX_BYTES + 2)` bytes is rejected
+//!     without materializing, and the bounded UTF-16 scan stops at the NUL
+//!     terminator;
+//!   - **macOS**: AppKit exposes no caller byte bound, so text reads are
+//!     refused with `PlatformError::ClipboardUnavailable` rather than
+//!     materializing the pasteboard value. Writes keep working.
+//!
+//!   The Linux read funnel has **no** unbounded `arboard` fallback; a Wayland
+//!   setup failure may only fall back to the bounded X11 client. See
+//!   [`CLIPBOARD_MAX_BYTES`] and the `clipboard_bounded`, `clipboard_x11`,
+//!   `clipboard_windows`, and `clipboard_limits` module docs for the exact
+//!   residual (setup roundtrips, native object existence, and foreign-server
+//!   allocations are outside these in-process windows).
 //! - The secondary selection is never used: it is unavailable on Wayland and
 //!   returns an error there by design.
 //!
@@ -79,18 +104,56 @@ use crate::error::PlatformError;
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
 ))]
-use arboard::{ClearExtLinux, GetExtLinux, LinuxClipboardKind, SetExtLinux};
+use arboard::{ClearExtLinux, LinuxClipboardKind, SetExtLinux};
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use crate::clipboard_bounded::{WaylandSelection, try_read_wayland_text};
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use crate::clipboard_limits::AcquisitionError;
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    )
+))]
+use crate::clipboard_limits::platform_error;
+#[cfg(windows)]
+use crate::clipboard_windows::try_read_windows_text;
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use crate::clipboard_x11::{X11Selection, try_read_x11_text};
 
 /// Maximum bytes allowed for a clipboard payload (mirrors
 /// `BoundedBytes::MAX_LEN` / `CLIPBOARD_MAX_PAYLOAD_BYTES` = 4096 plus a
 /// small slack for paste verification). Writes are rejected before any
 /// `arboard` call, so an over-limit write never reaches the OS.
 ///
-/// Scope (R-004 residual): this is a post-acquisition retained/inspection
-/// bound, not a strict peak-memory bound. A native read materializes the
-/// OS-provided `String` first and the bounded accessors clip afterwards, so
-/// only retained/inspected/pasted/answered bytes are capped. See the
-/// [`Clipboard`] type docs.
+/// Scope (R-004): this is the retained/inspected/pasted/answered bound and,
+/// on every implemented acquisition path, also the acquisition ceiling:
+///
+/// - **Linux Wayland** retains at most `CLIPBOARD_MAX_BYTES + 4` native bytes
+///   and never materializes the complete foreign value (`clipboard_bounded`);
+/// - **Linux X11** requests at most the ceiling (rounded to one four-byte X11
+///   unit) and rejects a larger property or INCR accumulation with a typed
+///   error (`clipboard_x11`);
+/// - **Windows** rejects a `CF_UNICODETEXT` allocation above
+///   `2 * (CLIPBOARD_MAX_BYTES + 2)` bytes before copying and scans at most
+///   that window (`clipboard_windows`);
+/// - **macOS** text reads are refused with a typed error because AppKit
+///   exposes no caller byte bound (see [`Clipboard::get_text`]).
+///
+/// These are in-process owned-memory bounds, not a bound on the foreign
+/// producer, compositor, X server, or pre-acquisition native framework
+/// allocation. See the [`Clipboard`] type docs.
 pub const CLIPBOARD_MAX_BYTES: usize = 8192;
 
 /// Whether a Wayland display is advertised via `WAYLAND_DISPLAY`.
@@ -134,13 +197,16 @@ pub fn display_backend_hint() -> &'static str {
 /// a second buffer and synced best-effort on Linux. See the module docs for
 /// the exact sync and error contract.
 ///
-/// Bound scope (R-004 residual): [`CLIPBOARD_MAX_BYTES`] is a
-/// post-acquisition retained/inspection bound, not a strict peak-memory
-/// bound. Native reads materialize the OS-provided `String` before the
-/// bounded accessors clip it, so a hostile clipboard can transiently exceed
-/// the cap in memory; what is retained, inspected, pasted, or answered is
-/// always within the cap. Whether the last bounded read clipped is
-/// observable via [`Self::last_bounded_read_truncated`].
+/// Bound scope (R-004 residual): [`CLIPBOARD_MAX_BYTES`] is the
+/// retained/inspected/pasted bound and also the acquisition ceiling on the
+/// implemented desktop paths (CTX-1366): Linux Wayland and X11 and Windows
+/// never retain more than their fixed native window; macOS text reads are
+/// refused instead of materializing the pasteboard value. These are
+/// in-process owned-memory bounds; the foreign producer's object, the
+/// compositor/X server, and pre-acquisition native framework allocations are
+/// outside them. Whether the last bounded read clipped is observable via
+/// [`Self::last_bounded_read_truncated`]; X11 and Windows over-cap reads fail
+/// with `PlatformError::ClipboardPayloadTooLarge` rather than clipping.
 pub struct Clipboard {
     inner: Option<arboard::Clipboard>,
     headless_buf: String,
@@ -174,6 +240,70 @@ impl std::fmt::Debug for Clipboard {
             .field("headless_reason", &self.headless_reason())
             .finish()
     }
+}
+
+/// Result of a bounded native transfer (`clipboard_bounded`, CTX-1315).
+///
+/// `Complete` means the producer reached EOF within the ceiling. `Truncated`
+/// means the ceiling (or a byte beyond it) was observed first: the prefix is
+/// the longest valid UTF-8 value at or below [`CLIPBOARD_MAX_BYTES`], and
+/// `observed_len` is the number of native bytes actually read — a lower bound
+/// on the foreign payload, never its full length.
+///
+/// Defined here (not in `clipboard_bounded`) so the read funnel and its bound
+/// decision compile on every platform; only Linux Wayland produces it, so the
+/// variants are intentionally unconstructed elsewhere.
+#[cfg_attr(
+    not(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    )),
+    allow(dead_code)
+)]
+#[derive(Debug)]
+pub(crate) enum BoundedText {
+    Complete(String),
+    Truncated { prefix: String, observed_len: usize },
+}
+
+impl BoundedText {
+    /// Total UTF-8 bytes retained (always within the configured ceiling).
+    ///
+    /// Used only by the Linux-only acquisition tests; gated with the same
+    /// target condition so cross-target `--all-targets` builds stay
+    /// warning-free (CTX-1315 review F3).
+    #[cfg(all(
+        test,
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ))]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Complete(text) => text.len(),
+            Self::Truncated { prefix, .. } => prefix.len(),
+        }
+    }
+}
+
+/// Raw result of the read funnel before the Bitty-owned bound is applied.
+///
+/// The funnel deliberately distinguishes values that already exist in memory
+/// (headless buffer or the simulated test seam) from a native acquisition
+/// that was bounded *while reading*. The former are measured after the fact
+/// exactly as before; the latter never materialized more than the accepted
+/// window, so only the observed lower bound is known.
+#[cfg_attr(
+    not(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    )),
+    allow(dead_code)
+)]
+enum RawText {
+    /// Complete in-memory value; the post-acquisition bound applies.
+    InMemory(String),
+    /// Bounded native acquisition result (`clipboard_bounded`).
+    Bounded(BoundedText),
 }
 
 impl Clipboard {
@@ -402,27 +532,45 @@ impl Clipboard {
     }
 
     /// Reads text from the regular clipboard, bounded by
-    /// [`CLIPBOARD_MAX_BYTES`] after the system call. When headless, returns
-    /// the buffer contents.
+    /// [`CLIPBOARD_MAX_BYTES`] during acquisition on Linux and Windows. When
+    /// headless, returns the buffer contents.
     ///
     /// # Errors
     ///
     /// When a system clipboard is present and the read fails, returns
-    /// `PlatformError::ClipboardOperation`; an over-limit system value is
-    /// rejected with `PlatformError::ClipboardPayloadTooLarge` instead of
-    /// being truncated. Paste and reply seams that must stay total use
-    /// [`Self::get_text_bounded`], which clips instead of rejecting. A
-    /// headless handle with no simulated system read never fails. There is
-    /// no silent fallback to the primary selection: use
-    /// [`Self::get_primary`] explicitly or [`Self::get_text_lossy`] for
-    /// best-effort reads.
+    /// `PlatformError::ClipboardOperation`; a bounded native acquisition that
+    /// exceeds its deadline returns
+    /// `PlatformError::ClipboardAcquisitionTimeout`; an over-limit system
+    /// value is rejected with `PlatformError::ClipboardPayloadTooLarge`
+    /// instead of being truncated. Paste and reply seams that must stay total
+    /// use [`Self::get_text_bounded`], which clips a Wayland or in-memory
+    /// over-limit value instead of rejecting it (X11 and Windows report the
+    /// typed rejection because their bounded read does not retain a partial
+    /// value). On macOS every native read returns
+    /// `PlatformError::ClipboardUnavailable`: AppKit exposes no caller byte
+    /// bound, so Bitty refuses rather than materialize an unbounded pasteboard
+    /// value; writes and headless/test handles are unaffected. A headless
+    /// handle with no simulated system read never fails. There is no silent
+    /// fallback to the primary selection: use [`Self::get_primary`] explicitly
+    /// or [`Self::get_text_lossy`] for best-effort reads.
     pub fn get_text(&mut self) -> Result<String, PlatformError> {
-        let text = self
-            .read_text_raw()
-            .map_err(PlatformError::ClipboardOperation)?;
-        ensure_within_limit(text.len())?;
-        self.headless_buf = text.clone();
-        Ok(text)
+        match self.read_text_raw()? {
+            RawText::InMemory(text) => {
+                ensure_within_limit(text.len())?;
+                self.headless_buf = text.clone();
+                Ok(text)
+            }
+            RawText::Bounded(BoundedText::Complete(text)) => {
+                self.headless_buf = text.clone();
+                Ok(text)
+            }
+            RawText::Bounded(BoundedText::Truncated { observed_len, .. }) => {
+                Err(PlatformError::ClipboardPayloadTooLarge {
+                    len: observed_len,
+                    max: CLIPBOARD_MAX_BYTES,
+                })
+            }
+        }
     }
 
     /// Reads text from the primary selection (middle-click /
@@ -434,16 +582,29 @@ impl Clipboard {
     /// # Errors
     ///
     /// When a system clipboard is present and the primary read fails, returns
-    /// `PlatformError::ClipboardOperation`; an over-limit system value is
-    /// rejected with `PlatformError::ClipboardPayloadTooLarge` instead of
-    /// being truncated.
+    /// `PlatformError::ClipboardOperation`; a bounded native acquisition that
+    /// exceeds its deadline returns
+    /// `PlatformError::ClipboardAcquisitionTimeout`; an over-limit system
+    /// value is rejected with `PlatformError::ClipboardPayloadTooLarge`
+    /// instead of being truncated.
     pub fn get_primary(&mut self) -> Result<String, PlatformError> {
-        let text = self
-            .read_primary_raw()
-            .map_err(PlatformError::ClipboardOperation)?;
-        ensure_within_limit(text.len())?;
-        self.primary_buf = text.clone();
-        Ok(text)
+        match self.read_primary_raw()? {
+            RawText::InMemory(text) => {
+                ensure_within_limit(text.len())?;
+                self.primary_buf = text.clone();
+                Ok(text)
+            }
+            RawText::Bounded(BoundedText::Complete(text)) => {
+                self.primary_buf = text.clone();
+                Ok(text)
+            }
+            RawText::Bounded(BoundedText::Truncated { observed_len, .. }) => {
+                Err(PlatformError::ClipboardPayloadTooLarge {
+                    len: observed_len,
+                    max: CLIPBOARD_MAX_BYTES,
+                })
+            }
+        }
     }
 
     /// Bounded regular-clipboard read for the paste and OSC 52 reply seams.
@@ -452,23 +613,33 @@ impl Clipboard {
     /// is clipped at a UTF-8 char boundary within [`CLIPBOARD_MAX_BYTES`]
     /// instead of failing with [`PlatformError::ClipboardPayloadTooLarge`]:
     /// a large clipboard pastes its bounded prefix instead of pasting nothing
-    /// (CTX-0478 review). The result is always at most
-    /// [`CLIPBOARD_MAX_BYTES`] bytes; the runtime paste gate re-applies its
-    /// own char-boundary bound before inspection and delivery.
+    /// (CTX-0478 review). On Linux Wayland the clip happens during
+    /// acquisition (no complete materialization); an in-memory or simulated
+    /// value is clipped after the fact. Linux X11 and Windows report the typed
+    /// over-limit rejection instead of a prefix (CTX-1366), and macOS refuses
+    /// the native read. The result is always at most
+    /// [`CLIPBOARD_MAX_BYTES`] bytes; the runtime paste gate re-applies its own
+    /// char-boundary bound before inspection and delivery.
     ///
     /// # Errors
     ///
     /// When a system clipboard is present and the read fails, returns
-    /// `PlatformError::ClipboardOperation`.
+    /// `PlatformError::ClipboardOperation`, `PlatformError::ClipboardUnavailable`
+    /// (macOS refusal), or, for an expired bounded acquisition,
+    /// `PlatformError::ClipboardAcquisitionTimeout`. No text is returned on
+    /// failure, so the paste seam delivers no input.
     ///
     /// Records whether the value was clipped in
     /// [`Self::last_bounded_read_truncated`].
     pub fn get_text_bounded(&mut self) -> Result<String, PlatformError> {
-        let text = self
-            .read_text_raw()
-            .map_err(PlatformError::ClipboardOperation)?;
-        let truncated = text.len() > CLIPBOARD_MAX_BYTES;
-        let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        let (text, truncated) = match self.read_text_raw()? {
+            RawText::InMemory(text) => {
+                let truncated = text.len() > CLIPBOARD_MAX_BYTES;
+                (truncate_to_bytes(text, CLIPBOARD_MAX_BYTES), truncated)
+            }
+            RawText::Bounded(BoundedText::Complete(text)) => (text, false),
+            RawText::Bounded(BoundedText::Truncated { prefix, .. }) => (prefix, true),
+        };
         self.bounded_read_truncated = truncated;
         self.headless_buf = text.clone();
         Ok(text)
@@ -476,24 +647,30 @@ impl Clipboard {
 
     /// Bounded primary-selection read for the middle-click paste seam.
     ///
-    /// Identical to [`Self::get_primary`] except that an over-limit system
-    /// value is clipped at a UTF-8 char boundary within
+    /// Identical to [`Self::get_primary`] except that an over-limit Wayland
+    /// system value is clipped at a UTF-8 char boundary within
     /// [`CLIPBOARD_MAX_BYTES`] instead of failing with
-    /// [`PlatformError::ClipboardPayloadTooLarge`] (CTX-0478 review).
+    /// [`PlatformError::ClipboardPayloadTooLarge`] (CTX-0478 review). The X11
+    /// primary read reports the typed over-limit rejection instead of a
+    /// prefix (CTX-1366).
     ///
     /// # Errors
     ///
     /// When a system clipboard is present and the read fails, returns
-    /// `PlatformError::ClipboardOperation`.
+    /// `PlatformError::ClipboardOperation` or
+    /// `PlatformError::ClipboardAcquisitionTimeout`.
     ///
     /// Records whether the value was clipped in
     /// [`Self::last_bounded_read_truncated`].
     pub fn get_primary_bounded(&mut self) -> Result<String, PlatformError> {
-        let text = self
-            .read_primary_raw()
-            .map_err(PlatformError::ClipboardOperation)?;
-        let truncated = text.len() > CLIPBOARD_MAX_BYTES;
-        let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        let (text, truncated) = match self.read_primary_raw()? {
+            RawText::InMemory(text) => {
+                let truncated = text.len() > CLIPBOARD_MAX_BYTES;
+                (truncate_to_bytes(text, CLIPBOARD_MAX_BYTES), truncated)
+            }
+            RawText::Bounded(BoundedText::Complete(text)) => (text, false),
+            RawText::Bounded(BoundedText::Truncated { prefix, .. }) => (prefix, true),
+        };
         self.bounded_read_truncated = truncated;
         self.primary_buf = text.clone();
         Ok(text)
@@ -505,27 +682,27 @@ impl Clipboard {
     ///
     /// The direct and bounded reads share this funnel, so the bound decision
     /// is identical for a simulated and a real system read.
-    fn read_text_raw(&mut self) -> Result<String, String> {
+    fn read_text_raw(&mut self) -> Result<RawText, PlatformError> {
         if let Some(text) = self.simulated_read.clone() {
-            return Ok(text);
+            return Ok(RawText::InMemory(text));
         }
         if let Some(inner) = self.inner.as_mut() {
             get_clipboard_text(inner)
         } else {
-            Ok(self.headless_buf.clone())
+            Ok(RawText::InMemory(self.headless_buf.clone()))
         }
     }
 
     /// Raw primary-selection text from the read funnel; see
     /// [`Self::read_text_raw`].
-    fn read_primary_raw(&mut self) -> Result<String, String> {
+    fn read_primary_raw(&mut self) -> Result<RawText, PlatformError> {
         if let Some(text) = self.simulated_read.clone() {
-            return Ok(text);
+            return Ok(RawText::InMemory(text));
         }
         if let Some(inner) = self.inner.as_mut() {
             get_primary_text(inner)
         } else {
-            Ok(self.primary_buf.clone())
+            Ok(RawText::InMemory(self.primary_buf.clone()))
         }
     }
 
@@ -822,40 +999,111 @@ fn reap_wl_copy(
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
 ))]
-fn get_clipboard_text(inner: &mut arboard::Clipboard) -> Result<String, String> {
-    inner
-        .get()
-        .clipboard(LinuxClipboardKind::Clipboard)
-        .text()
-        .map_err(|err| err.to_string())
+fn get_clipboard_text(_inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    // The Linux read path is bounded end to end and has no `arboard` fallback
+    // (CTX-1366). The only fallback is Wayland setup failure -> bounded X11,
+    // which mirrors the old backend preference without an unbounded read. The
+    // `arboard` handle is retained for writes and clears only.
+    linux_bounded_read(WaylandSelection::Clipboard, X11Selection::Clipboard)
 }
 
-#[cfg(not(all(
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+#[cfg(windows)]
+fn get_clipboard_text(_inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    try_read_windows_text()
+        .map(RawText::Bounded)
+        .map_err(platform_error)
+}
+
+/// Typed macOS read refusal (CTX-1366 path B).
+///
+/// AppKit's pasteboard accessors return whole `NSString`/`NSData` objects and
+/// expose no caller byte bound, streaming read, or cancellation, so a bounded
+/// in-process read cannot be demonstrated. Bitty therefore refuses native text
+/// reads instead of materializing an unbounded pasteboard value; writes,
+/// primary-buffer bookkeeping, headless handles, and the simulated-read test
+/// seam keep working unchanged.
+#[cfg(any(target_os = "macos", test))]
+fn macos_read_refusal() -> PlatformError {
+    PlatformError::ClipboardUnavailable(String::from(
+        "bounded clipboard text reads are unavailable on macOS: AppKit exposes no caller byte bound",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn get_clipboard_text(_inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    Err(macos_read_refusal())
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    )
 )))]
-fn get_clipboard_text(inner: &mut arboard::Clipboard) -> Result<String, String> {
-    inner.get_text().map_err(|err| err.to_string())
+fn get_clipboard_text(inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    inner
+        .get_text()
+        .map(RawText::InMemory)
+        .map_err(|err| PlatformError::ClipboardOperation(err.to_string()))
 }
 
 #[cfg(all(
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
 ))]
-fn get_primary_text(inner: &mut arboard::Clipboard) -> Result<String, String> {
-    inner
-        .get()
-        .clipboard(LinuxClipboardKind::Primary)
-        .text()
-        .map_err(|err| err.to_string())
+fn get_primary_text(_inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    linux_bounded_read(WaylandSelection::Primary, X11Selection::Primary)
+}
+
+/// Bounded Linux read with a bounded cross-backend fallback.
+///
+/// Wayland is preferred when advertised. [`AcquisitionError::Setup`] means no
+/// transfer pipe was produced before any payload byte was read, so trying the
+/// bounded X11 client (when `DISPLAY` is set) preserves the previous
+/// Wayland-first, X11-fallback behavior without ever entering `arboard`'s
+/// unbounded read. Any other Wayland error, and every X11 error, is final.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+fn linux_bounded_read(
+    wayland: WaylandSelection,
+    x11: X11Selection,
+) -> Result<RawText, PlatformError> {
+    if is_wayland_session() {
+        match try_read_wayland_text(wayland) {
+            Ok(text) => Ok(RawText::Bounded(text)),
+            Err(AcquisitionError::Setup(_)) if has_x11_display() => try_read_x11_text(x11)
+                .map(RawText::Bounded)
+                .map_err(platform_error),
+            Err(err) => Err(platform_error(err)),
+        }
+    } else {
+        try_read_x11_text(x11)
+            .map(RawText::Bounded)
+            .map_err(platform_error)
+    }
+}
+
+/// Whether an X11 display is advertised via `DISPLAY`.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+fn has_x11_display() -> bool {
+    std::env::var_os("DISPLAY").is_some()
 }
 
 #[cfg(not(all(
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
 )))]
-fn get_primary_text(_inner: &mut arboard::Clipboard) -> Result<String, String> {
-    Err("primary selection is unavailable on this platform".to_string())
+fn get_primary_text(_inner: &mut arboard::Clipboard) -> Result<RawText, PlatformError> {
+    Err(PlatformError::ClipboardOperation(String::from(
+        "primary selection is unavailable on this platform",
+    )))
 }
 
 #[cfg(all(
@@ -896,6 +1144,7 @@ fn clear_primary_text(_inner: &mut arboard::Clipboard) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard_limits::{AcquisitionError, platform_error};
     #[cfg(unix)]
     use std::time::Duration;
 
@@ -1058,6 +1307,59 @@ mod tests {
         assert!(text.len() <= CLIPBOARD_MAX_BYTES);
         assert_eq!(text.len() % 4, 0, "emoji must be cut on a char boundary");
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
+
+    // CTX-1315/CTX-1366: the typed deadline error is what the paste/OSC 52
+    // seams see; no text is produced and no input is delivered on failure.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ))]
+    #[test]
+    fn acquisition_deadline_maps_to_a_typed_platform_error() {
+        let mapped = platform_error(AcquisitionError::DeadlineExceeded {
+            stage: "wayland-transfer",
+            timeout_ms: 750,
+        });
+        assert_eq!(
+            mapped,
+            PlatformError::ClipboardAcquisitionTimeout {
+                stage: "wayland-transfer",
+                timeout_ms: 750,
+            }
+        );
+        assert!(mapped.to_string().contains("timed out"));
+    }
+
+    // CTX-1366: macOS has no caller byte bound, so the read is refused with a
+    // typed `ClipboardUnavailable` instead of materializing AppKit objects.
+    // This test compiles and runs on every host; only the platform wiring in
+    // `get_clipboard_text` is macOS-specific.
+    #[test]
+    fn macos_read_refusal_is_typed_and_does_not_return_text() {
+        let refusal = macos_read_refusal();
+        assert!(matches!(refusal, PlatformError::ClipboardUnavailable(_)));
+        assert!(
+            refusal.to_string().contains("no caller byte bound"),
+            "the refusal must state why the read is unavailable: {refusal}"
+        );
+    }
+
+    // CTX-1366: an over-limit bounded native read fails closed instead of
+    // delivering a truncated prefix on X11/Windows.
+    #[test]
+    fn bounded_over_limit_maps_to_payload_too_large() {
+        let mapped = platform_error(AcquisitionError::OverLimit {
+            stage: "x11-incr",
+            observed_len: 9000,
+        });
+        assert_eq!(
+            mapped,
+            PlatformError::ClipboardPayloadTooLarge {
+                len: 9000,
+                max: CLIPBOARD_MAX_BYTES,
+            }
+        );
     }
 
     #[test]

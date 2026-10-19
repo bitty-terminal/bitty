@@ -971,7 +971,7 @@ impl Runtime {
     /// classes name themselves as controls (`NUL`, `ESC`, `CR`, `C0`, ...).
     ///
     /// Bounded and deterministic: the input is already capped at
-    /// `CLIPBOARD_MAX_BYTES` (8192), reasons are at most 7 static tokens, and
+    /// `CLIPBOARD_MAX_BYTES` (8192), reasons are at most 8 static tokens, and
     /// the preview keeps the first 32 chars escaped (`escape_debug`) and cut
     /// to 48 bytes at a char boundary. Total length stays well under 256
     /// bytes, single-line (no raw `\n`). `O(n)` with `n ≤ 8192`.

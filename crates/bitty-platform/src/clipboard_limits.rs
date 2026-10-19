@@ -371,18 +371,38 @@ pub(crate) fn decode_x11_text(
     encoding: X11Encoding,
     max_bytes: usize,
 ) -> Result<BoundedText, AcquisitionError> {
-    const STAGE: &str = "x11-property";
+    decode_x11_text_at(bytes, encoding, max_bytes, "x11-property")
+}
+
+/// [`decode_x11_text`] with the failure stage supplied by the caller.
+///
+/// An ordinary property reply is reported as `x11-property`; an INCR
+/// continuation decoded by [`IncrAccumulator::finish`] is reported as
+/// `x11-incr` so the typed error names the stage that actually failed.
+#[cfg(any(
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ),
+    test
+))]
+fn decode_x11_text_at(
+    bytes: &[u8],
+    encoding: X11Encoding,
+    max_bytes: usize,
+    stage: &'static str,
+) -> Result<BoundedText, AcquisitionError> {
     match encoding {
         X11Encoding::Utf8 => {
             if bytes.len() > max_bytes {
                 return Err(AcquisitionError::OverLimit {
-                    stage: STAGE,
+                    stage,
                     observed_len: bytes.len(),
                 });
             }
             std::str::from_utf8(bytes)
                 .map(|text| BoundedText::Complete(text.to_owned()))
-                .map_err(|_| AcquisitionError::Malformed { stage: STAGE })
+                .map_err(|_| AcquisitionError::Malformed { stage })
         }
         X11Encoding::Latin1 => {
             let mut out = String::with_capacity(max_bytes.min(bytes.len()));
@@ -390,7 +410,7 @@ pub(crate) fn decode_x11_text(
                 let ch = char::from(octet);
                 if out.len() + ch.len_utf8() > max_bytes {
                     return Err(AcquisitionError::OverLimit {
-                        stage: STAGE,
+                        stage,
                         observed_len: bytes.len(),
                     });
                 }
@@ -514,7 +534,7 @@ impl IncrAccumulator {
     }
 
     /// `long_length` for the next `GetProperty` request: only the remaining
-    /// window, rounded down to whole four-byte units.
+    /// window, rounded up to whole four-byte units.
     pub(crate) fn remaining_units(&self) -> u32 {
         let remaining = self.window_bytes.saturating_sub(self.bytes.len());
         x11_long_length_units(remaining)
@@ -543,7 +563,7 @@ impl IncrAccumulator {
 
     /// Consumes the accumulator and decodes its retained bytes.
     pub(crate) fn finish(self, encoding: X11Encoding) -> Result<BoundedText, AcquisitionError> {
-        decode_x11_text(&self.bytes, encoding, self.max_bytes)
+        decode_x11_text_at(&self.bytes, encoding, self.max_bytes, "x11-incr")
     }
 }
 
@@ -886,6 +906,17 @@ mod tests {
         acc.push(b"hello").expect("chunk");
         let result = acc.finish(X11Encoding::Utf8).expect("decode");
         assert!(matches!(result, BoundedText::Complete(ref text) if text == "hello"));
+    }
+
+    #[test]
+    fn incr_accumulator_decode_failure_reports_the_incr_stage() {
+        let mut acc = IncrAccumulator::new(16);
+        acc.push(&[0xFF, 0xFE]).expect("chunk fits");
+        let error = acc.finish(X11Encoding::Utf8).expect_err("invalid UTF-8");
+        assert!(
+            matches!(error, AcquisitionError::Malformed { stage: "x11-incr" }),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

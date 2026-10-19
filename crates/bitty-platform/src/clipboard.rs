@@ -798,9 +798,12 @@ impl Default for Clipboard {
 /// Clips `text` to at most `max_bytes`, cutting at a UTF-8 char boundary so
 /// the result is always valid UTF-8.
 ///
-/// Used by the bounded reads, which deliberately clip an over-limit system
-/// value to a pasteable prefix instead of rejecting the paste. Mirrors the
-/// runtime paste gate's `truncate_paste_text` char-boundary semantics.
+/// Used only for the local in-memory value (headless or simulated), which the
+/// bounded reads deliberately clip to a pasteable prefix. Native X11 and
+/// Windows bounded reads refuse an over-limit value with a typed error
+/// instead, and the bounded Wayland transfer reports a truncated prefix from
+/// its own window. Mirrors the runtime paste gate's `truncate_paste_text`
+/// char-boundary semantics.
 fn truncate_to_bytes(text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
@@ -816,7 +819,9 @@ fn truncate_to_bytes(text: String, max_bytes: usize) -> String {
 ///
 /// The old behavior silently truncated at a UTF-8 boundary; truncation is now
 /// explicit and the caller decides how to handle the rejection (CTX-0478).
-/// The direct reads keep this rejection; the bounded reads clip instead.
+/// The direct reads and the native X11/Windows bounded reads keep this
+/// rejection; only the Wayland transfer window and the local in-memory value
+/// clip to a pasteable prefix (CTX-1366).
 fn ensure_within_limit(len: usize) -> Result<(), PlatformError> {
     if len > CLIPBOARD_MAX_BYTES {
         return Err(PlatformError::ClipboardPayloadTooLarge {

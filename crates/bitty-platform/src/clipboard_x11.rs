@@ -18,8 +18,10 @@
 //! - **Bounded wait:** one absolute monotonic deadline covers connection setup,
 //!   atom/window/selection requests, the `SelectionNotify` wait, every
 //!   `GetProperty` reply, and every INCR `PropertyNotify` wait. The connection
-//!   uses a [`DeadlineStream`] wrapper so x11rb's own internal poll loops
-//!   cannot wait past the deadline;
+//!   uses a [`DeadlineStream`] wrapper that bounds x11rb's internal `poll`
+//!   retry loops **and** its packet-reader `read` loop (which otherwise runs
+//!   until the socket would block), so no single call can wait past the
+//!   deadline;
 //! - **No unbounded fallback:** the Linux read funnel never falls back to
 //!   `arboard` for a failed X11 read.
 //!
@@ -119,13 +121,53 @@ impl Deadline {
     }
 }
 
-/// A `DefaultStream` wrapper that enforces the acquisition deadline in poll.
+/// Waits for `flags` on `fd` no longer than the absolute `deadline`.
+///
+/// Returns [`deadline_io_error`] when the deadline expires first. `poll(2)` is
+/// retried after `EINTR` with the recomputed remaining time; the `Stream`
+/// contract forbids surfacing `Interrupted` to x11rb.
+fn wait_for_fd(fd: impl AsFd, flags: PollFlags, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(deadline_io_error());
+        }
+        let mut fds = [PollFd::new(fd.as_fd(), flags)];
+        // Round down: `poll` must never sleep past the absolute deadline. A
+        // sub-millisecond remainder becomes a zero timeout; if it elapses
+        // before the deadline the helper reports a spurious wake and the
+        // caller retries with the recomputed remainder.
+        let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let timeout = PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX);
+        match poll(&mut fds, timeout) {
+            // The floor-rounded timeout elapsed. If the absolute deadline is
+            // still ahead, report a spurious wake and let the caller retry
+            // with the recomputed remaining time; otherwise fail typed.
+            Ok(0) if Instant::now() >= deadline => return Err(deadline_io_error()),
+            Ok(0) => return Ok(()),
+            Ok(_) => return Ok(()),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(errno) => return Err(io::Error::from(errno)),
+        }
+    }
+}
+
+/// A `DefaultStream` wrapper that enforces the acquisition deadline in
+/// `poll` **and** in `read`.
 ///
 /// `DefaultStream` is already non-blocking for reads/writes but its
-/// `Stream::poll` uses an infinite `poll(2)`. x11rb calls `poll` from its
-/// internal write/read retry loops, so wrapping `poll` is what makes handshake
-/// and request responses obey the one absolute deadline. Reads and writes are
-/// delegated unchanged (they never block on this non-blocking stream).
+/// `Stream::poll` uses an infinite `poll(2)`, so the wrapper bounds `poll` to
+/// the remaining time for x11rb's handshake/write/read retry loops.
+///
+/// Bounding `poll` alone is not enough: x11rb's `PacketReader::try_read_packets`
+/// loops over `Stream::read` until `WouldBlock`, EOF, or an error and consults
+/// no time source. A server (or local client keeping the socket readable) can
+/// therefore make one `poll_for_event()` call outlive the caller's deadline
+/// without ever calling `poll` again. `read` consequently checks the absolute
+/// deadline first, waits for readability only for the remaining time, and
+/// re-checks after the read; the deadline error propagates out of
+/// `try_read_packets` and `map_request_error` keeps it typed. Writes stay
+/// non-blocking and are bounded by x11rb's `poll` retry loop.
 #[derive(Debug)]
 struct DeadlineStream<S> {
     inner: S,
@@ -134,10 +176,6 @@ struct DeadlineStream<S> {
 
 impl<S: Stream + AsFd> Stream for DeadlineStream<S> {
     fn poll(&self, mode: PollMode) -> io::Result<()> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(deadline_io_error());
-        }
         let mut flags = PollFlags::empty();
         if mode.readable() {
             flags |= PollFlags::POLLIN;
@@ -145,21 +183,20 @@ impl<S: Stream + AsFd> Stream for DeadlineStream<S> {
         if mode.writable() {
             flags |= PollFlags::POLLOUT;
         }
-        let mut fds = [PollFd::new(self.inner.as_fd(), flags)];
-        let millis = i32::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
-        let timeout = PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX);
-        match poll(&mut fds, timeout) {
-            Ok(0) => Err(deadline_io_error()),
-            Ok(_) => Ok(()),
-            // The Stream contract forbids returning `Interrupted`; report the
-            // wake as spurious and let x11rb retry with the remaining time.
-            Err(nix::errno::Errno::EINTR) => Ok(()),
-            Err(errno) => Err(io::Error::from(errno)),
-        }
+        wait_for_fd(self.inner.as_fd(), flags, self.deadline)
     }
 
     fn read(&self, buf: &mut [u8], fd_storage: &mut Vec<RawFdContainer>) -> io::Result<usize> {
-        self.inner.read(buf, fd_storage)
+        // Top-of-read check: `try_read_packets` never consults a clock, so
+        // this is the only place that can stop its loop once the budget ends.
+        wait_for_fd(self.inner.as_fd(), PollFlags::POLLIN, self.deadline)?;
+        let read = self.inner.read(buf, fd_storage)?;
+        // Re-check after the read: even a single syscall that returned data
+        // just past the deadline must not let the packet loop continue.
+        if Instant::now() >= self.deadline {
+            return Err(deadline_io_error());
+        }
+        Ok(read)
     }
 
     fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
@@ -519,14 +556,19 @@ fn wait_for_property(
 
 /// Drains queued events until `accept` matches, under one absolute deadline.
 ///
-/// `next_event` must not block: x11rb's `poll_for_event` pops one queued event
-/// or performs one non-blocking read, so a client that keeps the stream
-/// non-empty would otherwise keep this loop running forever. The deadline is
-/// therefore re-checked **before every observed event and on every empty
-/// queue**, not only after the queue drains. An untrusted local X11 client can
-/// flood `PropertyNotify` or send synthetic `SelectionNotify`/`PropertyNotify`
-/// events to the requestor window; such a flood still ends in the typed
-/// deadline error, with no text and no teardown wait.
+/// `next_event` is the real `RustConnection::poll_for_event`: it pops one
+/// queued event when the protocol queue is non-empty, otherwise it calls
+/// `read_packet_and_enqueue(NonBlocking)`, which runs
+/// `PacketReader::try_read_packets`. That function is **not** one non-blocking
+/// read; it loops `stream.read()` until `WouldBlock`, EOF, or an error and
+/// consults no clock. [`DeadlineStream::read`] enforces the absolute deadline
+/// inside that loop (pre-read wait for the remaining time, top-of-read check,
+/// post-read re-check), and this loop additionally re-checks the deadline
+/// before every observed event and on every empty queue, not only after the
+/// queue drains. An untrusted local X11 client can flood `PropertyNotify` or
+/// send synthetic `SelectionNotify`/`PropertyNotify` events to the requestor
+/// window; such a flood still ends in the typed deadline error, with no text
+/// and no teardown wait.
 fn drain_until<T, E>(
     deadline: &Deadline,
     stage: &'static str,
@@ -556,9 +598,10 @@ fn drain_until<T, E>(
 /// Sleeps for a short bounded interval while waiting for an X event.
 ///
 /// x11rb's public `RustConnection` does not expose its stream, so the event
-/// loops cannot poll the connection FD directly; a one-millisecond pause keeps
-/// the synchronous paste path off a busy loop and still wakes well inside the
-/// absolute deadline. Bounded by the remaining time.
+/// loops cannot poll the connection FD directly; the wrapper's `read` blocks
+/// inside `poll(2)` for the remaining budget, and this pause only covers a
+/// spurious wake or a raced empty read so the synchronous paste path cannot
+/// busy-loop. Bounded by the remaining time.
 fn pause_until_next_poll(deadline: &Deadline) {
     const POLL_PAUSE: Duration = Duration::from_millis(1);
     let pause = POLL_PAUSE.min(deadline.remaining());
@@ -613,6 +656,16 @@ impl Drop for RequestorWindow<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
+    use nix::sys::socket::{setsockopt, sockopt};
+    use x11rb::protocol::xproto::{BackingStore, ImageOrder, Screen, Setup};
+    use x11rb::x11_utils::Serialize;
+
     use super::*;
 
     #[test]
@@ -693,31 +746,270 @@ mod tests {
         ));
     }
 
-    // F1 (CTX-1366 review): an untrusted client can keep
-    // `poll_for_event` returning `Some` forever. The drain loop must observe
-    // the absolute deadline on every event, not only when the queue empties.
-    #[test]
-    fn event_flood_cannot_starve_the_absolute_deadline() {
-        let deadline = Deadline::new(Duration::from_millis(20)).expect("deadline");
-        let started = Instant::now();
-        let error = drain_until(
-            &deadline,
-            STAGE_SELECTION,
-            || Ok(Some(1_u8)),
-            |_| None::<()>,
-        )
-        .expect_err("a never-empty event source must not outlive the deadline");
-        assert!(matches!(
-            error,
-            AcquisitionError::DeadlineExceeded {
-                stage: "x11-selection",
-                ..
+    /// Serialized minimal `Setup` reply for a fake X server.
+    ///
+    /// `RustConnection::connect_to_stream` sends the setup request first and
+    /// blocks for this reply, so the test peer writes it before any flood.
+    fn x11_setup_reply() -> Vec<u8> {
+        let setup = Setup {
+            status: 1,
+            protocol_major_version: 11,
+            protocol_minor_version: 0,
+            length: 0,
+            release_number: 1,
+            resource_id_base: 0x200000,
+            resource_id_mask: 0x1fffff,
+            motion_buffer_size: 0,
+            maximum_request_length: 4096,
+            image_byte_order: ImageOrder::LSB_FIRST,
+            bitmap_format_bit_order: ImageOrder::LSB_FIRST,
+            bitmap_format_scanline_unit: 32,
+            bitmap_format_scanline_pad: 32,
+            min_keycode: 8,
+            max_keycode: 255,
+            vendor: Vec::new(),
+            pixmap_formats: Vec::new(),
+            roots: vec![Screen {
+                root: 0x1234,
+                default_colormap: 0,
+                white_pixel: 0x00ff_ffff,
+                black_pixel: 0,
+                current_input_masks: EventMask::NO_EVENT,
+                width_in_pixels: 1,
+                height_in_pixels: 1,
+                width_in_millimeters: 1,
+                height_in_millimeters: 1,
+                min_installed_maps: 1,
+                max_installed_maps: 1,
+                root_visual: 0,
+                backing_stores: BackingStore::NOT_USEFUL,
+                save_unders: false,
+                root_depth: 24,
+                allowed_depths: Vec::new(),
+            }],
+        };
+        let mut bytes = setup.serialize();
+        // `length` counts four-byte units after the fixed eight-byte header.
+        let length_units = u16::try_from((bytes.len() - 8) / 4).expect("setup length fits u16");
+        bytes[6..8].copy_from_slice(&length_units.to_ne_bytes());
+        bytes
+    }
+
+    /// One `PropertyNotify` (`PropertyNewValue`) for an arbitrary window and
+    /// atom. `drain_until` never accepts it here, so only the event fetch path
+    /// is under test.
+    fn property_notify_packet() -> [u8; 32] {
+        let mut packet = [0_u8; 32];
+        packet[0] = 28; // PropertyNotify
+        packet[1] = 1; // Property::NEW_VALUE
+        packet[4..8].copy_from_slice(&0x1234_u32.to_ne_bytes()); // window
+        packet[8..12].copy_from_slice(&0x99_u32.to_ne_bytes()); // property atom
+        packet
+    }
+
+    /// Requested socket buffer size for the flood test.
+    ///
+    /// A full buffer is what makes the mutation (read-level bound removed)
+    /// deterministic: draining it takes far longer than the deadline even if
+    /// the producer never gets scheduled again. The kernel clamps the value to
+    /// `net.core.{r,w}mem_max`; the test tolerates a smaller effective buffer.
+    const FLOOD_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Grows both directions of a Unix socket so the fake server can queue a
+    /// large event backlog before the drain starts. Best-effort: a clamped
+    /// buffer still preserves the deadline contract, only the mutation margin
+    /// shrinks.
+    fn grow_socket_buffers(stream: &UnixStream) {
+        let _ = setsockopt(stream, sockopt::RcvBuf, &FLOOD_SOCKET_BUFFER_BYTES);
+        let _ = setsockopt(stream, sockopt::SndBuf, &FLOOD_SOCKET_BUFFER_BYTES);
+    }
+
+    /// Fake X server peer: writes the setup reply, then either floods valid
+    /// events forever or stays idle with the socket open.
+    ///
+    /// In flood mode `filled` is signalled once the first non-blocking write
+    /// reports `WouldBlock`, i.e. the socket buffer is full, so the caller can
+    /// start the drain against a deterministic backlog.
+    fn spawn_fake_x_server(
+        mut server: UnixStream,
+        flood: bool,
+        stop: Arc<AtomicBool>,
+        filled: mpsc::Sender<()>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            server
+                .write_all(&x11_setup_reply())
+                .expect("write fake X11 setup reply");
+            if !flood {
+                // Keep the peer open with no readable data so the control run
+                // observes the bare deadline instead of an EOF/transport
+                // error.
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                return;
             }
-        ));
+            server
+                .set_nonblocking(true)
+                .expect("non-blocking fake X server");
+            let packet = property_notify_packet();
+            let mut burst = Vec::with_capacity(64 * 1024);
+            while burst.len() < 64 * 1024 {
+                burst.extend_from_slice(&packet);
+            }
+            let mut announced = false;
+            while !stop.load(Ordering::Relaxed) {
+                match server.write(&burst) {
+                    Ok(_) => {}
+                    Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        if !announced {
+                            announced = true;
+                            filled.send(()).ok();
+                        }
+                        thread::yield_now();
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    /// Runs the real `drain_until` caller shape over a real
+    /// `RustConnection<DeadlineStream<DefaultStream>>`.
+    ///
+    /// Returns the typed error, how long the call took, and how many event
+    /// fetches it performed. The drain runs on its own thread behind a
+    /// watchdog so a missing read-level deadline fails the test instead of
+    /// hanging it.
+    fn run_event_wait(
+        budget: Duration,
+        flood: bool,
+        stage: &'static str,
+    ) -> (AcquisitionError, Duration, u64) {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        grow_socket_buffers(&client);
+        grow_socket_buffers(&server);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (filled_tx, filled_rx) = mpsc::channel();
+        let server_thread = spawn_fake_x_server(server, flood, Arc::clone(&stop), filled_tx);
+        let (inner, _peer) = DefaultStream::from_unix_stream(client).expect("default stream");
+        // Same production shape: one absolute deadline covers the handshake
+        // and the event wait, so timing starts before the handshake.
+        let started = Instant::now();
+        let deadline = Deadline::new(budget).expect("deadline");
+        let stream = DeadlineStream {
+            inner,
+            deadline: deadline.at,
+        };
+        let conn = RustConnection::connect_to_stream(stream, 0).expect("x11 handshake");
+        if flood {
+            filled_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("fake server never filled the socket buffer");
+        }
+
+        let (send, recv) = mpsc::channel();
+        let drain = thread::spawn(move || {
+            let mut calls = 0_u64;
+            let mut next_event = || {
+                calls += 1;
+                conn.poll_for_event()
+                    .map_err(|err| map_request_error(err, &deadline, stage))
+            };
+            let result = drain_until(&deadline, stage, &mut next_event, |_| None::<()>);
+            send.send((result, started.elapsed(), calls)).ok();
+        });
+
+        let received = recv.recv_timeout(budget + Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
+        drain.join().expect("drain thread");
+        server_thread.join().expect("fake server thread");
+        let (result, elapsed, calls) = received
+            .expect("event wait did not return; x11rb's read loop is not bounded by the deadline");
+        let error = result.expect_err("a never-matching event wait must time out");
+        (error, elapsed, calls)
+    }
+
+    // F1 (CTX-1366 review2): x11rb's `poll_for_event` loops `Stream::read`
+    // until `WouldBlock`; a socket that stays readable makes one call
+    // unbounded unless `DeadlineStream::read` enforces the deadline. This is
+    // the INCR `PropertyNotify` fetch (`wait_for_property`'s caller shape),
+    // over a real socket rather than a closure stub.
+    #[test]
+    fn incr_event_flood_is_cut_off_by_the_read_level_deadline() {
+        let budget = Duration::from_millis(20);
+        let (error, elapsed, calls) = run_event_wait(budget, true, STAGE_INCR);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "flood drain outlived the deadline: {:?}",
-            started.elapsed()
+            matches!(
+                error,
+                AcquisitionError::DeadlineExceeded {
+                    stage: "x11-incr",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(calls > 0, "the drain never fetched an event");
+        assert!(
+            elapsed + Duration::from_millis(2) >= budget,
+            "returned before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(100),
+            "the read loop outlived the deadline by draining the flood backlog: {elapsed:?}"
+        );
+    }
+
+    // The same event-fetch bound serves the `SelectionNotify` wait.
+    #[test]
+    fn selection_event_flood_is_cut_off_by_the_read_level_deadline() {
+        let budget = Duration::from_millis(20);
+        let (error, elapsed, calls) = run_event_wait(budget, true, STAGE_SELECTION);
+        assert!(
+            matches!(
+                error,
+                AcquisitionError::DeadlineExceeded {
+                    stage: "x11-selection",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(calls > 0, "the drain never fetched an event");
+        assert!(
+            elapsed < budget + Duration::from_millis(100),
+            "the read loop outlived the deadline by draining the flood backlog: {elapsed:?}"
+        );
+    }
+
+    // Control: with no readable data the same caller observes the deadline
+    // through the bounded wait rather than through the flood path. Without
+    // this run the flood assertions could pass for the wrong reason (e.g. an
+    // immediate transport error).
+    #[test]
+    fn event_wait_observes_the_deadline_without_a_flood() {
+        let budget = Duration::from_millis(20);
+        let (error, elapsed, _calls) = run_event_wait(budget, false, STAGE_INCR);
+        assert!(
+            matches!(
+                error,
+                AcquisitionError::DeadlineExceeded {
+                    stage: "x11-incr",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            elapsed + Duration::from_millis(2) >= budget,
+            "returned before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_secs(1),
+            "empty wait outlived the deadline: {elapsed:?}"
         );
     }
 

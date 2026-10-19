@@ -55,6 +55,9 @@ raw-window-handle = "=0.6.2"
 # `arboard` remains for writes and clear only.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dependencies]
 wl-clipboard-rs = "0.9"
+# `poll` bounds the Wayland transfer deadline. The X11 flood regression test
+# adds the `socket` feature through a dev-dependency below, so release builds
+# do not compile that surface.
 nix = { workspace = true, features = ["poll"] }
 # CTX-1366: bounded X11 acquisition replaces the unbounded `arboard` property /
 # INCR read. `x11rb` 0.13.2 is already in the lockfile through `arboard` and
@@ -77,3 +80,9 @@ harness = false
 [[test]]
 name = "winit_window"
 harness = false
+
+# CTX-1366: the X11 socket-level flood regression test sizes its Unix socket
+# buffers with nix's safe `setsockopt` wrapper. Dev-only, so release builds
+# compile nix with `poll` only.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dev-dependencies]
+nix = { workspace = true, features = ["socket"] }

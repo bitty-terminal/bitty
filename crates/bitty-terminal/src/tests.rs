@@ -17,18 +17,20 @@ fn args_of(words: &[&str]) -> Vec<String> {
     words.iter().map(|s| (*s).to_string()).collect()
 }
 
-// CTX-1327 / P0-AC-015: exercise the real application input callback through
-// `AppHandler::handle_event` with a headless `EventContext` and a read-only
-// owning-VM entry counter. The regression proves the accepted input path
-// enqueues the resolved band request without entering the plugin VM, and that
-// the deferred dispatch happens exactly once on the distinct cold pump.
+// CTX-1327 / CTX-1324 / P0-AC-015: exercise the real application input
+// callback through `AppHandler::handle_event` with a headless `EventContext`
+// and a read-only owning-VM entry counter. The regression proves the accepted
+// input path enqueues the resolved band request (and a static keybinding
+// command invocation) without entering the plugin VM, and that the deferred
+// dispatch happens exactly once on the distinct cold pump.
 #[cfg(feature = "input-vm-test-support")]
 mod input_vm_boundary {
     use super::*;
     use bitty_platform::app::RecordingOperation;
     use bitty_platform::{
-        AppHandler, CursorPosition, EventContext, ModifiersState, MouseButton, MouseEvent,
-        PhysicalSize, PressState, ScrollDelta, SystemAppearance, WindowId,
+        AppHandler, CursorPosition, EventContext, KeyEvent, KeyLocation, LogicalKey,
+        ModifiersState, MouseButton, MouseEvent, PhysicalSize, PressState, ScrollDelta,
+        SystemAppearance, WindowId,
     };
     use bitty_plugin_host::manifest::PluginId;
     use bitty_runtime::plugin_runtime::{
@@ -51,6 +53,28 @@ mod input_vm_boundary {
 
     impl Fixture {
         fn new(case: &str) -> Self {
+            let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("default in-memory keymap");
+            Self::build(case, maps)
+        }
+
+        /// Fixture with one explicit `command:<owner:command>` keybinding
+        /// (CTX-1324) so the real keyboard intercept can be driven through
+        /// `AppHandler::handle_event` without any host keymap file.
+        fn with_command_keybinding(case: &str) -> Self {
+            let effective = bitty_config::EffectiveConfig {
+                keymaps: vec![bitty_config::KeymapEntry {
+                    chord: "ctrl+alt+y".to_string(),
+                    action: format!("command:{PLUGIN}:step"),
+                    context: "global".to_string(),
+                }],
+                ..bitty_config::EffectiveConfig::default()
+            };
+            let maps = bitty_config::resolve_keymaps(&effective).expect("fixture keymap");
+            Self::build(case, maps)
+        }
+
+        fn build(case: &str, maps: Vec<bitty_config::ResolvedKeymap>) -> Self {
             // Only fixture-owned files are touched. No user configuration,
             // startup path, native clipboard, window, watcher, or PTY exists.
             let root = std::env::temp_dir().join(format!("ctx1327-{}-{case}", std::process::id()));
@@ -122,8 +146,6 @@ return {}
             assert_eq!(rt.pty_size(), None);
             assert!(!rt.has_pty_writer());
             assert_eq!(rt.background_loads(), 0);
-            let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
-                .expect("default in-memory keymap");
             let mut app = TerminalApp::with_theme(
                 rt,
                 bitty_config::theme::DEFAULT_THEME_NAME,
@@ -275,6 +297,29 @@ return {}
                 panic!("bounded integer marker expected: {result:?}");
             };
             marker
+        }
+
+        /// Presses the fixture's `ctrl+alt+y -> command:<plugin>:step` chord
+        /// through the real application input callback (CTX-1324).
+        fn press_command_chord(&mut self) -> u64 {
+            assert_eq!(
+                self.event(WindowEventKind::ModifiersChanged(ModifiersState {
+                    shift: false,
+                    control: true,
+                    alt: true,
+                    super_pressed: false,
+                })),
+                0,
+                "modifier input must not enter a VM"
+            );
+            self.event(WindowEventKind::KeyboardInput(KeyEvent {
+                logical_key: LogicalKey::Character("y".to_string()),
+                text: Some("y".to_string()),
+                location: KeyLocation::Standard,
+                state: PressState::Pressed,
+                repeat: false,
+                is_synthetic: false,
+            }))
         }
     }
 
@@ -565,6 +610,109 @@ return {}
         println!(
             "direct: one VM entry, bounded result 1; separate marker read: one VM entry, marker 1"
         );
+    }
+
+    #[test]
+    fn input_vm_boundary_keybinding_command_excludes_vm_entry() {
+        // CTX-1324 (P0-AC-015): the static `command:<owner:command>` keymap
+        // action is the remaining input path that used to enter the owning
+        // VM synchronously. Drive the real chord through `handle_event`:
+        // input only enqueues, the distinct `AboutToWait` cold phase delivers
+        // exactly once, and the command is still reachable explicitly.
+        let mut fixture = Fixture::with_command_keybinding("keybinding");
+        let before = fixture.entries();
+        assert_eq!(
+            fixture.press_command_chord(),
+            0,
+            "P0-AC-015: keybinding input must not enter the owning VM"
+        );
+        assert_eq!(fixture.entries(), before, "no owning-VM entry during input");
+        assert!(
+            fixture.app.runtime.pending_input().is_empty(),
+            "a consumed command chord emits no PTY bytes"
+        );
+        // Exactly-once later delivery on the real cold application callback.
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            1,
+            "one deferred command on the cold phase"
+        );
+        assert_eq!(
+            fixture.entries(),
+            before + 1,
+            "exactly one owning-VM entry on the cold pump"
+        );
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.input-boundary:step: 1"),
+            "the deferred command's bounded result surfaced"
+        );
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            0,
+            "a consumed command must not replay"
+        );
+        assert_eq!(fixture.entries(), before + 1, "still exactly one entry");
+        assert_eq!(fixture.read_marker(), 1, "the command ran exactly once");
+        // Valid-command positive control: an explicit host-mediated
+        // invocation outside the input path still executes once.
+        let read_before = fixture.entries();
+        let result = fixture
+            .app
+            .invoke_plugin_command(
+                &format!("{PLUGIN}:read"),
+                &TerminalApp::empty_command_args(),
+            )
+            .expect("registered command");
+        assert_eq!(result, LuaValue::Integer(1));
+        assert_eq!(
+            fixture.entries(),
+            read_before + 1,
+            "explicit invocation enters the VM exactly once"
+        );
+        println!(
+            "keybinding: input delta=0; cold pump delta=1 exactly once; marker=1; explicit invoke delta=1"
+        );
+    }
+
+    #[test]
+    fn input_vm_boundary_keybinding_queue_is_bounded() {
+        // CTX-1324: the new input-command queue is bounded and the payload
+        // bound refuses an oversize target before queueing. Unregistered
+        // names fail closed at the cold dispatch (no VM entry) and still
+        // count as bounded admission attempts.
+        let mut fixture = Fixture::new("keybinding-bounds");
+        let before = fixture.entries();
+        for index in 0..=crate::terminal_app::INPUT_COMMAND_QUEUE_CAPACITY {
+            fixture
+                .app
+                .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(format!(
+                    "{PLUGIN}:missing{index}"
+                )));
+        }
+        assert_eq!(
+            fixture.app.pump_cold_commands(),
+            crate::terminal_app::INPUT_COMMAND_QUEUE_CAPACITY,
+            "overflow drops the newest request"
+        );
+        assert_eq!(
+            fixture.entries(),
+            before,
+            "unregistered names never enter a VM"
+        );
+        let oversize = format!(
+            "{}:x",
+            "a".repeat(bitty_config::keymap::MAX_INVOKE_COMMAND_LEN)
+        );
+        fixture
+            .app
+            .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(oversize));
+        assert_eq!(
+            fixture.app.pump_cold_commands(),
+            0,
+            "an oversize target is refused before queueing"
+        );
+        assert_eq!(fixture.entries(), before);
     }
 
     #[test]

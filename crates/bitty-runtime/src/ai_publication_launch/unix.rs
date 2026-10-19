@@ -10,6 +10,23 @@
 //! The bootstrap channel is an anonymous pipe; the control channel is a
 //! `socketpair(2)` (via `UnixStream::pair`) so both directions of the
 //! dedicated control stream are independent of stdio.
+//!
+//! # Spawn-time descriptor reservation
+//!
+//! `std` allocates its close-on-exec exec-error channel inside
+//! `Command::spawn`, at the lowest free descriptors, and only then forks and
+//! runs the registered `pre_exec` hook. If [`CHILD_BOOTSTRAP_DESCRIPTOR`] and
+//! [`CHILD_CONTROL_DESCRIPTOR`] happen to be free at that instant, placement
+//! could `dup2` over the error channel and a failed `exec` would be reported
+//! to the parent as a successful spawn. [`Handles::install_child_descriptors`]
+//! therefore opens a close-on-exec pipe at the lowest free descriptors
+//! immediately before the spawn. Two lowest-free descriptors are enough:
+//! whatever was open before, both placement targets are then occupied (by the
+//! reservation or by a pre-existing descriptor), so std's error channel is
+//! allocated above them. The reservation is never read or written, carries
+//! `FD_CLOEXEC` so it cannot survive `exec`, and is closed by
+//! [`Handles::close_child_ends`], by [`Handles`] drop, or by
+//! [`super::PreparedLaunch::abort`]. See `SpawnReservation`.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -29,24 +46,60 @@ use super::{
 /// Parent end of the dedicated duplex control channel.
 pub(super) type ControlStream = UnixStream;
 
+/// Parent-side close-on-exec pipe held across `Command::spawn`.
+///
+/// The pipe is never read or written. Its only purpose is to occupy the
+/// lowest free descriptors so std's post-fork exec-error channel cannot be
+/// allocated on a child placement target. Both ends carry `FD_CLOEXEC`, so
+/// they never survive `exec`; dropping the value closes them.
+struct SpawnReservation {
+    // Leading underscores keep the unused-descriptor lint quiet: the fields
+    // exist for their drop side effect, not for I/O.
+    _read: OwnedFd,
+    _write: OwnedFd,
+}
+
+impl SpawnReservation {
+    /// Occupy the lowest free descriptors.
+    ///
+    /// Allocating the two lowest free numbers guarantees that both child
+    /// placement targets are occupied at spawn time: each target is either
+    /// one of the reservation ends, or a descriptor the process already had
+    /// open. Therefore `Command::spawn` cannot allocate its exec-error
+    /// channel there.
+    fn reserve() -> io::Result<Self> {
+        let (read, write) = cloexec_pipe()?;
+        Ok(Self {
+            _read: read,
+            _write: write,
+        })
+    }
+
+    #[cfg(test)]
+    fn descriptors(&self) -> [RawFd; 2] {
+        [self._read.as_raw_fd(), self._write.as_raw_fd()]
+    }
+}
+
 /// Parent- and child-side handles for one prepared launch.
 pub(super) struct Handles {
     bootstrap_writer: Option<File>,
     bootstrap_reader: Option<OwnedFd>,
     control_parent: Option<UnixStream>,
     control_child: Option<UnixStream>,
+    spawn_reservation: Option<SpawnReservation>,
 }
 
 impl Handles {
     pub(super) fn create() -> Result<Self, LaunchError> {
-        let (bootstrap_reader, bootstrap_writer) =
-            bootstrap_pipe().map_err(LaunchError::Channel)?;
+        let (bootstrap_reader, bootstrap_writer) = cloexec_pipe().map_err(LaunchError::Channel)?;
         let (control_parent, control_child) = UnixStream::pair().map_err(LaunchError::Channel)?;
         Ok(Self {
             bootstrap_writer: Some(File::from(bootstrap_writer)),
             bootstrap_reader: Some(bootstrap_reader),
             control_parent: Some(control_parent),
             control_child: Some(control_child),
+            spawn_reservation: None,
         })
     }
 
@@ -83,12 +136,29 @@ impl Handles {
         self.control_parent.take()
     }
 
+    /// Close the parent's child-side copies and release the spawn-time
+    /// descriptor reservation. Idempotent; also runs on drop.
     pub(super) fn close_child_ends(&mut self) {
         self.bootstrap_reader = None;
         self.control_child = None;
+        self.spawn_reservation = None;
     }
 
-    /// Register the post-fork placement hook.
+    /// Test-only view of the live spawn reservation descriptors.
+    #[cfg(test)]
+    pub(super) fn spawn_reservation_descriptors(&self) -> Vec<RawFd> {
+        self.spawn_reservation
+            .as_ref()
+            .map(|reservation| reservation.descriptors().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Reserve the placement targets and register the post-fork hook.
+    ///
+    /// The reservation must exist before `Command::spawn` allocates its
+    /// exec-error channel; it stays held until [`Self::close_child_ends`] or
+    /// drop. Registering twice keeps the existing reservation and appends a
+    /// second placement hook.
     ///
     /// # Safety
     ///
@@ -98,10 +168,12 @@ impl Handles {
     /// [`place_child_descriptors`], which touches only async-signal-safe
     /// descriptor syscalls (`fcntl`, `dup2`, `close`) and performs no
     /// allocation, locking, or std I/O. A returned error aborts the spawn, so
-    /// descriptor placement can never silently fail open.
+    /// descriptor placement can never silently fail open. The parent-side
+    /// reservation keeps both placement targets occupied across the spawn, so
+    /// std's close-on-exec exec-error channel is allocated elsewhere.
     #[allow(unsafe_code)]
     pub(super) fn install_child_descriptors(
-        &self,
+        &mut self,
         command: &mut Command,
     ) -> Result<(), LaunchError> {
         let bootstrap = self
@@ -114,9 +186,13 @@ impl Handles {
             .as_ref()
             .ok_or(LaunchError::HandleMissing)?
             .as_raw_fd();
+        if self.spawn_reservation.is_none() {
+            self.spawn_reservation =
+                Some(SpawnReservation::reserve().map_err(LaunchError::SpawnReservation)?);
+        }
         // SAFETY: see the method contract above. Both descriptors stay open
-        // in the parent until `close_child_ends` runs after a successful
-        // spawn, so the captured numbers remain valid through `fork`.
+        // in the parent until `close_child_ends` runs after the spawn attempt,
+        // so the captured numbers remain valid through `fork`.
         unsafe {
             command.pre_exec(move || place_child_descriptors(bootstrap, control));
         }
@@ -286,17 +362,19 @@ impl Write for DeadlineStream {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn bootstrap_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn bootstrap_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let (read, write) = nix::unistd::pipe().map_err(errno_to_io)?;
-    set_cloexec(&read)?;
-    set_cloexec(&write)?;
-    Ok((read, write))
+/// Create a close-on-exec pipe at the lowest free descriptors.
+fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let (read, write) = nix::unistd::pipe().map_err(errno_to_io)?;
+        set_cloexec(&read)?;
+        set_cloexec(&write)?;
+        Ok((read, write))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

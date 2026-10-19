@@ -27,8 +27,18 @@
 //! The parent keeps both child-side ends open until the child has inherited
 //! them. The caller registers [`PreparedLaunch::install_child_descriptors`],
 //! spawns, then calls [`PreparedLaunch::after_spawn`] to close the parent's
-//! child-side copies. Dropping the prepared launch closes every remaining
-//! handle, so an abandoned launch cannot leave a pipe half-open.
+//! child-side copies and the spawn-time descriptor reservation. Dropping the
+//! prepared launch closes every remaining handle, so an abandoned launch
+//! cannot leave a pipe half-open.
+//!
+//! Registration also reserves the two fixed child numbers in the parent: a
+//! close-on-exec placeholder pipe is opened at the lowest free descriptors, so
+//! std's close-on-exec exec-error channel (allocated inside `Command::spawn`)
+//! necessarily lands above them. Without that reservation, `pre_exec` could
+//! `dup2` over the error channel and a failed `exec` could be reported as a
+//! successful spawn. The placeholders never cross `exec` and are closed by
+//! [`PreparedLaunch::after_spawn`] after the spawn attempt, by
+//! [`PreparedLaunch::abort`], or by `Drop`.
 //!
 //! On Unix the channels are an anonymous pipe and a Unix-domain socketpair.
 //! On every other platform [`prepare`] fails closed with
@@ -259,6 +269,8 @@ pub enum LaunchError {
     Channel(io::Error),
     /// The requested handle was already consumed, closed, or never created.
     HandleMissing,
+    /// The parent-side spawn descriptor reservation could not be created.
+    SpawnReservation(io::Error),
     /// [`PreparedLaunch::establish`] ran before the bootstrap record was written.
     BootstrapNotWritten,
     /// [`PreparedLaunch::write_bootstrap`] ran more than once.
@@ -288,6 +300,9 @@ impl fmt::Display for LaunchError {
             Self::HandleMissing => {
                 formatter.write_str("launch handle is missing or already closed")
             }
+            Self::SpawnReservation(error) => {
+                write!(formatter, "spawn descriptor reservation failed: {error}")
+            }
             Self::BootstrapNotWritten => {
                 formatter.write_str("launch bootstrap record has not been written")
             }
@@ -310,7 +325,9 @@ impl fmt::Display for LaunchError {
 impl std::error::Error for LaunchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Channel(error) | Self::BootstrapWrite(error) => Some(error),
+            Self::Channel(error) | Self::SpawnReservation(error) | Self::BootstrapWrite(error) => {
+                Some(error)
+            }
             Self::TlsRefused(reason) => reason.source(),
             _ => None,
         }
@@ -437,20 +454,27 @@ impl PreparedLaunch {
     /// The hook duplicates the launch's child ends to
     /// [`CHILD_BOOTSTRAP_DESCRIPTOR`] and [`CHILD_CONTROL_DESCRIPTOR`],
     /// clearing close-on-exec on the placed copies. It runs post-fork in the
-    /// single-threaded child and fails the spawn closed on any error. The
-    /// parent's child-side ends must stay open until the spawn returns; call
-    /// [`Self::after_spawn`] afterwards.
-    pub fn install_child_descriptors(&self, command: &mut Command) -> Result<(), LaunchError> {
+    /// single-threaded child and fails the spawn closed on any error.
+    ///
+    /// On Unix, registration first reserves both placement numbers in the
+    /// parent with a close-on-exec placeholder pipe. The reservation must be
+    /// held across `Command::spawn` so std's exec-error channel is allocated
+    /// above the placement targets; [`Self::after_spawn`] releases it after
+    /// the spawn attempt, and dropping the launch releases it otherwise.
+    pub fn install_child_descriptors(&mut self, command: &mut Command) -> Result<(), LaunchError> {
         self.handles
-            .as_ref()
+            .as_mut()
             .ok_or(LaunchError::HandleMissing)?
             .install_child_descriptors(command)
     }
 
-    /// Close the parent's child-side descriptor copies after a successful spawn.
+    /// Close the parent's child-side descriptor copies after a spawn attempt.
     ///
-    /// Idempotent. Calling it before the child has inherited the descriptors
-    /// makes the launch unusable, so only the spawn path should call it.
+    /// Call this after `Command::spawn` returns, whether it succeeded or
+    /// failed: a failed spawn leaves the launch unusable, and the spawn-time
+    /// descriptor reservation must not outlive the attempt. Idempotent.
+    /// Dropping the prepared launch performs the same cleanup, so an early
+    /// return cannot leak the reservation.
     pub fn after_spawn(&mut self) {
         if let Some(handles) = self.handles.as_mut() {
             handles.close_child_ends();

@@ -49,7 +49,7 @@ impl Handles {
     pub(super) fn close_child_ends(&mut self) {}
 
     pub(super) fn install_child_descriptors(
-        &self,
+        &mut self,
         _command: &mut Command,
     ) -> Result<(), LaunchError> {
         Err(LaunchError::UnsupportedPlatform)

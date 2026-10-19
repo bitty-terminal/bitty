@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    BoundedHistory, BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler,
-    PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
+    BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
+    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TranscriptHistory,
     WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
 use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
@@ -226,6 +226,31 @@ impl WorkspaceSource for LiveWorkspaces {
     }
 }
 
+/// Sample the active session's completed scrollback into the bounded history
+/// ring (CTX-1352).
+///
+/// Only the runtime-global primary terminal state is sampled, and rows carry
+/// the active workspace sequence plus the primary view id as their scope
+/// attribution. Inactive panes, background workspaces, and alternate content
+/// are never captured into another scope.
+pub(crate) fn capture_history(runtime: &bitty_runtime::Runtime, history: &TranscriptHistory) {
+    let Some(view) = runtime.primary_view() else {
+        return;
+    };
+    let Some(workspace) = runtime
+        .workspace_summaries()
+        .into_iter()
+        .find(|summary| summary.active)
+    else {
+        return;
+    };
+    history.capture_state(
+        runtime.state(),
+        &view.0.to_string(),
+        &workspace.seq.to_string(),
+    );
+}
+
 /// Handles the startup wiring hands to the app tick loop.
 pub(crate) struct PluginSession {
     /// Plugin runtime owning every VM.
@@ -236,6 +261,8 @@ pub(crate) struct PluginSession {
     pub(crate) workspaces: Rc<LiveWorkspaces>,
     /// Live pin-target snapshot (CTX-1115).
     pub(crate) pin_state: Rc<LivePinState>,
+    /// Bounded transcript provider published by the tick loop (CTX-1352).
+    pub(crate) history: Rc<TranscriptHistory>,
 }
 
 /// Live pin-target snapshot for `bitty.panel.set_pinned` (CTX-1115).
@@ -429,6 +456,8 @@ pub(crate) struct StartupSeed<'a> {
     pub(crate) pinned: &'a [ViewId],
     /// Approved wallpaper roots for `bitty.image.read` (CTX-1169).
     pub(crate) image_roots: &'a [String],
+    /// Effective opt-in history capture switches (CTX-1352).
+    pub(crate) history_capture: bitty_config::HistoryCaptureConfig,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -537,14 +566,19 @@ pub(crate) fn discover_with_roots(
         Rc::clone(runtime.panel_pin_queue()),
         Rc::clone(&pin_state),
     )));
-    // CTX-1352 (issue #2247): install the history provider seam before
-    // activation so `init.lua` already observes a present
-    // `bitty.history` root. The provider starts unavailable (no durable
-    // history store in this slice): queries deny with the typed
-    // `E_HISTORY_UNAVAILABLE` code, never a nil-index. Installing the
-    // provider grants nothing; the per-source capability head and the Core
-    // history gate still decide every call.
-    let history = Rc::new(BoundedHistory::unavailable());
+    // CTX-1352 (issue #2247): install the bounded terminal-state history
+    // provider before activation so `init.lua` already observes a present
+    // `bitty.history` root. The tick loop samples completed scrollback lines
+    // into its redacted ring when `history.capture.transcript` is enabled;
+    // with capture off the provider is available but empty. Command history
+    // and KV have no backing source in this slice and deny with the typed
+    // `E_HISTORY_UNAVAILABLE`, never a nil-index. Installing the provider
+    // grants nothing; the per-source capability head and the Core history
+    // gate still decide every call.
+    let history = Rc::new(TranscriptHistory::new(
+        seed.history_capture.transcript,
+        seed.history_capture.commands,
+    ));
     let host_history: Rc<dyn bitty_runtime::plugin_runtime::HistoryProvider> = history.clone();
     runtime.set_history_provider(host_history);
     // CTX-1169 (issue #1976): seed the approved wallpaper roots before
@@ -592,6 +626,7 @@ pub(crate) fn discover_with_roots(
         snapshot,
         workspaces,
         pin_state,
+        history,
     })
 }
 
@@ -807,6 +842,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session");
@@ -1041,6 +1077,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session");
@@ -1200,6 +1237,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session");
@@ -1338,6 +1376,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
         discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
             .expect("dev root must yield a session")

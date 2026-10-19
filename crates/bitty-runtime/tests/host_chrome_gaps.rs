@@ -21,7 +21,9 @@
 
 use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiSlot};
 use bitty_platform::{CursorPosition, MouseButton, PressState};
-use bitty_runtime::{BandContent, BandEdge, ChromeBands, Runtime, UiRect, band_click_args_table};
+use bitty_runtime::{
+    BandContent, BandEdge, BandMount, ChromeBands, Runtime, UiRect, band_click_args_table,
+};
 
 fn minimal_runtime() -> Runtime {
     Runtime::with_defaults().expect("runtime must build")
@@ -785,4 +787,177 @@ fn band_scroll_with_foreign_command_is_denied() {
         "a foreign scroll never routes"
     );
     assert_eq!(rt.band_host_stats().scrolls_denied, 1);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1332 C-D4/C-D5: presented origins, remount fences, eager cancellation
+// ---------------------------------------------------------------------------
+
+fn mount_bottom_bar_with_mount(rt: &mut Runtime, root: UiNode, generation: u32, handle: i64) {
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            bottom: vec![text_band("test-bar", UiSlot::Bottom, root)],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Bottom,
+            version: 1,
+            generation,
+            handle,
+        }],
+    );
+}
+
+#[test]
+fn band_origin_publishes_only_after_a_presented_frame() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar_with_mount(&mut rt, UiNode::row(vec![pill("bar", 1.0)]), 7, 42);
+    // Captured for the pending frame but not executable yet.
+    assert!(
+        rt.published_band_origins().is_empty(),
+        "no-draw/bookkeeping path publishes nothing"
+    );
+    let pending = rt.band_frame_identity();
+    assert_eq!(pending.len(), 1);
+    let pending_origin = pending[0].origin.as_ref().expect("painted origin");
+    assert_eq!(pending_origin.generation, 7);
+    assert_eq!(pending_origin.handle, 42);
+
+    assert!(rt.tick().is_some(), "mounted band presents");
+    let origin = rt
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("presented origin");
+    assert_eq!(origin.generation, 7);
+    assert_eq!(origin.handle, 42);
+    assert_eq!(origin.slot, UiSlot::Bottom);
+    assert_eq!(origin.edge, BandEdge::Bottom);
+    assert_eq!(origin.visible_index, 0);
+    assert_eq!(origin.row, bar_row(&rt));
+    assert!(rt.band_origin_is_current(&origin));
+}
+
+#[test]
+fn version_one_remount_and_edge_move_invalidate_the_old_origin() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar_with_mount(&mut rt, UiNode::row(vec![pill("bar", 1.0)]), 7, 42);
+    assert!(rt.tick().is_some());
+    let first = rt
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("first origin");
+
+    // Replacement mount: the version restarts at 1 but the generation and
+    // handle are new, so the old origin must not compare equal.
+    mount_bottom_bar_with_mount(&mut rt, UiNode::row(vec![pill("bar", 1.0)]), 8, 43);
+    assert!(
+        !rt.band_origin_is_current(&first),
+        "version-1 replacement refuses the stale origin"
+    );
+    assert!(rt.tick().is_some(), "replacement forces a frame");
+    let second = rt
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("second origin");
+    assert_ne!(second, first);
+    assert_eq!(second.generation, 8);
+    assert_eq!(second.handle, 43);
+    assert!(rt.band_origin_is_current(&second));
+
+    // Edge move at an unchanged version: the damage identity and the origin
+    // both include the edge (F7).
+    let moved = BandContent {
+        plugin_id: "test-bar".to_string(),
+        slot: UiSlot::Top,
+        root: UiNode::row(vec![pill("bar", 1.0)]),
+        version: 1,
+    };
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            top: vec![moved],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Top,
+            version: 1,
+            generation: 8,
+            handle: 43,
+        }],
+    );
+    assert!(
+        !rt.band_origin_is_current(&second),
+        "edge move refuses the old origin before the next frame"
+    );
+    assert!(rt.tick().is_some(), "edge move forces a frame");
+    let moved_origin = rt
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("moved origin");
+    assert_eq!(moved_origin.edge, BandEdge::Top);
+    assert_ne!(moved_origin, second);
+}
+
+#[test]
+fn cancellation_drops_queued_admissions_and_keeps_the_release_swallow() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar_with_mount(&mut rt, UiNode::row(vec![pill("bar", 1.0)]), 7, 42);
+    assert!(rt.tick().is_some());
+    let row = bar_row(&rt);
+
+    // A complete click queues one origin-stamped admission.
+    click_at(&mut rt, row, 0);
+    assert_eq!(
+        rt.drain_band_clicks().len(),
+        1,
+        "origin-stamped click queued"
+    );
+
+    // Republish the same origin and queue again; then remove every mount.
+    click_at(&mut rt, row, 0);
+    assert_eq!(rt.drain_band_clicks().len(), 1);
+    rt.set_chrome_bands_with_mounts(ChromeBands::default(), Vec::new());
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "unmount eagerly cancels queued admissions"
+    );
+
+    // Arm a press, cancel mounts, and prove physical release ownership stays
+    // with the existing press state (never clear_band_press).
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            bottom: vec![text_band(
+                "test-bar",
+                UiSlot::Bottom,
+                UiNode::row(vec![pill("bar", 1.0)]),
+            )],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Bottom,
+            version: 1,
+            generation: 7,
+            handle: 42,
+        }],
+    );
+    let _ = rt.tick();
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 0));
+    rt.handle_mouse_input(press());
+    assert!(rt.band_release_armed(), "press arms the swallow");
+    rt.set_chrome_bands_with_mounts(ChromeBands::default(), Vec::new());
+    assert!(
+        rt.band_release_armed(),
+        "cancellation must not clear the release swallow"
+    );
+    rt.handle_mouse_input(release());
+    assert!(
+        !rt.band_release_armed(),
+        "the invalidated action consumes its release"
+    );
 }

@@ -20,10 +20,12 @@ use bitty_lua::{
 };
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, OVERLAY_CAPTURE_TIMEOUT_MS, PluginRuntime, PluginRuntimeConfig, SettingsSource,
-    SnapshotSource, UiBlock,
+    LifecycleState, OVERLAY_CAPTURE_TIMEOUT_MS, PluginRuntime, PluginRuntimeConfig,
+    PluginRuntimeError, SettingsSource, SnapshotSource, UiBlock,
 };
-use bitty_runtime::{BandEdge, ChromeBands, E_UI_UNAVAILABLE};
+use bitty_runtime::{
+    BandEdge, BandOrigin, ChromeBands, E_UI_UNAVAILABLE, UiSlotPlacement, ui_slot_placement,
+};
 
 // ---------------------------------------------------------------------------
 // Mount-loop wall-clock budget (bitty#1744, CTX-1001)
@@ -1315,4 +1317,154 @@ fn overlay_capture_timeout_bound_is_finite() {
     // hold: it must be positive and inside a reviewed ceiling.
     const { assert!(OVERLAY_CAPTURE_TIMEOUT_MS > 0) };
     const { assert!(OVERLAY_CAPTURE_TIMEOUT_MS <= 300_000) };
+}
+
+/// CTX-1332 C-D4: capture the presentation origin for the fixture's mounted
+/// block from the live mount registry (the runtime-level join is exercised in
+/// the host-chrome suites).
+fn band_origin_for(runtime: &PluginRuntime, id: &PluginId) -> BandOrigin {
+    let blocks = runtime.ui_blocks_with_handles();
+    let (_, slot, _, version, generation, handle) = blocks
+        .iter()
+        .find(|(plugin, ..)| plugin.as_str() == id.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "fixture mounted a block; live ids={:?}",
+                blocks
+                    .iter()
+                    .map(|block| block.0.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    let UiSlotPlacement::Band(edge) = ui_slot_placement(*slot) else {
+        panic!("fixture block must be a band");
+    };
+    BandOrigin {
+        plugin_id: id.to_string(),
+        generation: *generation,
+        handle: *handle,
+        slot: *slot,
+        version: *version,
+        edge,
+        visible_index: 0,
+        row: 0,
+    }
+}
+
+/// CTX-1332 C-D5/C-D6: the additive UI dispatch entry requires an `Active`
+/// generation and a live origin (generation, handle, slot, exact version), and
+/// delegates the actual invocation to the existing `dispatch_command` body.
+#[test]
+fn dispatch_ui_command_fences_origin_and_lifecycle() {
+    let mut fixture = Fixture::activate_with_commands(
+        "cold-ui-dispatch",
+        "test-cold.ui",
+        &["ui.rich"],
+        &[],
+        &["step"],
+        r#"
+local n = 0
+bitty.commands.register({ id = "step", title = "Step", run = function(args)
+  n = n + 1
+  return tostring(n)
+end })
+bitty.ui.mount("bottom", { kind = "Text", text = "cold" })
+return {}
+"#,
+    );
+    assert_eq!(
+        fixture.runtime.ui_blocks().len(),
+        1,
+        "fixture must mount one block: {:?}",
+        fixture.runtime.ui_blocks()
+    );
+    assert_eq!(
+        fixture.runtime.ui_blocks_with_handles().len(),
+        1,
+        "handles projection must see the same block"
+    );
+    eprintln!("origin: first");
+    let origin = band_origin_for(&fixture.runtime, &fixture.id);
+
+    // Positive control: the live origin delegates to the generic body.
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &origin)
+            .expect("live origin"),
+        LuaValue::String("1".to_string())
+    );
+
+    // Stale generation/handle/version/slot all fail closed with the existing
+    // lifecycle error class (no new error code).
+    let mut stale = origin.clone();
+    stale.generation = stale.generation.saturating_add(1);
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &stale),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+    let mut stale = origin.clone();
+    stale.handle = stale.handle.saturating_add(1);
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &stale),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+    let mut stale = origin.clone();
+    stale.version = stale.version.saturating_add(1);
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &stale),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+    let mut stale = origin.clone();
+    stale.slot = UiSlot::Overlay;
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &stale),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+
+    // Reload tears down N before N+1: the old generation/handle is dead and
+    // the fresh origin is live.
+    let before_reload = band_origin_for(&fixture.runtime, &fixture.id);
+    fixture.runtime.reload(&fixture.id).expect("reload");
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &before_reload),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+    let after_reload = band_origin_for(&fixture.runtime, &fixture.id);
+    assert_ne!(after_reload.generation, before_reload.generation);
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &after_reload)
+            .expect("fresh origin"),
+        LuaValue::String("1".to_string())
+    );
+
+    // Active is mandatory: a suspended generation refuses even a live origin.
+    fixture.runtime.suspend(&fixture.id).expect("suspend");
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &after_reload),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
+
+    // Dispose drops the VM: the live-at-capture origin is no longer valid.
+    fixture.runtime.dispose(&fixture.id).expect("dispose");
+    assert!(matches!(
+        fixture
+            .runtime
+            .dispatch_ui_command(&fixture.id, "step", &[], &after_reload),
+        Err(PluginRuntimeError::Lifecycle { .. })
+    ));
 }

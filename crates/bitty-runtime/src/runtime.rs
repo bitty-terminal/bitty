@@ -521,12 +521,16 @@ pub struct Runtime {
     /// allocations and generations are identical, so a focus change also
     /// forces a full present. Updated alongside the allocations.
     last_presented_focus: Option<ViewId>,
-    /// Mounted band versions at the last present (CTX-0946 C2).
+    /// Mounted band identity at the last *presented* frame (CTX-0946 C2,
+    /// CTX-1332 C-D4/F7).
     ///
-    /// Compared per tick against [`band_host`](self::band_host)
-    /// versions so a plugin mount/update/unmount presents on a quiet grid.
-    /// Updated on every present alongside the allocations.
-    last_presented_bands: Vec<(String, bitty_lua::ui::UiSlot, u32)>,
+    /// Compared per tick against [`band_host`](self::band_host) identity so a
+    /// plugin mount/update/unmount, an edge move at an unchanged version, or
+    /// a replacement mount whose version restarts at 1 presents on a quiet
+    /// grid. Unlike the older version triple this includes the band edge and
+    /// the captured origin. Assigned only on the eligible presentation
+    /// boundary: a no-draw/bookkeeping path publishes nothing clickable.
+    last_presented_bands: Vec<band_host::BandFrameIdentity>,
     cols: usize,
     rows: usize,
     layout: LayoutNode,
@@ -907,6 +911,16 @@ pub struct Runtime {
     /// [`BAND_SCROLL_QUEUE_MAX`](self::band_host::BAND_SCROLL_QUEUE_MAX);
     /// consecutive ticks for one target coalesce into one slot.
     band_scroll_queue: Vec<band_host::BandScrollRequest>,
+    /// Monotonic admission sequence across click/scroll/keyboard work
+    /// (CTX-1332, C-D4). Checked-add; exhaustion refuses admission.
+    admission_seq: u64,
+    /// Origins captured from the live mount projection for the current band
+    /// snapshot, before presentation (CTX-1332, C-D4). Never executable until
+    /// a frame actually presents.
+    pending_band_origins: Vec<band_host::BandOrigin>,
+    /// Origins published by the last successfully presented frame
+    /// (CTX-1332, C-D4). Input admission reads only this set.
+    published_band_origins: Vec<band_host::BandOrigin>,
     /// Press-side band target armed by the last consumed band press
     /// (CTX-0946 C1 review: standard button semantics — the paired release
     /// routes only onto the same band run). `None` when no band press owns
@@ -1721,6 +1735,9 @@ impl Runtime {
             band_release_swallow: false,
             band_click_queue: Vec::new(),
             band_scroll_queue: Vec::new(),
+            admission_seq: 0,
+            pending_band_origins: Vec::new(),
+            published_band_origins: Vec::new(),
             band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
@@ -1987,6 +2004,9 @@ impl Runtime {
             band_release_swallow: false,
             band_click_queue: Vec::new(),
             band_scroll_queue: Vec::new(),
+            admission_seq: 0,
+            pending_band_origins: Vec::new(),
+            published_band_origins: Vec::new(),
             band_press_target: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
@@ -2339,6 +2359,11 @@ impl Runtime {
     /// plugin_runtime types directly.
     pub fn set_chrome_bands(&mut self, bands: ChromeBands) {
         self.chrome_bands = bands;
+        // CTX-1332 C-D4: without a live mount projection there is no
+        // executable origin. Fail closed by clearing pending origins and
+        // cancelling queued/armed admissions; the release swallow is kept.
+        self.pending_band_origins.clear();
+        self.retain_live_band_admissions(&[]);
     }
 
     /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).

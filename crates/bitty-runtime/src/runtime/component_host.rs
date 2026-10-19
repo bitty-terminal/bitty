@@ -138,7 +138,7 @@ impl Runtime {
         if self.component_host.is_none() {
             return Err(ComponentHostError::Unavailable);
         }
-        let grant = self.component_grant(plugin_id, manifest_hash)?;
+        let grant = self.authorize_component(plugin_id, manifest_hash, component)?;
         let host = self
             .component_host
             .as_mut()
@@ -163,12 +163,31 @@ impl Runtime {
         if self.component_host.is_none() {
             return Err(ComponentHostError::Unavailable);
         }
-        let grant = self.component_grant(plugin_id, manifest_hash)?;
+        let grant = self.authorize_component(plugin_id, manifest_hash, component)?;
         let host = self
             .component_host
             .as_mut()
             .ok_or(ComponentHostError::Unavailable)?;
         host.request(component, &grant, request)
+    }
+
+    /// [`Self::component_grant`], recording a fail-closed denial so
+    /// `bitty extension list` reports `denied:<class>` (#2254).
+    fn authorize_component(
+        &mut self,
+        plugin_id: &str,
+        manifest_hash: &str,
+        component: &str,
+    ) -> Result<PluginGrant, ComponentHostError> {
+        match self.component_grant(plugin_id, manifest_hash) {
+            Ok(grant) => Ok(grant),
+            Err(error) => {
+                if let Some(host) = self.component_host.as_mut() {
+                    host.record_denial(component, &error);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Drain pending component events and advance lifecycle policy.

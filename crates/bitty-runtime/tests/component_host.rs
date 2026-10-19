@@ -21,8 +21,9 @@ use bitty_plugin_host::{
 };
 use bitty_runtime::Runtime;
 use bitty_runtime::component::{
-    BrokerEventKind, COMPONENT_HANDSHAKE_TIMEOUT, ComponentRequest, ComponentState,
-    ComponentWarnSink, StopOutcome, executable_file_name,
+    ActivationDenial, ActivationState, BrokerEventKind, COMPONENT_HANDSHAKE_TIMEOUT,
+    ComponentRequest, ComponentState, ComponentWarnSink, StopOutcome, executable_file_name,
+    read_component_activation,
 };
 use bitty_terminal::component::{ComponentContext, run_component_subcommand};
 use bitty_terminal::component_host::install_with_roots;
@@ -667,5 +668,106 @@ fn install_via_add_with_name(root: &Path, executable: &Path, name: &str, version
         0,
         "real add failed: {}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Activation projection consumed by `bitty extension list` (#2254)
+// ---------------------------------------------------------------------------
+
+fn activation_state(root: &Path) -> ActivationState {
+    read_component_activation(Some(root), None, NAME)
+}
+
+#[test]
+fn activation_is_installed_before_any_request_and_active_after() {
+    let scratch = Scratch::new("activation-active");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    // Installed through the real `add` path, never requested: no activation.
+    assert_eq!(activation_state(scratch.path()), ActivationState::Installed);
+
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+    let response = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect("component response");
+    assert_eq!(response.status, 200);
+    assert_eq!(activation_state(scratch.path()), ActivationState::Active);
+}
+
+#[test]
+fn denied_request_records_denied_with_the_named_class() {
+    let scratch = Scratch::new("activation-denied");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let manifest = plugin_manifest(PLUGIN, None);
+    let hash = manifest.manifest_hash();
+    runtime.register_plugin(manifest).expect("register plugin");
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    runtime
+        .activate_plugin(&plugin_id)
+        .expect("activate plugin");
+    runtime.insert_grant(GrantRecord::granted(
+        plugin_id,
+        hash.clone(),
+        BTreeSet::new(),
+        1,
+    ));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("denied");
+    assert_eq!(error.class(), "capability_denied");
+    assert_no_spawn(&runtime, NAME);
+    assert_eq!(
+        activation_state(scratch.path()),
+        ActivationState::Denied(ActivationDenial::CapabilityDenied),
+        "denied requests must record the named class, not an unearned active"
+    );
+}
+
+#[test]
+fn lifecycle_denial_records_plugin_not_active() {
+    let scratch = Scratch::new("activation-not-active");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let mut runtime = runtime_with_host(scratch.path());
+    let manifest = plugin_manifest(PLUGIN, Some(&format!("network.connect:{HOST}")));
+    let hash = manifest.manifest_hash();
+    let plugin_id = PluginId::new(PLUGIN).expect("valid id");
+    runtime.register_plugin(manifest).expect("register plugin");
+    let mut granted = BTreeSet::new();
+    granted.insert(network_capability());
+    runtime.insert_grant(GrantRecord::granted(plugin_id, hash.clone(), granted, 1));
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("registered plugin must deny");
+    assert_eq!(error.class(), "plugin_not_active");
+    assert_eq!(
+        activation_state(scratch.path()),
+        ActivationState::Denied(ActivationDenial::PluginNotActive)
+    );
+}
+
+#[test]
+fn untrusted_install_records_the_untrusted_class() {
+    let scratch = Scratch::new("activation-untrusted");
+    install_via_add(scratch.path(), Path::new(FIXTURE));
+    let executable = scratch
+        .path()
+        .join(NAME)
+        .join(VERSION)
+        .join(executable_file_name(&format!("bitty-{NAME}")));
+    std::fs::write(&executable, b"tampered").expect("tamper");
+    let mut runtime = runtime_with_host(scratch.path());
+    let hash = register_granted(&mut runtime);
+
+    let error = runtime
+        .component_request(PLUGIN, &hash, NAME, request())
+        .expect_err("digest mismatch");
+    assert_eq!(error.class(), "component_untrusted");
+    assert_eq!(
+        activation_state(scratch.path()),
+        ActivationState::Denied(ActivationDenial::Untrusted)
     );
 }

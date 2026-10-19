@@ -18,11 +18,12 @@ use bitty_network_wire::{ErrorKind, Method};
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::NetworkEgress;
 use bitty_runtime::component::{
-    BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, COMPONENT_DEADLINE_CRASH_THRESHOLD,
-    COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT, COMPONENT_MAX_IN_FLIGHT,
-    COMPONENT_REQUEST_DEADLINE_GRACE, COMPONENT_REQUEST_MAX_TIMEOUT, COMPONENT_SHUTDOWN_GRACE,
-    ComponentBroker, ComponentEnv, ComponentRequest, ComponentState, PluginGrant, RequestId,
-    ResolveError, StopOutcome, effective_timeout, executable_file_name,
+    ActivationDenial, ActivationState, BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind,
+    COMPONENT_DEADLINE_CRASH_THRESHOLD, COMPONENT_HANDSHAKE_TIMEOUT, COMPONENT_IDLE_TIMEOUT,
+    COMPONENT_MAX_IN_FLIGHT, COMPONENT_REQUEST_DEADLINE_GRACE, COMPONENT_REQUEST_MAX_TIMEOUT,
+    COMPONENT_SHUTDOWN_GRACE, ComponentBroker, ComponentEnv, ComponentRequest, ComponentState,
+    PluginGrant, RequestId, ResolveError, StopOutcome, effective_timeout, executable_file_name,
+    read_activation,
 };
 
 /// Real-time bound for any single wait on the fixture process.
@@ -643,5 +644,127 @@ fn idle_stop_hands_the_stderr_tail_to_the_warn_sink() {
     assert_eq!(warns.len(), 1);
     assert_eq!(warns[0].0, NAME);
     assert_eq!(warns[0].1, "idle stop");
+    let _ = broker.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// activation projection (#2254): what `bitty extension list` reports
+// ---------------------------------------------------------------------------
+
+#[test]
+fn activation_is_installed_until_the_first_spawn_then_active() {
+    let scratch = Scratch::new("activation-active");
+    install(&scratch.0, "echo");
+    let component_dir = scratch.0.join(NAME);
+    // Installed but never requested: no record, never `active`.
+    assert_eq!(read_activation(&component_dir), ActivationState::Installed);
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let t0 = Instant::now();
+    let id = broker
+        .submit(t0, NAME, &grant(), request())
+        .expect("submit");
+    until_terminal(&mut broker, t0, id);
+    assert_eq!(read_activation(&component_dir), ActivationState::Active);
+    // A clean idle stop keeps the process state honest.
+    let idle = t0 + COMPONENT_IDLE_TIMEOUT;
+    let _ = broker.poll(idle);
+    until_state(&mut broker, idle, ComponentState::Stopped);
+    assert_eq!(read_activation(&component_dir), ActivationState::Stopped);
+    let _ = broker.shutdown();
+}
+
+#[test]
+fn activation_marks_a_crashed_component() {
+    let scratch = Scratch::new("activation-crash");
+    install(&scratch.0, "crash");
+    let component_dir = scratch.0.join(NAME);
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let now = Instant::now();
+    let id = broker
+        .submit(now, NAME, &grant(), request())
+        .expect("submit");
+    let events = until_terminal(&mut broker, now, id);
+    assert_eq!(
+        failed_kind(&events, id),
+        Some(ErrorKind::ComponentLost),
+        "fixture must crash"
+    );
+    assert_eq!(read_activation(&component_dir), ActivationState::Crashed);
+    // The post-crash backoff is a transient refusal: it must not overwrite
+    // the recorded crash with a denial.
+    assert!(matches!(
+        broker.submit(now, NAME, &grant(), request()),
+        Err(BrokerError::Backoff { .. })
+    ));
+    assert_eq!(read_activation(&component_dir), ActivationState::Crashed);
+}
+
+#[test]
+fn a_denial_does_not_mask_a_running_component() {
+    let scratch = Scratch::new("activation-live-denial");
+    install(&scratch.0, "echo");
+    let component_dir = scratch.0.join(NAME);
+    let mut broker = broker(&scratch.0, ComponentEnv::empty());
+    let t0 = Instant::now();
+    let id = broker
+        .submit(t0, NAME, &grant(), request())
+        .expect("submit");
+    until_terminal(&mut broker, t0, id);
+    assert_eq!(read_activation(&component_dir), ActivationState::Active);
+    // A second plugin's denial must not hide the running component.
+    broker.record_activation(
+        NAME,
+        ActivationState::Denied(ActivationDenial::CapabilityDenied),
+    );
+    assert_eq!(read_activation(&component_dir), ActivationState::Active);
+    let _ = broker.shutdown();
+}
+
+#[test]
+fn activation_names_a_denial_class_and_never_escapes_the_root() {
+    let scratch = Scratch::new("activation-denied");
+    install(&scratch.0, "echo");
+    let component_dir = scratch.0.join(NAME);
+    let broker = broker(&scratch.0, ComponentEnv::empty());
+    broker.record_activation(
+        NAME,
+        ActivationState::Denied(ActivationDenial::CapabilityDenied),
+    );
+    assert_eq!(
+        read_activation(&component_dir),
+        ActivationState::Denied(ActivationDenial::CapabilityDenied)
+    );
+    // Path-shaped names and unknown components write nothing and never
+    // escape the component root.
+    broker.record_activation(
+        "../escape",
+        ActivationState::Denied(ActivationDenial::Untrusted),
+    );
+    broker.record_activation(
+        "not-installed",
+        ActivationState::Denied(ActivationDenial::Untrusted),
+    );
+    assert!(!scratch.0.parent().expect("parent").join("escape").exists());
+    assert!(!scratch.0.join("not-installed").exists());
+}
+
+#[test]
+fn system_only_components_are_not_recorded() {
+    // The system tier is read-only: a broker configured without a user root
+    // never writes an activation record (the component lists as installed).
+    let scratch = Scratch::new("activation-system");
+    install(&scratch.0, "echo");
+    let mut broker = ComponentBroker::new(
+        BrokerConfig::new(None, ComponentEnv::empty()).with_system_root(Some(scratch.0.clone())),
+    );
+    let now = Instant::now();
+    let id = broker
+        .submit(now, NAME, &grant(), request())
+        .expect("submit");
+    until_terminal(&mut broker, now, id);
+    assert_eq!(
+        read_activation(&scratch.0.join(NAME)),
+        ActivationState::Installed
+    );
     let _ = broker.shutdown();
 }

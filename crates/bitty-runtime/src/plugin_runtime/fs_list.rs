@@ -596,6 +596,19 @@ mod tests {
         dir
     }
 
+    /// Removes a fixture tree when the test ends, including on panic.
+    ///
+    /// The multi-thousand-entry fixtures below would otherwise accumulate in
+    /// the temp directory across runs and eventually exhaust its inode
+    /// budget, which surfaces as a misleading `StorageFull` fixture error.
+    struct FixtureCleanup(PathBuf);
+
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Fixture deadline for tests that assert the entry/byte caps, not time.
     ///
     /// The production [`FsListBackend::list`] budget is the accepted RC-1
@@ -792,6 +805,7 @@ mod tests {
     #[test]
     fn oversized_directory_is_bounded_by_entries_and_bytes() {
         let home = temp_home("oversized");
+        let _cleanup = FixtureCleanup(home.clone());
         std::fs::create_dir_all(home.join("docs")).expect("docs");
         for index in 0..(FS_LIST_MAX_ENTRIES + 8) {
             touch(&home, &format!("docs/file-{index:04}.txt"), "x");
@@ -1072,6 +1086,7 @@ mod tests {
     #[test]
     fn large_directory_aborts_near_the_scan_deadline() {
         let home = temp_home("deadline");
+        let _cleanup = FixtureCleanup(home.clone());
         std::fs::create_dir_all(home.join("docs")).expect("docs");
         for index in 0..20_000 {
             std::fs::File::create(home.join(format!("docs/f{index:05}"))).expect("entry");

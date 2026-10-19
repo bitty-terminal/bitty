@@ -17,7 +17,9 @@
 //! `bitty-platform` clipboard remain headless-testable, and the workspace
 //! `just check` + `cargo test` gates stay green (see soak doc).
 //!
-//! Every test is bounded, headless, deterministic, and under 10s (90s on Windows). No window,
+//! Every test is bounded, headless, and deterministic, and each carries its own wall-clock
+//! liveness budget (the 1000-tick soak documents its CI and local budgets on
+//! `SOAK_HEADLESS_BUDGET_CI` / `SOAK_HEADLESS_BUDGET_LOCAL`). No window,
 //! GPU, or PTY is required for the default `cargo test` run. Real PTY/real
 //! GPU legs are `#[cfg(unix)]` / env-gated and skip gracefully when the
 //! resource is absent, so CI stays green.
@@ -49,6 +51,22 @@ use bitty_ui::{LayoutNode, View, ViewId};
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("default headless runtime must build")
 }
+
+/// Liveness budget for the 1000-tick headless soak on a CI runner.
+///
+/// The bound is a hang detector, not a performance target: a hang never
+/// finishes, while a correct run only tracks runner speed. Measured on the
+/// 2026-10-19 Tier-1 shards (CTX-1348 head): Linux Wayland 120.8s, Linux X11
+/// 114.2s, Windows 115.1s, versus ~6.6s isolated on the development host. The
+/// budget is twice the slowest observation, so a loaded shard cannot fail a
+/// correct run, while an order-of-magnitude regression still trips it.
+const SOAK_HEADLESS_BUDGET_CI: Duration = Duration::from_secs(240);
+
+/// Liveness budget for the same soak off CI, where it takes ~6.6s.
+///
+/// Ten times the isolated observation keeps the guard meaningful on a local
+/// run without turning a loaded workstation into a flake.
+const SOAK_HEADLESS_BUDGET_LOCAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Headless soak: 1000 ticks of synthetic shell bytes, bounded queues, no leak
@@ -132,14 +150,19 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
         "most soak iterations should present, got {presented} presented, {idle} idle"
     );
     // Wall budget is liveness guard only (functional bounds like caps/determinism remain strict
-    // and unchanged); measured: local isolated ~3.2s vs CI 94.3s/95.6s on 2 runners (CTX-0193,
-    // PX-0793/94/95/96). CTX-0157 cells contribute only +6-12%. Budget = max-observed 95.6s
-    // + ~25% headroom = 120s uniform. Real hangs are orders of magnitude slower, so liveness
-    // is still guarded.
-    let budget = Duration::from_secs(120);
+    // and unchanged). Both bounds and their measurement basis are documented on the constants:
+    // CI gets an explicit 2x margin over the slowest observed shard, off CI keeps a tighter
+    // 10x-isolated check. Real hangs are orders of magnitude slower, so liveness is still
+    // guarded.
+    let is_ci = std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok();
+    let budget = if is_ci {
+        SOAK_HEADLESS_BUDGET_CI
+    } else {
+        SOAK_HEADLESS_BUDGET_LOCAL
+    };
     assert!(
         elapsed < budget,
-        "soak must be fast, took {elapsed:?} (budget {budget:?})"
+        "soak must be fast, took {elapsed:?} (budget {budget:?}, ci={is_ci})"
     );
 
     // Post-soak: surface extent unchanged (no resize in this leg), RGBA valid.

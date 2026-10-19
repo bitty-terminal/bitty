@@ -19,6 +19,10 @@ cargo deny check
 echo "==> cargo audit"
 tmpdb="$(mktemp -d)"
 trap 'rm -rf "$tmpdb"' EXIT INT TERM
-cargo audit --db "$tmpdb" --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+# RUSTSEC-2026-0009 (time < 0.3.47) is the rcgen/yasna path carried by the
+# opt-in `publication-control` feature; deny.toml records the full
+# justification (parsing feature off, no RFC 2822 input). Remove this ignore
+# when the MSRV moves to 1.88 and time is raised to >= 0.3.47.
+cargo audit --db "$tmpdb" --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0009
 trap - EXIT INT TERM
 rm -rf "$tmpdb"

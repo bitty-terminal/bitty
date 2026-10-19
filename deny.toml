@@ -2,6 +2,11 @@
 targets = []
 all-features = false
 no-default-features = false
+# CTX-1373: the opt-in `publication-control` graph is not part of the default
+# terminal build but ships in feature-enabled builds, and it carries the
+# rcgen/time advisory path. Check it alongside the default graph; dev-only
+# test-support features (for example the fixture TLS 1.2 server) stay out.
+features = ["publication-control"]
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
@@ -15,7 +20,18 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Time bound (CTX-0634, P0-AC-034 exception policy): re-check both upstream
 # replacements no later than 2027-03-31 and drop each ignore when its
 # replacement lands; any extension needs a dated ADR-0004 revision.
-ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436"]
+#
+# RUSTSEC-2026-0009 (time < 0.3.47, RFC 2822 stack exhaustion): `time` enters
+# the graph only through `bitty-network-publication`'s rcgen path (rcgen ->
+# yasna -> time) for the opt-in `publication-control` feature. The `parsing`
+# feature is disabled in that dependency, and yasna builds its timestamps from
+# calendar components rather than parsing calendar text, so no RFC 2822 string
+# can reach the vulnerable parser. The fix in time 0.3.47 requires rustc 1.88,
+# above the workspace MSRV 1.85; adding a direct dependency-adoption decision
+# is out of scope for CTX-1373. Time bound (P0-AC-034): review by 2027-03-31 or
+# earlier when the MSRV moves to 1.88; then remove this ignore and raise `time`
+# to >= 0.3.47. Any extension needs a dated ADR-0004 revision.
+ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436", "RUSTSEC-2026-0009"]
 
 [bans]
 multiple-versions = "warn"
@@ -69,12 +85,15 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
-# bitty-network is pinned to commit c69fe57 for the `bitty-network-wire`
-# crate only (CTX-0906, DIR-030): the dependency-free native-component wire
-# protocol v1 codec the component broker speaks to out-of-process components.
-# Core never links a bitty-network implementation crate (HTTP/TLS/DNS stay
-# in the separately installed `bitty-net` component); the embedded
-# `bitty-network-lua` path at d97c5da was removed.
+# bitty-network is pinned for two crates: `bitty-network-wire` at c69fe57
+# (CTX-0906, DIR-030), the dependency-free native-component wire protocol v1
+# codec the component broker speaks to out-of-process components, and
+# `bitty-network-publication` at c8710e0 (CTX-1373), the launch-scoped
+# mutual-certificate provider-publication transport linked only behind the
+# opt-in `publication-control` feature. Core still never links a general
+# network implementation crate (HTTP/DNS stay in the separately installed
+# `bitty-net` component); the embedded `bitty-network-lua` path at d97c5da was
+# removed.
 # bitty-ipc is a first-party extraction target (CTX-1585, bitty#1585) and
 # stays linked as Core's inbound socket mechanism (DIR-030): pulled from the
 # independent bitty-terminal/bitty-ipc repository at an exact rev (aa7259d) by

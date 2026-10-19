@@ -895,6 +895,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn out_of_grant_sensitive_target_denies_as_scope_mismatch() {
+        // Canonical containment must be decided before any sensitivity fact:
+        // an escaping symlink whose target happens to be `~/.ssh` must answer
+        // exactly like any other out-of-grant target, so a plugin cannot use
+        // the denial code to probe the resolved target. An in-grant
+        // sensitive path keeps its own typed denial for contrast.
+        let home = temp_home("ordering");
+        touch(&home, "docs/inside.txt", "x");
+        touch(&home, ".ssh/authorized_keys", "k");
+        touch(&home, "docs/shadow", "x");
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("docs/escape")).expect("symlink");
+        let backend = FsListBackend::new(&home);
+
+        for request in [
+            "~/docs/escape",
+            "~/docs/escape/authorized_keys",
+            "~/docs/escape/shadow",
+            "~/docs/escape/missing",
+        ] {
+            let error = backend
+                .list(&grant("~/docs/**"), request, 16)
+                .expect_err("out-of-grant target must deny");
+            assert_eq!(
+                error.code, "E_FS_SCOPE_MISMATCH",
+                "request {request} must not reveal the target's sensitivity"
+            );
+        }
+
+        let error = backend
+            .list(&grant("~/docs/**"), "~/docs/shadow", 16)
+            .expect_err("in-grant sensitive path must deny");
+        assert_eq!(error.code, "E_FS_SENSITIVE_PATH");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlinked_grant_root_fails_closed() {
         // A grant root that is itself a symlink silently changes meaning
         // (`~/docs -> /` would list the host); it is rejected at grant
@@ -910,8 +946,12 @@ mod tests {
             .expect_err("symlinked grant root must not resolve");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
-        // The same applies to an intermediate literal segment.
+        // The same applies to an intermediate literal segment. The target
+        // tree must exist, otherwise the grant would be rejected for a
+        // missing directory and the per-segment symlink check itself would
+        // go untested.
         std::fs::create_dir_all(home.join("plain")).expect("plain");
+        std::fs::create_dir_all(outside.join("docs")).expect("outside docs target");
         std::os::unix::fs::symlink(&outside, home.join("link")).expect("segment symlink");
         let error = backend
             .list(&grant("~/link/docs/**"), "~/link/docs", 16)

@@ -1892,7 +1892,14 @@ impl PluginServices {
 
     /// Reset the per-plugin `fs.list` window once the accepted window elapsed.
     fn refresh_fs_window(&self) {
-        let now = Instant::now();
+        self.refresh_fs_window_at(Instant::now());
+    }
+
+    /// [`Self::refresh_fs_window`] at an explicit instant.
+    ///
+    /// The explicit clock keeps the window boundary testable without a
+    /// wall-clock sleep; production always passes [`Instant::now`].
+    fn refresh_fs_window_at(&self, now: Instant) {
         if now.duration_since(self.fs_window_start.get()) >= FS_LIST_WINDOW {
             self.fs_gate.borrow_mut().advance_window();
             self.fs_window_start.set(now);
@@ -5616,6 +5623,44 @@ mod tests {
         let (call, error) = denial.expect("empty pages must still exhaust the op window");
         assert_eq!(error.code, "E_FS_OVER_BOUND");
         assert_eq!(call, FS_LIST_MAX_ENTRIES + 1);
+    }
+
+    #[test]
+    fn fs_list_window_reopens_after_the_accepted_window() {
+        // A plugin that exhausts the op window must regain capacity once the
+        // accepted window elapses. Drive the boundary through the explicit
+        // clock instead of sleeping, so the test is deterministic and fast.
+        let home = fs_list_test_home("window-reset");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::remove_file(home.join("docs").join(name)).expect("clear fixture");
+        }
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        // Empty pages return no bytes, so the op window is what runs out.
+        for _ in 0..FS_LIST_MAX_ENTRIES {
+            services.fs_list("~/docs", 16).expect("window has capacity");
+        }
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("exhausted window must deny");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+
+        // Still inside the same window: the usage is not cleared.
+        services.refresh_fs_window_at(
+            services.fs_window_start.get() + (FS_LIST_WINDOW - Duration::from_millis(1)),
+        );
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("usage must survive until the window elapses");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+
+        // One full window later the usage clears and listing resumes.
+        services.refresh_fs_window_at(services.fs_window_start.get() + FS_LIST_WINDOW);
+        services
+            .fs_list("~/docs", 16)
+            .expect("elapsed window must restore capacity");
     }
 
     fn env_services(grants: &[&str], values: &[(&str, &str)]) -> PluginServices {

@@ -15,6 +15,7 @@
 //! environment (or `$HOME`), never literals.
 
 use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -434,12 +435,27 @@ fn data_home() -> Option<PathBuf> {
 /// Process home used to resolve `~`-rooted `fs.read` grants (CTX-1348).
 ///
 /// `HOME` is authoritative on Unix; `USERPROFILE` is the Windows fallback.
-/// An absent home leaves the backend unwired, so `bitty.fs.list` fails
-/// closed with `E_NOT_IMPLEMENTED` rather than guessing a root.
+/// An absent, empty, or relative home leaves the backend unwired, so
+/// `bitty.fs.list` fails closed with `E_NOT_IMPLEMENTED` rather than guessing
+/// a root: an empty or relative home would otherwise resolve `~/docs` against
+/// the process working directory.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    abs_home_for(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+}
+
+/// First absolute, non-empty home candidate from explicit environment values.
+///
+/// Taking the values as arguments keeps the fallback (an empty `HOME` must not
+/// mask `USERPROFILE`) testable without mutating the process environment.
+fn abs_home_for(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Option<PathBuf> {
+    [home, userprofile]
+        .into_iter()
+        .flatten()
         .map(PathBuf::from)
+        .find(|path| path.is_absolute())
 }
 
 /// Untrusted local-path development roots from `$BITTY_PLUGIN_DIR`.
@@ -722,6 +738,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp root");
         dir
+    }
+
+    /// `home_dir` rejects an unsafe root instead of letting grants resolve
+    /// against the process working directory (CTX-1348 review).
+    #[test]
+    fn absent_empty_or_relative_home_is_rejected_with_fallback() {
+        let absolute = std::env::temp_dir();
+        assert!(abs_home_for(None, None).is_none());
+        assert!(abs_home_for(Some(OsStr::new("")), None).is_none());
+        assert!(abs_home_for(Some(OsStr::new("relative-home")), None).is_none());
+        assert_eq!(
+            abs_home_for(Some(absolute.as_os_str()), None),
+            Some(absolute.clone())
+        );
+        // An empty `HOME` must not mask the `USERPROFILE` fallback.
+        assert_eq!(
+            abs_home_for(Some(OsStr::new("")), Some(absolute.as_os_str())),
+            Some(absolute)
+        );
     }
 
     /// Composition-root wiring for `bitty.fs.list` (CTX-1348): a development

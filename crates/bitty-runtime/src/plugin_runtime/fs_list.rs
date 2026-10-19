@@ -96,6 +96,10 @@ pub struct FsListBackend {
 impl FsListBackend {
     /// Create a backend rooted at `home` for `~`-rooted requests.
     ///
+    /// `home` must be absolute. A relative or empty home makes every grant
+    /// unusable (fail closed), because its literal roots would otherwise
+    /// resolve against the process working directory.
+    ///
     /// The home is not canonicalized here: grants whose literal root does not
     /// resolve fail closed at call time, and every real path is canonicalized
     /// before use.
@@ -303,6 +307,13 @@ impl FsListBackend {
     /// symlink (mounted/redirected homes); its canonical form is the
     /// authority, so only segments *below* the home are rejected.
     fn literal_root(&self, pattern: &str) -> Option<PathBuf> {
+        if !self.home.is_absolute() {
+            // An empty or relative home would resolve the literal grant root
+            // against the process working directory, so no grant rooted there
+            // is usable. The composition root already rejects such a home;
+            // this keeps the public backend fail-closed on its own.
+            return None;
+        }
         let segments: Vec<&str> = pattern.split('/').collect();
         let literals: Vec<&str> = segments
             .iter()
@@ -646,6 +657,19 @@ mod tests {
 
     fn grant(pattern: &str) -> Vec<String> {
         vec![format!("fs.read:{pattern}")]
+    }
+
+    /// An empty or relative home must not turn `~/docs` into `$CWD/docs`
+    /// (CTX-1348 review).
+    #[test]
+    fn non_absolute_home_makes_every_grant_unusable() {
+        for home in ["", "relative-home", "."] {
+            let backend = FsListBackend::new(home);
+            let error = backend
+                .list(&grant("~/docs/**"), "~/docs", 16)
+                .expect_err("non-absolute home must fail closed");
+            assert_eq!(error.code, "E_FS_MISSING_GRANT", "home {home:?}");
+        }
     }
 
     #[test]

@@ -2126,6 +2126,12 @@ impl TerminalApp {
             .runtime
             .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);
         let mut attempted = 0usize;
+        // Defense-in-depth: every `drive_tick` calls
+        // `set_chrome_bands_with_mounts`, which eagerly retains only live
+        // origins, so a surviving admission normally passes this check. It
+        // remains for any state combination where pending/published diverge;
+        // `dispatch_ui_command` then re-queries the live mount registry
+        // immediately before the VM borrow.
         for admission in admissions {
             match admission {
                 bitty_runtime::BandAdmission::Click(click) => {

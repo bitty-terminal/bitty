@@ -197,7 +197,8 @@ return {}
                 assert!(
                     matches!(
                         operation,
-                        RecordingOperation::Poll
+                        RecordingOperation::WindowCreationRefused
+                            | RecordingOperation::Poll
                             | RecordingOperation::Wait
                             | RecordingOperation::WaitUntil(_)
                     ),
@@ -488,6 +489,10 @@ return {}
                 "SystemAppearanceChanged",
                 PlatformEvent::SystemAppearanceChanged(SystemAppearance::Light),
             ),
+            // Headless `Resumed` is the sixth `drive_tick` caller. In a
+            // recording context its window creation is refused and it falls
+            // back to one tick; the pump must still be unreachable here.
+            ("Resumed", PlatformEvent::Resumed),
         ];
 
         // (3) Prohibited arms: queue immediately before each probe, assert

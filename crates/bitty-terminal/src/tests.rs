@@ -9961,6 +9961,143 @@ fn new_panel_over_empty_tiled_base_with_float_materializes_tile_issue_2223() {
     );
 }
 
+/// CTX-1347 (#2240): app whose spawned shells print their physical cwd and
+/// then stay alive, so the pane grid proves the inherited directory without
+/// racing the reader pump (same technique as `cwd_inherit.rs`).
+#[cfg(unix)]
+fn cwd_probe_app() -> TerminalApp {
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let spec = SpawnSpec {
+        program: Some("/bin/sh".to_string()),
+        program_args: vec!["-c".to_string(), "pwd -P; exec sleep 30".to_string()],
+        ..SpawnSpec::default()
+    };
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        spec,
+    );
+    app.runtime.set_layout(two_pane_layout());
+    app
+}
+
+/// Drains the PTY pump until `view`'s grid shows `needle`, then returns the
+/// grid text (bounded, so a regression fails instead of hanging).
+#[cfg(unix)]
+fn wait_for_pane_text_ctx1347(app: &mut TerminalApp, view: ViewId, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = app.poll_pty_pump();
+        let _ = app.drive_tick();
+        let text = app
+            .runtime
+            .pane_snapshot(&view)
+            .map(|snap| snap.cells.iter().map(|cell| cell.glyph).collect::<String>())
+            .unwrap_or_default();
+        if text.contains(needle) || std::time::Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Issue #2240 / CTX-1347: `new_panel` materializing a tiled base over an
+/// empty workspace must let the fresh shell inherit the surviving float's
+/// `OSC 7` cwd. `set_layout` re-homes focus to the fresh leaf, so the
+/// inheritance source has to be captured before the install.
+#[test]
+#[cfg(unix)]
+fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
+    require_pty!();
+    let mut app = cwd_probe_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(float, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .handle_pane_bytes(float, b"\x1b]7;file:///tmp\x07");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert!(
+        app.runtime.layout().leaf_ids().is_empty(),
+        "precondition: the tiled base is empty"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(float),
+        "precondition: the surviving float holds focus outside the layout"
+    );
+
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let leaves = app.runtime.layout().leaf_ids();
+    assert_eq!(leaves.len(), 1, "new_panel must materialize a tiled base");
+    let panel = leaves[0];
+    assert!(
+        app.runtime.has_pane_session(&panel),
+        "the materialized panel must own its fresh shell"
+    );
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
+    assert!(
+        text.contains("/tmp"),
+        "new panel must inherit the surviving float's OSC 7 cwd (/tmp): {text:?}"
+    );
+}
+
+/// Issue #2240 / CTX-1347: the same empty-base path with a pinned survivor
+/// must inherit the pin's `OSC 7` cwd too.
+#[test]
+#[cfg(unix)]
+fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
+    require_pty!();
+    let mut app = cwd_probe_app();
+    let host = ViewId::new(1);
+    let pin = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(pin, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .expect("spawn pin shell");
+    app.runtime
+        .handle_pane_bytes(pin, b"\x1b]7;file:///tmp\x07");
+    assert!(app.runtime.set_focus(pin), "pin source must hold focus");
+    app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned);
+    assert!(
+        app.runtime.pinned_views().contains(&pin),
+        "precondition: the survivor is pinned"
+    );
+    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert!(
+        app.runtime.layout().leaf_ids().is_empty(),
+        "precondition: the tiled base is empty"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(pin),
+        "precondition: the surviving pin holds focus outside the layout"
+    );
+
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let leaves = app.runtime.layout().leaf_ids();
+    assert_eq!(leaves.len(), 1, "new_panel must materialize a tiled base");
+    let panel = leaves[0];
+    assert!(
+        app.runtime.has_pane_session(&panel),
+        "the materialized panel must own its fresh shell"
+    );
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
+    assert!(
+        text.contains("/tmp"),
+        "new panel must inherit the surviving pin's OSC 7 cwd (/tmp): {text:?}"
+    );
+}
+
 #[cfg(unix)]
 fn probe_rgba(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
     let idx = (y * width + x) * 4;

@@ -298,7 +298,13 @@ impl Runtime {
     /// or relative, or the decoded path is no longer an existing directory.
     /// The caller then keeps the PTY default (`$HOME`/`USERPROFILE`, else the
     /// process cwd; ghostty `working-directory = home` parity).
-    fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
+    ///
+    /// Creation paths that install their layout *before* spawning must read
+    /// this first: installing the layout re-homes focus to the fresh leaf
+    /// ([`Self::set_layout`]), which would make `target` the focused source
+    /// and drop the surviving float/pin report (CTX-1347).
+    #[must_use]
+    pub fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
         if let Some(source) = self.focused_view() {
             if source != target {
                 let report = match self.pane_sessions.get(&source) {

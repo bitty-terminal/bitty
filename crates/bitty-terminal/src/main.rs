@@ -927,7 +927,9 @@ fn main() {
     // CTX-1361 (bitty#2254): own the installed-component broker for this
     // instance. The host resolves only the staged store (never `PATH`) and
     // digest-verifies every spawn; requests are capability-gated in
-    // `Runtime::component_request`. No root means no host (fail closed).
+    // `Runtime::component_request`. The system tier always resolves, so a host
+    // is installed even without a user data root; a missing component still
+    // fails closed at spawn resolution.
     install_component_host(&mut runtime);
     // CTX-0929 G-1: sweep crashed-owner editor temps once per start, before
     // session restore or any new editor use.

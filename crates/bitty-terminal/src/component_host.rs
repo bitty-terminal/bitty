@@ -20,9 +20,9 @@ use bitty_runtime::component::{
 
 /// Resolve the production component roots from the process environment.
 ///
-/// Returns `(user, system)`; the system tier defaults to the platform path,
-/// so this is `None` only when no data-directory root exists at all and the
-/// system override is explicitly empty.
+/// Returns `(user, system)`. The system tier always resolves (platform
+/// default unless the developer override names one), so an unavailable user
+/// data directory yields `(None, Some(...))`, not "no host".
 #[must_use]
 pub fn roots_from_env() -> (Option<PathBuf>, Option<PathBuf>) {
     let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();

@@ -29,9 +29,14 @@
 //!    - Any other C0 control `0x00..0x1F` excluding tab and the
 //!      specifically-named NUL/ESC/CR/LF — `has_c0`
 //!    - Unicode controls `U+0080..U+009F` (C1 controls) — `has_unicode_control`
+//!    - Zero-width formatting: ZWSP `U+200B`, WORD JOINER `U+2060`, BOM
+//!      `U+FEFF` — `has_zero_width`. ZWJ/ZWNJ (`U+200C`, `U+200D`) are
+//!      legitimate emoji/script joiners and are exempt: classifying them as
+//!      suspicious made a plain family emoji require paste confirmation
+//!      (issue #2261).
 //!    - BiDi / directional controls: `U+061C`, `U+200E`, `U+200F`,
-//!      `U+202A..202E`, `U+2066..2069`, plus zero-width `U+200B..200D`,
-//!      `U+FEFF`, `U+2060` — `has_bidi`
+//!      `U+202A..202E`, `U+2066..2069` — `has_bidi`. These, and only these,
+//!      reorder text; zero-width formatting is a separate class.
 
 #![forbid(unsafe_code)]
 
@@ -58,6 +63,15 @@ pub(crate) struct PasteInspection {
     pub has_newline: bool,
     /// `true` when Unicode C1 `U+0080..U+009F` is present.
     pub has_unicode_control: bool,
+    /// `true` when a zero-width *formatting* scalar is present: ZWSP
+    /// `U+200B`, WORD JOINER `U+2060`, or BOM `U+FEFF`.
+    ///
+    /// Zero-width formatting is inspected because it can hide or splice
+    /// text, but it is not a BiDi control. ZWJ/ZWNJ (`U+200C`, `U+200D`)
+    /// are legitimate cluster joiners and are deliberately exempt: they
+    /// carry an emoji or script cluster rather than an attack signal
+    /// (issue #2261).
+    pub has_zero_width: bool,
     /// `true` when any BiDi / directional control is present.
     pub has_bidi: bool,
 }
@@ -72,13 +86,14 @@ impl PasteInspection {
             || self.has_cr
             || self.has_newline
             || self.has_unicode_control
+            || self.has_zero_width
             || self.has_bidi
     }
 
     /// Human-readable reasons for inspection (bounded, deterministic order).
     ///
     /// Production-visible (CTX-0186): the pending-paste summary surfaces these
-    /// so a gated paste is never silent. At most 7 entries, `&'static str` only.
+    /// so a gated paste is never silent. At most 8 entries, `&'static str` only.
     #[must_use]
     pub fn reasons(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
@@ -99,6 +114,9 @@ impl PasteInspection {
         }
         if self.has_unicode_control {
             out.push("unicode-control");
+        }
+        if self.has_zero_width {
+            out.push("zero-width");
         }
         if self.has_bidi {
             out.push("bidi");
@@ -143,9 +161,13 @@ pub(crate) fn inspect_paste(text: &str) -> PasteInspection {
         if (0x80..=0x9F).contains(&cp) {
             insp.has_unicode_control = true;
         }
-        // BiDi and zero-width controls
+        // BiDi / directional controls and zero-width formatting are distinct
+        // classes: only the former reorders text (issue #2261).
         if is_bidi_control(ch) {
             insp.has_bidi = true;
+        }
+        if is_zero_width_format(ch) {
+            insp.has_zero_width = true;
         }
         // Early exit when all flags set — still deterministic.
         if insp.has_c0
@@ -154,6 +176,7 @@ pub(crate) fn inspect_paste(text: &str) -> PasteInspection {
             && insp.has_cr
             && insp.has_newline
             && insp.has_unicode_control
+            && insp.has_zero_width
             && insp.has_bidi
         {
             break;
@@ -162,13 +185,28 @@ pub(crate) fn inspect_paste(text: &str) -> PasteInspection {
     insp
 }
 
+/// Zero-width formatting scalars that can hide or splice text but are not
+/// BiDi controls.
+///
+/// Joiners (`U+200C` ZWNJ, `U+200D` ZWJ) are deliberately absent: they are
+/// legitimate emoji/script cluster members, not attack signals (issue
+/// #2261). Variation selectors are likewise normal emoji presentation.
+fn is_zero_width_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}' // ZERO WIDTH SPACE
+        | '\u{2060}' // WORD JOINER
+        | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
+    )
+}
+
 fn is_bidi_control(ch: char) -> bool {
+    // Real BiDi/Directional formatting controls only. ZWJ/ZWNJ are cluster
+    // joiners and ZWSP/WORD JOINER/BOM are zero-width formatting, not
+    // directional controls (issue #2261).
     matches!(
         ch,
         '\u{061C}' // ARABIC LETTER MARK
-        | '\u{200B}' // ZERO WIDTH SPACE
-        | '\u{200C}' // ZERO WIDTH NON-JOINER
-        | '\u{200D}' // ZERO WIDTH JOINER
         | '\u{200E}' // LEFT-TO-RIGHT MARK
         | '\u{200F}' // RIGHT-TO-LEFT MARK
         | '\u{202A}' // LRE
@@ -176,12 +214,10 @@ fn is_bidi_control(ch: char) -> bool {
         | '\u{202C}' // PDF
         | '\u{202D}' // LRO
         | '\u{202E}' // RLO
-        | '\u{2060}' // WORD JOINER
         | '\u{2066}' // LRI
         | '\u{2067}' // RLI
         | '\u{2068}' // FSI
         | '\u{2069}' // PDI
-        | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
     )
 }
 
@@ -322,13 +358,43 @@ mod tests {
     fn bidi_controls_each_flag() {
         for ch in [
             '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
-            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200B}', '\u{FEFF}',
-            '\u{2060}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ] {
             let s = format!("a{ch}b");
             let insp = inspect_paste(&s);
             assert!(insp.has_bidi, "missing bidi for U+{:04X}", ch as u32);
             assert!(insp.needs_confirmation());
+        }
+    }
+
+    #[test]
+    fn zwj_family_emoji_is_not_bidi_and_needs_no_confirmation() {
+        // Issue #2261: ZWJ/ZWNJ are cluster joiners, not directional
+        // controls. A single-line family emoji must paste silently.
+        let family = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+        let insp = inspect_paste(family);
+        assert!(!insp.has_bidi, "ZWJ must not classify as bidi");
+        assert!(!insp.has_zero_width, "ZWJ is a joiner, not formatting");
+        assert!(!insp.needs_confirmation(), "family emoji is clean");
+        assert!(insp.reasons().is_empty());
+
+        // ZWNJ is exempt too.
+        let zwnj = inspect_paste("a\u{200C}b");
+        assert!(zwnj.is_clean());
+
+        // Genuine zero-width formatting stays gated under its own reason
+        // (it can hide text) but is never mislabeled as bidi.
+        for ch in ['\u{200B}', '\u{2060}', '\u{FEFF}'] {
+            let s = format!("a{ch}b");
+            let insp = inspect_paste(&s);
+            assert!(
+                !insp.has_bidi,
+                "U+{:04X} is formatting, not bidi",
+                ch as u32
+            );
+            assert!(insp.has_zero_width);
+            assert!(insp.needs_confirmation());
+            assert_eq!(insp.reasons(), vec!["zero-width"]);
         }
     }
 

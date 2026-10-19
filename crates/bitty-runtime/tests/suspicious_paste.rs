@@ -103,16 +103,40 @@ fn unicode_c1_controls_trigger() {
 }
 
 #[test]
-fn bidi_and_zero_width_trigger() {
+fn bidi_controls_trigger_and_joiners_are_exempt() {
+    // Real BiDi/directional controls gate.
     for ch in [
-        '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}',
-        '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2066}', '\u{2067}',
-        '\u{2068}', '\u{2069}', '\u{FEFF}',
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
     ] {
         let s = format!("a{ch}b");
         let insp = inspect_via_runtime(&s);
         assert!(insp, "bidi U+{:04X} must need confirmation", ch as u32);
     }
+    // Zero-width joiners are legitimate cluster members (issue #2261):
+    // ZWJ/ZWNJ paste silently.
+    for ch in ['\u{200C}', '\u{200D}'] {
+        let s = format!("a{ch}b");
+        let insp = inspect_via_runtime(&s);
+        assert!(
+            !insp,
+            "joiner U+{:04X} must not need confirmation",
+            ch as u32
+        );
+    }
+    // Genuine zero-width formatting still gates (it can hide text) but is
+    // reported as its own class, never as bidi.
+    for ch in ['\u{200B}', '\u{2060}', '\u{FEFF}'] {
+        let s = format!("a{ch}b");
+        assert!(
+            inspect_via_runtime(&s),
+            "formatting U+{:04X} must need confirmation",
+            ch as u32
+        );
+    }
+    // The reported symptom: a plain family emoji is clean.
+    let family = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+    assert!(!inspect_via_runtime(family));
 }
 
 // ── Integration: confirmation gate — no silent delivery path ──────────
@@ -645,7 +669,8 @@ fn ctx1372_enter_with_no_pending_paste_is_unchanged() {
 fn ctx1372_every_trigger_class_still_requires_the_gate() {
     use bitty_platform::PressState;
     // Every P0-AC-008 class still holds the paste pending (no silent
-    // delivery) and only Enter/confirm releases it.
+    // delivery) and only Enter/confirm releases it. Joiners are covered by
+    // the negative case below (DEC-0119 keeps them exempt), not here.
     let cases: &[(&str, &str)] = &[
         ("a\0b", "NUL"),
         ("a\x1bb", "ESC"),
@@ -654,6 +679,9 @@ fn ctx1372_every_trigger_class_still_requires_the_gate() {
         ("a\x07b", "C0"),
         ("a\u{0080}b", "unicode-control"),
         ("a\u{202E}b", "bidi"),
+        ("a\u{200B}b", "zero-width/ZWSP"),
+        ("a\u{2060}b", "zero-width/WORD JOINER"),
+        ("a\u{FEFF}b", "zero-width/BOM"),
     ];
     for (text, reason) in cases {
         let mut rt = make_runtime();
@@ -673,6 +701,45 @@ fn ctx1372_every_trigger_class_still_requires_the_gate() {
         assert!(!rt.has_pending_paste(), "{reason}: Enter clears the gate");
         assert_eq!(rt.pending_input(), text.as_bytes(), "{reason}: exact bytes");
     }
+}
+
+#[test]
+fn ctx1368_joiners_are_exempt_and_deliver_without_confirmation() {
+    // DEC-0119: ZWJ/ZWNJ are cluster joiners, not directional controls and
+    // not zero-width formatting, so they stay outside the confirmation gate.
+    // This is the negative half of the class matrix above: the gate must not
+    // arm, and delivery must be immediate and byte-exact.
+    for ch in ['\u{200C}', '\u{200D}'] {
+        let text = format!("a{ch}b");
+        let mut rt = make_runtime();
+        rt.clipboard_mut().set_text(text.clone()).unwrap();
+        rt.drain_pending_input();
+        assert!(
+            !rt.paste_from_clipboard().unwrap().unwrap(),
+            "joiner U+{:04X} must not need confirmation",
+            ch as u32
+        );
+        assert!(
+            !rt.has_pending_paste(),
+            "joiner U+{:04X} must not arm the pending gate",
+            ch as u32
+        );
+        assert_eq!(
+            rt.pending_input(),
+            text.as_bytes(),
+            "joiner U+{:04X} must deliver the exact bytes immediately",
+            ch as u32
+        );
+    }
+
+    // A plain family emoji (joiners inside one cluster) stays clean.
+    let family = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text(family.to_string()).unwrap();
+    rt.drain_pending_input();
+    assert!(!rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), family.as_bytes());
 }
 
 #[test]

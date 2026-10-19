@@ -984,6 +984,75 @@ fn ctx_0205_small_cursor_moves_stay_exact() {
 }
 
 #[test]
+fn cursor_move_counts_columns_across_wide_spacers() {
+    // Issue #2261: CUF/CUB count grid *columns*, not character positions.
+    // Four wide scalars occupy columns 35..42 (leads 35/37/39/41, spacers
+    // 36/38/40/42). `CUF 43` from column 0 must land exactly on 43; hopping
+    // spacers as extra steps landed on 47 and made shell repaints start four
+    // columns too far right.
+    let mut s = State::new();
+    prints(&mut s, &" ".repeat(35));
+    prints(&mut s, "中中中中");
+    assert_eq!(s.cursor().position.col, 43);
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row::SENTINEL,
+        col: Col(1),
+    });
+    assert_eq!(s.cursor().position.col, 0);
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Right,
+        n: Count(43),
+    });
+    assert_eq!(s.cursor().position.col, 43);
+    // A backward move on a row without spacers (the shell's repaint row)
+    // must land on the exact source column, so the redraw overwrites the
+    // first paint instead of appending a duplicate.
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Down,
+        n: Count(1),
+    });
+    assert_eq!(s.cursor().position.col, 43);
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Left,
+        n: Count(8),
+    });
+    assert_eq!(s.cursor().position.col, 35);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn cursor_move_snaps_off_a_spacer_without_extra_steps() {
+    // Landing on a trailing half snaps to its lead (invariant 3) but the
+    // requested count is never inflated: CUF 2 over a wide pair lands on the
+    // pair's lead, not two columns beyond it.
+    let mut s = State::new();
+    prints(&mut s, "中中");
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row::SENTINEL,
+        col: Col(1),
+    });
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Right,
+        n: Count(2),
+    });
+    // Target column 2 is the second pair's lead: exact.
+    assert_eq!(s.cursor().position.col, 2);
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Right,
+        n: Count(1),
+    });
+    // Target column 3 is its spacer: snap back to the lead at 2.
+    assert_eq!(s.cursor().position.col, 2);
+    s.apply(&TerminalAction::CursorMove {
+        dir: Direction::Left,
+        n: Count(1),
+    });
+    // Target column 1 is the first pair's spacer: snap to the lead at 0.
+    assert_eq!(s.cursor().position.col, 0);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn ctx_0205_large_cursor_left_stops_at_zero() {
     // CR-TERM-02: symmetric CUB bound at the left margin.
     let mut s = State::new();

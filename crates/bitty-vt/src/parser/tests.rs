@@ -2890,6 +2890,31 @@ fn kitty_font_query_oversized_payload_is_inert() {
 }
 
 #[test]
+fn kitty_font_query_decoded_cap_is_inert_and_stream_recovers() {
+    // 300 hex characters decode to 150 bytes: inside the 512-byte wire cap
+    // but above the 128-byte decoded cap. This is the case that would write
+    // past the fixed stack buffer if the decoded bound were removed (review
+    // F2). The parser must stay silent and the next query must still route.
+    let mut wire = b"\x1bP+q".to_vec();
+    wire.extend(std::iter::repeat_n(b'a', 300));
+    wire.extend_from_slice(b"\x1b\\");
+    assert!(
+        kitty_font_queries(&parse(&wire)).is_empty(),
+        "an over-decoded-cap payload must emit no font action"
+    );
+    let mut stream = wire;
+    stream.extend_from_slice(&fastfetch_font_query());
+    assert_eq!(
+        kitty_font_queries(&parse(&stream)),
+        vec![crate::kitty_font_query::KittyFontQuery {
+            family: true,
+            size: true
+        }],
+        "the stream must recover after an oversized decoded payload"
+    );
+}
+
+#[test]
 fn kitty_font_query_apc_bel_terminator_is_accepted() {
     let st = fastfetch_font_query();
     let mut bel = b"\x1b_".to_vec();

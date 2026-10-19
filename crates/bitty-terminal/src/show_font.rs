@@ -22,8 +22,21 @@
 //! - `0` — resolved font printed.
 //! - `2` — the merged config could not be loaded (invalid or missing
 //!   explicit file, invalid profile), or usage was rejected.
-//! - `3` — config loaded but carries no usable font identity
-//!   ([`ShowFontError::Unavailable`]).
+//!
+//! [`ShowFontError::Unavailable`] / [`EXIT_UNAVAILABLE`] remain as
+//! defense-in-depth for direct callers of [`render_font`], but config
+//! validation rejects an empty/overlong family and a non-finite, zero, or
+//! `> 128` size at load time, so the CLI path normally reports those as exit
+//! `2` (CTX-1370 review F5). The usage text lists only the reachable codes.
+//!
+//! # Live config vs. file config
+//!
+//! This probe starts a fresh process and reads the merged config files. The
+//! DCS font-query path in a running terminal answers from the live
+//! `RuntimeConfig`, which a live zoom or appearance change can update without
+//! writing the file. The two paths can therefore report different sizes until
+//! the config is saved/restarted; the DCS answer is the value the running
+//! terminal is actually using (review F4).
 //!
 //! The command grants no capability and never reads or writes anything
 //! outside the existing config-loading path.
@@ -71,8 +84,7 @@ pub(crate) fn show_font_usage() -> &'static str {
      \n\
      Read-only: loads the same merged config startup uses, then exits.\n  \
        Exit 0  font printed\n  \
-       Exit 2  config could not be loaded / usage error\n  \
-       Exit 3  no usable font identity in the effective config\n"
+       Exit 2  config could not be loaded / usage error\n"
 }
 
 /// Renders the stable text block for a resolved font config.

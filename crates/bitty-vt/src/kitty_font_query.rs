@@ -13,8 +13,10 @@
 //!
 //! Each wire token hex-decodes to a query key. fastfetch sends both keys in
 //! one query and expects one reply per key (see
-//! [`crate::TerminalAction::KittyFontQuery`] and the runtime reply builder),
-//! in request order:
+//! [`crate::TerminalAction::KittyFontQuery`] and the runtime reply builder).
+//! The reply order is fixed as family then size, matching fastfetch's
+//! canonical `family;size` request; the action carries booleans, not request
+//! order (CTX-1370 review F3):
 //!
 //! ```text
 //! ESC P 1+r kitty-query-font_family=<hex-value> ST
@@ -177,7 +179,11 @@ pub fn parse_kitty_font_query_body(body: &[u8]) -> Option<KittyFontQuery> {
 /// Hex spelling of the reserved `kitty-query-` key prefix.
 const KITTY_QUERY_FONT_HEX_PREFIX: &[u8] = b"6b697474792d71756572792d";
 
-/// Whether a DCS `+q` payload belongs to the kitty font-query family.
+/// Whether a DCS `+q` payload starts with the reserved kitty font hex prefix.
+///
+/// This is only a prefix check; the classification contract is
+/// [`classify_dcs_query_body`], which decodes the payload once and is shared
+/// by the parser and the runtime XTGETTCAP finder.
 ///
 /// The XTGETTCAP and kitty font protocols share the `ESC P +q ... ST`
 /// envelope. Reserved `kitty-query-*` keys must never be answered as
@@ -190,6 +196,51 @@ pub fn looks_like_kitty_font_query(body: &[u8]) -> bool {
     body.len() >= KITTY_QUERY_FONT_HEX_PREFIX.len()
         && body[..KITTY_QUERY_FONT_HEX_PREFIX.len()]
             .eq_ignore_ascii_case(KITTY_QUERY_FONT_HEX_PREFIX)
+}
+
+/// Classification of one DCS `+q` payload, shared by every consumer.
+///
+/// The parser and the runtime XTGETTCAP pre-scan previously classified mixed
+/// payloads differently: the parser answered a payload containing any known
+/// font key, while the finder only skipped a payload whose *leading* hex was
+/// the reserved prefix. A payload mixing a capability name with a font key
+/// was therefore both answered as a font query and queued as an XTGETTCAP
+/// query, desynchronising the capability queue (CTX-1370 review F1).
+///
+/// This is the single contract: decode/classify the payload exactly once and
+/// route by the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DcsQueryClass {
+    /// At least one answerable font key: emit `KittyFontQuery`, never an
+    /// XTGETTCAP answer.
+    Font(KittyFontQuery),
+    /// Reserved `kitty-query-*` family but empty, malformed, oversized, or
+    /// unknown-only: stay silent (never fall through to a negative XTGETTCAP
+    /// reply).
+    ReservedFont,
+    /// Not a font query: XTGETTCAP may answer it.
+    Xtgettcap,
+}
+
+/// Decodes and classifies one DCS `+q` payload body.
+///
+/// The wire/decoded caps are enforced by
+/// [`parse_kitty_font_query_body`], so an oversized or malformed reserved
+/// payload is [`DcsQueryClass::ReservedFont`] (silent), while an ordinary
+/// capability payload is [`DcsQueryClass::Xtgettcap`]. A mixed payload with
+/// at least one known font key is [`DcsQueryClass::Font`], matching the
+/// parser's existing "answer known keys" behavior and keeping the
+/// XTGETTCAP queue aligned because the finder skips that same class.
+#[must_use]
+pub fn classify_dcs_query_body(body: &[u8]) -> DcsQueryClass {
+    if let Some(query) = parse_kitty_font_query_body(body) {
+        return DcsQueryClass::Font(query);
+    }
+    if body.is_empty() || looks_like_kitty_font_query(body) {
+        DcsQueryClass::ReservedFont
+    } else {
+        DcsQueryClass::Xtgettcap
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +377,70 @@ mod tests {
             parse_kitty_font_query_body(&body),
             parse_kitty_font_query(&[b"+q".as_slice(), body.as_slice()].concat())
         );
+    }
+
+    #[test]
+    fn classification_is_shared_for_mixed_capability_and_font_payloads() {
+        // Capability-only payload: XTGETTCAP may answer it.
+        assert_eq!(classify_dcs_query_body(b"544E"), DcsQueryClass::Xtgettcap);
+        assert_eq!(
+            classify_dcs_query_body(b"544E;436F"),
+            DcsQueryClass::Xtgettcap
+        );
+        // Mixed payload with a known font key: one font answer, never an
+        // XTGETTCAP answer (review F1).
+        let mut mixed = hex(b"TN");
+        mixed.push(b';');
+        mixed.extend_from_slice(&hex(KITTY_FONT_QUERY_SIZE));
+        assert_eq!(
+            classify_dcs_query_body(&mixed),
+            DcsQueryClass::Font(KittyFontQuery {
+                family: false,
+                size: true
+            })
+        );
+        // Reserved family with no answerable key stays silent.
+        let mut reserved = b"6b697474792d71756572792d".to_vec();
+        reserved.extend_from_slice(b"zz");
+        assert_eq!(
+            classify_dcs_query_body(&reserved),
+            DcsQueryClass::ReservedFont
+        );
+        assert_eq!(classify_dcs_query_body(b""), DcsQueryClass::ReservedFont);
+    }
+
+    #[test]
+    fn wire_cap_rejects_an_oversized_payload_even_with_valid_keys() {
+        // Fourteen valid 20-byte keys are 573 wire bytes: above the wire cap
+        // but every individual token is inside the decoded cap, so removing
+        // the wire bound would incorrectly produce an answer.
+        let mut body = Vec::new();
+        for index in 0..14 {
+            if index > 0 {
+                body.push(b';');
+            }
+            body.extend_from_slice(&hex(KITTY_FONT_QUERY_FAMILY));
+        }
+        assert!(body.len() > KITTY_FONT_QUERY_WIRE_MAX_BYTES);
+        assert!(parse_kitty_font_query_body(&body).is_none());
+    }
+
+    #[test]
+    fn decoded_cap_rejects_a_body_inside_the_wire_cap() {
+        // 300 hex characters decode to 150 bytes: above the 128-byte decoded
+        // cap while still inside the 512-byte wire cap. Without the decoded
+        // cap this writes past the fixed stack buffer.
+        let body = vec![b'a'; 300];
+        assert!(body.len() <= KITTY_FONT_QUERY_WIRE_MAX_BYTES);
+        assert!(parse_kitty_font_query_body(&body).is_none());
+    }
+
+    #[test]
+    fn decoded_cap_rejects_one_oversized_token() {
+        // 258 hex characters decode to 129 bytes: one byte above the cap.
+        let body = vec![b'a'; (KITTY_FONT_QUERY_DECODED_MAX_BYTES + 1) * 2];
+        assert!(body.len() <= KITTY_FONT_QUERY_WIRE_MAX_BYTES);
+        assert!(parse_kitty_font_query_body(&body).is_none());
     }
 
     #[test]

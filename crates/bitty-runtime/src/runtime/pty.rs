@@ -954,7 +954,10 @@ impl Runtime {
             // Values come from the live resolved config (so reloads and CLI
             // appearance overrides are reflected) and ride the same bounded
             // `Reply` channel as every other host answer — no second PTY
-            // path, no echo of the query bytes.
+            // path, no echo of the query bytes. A separate `bitty +show-font`
+            // process reads the config file instead, so after a live zoom the
+            // two paths can differ until the file catches up (CTX-1370 review
+            // F4); the live value is what this terminal is actually using.
             if let TerminalAction::KittyFontQuery { query } = &action {
                 let font = crate::queries::FontIdentity {
                     family: &self.config.font_family,

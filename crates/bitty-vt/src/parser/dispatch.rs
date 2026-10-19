@@ -16,7 +16,9 @@ use crate::action::{
     UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
-use crate::kitty_font_query::{looks_like_kitty_font_query, parse_kitty_font_query_body};
+use crate::kitty_font_query::{
+    DcsQueryClass, classify_dcs_query_body, looks_like_kitty_font_query,
+};
 use vte::{Params, Perform};
 
 impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
@@ -1270,27 +1272,36 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         if self.dcs.font_query {
             let overflow = self.dcs.font_overflow;
             let len = self.dcs.font_len;
-            let parsed = if overflow {
-                None
+            // One classification contract shared with the runtime XTGETTCAP
+            // pre-scan (CTX-1370 review F1). An overflowed capture cannot be
+            // decoded truthfully, so it keeps the reserved-family decision
+            // from the captured prefix and never emits a partial font answer.
+            let classification = if overflow {
+                if len == 0 || looks_like_kitty_font_query(&self.dcs.font_payload[..len]) {
+                    DcsQueryClass::ReservedFont
+                } else {
+                    DcsQueryClass::Xtgettcap
+                }
             } else {
-                parse_kitty_font_query_body(&self.dcs.font_payload[..len])
+                classify_dcs_query_body(&self.dcs.font_payload[..len])
             };
-            // A malformed, empty, or unknown-key font query still belongs to
-            // the reserved family: answer nothing rather than falling through
-            // to the XTGETTCAP negative reply.
-            let reserved_family =
-                len == 0 || looks_like_kitty_font_query(&self.dcs.font_payload[..len]);
             self.dcs.font_query = false;
             self.dcs.font_len = 0;
             self.dcs.font_overflow = false;
-            if let Some(query) = parsed {
-                self.dcs.active = false;
-                self.emit(TerminalAction::KittyFontQuery { query });
-                return;
-            }
-            if reserved_family {
-                self.dcs.active = false;
-                return;
+            match classification {
+                DcsQueryClass::Font(query) => {
+                    self.dcs.active = false;
+                    self.emit(TerminalAction::KittyFontQuery { query });
+                    return;
+                }
+                DcsQueryClass::ReservedFont => {
+                    // A malformed, empty, or unknown-key font query still
+                    // belongs to the reserved family: answer nothing rather
+                    // than falling through to the XTGETTCAP negative reply.
+                    self.dcs.active = false;
+                    return;
+                }
+                DcsQueryClass::Xtgettcap => {}
             }
         }
         let reported = UnrecognizedSequence {

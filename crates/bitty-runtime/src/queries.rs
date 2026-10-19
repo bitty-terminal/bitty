@@ -74,7 +74,8 @@
 
 use bitty_term_state::State;
 use bitty_vt::{
-    KittyFontQuery, UnrecognizedSequence, kitty_font_query::looks_like_kitty_font_query,
+    KittyFontQuery, UnrecognizedSequence,
+    kitty_font_query::{DcsQueryClass, classify_dcs_query_body},
 };
 
 /// Bytes of PTY history retained across [`Runtime::handle_pty_bytes`](crate::Runtime::handle_pty_bytes)
@@ -416,14 +417,14 @@ pub(crate) fn find_xtgettcap(combined: &[u8], new_start: usize) -> Vec<Xtgettcap
             j += 1;
         }
         if let Some((term_start, term_end)) = end {
-            // `+q` is shared with the kitty font protocol (CTX-1370): a
-            // reserved `kitty-query-*` payload is answered by the parser's
-            // `KittyFontQuery` action, never as an XTGETTCAP capability.
-            // Skipping it here also keeps the `tcaps` queue aligned.
-            if term_end > new_start
-                && !combined[payload_start..term_start].is_empty()
-                && !looks_like_kitty_font_query(&combined[payload_start..term_start])
-            {
+            // `+q` is shared with the kitty font protocol (CTX-1370). Use
+            // the parser's single classification contract (review F1), not a
+            // leading-hex-prefix check: a mixed payload containing any known
+            // font key is answered as a font query and must never also be
+            // queued as an XTGETTCAP capability, or a following capability
+            // would consume the wrong queue entry.
+            let class = classify_dcs_query_body(&combined[payload_start..term_start]);
+            if term_end > new_start && matches!(class, DcsQueryClass::Xtgettcap) {
                 out.push(XtgettcapQuery {
                     payload: combined[payload_start..term_start].to_vec(),
                 });
@@ -1153,6 +1154,19 @@ mod tests {
         assert!(find_xtgettcap(bytes, bytes.len()).is_empty());
         // Unterminated DCS fails closed.
         assert!(find_xtgettcap(b"\x1bP+q544E", 0).is_empty());
+    }
+
+    #[test]
+    fn find_xtgettcap_skips_a_mixed_font_payload_and_keeps_alignment() {
+        // Review F1: the mixed payload is classified as a font query by the
+        // shared contract, so it must not occupy an XTGETTCAP queue slot; the
+        // following Co query is the only capability returned.
+        let mut bytes = b"\x1bP+q544E;".to_vec();
+        bytes.extend_from_slice(b"6b697474792d71756572792d666f6e745f73697a65");
+        bytes.extend_from_slice(b"\x1b\\\x1bP+q436F\x1b\\");
+        let found = find_xtgettcap(&bytes, 0);
+        assert_eq!(found.len(), 1, "the mixed font payload must be skipped");
+        assert_eq!(found[0].payload, b"436F");
     }
 
     #[test]

@@ -1804,6 +1804,10 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // CTX-1361: drive native-component lifecycle (handshake deadlines,
+        // request deadlines, idle stop, crash backoff) on the same owner
+        // thread that owns the runtime and its broker.
+        let _ = self.poll_component_events(now);
         // CTX-0783: the embedder ticks once per dispatched event batch
         // (`ApplicationHandler::about_to_wait`), which is the boundary a
         // compositor may or may not put the commit and its echoing key in. Age

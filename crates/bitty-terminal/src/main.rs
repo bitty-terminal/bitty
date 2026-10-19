@@ -231,6 +231,7 @@ mod cmd;
 mod color;
 mod completion;
 mod component;
+mod component_host;
 mod component_seed;
 mod composer_owner;
 mod config_cli;
@@ -923,6 +924,11 @@ fn main() {
     // CTX-1080: install declarative panel spawn rules from the effective
     // config so PTY spawn and view initialization evaluate them.
     runtime.set_panel_spawn_rules(app_config.effective.panel_rules.clone());
+    // CTX-1361 (bitty#2254): own the installed-component broker for this
+    // instance. The host resolves only the staged store (never `PATH`) and
+    // digest-verifies every spawn; requests are capability-gated in
+    // `Runtime::component_request`. No root means no host (fail closed).
+    install_component_host(&mut runtime);
     // CTX-0929 G-1: sweep crashed-owner editor temps once per start, before
     // session restore or any new editor use.
     startup_maintenance();
@@ -1251,6 +1257,8 @@ fn main() {
         // CTX-1080: same panel-rule install as the primary path so headless
         // smoke evaluates the same spawn rules.
         rt.set_panel_spawn_rules(app_config.effective.panel_rules.clone());
+        // CTX-1361: the fallback runtime owns the same component host wiring.
+        install_component_host(&mut rt);
         // Re-apply layout and focus in fallback so headless smoke proves the same composition
         // that real mode would have driven via the window (TERM-APP-003 / CTX-0553).
         apply_startup_layout_and_focus(&mut rt, &args);
@@ -1278,6 +1286,30 @@ pub(crate) fn startup_maintenance() -> usize {
         logging::info(|| format!("bitty: swept {swept} crashed editor temp(s)"));
     }
     swept
+}
+
+/// Install the production native-component host (CTX-1361, bitty#2254).
+///
+/// The host is inert until a capability-authorized request names an installed
+/// component; construction alone spawns nothing. Missing data roots leave the
+/// runtime without a host, which fails every request closed.
+fn install_component_host(runtime: &mut Runtime) {
+    let installed = component_host::install(runtime, LoggingComponentWarn);
+    if !installed {
+        logging::info(|| {
+            "bitty: no component data root — native components stay disabled".to_string()
+        });
+    }
+}
+
+/// Route the broker's crash/handshake/idle stderr tails through the binary's
+/// stderr gate (the tail is already escaped by the broker).
+struct LoggingComponentWarn;
+
+impl bitty_runtime::component::ComponentWarnSink for LoggingComponentWarn {
+    fn warn(&mut self, component: &str, reason: &str, stderr_tail: &str) {
+        logging::warn(|| format!("bitty: component '{component}' {reason}: {stderr_tail}"));
+    }
 }
 
 /// Assembles startup layout and applies focus specifications (TERM-APP-003 / CTX-0553).

@@ -20,6 +20,20 @@ workspace = true
 name = "bitty"
 path = "src/main.rs"
 
+# CTX-1361: the composition root's component-store/staging implementation is
+# also exposed as a library so integration tests in `bitty-runtime` can drive
+# the real `bitty extension add` code path instead of duplicating it. The
+# binary keeps using the same source modules; this target adds no runtime
+# behavior and pulls no new dependency.
+[lib]
+name = "bitty_terminal"
+path = "src/lib.rs"
+# Test seam only: the binary owns this crate's unit/integration coverage, and
+# the module's tests reference binary-only modules (`crate::plugin`). Keeping
+# the library untested here avoids compiling a second, partial module graph.
+test = false
+doctest = false
+
 [dependencies]
 bitty-config = { version = "0.0.24", path = "../bitty-config" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }

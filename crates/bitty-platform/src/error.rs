@@ -51,7 +51,9 @@ pub enum PlatformError {
     /// in-memory paths still report the exact length. Linux X11 and Windows
     /// over-cap reads return this error with no partial text (CTX-1366);
     /// Linux Wayland returns a truncated prefix through the bounded accessors
-    /// instead, and the direct reads report this error there too.
+    /// instead, and the direct reads report this error there too. When this
+    /// error reaches a lossy read, the paste seam delivers no input and an
+    /// authorized OSC 52 read answers with the existing framed-empty reply.
     ClipboardPayloadTooLarge {
         /// Byte length of the rejected payload, or the observed lower bound
         /// for a bounded native acquisition.

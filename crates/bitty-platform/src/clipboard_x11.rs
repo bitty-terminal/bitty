@@ -57,8 +57,8 @@ use x11rb::utils::RawFdContainer;
 
 use crate::clipboard::BoundedText;
 use crate::clipboard_limits::{
-    AcquisitionError, AcquisitionLimits, IncrAccumulator, X11Encoding, decode_x11_text,
-    x11_long_length_units, x11_property_within_cap,
+    AcquisitionError, AcquisitionLimits, IncrAccumulator, IncrReply, X11Encoding,
+    classify_incr_reply, decode_x11_text, x11_long_length_units, x11_property_within_cap,
 };
 
 const STAGE_CONNECT: &str = "x11-connect";
@@ -368,22 +368,18 @@ fn wait_for_selection(
     window: Window,
     deadline: &Deadline,
 ) -> Result<SelectionNotifyEvent, AcquisitionError> {
-    loop {
-        while let Some(event) = conn
-            .poll_for_event()
-            .map_err(|err| map_request_error(err, deadline, STAGE_SELECTION))?
-        {
-            if let Event::SelectionNotify(notify) = event {
-                if notify.requestor == window {
-                    return Ok(notify);
-                }
-            }
-        }
-        if deadline.expired() {
-            return Err(deadline.error(STAGE_SELECTION));
-        }
-        pause_until_next_poll(deadline);
-    }
+    drain_until(
+        deadline,
+        STAGE_SELECTION,
+        || {
+            conn.poll_for_event()
+                .map_err(|err| map_request_error(err, deadline, STAGE_SELECTION))
+        },
+        |event| match event {
+            Event::SelectionNotify(notify) if notify.requestor == window => Some(notify),
+            _ => None,
+        },
+    )
 }
 
 /// Reads one property reply bounded to `max_bytes` (rounded up to four bytes).
@@ -480,26 +476,17 @@ fn read_incr(
     loop {
         wait_for_property(conn, window, property, deadline)?;
         let reply = read_incr_property(conn, window, property, &accumulator, deadline)?;
-        if reply.format != 8 {
-            return Err(AcquisitionError::Malformed { stage: STAGE_INCR });
-        }
-        let value_len = reply.value.len();
         let bytes_after = usize::try_from(reply.bytes_after).unwrap_or(usize::MAX);
-        if value_len == 0 && bytes_after == 0 {
-            // Zero-length property: the owner has delivered the complete value.
-            return accumulator.finish(encoding);
+        match classify_incr_reply(reply.format, reply.value.len(), bytes_after)? {
+            IncrReply::Complete => return accumulator.finish(encoding),
+            IncrReply::Append => accumulator.push(&reply.value)?,
+            IncrReply::Reject { observed_len } => {
+                return Err(AcquisitionError::OverLimit {
+                    stage: STAGE_INCR,
+                    observed_len: accumulator.len().saturating_add(observed_len),
+                });
+            }
         }
-        if bytes_after > 0 {
-            // More of *this* property remains than the requested window.
-            return Err(AcquisitionError::OverLimit {
-                stage: STAGE_INCR,
-                observed_len: accumulator
-                    .len()
-                    .saturating_add(value_len)
-                    .saturating_add(bytes_after),
-            });
-        }
-        accumulator.push(&reply.value)?;
     }
 }
 
@@ -510,24 +497,59 @@ fn wait_for_property(
     property: Atom,
     deadline: &Deadline,
 ) -> Result<(), AcquisitionError> {
-    loop {
-        while let Some(event) = conn
-            .poll_for_event()
-            .map_err(|err| map_request_error(err, deadline, STAGE_INCR))?
-        {
-            if let Event::PropertyNotify(notify) = event {
+    drain_until(
+        deadline,
+        STAGE_INCR,
+        || {
+            conn.poll_for_event()
+                .map_err(|err| map_request_error(err, deadline, STAGE_INCR))
+        },
+        |event| match event {
+            Event::PropertyNotify(notify)
                 if notify.window == window
                     && notify.atom == property
-                    && notify.state == Property::NEW_VALUE
-                {
-                    return Ok(());
+                    && notify.state == Property::NEW_VALUE =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Drains queued events until `accept` matches, under one absolute deadline.
+///
+/// `next_event` must not block: x11rb's `poll_for_event` pops one queued event
+/// or performs one non-blocking read, so a client that keeps the stream
+/// non-empty would otherwise keep this loop running forever. The deadline is
+/// therefore re-checked **before every observed event and on every empty
+/// queue**, not only after the queue drains. An untrusted local X11 client can
+/// flood `PropertyNotify` or send synthetic `SelectionNotify`/`PropertyNotify`
+/// events to the requestor window; such a flood still ends in the typed
+/// deadline error, with no text and no teardown wait.
+fn drain_until<T, E>(
+    deadline: &Deadline,
+    stage: &'static str,
+    mut next_event: impl FnMut() -> Result<Option<E>, AcquisitionError>,
+    mut accept: impl FnMut(E) -> Option<T>,
+) -> Result<T, AcquisitionError> {
+    loop {
+        match next_event()? {
+            Some(event) => {
+                if deadline.expired() {
+                    return Err(deadline.error(stage));
+                }
+                if let Some(value) = accept(event) {
+                    return Ok(value);
                 }
             }
+            None => {
+                if deadline.expired() {
+                    return Err(deadline.error(stage));
+                }
+                pause_until_next_poll(deadline);
+            }
         }
-        if deadline.expired() {
-            return Err(deadline.error(STAGE_INCR));
-        }
-        pause_until_next_poll(deadline);
     }
 }
 
@@ -668,6 +690,61 @@ mod tests {
         assert!(matches!(
             decode_ordinary(reply, X11Encoding::Utf8, 8192),
             Err(AcquisitionError::OverLimit { .. })
+        ));
+    }
+
+    // F1 (CTX-1366 review): an untrusted client can keep
+    // `poll_for_event` returning `Some` forever. The drain loop must observe
+    // the absolute deadline on every event, not only when the queue empties.
+    #[test]
+    fn event_flood_cannot_starve_the_absolute_deadline() {
+        let deadline = Deadline::new(Duration::from_millis(20)).expect("deadline");
+        let started = Instant::now();
+        let error = drain_until(
+            &deadline,
+            STAGE_SELECTION,
+            || Ok(Some(1_u8)),
+            |_| None::<()>,
+        )
+        .expect_err("a never-empty event source must not outlive the deadline");
+        assert!(matches!(
+            error,
+            AcquisitionError::DeadlineExceeded {
+                stage: "x11-selection",
+                ..
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "flood drain outlived the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn drain_returns_a_matching_event_before_the_deadline() {
+        let deadline = Deadline::new(Duration::from_secs(1)).expect("deadline");
+        let value = drain_until(
+            &deadline,
+            STAGE_INCR,
+            || Ok(Some(7_u8)),
+            |event| (event == 7).then_some(event),
+        )
+        .expect("matching event");
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn drain_times_out_on_an_empty_queue() {
+        let deadline = Deadline::new(Duration::from_millis(5)).expect("deadline");
+        let error = drain_until(&deadline, STAGE_INCR, || Ok(None::<u8>), |_| None::<()>)
+            .expect_err("an empty queue must time out");
+        assert!(matches!(
+            error,
+            AcquisitionError::DeadlineExceeded {
+                stage: "x11-incr",
+                ..
+            }
         ));
     }
 

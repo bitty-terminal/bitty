@@ -105,6 +105,10 @@ impl AcquisitionLimits {
 pub(crate) enum AcquisitionError {
     /// Backend setup produced no transfer (Wayland: no seat, empty clipboard,
     /// no text MIME type, socket/roundtrip failure).
+    ///
+    /// Mapped to [`PlatformError::ClipboardOperation`], not
+    /// `ClipboardUnavailable`. Only the Linux Wayland caller treats this
+    /// variant as a trigger for the bounded X11 fallback.
     Setup(String),
     /// The absolute deadline expired before completion.
     DeadlineExceeded {
@@ -145,9 +149,11 @@ pub(crate) enum AcquisitionError {
 ///
 /// This is the single error surface for every bounded reader: the caller sees
 /// a deadline as [`PlatformError::ClipboardAcquisitionTimeout`], an over-limit
-/// producer as [`PlatformError::ClipboardPayloadTooLarge`], a missing/refused
-/// backend as [`PlatformError::ClipboardUnavailable`], and any other transport
-/// or decode failure as [`PlatformError::ClipboardOperation`].
+/// producer as [`PlatformError::ClipboardPayloadTooLarge`], a missing or
+/// explicitly refused backend ([`AcquisitionError::Unavailable`]) as
+/// [`PlatformError::ClipboardUnavailable`], and any other setup, transport, or
+/// decode failure (including [`AcquisitionError::Setup`]) as
+/// [`PlatformError::ClipboardOperation`].
 pub(crate) fn platform_error(err: AcquisitionError) -> PlatformError {
     match err {
         AcquisitionError::Setup(detail) => PlatformError::ClipboardOperation(detail),
@@ -395,12 +401,72 @@ pub(crate) fn decode_x11_text(
     }
 }
 
+/// Decision for one INCR `GetProperty` reply.
+///
+/// The X11 client delegates every per-reply guard to this pure function so the
+/// "no partial delivery" wiring is testable without a display server: a
+/// non-byte format is malformed, a zero-length property completes the
+/// transfer, any property that still has `bytes_after` is an over-limit
+/// rejection, and every other chunk is appended.
+#[cfg(any(
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ),
+    test
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncrReply {
+    /// Zero-length property: the owner finished; decode the accumulated bytes.
+    Complete,
+    /// Format-8 data with no unread remainder: append it.
+    Append,
+    /// The reply cannot be accepted; carries the lower bound to report.
+    Reject {
+        /// `value_len + bytes_after` observed for this reply.
+        observed_len: usize,
+    },
+}
+
+/// Classifies one INCR `GetProperty` reply before any bytes are retained.
+///
+/// `bytes_after > 0` means the property is larger than the requested window,
+/// so accepting the returned value would silently deliver a partial prefix;
+/// it is a typed rejection instead. The format check comes first so a
+/// non-byte-valued property is malformed even when it is empty.
+#[cfg(any(
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ),
+    test
+))]
+pub(crate) fn classify_incr_reply(
+    format: u8,
+    value_len: usize,
+    bytes_after: usize,
+) -> Result<IncrReply, AcquisitionError> {
+    const STAGE: &str = "x11-incr";
+    if format != 8 {
+        return Err(AcquisitionError::Malformed { stage: STAGE });
+    }
+    if value_len == 0 && bytes_after == 0 {
+        return Ok(IncrReply::Complete);
+    }
+    if bytes_after > 0 {
+        return Ok(IncrReply::Reject {
+            observed_len: value_len.saturating_add(bytes_after),
+        });
+    }
+    Ok(IncrReply::Append)
+}
+
 /// Bounded INCR accumulation.
 ///
 /// The ICCCM INCR advertisement is untrusted metadata, never an allocation
 /// instruction: the buffer is pre-sized to the rounded ceiling and a chunk
-/// that would cross either the rounded window or the decoded ceiling is
-/// rejected as [`AcquisitionError::OverLimit`] **before** it is retained.
+/// that would cross the decoded ceiling is rejected as
+/// [`AcquisitionError::OverLimit`] **before** it is retained.
 /// The caller requests only [`Self::remaining_units`] from the next property
 /// read, so a conforming server can never hand back more than the window.
 #[cfg(any(
@@ -696,6 +762,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // F4 (CTX-1366 review): the per-reply INCR guards are a pure decision so
+    // the "no partial delivery" wiring is executable without a display server.
+    #[test]
+    fn incr_reply_classification_rejects_a_non_byte_format() {
+        assert!(matches!(
+            classify_incr_reply(32, 0, 0),
+            Err(AcquisitionError::Malformed { stage: "x11-incr" })
+        ));
+        assert!(matches!(
+            classify_incr_reply(16, 4, 0),
+            Err(AcquisitionError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn incr_reply_zero_length_completes_but_only_without_a_remainder() {
+        assert_eq!(
+            classify_incr_reply(8, 0, 0).expect("zero-length completion"),
+            IncrReply::Complete
+        );
+        // A zero-length observed value with an unread remainder is not
+        // completion; it is an over-limit reply.
+        assert_eq!(
+            classify_incr_reply(8, 0, 5).expect("remainder decision"),
+            IncrReply::Reject { observed_len: 5 }
+        );
+    }
+
+    #[test]
+    fn incr_reply_with_a_remainder_is_a_typed_rejection() {
+        assert_eq!(
+            classify_incr_reply(8, 10, 1).expect("remainder decision"),
+            IncrReply::Reject { observed_len: 11 }
+        );
+        assert_eq!(
+            classify_incr_reply(8, 8192, 1).expect("remainder decision"),
+            IncrReply::Reject { observed_len: 8193 }
+        );
+    }
+
+    #[test]
+    fn incr_reply_without_a_remainder_appends() {
+        assert_eq!(
+            classify_incr_reply(8, 1, 0).expect("append decision"),
+            IncrReply::Append
+        );
+        assert_eq!(
+            classify_incr_reply(8, 8192, 0).expect("append decision"),
+            IncrReply::Append
+        );
     }
 
     #[test]

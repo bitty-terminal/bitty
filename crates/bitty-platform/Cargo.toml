@@ -50,8 +50,9 @@ raw-window-handle = "=0.6.2"
 # latter through the PTY/runtime crates), so this declares the direct surface
 # the bound needs without adding or upgrading a crate version. The direct
 # import exists because `arboard` exposes no bounded or deadline-aware read;
-# its own private Wayland module is not copied. X11/Windows/macOS stay on the
-# `arboard` path and are recorded as residual in the module docs.
+# its own private Wayland module is not copied. CTX-1366 adds a bounded X11
+# client, a bounded Windows `GlobalSize` scan, and a macOS read refusal;
+# `arboard` remains for writes and clear only.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dependencies]
 wl-clipboard-rs = "0.9"
 nix = { workspace = true, features = ["poll"] }

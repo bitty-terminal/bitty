@@ -38,9 +38,11 @@
 //!   fails with `PlatformError::ClipboardPayloadTooLarge`, and a rejected
 //!   write leaves both selections unchanged (CTX-0478). The bounded reads
 //!   [`Clipboard::get_text_bounded`] / [`Clipboard::get_primary_bounded`],
-//!   used by the paste and OSC 52 reply seams, clip an over-limit system
-//!   value at a UTF-8 char boundary instead of rejecting it, so an oversized
-//!   clipboard never pastes (or answers) nothing (CTX-0478 review).
+//!   used by the paste and OSC 52 reply seams, clip an over-limit **Wayland or
+//!   in-memory** value at a UTF-8 char boundary instead of rejecting it
+//!   (CTX-0478 review). Linux X11 and Windows bounded reads retain no partial
+//!   value: they return `ClipboardPayloadTooLarge`, so a paste or authorized
+//!   OSC 52 read on those backends fails closed (CTX-1366).
 //! - Native text acquisition is bounded **before** the foreign value is
 //!   materialized on every implemented desktop path (CTX-1315/CTX-1366 /
 //!   R-004):
@@ -724,19 +726,22 @@ impl Clipboard {
     ///
     /// Returns an empty string when the system read fails: replaying the last
     /// in-memory value would present a stale clipboard as current (CTX-0478).
-    /// An over-limit system value is clipped to its bounded prefix by the
-    /// bounded read instead of being dropped (CTX-0478 review), so the OSC 52
-    /// read reply stays non-empty for a large clipboard. Headless reads still
-    /// return the buffer.
+    /// A Wayland or in-memory over-limit value is clipped to its bounded
+    /// prefix instead of being dropped (CTX-0478 review), so an authorized
+    /// OSC 52 read still answers with text. On Linux X11 and Windows an
+    /// over-cap acquisition returns `ClipboardPayloadTooLarge`, so this lossy
+    /// path answers with the empty string (the existing framed-empty OSC 52
+    /// reply, CTX-1366). Headless reads still return the buffer.
     #[must_use]
     pub fn get_text_lossy(&mut self) -> String {
         self.get_text_bounded().unwrap_or_default()
     }
 
     /// Best-effort primary read that returns an empty string when the system
-    /// read fails, rather than replaying a stale buffer (CTX-0478). An
-    /// over-limit system value is clipped to its bounded prefix instead of
-    /// being dropped (CTX-0478 review).
+    /// read fails, rather than replaying a stale buffer (CTX-0478). A Wayland
+    /// or in-memory over-limit value is clipped to its bounded prefix instead
+    /// of being dropped (CTX-0478 review); on Linux X11 an over-cap
+    /// acquisition fails closed and returns the empty string (CTX-1366).
     #[must_use]
     pub fn get_primary_lossy(&mut self) -> String {
         self.get_primary_bounded().unwrap_or_default()

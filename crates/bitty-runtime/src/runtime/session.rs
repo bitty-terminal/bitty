@@ -110,6 +110,12 @@
 //!   Alt+drag re-anchor offset is presentation-only and resets: a restored
 //!   pin presents at its cascade anchor, exactly like a fresh pin (unpin
 //!   already drops the offset, so the lifecycle stays consistent).
+//! * A pin-only empty tiled base (#2230, after CTX-1337/#2222) is a valid
+//!   live state but has no v3 encoding: the file codec (bitty-storage)
+//!   rejects every workspace without a layout leaf. Capture refuses it with
+//!   [`SessionError::PinOnlyEmptyBase`] instead of misreporting corruption;
+//!   persisting it needs a codec change in that repository. A pinless empty
+//!   workspace remains [`SessionError::Corrupt`].
 //! * Detached floats restore into their workspace's float store (CTX-1147):
 //!   the parked leaf (identity, geometry, `Floating` mode) plus its cwd
 //!   plus scrollback history come back in detach order, so the composited
@@ -285,6 +291,14 @@ pub enum SessionError {
     },
     /// File or snapshot is structurally invalid (whole file rejected).
     Corrupt(&'static str),
+    /// Capture refused: a pin-only empty tiled base has no v3 encoding.
+    ///
+    /// CTX-1337 (#2222) makes an empty tiled base with a surviving focused
+    /// pin a valid live state, but the v3 file codec (bitty-storage)
+    /// rejects every workspace without a layout leaf. Refuse explicitly
+    /// instead of reporting corruption; persisting the state needs a codec
+    /// change in that repository.
+    PinOnlyEmptyBase,
     /// Version mismatch (whole file rejected).
     UnsupportedVersion(u32),
     /// Filesystem failure (message only, never file contents).
@@ -304,6 +318,9 @@ impl std::fmt::Display for SessionError {
                 write!(f, "session {what} too large ({actual} > {limit})")
             }
             Self::Corrupt(why) => write!(f, "session file corrupt ({why})"),
+            Self::PinOnlyEmptyBase => {
+                write!(f, "pin-only empty tiled base has no session encoding yet")
+            }
             Self::UnsupportedVersion(v) => write!(f, "unsupported session version ({v})"),
             Self::Io(msg) => write!(f, "session io error ({msg})"),
         }
@@ -719,9 +736,20 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
             return Err(SessionError::Corrupt("workspace name"));
         }
         let leaves = ws.layout.leaf_ids();
-        // P3-6: every workspace restores at least one live leaf; an empty
-        // stack would otherwise apply as a dead workspace.
+        let focus_is_pinned = ws
+            .focus
+            .is_some_and(|focus| snap.pinned.iter().any(|pin| pin.view.id() == focus));
+        // P3-6: every workspace restores at least one live view; an empty
+        // stack would otherwise apply as a dead workspace. CTX-1337 (#2222)
+        // made a pin-only empty tiled base a valid live state, but the v3
+        // file codec (bitty-storage) has no encoding for it. Refuse that
+        // valid state with its own typed diagnostic (#2230) instead of
+        // reporting file corruption; a pinless empty workspace stays
+        // corrupt, so the never-empty invariant is unchanged.
         if leaves.is_empty() {
+            if focus_is_pinned {
+                return Err(SessionError::PinOnlyEmptyBase);
+            }
             return Err(SessionError::Corrupt("empty workspace"));
         }
         for leaf in &leaves {
@@ -2139,6 +2167,45 @@ mod tests {
         tiled.pinned.push(wrong_mode);
         let err = validate_snapshot(&tiled).expect_err("non-floating pin must fail");
         assert_eq!(format!("{err}"), "session file corrupt (pinned mode)");
+    }
+
+    #[test]
+    fn pin_only_empty_base_refuses_with_typed_error_not_corruption() {
+        // #2230: after CTX-1337 (#2222) a focused pin over an empty tiled
+        // base is a valid live state, but the v3 codec cannot encode it.
+        // Validation must name that state instead of calling it corruption.
+        let mut snap = SessionSnapshot {
+            version: SESSION_FORMAT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                seq: 1,
+                name: "ws1".to_string(),
+                layout: LayoutNode::stack(Vec::new()),
+                focus: Some(ViewId::new(9)),
+                panes: Vec::new(),
+                floats: Vec::new(),
+            }],
+            active: 0,
+            mru: vec![0],
+            pinned: vec![pinned_entry(9, PaneAttachment::Primary)],
+        };
+        let err = validate_snapshot(&snap).expect_err("pin-only base must refuse");
+        assert_eq!(err, SessionError::PinOnlyEmptyBase);
+        let message = format!("{err}");
+        assert!(
+            message.contains("pin-only"),
+            "diagnostic names the state: {message}"
+        );
+        assert!(
+            !message.contains("corrupt"),
+            "never reported as corruption: {message}"
+        );
+
+        // The never-empty invariant stays: an empty base with no pinned
+        // focus is corrupt, not a pin-only refusal.
+        snap.workspaces[0].focus = None;
+        snap.pinned.clear();
+        let err = validate_snapshot(&snap).expect_err("pinless empty base must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (empty workspace)");
     }
 
     #[test]

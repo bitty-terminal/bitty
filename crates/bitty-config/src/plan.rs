@@ -42,9 +42,11 @@ pub struct ConfigPlan {
     /// Selection configuration (CTX-0191 `selection.auto_copy`).
     pub selection: Option<SelectionConfig>,
     /// Plugin history capture opt-ins (CTX-1352
-    /// `history.capture.transcript` / `history.capture.commands`; both
-    /// default `false`). `None` means "this layer says nothing".
-    pub history: Option<HistoryConfig>,
+    /// `history.capture.transcript` / `history.capture.commands`). Each leaf
+    /// is optional so a layer that declares only one leaf does not overwrite
+    /// an inherited value for the other; the final effective config applies
+    /// the `false` defaults.
+    pub history: Option<HistoryConfigPlan>,
     /// Close-confirmation mode (CTX-0370 top-level `close_confirm`;
     /// scalar-replace). `None` means "this layer says nothing".
     pub close_confirm: Option<CloseConfirm>,
@@ -112,6 +114,50 @@ pub struct ConfigPlan {
     pub undeclared_fields: Vec<String>,
 }
 
+/// Per-layer history capture declaration (CTX-1352).
+///
+/// Leaves stay `Option` through the plan and merge so an omitted leaf says
+/// nothing and keeps the lower-precedence value. Defaults are applied only to
+/// the final effective configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryConfigPlan {
+    /// `history.capture` table.
+    pub capture: HistoryCaptureConfigPlan,
+}
+
+impl HistoryConfigPlan {
+    /// Convert a fully declared config into a plan (builder seam).
+    #[must_use]
+    pub fn from_config(history: HistoryConfig) -> Self {
+        Self {
+            capture: HistoryCaptureConfigPlan {
+                transcript: Some(history.capture.transcript),
+                commands: Some(history.capture.commands),
+            },
+        }
+    }
+
+    /// Whether this plan declares no history leaf.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.capture.transcript.is_none() && self.capture.commands.is_none()
+    }
+
+    /// Validate the plan (both leaves are booleans; total today).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
+/// Per-leaf history capture plan (`history.capture.*`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryCaptureConfigPlan {
+    /// `history.capture.transcript`; `None` means this layer omits the leaf.
+    pub transcript: Option<bool>,
+    /// `history.capture.commands`; `None` means this layer omits the leaf.
+    pub commands: Option<bool>,
+}
+
 impl ConfigPlan {
     /// Create an empty plan at the current schema version.
     #[must_use]
@@ -153,7 +199,7 @@ impl ConfigPlan {
     /// Convenience builder: set history capture opt-ins.
     #[must_use]
     pub fn with_history(mut self, history: HistoryConfig) -> Self {
-        self.history = Some(history);
+        self.history = Some(HistoryConfigPlan::from_config(history));
         self
     }
 
@@ -313,6 +359,10 @@ impl ConfigPlan {
             && self.window.is_none()
             && self.terminal.is_none()
             && self.selection.is_none()
+            && self
+                .history
+                .as_ref()
+                .is_none_or(HistoryConfigPlan::is_empty)
             && self.close_confirm.is_none()
             && self.layout.is_none()
             && self.decoration.is_none()

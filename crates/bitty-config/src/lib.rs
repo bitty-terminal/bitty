@@ -116,7 +116,9 @@ pub use panel_rules::{
     MAX_PANEL_RULES, PanelPresentation, PanelSpawnRule, command_line_for, find_match,
     matches_regex, validate_regex_pattern,
 };
-pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
+pub use plan::{
+    ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+};
 pub use project_schema::{
     MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,
     MAX_PROJECT_DESCRIPTION_CHARS, MAX_PROJECT_NAME_BYTES, MAX_PROJECT_TOML_BYTES,

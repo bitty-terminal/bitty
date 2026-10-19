@@ -220,14 +220,16 @@ use bitty_lua::config::ConfigEval;
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
-use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
+use crate::plan::{
+    ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+};
 use crate::types::{
-    AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig,
-    HistoryCaptureConfig, HistoryConfig, KeymapEntry, LayoutConfig,
-    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN,
-    MAX_PLUGIN_ID_LEN, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, MouseConfig,
-    OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig, SessionConfig,
-    StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
+    AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
+    LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
+    MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
+    MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig,
+    SessionConfig, StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector,
+    WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1701,16 +1703,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // CTX-1352: `history` is fully optional. When present, omitted capture
     // leaves fall back to the defaults (both `false`): the bounded in-memory
     // transcript ring stays empty until the user opts in explicitly.
-    let history = data.history.map(|h| {
-        let defaults = HistoryCaptureConfig::default();
-        let capture = match h.capture {
-            None => defaults,
-            Some(c) => HistoryCaptureConfig {
-                transcript: c.transcript.unwrap_or(defaults.transcript),
-                commands: c.commands.unwrap_or(defaults.commands),
-            },
-        };
-        HistoryConfig { capture }
+    let history = data.history.map(|h| HistoryConfigPlan {
+        capture: HistoryCaptureConfigPlan {
+            transcript: h.capture.as_ref().and_then(|c| c.transcript),
+            commands: h.capture.as_ref().and_then(|c| c.commands),
+        },
     });
     // CTX-0177: `layout` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.layout None so merge keeps
@@ -3170,26 +3167,26 @@ mod tests {
     }
 
     #[test]
-    fn lua_history_capture_parses_and_defaults_off() {
-        // CTX-1352: explicit capture opt-ins parse; absent table means "says
-        // nothing" (plan.history None so merge keeps lower); present-but-
-        // partial tables default the omitted leaf to `false`.
+    fn lua_history_capture_preserves_per_leaf_presence() {
+        // CTX-1352: explicit capture opt-ins parse; an omitted leaf stays
+        // `None` so merge keeps the lower-precedence value. Defaults apply
+        // only to the final effective configuration.
         let plan = parse_lua_config(
             r#"return { history = { capture = { transcript = true, commands = true } } }"#,
             &test_source(),
         )
         .expect("capture parses");
         let history = plan.history.expect("history present");
-        assert!(history.capture.transcript);
-        assert!(history.capture.commands);
+        assert_eq!(history.capture.transcript, Some(true));
+        assert_eq!(history.capture.commands, Some(true));
         let plan = parse_lua_config(
             r#"return { history = { capture = { transcript = true } } }"#,
             &test_source(),
         )
         .expect("partial capture parses");
         let history = plan.history.expect("history present");
-        assert!(history.capture.transcript);
-        assert!(!history.capture.commands);
+        assert_eq!(history.capture.transcript, Some(true));
+        assert_eq!(history.capture.commands, None);
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,
             &test_source(),
@@ -3199,8 +3196,9 @@ mod tests {
         let plan =
             parse_lua_config(r#"return { history = {} }"#, &test_source()).expect("empty history");
         let history = plan.history.expect("history present");
-        assert!(!history.capture.transcript);
-        assert!(!history.capture.commands);
+        assert_eq!(history.capture.transcript, None);
+        assert_eq!(history.capture.commands, None);
+        assert!(history.is_empty());
     }
 
     #[test]

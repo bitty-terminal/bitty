@@ -16,9 +16,9 @@ use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::panel_rules::PanelSpawnRule;
 use crate::types::{
-    AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry,
-    LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig,
-    TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
+    AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, HistoryConfig,
+    KeymapEntry, LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig,
+    SessionConfig, TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -41,6 +41,10 @@ pub struct ConfigPlan {
     pub terminal: Option<TerminalConfig>,
     /// Selection configuration (CTX-0191 `selection.auto_copy`).
     pub selection: Option<SelectionConfig>,
+    /// Plugin history capture opt-ins (CTX-1352
+    /// `history.capture.transcript` / `history.capture.commands`; both
+    /// default `false`). `None` means "this layer says nothing".
+    pub history: Option<HistoryConfig>,
     /// Close-confirmation mode (CTX-0370 top-level `close_confirm`;
     /// scalar-replace). `None` means "this layer says nothing".
     pub close_confirm: Option<CloseConfirm>,
@@ -146,6 +150,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set history capture opt-ins.
+    #[must_use]
+    pub fn with_history(mut self, history: HistoryConfig) -> Self {
+        self.history = Some(history);
+        self
+    }
+
     /// Convenience builder: set layout.
     #[must_use]
     pub fn with_layout(mut self, layout: LayoutConfig) -> Self {
@@ -221,6 +232,9 @@ impl ConfigPlan {
         }
         if let Some(s) = &self.selection {
             s.validate()?;
+        }
+        if let Some(h) = &self.history {
+            h.validate()?;
         }
         if let Some(c) = &self.close_confirm {
             c.validate()

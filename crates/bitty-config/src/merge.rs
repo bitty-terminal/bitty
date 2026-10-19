@@ -92,6 +92,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.cursor_style"
         | "terminal.bell"
         | "selection.auto_copy"
+        | "history.capture.transcript"
+        | "history.capture.commands"
         | "layout.gaps_in"
         | "layout.gaps_out"
         | "layout.resize_step"
@@ -161,6 +163,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "window"
         | "terminal"
         | "selection"
+        | "history"
+        | "history.capture"
         | "layout"
         | "workspace"
         | "decoration"
@@ -767,6 +771,10 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "terminal",
     "selection.auto_copy",
     "selection",
+    "history.capture.transcript",
+    "history.capture.commands",
+    "history",
+    "history.capture",
     "close_confirm",
     "layout.gaps_in",
     "layout.gaps_out",
@@ -1310,6 +1318,50 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 );
             }
             attribution.insert("selection".to_string(), src.clone());
+        }
+
+        // CTX-1352: `history.capture.transcript` and
+        // `history.capture.commands` are scalar-replace booleans like
+        // `selection.auto_copy`; an absent table means "says nothing".
+        if let Some(history) = &plan.history {
+            for (field, value) in [
+                ("history.capture.transcript", history.capture.transcript),
+                ("history.capture.commands", history.capture.commands),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "history.capture.transcript" => {
+                        effective.history.capture.transcript = value;
+                    }
+                    _ => effective.history.capture.commands = value,
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("history".to_string(), src.clone());
+            attribution.insert("history.capture".to_string(), src.clone());
         }
 
         // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
@@ -2901,6 +2953,50 @@ fn merge_layers_allow_policy_violations(
                 );
             }
             attribution.insert("selection".to_string(), src.clone());
+        }
+
+        // CTX-1352: `history.capture.transcript` and
+        // `history.capture.commands` are scalar-replace booleans like
+        // `selection.auto_copy`; an absent table means "says nothing".
+        if let Some(history) = &plan.history {
+            for (field, value) in [
+                ("history.capture.transcript", history.capture.transcript),
+                ("history.capture.commands", history.capture.commands),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "history.capture.transcript" => {
+                        effective.history.capture.transcript = value;
+                    }
+                    _ => effective.history.capture.commands = value,
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("history".to_string(), src.clone());
+            attribution.insert("history.capture".to_string(), src.clone());
         }
         // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
         // like `selection.auto_copy`; absent table means "says nothing".

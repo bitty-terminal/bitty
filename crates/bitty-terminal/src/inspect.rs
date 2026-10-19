@@ -746,6 +746,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "terminal.cursor_style" => defaults.terminal.cursor_style.as_str().to_string(),
         "terminal.bell" => defaults.terminal.bell.as_str().to_string(),
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
+        "history.capture.transcript" => defaults.history.capture.transcript.to_string(),
+        "history.capture.commands" => defaults.history.capture.commands.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
         "layout.resize_step" => format!("{}", defaults.layout.resize_step),
@@ -1276,7 +1278,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {
@@ -1567,6 +1569,14 @@ mod tests {
         let bell = inspect_config("TERMINAL.BELL").expect("bell key (case-insensitive)");
         assert_eq!(bell.key, "terminal.bell");
         assert_eq!(bell.value, "visual");
+        // CTX-1352: history capture defaults are inspectable and off.
+        let transcript =
+            inspect_config("history.capture.transcript").expect("history transcript key");
+        assert_eq!(transcript.key, "history.capture.transcript");
+        assert_eq!(transcript.value, "false");
+        let commands = inspect_config("history.capture.commands").expect("history commands key");
+        assert_eq!(commands.key, "history.capture.commands");
+        assert_eq!(commands.value, "false");
         assert!(inspect_config("font.nope").is_none());
         assert!(inspect_config("").is_none());
     }

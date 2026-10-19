@@ -21,7 +21,7 @@ use bitty_runtime::{
     ViewCloseRequest, ViewId, WsCloseRequest,
 };
 
-use crate::spawn::spawn_pane_shell;
+use crate::spawn::spawn_pane_shell_in;
 use crate::terminal_app::TerminalApp;
 
 /// Plugin id of the first-party Palette extension (CTX-1143, issue #1966).
@@ -1165,6 +1165,11 @@ impl TerminalApp {
     /// (CTX-1338, #2223): install the layout, spawn the fresh pane's shell
     /// sized to its allocation, and move focus to it.
     fn commit_new_leaf(&mut self, layout: LayoutNode, new_id: ViewId, label: &str) {
+        // CTX-1347 (#2240): capture the source report before installing the
+        // layout. `set_layout` re-homes focus to the fresh leaf, so a
+        // post-install read would see the target itself and miss the
+        // surviving float/pin that held focus on the empty-base path.
+        let inherited_cwd = self.runtime.inherited_cwd_for(new_id);
         self.runtime.set_layout(layout);
         // CTX-0176: the fresh leaf gets its own shell/PTY sized
         // to its allocation — best-effort (startup parity). On
@@ -1177,11 +1182,17 @@ impl TerminalApp {
             .find(|(id, _)| *id == new_id)
             .map(|(_, r)| (r.width.max(1), r.height.max(1)))
             .unwrap_or((80, 24));
-        let spawn_result =
-            spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
+        let spawn_result = spawn_pane_shell_in(
+            &mut self.runtime,
+            &self.spawn_spec,
+            new_id,
+            cols,
+            rows,
+            inherited_cwd.as_deref(),
+        );
         // CTX-0364: focus follows the fresh pane (kitty/ghostty
-        // parity). Set after the spawn so CTX-0357 cwd
-        // inheritance still reads the source pane as focused.
+        // parity). The CTX-0357 inheritance source was captured above,
+        // before the layout install moved focus to the fresh leaf.
         self.runtime.set_focus(new_id);
         match spawn_result {
             Ok(()) => eprintln!(

@@ -36,6 +36,18 @@ test:
 typecheck:
     cargo check --workspace --all-targets --locked
 
+# CTX-1332 (issue #2213): mandatory feature-on cold-delivery gate.
+#
+# The phase/origin/fence suites live behind the existing default-off
+# `input-vm-test-support` feature, so the default workspace run compiles them
+# out. This recipe is the required invocation: it enables the feature on both
+# packages and selects the cold-delivery terminal and runtime targets. Wired
+# into `check` and the CI `Quality gates` job; `default = []` and the release
+# dependency graph stay unchanged.
+cold-delivery-test:
+    cargo nextest run -p bitty-terminal --features input-vm-test-support --locked -E 'test(input_vm_boundary)'
+    cargo nextest run -p bitty-runtime --features input-vm-test-support --locked -E 'test(dispatch_ui_command_fences_origin_and_lifecycle) | test(band_origin_publishes_only_after_a_presented_frame) | test(version_one_remount_and_edge_move_invalidate_the_old_origin) | test(cancellation_drops_queued_admissions_and_keeps_the_release_swallow) | test(chrome_band_versions_include_the_band_edge) | test(cold_selection_bound_is_sixteen_and_leaves_the_tail_queued)'
+
 actionlint:
     actionlint -color
 
@@ -322,7 +334,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
+check: fmt-check clippy test cold-delivery-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

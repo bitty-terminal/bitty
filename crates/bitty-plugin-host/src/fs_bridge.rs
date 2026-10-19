@@ -936,6 +936,32 @@ impl FsGate {
         scope.allows(path)
     }
 
+    /// Whether the per-plugin window admits one more operation of `bytes`.
+    fn window_admits(&self, key: &str, bytes: u64) -> bool {
+        let used = self.usage.get(key).copied().unwrap_or_default();
+        used.ops < self.caps.max_ops_per_window
+            && used.bytes < self.caps.max_bytes_per_window
+            && used.bytes.saturating_add(bytes) <= self.caps.max_bytes_per_window
+    }
+
+    /// Whether the per-plugin byte window admits `bytes` more result bytes.
+    ///
+    /// The operation dimension is excluded: a listing already admitted by
+    /// [`Self::admit_listing`] must still be able to charge its returned
+    /// bytes when it is the operation that reaches the op cap.
+    fn window_bytes_admit(&self, key: &str, bytes: u64) -> bool {
+        let used = self.usage.get(key).copied().unwrap_or_default();
+        used.bytes < self.caps.max_bytes_per_window
+            && used.bytes.saturating_add(bytes) <= self.caps.max_bytes_per_window
+    }
+
+    /// Commit admitted operations and result bytes to the window.
+    fn commit_window(&mut self, key: String, ops: u64, bytes: u64) {
+        let entry = self.usage.entry(key).or_default();
+        entry.ops = entry.ops.saturating_add(ops);
+        entry.bytes = entry.bytes.saturating_add(bytes);
+    }
+
     /// Charge one successful operation to the per-plugin window.
     fn charge(
         &mut self,
@@ -945,20 +971,14 @@ impl FsGate {
         slot: Option<usize>,
     ) -> Result<(), FsBridgeError> {
         let key = plugin.as_str().to_string();
-        let used = self.usage.get(&key).copied().unwrap_or_default();
-        if used.ops >= self.caps.max_ops_per_window
-            || used.bytes >= self.caps.max_bytes_per_window
-            || used.bytes.saturating_add(bytes) > self.caps.max_bytes_per_window
-        {
+        if !self.window_admits(&key, bytes) {
             return Err(FsBridgeError::denied(
                 FsBridgeDenialKind::OverBoundOrRate,
                 level,
                 "over window budget",
             ));
         }
-        let entry = self.usage.entry(key).or_default();
-        entry.ops += 1;
-        entry.bytes += bytes;
+        self.commit_window(key, 1, bytes);
         if matches!(level, TrustLevel::NativeSidecar | TrustLevel::ExternalTool) {
             if let Some(idx) = slot {
                 if let FsGrantKind::PerRequest { uses_left } = &mut self.grants[idx].kind {
@@ -966,6 +986,49 @@ impl FsGate {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Admit one listing operation against the per-plugin window.
+    ///
+    /// Host I/O boundary accounting for the real `bitty.fs.list` verb
+    /// (`bitty-runtime`): grants and static bounds are evaluated there
+    /// against the real filesystem, while this method applies only the
+    /// `P0-AC-014` window bookkeeping. It fails with
+    /// [`FsBridgeDenialKind::OverBoundOrRate`] once the window is exhausted,
+    /// so the caller can deny before performing any directory I/O.
+    ///
+    /// The runtime services layer does not carry a per-generation trust
+    /// level; the denial shape uses the generic Lua level, and only the
+    /// stable code crosses the bridge.
+    pub fn admit_listing(&mut self, plugin: &str) -> Result<(), FsBridgeError> {
+        let key = plugin.to_string();
+        if !self.window_admits(&key, 0) {
+            return Err(FsBridgeError::denied(
+                FsBridgeDenialKind::OverBoundOrRate,
+                TrustLevel::ThirdPartyLua,
+                "over window budget",
+            ));
+        }
+        self.commit_window(key, 1, 0);
+        Ok(())
+    }
+
+    /// Charge the returned name bytes of one listing to the per-plugin window.
+    ///
+    /// Called after [`Self::admit_listing`] admitted the operation; an
+    /// exhausted byte budget denies the page with
+    /// [`FsBridgeDenialKind::OverBoundOrRate`].
+    pub fn charge_listing_bytes(&mut self, plugin: &str, bytes: u64) -> Result<(), FsBridgeError> {
+        let key = plugin.to_string();
+        if !self.window_bytes_admit(&key, bytes) {
+            return Err(FsBridgeError::denied(
+                FsBridgeDenialKind::OverBoundOrRate,
+                TrustLevel::ThirdPartyLua,
+                "over window budget",
+            ));
+        }
+        self.commit_window(key, 0, bytes);
         Ok(())
     }
 
@@ -2069,6 +2132,40 @@ mod tests {
         assert!(FsCaps::new(4096, 4096, 16, 0, 4, 16384).is_err());
         assert!(FsCaps::new(4096, 4096, 16, 8192, 0, 16384).is_err());
         assert!(FsCaps::new(4096, 4096, 16, 8192, 4, 0).is_err());
+    }
+
+    #[test]
+    fn host_listing_accounting_denies_over_op_and_byte_windows() {
+        // Op window: the runtime admits one op per call before I/O.
+        let mut gate = FsGate::new(FsCaps::new(4096, 4096, 16, 8192, 2, 1024).unwrap());
+        gate.admit_listing("xuepoo.files").unwrap();
+        gate.admit_listing("xuepoo.files").unwrap();
+        assert_eq!(
+            gate.admit_listing("xuepoo.files")
+                .unwrap_err()
+                .denial_kind(),
+            Some(FsBridgeDenialKind::OverBoundOrRate)
+        );
+        // A new window restores admission.
+        gate.advance_window();
+        gate.admit_listing("xuepoo.files").unwrap();
+
+        // Byte window: returned name bytes exhaust it independently.
+        let mut gate = FsGate::new(FsCaps::new(4096, 4096, 16, 8192, 1024, 8).unwrap());
+        gate.admit_listing("xuepoo.files").unwrap();
+        gate.charge_listing_bytes("xuepoo.files", 8).unwrap();
+        assert_eq!(
+            gate.charge_listing_bytes("xuepoo.files", 1)
+                .unwrap_err()
+                .denial_kind(),
+            Some(FsBridgeDenialKind::OverBoundOrRate)
+        );
+        assert_eq!(
+            gate.admit_listing("xuepoo.files")
+                .unwrap_err()
+                .denial_kind(),
+            Some(FsBridgeDenialKind::OverBoundOrRate)
+        );
     }
 
     // ── labels ─────────────────────────────────────────────────────────

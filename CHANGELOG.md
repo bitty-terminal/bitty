@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Restricted Lua plugin settings (CTX-1294, #2192):** per-plugin settings
   files use declared keys and strict types, with bounded reads and fail-closed
   fallback; short-name aliases require complete discovery.
+- **Panel geometry interpolation (CTX-1335, #2113):** split, move, and resize
+  transitions interpolate painted bounds, with instant, reduced-motion, safe,
+  and zero-duration paths that paint the committed end bounds on the first
+  frame. Float detach/restore fails closed to instant bounds, and a tier or
+  capacity change cancels the stale tween before the next present. Layout,
+  hit-testing, PTY size, and terminal truth keep reading the committed frames.
 
 ### Fixed
 
@@ -45,17 +51,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and rejected settings files through host warning logs. Summaries omit
   setting names and values and preserve the existing activation-report and
   loaded-settings layouts and capability checks.
+- **Float teardown and workspace focus (CTX-1336, CTX-1337, #2221, #2222):**
+  a closed float no longer leaves a ghost host leaf, a workspace emptied by
+  its last float is pruned instead of showing a blank slot, focus moves to a
+  surviving pinned view when the last tiled panel closes, and cross-workspace
+  focus and pin-only survivors are fenced.
+- **`new_panel` over an emptied workspace (CTX-1338, CTX-1347, #2223,
+  #2240):** `new_panel` materializes a tiled base when the workspace has none
+  (or refuses loudly), and the fresh shell inherits the working directory from
+  the surviving float or pin instead of its own allocation target.
+- **Pin-only session capture (CTX-1342, #2230):** a pin-only empty tiled base
+  is refused with the typed `SessionError::PinOnlyEmptyBase` diagnostic
+  instead of being reported as file corruption; capture writes no file and
+  leaves the existing session untouched. Pinless empty workspaces remain
+  `Corrupt`; persisting the pin-only state needs a storage codec change.
+- **Plugin UI retained strings (CTX-1340, #2229):** retained text, theme
+  tokens, command identifiers, argument keys, and string argument values are
+  charged against the existing 2 MiB SCN-4 aggregate, and argument keys are
+  capped at the existing 64-byte command-identifier bound. The 320 KiB
+  envelope, aggregate, and `E_UI_BLOCK_BUDGET` class are unchanged.
+- **Animation budget (CTX-1335, #2232):** a gesture re-arming its ring carries
+  the painted frame forward, and only bounds-only tweens are evicted at the
+  shared budget; a budget full of ring entries refuses the trigger.
+- **Lua error diagnostics (CTX-1346, #2237):** table-shaped bridge errors
+  decode to `<code>: <message>` instead of `<table 0x...>`; plain strings,
+  numbers, userdata, and opaque tables keep their existing rendering.
+- **Clipboard live-test isolation (CTX-1316, #2205):** guard only: native
+  scenarios are refused, not accepted. Live validation requires a disposable
+  display and fails closed when isolation evidence is unbound; acquisition
+  behavior itself is unchanged.
 
 ### Changed
 
 - **Release and installation tooling:** hardened Windows installer checks,
   immutable R2 rerun protection, and plugin-install next steps.
+- **Plugin install staging (CTX-1313, #2204):** fresh CLI installs stay
+  staged-disabled until explicit enable; update installs keep their desired
+  state and the existing package security gates.
+- **Startup configuration fallback (CTX-1339, #2225):** on first start, a
+  present user config file that cannot be loaded or merged falls back to the
+  built-in defaults with diagnostics; a missing explicit `--config` or
+  `BITTY_CONFIG` path, an invalid profile, a CLI usage error, and an invalid
+  built-in plan stay fail-closed. Merge errors name the offending layer, and
+  `--theme` is validated with the other CLI appearance overrides before any
+  layer merge.
+- **Band input delivery (CTX-1332, #2213):** partial: band delivery moved to
+  the AboutToWait cold phase; remaining `drive_tick` VM pumps are not covered
+  and P0-AC-015 remains unverified.
+- **Input-to-VM regression lock (CTX-1327, #2215):** a headless proof through
+  `AppHandler::handle_event` shows the accepted input path taking no
+  owning-plugin-VM entries and delivering exactly once on the later cold pump.
+- **Band slot placement (CTX-1341, #2234):** left and right band slots fail
+  closed at mount with an unsupported-placement refusal instead of returning a
+  handle that no renderer paints, reserves, or hit-tests.
+- **Terminal docs pin (CTX-1318, #2214):** the `docs` gitlink advances to
+  Terminal Docs `2b027ccd`, which carries the `interfaces/provider-contracts.md`
+  specification-spine repair; the re-audited pin range returns `CLEAN`.
 
 ### Removed
 
 - **Obsolete mascot splash (CTX-1301, #2197):** removed the first-run splash,
   its marker-file writes, and the `--no-splash` flag from CLI parsing, help,
   and shell completions.
+
+### Known issues
+
+- Native clipboard acquisition (#2206) remains open at P0: acquisition is
+  still unbounded before allocation and delivery.
+- Residual input-to-VM paths (#2213) remain open: `drive_tick` VM pumps are
+  uncovered and P0-AC-015 is unverified.
+- The stray blank first row on a new panel (#2145) is unreproduced and moved
+  to 0.0.25 as a P2 follow-up.
 
 ### Follow-ups (not in this release)
 

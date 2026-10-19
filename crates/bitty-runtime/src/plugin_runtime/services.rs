@@ -8360,9 +8360,9 @@ mod history_tests {
             panic!("record table");
         };
         let record = LuaValue::Table(record.clone());
-        assert_eq!(
-            record.get("body"),
-            Some(&LuaValue::String("secret-free transcript".to_string()))
+        assert!(
+            record.get("body") == Some(&LuaValue::String("secret-free transcript".to_string())),
+            "unexpected transcript record body"
         );
         assert_eq!(
             record.get("label"),

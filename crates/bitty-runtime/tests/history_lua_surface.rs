@@ -145,18 +145,19 @@ fn three_plugin_call_shapes_return_rows_for_all_sources() {
         stored(&services, "transcript_rows"),
         Some(LuaValue::Integer(1))
     );
-    assert_eq!(
-        stored(&services, "transcript_body"),
-        Some(LuaValue::String("transcript row".to_string()))
+    assert!(
+        stored(&services, "transcript_body")
+            == Some(LuaValue::String("transcript row".to_string())),
+        "unexpected transcript record body"
     );
     assert_eq!(
         stored(&services, "commands_rows"),
         Some(LuaValue::Integer(1))
     );
     assert_eq!(stored(&services, "kv_rows"), Some(LuaValue::Integer(1)));
-    assert_eq!(
-        stored(&services, "kv_body"),
-        Some(LuaValue::String("own value".to_string()))
+    assert!(
+        stored(&services, "kv_body") == Some(LuaValue::String("own value".to_string())),
+        "unexpected kv record body"
     );
     assert_eq!(
         stored(&services, "freshness"),

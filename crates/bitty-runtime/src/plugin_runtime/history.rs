@@ -681,12 +681,15 @@ mod tests {
         let rows = snapshot_rows(&provider);
         assert_eq!(rows.len(), retained);
         assert_eq!(rows[0].0, HistorySource::Transcript);
-        assert_eq!(rows[0].1.redacted_body, "line00");
+        assert!(
+            rows[0].1.redacted_body == "line00",
+            "unexpected first captured row body"
+        );
         assert_eq!(rows[0].1.panel, "1");
         assert_eq!(rows[0].1.workspace, "7");
-        assert_eq!(
-            rows[retained - 1].1.redacted_body,
-            format!("line{:02}", retained - 1)
+        assert!(
+            rows[retained - 1].1.redacted_body == format!("line{:02}", retained - 1),
+            "unexpected last captured row body"
         );
 
         // A second sample of the same buffer adds nothing.
@@ -701,8 +704,14 @@ mod tests {
         assert_eq!(rows.len(), retained + 2);
         // The two oldest grid rows scrolled into history; later input has
         // not reached the ring yet.
-        assert_eq!(rows[retained].1.redacted_body, "line07");
-        assert_eq!(rows[retained + 1].1.redacted_body, "line08");
+        assert!(
+            rows[retained].1.redacted_body == "line07",
+            "unexpected first newly captured row body"
+        );
+        assert!(
+            rows[retained + 1].1.redacted_body == "line08",
+            "unexpected second newly captured row body"
+        );
         assert!(provider.history().len() <= HISTORY_SNAPSHOT_MAX_ROWS);
     }
 
@@ -738,8 +747,14 @@ mod tests {
         }
 
         let body = redact_transcript_line(&scrollback_line("export API_KEY=sk-live-SECRET-abc123"));
-        assert!(!body.contains("sk-live-SECRET-abc123"), "{body}");
-        assert!(body.contains("[redacted]"), "{body}");
+        assert!(
+            !body.contains("sk-live-SECRET-abc123"),
+            "redaction kept a secret-shaped token"
+        );
+        assert!(
+            body.contains("[redacted]"),
+            "redaction marker missing from a secret-shaped row"
+        );
 
         // The same bytes flow through capture unchanged: only redacted text
         // ever reaches the ring.
@@ -749,9 +764,19 @@ mod tests {
             feed_line(&mut state, &format!("line{index:02} sk-live-SECRET-abc123"));
         }
         assert!(provider.capture_state(&state, "1", "7") > 0);
-        let rendered = format!("{:?}", snapshot_rows(&provider));
-        assert!(!rendered.contains("sk-live-SECRET-abc123"), "{rendered}");
-        assert!(rendered.contains("[redacted]"), "{rendered}");
+        let rows = snapshot_rows(&provider);
+        assert!(!rows.is_empty(), "capture stored no rows");
+        let leaked = rows
+            .iter()
+            .any(|(_, row)| row.redacted_body.contains("sk-live-SECRET-abc123"));
+        let marked = rows
+            .iter()
+            .any(|(_, row)| row.redacted_body.contains("[redacted]"));
+        assert!(
+            !leaked,
+            "captured transcript contains a secret-shaped token"
+        );
+        assert!(marked, "captured transcript lacks a redaction marker");
     }
 
     #[test]
@@ -883,7 +908,10 @@ mod tests {
             rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq,
             HISTORY_SNAPSHOT_MAX_ROWS as u64
         );
-        assert_eq!(rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.redacted_body, "new");
+        assert!(
+            rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.redacted_body == "new",
+            "unexpected newest captured row body"
+        );
     }
 
     #[test]

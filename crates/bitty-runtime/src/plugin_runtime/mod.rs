@@ -2781,6 +2781,7 @@ impl PluginRuntime {
     /// live registry, the generation/handle/version/slot changed, or the
     /// plugin is not `Active`; otherwise the delegated
     /// [`dispatch_command`](Self::dispatch_command) errors.
+    #[doc(hidden)]
     pub fn dispatch_ui_command(
         &mut self,
         id: &PluginId,

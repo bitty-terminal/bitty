@@ -2622,53 +2622,43 @@ impl State {
                 self.cursor.position.row = row.saturating_add(n).min(ceiling).min(last_row);
             }
             Direction::Right => {
-                // CR-TERM-02: break at the right margin so a 65535-count
-                // CUF from untrusted input cannot amplify into 65k grid
-                // probes; iterations past the margin are no-ops.
+                // CR-TERM-02: clamp at the right margin so a 65535-count
+                // CUF from untrusted input is O(1) instead of a 65k grid
+                // scan. CUF/CUB counts are *columns*, not character
+                // positions: a wide pair's trailing spacer is not an extra
+                // step. The destination is therefore exactly `col + n`
+                // (clamped), snapped back to the leading half only when it
+                // lands on a spacer (invariant 3: the cursor never rests on
+                // one). Counting spacers as extra columns made shell redraws
+                // (`CR`, absolute CUF, then CUB) land past their intended
+                // column and repaint over stale cells (issue #2261).
                 let last = last_col as usize;
-                let mut c = col as usize;
-                for _ in 0..n {
-                    if c >= last {
-                        break;
-                    }
-                    c += 1;
-                    // Hop across a wide pair's trailing half so the
-                    // cursor never rests on a spacer (invariant 3).
-                    if self
-                        .screens_active()
-                        .get(self.cursor.position.row as usize, c)
-                        .spacer
-                    {
-                        if c < last {
-                            c += 1;
-                        } else {
-                            // A pair ending at the last column returns the
-                            // cursor to its leading half: a fixed point, so
-                            // every remaining step is a no-op.
-                            c -= 1;
-                            break;
-                        }
-                    }
-                }
+                let c = (col as usize).saturating_add(usize::from(n)).min(last);
+                let c = if self
+                    .screens_active()
+                    .get(self.cursor.position.row as usize, c)
+                    .spacer
+                {
+                    c.saturating_sub(1)
+                } else {
+                    c
+                };
                 self.cursor.position.col = c as u16;
             }
             Direction::Left => {
-                // CR-TERM-02: symmetric left-margin break for CUB
-                // (iterations at column 0 are no-ops).
-                let mut c = col as usize;
-                for _ in 0..n {
-                    if c == 0 {
-                        break;
-                    }
-                    c -= 1;
-                    if self
-                        .screens_active()
-                        .get(self.cursor.position.row as usize, c)
-                        .spacer
-                    {
-                        c = c.saturating_sub(1);
-                    }
-                }
+                // CR-TERM-02: symmetric O(1) left-margin clamp. A spacer
+                // destination snaps to its leading half; the step count is
+                // never inflated by the pair it traverses.
+                let c = (col as usize).saturating_sub(usize::from(n));
+                let c = if self
+                    .screens_active()
+                    .get(self.cursor.position.row as usize, c)
+                    .spacer
+                {
+                    c.saturating_sub(1)
+                } else {
+                    c
+                };
                 self.cursor.position.col = c as u16;
             }
         }

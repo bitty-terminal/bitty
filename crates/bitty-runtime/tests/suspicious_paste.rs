@@ -103,16 +103,40 @@ fn unicode_c1_controls_trigger() {
 }
 
 #[test]
-fn bidi_and_zero_width_trigger() {
+fn bidi_controls_trigger_and_joiners_are_exempt() {
+    // Real BiDi/directional controls gate.
     for ch in [
-        '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}',
-        '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2066}', '\u{2067}',
-        '\u{2068}', '\u{2069}', '\u{FEFF}',
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
     ] {
         let s = format!("a{ch}b");
         let insp = inspect_via_runtime(&s);
         assert!(insp, "bidi U+{:04X} must need confirmation", ch as u32);
     }
+    // Zero-width joiners are legitimate cluster members (issue #2261):
+    // ZWJ/ZWNJ paste silently.
+    for ch in ['\u{200C}', '\u{200D}'] {
+        let s = format!("a{ch}b");
+        let insp = inspect_via_runtime(&s);
+        assert!(
+            !insp,
+            "joiner U+{:04X} must not need confirmation",
+            ch as u32
+        );
+    }
+    // Genuine zero-width formatting still gates (it can hide text) but is
+    // reported as its own class, never as bidi.
+    for ch in ['\u{200B}', '\u{2060}', '\u{FEFF}'] {
+        let s = format!("a{ch}b");
+        assert!(
+            inspect_via_runtime(&s),
+            "formatting U+{:04X} must need confirmation",
+            ch as u32
+        );
+    }
+    // The reported symptom: a plain family emoji is clean.
+    let family = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+    assert!(!inspect_via_runtime(family));
 }
 
 // ── Integration: confirmation gate — no silent delivery path ──────────

@@ -116,7 +116,9 @@ pub use panel_rules::{
     MAX_PANEL_RULES, PanelPresentation, PanelSpawnRule, command_line_for, find_match,
     matches_regex, validate_regex_pattern,
 };
-pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
+pub use plan::{
+    ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+};
 pub use project_schema::{
     MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,
     MAX_PROJECT_DESCRIPTION_CHARS, MAX_PROJECT_NAME_BYTES, MAX_PROJECT_TOML_BYTES,
@@ -141,13 +143,13 @@ pub use trust::{
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
     AppearanceConfig, BackgroundFit, BackgroundPosition, BellMode, CloseConfirm, CursorStyle,
-    DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
-    MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec,
-    ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance,
-    ResolvedViewStyle, ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig,
-    TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride,
-    ViewSelector, WindowConfig, WorkspaceConfig,
+    DecorationConfig, EffectiveConfig, FontConfig, HistoryCaptureConfig, HistoryConfig,
+    KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_STYLE_GLOW_WIDTH_PX,
+    MAX_STYLE_SHADOW_OFFSET_PX, MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig,
+    OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths,
+    ResolvedViewAppearance, ResolvedViewStyle, ScrollbarConfig, ScrollbarMode, SelectionConfig,
+    StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget, ViewContent,
+    ViewOverride, ViewSelector, WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 pub use wheel::{

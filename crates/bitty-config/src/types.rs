@@ -2706,6 +2706,42 @@ impl TerminalConfig {
     }
 }
 
+/// Opt-in transcript and command capture for the plugin history surface
+/// (CTX-1352, issue #2247).
+///
+/// Both switches default to `false`: nothing terminal-derived enters the
+/// bounded in-memory history ring until the user opts in. A disabled
+/// transcript switch keeps the source available but makes the gate deny with
+/// the accepted `E_HISTORY_CAPTURE_DISABLED` category; the gate remains
+/// authoritative for grants, scopes, safe mode, bounds, and budgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryConfig {
+    /// Capture switches for the terminal-derived sources.
+    pub capture: HistoryCaptureConfig,
+}
+
+impl HistoryConfig {
+    /// Validate history capture configuration.
+    ///
+    /// Both leaves are booleans, so this is total today; the explicit call
+    /// keeps a future leaf from slipping past review unvalidated.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
+/// Terminal-derived history capture opt-ins (`history.capture.*`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryCaptureConfig {
+    /// Capture completed scrollback lines into the bounded transcript ring
+    /// (`history.capture.transcript`, default `false`).
+    pub transcript: bool,
+    /// Reserved command-history capture opt-in
+    /// (`history.capture.commands`, default `false`). The command source has
+    /// no backing span store yet and reports typed unavailability regardless.
+    pub commands: bool,
+}
+
 /// Selection behavior configuration (CTX-0191, CTX-0371).
 ///
 /// `auto_copy` controls copy-on-select. `false` (default) matches kitty
@@ -3887,6 +3923,8 @@ pub struct EffectiveConfig {
     pub terminal: TerminalConfig,
     /// Selection config (CTX-0191; default auto-copies on select).
     pub selection: SelectionConfig,
+    /// Plugin history capture opt-ins (CTX-1352; both default off).
+    pub history: HistoryConfig,
     /// Close-confirmation mode (CTX-0370 top-level `close_confirm`; default
     /// `when_busy`).
     pub close_confirm: CloseConfirm,
@@ -3958,6 +3996,7 @@ impl Default for EffectiveConfig {
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
             selection: SelectionConfig::default(),
+            history: HistoryConfig::default(),
             close_confirm: DEFAULT_CLOSE_CONFIRM,
             layout: LayoutConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -4044,6 +4083,8 @@ impl EffectiveConfig {
         self.appearance.style = Some(StyleConfig::safe());
         self.views.clear();
         self.panel_rules.clear();
+        // CTX-1352: safe mode captures no terminal-derived history.
+        self.history = HistoryConfig::default();
         self.animations.duration_ms = AnimationDurations {
             open: 0,
             close: 0,
@@ -4062,6 +4103,7 @@ impl EffectiveConfig {
         self.window.validate()?;
         self.terminal.validate()?;
         self.selection.validate()?;
+        self.history.validate()?;
         self.layout.validate()?;
         self.decoration.validate()?;
         // CTX-0343: every merged `views` entry must stay structurally valid

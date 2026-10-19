@@ -150,6 +150,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.cursor_style`         | RestartRequired    |
 /// | `terminal.bell`                 | RestartRequired    |
 /// | `selection.auto_copy`     | RestartRequired    |
+/// | `history.capture.transcript` | RestartRequired |
+/// | `history.capture.commands`   | RestartRequired |
 /// | `close_confirm`           | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
 /// | `layout.gaps_out`         | RestartRequired    |
@@ -298,6 +300,8 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "terminal.cursor_style",
     "terminal.bell",
     "selection.auto_copy",
+    "history.capture.transcript",
+    "history.capture.commands",
     "close_confirm",
     "layout.gaps_in",
     "layout.gaps_out",
@@ -313,6 +317,8 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
 pub const RESTART_REQUIRED_SECTIONS: &[&str] = &[
     "terminal",
     "selection",
+    "history",
+    "history.capture",
     "layout",
     "workspace",
     "scrollbar",
@@ -627,6 +633,18 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "selection.auto_copy",
         old.selection.auto_copy.to_string(),
         new.selection.auto_copy.to_string(),
+    );
+    // CTX-1352: history capture is adopted by the composition root at
+    // startup, so changes are restart-required like selection above.
+    push_if_changed(
+        "history.capture.transcript",
+        old.history.capture.transcript.to_string(),
+        new.history.capture.transcript.to_string(),
+    );
+    push_if_changed(
+        "history.capture.commands",
+        old.history.capture.commands.to_string(),
+        new.history.capture.commands.to_string(),
     );
     // CTX-0370: close confirmation is adopted at startup (RuntimeConfig is
     // built once from the effective config), so changes are restart-required,

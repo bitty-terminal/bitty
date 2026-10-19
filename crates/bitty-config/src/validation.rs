@@ -111,6 +111,11 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(e);
         }
     }
+    if let Some(v) = &plan.history {
+        if let Err(e) = v.validate() {
+            out.push(e);
+        }
+    }
     if let Some(v) = &plan.close_confirm {
         if let Err(e) = v.validate() {
             out.push(ConfigError::validation("close_confirm", e.to_string()));

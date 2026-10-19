@@ -16,11 +16,11 @@ use bitty_config::theme::CustomPalette;
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HostServices, LuaValue,
-    LuaVm, OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES,
-    OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute,
-    StashedFunction, ThemeTable, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest,
-    env_grant_shape_ok, validate_env_key,
+    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HistoryQueryOp,
+    HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm, OVERLAY_CALL_MAX_BYTES,
+    OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll,
+    SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, ThemeTable, WORKSPACE_LIST_MAX_ITEMS,
+    WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_rich::{
@@ -39,7 +39,14 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use bitty_plugin_host::{
-    ProvidedService, parse_service_reference, service_version_satisfies, value_satisfies_schema,
+    HISTORY_READ_VERSION, HistoryDenialKind, HistoryGate, HistoryGrant, HistoryScope,
+    HistorySource, PluginId, ProvidedService, QueryOp, SnapshotQuery, TrustLevel,
+    parse_service_reference, service_version_satisfies, value_satisfies_schema,
+};
+
+use super::history::{
+    HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
+    history_error, history_page_value, history_source, history_unavailable,
 };
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
@@ -1648,6 +1655,27 @@ pub struct PluginServices {
     workspace_control: Cell<bool>,
     workspace_source: RefCell<Option<Rc<dyn WorkspaceSource>>>,
     workspace_requests: RefCell<Option<Rc<RefCell<WorkspaceRequestQueue>>>>,
+    /// Composition-root history snapshot provider (CTX-1352, issue #2247).
+    ///
+    /// `None` leaves every granted history query failing closed with the
+    /// typed `E_HISTORY_UNAVAILABLE` denial. Presence never grants access:
+    /// the per-source capability head stays the first gate.
+    history_provider: RefCell<Option<Rc<dyn HistoryProvider>>>,
+    /// Per-generation Core history gate (grants, scopes, capture, safe mode,
+    /// bounds, budgets). One gate per generation keeps rate/aggregate usage
+    /// attributed to this plugin only (`P0-AC-014`).
+    history_gate: RefCell<HistoryGate>,
+    /// Query scopes already granted to the gate this rate window.
+    ///
+    /// The accepted history heads carry no grant parameter (scope travels
+    /// with the host call), so the gate grant extent is the authorized call
+    /// scope. Remembering issued scopes avoids growing the gate's grant list
+    /// on every repeated query; the set is capped at
+    /// [`HISTORY_GRANT_SCOPE_CACHE_MAX`] and overflow clears grants while
+    /// keeping rate usage. Cleared when the rate window advances.
+    history_grant_scopes: RefCell<BTreeSet<(HistorySource, Option<String>, Option<String>)>>,
+    /// Start of the current history rate window.
+    history_window_start: Cell<Instant>,
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
     panel_create_backend: RefCell<Option<PanelCreateHandler>>,
@@ -1749,6 +1777,10 @@ impl PluginServices {
             workspace_control: Cell::new(false),
             workspace_source: RefCell::new(None),
             workspace_requests: RefCell::new(None),
+            history_provider: RefCell::new(None),
+            history_gate: RefCell::new(HistoryGate::new(history_caps())),
+            history_grant_scopes: RefCell::new(BTreeSet::new()),
+            history_window_start: Cell::new(Instant::now()),
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
             panel_create_backend: RefCell::new(None),
@@ -1940,6 +1972,16 @@ impl PluginServices {
     ) {
         *self.workspace_source.borrow_mut() = source;
         *self.workspace_requests.borrow_mut() = requests;
+    }
+
+    /// Attach the composition-root history snapshot provider (CTX-1352).
+    ///
+    /// Only the provider supplies persisted rows; the per-source capability
+    /// head still gates every call, and the gate still enforces capture,
+    /// scope, safe mode, bounds, and budgets. Without a provider a granted
+    /// call fails closed with the typed `E_HISTORY_UNAVAILABLE` denial.
+    pub fn set_history_provider(&self, provider: Option<Rc<dyn HistoryProvider>>) {
+        *self.history_provider.borrow_mut() = provider;
     }
 
     /// Grant the UI surfaces for this generation from the activation snapshot.
@@ -2700,6 +2742,103 @@ impl HostServices for PluginServices {
             ));
         }
         Ok(snapshot)
+    }
+
+    fn history_query(
+        &self,
+        source: HistoryQuerySource,
+        request: &HistoryQueryRequest,
+    ) -> Result<LuaValue, BridgeError> {
+        // CTX-1352: the closed capability head is the first gate, exactly
+        // like the other per-domain verbs. Absent grants deny with the
+        // family's typed category; the gate below would also deny, but this
+        // check keeps the no-backend and no-grant cases distinguishable and
+        // makes the grant check independently mutation-testable.
+        if !self.has_granted_capability(source.capability_head()) {
+            return Err(BridgeError::new(
+                "runtime",
+                HistoryDenialKind::MissingGrant.code(),
+                format!(
+                    "{} denied for level 'third-party-lua' (family 'history')",
+                    HistoryDenialKind::MissingGrant.code()
+                ),
+            ));
+        }
+        let provider = self
+            .history_provider
+            .borrow()
+            .clone()
+            .ok_or_else(history_unavailable)?;
+        let core_source = history_source(source);
+        // A provider may exist while one source has no backing
+        // implementation (command history today). That is typed
+        // unavailability for that source only, never a fabricated empty
+        // page. Capture opt-in is a separate axis handled by the gate: an
+        // available transcript with capture disabled denies with
+        // E_HISTORY_CAPTURE_DISABLED.
+        if !provider.source_available(core_source) {
+            return Err(history_unavailable());
+        }
+        // Snapshot first: no store is a typed unavailability, never an
+        // empty page and never a Lua nil-index.
+        let snapshot = provider.snapshot()?;
+        let scope = HistoryScope::new(
+            core_source,
+            request.panel.as_deref(),
+            request.workspace.as_deref(),
+        )
+        .map_err(history_error)?;
+        let mut gate = self.history_gate.borrow_mut();
+        let now = Instant::now();
+        if now.duration_since(self.history_window_start.get()) >= HISTORY_RATE_WINDOW {
+            // A fresh gate resets per-window usage and drops the previous
+            // window's per-call grants, so grant storage stays bounded by
+            // one window's distinct scopes.
+            *gate = HistoryGate::new(history_caps());
+            self.history_grant_scopes.borrow_mut().clear();
+            self.history_window_start.set(now);
+        }
+        gate.set_safe_mode(self.safe_mode.get());
+        gate.set_capture(core_source, provider.capture_enabled(core_source));
+        let plugin = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        let grant_key = (
+            core_source,
+            request.panel.clone(),
+            request.workspace.clone(),
+        );
+        // The scope above is validated before any grant is recorded. Grants
+        // are cached per exact caller-named scope only up to a fixed bound;
+        // overflow clears the grant list (never usage) and starts a fresh
+        // bounded cache, so caller-chosen scopes cannot grow state without
+        // limit inside one rate window.
+        if !self.history_grant_scopes.borrow().contains(&grant_key) {
+            if self.history_grant_scopes.borrow().len() >= HISTORY_GRANT_SCOPE_CACHE_MAX {
+                gate.clear_grants();
+                self.history_grant_scopes.borrow_mut().clear();
+            }
+            gate.issue_grant(HistoryGrant::standing(plugin.clone(), scope.clone()));
+            self.history_grant_scopes.borrow_mut().insert(grant_key);
+        }
+        let op = match request.op {
+            HistoryQueryOp::List => QueryOp::List,
+            HistoryQueryOp::Tail => QueryOp::Tail,
+            HistoryQueryOp::Search => QueryOp::Search {
+                needle: request.needle.clone().unwrap_or_default(),
+            },
+        };
+        let query = SnapshotQuery {
+            client_version: HISTORY_READ_VERSION,
+            scope,
+            row_start: request.row_start,
+            row_count: request.row_count,
+            max_bytes: request.max_bytes,
+            op,
+        };
+        let page = gate
+            .query(&plugin, TrustLevel::ThirdPartyLua, &query, &snapshot)
+            .map_err(history_error)?;
+        Ok(history_page_value(&page))
     }
 
     fn has_terminal_submit(&self) -> bool {
@@ -8129,5 +8268,456 @@ mod tests {
                 .code,
             E_UI_NOT_OWNER
         );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::plugin_runtime::history::{
+        BoundedHistory, HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_MAX_QUERIES_PER_WINDOW,
+        HISTORY_MAX_ROWS_PER_QUERY,
+    };
+    use bitty_plugin_host::{Attribution, HistorySnapshot, PluginId, StoredRow};
+    use std::time::Instant;
+
+    fn services() -> PluginServices {
+        PluginServices::new(
+            "xuepoo.test",
+            PluginStore::in_memory(),
+            Rc::new(EmptySettings),
+            Rc::new(UnavailableSnapshot),
+            Rc::new(RefCell::new(NotificationQueue::new(8))),
+            false,
+            false,
+        )
+    }
+
+    fn row(owner: Option<&str>, panel: &str, seq: u64, body: &str) -> StoredRow {
+        StoredRow {
+            owner: owner.map(|id| PluginId::new(id).expect("plugin id")),
+            panel: panel.to_string(),
+            workspace: "ws-1".to_string(),
+            seq,
+            redacted_body: body.to_string(),
+            attribution: Attribution {
+                panel: panel.to_string(),
+                workspace: "ws-1".to_string(),
+                command: None,
+                recorded_at: seq,
+                actor: None,
+            },
+            purged: false,
+        }
+    }
+
+    fn request(op: HistoryQueryOp) -> HistoryQueryRequest {
+        HistoryQueryRequest {
+            panel: None,
+            workspace: Some("ws-1".to_string()),
+            row_start: 0,
+            row_count: 16,
+            max_bytes: 4096,
+            op,
+            needle: None,
+        }
+    }
+
+    fn grant(services: &PluginServices, source: HistoryQuerySource) {
+        services.set_granted_capabilities(vec![source.capability_head().to_string()]);
+    }
+
+    fn provider_with(source: HistorySource, rows: Vec<StoredRow>) -> Rc<BoundedHistory> {
+        let provider = Rc::new(BoundedHistory::empty(true, true));
+        for row in rows {
+            assert!(provider.push(source, row));
+        }
+        provider
+    }
+
+    #[test]
+    fn transcript_query_returns_rows_through_the_gate() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        let provider = provider_with(
+            HistorySource::Transcript,
+            vec![row(None, "pane-a", 0, "secret-free transcript")],
+        );
+        services.set_history_provider(Some(provider));
+        let page = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("granted transcript page");
+        assert_eq!(page.get("ok"), Some(&LuaValue::Bool(true)));
+        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(1)));
+        let Some(LuaValue::Table(records)) = page.get("records") else {
+            panic!("records array");
+        };
+        assert_eq!(records.len(), 1);
+        let Some(LuaValue::Table(record)) = records.first().map(|(_, value)| value) else {
+            panic!("record table");
+        };
+        let record = LuaValue::Table(record.clone());
+        assert!(
+            record.get("body") == Some(&LuaValue::String("secret-free transcript".to_string())),
+            "unexpected transcript record body"
+        );
+        assert_eq!(
+            record.get("label"),
+            Some(&LuaValue::String("untrusted-observation".to_string()))
+        );
+    }
+
+    #[test]
+    fn commands_and_kv_queries_are_per_source_and_namespaced() {
+        let services = services();
+        services.set_granted_capabilities(vec![
+            "history.commands.read".to_string(),
+            "history.kv.read".to_string(),
+        ]);
+        let provider = Rc::new(BoundedHistory::empty(true, true));
+        provider.push(
+            HistorySource::CommandHistory,
+            row(None, "pane-a", 0, "cargo test"),
+        );
+        provider.push(
+            HistorySource::PluginKv,
+            row(Some("xuepoo.test"), "", 0, "own value"),
+        );
+        provider.push(
+            HistorySource::PluginKv,
+            row(Some("other.plugin"), "", 1, "foreign value"),
+        );
+        services.set_history_provider(Some(provider));
+        let mut kv_request = request(HistoryQueryOp::Tail);
+        kv_request.workspace = None;
+        let mut commands_request = request(HistoryQueryOp::Search);
+        commands_request.needle = Some("cargo".to_string());
+        let commands = services
+            .history_query(HistoryQuerySource::CommandHistory, &commands_request)
+            .expect("commands page");
+        assert_eq!(commands.get("total_in_scope"), Some(&LuaValue::Integer(1)));
+        let kv = services
+            .history_query(HistoryQuerySource::PluginKv, &kv_request)
+            .expect("kv page");
+        assert_eq!(kv.get("total_in_scope"), Some(&LuaValue::Integer(1)));
+        let Some(LuaValue::Table(records)) = kv.get("records") else {
+            panic!("records");
+        };
+        assert_eq!(records.len(), 1);
+        assert!(!format!("{kv:?}").contains("foreign value"));
+    }
+
+    #[test]
+    fn missing_grant_denies_typed_without_touching_provider() {
+        let services = services();
+        let provider = Rc::new(BoundedHistory::empty(true, true));
+        services.set_history_provider(Some(provider));
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("ungranted");
+        assert_eq!(error.class, "runtime");
+        assert_eq!(error.code, "E_HISTORY_MISSING_GRANT");
+    }
+
+    #[test]
+    fn absent_provider_denies_typed_unavailable() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("no provider");
+        assert_eq!(error.code, "E_HISTORY_UNAVAILABLE");
+        assert!(!error.message.contains("transcript"));
+    }
+
+    #[test]
+    fn empty_result_is_a_successful_page() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(BoundedHistory::empty(true, true))));
+        let page = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("empty page");
+        assert_eq!(page.get("ok"), Some(&LuaValue::Bool(true)));
+        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(0)));
+    }
+
+    #[test]
+    fn over_bound_request_denies_without_clamping() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(provider_with(
+            HistorySource::Transcript,
+            (0..20)
+                .map(|seq| row(None, "pane-a", seq, "line"))
+                .collect(),
+        )));
+        let mut request = request(HistoryQueryOp::List);
+        request.row_count = HISTORY_MAX_ROWS_PER_QUERY + 1;
+        let error = services
+            .history_query(HistoryQuerySource::Transcript, &request)
+            .expect_err("over bound");
+        assert_eq!(error.code, "E_HISTORY_OVER_BOUND");
+    }
+
+    #[test]
+    fn snapshot_is_replaced_not_appended_between_calls() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        let provider = provider_with(
+            HistorySource::Transcript,
+            vec![row(None, "pane-a", 0, "first")],
+        );
+        services.set_history_provider(Some(provider.clone()));
+        let first = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("first page");
+        assert!(format!("{first:?}").contains("first"));
+        let mut next = HistorySnapshot::new();
+        next.push(HistorySource::Transcript, row(None, "pane-a", 1, "second"));
+        provider.publish(next);
+        let second = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("second page");
+        let rendered = format!("{second:?}");
+        assert!(rendered.contains("second"));
+        assert!(!rendered.contains("first"));
+        assert_eq!(
+            second.get("freshness"),
+            Some(&LuaValue::String("point-in-time-no-guarantee".to_string()))
+        );
+    }
+
+    #[test]
+    fn captured_transcript_rows_return_through_the_gate_bounded() {
+        use bitty_term_state::{State, TerminalAction};
+        use bitty_vt::{ControlChar, GraphemeCell};
+
+        fn feed_line(state: &mut State, text: &str) {
+            for ch in text.chars() {
+                state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+            }
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        let provider = Rc::new(crate::plugin_runtime::history::TranscriptHistory::new(
+            true, false,
+        ));
+        let mut state = State::with_scrollback_lines(100);
+        for index in 0..40 {
+            feed_line(&mut state, &format!("captured line {index:02}"));
+        }
+        let captured = state.scrollback_len();
+        assert!(captured > 0);
+        assert_eq!(provider.capture_state(&state, "pane-a", "ws-1"), captured);
+        services.set_history_provider(Some(provider));
+        let page = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::Tail),
+            )
+            .expect("captured rows page");
+        assert_eq!(
+            page.get("total_in_scope"),
+            Some(&LuaValue::Integer(captured as i64))
+        );
+        let Some(LuaValue::Table(records)) = page.get("records") else {
+            panic!("records array");
+        };
+        assert_eq!(
+            records.len(),
+            captured.min(HISTORY_MAX_ROWS_PER_QUERY as usize)
+        );
+        assert!(!format!("{page:?}").contains("sk-live"));
+    }
+
+    #[test]
+    fn live_transcript_capture_off_denies_capture_disabled() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(
+            crate::plugin_runtime::history::TranscriptHistory::new(false, false),
+        )));
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("capture off must deny with the taxonomy category");
+        assert_eq!(error.code, "E_HISTORY_CAPTURE_DISABLED");
+        assert!(!error.message.contains("transcript"));
+    }
+
+    #[test]
+    fn command_source_is_typed_unavailable_when_no_span_source_exists() {
+        let services = services();
+        services.set_granted_capabilities(vec![
+            "history.transcript.read".to_string(),
+            "history.commands.read".to_string(),
+        ]);
+        services.set_history_provider(Some(Rc::new(
+            crate::plugin_runtime::history::TranscriptHistory::new(true, true),
+        )));
+        let transcript = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("transcript remains available");
+        assert_eq!(transcript.get("ok"), Some(&LuaValue::Bool(true)));
+        let error = services
+            .history_query(
+                HistoryQuerySource::CommandHistory,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("command source has no backing store");
+        assert_eq!(error.code, "E_HISTORY_UNAVAILABLE");
+    }
+
+    #[test]
+    fn command_source_serves_rows_when_a_provider_has_them() {
+        let services = services();
+        grant(&services, HistoryQuerySource::CommandHistory);
+        services.set_history_provider(Some(provider_with(
+            HistorySource::CommandHistory,
+            vec![row(None, "pane-a", 0, "cargo test")],
+        )));
+        let page = services
+            .history_query(
+                HistoryQuerySource::CommandHistory,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("available command provider");
+        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(1)));
+    }
+
+    #[test]
+    fn capture_off_denies_terminal_sources() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(BoundedHistory::empty(false, false))));
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("capture off");
+        assert_eq!(error.code, "E_HISTORY_CAPTURE_DISABLED");
+    }
+
+    #[test]
+    fn safe_mode_denies_every_source() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(BoundedHistory::empty(true, true))));
+        services.set_safe_mode(true);
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("safe mode");
+        assert_eq!(error.code, "E_HISTORY_SAFE_MODE");
+    }
+
+    #[test]
+    fn per_plugin_window_budget_denies_after_four_queries() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(provider_with(
+            HistorySource::Transcript,
+            vec![row(None, "pane-a", 0, "line")],
+        )));
+        for index in 0..HISTORY_MAX_QUERIES_PER_WINDOW {
+            services
+                .history_query(
+                    HistoryQuerySource::Transcript,
+                    &request(HistoryQueryOp::List),
+                )
+                .unwrap_or_else(|error| panic!("query {index}: {error:?}"));
+        }
+        let error = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("over rate");
+        assert_eq!(error.code, "E_HISTORY_OVER_BOUND");
+    }
+
+    #[test]
+    fn kv_scope_extent_is_rejected() {
+        let services = services();
+        grant(&services, HistoryQuerySource::PluginKv);
+        let provider = Rc::new(BoundedHistory::empty(true, true));
+        services.set_history_provider(Some(provider));
+        let error = services
+            .history_query(HistoryQuerySource::PluginKv, &request(HistoryQueryOp::List))
+            .expect_err("kv scope");
+        assert_eq!(error.code, "E_DEF_INVALID");
+    }
+
+    #[test]
+    fn cached_grant_scopes_and_gate_grants_stay_bounded() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(BoundedHistory::empty(true, true))));
+        for index in 0..(HISTORY_GRANT_SCOPE_CACHE_MAX * 3) {
+            let mut request = request(HistoryQueryOp::List);
+            request.panel = Some(format!("pane-{index}"));
+            // The per-window rate budget denies most calls; the cache must
+            // stay bounded regardless of whether the query succeeds.
+            let _ = services.history_query(HistoryQuerySource::Transcript, &request);
+            assert!(services.history_grant_scopes.borrow().len() <= HISTORY_GRANT_SCOPE_CACHE_MAX);
+            assert!(services.history_gate.borrow().grant_count() <= HISTORY_GRANT_SCOPE_CACHE_MAX);
+        }
+    }
+
+    #[test]
+    fn window_advance_restores_budget() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(provider_with(
+            HistorySource::Transcript,
+            vec![row(None, "pane-a", 0, "line")],
+        )));
+        for _ in 0..HISTORY_MAX_QUERIES_PER_WINDOW {
+            services
+                .history_query(
+                    HistoryQuerySource::Transcript,
+                    &request(HistoryQueryOp::List),
+                )
+                .expect("within budget");
+        }
+        services
+            .history_window_start
+            .set(Instant::now() - HISTORY_RATE_WINDOW - std::time::Duration::from_secs(1));
+        services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("budget restored");
     }
 }

@@ -34,6 +34,7 @@
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
+//!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified gaps + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
@@ -314,6 +315,29 @@ pub struct TerminalData {
 pub struct SelectionData {
     /// Auto-copy on select (present only when the key is set).
     pub auto_copy: Option<bool>,
+}
+
+/// History capture overrides, plain data (CTX-1352; see [`FontData`] for
+/// `Option` semantics).
+///
+/// `history = { capture = { transcript = true, commands = false } }` opts the
+/// bounded in-memory history ring into terminal-derived capture. Both leaves
+/// default `false` downstream; an absent table means "this layer says
+/// nothing".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HistoryData {
+    /// `history.capture` table.
+    pub capture: Option<HistoryCaptureData>,
+}
+
+/// Terminal-derived history capture switches (`history.capture.*`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HistoryCaptureData {
+    /// Capture completed scrollback lines (present only when the key is set).
+    pub transcript: Option<bool>,
+    /// Reserved command-history capture opt-in (present only when the key is
+    /// set). The command source has no backing store yet.
+    pub commands: Option<bool>,
 }
 
 /// Layout overrides, plain data (CTX-0177; see [`FontData`] for `Option`
@@ -643,6 +667,8 @@ pub struct ConfigData {
     pub terminal: Option<TerminalData>,
     /// `selection` table (CTX-0191).
     pub selection: Option<SelectionData>,
+    /// `history` table (CTX-1352 opt-in transcript/command capture).
+    pub history: Option<HistoryData>,
     /// `layout` table (CTX-0177 panel gaps).
     pub layout: Option<LayoutData>,
     /// `workspace` table (CW-07 default layout provider).
@@ -719,6 +745,7 @@ impl ConfigData {
             && self.window.is_none()
             && self.terminal.is_none()
             && self.selection.is_none()
+            && self.history.is_none()
             && self.layout.is_none()
             && self.workspace.is_none()
             && self.chrome.is_none()
@@ -1673,6 +1700,39 @@ impl ConfigData {
                         None => None,
                     };
                     out.selection = Some(SelectionData { auto_copy });
+                }
+                "history" => {
+                    // CTX-1352: `history = { capture = { transcript = true,
+                    // commands = false } }` opts the plugin history surface
+                    // into terminal-derived capture. Absent table/key means
+                    // "says nothing"; booleans only (never coerced). Both
+                    // leaves default `false` downstream.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["capture"])?;
+                    let capture = match get_field(nested, "capture") {
+                        Some(v) => {
+                            let capture_table = expect_table("history.capture", v)?;
+                            check_nested_keys(
+                                "history.capture",
+                                capture_table,
+                                &["transcript", "commands"],
+                            )?;
+                            let transcript = match get_field(capture_table, "transcript") {
+                                Some(v) => Some(expect_bool("history.capture.transcript", v)?),
+                                None => None,
+                            };
+                            let commands = match get_field(capture_table, "commands") {
+                                Some(v) => Some(expect_bool("history.capture.commands", v)?),
+                                None => None,
+                            };
+                            Some(HistoryCaptureData {
+                                transcript,
+                                commands,
+                            })
+                        }
+                        None => None,
+                    };
+                    out.history = Some(HistoryData { capture });
                 }
                 "layout" => {
                     // CTX-0177: `layout = { gaps_in = 1, gaps_out = 2 }`
@@ -2689,6 +2749,45 @@ mod tests {
         assert_eq!(data.selection, None);
         let data = eval_ok(r#"return { selection = {} }"#);
         assert_eq!(data.selection.unwrap().auto_copy, None);
+    }
+
+    #[test]
+    fn history_capture_extracts_and_absent_means_no_override() {
+        // CTX-1352: explicit booleans parse; absent table/key is `None` so
+        // merge keeps the lower-precedence value (both default `false`).
+        let data = eval_ok(
+            r#"return { history = { capture = { transcript = true, commands = false } } }"#,
+        );
+        let capture = data.history.unwrap().capture.unwrap();
+        assert_eq!(capture.transcript, Some(true));
+        assert_eq!(capture.commands, Some(false));
+        let data = eval_ok(r#"return { history = { capture = { transcript = false } } }"#);
+        let capture = data.history.unwrap().capture.unwrap();
+        assert_eq!(capture.transcript, Some(false));
+        assert_eq!(capture.commands, None);
+        let data = eval_ok(r#"return { history = {} }"#);
+        assert!(data.history.unwrap().capture.is_none());
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert!(data.history.is_none());
+    }
+
+    #[test]
+    fn history_capture_wrong_type_and_unknown_key_fail_closed() {
+        let mut vm = LuaVm::new("test.history-type");
+        for code in [
+            r#"return { history = { capture = { transcript = 1 } } }"#,
+            r#"return { history = { capture = { commands = "false" } } }"#,
+            r#"return { history = { capture = { bogus = true } } }"#,
+            r#"return { history = "on" }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("history"), "{code:?}: {message}");
+                    assert!(!message.contains("false"), "must not echo value: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

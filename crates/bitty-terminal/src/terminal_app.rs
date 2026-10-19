@@ -573,6 +573,10 @@ pub(crate) struct TerminalApp {
     /// so the deferred `bitty.panel.set_pinned` backend validates against
     /// committed state. `None` without a plugin runtime.
     pub(crate) live_pin_state: Option<std::rc::Rc<crate::plugin_runtime::LivePinState>>,
+    /// Bounded transcript provider (CTX-1352): `drive_tick` samples newly
+    /// completed scrollback lines into its redacted ring. `None` without a
+    /// plugin runtime or capture opt-in.
+    pub(crate) live_history: Option<std::rc::Rc<bitty_runtime::plugin_runtime::TranscriptHistory>>,
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
@@ -682,6 +686,7 @@ impl TerminalApp {
             live_snapshot: None,
             live_workspaces: None,
             live_pin_state: None,
+            live_history: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -722,6 +727,7 @@ impl TerminalApp {
             live_snapshot: None,
             live_workspaces: None,
             live_pin_state: None,
+            live_history: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -848,6 +854,18 @@ impl TerminalApp {
         pin_state: Option<std::rc::Rc<crate::plugin_runtime::LivePinState>>,
     ) -> Self {
         self.live_pin_state = pin_state;
+        self
+    }
+
+    /// Attaches the live bounded transcript provider (CTX-1352). Production
+    /// startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; plugin-less runs
+    /// leave it `None`.
+    pub(crate) fn with_live_history(
+        mut self,
+        history: Option<std::rc::Rc<bitty_runtime::plugin_runtime::TranscriptHistory>>,
+    ) -> Self {
+        self.live_history = history;
         self
     }
 
@@ -1326,6 +1344,12 @@ impl TerminalApp {
         // the source itself.
         if let Some(snapshot) = self.live_snapshot.as_ref() {
             snapshot.publish(&self.runtime);
+        }
+        // CTX-1352: sample newly completed scrollback lines into the bounded,
+        // already-redacted transcript ring. Sampling is idempotent per line id
+        // and opt-in gated inside the provider.
+        if let Some(history) = self.live_history.as_ref() {
+            crate::plugin_runtime::capture_history(&self.runtime, history);
         }
         // CTX-0367: the presented frame refreshed the focused caret; forward
         // it to the platform so the OS IME preedit/candidate window tracks

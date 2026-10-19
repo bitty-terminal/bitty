@@ -975,6 +975,22 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "history.capture.transcript",
+                        format!("{}", e.history.capture.transcript),
+                        &src("history.capture.transcript")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "history.capture.commands",
+                        format!("{}", e.history.capture.commands),
+                        &src("history.capture.commands")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "layout.gaps_in",
                         format!("{}", e.layout.gaps_in),
                         &src("layout.gaps_in")

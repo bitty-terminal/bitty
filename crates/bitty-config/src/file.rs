@@ -46,6 +46,7 @@
 //!     -- (OQ-038): never parsed, always 0.
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
+//!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
@@ -148,6 +149,15 @@
 //!   [`SelectionConfig`](crate::types::SelectionConfig) default `false`
 //!   (CTX-0371) when omitted, so configs without `selection` keep working and
 //!   selecting text never writes the system clipboard implicitly.
+//!   `history` is fully optional (`history.capture.transcript`,
+//!   `history.capture.commands`, both default `false`; CTX-1352). Explicit
+//!   booleans opt the bounded in-memory plugin history ring into
+//!   terminal-derived capture; an absent table means "this layer says
+//!   nothing", and wrong shapes/unknown keys fail closed with the field path.
+//!   A disabled transcript opt-in keeps the source available but denies with
+//!   the accepted `E_HISTORY_CAPTURE_DISABLED` category; capture defaults to
+//!   `false`, so users must opt in for a real transcript. Command history
+//!   remains typed-unavailable until submitted command spans are tracked.
 //!   `layout` follows the same fully-optional pattern: absent table/key means
 //!   "this layer says nothing"; when the table is present, omitted keys
 //!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
@@ -210,7 +220,9 @@ use bitty_lua::config::ConfigEval;
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
-use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
+use crate::plan::{
+    ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+};
 use crate::types::{
     AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
     LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
@@ -1688,6 +1700,15 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     let selection = data.selection.map(|s| SelectionConfig {
         auto_copy: s.auto_copy.unwrap_or(SelectionConfig::default().auto_copy),
     });
+    // CTX-1352: `history` is fully optional. When present, omitted capture
+    // leaves fall back to the defaults (both `false`): the bounded in-memory
+    // transcript ring stays empty until the user opts in explicitly.
+    let history = data.history.map(|h| HistoryConfigPlan {
+        capture: HistoryCaptureConfigPlan {
+            transcript: h.capture.as_ref().and_then(|c| c.transcript),
+            commands: h.capture.as_ref().and_then(|c| c.commands),
+        },
+    });
     // CTX-0177: `layout` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.layout None so merge keeps
     // the lower-precedence value). When the table is present, omitted keys
@@ -2473,6 +2494,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         window,
         terminal,
         selection,
+        history,
         close_confirm,
         layout,
         workspace,
@@ -3142,6 +3164,41 @@ mod tests {
             );
             assert!(!msg.contains("\"false\""), "must not echo value: {msg}");
         }
+    }
+
+    #[test]
+    fn lua_history_capture_preserves_per_leaf_presence() {
+        // CTX-1352: explicit capture opt-ins parse; an omitted leaf stays
+        // `None` so merge keeps the lower-precedence value. Defaults apply
+        // only to the final effective configuration.
+        let plan = parse_lua_config(
+            r#"return { history = { capture = { transcript = true, commands = true } } }"#,
+            &test_source(),
+        )
+        .expect("capture parses");
+        let history = plan.history.expect("history present");
+        assert_eq!(history.capture.transcript, Some(true));
+        assert_eq!(history.capture.commands, Some(true));
+        let plan = parse_lua_config(
+            r#"return { history = { capture = { transcript = true } } }"#,
+            &test_source(),
+        )
+        .expect("partial capture parses");
+        let history = plan.history.expect("history present");
+        assert_eq!(history.capture.transcript, Some(true));
+        assert_eq!(history.capture.commands, None);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no history table");
+        assert!(plan.history.is_none());
+        let plan =
+            parse_lua_config(r#"return { history = {} }"#, &test_source()).expect("empty history");
+        let history = plan.history.expect("history present");
+        assert_eq!(history.capture.transcript, None);
+        assert_eq!(history.capture.commands, None);
+        assert!(history.is_empty());
     }
 
     #[test]

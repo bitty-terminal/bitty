@@ -587,6 +587,36 @@ impl HistorySnapshot {
             HistorySource::PluginKv => &self.kv,
         }
     }
+
+    /// Whether the snapshot holds no rows at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.transcript.is_empty() && self.commands.is_empty() && self.kv.is_empty()
+    }
+
+    /// Consume the snapshot, yielding `(source, row)` pairs grouped by source
+    /// in snapshot order.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<(HistorySource, StoredRow)> {
+        let mut out =
+            Vec::with_capacity(self.transcript.len() + self.commands.len() + self.kv.len());
+        out.extend(
+            self.transcript
+                .into_iter()
+                .map(|row| (HistorySource::Transcript, row)),
+        );
+        out.extend(
+            self.commands
+                .into_iter()
+                .map(|row| (HistorySource::CommandHistory, row)),
+        );
+        out.extend(
+            self.kv
+                .into_iter()
+                .map(|row| (HistorySource::PluginKv, row)),
+        );
+        out
+    }
 }
 
 /// Snapshot freshness: queries carry no freshness guarantee.
@@ -816,6 +846,22 @@ impl HistoryGate {
                 grant.revoked = true;
             }
         }
+    }
+
+    /// Drop every recorded grant without changing rate/window usage.
+    ///
+    /// The host caches one standing grant per caller-named query scope. When
+    /// that cache reaches its fixed bound, it clears both the cache and the
+    /// gate's grant list. Usage stays intact, so clearing grants can never
+    /// reset the per-plugin rate window.
+    pub fn clear_grants(&mut self) {
+        self.grants.clear();
+    }
+
+    /// Number of recorded grants (bounded-cache regression evidence).
+    #[must_use]
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
     }
 
     /// Set opt-in capture for a source (W-131: default off for

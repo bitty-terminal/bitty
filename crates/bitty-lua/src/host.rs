@@ -556,6 +556,85 @@ impl Default for MarshallingLimits {
     }
 }
 
+// ── history-read bridge request (RFC-0004, W-139/W-146) ────────────────────
+
+/// Queryable history source exposed as `bitty.history.<source>.query`
+/// (RFC-0004, CTX-0955).
+///
+/// Session snapshots are deliberately absent: save/restore stays Core-only
+/// and no Lua spelling can name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryQuerySource {
+    /// Segmented transcript snapshots (`history.transcript.read`).
+    Transcript,
+    /// Command-history snapshots (`history.commands.read`).
+    CommandHistory,
+    /// The caller's own KV namespace (`history.kv.read`).
+    PluginKv,
+}
+
+impl HistoryQuerySource {
+    /// Stable Lua table key (`bitty.history.<key>.query`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::CommandHistory => "commands",
+            Self::PluginKv => "kv",
+        }
+    }
+
+    /// Closed capability head granting reads of this source.
+    #[must_use]
+    pub const fn capability_head(self) -> &'static str {
+        match self {
+            Self::Transcript => "history.transcript.read",
+            Self::CommandHistory => "history.commands.read",
+            Self::PluginKv => "history.kv.read",
+        }
+    }
+}
+
+/// Snapshot operation selected by `opts.op` (mirrors Core `QueryOp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryQueryOp {
+    /// Bounded list from `row_start`.
+    List,
+    /// The last `row_count` rows in scope.
+    Tail,
+    /// Bounded substring search over redacted bodies.
+    Search,
+}
+
+/// Bounded, validated snapshot query crossing the host-service boundary.
+///
+/// The bridge validates shape and integer ranges; ceilings, grants, scopes,
+/// capture, safe mode, and budgets stay authoritative in the runtime gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryQueryRequest {
+    /// Panel extent, if any.
+    pub panel: Option<String>,
+    /// Workspace extent, if any.
+    pub workspace: Option<String>,
+    /// First row offset (`0` default; ignored for tail).
+    pub row_start: u64,
+    /// Explicit row bound (`0` fails closed at the gate).
+    pub row_count: u32,
+    /// Explicit result byte bound (`0` fails closed at the gate).
+    pub max_bytes: u32,
+    /// List, tail, or bounded search.
+    pub op: HistoryQueryOp,
+    /// Search needle, present exactly for search ops.
+    pub needle: Option<String>,
+}
+
+/// Maximum bytes of one history search needle (RFC-0004).
+///
+/// Mirrors the Core validation bound (`bitty-plugin-host`
+/// `MAX_NEEDLE_BYTES`); longer input is a typed over-bound denial before any
+/// host call.
+pub const HISTORY_NEEDLE_MAX_BYTES: usize = 256;
+
 struct MarshalBudget {
     nodes: usize,
     bytes: usize,
@@ -788,12 +867,30 @@ impl BridgeError {
     }
 
     /// Render this error as a catchable Lua error table (`class`/`code`/`message`).
+    ///
+    /// The table also carries a presentation-only `__tostring` that renders
+    /// the class, message, and stable code. Plugins that predate table-shaped
+    /// errors (the official `history`/`search`/`copy-mode` diagnostics) read
+    /// the typed code through `tostring(err)`; without the metamethod they
+    /// would degrade every denial to `E_UNKNOWN` even though `err.code` is
+    /// correct. Field access is unchanged.
     #[must_use]
     pub fn to_error<'gc>(&self, ctx: Context<'gc>) -> Error<'gc> {
         let table = Table::new(&ctx);
         let _ = table.set(ctx, "class", self.class);
         let _ = table.set(ctx, "code", self.code);
         let _ = table.set(ctx, "message", self.message.clone());
+        let rendered = format!("{}: {} ({})", self.class, self.message, self.code);
+        let metatable = Table::new(&ctx);
+        let _ = metatable.set(
+            ctx,
+            "__tostring",
+            Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
+                stack.replace(ctx, rendered.clone());
+                Ok(CallbackReturn::Return)
+            }),
+        );
+        table.set_metatable(&ctx, Some(metatable));
         Value::Table(table).into()
     }
 }
@@ -953,6 +1050,36 @@ pub trait HostServices {
     }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
+    /// One bounded snapshot read for `bitty.history.<source>.query`
+    /// (RFC-0004, CTX-0955/W-146).
+    ///
+    /// Host-mediated and grant-gated: the implementation must fail closed
+    /// until the calling generation holds the source's capability head
+    /// (`history.transcript.read`, `history.commands.read`, or
+    /// `history.kv.read`), then route the request through the Core history
+    /// gate (safe mode, trust admission, version compat, grant/scope
+    /// intersection, capture opt-in, per-query bounds, and per-plugin
+    /// budgets). Results are point-in-time snapshots only: no streaming,
+    /// subscription, watch, tail-follow, or cross-call cursor exists.
+    ///
+    /// Denials are typed and oracle-tight (`E_HISTORY_*`; level and family
+    /// only). An absent backing source denies with
+    /// `E_HISTORY_UNAVAILABLE`, never a Lua nil-index or a fabricated empty
+    /// page. The default implementation fails closed the same way, so a host
+    /// without a history backend can never gain ambient reads from the
+    /// always-present `bitty.history` namespace.
+    fn history_query(
+        &self,
+        source: HistoryQuerySource,
+        request: &HistoryQueryRequest,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (source, request);
+        Err(BridgeError::new(
+            "runtime",
+            "E_HISTORY_UNAVAILABLE",
+            "E_HISTORY_UNAVAILABLE denied for level 'third-party-lua' (family 'history')",
+        ))
+    }
     /// Submit bounded text to the focused panel through the paste pipeline
     /// for `bitty.terminal.submit` (CTX-1239, issue #2101).
     ///
@@ -2905,6 +3032,161 @@ impl LuaVm {
             }
         }
     }
+}
+
+/// Parse the `opts` table of one `bitty.history.<source>.query` call.
+///
+/// Shape and integer-range validation only: every ceiling, grant, scope,
+/// capture, safe-mode, and budget decision stays authoritative in the
+/// runtime gate, so the bridge never clamps a request silently. A missing or
+/// malformed field fails closed with `E_DEF_INVALID`; an over-long search
+/// needle is the gate's typed `E_HISTORY_OVER_BOUND`, not a shape error.
+fn parse_history_query(
+    source: HistoryQuerySource,
+    opts: &LuaValue,
+) -> Result<HistoryQueryRequest, BridgeError> {
+    let LuaValue::Table(_) = opts else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "history query opts must be a table",
+        ));
+    };
+    let scope = opts.get("scope").ok_or_else(|| {
+        BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "history query requires an explicit scope table",
+        )
+    })?;
+    let LuaValue::Table(_) = scope else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "history query scope must be a table",
+        ));
+    };
+    let panel = history_optional_string(scope.get("panel"), "scope.panel")?;
+    let workspace = history_optional_string(scope.get("workspace"), "scope.workspace")?;
+    if source == HistoryQuerySource::PluginKv && (panel.is_some() || workspace.is_some()) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "history kv scope is the caller namespace; panel/workspace extents are rejected",
+        ));
+    }
+    let row_start = match opts.get("row_start") {
+        None | Some(LuaValue::Nil) => 0,
+        Some(value) => history_integer(value, "row_start")?,
+    };
+    let row_count = history_u32(opts.get("row_count"), "row_count")?;
+    let max_bytes = history_u32(opts.get("max_bytes"), "max_bytes")?;
+    let op = match opts.get("op") {
+        Some(LuaValue::String(op)) => match op.as_str() {
+            "list" => HistoryQueryOp::List,
+            "tail" => HistoryQueryOp::Tail,
+            "search" => HistoryQueryOp::Search,
+            _ => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "history op must be one of list, tail, search",
+                ));
+            }
+        },
+        _ => {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "history op must be one of list, tail, search",
+            ));
+        }
+    };
+    let needle = match op {
+        HistoryQueryOp::Search => {
+            let Some(LuaValue::String(needle)) = opts.get("needle") else {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "history search requires a string needle",
+                ));
+            };
+            if needle.is_empty() {
+                return Err(BridgeError::new(
+                    "runtime",
+                    "E_HISTORY_OVER_BOUND",
+                    "E_HISTORY_OVER_BOUND denied for level 'third-party-lua' (family 'history')",
+                ));
+            }
+            if needle.len() > HISTORY_NEEDLE_MAX_BYTES {
+                return Err(BridgeError::new(
+                    "runtime",
+                    "E_HISTORY_OVER_BOUND",
+                    "E_HISTORY_OVER_BOUND denied for level 'third-party-lua' (family 'history')",
+                ));
+            }
+            Some(needle.clone())
+        }
+        HistoryQueryOp::List | HistoryQueryOp::Tail => None,
+    };
+    Ok(HistoryQueryRequest {
+        panel,
+        workspace,
+        row_start,
+        row_count,
+        max_bytes,
+        op,
+        needle,
+    })
+}
+
+fn history_optional_string(
+    value: Option<&LuaValue>,
+    field: &'static str,
+) -> Result<Option<String>, BridgeError> {
+    match value {
+        None | Some(LuaValue::Nil) => Ok(None),
+        Some(LuaValue::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("history {field} must be a string"),
+        )),
+    }
+}
+
+fn history_integer(value: &LuaValue, field: &'static str) -> Result<u64, BridgeError> {
+    match value {
+        LuaValue::Integer(number) if *number >= 0 => Ok(*number as u64),
+        LuaValue::Number(number)
+            if number.is_finite() && *number >= 0.0 && number.fract() == 0.0 =>
+        {
+            Ok(*number as u64)
+        }
+        _ => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("history {field} must be a non-negative integer"),
+        )),
+    }
+}
+
+fn history_u32(value: Option<&LuaValue>, field: &'static str) -> Result<u32, BridgeError> {
+    let Some(value) = value else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("history {field} is required"),
+        ));
+    };
+    let number = history_integer(value, field)?;
+    u32::try_from(number).map_err(|_| {
+        BridgeError::new(
+            "budget",
+            "E_HISTORY_OVER_BOUND",
+            format!("history {field} exceeds the representable query bound"),
+        )
+    })
 }
 
 /// Initialise a fresh `bitty` namespace inside the current arena.
@@ -5243,6 +5525,46 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     ui.set(ctx, "labels", readonly_table(ctx, labels))
         .expect("ui table accepts 'labels'");
 
+    // CTX-1352 (issue #2247, W-146): the read-only `bitty.history` root is
+    // present for every generation, even when no source is wired and no
+    // grant is held. Each `query` call validates shape, then delegates to
+    // the host services where the Core `HistoryGate` owns grants, scopes,
+    // capture, safe mode, bounds, and budgets. Presence here is deliberate:
+    // `search`, `copy-mode`, and `history` index `bitty.history.transcript`
+    // before `pcall`, so an absent root was a nil-index VM error instead of
+    // a typed denial. Absent grant/source now surfaces as `E_HISTORY_*`.
+    let history = Table::new(&ctx);
+    for source in [
+        HistoryQuerySource::Transcript,
+        HistoryQuerySource::CommandHistory,
+        HistoryQuerySource::PluginKv,
+    ] {
+        let namespace = Table::new(&ctx);
+        namespace
+            .set(
+                ctx,
+                "query",
+                Callback::from_fn(&ctx, {
+                    let state = state.clone();
+                    move |ctx, _exec, mut stack| {
+                        let opts = LuaValue::from_lua(stack.get(0), state.limits)
+                            .map_err(|error| error.to_error(ctx))?;
+                        let request =
+                            parse_history_query(source, &opts).map_err(|e| e.to_error(ctx))?;
+                        let result = state
+                            .bounded(|_expiry| state.services.history_query(source, &request))
+                            .map_err(|e| e.to_error(ctx))?;
+                        stack.replace(ctx, result.to_lua(ctx));
+                        Ok(CallbackReturn::Return)
+                    }
+                }),
+            )
+            .expect("history namespace accepts 'query'");
+        history
+            .set(ctx, source.as_str(), readonly_table(ctx, namespace))
+            .expect("history root accepts source namespace");
+    }
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -5291,6 +5613,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts theme");
     root.set(ctx, "workspace", readonly_table(ctx, workspace))
         .expect("root accepts workspace");
+    root.set(ctx, "history", readonly_table(ctx, history))
+        .expect("root accepts history");
     Value::Table(readonly_table(ctx, root))
 }
 

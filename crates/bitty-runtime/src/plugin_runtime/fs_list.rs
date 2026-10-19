@@ -185,12 +185,6 @@ impl FsListBackend {
         // leaf under an escaping symlink must not answer "absent" while an
         // existing leaf under the same link answers "denied".
         let (canonical, missing) = resolve_nearest_existing(&requested)?;
-        // Symlink resolution can introduce sensitive component names the
-        // logical-prefix policy never sees (`.ssh`, `authorized_keys`,
-        // `shadow`); deny them before any listing.
-        if resolved_sensitive(&canonical) {
-            return Err(denial(FsBridgeDenialKind::SensitivePath));
-        }
         let authorized: Vec<&GrantScope> = covering
             .into_iter()
             .filter(|scope| scope.root_covers(&canonical))
@@ -198,7 +192,15 @@ impl FsListBackend {
         if authorized.is_empty() {
             // In-scope lexically but outside every canonical grant root:
             // a symlink escape (or a grant root that no longer resolves).
+            // Containment precedes every sensitive fact so an out-of-grant
+            // caller learns nothing about the resolved target.
             return Err(denial(FsBridgeDenialKind::ScopeMismatch));
+        }
+        // Symlink resolution can introduce sensitive component names the
+        // logical-prefix policy never sees (`.ssh`, `authorized_keys`,
+        // `shadow`); deny them before any listing.
+        if resolved_sensitive(&canonical) {
+            return Err(denial(FsBridgeDenialKind::SensitivePath));
         }
         if missing {
             // The nearest existing ancestor is inside the grant, so the leaf

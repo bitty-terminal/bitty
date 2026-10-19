@@ -50,6 +50,7 @@ use super::history::{
 };
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
+use super::fs_list::{FsListBackend, FsListEntry};
 use super::overlay::{
     DEFAULT_RELEASE_REASON, OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture, is_owner_release_reason,
 };
@@ -1719,6 +1720,14 @@ pub struct PluginServices {
     /// `None` leaves native audio calls failing closed with
     /// `E_SERVICE_GONE`, like a parked provider.
     audio_host: RefCell<Option<Rc<RefCell<super::audio::AudioHost>>>>,
+    /// Real-filesystem backend for `bitty.fs.list` (CTX-1348).
+    ///
+    /// Shared at activation with every generation; the call-time grant gate
+    /// in [`HostServices::fs_list`] consults this generation's own `fs.read:`
+    /// snapshot, so the backend itself carries no authority. `None` leaves
+    /// the verb failing closed with `E_NOT_IMPLEMENTED`, like every other
+    /// host-mediated verb without a wired backend.
+    fs_backend: RefCell<Option<Rc<FsListBackend>>>,
 }
 
 impl PluginServices {
@@ -1793,6 +1802,7 @@ impl PluginServices {
             sensor_host: RefCell::new(None),
             device_host: RefCell::new(None),
             audio_host: RefCell::new(None),
+            fs_backend: RefCell::new(None),
         }
     }
 
@@ -1824,6 +1834,16 @@ impl PluginServices {
     /// `bitty-terminal.audio` calls fail closed with `E_SERVICE_GONE`.
     pub fn set_audio_host(&self, host: Option<Rc<RefCell<super::audio::AudioHost>>>) {
         *self.audio_host.borrow_mut() = host;
+    }
+
+    /// Attach the real-filesystem backend for `bitty.fs.list` (CTX-1348).
+    ///
+    /// Shared at activation with every generation; the call-time gate in
+    /// [`HostServices::fs_list`] reads this generation's own `fs.read:`
+    /// snapshot, so installing the backend never widens authority. Without
+    /// it the verb keeps failing closed with `E_NOT_IMPLEMENTED`.
+    pub fn set_fs_backend(&self, backend: Option<Rc<FsListBackend>>) {
+        *self.fs_backend.borrow_mut() = backend;
     }
 
     /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
@@ -2720,6 +2740,33 @@ impl HostServices for PluginServices {
             return Err(BridgeError::not_implemented("bitty.env.has"));
         }
         Ok(self.env_source.borrow().get(key).is_some())
+    }
+
+    fn fs_list(&self, prefix: &str, max_entries: usize) -> Result<LuaValue, BridgeError> {
+        // CTX-1348: the backend resolves only paths covered by this
+        // generation's own `fs.read:` grants. It reads the activation
+        // snapshot directly, so a revoked generation cannot list through a
+        // stale service handle. Without a wired backend the verb keeps its
+        // historical fail-closed behavior.
+        let granted = self.granted_capabilities.borrow().clone();
+        let backend = self
+            .fs_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.fs.list"))?;
+        let entries: Vec<FsListEntry> = backend.list(&granted, prefix, max_entries)?;
+        Ok(LuaValue::array(
+            entries
+                .into_iter()
+                .map(|entry| {
+                    LuaValue::table([
+                        ("name", LuaValue::String(entry.name)),
+                        ("kind", LuaValue::String(entry.kind.to_string())),
+                        ("untrusted", LuaValue::Bool(true)),
+                    ])
+                })
+                .collect(),
+        ))
     }
 
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
@@ -5350,6 +5397,67 @@ mod tests {
             .process_spawn(&["status".to_owned()])
             .expect_err("grant absent must deny");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    fn fs_list_test_home(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1348-services-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).expect("create docs");
+        std::fs::write(dir.join("docs/a.txt"), "a").expect("write a");
+        std::fs::write(dir.join("docs/b.txt"), "b").expect("write b");
+        dir
+    }
+
+    #[test]
+    fn fs_list_serves_granted_entries_with_untrusted_shape() {
+        let home = fs_list_test_home("granted");
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        let value = services.fs_list("~/docs", 16).expect("granted listing");
+        let LuaValue::Table(entries) = value else {
+            panic!("fs.list must return an array");
+        };
+        assert_eq!(entries.len(), 2);
+        for (index, expected) in ["~/docs/a.txt", "~/docs/b.txt"].iter().enumerate() {
+            let pair_key = LuaValue::Integer(index as i64 + 1);
+            let (_, entry) = entries
+                .iter()
+                .find(|(key, _)| *key == pair_key)
+                .expect("array entry");
+            assert_eq!(
+                entry.get("name"),
+                Some(&LuaValue::String((*expected).to_string()))
+            );
+            assert_eq!(
+                entry.get("kind"),
+                Some(&LuaValue::String("file".to_string()))
+            );
+            assert_eq!(entry.get("untrusted"), Some(&LuaValue::Bool(true)));
+        }
+    }
+
+    #[test]
+    fn fs_list_without_backend_or_grant_fails_closed() {
+        let home = fs_list_test_home("closed");
+        let services = services();
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("no backend must fail");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("no grant must fail");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
     }
 
     fn env_services(grants: &[&str], values: &[(&str, &str)]) -> PluginServices {

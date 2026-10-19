@@ -45,8 +45,8 @@ use bitty_plugin_host::{
 };
 
 use super::history::{
-    HISTORY_RATE_WINDOW, HistoryProvider, history_caps, history_error, history_page_value,
-    history_source, history_unavailable,
+    HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
+    history_error, history_page_value, history_source, history_unavailable,
 };
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
@@ -1670,7 +1670,9 @@ pub struct PluginServices {
     /// The accepted history heads carry no grant parameter (scope travels
     /// with the host call), so the gate grant extent is the authorized call
     /// scope. Remembering issued scopes avoids growing the gate's grant list
-    /// on every repeated query. Cleared when the rate window advances.
+    /// on every repeated query; the set is capped at
+    /// [`HISTORY_GRANT_SCOPE_CACHE_MAX`] and overflow clears grants while
+    /// keeping rate usage. Cleared when the rate window advances.
     history_grant_scopes: RefCell<BTreeSet<(HistorySource, Option<String>, Option<String>)>>,
     /// Start of the current history rate window.
     history_window_start: Cell<Instant>,
@@ -2804,7 +2806,16 @@ impl HostServices for PluginServices {
             request.panel.clone(),
             request.workspace.clone(),
         );
+        // The scope above is validated before any grant is recorded. Grants
+        // are cached per exact caller-named scope only up to a fixed bound;
+        // overflow clears the grant list (never usage) and starts a fresh
+        // bounded cache, so caller-chosen scopes cannot grow state without
+        // limit inside one rate window.
         if !self.history_grant_scopes.borrow().contains(&grant_key) {
+            if self.history_grant_scopes.borrow().len() >= HISTORY_GRANT_SCOPE_CACHE_MAX {
+                gate.clear_grants();
+                self.history_grant_scopes.borrow_mut().clear();
+            }
             gate.issue_grant(HistoryGrant::standing(plugin.clone(), scope.clone()));
             self.history_grant_scopes.borrow_mut().insert(grant_key);
         }
@@ -8263,7 +8274,8 @@ mod tests {
 mod history_tests {
     use super::*;
     use crate::plugin_runtime::history::{
-        BoundedHistory, HISTORY_MAX_QUERIES_PER_WINDOW, HISTORY_MAX_ROWS_PER_QUERY,
+        BoundedHistory, HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_MAX_QUERIES_PER_WINDOW,
+        HISTORY_MAX_ROWS_PER_QUERY,
     };
     use bitty_plugin_host::{Attribution, HistorySnapshot, PluginId, StoredRow};
     use std::time::Instant;
@@ -8663,6 +8675,22 @@ mod history_tests {
             .history_query(HistoryQuerySource::PluginKv, &request(HistoryQueryOp::List))
             .expect_err("kv scope");
         assert_eq!(error.code, "E_DEF_INVALID");
+    }
+
+    #[test]
+    fn cached_grant_scopes_and_gate_grants_stay_bounded() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(BoundedHistory::empty(true, true))));
+        for index in 0..(HISTORY_GRANT_SCOPE_CACHE_MAX * 3) {
+            let mut request = request(HistoryQueryOp::List);
+            request.panel = Some(format!("pane-{index}"));
+            // The per-window rate budget denies most calls; the cache must
+            // stay bounded regardless of whether the query succeeds.
+            let _ = services.history_query(HistoryQuerySource::Transcript, &request);
+            assert!(services.history_grant_scopes.borrow().len() <= HISTORY_GRANT_SCOPE_CACHE_MAX);
+            assert!(services.history_gate.borrow().grant_count() <= HISTORY_GRANT_SCOPE_CACHE_MAX);
+        }
     }
 
     #[test]

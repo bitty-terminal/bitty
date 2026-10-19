@@ -44,6 +44,15 @@ pub const HISTORY_MAX_BYTES_PER_WINDOW: u64 = 8192;
 pub const HISTORY_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// Maximum rows one bounded provider retains across all sources.
 pub const HISTORY_SNAPSHOT_MAX_ROWS: usize = 4096;
+/// Maximum caller-named query scopes cached as standing grants per plugin and
+/// rate window.
+///
+/// The accepted history heads carry no grant parameter, so the host caches
+/// one grant per distinct `(source, panel, workspace)` scope. A fixed bound
+/// keeps both the cache and [`HistoryGate`](bitty_plugin_host::HistoryGate)
+/// grant storage from growing with caller-chosen scopes; reaching it clears
+/// only grants, never rate usage.
+pub const HISTORY_GRANT_SCOPE_CACHE_MAX: usize = 64;
 
 /// Composition-root seam over already-persisted history state.
 ///
@@ -808,6 +817,62 @@ mod tests {
             rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq,
             HISTORY_SNAPSHOT_MAX_ROWS as u64
         );
+    }
+
+    fn snapshot_of(count: u64) -> HistorySnapshot {
+        let mut snapshot = HistorySnapshot::new();
+        for seq in 0..count {
+            snapshot.push(HistorySource::Transcript, row("pane-a", seq, "line"));
+        }
+        snapshot
+    }
+
+    #[test]
+    fn publish_is_bounded_at_the_snapshot_cap() {
+        let provider = BoundedHistory::unavailable();
+
+        provider.publish(snapshot_of(HISTORY_SNAPSHOT_MAX_ROWS as u64));
+        assert_eq!(provider.len(), HISTORY_SNAPSHOT_MAX_ROWS);
+        let rows = provider.snapshot().expect("available").into_rows();
+        assert_eq!(rows[0].1.seq, 0);
+        assert_eq!(
+            rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq,
+            HISTORY_SNAPSHOT_MAX_ROWS as u64 - 1
+        );
+
+        provider.publish(snapshot_of(HISTORY_SNAPSHOT_MAX_ROWS as u64 + 1));
+        assert_eq!(provider.len(), HISTORY_SNAPSHOT_MAX_ROWS);
+        let rows = provider.snapshot().expect("available").into_rows();
+        assert_eq!(rows[0].1.seq, 1);
+        assert_eq!(
+            rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq,
+            HISTORY_SNAPSHOT_MAX_ROWS as u64
+        );
+
+        provider.publish(snapshot_of(5000));
+        assert_eq!(provider.len(), HISTORY_SNAPSHOT_MAX_ROWS);
+        let rows = provider.snapshot().expect("available").into_rows();
+        assert_eq!(rows[0].1.seq, 904);
+        assert_eq!(rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq, 4999);
+    }
+
+    #[test]
+    fn publish_then_push_keeps_the_same_ring_bound() {
+        let provider = BoundedHistory::unavailable();
+        provider.publish(snapshot_of(HISTORY_SNAPSHOT_MAX_ROWS as u64));
+        assert_eq!(provider.len(), HISTORY_SNAPSHOT_MAX_ROWS);
+        assert!(provider.push(
+            HistorySource::Transcript,
+            row("pane-a", HISTORY_SNAPSHOT_MAX_ROWS as u64, "new")
+        ));
+        assert_eq!(provider.len(), HISTORY_SNAPSHOT_MAX_ROWS);
+        let rows = provider.snapshot().expect("available").into_rows();
+        assert_eq!(rows[0].1.seq, 1);
+        assert_eq!(
+            rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.seq,
+            HISTORY_SNAPSHOT_MAX_ROWS as u64
+        );
+        assert_eq!(rows[HISTORY_SNAPSHOT_MAX_ROWS - 1].1.redacted_body, "new");
     }
 
     #[test]

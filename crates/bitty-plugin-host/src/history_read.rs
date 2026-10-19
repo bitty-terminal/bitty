@@ -848,6 +848,22 @@ impl HistoryGate {
         }
     }
 
+    /// Drop every recorded grant without changing rate/window usage.
+    ///
+    /// The host caches one standing grant per caller-named query scope. When
+    /// that cache reaches its fixed bound, it clears both the cache and the
+    /// gate's grant list. Usage stays intact, so clearing grants can never
+    /// reset the per-plugin rate window.
+    pub fn clear_grants(&mut self) {
+        self.grants.clear();
+    }
+
+    /// Number of recorded grants (bounded-cache regression evidence).
+    #[must_use]
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+
     /// Set opt-in capture for a source (W-131: default off for
     /// terminal-derived content).
     pub fn set_capture(&mut self, source: HistorySource, enabled: bool) {

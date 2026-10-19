@@ -3107,16 +3107,12 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         list: &mut DrawList,
     ) -> Option<i32> {
         let key = RasterKey::new(mark, self.font, self.point_size).ok()?;
+        // A mark without a drawable bitmap (blank or rasterizer failure) is
+        // dropped, never promoted to a tofu box over its base. It is not a
+        // *cell* skip, so `blank_cells_skipped` stays cell-accurate.
         let bitmap = match self.cache.cached_glyph(key) {
             Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
-            Ok(CachedGlyphRef::Blank) => {
-                self.counters.blank_cells_skipped += 1;
-                return None;
-            }
-            Err(_) => {
-                self.counters.blank_cells_skipped += 1;
-                return None;
-            }
+            Ok(CachedGlyphRef::Blank) | Err(_) => return None,
         };
         let metrics = bitmap.metrics();
         if metrics.width <= 0 || metrics.height <= 0 {

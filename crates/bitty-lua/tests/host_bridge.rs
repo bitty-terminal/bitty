@@ -2383,3 +2383,55 @@ fn panel_set_pinned_forwards_validated_id_and_state() {
         "malformed shapes must never reach the host"
     );
 }
+
+/// bitty#2237: bridge errors are tables; host logs must show their diagnostic,
+/// never `<table 0x...>`.
+#[test]
+fn table_shaped_lua_error_renders_code_and_message() {
+    let mut vm = gate_vm("table-error");
+    install(&mut vm, Rc::new(FakeServices::default()));
+    let outcome = vm
+        .execute_bounded(
+            r#"error({
+                class = "validation",
+                code = "E_SETTINGS_UNDECLARED",
+                message = "settings key 'show' is not declared",
+            })"#,
+        )
+        .expect("execute");
+    assert_eq!(
+        outcome,
+        BoundedExecution::RuntimeError(
+            "E_SETTINGS_UNDECLARED: settings key 'show' is not declared".to_string()
+        )
+    );
+}
+
+/// The same rendering applies to a real bridge rejection raised from a
+/// callback (the activation / command-dispatch failure path).
+#[test]
+fn bridge_denial_renders_code_and_message() {
+    let mut vm = gate_vm("bridge-denial");
+    install(&mut vm, Rc::new(FakeServices::default()));
+    let outcome = vm
+        .execute_bounded(r#"bitty.terminal.snapshot({ scope = "semantic" })"#)
+        .expect("execute");
+    assert_eq!(
+        outcome,
+        BoundedExecution::RuntimeError(
+            "E_CAPABILITY_DENIED: capability 'terminal.semantic-read' is not granted".to_string()
+        )
+    );
+}
+
+/// Non-table errors keep phodopus's existing rendering unchanged.
+#[test]
+fn string_lua_error_is_unchanged() {
+    let mut vm = gate_vm("string-error");
+    install(&mut vm, Rc::new(FakeServices::default()));
+    let outcome = vm.execute_bounded(r#"error("boom")"#).expect("execute");
+    assert_eq!(
+        outcome,
+        BoundedExecution::RuntimeError("lua error: boom".to_string())
+    );
+}

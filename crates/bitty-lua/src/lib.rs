@@ -733,7 +733,9 @@ impl LuaVm {
                 Ok(Ok(Variadic(_))) => Err(plain_config::PlainConfigError::Shape(
                     "configuration must return exactly one table".to_string(),
                 )),
-                Ok(Err(error)) => Err(plain_config::PlainConfigError::Lua(format!("{error}"))),
+                Ok(Err(error)) => Err(plain_config::PlainConfigError::Lua(
+                    crate::error::format_lua_error(ctx, &error),
+                )),
                 Err(error) => Err(plain_config::PlainConfigError::Lua(format!("{error:?}"))),
             }
         })
@@ -1424,7 +1426,9 @@ impl LuaVm {
                         let exec = ctx.fetch(&stashed);
                         match exec.take_result::<()>(ctx) {
                             Ok(Ok(())) => ok = true,
-                            Ok(Err(e)) => runtime_msg = Some(format!("{e}")),
+                            Ok(Err(e)) => {
+                                runtime_msg = Some(crate::error::format_lua_error(ctx, &e))
+                            }
                             Err(e) => runtime_msg = Some(format!("{e:?}")),
                         }
                     });

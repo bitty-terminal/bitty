@@ -596,6 +596,33 @@ mod tests {
         dir
     }
 
+    /// Fixture deadline for tests that assert the entry/byte caps, not time.
+    ///
+    /// The production [`FsListBackend::list`] budget is the accepted RC-1
+    /// 50 ms; a saturated CI runner needs longer than that to resolve a
+    /// thousand entries, so cap/containment tests would fail on
+    /// `E_TIMEOUT` before ever reaching the cap they assert. They therefore
+    /// run under this deadline, which no fixture scan can reach, while
+    /// [`large_directory_aborts_near_the_scan_deadline`] keeps proving the
+    /// deadline path (production budget and explicit tiny expiries).
+    const FIXTURE_SCAN_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// Listing with [`FIXTURE_SCAN_DEADLINE`], i.e. cap assertions are
+    /// decided by entries/bytes rather than runner speed.
+    fn list_with_generous_deadline(
+        backend: &FsListBackend,
+        granted: &[String],
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<Vec<FsListEntry>, BridgeError> {
+        backend.list_with_expiry(
+            granted,
+            prefix,
+            max_entries,
+            Instant::now() + FIXTURE_SCAN_DEADLINE,
+        )
+    }
+
     fn touch(home: &Path, relative: &str, content: &str) {
         let path = home.join(relative);
         if let Some(parent) = path.parent() {
@@ -770,9 +797,13 @@ mod tests {
             touch(&home, &format!("docs/file-{index:04}.txt"), "x");
         }
         let backend = FsListBackend::new(&home);
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", FS_LIST_MAX_ENTRIES)
-            .expect("bounded listing");
+        let entries = list_with_generous_deadline(
+            &backend,
+            &grant("~/docs/**"),
+            "~/docs",
+            FS_LIST_MAX_ENTRIES,
+        )
+        .expect("bounded listing");
         // Neither cap may be exceeded: the requested page and the bridge
         // entry ceiling, and the 8 KiB returned-name ceiling.
         assert!(entries.len() <= FS_LIST_MAX_ENTRIES);
@@ -782,8 +813,7 @@ mod tests {
         assert_eq!(entries[0].name, "~/docs/file-0000.txt");
 
         // An explicit smaller page truncates deterministically.
-        let small = backend
-            .list(&grant("~/docs/**"), "~/docs", 8)
+        let small = list_with_generous_deadline(&backend, &grant("~/docs/**"), "~/docs", 8)
             .expect("small page");
         assert_eq!(small.len(), 8);
         assert_eq!(small[0].name, "~/docs/file-0000.txt");
@@ -801,9 +831,13 @@ mod tests {
         for index in 0..64 {
             touch(&home, &format!("docs/long-{index:02}-{long}"), "x");
         }
-        let entries = backend
-            .list(&grant("~/docs/**"), "~/docs", FS_LIST_MAX_ENTRIES)
-            .expect("byte-bounded listing");
+        let entries = list_with_generous_deadline(
+            &backend,
+            &grant("~/docs/**"),
+            "~/docs",
+            FS_LIST_MAX_ENTRIES,
+        )
+        .expect("byte-bounded listing");
         let total: usize = entries.iter().map(|entry| entry.name.len()).sum();
         assert!(total <= FS_LIST_MAX_BYTES, "name bytes {total}");
         assert!(!entries.is_empty());

@@ -100,6 +100,12 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
+# CTX-1361: the production component-host slice drives the real
+# `bitty extension add` implementation through the composition-root library
+# target instead of re-creating the staging layout in the test. Cargo allows
+# this test-only cycle (the library's normal dependency on this crate stays
+# the only production edge).
+bitty-terminal = { path = "../bitty-terminal" }
 
 # CTX-0903: Windows liveness probes for the owned-tree tests (safe API of
 # the first-party Job Object adapter; no new third-party crate).

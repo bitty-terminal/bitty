@@ -341,6 +341,7 @@ dependencies = [
  "bitty-rich",
  "bitty-sandbox",
  "bitty-term-state",
+ "bitty-terminal",
  "bitty-test-support",
  "bitty-ui",
  "bitty-url-detector",

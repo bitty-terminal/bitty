@@ -131,6 +131,7 @@ pub mod bell;
 pub mod chrome_band;
 pub mod click;
 pub mod close_confirm;
+pub mod component_host;
 pub mod copy_mode;
 pub mod cw_live;
 pub mod fx;
@@ -463,6 +464,19 @@ pub struct Runtime {
     gpu: Option<GpuContext>,
     cold_queue: ColdQueue,
     plugin_host: PluginHost,
+    /// Native-component host (CTX-1361, bitty#2254).
+    ///
+    /// `None` is fail-closed: no component can be spawned or requested until
+    /// the composition root installs a host via
+    /// [`Runtime::install_component_host`]. The host owns the only
+    /// [`crate::component::ComponentBroker`] and every recorded child, and
+    /// [`Runtime::shutdown_with_timeout`] stops them gracefully.
+    component_host: Option<crate::component::ComponentHost>,
+    /// Component events polled by `tick_at` and not yet taken by the
+    /// embedder (CTX-1361 F5). Bounded; oldest dropped first.
+    component_events: std::collections::VecDeque<crate::component::BrokerEvent>,
+    /// Events dropped from the bounded component delivery queue.
+    component_events_dropped: u64,
     last_presented_generation: u64,
     /// Per-leaf retained present primitives, keyed by visible [`ViewId`]
     /// (CTX-0386).
@@ -1451,6 +1465,12 @@ impl Runtime {
     /// A zero timeout still drops the waker/receivers/`Pty`s promptly and
     /// joins only already-finished threads.
     pub fn shutdown_with_timeout(&mut self, timeout: std::time::Duration) -> bool {
+        // CTX-1361: stop every recorded component child before the PTY
+        // teardown so no coprocess outlives the instance.
+        if let Some(host) = self.component_host.as_mut() {
+            let _ = host.shutdown();
+        }
+        self.component_host = None;
         // Clear first: no new promotes, no post-destroy wakes from retained
         // state. In-flight forwarders hold their own waker clone and may
         // fire once on EOF; that clone is Runtime-independent by contract.
@@ -1695,6 +1715,9 @@ impl Runtime {
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
+            component_host: None,
+            component_events: std::collections::VecDeque::new(),
+            component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
@@ -1964,6 +1987,9 @@ impl Runtime {
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
+            component_host: None,
+            component_events: std::collections::VecDeque::new(),
+            component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,

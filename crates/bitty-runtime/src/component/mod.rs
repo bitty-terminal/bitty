@@ -75,6 +75,7 @@ mod broker;
 mod descriptor;
 mod env;
 mod grant;
+mod host;
 mod inventory;
 mod policy;
 mod stderr;
@@ -97,6 +98,8 @@ pub use grant::{
     BUILTIN_INSTALLER_EGRESS, BUILTIN_INSTALLER_EGRESS_HOST, BUILTIN_INSTALLER_EGRESS_PORT,
     GrantError, PluginGrant, builtin_installer_egress, is_builtin_installer_egress,
 };
+#[doc(hidden)]
+pub use host::{COMPONENT_HOST_WAIT_SLICE, ComponentHost, ComponentHostError, ComponentResponse};
 pub use inventory::{
     ComponentSource, ComponentSummary, InstalledVersion, SYSTEM_COMPONENTS_DIR_DEFAULT,
     SYSTEM_COMPONENTS_DIR_ENV, SearchedComponent, component_search_roots_for, discover_components,

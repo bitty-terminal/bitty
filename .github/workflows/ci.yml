@@ -240,6 +240,18 @@ jobs:
           cargo nextest run -p bitty-terminal --features input-vm-test-support --locked -E 'test(input_vm_boundary)'
           cargo nextest run -p bitty-runtime --features input-vm-test-support --locked -E 'test(dispatch_ui_command_fences_origin_and_lifecycle) | test(band_origin_publishes_only_after_a_presented_frame) | test(version_one_remount_and_edge_move_invalidate_the_old_origin) | test(cancellation_drops_queued_admissions_and_keeps_the_release_swallow) | test(chrome_band_versions_include_the_band_edge) | test(cold_selection_bound_is_sixteen_and_leaves_the_tail_queued)'
 
+      # CTX-1373 (bitty#2199): the provider-publication launch seam and its
+      # fixture tests are behind the default-off `publication-control`
+      # feature. This required step runs the same feature-on selection as
+      # `just publication-control-test`, including the Unix handle plumbing,
+      # bootstrap zeroization, and the in-process TLS refusal/deadline cases.
+      - name: Run publication-control feature-on tests
+        if: matrix.shard == 1
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_BUILD_JOBS: "2"
+        run: cargo nextest run -p bitty-runtime --features publication-control-test-support --lib --locked -E 'test(ai_publication_launch)'
+
       # CTX-0971 R4: nextest covers neither doctests nor harness=false
       # binaries nor benches, so split them explicitly across shards to keep
       # coverage identical without running them twice. Shard 1 takes doctests
@@ -945,10 +957,14 @@ jobs:
 
       # unmaintained advisories for ttf-parser/paste are tracked via deny.toml
       # and ignored for audit until upstream replacement lands (winit/metal paths)
+      # RUSTSEC-2026-0009 (time < 0.3.47) is the rcgen/yasna path behind the
+      # opt-in publication-control feature; deny.toml carries the full
+      # justification (parsing feature off, no RFC 2822 input). Remove this
+      # ignore when MSRV 1.88 allows time >= 0.3.47.
       # cargo-deny and cargo-audit share ~/.cargo/advisory-db; deny populates it
       # so clear before audit to avoid "Refusing to initialize non-empty directory" failure.
       - name: Audit advisories
-        run: rm -rf ~/.cargo/advisory-db && cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+        run: rm -rf ~/.cargo/advisory-db && cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0009
 
   windows:
     name: Windows check and test

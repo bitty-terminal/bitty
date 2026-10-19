@@ -135,11 +135,16 @@
 //!
 //! # Security and resource bounds
 //!
-//! - No `unsafe` is required. The workspace denies `unsafe_code`; this crate
-//!   enforces `#![forbid(unsafe_code)]` with no exception. The two audited
-//!   `allow(unsafe_code)` modules — `bitty-render`'s GPU surface creation
-//!   path and `bitty-winjob`'s Win32 Job Object adapter (Windows only) —
-//!   stay behind their own crate boundaries.
+//! - No `unsafe` is required by the default surface. The workspace denies
+//!   `unsafe_code`; the default build enforces `#![forbid(unsafe_code)]` with
+//!   no exception. The opt-in `publication-control` feature relaxes the crate
+//!   root to `#![deny(unsafe_code)]` for one audited exception: the private
+//!   Unix launch-handle adapter needs the post-fork `pre_exec` hook to place
+//!   inherited bootstrap/control descriptors at their fixed child numbers,
+//!   and its closure is confined to raw descriptor arithmetic. The other
+//!   audited `allow(unsafe_code)` modules — `bitty-render`'s GPU surface
+//!   creation path and `bitty-winjob`'s Win32 Job Object adapter (Windows
+//!   only) — stay behind their own crate boundaries.
 //! - Bounded parsing/state invariants are owned by `bitty-vt`/`bitty-term-state`.
 //!   Bounded rendering (atlas size, cache capacity) is owned by `bitty-render`.
 //!   The bounded cold-path queue is owned here; the bounded plugin side queue
@@ -183,9 +188,16 @@
 //! assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
 //! ```
 
-#![forbid(unsafe_code)]
+// The default terminal build keeps the strongest lint. The opt-in launch seam
+// needs one audited `allow(unsafe_code)` module for its post-fork descriptor
+// placement (`ai_publication_launch/unix.rs`), so only that feature build
+// relaxes the crate root to `deny`, which a scoped `allow` can override.
+#![cfg_attr(not(feature = "publication-control"), forbid(unsafe_code))]
+#![cfg_attr(feature = "publication-control", deny(unsafe_code))]
 
 pub mod ai_helper;
+#[cfg(feature = "publication-control")]
+pub mod ai_publication_launch;
 pub mod ai_request;
 pub mod component;
 pub mod config;

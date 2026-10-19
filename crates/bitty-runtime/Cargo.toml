@@ -16,6 +16,16 @@ workspace = true
 [features]
 # Read-only VM accounting and safe construction for the explicit regression.
 input-vm-test-support = []
+# CTX-1373 (bitty#2199): opt-in Core-side launch seam for authenticated
+# provider publication. Default-off: the shipped terminal build keeps no
+# TLS, certificate-generation, or crypto-provider surface. Slice 1 ends at
+# TLS establishment; `ai_helper` spawn wiring is a follow-up.
+publication-control = ["dep:bitty-network-publication", "dep:getrandom", "dep:libc", "dep:zeroize"]
+# Test-only fixture server for the launch seam. `tls12` exists solely so a
+# test can build a TLS 1.2-only server and prove the TLS 1.3-only client
+# refuses it; the shipped `publication-control` build stays TLS 1.3-only.
+# Never enable in a released build.
+publication-control-test-support = ["publication-control", "dep:rustls"]
 
 # CTX-0906: hermetic native-component test fixture. Speaks wire protocol v1
 # over stdio so the broker integration tests spawn a real coprocess without
@@ -65,10 +75,25 @@ bitty-package = { version = "0.0.24", path = "../bitty-package" }
 # same workspace crate, no new supply-chain surface).
 bitty-rich = { version = "0.0.24", path = "../bitty-rich" }
 # CTX-0906 (DIR-030): the component broker speaks native-component wire
-# protocol v1 to out-of-process components (first: `bitty-net`). Core links
-# the dependency-free codec crate only, never a network implementation
-# crate; same exact-rev pin pattern as `bitty-ipc`.
+# protocol v1 to out-of-process components (first: `bitty-net`). On this path
+# Core links only the dependency-free codec crate, never a general network
+# implementation crate; same exact-rev pin pattern as `bitty-ipc`.
 bitty-network-wire = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
+# CTX-1373 (bitty#2199): launch-scoped mutual-certificate provider-publication
+# control transport (launch material, bounded bootstrap manifest, TLS 1.3
+# client). Opt-in behind `publication-control`; same exact-rev pin pattern as
+# `bitty-ipc` / `bitty-network-wire` (7-char short SHA, merged main c8710e0).
+bitty-network-publication = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-network", rev = "c8710e0", optional = true }
+# CTX-1373: OS-random launch/channel nonces. Already resolved through
+# `bitty-ipc-auth`; the direct edge is optional and needs no new crate version.
+getrandom = { version = "0.4", optional = true }
+# CTX-1373: serialized bootstrap record zeroization. Optional and feature-bound
+# so the default terminal build keeps no extra dependency edge.
+zeroize = { version = "=1.9.0", optional = true }
+# CTX-1373: fixture-side TLS server for the feature-gated launch tests only
+# (`publication-control-test-support`). The shipped client configuration stays
+# TLS 1.3-only; this optional dev-facing edge is never part of a terminal build.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws-lc-rs", "tls12"], optional = true }
 # Issue #1760 (OQ-004): plaintext URL pattern detection wires the
 # dependency-free matcher crate (`bitty-url-detector` v0.0.1, `forbid(unsafe)`,
 # `std` only) into the same `ValidatedUrl` + `ActivationGesture` pipeline as
@@ -87,10 +112,21 @@ bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-t
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { workspace = true, features = ["fs", "std"] }
+# CTX-1373: `pipe` backs the one-shot bootstrap channel for the opt-in
+# publication-control launch seam. The safe wrapper keeps channel creation out
+# of the adapter's single audited unsafe block.
+rustix = { workspace = true, features = ["fs", "pipe", "std"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 nix = { workspace = true, features = ["fs"] }
+
+# CTX-1373: the single audited pre-exec hook (`ai_publication_launch/unix.rs`)
+# duplicates the inherited child descriptors with `fcntl`/`dup2`/`close`. Same
+# workspace `libc` line already linked by bitty-pty/bitty-sandbox; no new crate
+# version. Optional: only the `publication-control` feature compiles the
+# adapter that uses it.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

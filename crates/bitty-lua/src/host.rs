@@ -196,6 +196,10 @@ pub const SPAWN_LUA_MAX_ARGS: usize = 64;
 /// Maximum bytes of one `process.spawn` argv entry accepted from Lua (params
 /// bound precedent; the host allowlist enforces a tighter per-tool count).
 pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
+
+/// Maximum bytes of the optional `process.spawn { cwd = "..." }` option
+/// (CTX-1345; reuses the accepted cwd bound from `bitty-ipc`'s ctl surface).
+pub const SPAWN_LUA_MAX_CWD_BYTES: usize = 4096;
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// Maximum bytes of one `bitty.env` key (CTX-0330, ADR 0006 normative,
@@ -1063,6 +1067,29 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.process_spawn(args)
+    }
+    /// Expiry-aware `process_spawn` carrying the optional `{ cwd = "..." }`
+    /// working directory (CTX-1345).
+    ///
+    /// `cwd` is already shape-validated by the bridge (absolute, bounded, no
+    /// NUL/control, no parent traversal). The default fails closed with
+    /// `E_DEF_INVALID` when a cwd is supplied so a host that cannot honor it
+    /// never silently runs the child in the wrong directory; without a cwd it
+    /// keeps delegating to [`HostServices::process_spawn_with_expiry`].
+    fn process_spawn_with_cwd(
+        &self,
+        args: &[String],
+        cwd: Option<&str>,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if cwd.is_some() {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "process.spawn cwd is not supported by this host",
+            ));
+        }
+        self.process_spawn_with_expiry(args, expiry)
     }
     /// Current monotonic host time in milliseconds (for timer scheduling).
     fn now_millis(&self) -> u64 {
@@ -3369,9 +3396,21 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let args = spawn_argv(&value).map_err(|e| e.to_error(ctx))?;
+                    // CTX-1345: read the options table instead of dropping
+                    // it. The only accepted option is an absolute `cwd`
+                    // confined to the host process's filesystem view (no
+                    // parent traversal); unknown options and malformed
+                    // values fail closed instead of being ignored.
+                    let cwd = spawn_cwd(
+                        &LuaValue::from_lua(stack.get(1), state.limits)
+                            .map_err(|e| e.to_error(ctx))?,
+                    )
+                    .map_err(|e| e.to_error(ctx))?;
                     let result = state
                         .bounded_spawn(|expiry| {
-                            state.services.process_spawn_with_expiry(&args, expiry)
+                            state
+                                .services
+                                .process_spawn_with_cwd(&args, cwd.as_deref(), expiry)
                         })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
@@ -5871,6 +5910,104 @@ fn spawn_argv(value: &LuaValue) -> Result<Vec<String>, BridgeError> {
         args.push(text.clone());
     }
     Ok(args)
+}
+
+/// Parse the optional `process.spawn` options table (CTX-1345).
+///
+/// `Nil` means "no options". A table accepts exactly one key, `cwd`, whose
+/// value must be an absolute path string with no parent-directory traversal
+/// and no NUL/control bytes. Unknown keys and malformed values fail closed
+/// with a typed error, so an unsupported option is never silently ignored.
+fn spawn_cwd(options: &LuaValue) -> Result<Option<String>, BridgeError> {
+    let LuaValue::Table(pairs) = options else {
+        return match options {
+            LuaValue::Nil => Ok(None),
+            _ => Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "process.spawn options must be a table",
+            )),
+        };
+    };
+    let mut cwd = None;
+    for (key, value) in pairs {
+        let LuaValue::String(name) = key else {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "process.spawn option names must be strings",
+            ));
+        };
+        match name.as_str() {
+            "cwd" => {
+                let LuaValue::String(path) = value else {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "process.spawn cwd must be a string",
+                    ));
+                };
+                validate_spawn_cwd(path)?;
+                cwd = Some(path.clone());
+            }
+            other => {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    format!("process.spawn does not support option '{other}'"),
+                ));
+            }
+        }
+    }
+    Ok(cwd)
+}
+
+/// Validate one `process.spawn cwd` value (CTX-1345).
+///
+/// Absolute-only and parent-traversal rejection keep a granted spawn tied to
+/// a host-addressable location instead of silently inheriting a relative
+/// path from the host process. The host still enforces its own tool and
+/// filesystem policy; this is shape validation before the call.
+fn validate_spawn_cwd(cwd: &str) -> Result<(), BridgeError> {
+    if cwd.is_empty() {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "process.spawn cwd must not be empty",
+        ));
+    }
+    if cwd.len() > SPAWN_LUA_MAX_CWD_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("process.spawn cwd exceeds {SPAWN_LUA_MAX_CWD_BYTES} bytes"),
+        ));
+    }
+    if cwd.contains('\0') || cwd.chars().any(char::is_control) {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "process.spawn cwd must not contain NUL or control bytes",
+        ));
+    }
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "process.spawn cwd must be an absolute path",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "process.spawn cwd must not contain parent-directory traversal",
+        ));
+    }
+    Ok(())
 }
 
 fn required_string<'gc>(

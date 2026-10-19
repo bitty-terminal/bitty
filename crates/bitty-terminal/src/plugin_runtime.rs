@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    EmptySettings, LuaValue, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
-    QueuedPinRequest, SnapshotSource, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
+    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, WorkspaceAttention,
+    WorkspaceInfo, WorkspaceSource,
 };
+use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
 use bitty_runtime::{ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
@@ -311,6 +313,54 @@ pub(crate) fn startup_pin_backend(
     })
 }
 
+/// Synchronous `bitty.panel.create` backend for production startup (CTX-1345).
+///
+/// Allocates a native (`rich`, `browser`, `helper`, or `canvas`) panel in the
+/// process-owned [`PanelRegistry`] and returns the raw `(id, generation)`
+/// pair the plugin API shapes into `{ id, generation }`. Mounting and
+/// focusing stay host-driven, so the backend carries no layout authority and
+/// creates no PTY: `terminal` (process-spawn authority the `panel.create`
+/// grant never conveys) and unknown types fail closed with `E_DEF_INVALID`.
+/// Registry exhaustion maps to the bounded `E_DEF_LIMIT`; an unservable
+/// registry maps to `E_NOT_IMPLEMENTED`, like the sibling panel verbs.
+pub(crate) fn startup_panel_create_backend(
+    panels: Rc<RefCell<PanelRegistry>>,
+) -> PanelCreateHandler {
+    Rc::new(move |panel_type| {
+        let parsed = PanelType::parse(panel_type).ok_or_else(|| {
+            BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                format!("unknown panel type '{panel_type}'"),
+            )
+        })?;
+        if parsed == PanelType::Terminal {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "panel.create cannot create terminal panels: plugins create zero-PTY panels only",
+            ));
+        }
+        panels
+            .borrow_mut()
+            .create_panel(parsed, None)
+            .map(|handle| (handle.id.0, handle.generation.get()))
+            .map_err(|error| match error {
+                PanelError::TooManyPanels { max, .. } => BridgeError::new(
+                    "budget",
+                    "E_DEF_LIMIT",
+                    format!("panel registry full (max {max} panels)"),
+                ),
+                PanelError::UnknownPanelType { value } => BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    format!("unknown panel type '{value}'"),
+                ),
+                _ => BridgeError::not_implemented("bitty.panel.create"),
+            })
+    })
+}
+
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
 ///
 /// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
@@ -449,6 +499,21 @@ pub(crate) fn discover_with_roots(
     // `plugins/<owner>.<name>.toml` file when its services are built
     // (absent file serves shipped defaults plus the old home).
     runtime.set_settings_dir(settings_dir);
+    // CTX-1345: install the production `bitty.panel.create` backend before
+    // activation so panel-creating generations capture a real allocator.
+    // The registry is process-owned and lives as long as the plugin runtime
+    // (the handler owns the only handle); activation still gates the backend
+    // on the `panel.create` grant, and the call-time gate stays as the
+    // second layer. A registry that cannot be constructed leaves the backend
+    // unwired, so granted calls keep failing closed with `E_NOT_IMPLEMENTED`.
+    match PanelRegistry::new(PanelRegistryConfig::default()) {
+        Ok(registry) => runtime.set_panel_create_backend(Some(startup_panel_create_backend(
+            Rc::new(RefCell::new(registry)),
+        ))),
+        Err(error) => crate::logging::warn(|| {
+            format!("bitty: panel registry unavailable, panel.create disabled ({error})")
+        }),
+    }
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the
     // RC-1 accounting; only the atomic-commit bytes flow through here.
@@ -522,6 +587,7 @@ pub(crate) fn discover_with_roots(
 mod tests {
     use super::*;
     use bitty_runtime::Runtime;
+    use bitty_runtime::registry::{Generation, PanelId, PanelState};
     use bitty_runtime::{LayoutNode, SplitAxis, UiRect, View};
 
     fn generation_of(snapshot: &LuaValue) -> u64 {
@@ -1202,5 +1268,165 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         );
         app.apply_plugin_submit_requests();
         assert!(app.runtime.pending_input().is_empty());
+    }
+
+    // ── CTX-1345: production panel.create backend ───────────────────────
+
+    const PANEL_PROBE_COMMANDS: &[&str] = &["create_rich", "create_helper", "create_terminal"];
+
+    /// Probe plugin: table-form `bitty.panel.create` reports
+    /// `OK:<id>/<generation>` or `ERR:<code>` across the real Lua bridge.
+    const PANEL_PROBE: &str = r#"
+local function create_result(typ)
+  local ok, res = pcall(bitty.panel.create, { type = typ })
+  if not ok then return "ERR:" .. res.code end
+  return "OK:" .. tostring(res.id) .. "/" .. tostring(res.generation)
+end
+
+bitty.commands.register({ id = "create_rich", title = "Create rich", run = function()
+  return create_result("rich") end })
+bitty.commands.register({ id = "create_helper", title = "Create helper", run = function()
+  return create_result("helper") end })
+bitty.commands.register({ id = "create_terminal", title = "Create terminal", run = function()
+  return create_result("terminal") end })
+"#;
+
+    fn write_panel_probe(root: &Path, id: &str, capabilities: &[&str]) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let qualified: Vec<String> = PANEL_PROBE_COMMANDS
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect();
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{capabilities_toml}[lazy]\ncommands = [{}]\nevents = []\n",
+                qualified.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), PANEL_PROBE).expect("init");
+    }
+
+    /// Activate a panel probe through the real startup composition root.
+    fn panel_probe_runtime(tag: &str, id: &str, capabilities: &[&str]) -> PluginRuntime {
+        let root = pin_test_dir(tag);
+        write_panel_probe(&root, id, capabilities);
+        let live = Runtime::with_defaults().expect("defaults must build");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+        };
+        discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+            .expect("dev root must yield a session")
+            .runtime
+    }
+
+    fn dispatch_panel(runtime: &mut PluginRuntime, id: &str, command: &str) -> String {
+        use bitty_plugin_host::manifest::PluginId;
+        let pid = PluginId::new(id).expect("id");
+        match runtime.dispatch_command(&pid, command, &[]) {
+            Ok(LuaValue::String(value)) => value,
+            Ok(other) => panic!("{command}: expected a string result, got {other:?}"),
+            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn startup_panel_create_backend_serves_granted_lua_verb() {
+        // CTX-1345: the startup wiring must install a real allocator, not
+        // the unwired seam (which returned E_NOT_IMPLEMENTED for every
+        // granted call). Distinct ids prove each call mints a fresh record.
+        let mut runtime = panel_probe_runtime("granted", "xuepoo.prodcreate", &["panel.create"]);
+        let first = dispatch_panel(&mut runtime, "xuepoo.prodcreate", "create_rich");
+        let (first_id, first_generation) = parse_panel_handle(&first, "granted create");
+        let second = dispatch_panel(&mut runtime, "xuepoo.prodcreate", "create_helper");
+        let (second_id, second_generation) = parse_panel_handle(&second, "second create");
+        assert_ne!(
+            first_id, second_id,
+            "each create allocates a distinct panel id"
+        );
+        assert!(
+            second_generation > first_generation,
+            "the registry generation advances ({first_generation} -> {second_generation})"
+        );
+    }
+
+    #[test]
+    fn startup_panel_create_backend_denies_ungranted_generation() {
+        // Grant gating stays: without `panel.create` activation captures no
+        // backend and the call-time gate denies before allocation.
+        let mut runtime = panel_probe_runtime("denied", "xuepoo.prodcreatedenied", &[]);
+        assert_eq!(
+            dispatch_panel(&mut runtime, "xuepoo.prodcreatedenied", "create_rich"),
+            "ERR:E_CAPABILITY_DENIED"
+        );
+    }
+
+    #[test]
+    fn startup_panel_create_backend_rejects_terminal_without_allocating() {
+        // Zero-PTY policy: `terminal` fails closed with the existing typed
+        // error, and the same generation still serves a native type.
+        let mut runtime =
+            panel_probe_runtime("terminal", "xuepoo.prodcreateterminal", &["panel.create"]);
+        assert_eq!(
+            dispatch_panel(&mut runtime, "xuepoo.prodcreateterminal", "create_terminal"),
+            "ERR:E_DEF_INVALID"
+        );
+        let created = dispatch_panel(&mut runtime, "xuepoo.prodcreateterminal", "create_rich");
+        parse_panel_handle(&created, "rich after terminal rejection");
+    }
+
+    #[test]
+    fn startup_panel_create_backend_allocates_registry_records() {
+        // Handler contract: allocate a `Created` record of the parsed type
+        // and return its raw `(id, generation)`; unsupported types allocate
+        // nothing.
+        let panels = Rc::new(RefCell::new(
+            PanelRegistry::new(PanelRegistryConfig::default()).expect("panel registry"),
+        ));
+        let backend = startup_panel_create_backend(Rc::clone(&panels));
+        let (id, generation) = backend("rich").expect("rich allocates");
+        assert_eq!(panels.borrow().panel_count(), 1);
+        assert_eq!(
+            panels
+                .borrow()
+                .panel_state(PanelId(id), Generation(generation))
+                .expect("live handle"),
+            PanelState::Created,
+            "creation allocates only; the host mounts"
+        );
+        for unsupported in ["terminal", "bogus"] {
+            let error = backend(unsupported).expect_err("unsupported type must fail");
+            assert_eq!(error.code, "E_DEF_INVALID", "{unsupported}");
+        }
+        assert_eq!(
+            panels.borrow().panel_count(),
+            1,
+            "rejected types allocate nothing"
+        );
+    }
+
+    fn parse_panel_handle(result: &str, context: &str) -> (u64, u64) {
+        let rest = result
+            .strip_prefix("OK:")
+            .unwrap_or_else(|| panic!("{context}: expected OK result, got {result}"));
+        let (id, generation) = rest
+            .split_once('/')
+            .unwrap_or_else(|| panic!("{context}: expected id/generation, got {result}"));
+        (
+            id.parse().expect("numeric panel id"),
+            generation.parse().expect("numeric generation"),
+        )
     }
 }

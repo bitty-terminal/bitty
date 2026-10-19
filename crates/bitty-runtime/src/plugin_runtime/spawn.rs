@@ -2023,6 +2023,17 @@ fn truncate_message(mut text: String, limit: usize) -> String {
     text
 }
 
+/// Build the Layer-2 `git` request for one plugin generation (CTX-1345).
+///
+/// The optional cwd arrives already validated by the Lua bridge (absolute,
+/// bounded, no parent traversal) and is forwarded verbatim so the panel's
+/// git commands run in the observed pane repository instead of the host
+/// process cwd.
+#[must_use]
+fn git_spawn_request(args: Vec<String>, cwd: Option<&str>) -> SpawnRequest {
+    SpawnRequest::new("git", args).with_cwd(cwd.map(str::to_owned))
+}
+
 /// Build the Layer-2 `git` spawn backend for one plugin generation.
 ///
 /// The backend closes over a [`SpawnService`], the `process.spawn` scope set,
@@ -2068,10 +2079,10 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
         "install-grant".to_owned(),
     );
     let next_id = Rc::new(Cell::new(0u64));
-    Rc::new(move |args: &[String]| {
+    Rc::new(move |args: &[String], cwd: Option<&str>| {
         let id = next_id.get();
         next_id.set(id.saturating_add(1));
-        let request = SpawnRequest::new("git", args.to_vec())
+        let request = git_spawn_request(args.to_vec(), cwd)
             .with_timeout_ms(DEFAULT_EXEC_TIMEOUT_MS)
             .with_output_budget(SpawnMechanicsPolicy::core_defaults().panel_output_budget)
             .with_allow_effects(true);
@@ -2741,6 +2752,18 @@ mod tests {
     fn spawn_scope_is_process_spawn() {
         assert_eq!(SPAWN_SCOPE, Scope::ProcessSpawn);
         assert_eq!(SPAWN_PANEL_OUTPUT_BUDGET, 8 * 1024);
+    }
+
+    #[test]
+    fn git_spawn_request_carries_the_pane_cwd() {
+        // CTX-1345: the git-panel Lua shape passes `{ cwd = ... }`; dropping
+        // the option at the request boundary would send git back to the host
+        // process cwd (the observed E_SPAWN_FAILED).
+        let request = git_spawn_request(vec!["status".to_owned()], Some("/tmp/pane-repo"));
+        assert_eq!(request.tool, "git");
+        assert_eq!(request.cwd.as_deref(), Some("/tmp/pane-repo"));
+        let request = git_spawn_request(vec!["status".to_owned()], None);
+        assert_eq!(request.cwd, None);
     }
 
     #[test]

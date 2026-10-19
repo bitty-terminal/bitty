@@ -265,6 +265,9 @@ fn host_call_deadline_returns_typed_timeout() {
 struct SpawnServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
     calls: RefCell<Vec<Vec<String>>>,
+    /// Working directories received through the cwd-aware entry point
+    /// (CTX-1345): `Some` for an explicit option, `None` for no option.
+    cwds: RefCell<Vec<Option<String>>>,
     deny: bool,
 }
 
@@ -303,12 +306,29 @@ impl HostServices for SpawnServices {
             ("untrusted", LuaValue::Bool(true)),
         ]))
     }
+
+    fn process_spawn_with_cwd(
+        &self,
+        args: &[String],
+        cwd: Option<&str>,
+        _expiry: std::time::Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        self.cwds.borrow_mut().push(cwd.map(str::to_owned));
+        self.process_spawn(args)
+    }
 }
 
 fn install_spawn(vm: &mut LuaVm, services: Rc<SpawnServices>) {
     let services: Rc<dyn HostServices> = services;
     vm.install_host_module(services, MarshallingLimits::default(), 50)
         .expect("install");
+}
+
+/// Escape a filesystem path for a double-quoted Lua string literal.
+fn lua_path(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 #[test]
@@ -345,6 +365,7 @@ fn process_spawn_serves_bounded_table() {
     let services = Rc::new(SpawnServices {
         store: RefCell::new(BTreeMap::new()),
         calls: RefCell::new(Vec::new()),
+        cwds: RefCell::new(Vec::new()),
         deny: false,
     });
     let mut vm = gate_vm("spawn-ok");
@@ -377,10 +398,119 @@ fn process_spawn_serves_bounded_table() {
 }
 
 #[test]
+fn process_spawn_honors_absolute_cwd_option() {
+    // CTX-1345: the bridge used to read only stack.get(0), so a plugin's
+    // `{ cwd = ... }` was silently dropped and the child ran in the host
+    // process cwd. The validated option must reach the host backend.
+    let dir = std::env::temp_dir().join(format!("bitty-spawn-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp cwd");
+    let services = Rc::new(SpawnServices {
+        store: RefCell::new(BTreeMap::new()),
+        calls: RefCell::new(Vec::new()),
+        cwds: RefCell::new(Vec::new()),
+        deny: false,
+    });
+    let mut vm = gate_vm("spawn-cwd");
+    install_spawn(&mut vm, services.clone());
+    let script = format!(
+        r#"local result = bitty.process.spawn({{ "status" }}, {{ cwd = "{cwd}" }})
+           bitty.store.set("output", result.output)"#,
+        cwd = lua_path(&dir),
+    );
+    let outcome = vm.execute_bounded(&script).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.cwds.borrow().as_slice(),
+        &[Some(dir.to_string_lossy().into_owned())],
+        "the absolute cwd reaches the host backend"
+    );
+    assert_eq!(
+        services.calls.borrow().as_slice(),
+        &[vec!["status".to_string()]]
+    );
+}
+
+#[test]
+fn process_spawn_rejects_invalid_options_instead_of_ignoring_them() {
+    // CTX-1345: unknown options and malformed cwd values fail closed with a
+    // typed error and never reach the backend, instead of being ignored or
+    // running relative to the host process cwd.
+    let dir = std::env::temp_dir().join(format!("bitty-spawn-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp cwd");
+    let traversal = format!("{}/..", dir.to_string_lossy());
+    let cases = [
+        (
+            "relative",
+            r#"bitty.process.spawn({ "status" }, { cwd = "relative/dir" })"#.to_string(),
+            "E_DEF_INVALID",
+        ),
+        (
+            "traversal",
+            format!(
+                r#"bitty.process.spawn({{ "status" }}, {{ cwd = "{}" }})"#,
+                lua_path(std::path::Path::new(&traversal))
+            ),
+            "E_DEF_INVALID",
+        ),
+        (
+            "unknown-option",
+            r#"bitty.process.spawn({ "status" }, { shell = true })"#.to_string(),
+            "E_DEF_INVALID",
+        ),
+        (
+            "non-string-cwd",
+            r#"bitty.process.spawn({ "status" }, { cwd = 5 })"#.to_string(),
+            "E_DEF_INVALID",
+        ),
+        (
+            "non-table-options",
+            r#"bitty.process.spawn({ "status" }, "nope")"#.to_string(),
+            "E_VALUE_TYPE",
+        ),
+    ];
+    for (tag, expression, code) in cases {
+        let services = Rc::new(SpawnServices {
+            store: RefCell::new(BTreeMap::new()),
+            calls: RefCell::new(Vec::new()),
+            cwds: RefCell::new(Vec::new()),
+            deny: false,
+        });
+        let mut vm = gate_vm(format!("spawn-bad-option-{tag}"));
+        install_spawn(&mut vm, services.clone());
+        let script = format!(
+            r#"local ok, err = pcall(function() {expression} end)
+               bitty.store.set("code", ok and "NONE" or err.code)"#
+        );
+        let outcome = vm.execute_bounded(&script).expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{tag}: {outcome:?}"
+        );
+        assert_eq!(
+            services.store.borrow().get("code"),
+            Some(&LuaValue::String(code.to_string())),
+            "{tag}"
+        );
+        assert!(
+            services.calls.borrow().is_empty(),
+            "{tag}: rejected options never reach the spawn backend"
+        );
+        assert!(
+            services.cwds.borrow().is_empty(),
+            "{tag}: no cwd reaches the spawn backend"
+        );
+    }
+}
+
+#[test]
 fn process_spawn_denied_stays_typed() {
     let services = Rc::new(SpawnServices {
         store: RefCell::new(BTreeMap::new()),
         calls: RefCell::new(Vec::new()),
+        cwds: RefCell::new(Vec::new()),
         deny: true,
     });
     let mut vm = gate_vm("spawn-denied");
@@ -431,6 +561,7 @@ fn process_spawn_rejects_malformed_argv() {
         let services = Rc::new(SpawnServices {
             store: RefCell::new(BTreeMap::new()),
             calls: RefCell::new(Vec::new()),
+            cwds: RefCell::new(Vec::new()),
             deny: false,
         });
         let mut vm = gate_vm(format!("spawn-bad-{tag}"));

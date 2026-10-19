@@ -8,7 +8,10 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,11 +28,14 @@ use rustls::{
 use zeroize::Zeroizing;
 
 use super::{
-    CONTROL_ALPN, CONTROL_ESTABLISH_TIMEOUT, CONTROL_PROFILE, DELEGATION_PURPOSE, LaunchError,
-    LaunchIdentity, PreparedLaunch, TlsRefusal, prepare, write_and_zeroize,
+    CHILD_BOOTSTRAP_DESCRIPTOR, CHILD_CONTROL_DESCRIPTOR, CONTROL_ALPN, CONTROL_ESTABLISH_TIMEOUT,
+    CONTROL_PROFILE, DELEGATION_PURPOSE, LaunchError, LaunchIdentity, PreparedLaunch, TlsRefusal,
+    prepare, write_and_zeroize,
 };
 
 const CORE_INSTANCE_NONCE: [u8; RANDOM_ID_BYTES] = [0x11; RANDOM_ID_BYTES];
+const PLACEMENT_BOOTSTRAP: RawFd = CHILD_BOOTSTRAP_DESCRIPTOR as RawFd;
+const PLACEMENT_CONTROL: RawFd = CHILD_CONTROL_DESCRIPTOR as RawFd;
 
 fn identity(component_name: &str) -> LaunchIdentity {
     LaunchIdentity::new(
@@ -62,6 +68,51 @@ fn take_control_child(prepared: &mut PreparedLaunch) -> UnixStream {
         .expect("platform handles")
         .take_control_child()
         .expect("child control stream")
+}
+
+fn reservation_descriptors(prepared: &PreparedLaunch) -> Vec<RawFd> {
+    prepared
+        .handles
+        .as_ref()
+        .expect("platform handles")
+        .spawn_reservation_descriptors()
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_target(fd: RawFd) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+}
+
+/// Match by descriptor identity, not by number: under parallel tests another
+/// thread can reuse a number we just closed, but it cannot reuse an anonymous
+/// pipe inode.
+#[cfg(target_os = "linux")]
+fn target_is_open(target: &std::path::Path) -> bool {
+    let entries = std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd");
+    entries.filter_map(Result::ok).any(|entry| {
+        std::fs::read_link(entry.path()).is_ok_and(|candidate| candidate.as_path() == target)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reservation_targets(prepared: &PreparedLaunch) -> Vec<PathBuf> {
+    reservation_descriptors(prepared)
+        .into_iter()
+        .map(|fd| descriptor_target(fd).unwrap_or_else(|| panic!("reservation fd {fd} target")))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn child_end_targets(prepared: &PreparedLaunch) -> (Option<PathBuf>, Option<PathBuf>) {
+    let handles = prepared.handles.as_ref().expect("platform handles");
+    (
+        handles
+            .bootstrap_reader_descriptor()
+            .and_then(descriptor_target),
+        handles
+            .control_child_descriptor()
+            .and_then(descriptor_target),
+    )
 }
 
 struct MaterialSnapshot {
@@ -371,6 +422,367 @@ fn child_descriptors_are_fixed_and_disappear_after_spawn() {
         launch.install_child_descriptors(&mut command),
         Err(LaunchError::HandleMissing)
     ));
+}
+
+/// The spawn guard child runs only when the parent test re-executes this
+/// binary through `sh`, which closes descriptors 3 through 9 first.
+const SPAWN_GUARD_CHILD_ENV: &str = "BITTY_PUBLICATION_SPAWN_GUARD_CHILD";
+
+#[test]
+fn nonexistent_executable_is_reported_when_placement_descriptors_are_free() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_some() {
+        return;
+    }
+    let executable = std::env::current_exe().expect("test executable path");
+    // The wrapper owns no extra descriptors and closes the placement range
+    // before exec, so the guarded child starts with 3/4 free. Without the
+    // parent-side reservation, std's exec-error channel lands there and a
+    // failed exec is reported as a successful spawn.
+    let script = "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; \
+                  exec \"$0\" publication_spawn_fd_guard_child --test-threads=1 --nocapture";
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(executable)
+        .env(SPAWN_GUARD_CHILD_ENV, "1")
+        .status()
+        .expect("guarded child test process");
+    assert!(
+        status.success(),
+        "guarded spawn-failure child failed: {status}"
+    );
+}
+
+#[test]
+fn publication_spawn_fd_guard_child() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_none() {
+        return;
+    }
+
+    // While the launch channels are created, hold 3/4 with harmless dummy
+    // descriptors so the channels land above the placement range. Freeing the
+    // dummies afterwards puts 3/4 back in the lowest-free set that std uses
+    // for its exec-error channel.
+    let dummies = [
+        File::open("/dev/null").expect("dummy descriptor one"),
+        File::open("/dev/null").expect("dummy descriptor two"),
+    ];
+    let dummy_descriptors: Vec<RawFd> = dummies.iter().map(AsRawFd::as_raw_fd).collect();
+    assert!(
+        dummy_descriptors.contains(&PLACEMENT_BOOTSTRAP)
+            && dummy_descriptors.contains(&PLACEMENT_CONTROL),
+        "guarded child did not start with the placement descriptors free: {dummy_descriptors:?}"
+    );
+
+    let mut launch = prepared("bitty-ai");
+    drop(dummies);
+
+    let mut command = std::process::Command::new("/nonexistent/bitty-publication-spawn-probe");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
+
+    let result = command.spawn();
+    launch.after_spawn();
+
+    match result {
+        Err(error) => eprintln!("spawn failed closed as required: {error}"),
+        Ok(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("spawn of a nonexistent executable reported success");
+        }
+    }
+    assert!(
+        reservation.contains(&PLACEMENT_BOOTSTRAP) && reservation.contains(&PLACEMENT_CONTROL),
+        "reservation does not cover the placement range: {reservation:?}"
+    );
+    assert!(matches!(
+        launch.child_descriptors(),
+        Err(LaunchError::HandleMissing)
+    ));
+    assert!(reservation_descriptors(&launch).is_empty());
+    #[cfg(target_os = "linux")]
+    {
+        for target in &reservation_targets {
+            assert!(
+                !target_is_open(target),
+                "reservation target {target:?} leaked after a failed spawn"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nonexistent_executable_is_reported_when_low_stdio_descriptors_are_free() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_some() {
+        return;
+    }
+    let executable = std::env::current_exe().expect("test executable path");
+    // Keep 0/1/2 open at process start so preparation allocates its channels
+    // above the placement range; the guarded child frees stdin and stderr
+    // after preparation, leaving 0 and 2 as the two lowest free descriptors.
+    // stdout stays open for the test harness.
+    let script = "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; \
+                  exec \"$0\" publication_low_stdio_guard_child --test-threads=1 --nocapture";
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(executable)
+        .env(SPAWN_GUARD_CHILD_ENV, "1")
+        .status()
+        .expect("guarded low-stdio child process");
+    assert!(
+        status.success(),
+        "guarded low-stdio spawn child failed: {status}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_low_stdio_guard_child() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_none() {
+        return;
+    }
+
+    let dummies = [
+        File::open("/dev/null").expect("dummy descriptor one"),
+        File::open("/dev/null").expect("dummy descriptor two"),
+    ];
+    let dummy_descriptors: Vec<RawFd> = dummies.iter().map(AsRawFd::as_raw_fd).collect();
+    assert!(
+        dummy_descriptors.contains(&PLACEMENT_BOOTSTRAP)
+            && dummy_descriptors.contains(&PLACEMENT_CONTROL),
+        "guarded child did not start with the placement descriptors free: {dummy_descriptors:?}"
+    );
+
+    let mut launch = prepared("bitty-ai");
+    drop(dummies);
+
+    // Free stdin and stderr; stdout stays open for libtest. The previous
+    // two-lowest reservation would hold 0/2 and leave 3/4 to std's error
+    // channel, whose write end at 4 the placement hook would clobber.
+    super::platform::close_test_descriptor(0).expect("close stdin");
+    super::platform::close_test_descriptor(2).expect("close stderr");
+    assert!(descriptor_target(0).is_none(), "stdin must be free");
+    assert!(descriptor_target(2).is_none(), "stderr must be free");
+
+    let mut command = std::process::Command::new("/nonexistent/bitty-publication-spawn-probe");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    let reservation_targets = reservation_targets(&launch);
+
+    let result = command.spawn();
+    launch.after_spawn();
+
+    match result {
+        Err(error) => println!("spawn failed closed as required: {error}"),
+        Ok(mut child) => {
+            // stdout stays open because stderr is closed in this child.
+            println!("BUG: spawn of a nonexistent executable reported success");
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("spawn of a nonexistent executable reported success");
+        }
+    }
+    assert!(
+        reservation.contains(&PLACEMENT_BOOTSTRAP) && reservation.contains(&PLACEMENT_CONTROL),
+        "reservation does not cover the placement range: {reservation:?}"
+    );
+    assert!(matches!(
+        launch.child_descriptors(),
+        Err(LaunchError::HandleMissing)
+    ));
+    for target in &reservation_targets {
+        assert!(
+            !target_is_open(target),
+            "reservation target {target:?} leaked after a failed spawn"
+        );
+    }
+}
+
+#[test]
+fn reservation_is_held_across_a_successful_spawn_and_released_afterwards() {
+    let mut launch = prepared("bitty-ai");
+    let expected_pin = launch.helper_cert_sha256().expect("material pin");
+    let material = snapshot(&launch);
+
+    let mut command = std::process::Command::new("true");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    assert!(
+        !reservation.is_empty(),
+        "spawn reservation must be installed"
+    );
+    #[cfg(target_os = "linux")]
+    for fd in &reservation {
+        assert_cloexec(*fd);
+    }
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
+
+    let mut child = command.spawn().expect("fixture process spawn");
+    assert!(child.wait().expect("fixture process wait").success());
+
+    // Keep the same launch's child ends for the in-process fixture handshake,
+    // then release the parent's copies and the reservation.
+    let bootstrap = take_bootstrap_reader(&mut launch);
+    let control_child = take_control_child(&mut launch);
+    launch.after_spawn();
+    assert!(reservation_descriptors(&launch).is_empty());
+    #[cfg(target_os = "linux")]
+    for target in &reservation_targets {
+        assert!(
+            !target_is_open(target),
+            "reservation target {target:?} survived after_spawn"
+        );
+    }
+
+    launch.write_bootstrap().expect("bootstrap write");
+    let server = spawn_fixture_server(bootstrap, control_child, material, false, CONTROL_ALPN);
+    let established = launch
+        .establish(Instant::now() + CONTROL_ESTABLISH_TIMEOUT)
+        .expect("mutual TLS establishment after a reserved spawn");
+    assert!(!established.is_handshaking());
+    assert_eq!(established.alpn_protocol(), Some(CONTROL_ALPN));
+    assert_eq!(established.helper_cert_sha256(), expected_pin);
+
+    let outcome = server
+        .join()
+        .expect("server thread")
+        .expect("server handshake");
+    assert!(!outcome.handshaking);
+    assert_eq!(outcome.alpn.as_deref(), Some(CONTROL_ALPN));
+}
+
+#[test]
+fn dropping_the_launch_releases_the_spawn_reservation() {
+    let mut launch = prepared("bitty-ai");
+    let mut command = std::process::Command::new("true");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    assert!(
+        !reservation.is_empty(),
+        "spawn reservation must be installed"
+    );
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
+
+    drop(launch);
+    #[cfg(target_os = "linux")]
+    for target in &reservation_targets {
+        assert!(
+            !target_is_open(target),
+            "reservation target {target:?} leaked after dropping the launch"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reservation_descriptors_do_not_cross_exec() {
+    let mut launch = prepared("bitty-ai");
+    let mut command = std::process::Command::new("sleep");
+    command.arg("30");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    assert!(!reservation.is_empty());
+    let reserved_targets = reservation_targets(&launch);
+    let (bootstrap_target, control_target) = child_end_targets(&launch);
+
+    let mut child = command.spawn().expect("sleep spawn");
+    wait_for_exec(child.id(), "sleep");
+    let targets = child_fd_targets(child.id());
+    let leaked: Vec<_> = targets
+        .iter()
+        .filter(|(_, target)| reserved_targets.contains(target))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "reservation descriptors survived exec: {leaked:?}"
+    );
+    let target_for = |name: &str| {
+        targets
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, target)| target)
+    };
+    let bootstrap_name = PLACEMENT_BOOTSTRAP.to_string();
+    let control_name = PLACEMENT_CONTROL.to_string();
+    assert_eq!(
+        target_for(&bootstrap_name),
+        bootstrap_target.as_ref(),
+        "placed bootstrap descriptor is not the launch pipe"
+    );
+    assert_eq!(
+        target_for(&control_name),
+        control_target.as_ref(),
+        "placed control descriptor is not the launch socket"
+    );
+
+    launch.after_spawn();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cloexec(fd: RawFd) {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .unwrap_or_else(|error| panic!("read fdinfo for reservation fd {fd}: {error}"));
+    let flags = info
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:\t"))
+        .unwrap_or_else(|| panic!("fdinfo for reservation fd {fd} has no flags line"));
+    let flags = u32::from_str_radix(flags.trim(), 8).expect("octal descriptor flags");
+    assert_ne!(
+        flags & libc::O_CLOEXEC as u32,
+        0,
+        "reservation fd {fd} is not close-on-exec"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_exec(pid: u32, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let comm = format!("/proc/{pid}/comm");
+    loop {
+        if std::fs::read_to_string(&comm).is_ok_and(|name| name.trim() == expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} did not exec {expected}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn child_fd_targets(pid: u32) -> Vec<(String, std::path::PathBuf)> {
+    let directory = format!("/proc/{pid}/fd");
+    let entries =
+        std::fs::read_dir(&directory).unwrap_or_else(|error| panic!("read {directory}: {error}"));
+    let mut targets = Vec::new();
+    for entry in entries {
+        let entry = entry.expect("child fd entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            targets.push((name, target));
+        }
+    }
+    targets
 }
 
 struct FailingWriter;

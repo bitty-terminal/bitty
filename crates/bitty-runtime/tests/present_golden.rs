@@ -40,6 +40,11 @@
 //! The paste-banner digests were re-recorded under CTX-1372 (#2265): the full
 //! summary and collapsed flash now name `Enter` as the confirm gesture
 //! alongside `Esc` as cancel.
+//!
+//! The `wide_combining` digest was re-recorded under CTX-1371 (#2264): the
+//! unshaped paint path now emits a cell's `zerowidth` combining marks over
+//! their base (CR-TERM-01), so `e` + U+0301 actually paints its acute. This
+//! is an explicit behavior change, not golden drift.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -285,5 +290,5 @@ fn golden_wide_and_combining_glyphs() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("A\u{4e2d}\u{1f389}e\u{0301}".as_bytes());
     let mixed = rt.tick().expect("mixed-width present");
-    assert_digest("wide_combining", &rt, &mixed, 0x93e5_d5e4_eeff_b41a);
+    assert_digest("wide_combining", &rt, &mixed, 0xe9ea_3dd7_45ca_5be5);
 }

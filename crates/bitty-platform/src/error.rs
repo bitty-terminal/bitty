@@ -31,6 +31,10 @@ pub enum PlatformError {
     InvalidScaleFactor(f64),
 
     /// Clipboard is unavailable on this platform or display server.
+    ///
+    /// Since CTX-1366 this is also the typed refusal for a macOS text read:
+    /// AppKit exposes no caller byte bound, so Bitty does not materialize the
+    /// pasteboard value. Headless handles and writes are unaffected.
     ClipboardUnavailable(String),
 
     /// Clipboard operation failed.
@@ -40,11 +44,35 @@ pub enum PlatformError {
     ///
     /// Truncation is never silent: callers receive this typed error and the
     /// clipboard is left unchanged instead of storing a shortened value.
+    ///
+    /// For bounded native acquisition the value was never fully materialized,
+    /// so `len` is the number of bytes actually observed or advertised, a
+    /// lower bound on the foreign payload rather than its full length. The
+    /// in-memory paths still report the exact length. Linux X11 and Windows
+    /// over-cap reads return this error with no partial text (CTX-1366);
+    /// Linux Wayland returns a truncated prefix through the bounded accessors
+    /// instead, and the direct reads report this error there too. When this
+    /// error reaches a lossy read, the paste seam delivers no input and an
+    /// authorized OSC 52 read answers with the existing framed-empty reply.
     ClipboardPayloadTooLarge {
-        /// Byte length of the rejected payload.
+        /// Byte length of the rejected payload, or the observed lower bound
+        /// for a bounded native acquisition.
         len: usize,
         /// Configured maximum in bytes (`CLIPBOARD_MAX_BYTES`).
         max: usize,
+    },
+
+    /// A bounded native clipboard acquisition exceeded its wall-clock budget
+    /// and failed closed (CTX-1315).
+    ///
+    /// No text is returned and no input is delivered: the paste seam reports
+    /// the failure and an authorized OSC 52 read answers with the existing
+    /// framed-empty reply.
+    ClipboardAcquisitionTimeout {
+        /// Acquisition stage that was waiting when the deadline expired.
+        stage: &'static str,
+        /// Configured budget in milliseconds.
+        timeout_ms: u64,
     },
 
     /// The URI is not in the supported, safe scheme allowlist.
@@ -80,7 +108,13 @@ impl fmt::Display for PlatformError {
             Self::ClipboardPayloadTooLarge { len, max } => {
                 write!(
                     f,
-                    "clipboard payload of {len} bytes exceeds the {max}-byte limit"
+                    "clipboard payload exceeds the {max}-byte limit ({len} bytes observed)"
+                )
+            }
+            Self::ClipboardAcquisitionTimeout { stage, timeout_ms } => {
+                write!(
+                    f,
+                    "clipboard acquisition timed out after {timeout_ms} ms during {stage}"
                 )
             }
             Self::InvalidUrl => write!(f, "URL rejected by scheme and character policy"),

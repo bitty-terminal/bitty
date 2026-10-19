@@ -914,9 +914,11 @@ impl Runtime {
     /// nothing but is recorded for [`Self::last_clipboard_error`] instead of
     /// swallowed (PR #259 review); a successful read clears the slot.
     ///
-    /// An over-limit primary selection is read through the bounded accessor,
-    /// so it pastes its clipped prefix instead of failing closed
-    /// (CTX-0478 review).
+    /// An over-limit primary selection is read through the bounded accessor:
+    /// a Wayland or in-memory value pastes its clipped prefix (CTX-0478
+    /// review), while a Linux X11 over-cap acquisition returns
+    /// `ClipboardPayloadTooLarge` and this fail-soft path records the error
+    /// and pastes nothing (CTX-1366).
     pub fn paste_from_primary(&mut self) -> Option<bool> {
         let text = match self.clipboard.get_primary_bounded() {
             Ok(text) => {
@@ -1085,11 +1087,12 @@ impl Runtime {
     ///
     /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) before the scan
     /// (T-01), so untrusted clipboard content cannot grow the heap without
-    /// limit. The clipboard read is bounded on purpose: an over-limit system
-    /// clipboard is clipped at a UTF-8 char boundary and pastes its prefix
-    /// instead of propagating `ClipboardPayloadTooLarge` and pasting nothing
-    /// (CTX-0478 review); the inspection gate re-applies the same
-    /// char-boundary bound via `truncate_paste_text`.
+    /// limit. The clipboard read is bounded on purpose: a Wayland or
+    /// in-memory over-limit clipboard is clipped at a UTF-8 char boundary and
+    /// pastes its prefix (CTX-0478 review), while a Linux X11/Windows over-cap
+    /// acquisition propagates `ClipboardPayloadTooLarge` and pastes nothing
+    /// (CTX-1366). The inspection gate re-applies the same char-boundary bound
+    /// via `truncate_paste_text`.
     pub fn paste_from_clipboard(&mut self) -> Result<Option<bool>, bitty_platform::PlatformError> {
         let text = self.clipboard.get_text_bounded()?;
         if self.clipboard.last_bounded_read_truncated() {

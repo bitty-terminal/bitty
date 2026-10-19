@@ -102,6 +102,27 @@ pub mod backlight_state;
 pub mod bluetooth_state;
 mod blur;
 pub mod clipboard;
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+mod clipboard_bounded;
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ),
+    test
+))]
+mod clipboard_limits;
+#[cfg(windows)]
+mod clipboard_windows;
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+mod clipboard_x11;
 pub mod cursor;
 pub mod dpi;
 pub mod error;

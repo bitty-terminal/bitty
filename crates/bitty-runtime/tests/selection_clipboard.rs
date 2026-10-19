@@ -174,7 +174,8 @@ fn clipboard_rejects_over_limit_payloads_without_truncating() {
 fn oversized_primary_selection_pastes_bounded_prefix() {
     // CTX-0478 review: middle-click paste reads through the bounded primary
     // accessor, so an over-limit primary selection pastes its clipped prefix
-    // instead of failing closed.
+    // instead of failing closed. This test's value is the in-memory simulated
+    // one; native X11/Windows primary reads refuse over-limit values (CTX-1366).
     let mut rt = make_runtime();
     let oversized = "p".repeat(CLIPBOARD_MAX_BYTES + 300);
     rt.clipboard_mut().simulate_system_text_for_test(oversized);

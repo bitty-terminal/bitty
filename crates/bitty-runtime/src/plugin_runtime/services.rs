@@ -87,6 +87,10 @@ pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
 /// backend is the consent-gated [`SpawnService`](super::spawn::SpawnService)
 /// path wired at activation; tests inject canned closures. `None` (no
 /// backend) fails closed with `E_SPAWN_UNAVAILABLE`.
+///
+/// The handler takes no working directory: CTX-1345 review F1 found that a
+/// plugin-controlled `{ cwd }` is unconfined, so the bridge rejects the
+/// option and the backend has no path to honor it.
 pub type SpawnHandler = Rc<dyn Fn(&[String]) -> Result<LuaValue, BridgeError>>;
 
 /// Read-only typed settings source (owned by `bitty-config` in the app).
@@ -2795,6 +2799,17 @@ impl HostServices for PluginServices {
             )
         })?;
         backend(args)
+    }
+
+    fn process_spawn_with_expiry(
+        &self,
+        args: &[String],
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.process_spawn(args)
     }
 
     fn ui_mount(&self, slot: &str, component: &UiNode) -> Result<i64, BridgeError> {

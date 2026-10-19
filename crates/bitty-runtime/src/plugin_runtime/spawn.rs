@@ -90,7 +90,10 @@
 //! - Args: at most `64` entries (`devtools::MAX_INPUT_RING`), each
 //!   `<= 4096` bytes (`ctl::MAX_CTL_PARAMS_BYTES`) with no NUL, total
 //!   `<= 16 KiB` (`tool_dispatch::MAX_TOOL_ARGS_BYTES`).
-//! - `cwd`: optional, validated by `ctl::validate_ctl_cwd` (`4096`).
+//! - `cwd`: not supported. A caller-supplied working directory cannot be
+//!   confined to the plugin filesystem grant or the `[tools.*]` repo-escape
+//!   policy, so [`SpawnRequest::validate`] rejects `Some(cwd)` (CTX-1345
+//!   review F1/F5) and the request executes in the host default directory.
 //! - Env: at most `64` explicit entries with [`EnvVar`] grammar
 //!   (`devtools::MAX_INPUT_RING`, `auth`/`ctl` field bounds).
 //! - Timeout `1..=30_000` ms, default `5_000` ms
@@ -618,16 +621,18 @@ pub enum SpawnCancelReceipt {
 ///
 /// The `tool` names a `[tools.*]` table (e.g. `git`); the concrete executable
 /// is resolved by the [`SpawnAuthorizer`], never by the caller. The caller
-/// supplies only data: argv, optional cwd, explicit env, timeout, and budget.
+/// supplies only data: argv, explicit env, timeout, and budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnRequest {
     /// `[tools.*]` tool name (`1..=64` bytes, no NUL/control).
     pub tool: String,
     /// Argument list (bounded count, per-arg, and total budgets, no NUL).
     pub args: Vec<String>,
-    /// Working directory (`None` means the host default; `Some` is validated
-    /// by `ctl::validate_ctl_cwd`). Explicit per-spawn cwd plumbing from
-    /// terminal state is sequel work.
+    /// Working directory. Always `None` today: [`SpawnRequest::validate`]
+    /// rejects `Some` because a caller-supplied directory cannot be confined
+    /// to the plugin filesystem grant or the `[tools.*]` repo-escape policy
+    /// (CTX-1345 review F1/F5). The field stays as the seam for a future
+    /// host-derived cwd that carries its own confinement proof.
     pub cwd: Option<String>,
     /// Explicit environment entries (never ambient inheritance).
     pub env: Vec<(String, String)>,
@@ -655,7 +660,13 @@ impl SpawnRequest {
         }
     }
 
-    /// Set the working directory (`None` keeps the host default).
+    /// Set the working directory.
+    ///
+    /// Rejected by [`SpawnRequest::validate`]: no confinement anchors a
+    /// caller-supplied path to the plugin filesystem grant or the
+    /// `[tools.*]` repo-escape policy (CTX-1345 review F1/F5). The setter
+    /// remains so a direct caller fails with a typed validation error
+    /// instead of silently running in the wrong directory.
     #[must_use]
     pub fn with_cwd(mut self, cwd: Option<String>) -> Self {
         self.cwd = cwd;
@@ -704,8 +715,9 @@ impl SpawnRequest {
     /// # Errors
     ///
     /// - `InvalidRequest` when the tool is empty or carries NUL/control, args
-    ///   are empty or carry NUL, the timeout/budget is zero, or any env entry
-    ///   violates its grammar.
+    ///   are empty or carry NUL, the timeout/budget is zero, any env entry
+    ///   violates its grammar, or a working directory is supplied (CTX-1345
+    ///   F1/F5: no confinement exists for a caller-supplied cwd).
     /// - `LimitExceeded` when any field exceeds its accepted budget.
     pub fn validate(&self) -> Result<(), IpcError> {
         if self.tool.is_empty() {
@@ -758,15 +770,15 @@ impl SpawnRequest {
                 actual: self.args_total_bytes(),
             });
         }
-        if let Some(cwd) = &self.cwd {
-            if cwd.len() > bitty_ipc::ctl::MAX_CTL_CWD_LEN {
-                return Err(IpcError::LimitExceeded {
-                    field: "spawn cwd".into(),
-                    limit: bitty_ipc::ctl::MAX_CTL_CWD_LEN,
-                    actual: cwd.len(),
-                });
-            }
-            bitty_ipc::ctl::validate_ctl_cwd(cwd)?;
+        if self.cwd.is_some() {
+            // CTX-1345 review F1/F5: shape validation is not confinement. A
+            // symlink or an absolute path outside the granted roots escapes
+            // both the plugin `fs.read` scope and the `[tools.*]` repo-escape
+            // denial, so the request boundary refuses any caller-supplied
+            // directory instead of forwarding it to `Command::current_dir`.
+            return Err(IpcError::InvalidRequest {
+                reason: "spawn cwd is not supported: a caller-supplied working directory cannot be confined to the plugin filesystem grant".into(),
+            });
         }
         if self.env.len() > MAX_EXEC_ENV_VARS {
             return Err(IpcError::LimitExceeded {
@@ -2044,6 +2056,13 @@ fn truncate_message(mut text: String, limit: usize) -> String {
 /// bytes; timeouts fail as `E_SPAWN_TIMEOUT` via the stored `Unknown`
 /// outcome.
 ///
+/// The handler accepts argv only. CTX-1345 review F1 established that a
+/// plugin-supplied `{ cwd }` is unconfined (absolute paths and symlinks
+/// escape the `fs.read` grant and the `-C` repo-escape denial), so the Lua
+/// bridge rejects the option and no working directory reaches this backend;
+/// the child inherits the host process cwd until a confined, host-derived
+/// cwd lands.
+///
 /// The success table carries `execution_id` (CTX-0439): Lua callers read it
 /// back for explicit reconcile via the host before re-executing.
 #[must_use]
@@ -2336,6 +2355,8 @@ mod tests {
             SpawnRequest::new("test", vec!["bad\0arg".to_owned()]),
             SpawnRequest::new("test", vec!["x".to_owned()]).with_timeout_ms(0),
             SpawnRequest::new("test", vec!["x".to_owned()]).with_output_budget(0),
+            SpawnRequest::new("test", vec!["x".to_owned()])
+                .with_cwd(Some("/tmp/escape".to_owned())),
         ] {
             let request = request.with_allow_effects(true);
             assert!(dispatch_ok(&mut service, &request, 100).is_err());
@@ -2344,6 +2365,30 @@ mod tests {
             seen.borrow().is_empty(),
             "shape failures must precede routing"
         );
+    }
+
+    #[test]
+    fn dispatch_rejects_a_cwd_before_any_process_contact() {
+        // CTX-1345 review F5: enforcement lives at the request/dispatch
+        // boundary, not only in the Lua bridge, so a direct `git_spawn_backend`
+        // or `SpawnRequest` caller cannot select an unconfined directory.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen.clone())));
+        let request = SpawnRequest::new("test", vec!["ignored".to_owned()])
+            .with_cwd(Some("/tmp/outside-the-grant".to_owned()))
+            .with_allow_effects(true);
+        let error = dispatch_ok(&mut service, &request, 200)
+            .expect_err("a caller-supplied cwd must fail closed");
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("spawn cwd is not supported"),
+            "{error}"
+        );
+        assert!(seen.borrow().is_empty(), "no routing or process contact");
+        assert!(service.is_empty());
     }
 
     #[test]
@@ -2741,6 +2786,41 @@ mod tests {
     fn spawn_scope_is_process_spawn() {
         assert_eq!(SPAWN_SCOPE, Scope::ProcessSpawn);
         assert_eq!(SPAWN_PANEL_OUTPUT_BUDGET, 8 * 1024);
+    }
+
+    #[test]
+    fn spawn_request_rejects_caller_supplied_cwd() {
+        // CTX-1345 review F1/F5: shape checks are not confinement. Absolute
+        // paths, lexical traversal, and symlinks all reach the same typed
+        // refusal at the request boundary, so a non-bridge caller cannot run
+        // an allowlisted tool outside the plugin filesystem grant.
+        let cases = [
+            ("absolute", "/tmp/pane-repo".to_owned()),
+            ("relative", "relative/dir".to_owned()),
+            ("traversal", "/tmp/pane-repo/../other".to_owned()),
+            ("empty", String::new()),
+        ];
+        for (tag, cwd) in cases {
+            let request = SpawnRequest::new("git", vec!["status".to_owned()])
+                .with_cwd(Some(cwd))
+                .with_allow_effects(true);
+            let error = request
+                .validate()
+                .expect_err("a caller-supplied cwd must fail closed");
+            assert!(
+                matches!(error, IpcError::InvalidRequest { .. }),
+                "{tag}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("spawn cwd is not supported"),
+                "{tag}: {error}"
+            );
+        }
+
+        let request = SpawnRequest::new("git", vec!["status".to_owned()])
+            .with_cwd(None)
+            .with_allow_effects(true);
+        request.validate().expect("no cwd keeps the host default");
     }
 
     #[test]

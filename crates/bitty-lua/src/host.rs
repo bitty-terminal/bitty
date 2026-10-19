@@ -196,6 +196,7 @@ pub const SPAWN_LUA_MAX_ARGS: usize = 64;
 /// Maximum bytes of one `process.spawn` argv entry accepted from Lua (params
 /// bound precedent; the host allowlist enforces a tighter per-tool count).
 pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
+
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// Maximum bytes of one `bitty.env` key (CTX-0330, ADR 0006 normative,
@@ -3369,6 +3370,17 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let args = spawn_argv(&value).map_err(|e| e.to_error(ctx))?;
+                    // CTX-1345 review F1: the options table is parsed so an
+                    // unsupported option fails closed with a typed error
+                    // instead of being silently dropped. `{ cwd }` stays
+                    // explicitly rejected until the host can confine a
+                    // plugin-supplied directory to the plugin filesystem
+                    // grant and the `[tools.*]` repo-escape policy.
+                    spawn_options(
+                        &LuaValue::from_lua(stack.get(1), state.limits)
+                            .map_err(|e| e.to_error(ctx))?,
+                    )
+                    .map_err(|e| e.to_error(ctx))?;
                     let result = state
                         .bounded_spawn(|expiry| {
                             state.services.process_spawn_with_expiry(&args, expiry)
@@ -5871,6 +5883,65 @@ fn spawn_argv(value: &LuaValue) -> Result<Vec<String>, BridgeError> {
         args.push(text.clone());
     }
     Ok(args)
+}
+
+/// Parse the optional `process.spawn` options table (CTX-1345).
+///
+/// `Nil` means "no options". The bridge recognizes the `cwd` key so it can
+/// reject it explicitly: a plugin-supplied working directory is unconfined
+/// (absolute paths and symlinks escape the plugin's `fs.read` grant and the
+/// `[tools.*]` `-C` repo-escape denial), so Core fails closed with a typed
+/// `E_DEF_INVALID` instead of silently dropping the option and running the
+/// child in the host process cwd. Unknown keys, non-string names, and a
+/// non-string `cwd` also fail closed.
+fn spawn_options(options: &LuaValue) -> Result<(), BridgeError> {
+    let LuaValue::Table(pairs) = options else {
+        return match options {
+            LuaValue::Nil => Ok(()),
+            _ => Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "process.spawn options must be a table",
+            )),
+        };
+    };
+    // Every recognized option is rejected, so the first key decides the
+    // diagnostic; an empty table means "no options".
+    let Some((key, value)) = pairs.first() else {
+        return Ok(());
+    };
+    let LuaValue::String(name) = key else {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            "process.spawn option names must be strings",
+        ));
+    };
+    match name.as_str() {
+        "cwd" => {
+            if !matches!(value, LuaValue::String(_)) {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_INVALID",
+                    "process.spawn cwd must be a string",
+                ));
+            }
+            // CTX-1345 review F1: no confinement exists that anchors a
+            // plugin-supplied path to the granted filesystem roots or to the
+            // host-observed pane cwd, and `current_dir` follows symlinks.
+            // Reject rather than expose an unconfined directory selector
+            // through the spawn side channel.
+            Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "process.spawn cwd is not supported: a plugin-controlled working directory cannot be confined to the plugin filesystem grant",
+            ))
+        }
+        other => Err(BridgeError::new(
+            "validation",
+            "E_DEF_INVALID",
+            format!("process.spawn does not support option '{other}'"),
+        )),
+    }
 }
 
 fn required_string<'gc>(

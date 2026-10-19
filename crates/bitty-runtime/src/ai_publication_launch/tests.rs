@@ -10,6 +10,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -74,6 +76,43 @@ fn reservation_descriptors(prepared: &PreparedLaunch) -> Vec<RawFd> {
         .as_ref()
         .expect("platform handles")
         .spawn_reservation_descriptors()
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_target(fd: RawFd) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+}
+
+/// Match by descriptor identity, not by number: under parallel tests another
+/// thread can reuse a number we just closed, but it cannot reuse an anonymous
+/// pipe inode.
+#[cfg(target_os = "linux")]
+fn target_is_open(target: &std::path::Path) -> bool {
+    let entries = std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd");
+    entries.filter_map(Result::ok).any(|entry| {
+        std::fs::read_link(entry.path()).is_ok_and(|candidate| candidate.as_path() == target)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reservation_targets(prepared: &PreparedLaunch) -> Vec<PathBuf> {
+    reservation_descriptors(prepared)
+        .into_iter()
+        .map(|fd| descriptor_target(fd).unwrap_or_else(|| panic!("reservation fd {fd} target")))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn child_end_targets(prepared: &PreparedLaunch) -> (Option<PathBuf>, Option<PathBuf>) {
+    let handles = prepared.handles.as_ref().expect("platform handles");
+    (
+        handles
+            .bootstrap_reader_descriptor()
+            .and_then(descriptor_target),
+        handles
+            .control_child_descriptor()
+            .and_then(descriptor_target),
+    )
 }
 
 struct MaterialSnapshot {
@@ -443,6 +482,8 @@ fn publication_spawn_fd_guard_child() {
         .install_child_descriptors(&mut command)
         .expect("pre-exec registration");
     let reservation = reservation_descriptors(&launch);
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
 
     let result = command.spawn();
     launch.after_spawn();
@@ -455,10 +496,9 @@ fn publication_spawn_fd_guard_child() {
             panic!("spawn of a nonexistent executable reported success");
         }
     }
-    assert_eq!(
-        reservation.len(),
-        2,
-        "the spawn reservation must cover two descriptors"
+    assert!(
+        reservation.contains(&PLACEMENT_BOOTSTRAP) && reservation.contains(&PLACEMENT_CONTROL),
+        "reservation does not cover the placement range: {reservation:?}"
     );
     assert!(matches!(
         launch.child_descriptors(),
@@ -467,15 +507,102 @@ fn publication_spawn_fd_guard_child() {
     assert!(reservation_descriptors(&launch).is_empty());
     #[cfg(target_os = "linux")]
     {
-        for fd in &reservation {
+        for target in &reservation_targets {
             assert!(
-                !descriptor_is_open(*fd),
-                "reservation fd {fd} leaked after a failed spawn"
+                !target_is_open(target),
+                "reservation target {target:?} leaked after a failed spawn"
             );
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nonexistent_executable_is_reported_when_low_stdio_descriptors_are_free() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_some() {
+        return;
+    }
+    let executable = std::env::current_exe().expect("test executable path");
+    // Keep 0/1/2 open at process start so preparation allocates its channels
+    // above the placement range; the guarded child frees stdin and stderr
+    // after preparation, leaving 0 and 2 as the two lowest free descriptors.
+    // stdout stays open for the test harness.
+    let script = "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; \
+                  exec \"$0\" publication_low_stdio_guard_child --test-threads=1 --nocapture";
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(executable)
+        .env(SPAWN_GUARD_CHILD_ENV, "1")
+        .status()
+        .expect("guarded low-stdio child process");
+    assert!(
+        status.success(),
+        "guarded low-stdio spawn child failed: {status}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_low_stdio_guard_child() {
+    if std::env::var_os(SPAWN_GUARD_CHILD_ENV).is_none() {
+        return;
+    }
+
+    let dummies = [
+        File::open("/dev/null").expect("dummy descriptor one"),
+        File::open("/dev/null").expect("dummy descriptor two"),
+    ];
+    let dummy_descriptors: Vec<RawFd> = dummies.iter().map(AsRawFd::as_raw_fd).collect();
+    assert!(
+        dummy_descriptors.contains(&PLACEMENT_BOOTSTRAP)
+            && dummy_descriptors.contains(&PLACEMENT_CONTROL),
+        "guarded child did not start with the placement descriptors free: {dummy_descriptors:?}"
+    );
+
+    let mut launch = prepared("bitty-ai");
+    drop(dummies);
+
+    // Free stdin and stderr; stdout stays open for libtest. Without a
+    // reservation covering the whole 0..=4 range, the next error channel
+    // would take 0 and 2, then placement would clobber 3 and 4.
+    super::platform::close_test_descriptor(0).expect("close stdin");
+    super::platform::close_test_descriptor(2).expect("close stderr");
+    assert!(descriptor_target(0).is_none(), "stdin must be free");
+    assert!(descriptor_target(2).is_none(), "stderr must be free");
+
+    let mut command = std::process::Command::new("/nonexistent/bitty-publication-spawn-probe");
+    launch
+        .install_child_descriptors(&mut command)
+        .expect("pre-exec registration");
+    let reservation = reservation_descriptors(&launch);
+    let reservation_targets = reservation_targets(&launch);
+
+    let result = command.spawn();
+    launch.after_spawn();
+
+    match result {
+        Err(error) => println!("spawn failed closed as required: {error}"),
+        Ok(mut child) => {
+            // stdout stays open because stderr is closed in this child.
+            println!("BUG: spawn of a nonexistent executable reported success");
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("spawn of a nonexistent executable reported success");
+        }
+    }
+    assert!(
+        reservation.contains(&PLACEMENT_BOOTSTRAP) && reservation.contains(&PLACEMENT_CONTROL),
+        "reservation does not cover the placement range: {reservation:?}"
+    );
+    assert!(matches!(
+        launch.child_descriptors(),
+        Err(LaunchError::HandleMissing)
+    ));
+    for target in &reservation_targets {
         assert!(
-            !descriptor_is_open(PLACEMENT_BOOTSTRAP) && !descriptor_is_open(PLACEMENT_CONTROL),
-            "placement descriptors were not released after a failed spawn"
+            !target_is_open(target),
+            "reservation target {target:?} leaked after a failed spawn"
         );
     }
 }
@@ -491,11 +618,16 @@ fn reservation_is_held_across_a_successful_spawn_and_released_afterwards() {
         .install_child_descriptors(&mut command)
         .expect("pre-exec registration");
     let reservation = reservation_descriptors(&launch);
-    assert_eq!(reservation.len(), 2, "spawn reservation must be installed");
+    assert!(
+        !reservation.is_empty(),
+        "spawn reservation must be installed"
+    );
     #[cfg(target_os = "linux")]
     for fd in &reservation {
         assert_cloexec(*fd);
     }
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
 
     let mut child = command.spawn().expect("fixture process spawn");
     assert!(child.wait().expect("fixture process wait").success());
@@ -507,10 +639,10 @@ fn reservation_is_held_across_a_successful_spawn_and_released_afterwards() {
     launch.after_spawn();
     assert!(reservation_descriptors(&launch).is_empty());
     #[cfg(target_os = "linux")]
-    for fd in reservation {
+    for target in &reservation_targets {
         assert!(
-            !descriptor_is_open(fd),
-            "reservation fd {fd} survived after_spawn"
+            !target_is_open(target),
+            "reservation target {target:?} survived after_spawn"
         );
     }
 
@@ -539,14 +671,19 @@ fn dropping_the_launch_releases_the_spawn_reservation() {
         .install_child_descriptors(&mut command)
         .expect("pre-exec registration");
     let reservation = reservation_descriptors(&launch);
-    assert_eq!(reservation.len(), 2, "spawn reservation must be installed");
+    assert!(
+        !reservation.is_empty(),
+        "spawn reservation must be installed"
+    );
+    #[cfg(target_os = "linux")]
+    let reservation_targets = reservation_targets(&launch);
 
     drop(launch);
     #[cfg(target_os = "linux")]
-    for fd in reservation {
+    for target in &reservation_targets {
         assert!(
-            !descriptor_is_open(fd),
-            "reservation fd {fd} leaked after dropping the launch"
+            !target_is_open(target),
+            "reservation target {target:?} leaked after dropping the launch"
         );
     }
 }
@@ -561,14 +698,9 @@ fn reservation_descriptors_do_not_cross_exec() {
         .install_child_descriptors(&mut command)
         .expect("pre-exec registration");
     let reservation = reservation_descriptors(&launch);
-    assert_eq!(reservation.len(), 2);
-    let reserved_targets: Vec<std::path::PathBuf> = reservation
-        .iter()
-        .map(|fd| {
-            std::fs::read_link(format!("/proc/self/fd/{fd}"))
-                .unwrap_or_else(|error| panic!("read reservation fd {fd} target: {error}"))
-        })
-        .collect();
+    assert!(!reservation.is_empty());
+    let reserved_targets = reservation_targets(&launch);
+    let (bootstrap_target, control_target) = child_end_targets(&launch);
 
     let mut child = command.spawn().expect("sleep spawn");
     wait_for_exec(child.id(), "sleep");
@@ -581,22 +713,28 @@ fn reservation_descriptors_do_not_cross_exec() {
         leaked.is_empty(),
         "reservation descriptors survived exec: {leaked:?}"
     );
-    let names: Vec<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();
+    let target_for = |name: &str| {
+        targets
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, target)| target)
+    };
     let bootstrap_name = PLACEMENT_BOOTSTRAP.to_string();
     let control_name = PLACEMENT_CONTROL.to_string();
-    assert!(
-        names.contains(&bootstrap_name.as_str()) && names.contains(&control_name.as_str()),
-        "placed child descriptors are missing after exec: {names:?}"
+    assert_eq!(
+        target_for(&bootstrap_name),
+        bootstrap_target.as_ref(),
+        "placed bootstrap descriptor is not the launch pipe"
+    );
+    assert_eq!(
+        target_for(&control_name),
+        control_target.as_ref(),
+        "placed control descriptor is not the launch socket"
     );
 
     launch.after_spawn();
     let _ = child.kill();
     let _ = child.wait();
-}
-
-#[cfg(target_os = "linux")]
-fn descriptor_is_open(fd: RawFd) -> bool {
-    std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok()
 }
 
 #[cfg(target_os = "linux")]

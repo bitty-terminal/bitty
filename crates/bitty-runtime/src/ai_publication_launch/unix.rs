@@ -15,18 +15,33 @@
 //!
 //! `std` allocates its close-on-exec exec-error channel inside
 //! `Command::spawn`, at the lowest free descriptors, and only then forks and
-//! runs the registered `pre_exec` hook. If [`CHILD_BOOTSTRAP_DESCRIPTOR`] and
-//! [`CHILD_CONTROL_DESCRIPTOR`] happen to be free at that instant, placement
-//! could `dup2` over the error channel and a failed `exec` would be reported
-//! to the parent as a successful spawn. [`Handles::install_child_descriptors`]
-//! therefore opens a close-on-exec pipe at the lowest free descriptors
-//! immediately before the spawn. Two lowest-free descriptors are enough:
-//! whatever was open before, both placement targets are then occupied (by the
-//! reservation or by a pre-existing descriptor), so std's error channel is
-//! allocated above them. The reservation is never read or written, carries
-//! `FD_CLOEXEC` so it cannot survive `exec`, and is closed by
-//! [`Handles::close_child_ends`], by [`Handles`] drop, or by
+//! runs the registered `pre_exec` hook. If any free descriptor at or below
+//! the placement range is available, the error channel can occupy it, and a
+//! sibling error-channel descriptor can land on
+//! [`CHILD_BOOTSTRAP_DESCRIPTOR`] or [`CHILD_CONTROL_DESCRIPTOR`]; placement
+//! would then `dup2` over it and a failed `exec` could be reported to the
+//! parent as a successful spawn.
+//!
+//! [`Handles::install_child_descriptors`] therefore opens close-on-exec
+//! placeholder pipes until every descriptor from `0` through the highest
+//! placement target is occupied. A `pipe(2)` always returns the two lowest
+//! free descriptors, so a pair that still contains a descriptor at or below
+//! the placement range proves a free descriptor remained; the first pair
+//! entirely above the range proves the whole range was occupied when it was
+//! allocated. std's error channel is then allocated above the placement
+//! range while the descriptors occupied here or by another owner stay open.
+//! The placeholders are held across `Command::spawn`, are never read or
+//! written, carry `FD_CLOEXEC` so they cannot survive `exec`, and are closed
+//! by [`Handles::close_child_ends`], by [`Handles`] drop, or by
 //! [`super::PreparedLaunch::abort`]. See `SpawnReservation`.
+//!
+//! Residual race: a placement descriptor already occupied by another owner
+//! at reservation time cannot be claimed without closing that owner's
+//! descriptor. std cannot allocate its error channel there while it stays
+//! open, but a concurrent close of that descriptor between reservation and
+//! spawn would reopen the window. The launch seam assumes its caller does not
+//! close low descriptors concurrently, which single-threaded launch setup
+//! satisfies.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -46,38 +61,58 @@ use super::{
 /// Parent end of the dedicated duplex control channel.
 pub(super) type ControlStream = UnixStream;
 
-/// Parent-side close-on-exec pipe held across `Command::spawn`.
+/// Highest descriptor that placement overwrites. The whole `0..=` range must
+/// be occupied while std allocates its exec-error channel.
+const HIGHEST_PLACEMENT_DESCRIPTOR: RawFd = CHILD_CONTROL_DESCRIPTOR as RawFd;
+
+// The range logic assumes the bootstrap target is below the control target.
+const _: () = assert!(CHILD_BOOTSTRAP_DESCRIPTOR <= CHILD_CONTROL_DESCRIPTOR);
+
+/// Parent-side close-on-exec placeholders held across `Command::spawn`.
 ///
-/// The pipe is never read or written. Its only purpose is to occupy the
-/// lowest free descriptors so std's post-fork exec-error channel cannot be
-/// allocated on a child placement target. Both ends carry `FD_CLOEXEC`, so
-/// they never survive `exec`; dropping the value closes them.
+/// The pipes are never read or written. Their only purpose is to occupy every
+/// descriptor at or below the highest placement target so std's exec-error
+/// channel is allocated above the placement range while those descriptors
+/// stay open. Every end carries `FD_CLOEXEC`, so none survive `exec`; dropping
+/// the value closes them.
 struct SpawnReservation {
-    // Leading underscores keep the unused-descriptor lint quiet: the fields
-    // exist for their drop side effect, not for I/O.
-    _read: OwnedFd,
-    _write: OwnedFd,
+    // Leading underscore keeps the unused-descriptor lint quiet: the field
+    // exists for its drop side effect, not for I/O.
+    _placeholders: Vec<(OwnedFd, OwnedFd)>,
 }
 
 impl SpawnReservation {
-    /// Occupy the lowest free descriptors.
+    /// Fill every descriptor at or below the placement range.
     ///
-    /// Allocating the two lowest free numbers guarantees that both child
-    /// placement targets are occupied at spawn time: each target is either
-    /// one of the reservation ends, or a descriptor the process already had
-    /// open. Therefore `Command::spawn` cannot allocate its exec-error
-    /// channel there.
+    /// `pipe(2)` allocates the two lowest free descriptors. Each pair that
+    /// contains a descriptor at or below [`HIGHEST_PLACEMENT_DESCRIPTOR`]
+    /// proves the range was not yet fully occupied, so another pair is
+    /// allocated. The first pair entirely above the range proves no free
+    /// descriptor remained at or below it; keeping that pair too means the
+    /// reservation always owns at least one pipe. std's exec-error channel is
+    /// then allocated above every placement target, provided descriptors
+    /// occupied by another owner stay open through the spawn.
     fn reserve() -> io::Result<Self> {
-        let (read, write) = cloexec_pipe()?;
-        Ok(Self {
-            _read: read,
-            _write: write,
-        })
+        let mut placeholders = Vec::new();
+        loop {
+            let pair = cloexec_pipe()?;
+            let covers_range = pair.0.as_raw_fd() <= HIGHEST_PLACEMENT_DESCRIPTOR
+                || pair.1.as_raw_fd() <= HIGHEST_PLACEMENT_DESCRIPTOR;
+            placeholders.push(pair);
+            if !covers_range {
+                return Ok(Self {
+                    _placeholders: placeholders,
+                });
+            }
+        }
     }
 
     #[cfg(test)]
-    fn descriptors(&self) -> [RawFd; 2] {
-        [self._read.as_raw_fd(), self._write.as_raw_fd()]
+    fn descriptors(&self) -> Vec<RawFd> {
+        self._placeholders
+            .iter()
+            .flat_map(|(read, write)| [read.as_raw_fd(), write.as_raw_fd()])
+            .collect()
     }
 }
 
@@ -149,8 +184,20 @@ impl Handles {
     pub(super) fn spawn_reservation_descriptors(&self) -> Vec<RawFd> {
         self.spawn_reservation
             .as_ref()
-            .map(|reservation| reservation.descriptors().to_vec())
+            .map(SpawnReservation::descriptors)
             .unwrap_or_default()
+    }
+
+    /// Test-only raw number of the parent bootstrap read end.
+    #[cfg(test)]
+    pub(super) fn bootstrap_reader_descriptor(&self) -> Option<RawFd> {
+        self.bootstrap_reader.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Test-only raw number of the child-side control stream.
+    #[cfg(test)]
+    pub(super) fn control_child_descriptor(&self) -> Option<RawFd> {
+        self.control_child.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// Reserve the placement targets and register the post-fork hook.
@@ -374,6 +421,24 @@ fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         set_cloexec(&read)?;
         set_cloexec(&write)?;
         Ok((read, write))
+    }
+}
+
+/// Test-only: close one descriptor owned by the test process.
+///
+/// The low-stdio regression needs to free descriptors after launch
+/// preparation, which safe std APIs cannot express. This is the only added
+/// unsafe operation and exists solely in the audited Unix adapter under
+/// `cfg(test)`.
+#[cfg(all(test, target_os = "linux"))]
+#[allow(unsafe_code)]
+pub(super) fn close_test_descriptor(fd: RawFd) -> io::Result<()> {
+    // SAFETY: the caller passes a descriptor the test process owns and no
+    // other owner remains; `close` neither allocates nor touches other fds.
+    if unsafe { libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 

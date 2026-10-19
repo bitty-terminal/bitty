@@ -31,14 +31,22 @@
 //! prepared launch closes every remaining handle, so an abandoned launch
 //! cannot leave a pipe half-open.
 //!
-//! Registration also reserves the two fixed child numbers in the parent: a
-//! close-on-exec placeholder pipe is opened at the lowest free descriptors, so
-//! std's close-on-exec exec-error channel (allocated inside `Command::spawn`)
-//! necessarily lands above them. Without that reservation, `pre_exec` could
-//! `dup2` over the error channel and a failed `exec` could be reported as a
-//! successful spawn. The placeholders never cross `exec` and are closed by
+//! Registration also reserves every descriptor from `0` through the highest
+//! placement target in the parent with close-on-exec placeholder pipes. std's
+//! close-on-exec exec-error channel is allocated inside `Command::spawn` at the
+//! lowest free descriptors, so occupying the whole range places it above every
+//! placement target while those descriptors stay open. Without that
+//! reservation, `pre_exec` could `dup2` over the error channel and a failed
+//! `exec` could be reported as a successful spawn. The placeholders never
+//! cross `exec` and are closed by
 //! [`PreparedLaunch::after_spawn`] after the spawn attempt, by
 //! [`PreparedLaunch::abort`], or by `Drop`.
+//!
+//! A descriptor already owned elsewhere at reservation time cannot be claimed
+//! without closing its owner's descriptor. It blocks std's error channel while
+//! it stays open; a concurrent close between reservation and spawn could reopen
+//! the window, so callers must not close low descriptors during the spawn
+//! attempt (single-threaded launch setup does not).
 //!
 //! On Unix the channels are an anonymous pipe and a Unix-domain socketpair.
 //! On every other platform [`prepare`] fails closed with

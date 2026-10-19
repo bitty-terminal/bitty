@@ -2768,6 +2768,14 @@ impl HostServices for PluginServices {
             .clone()
             .ok_or_else(history_unavailable)?;
         let core_source = history_source(source);
+        // A provider may exist while one source has no backing
+        // implementation (command history today). That is typed
+        // unavailability for that source only, never a fabricated empty
+        // page. Capture opt-in is a separate axis handled by the gate: an
+        // available transcript with capture disabled serves an empty page.
+        if !provider.source_available(core_source) {
+            return Err(history_unavailable());
+        }
         // Snapshot first: no store is a typed unavailability, never an
         // empty page and never a Lua nil-index.
         let snapshot = provider.snapshot()?;
@@ -8483,6 +8491,112 @@ mod history_tests {
             second.get("freshness"),
             Some(&LuaValue::String("point-in-time-no-guarantee".to_string()))
         );
+    }
+
+    #[test]
+    fn captured_transcript_rows_return_through_the_gate_bounded() {
+        use bitty_term_state::{State, TerminalAction};
+        use bitty_vt::{ControlChar, GraphemeCell};
+
+        fn feed_line(state: &mut State, text: &str) {
+            for ch in text.chars() {
+                state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+            }
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        let provider = Rc::new(crate::plugin_runtime::history::TranscriptHistory::new(
+            true, false,
+        ));
+        let mut state = State::with_scrollback_lines(100);
+        for index in 0..40 {
+            feed_line(&mut state, &format!("captured line {index:02}"));
+        }
+        let captured = state.scrollback_len();
+        assert!(captured > 0);
+        assert_eq!(provider.capture_state(&state, "pane-a", "ws-1"), captured);
+        services.set_history_provider(Some(provider));
+        let page = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::Tail),
+            )
+            .expect("captured rows page");
+        assert_eq!(
+            page.get("total_in_scope"),
+            Some(&LuaValue::Integer(captured as i64))
+        );
+        let Some(LuaValue::Table(records)) = page.get("records") else {
+            panic!("records array");
+        };
+        assert_eq!(
+            records.len(),
+            captured.min(HISTORY_MAX_ROWS_PER_QUERY as usize)
+        );
+        assert!(!format!("{page:?}").contains("sk-live"));
+    }
+
+    #[test]
+    fn live_transcript_capture_off_serves_empty_page_not_denial() {
+        let services = services();
+        grant(&services, HistoryQuerySource::Transcript);
+        services.set_history_provider(Some(Rc::new(
+            crate::plugin_runtime::history::TranscriptHistory::new(false, false),
+        )));
+        let page = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("capture off is an empty page for the live provider");
+        assert_eq!(page.get("ok"), Some(&LuaValue::Bool(true)));
+        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(0)));
+    }
+
+    #[test]
+    fn command_source_is_typed_unavailable_when_no_span_source_exists() {
+        let services = services();
+        services.set_granted_capabilities(vec![
+            "history.transcript.read".to_string(),
+            "history.commands.read".to_string(),
+        ]);
+        services.set_history_provider(Some(Rc::new(
+            crate::plugin_runtime::history::TranscriptHistory::new(true, true),
+        )));
+        let transcript = services
+            .history_query(
+                HistoryQuerySource::Transcript,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("transcript remains available");
+        assert_eq!(transcript.get("ok"), Some(&LuaValue::Bool(true)));
+        let error = services
+            .history_query(
+                HistoryQuerySource::CommandHistory,
+                &request(HistoryQueryOp::List),
+            )
+            .expect_err("command source has no backing store");
+        assert_eq!(error.code, "E_HISTORY_UNAVAILABLE");
+    }
+
+    #[test]
+    fn command_source_serves_rows_when_a_provider_has_them() {
+        let services = services();
+        grant(&services, HistoryQuerySource::CommandHistory);
+        services.set_history_provider(Some(provider_with(
+            HistorySource::CommandHistory,
+            vec![row(None, "pane-a", 0, "cargo test")],
+        )));
+        let page = services
+            .history_query(
+                HistoryQuerySource::CommandHistory,
+                &request(HistoryQueryOp::List),
+            )
+            .expect("available command provider");
+        assert_eq!(page.get("total_in_scope"), Some(&LuaValue::Integer(1)));
     }
 
     #[test]

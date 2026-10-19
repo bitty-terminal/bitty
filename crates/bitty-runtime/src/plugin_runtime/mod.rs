@@ -69,8 +69,8 @@ pub use fs::{
 pub use history::{
     BoundedHistory, HISTORY_MAX_BYTES_PER_QUERY, HISTORY_MAX_BYTES_PER_ROW,
     HISTORY_MAX_BYTES_PER_WINDOW, HISTORY_MAX_QUERIES_PER_WINDOW, HISTORY_MAX_ROWS_PER_QUERY,
-    HISTORY_RATE_WINDOW, HISTORY_SNAPSHOT_MAX_ROWS, HistoryProvider, history_caps,
-    history_page_value,
+    HISTORY_RATE_WINDOW, HISTORY_SNAPSHOT_MAX_ROWS, HistoryProvider, TranscriptHistory,
+    history_caps, history_page_value,
 };
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,

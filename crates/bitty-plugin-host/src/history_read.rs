@@ -587,6 +587,36 @@ impl HistorySnapshot {
             HistorySource::PluginKv => &self.kv,
         }
     }
+
+    /// Whether the snapshot holds no rows at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.transcript.is_empty() && self.commands.is_empty() && self.kv.is_empty()
+    }
+
+    /// Consume the snapshot, yielding `(source, row)` pairs grouped by source
+    /// in snapshot order.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<(HistorySource, StoredRow)> {
+        let mut out =
+            Vec::with_capacity(self.transcript.len() + self.commands.len() + self.kv.len());
+        out.extend(
+            self.transcript
+                .into_iter()
+                .map(|row| (HistorySource::Transcript, row)),
+        );
+        out.extend(
+            self.commands
+                .into_iter()
+                .map(|row| (HistorySource::CommandHistory, row)),
+        );
+        out.extend(
+            self.kv
+                .into_iter()
+                .map(|row| (HistorySource::PluginKv, row)),
+        );
+        out
+    }
 }
 
 /// Snapshot freshness: queries carry no freshness guarantee.

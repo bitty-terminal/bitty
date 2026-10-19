@@ -25,6 +25,7 @@ pub mod audio;
 pub mod debug;
 pub mod device_providers;
 pub mod fs;
+pub mod history;
 pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
@@ -64,6 +65,12 @@ pub use bitty_lua::{
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
     write_atomic_durably,
+};
+pub use history::{
+    BoundedHistory, HISTORY_MAX_BYTES_PER_QUERY, HISTORY_MAX_BYTES_PER_ROW,
+    HISTORY_MAX_BYTES_PER_WINDOW, HISTORY_MAX_QUERIES_PER_WINDOW, HISTORY_MAX_ROWS_PER_QUERY,
+    HISTORY_RATE_WINDOW, HISTORY_SNAPSHOT_MAX_ROWS, HistoryProvider, history_caps,
+    history_page_value,
 };
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
@@ -624,6 +631,10 @@ pub struct PluginRuntime {
     /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
     /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
     workspace_source: Option<Rc<dyn WorkspaceSource>>,
+    /// CTX-1352 (issue #2247): optional composition-root history provider.
+    /// `None` leaves granted `bitty.history.*.query` calls failing closed
+    /// with the typed `E_HISTORY_UNAVAILABLE` denial, never a nil-index.
+    history_provider: Option<Rc<dyn history::HistoryProvider>>,
     /// CTX-0889: bounded queue of `workspace.control` mutations, drained by
     /// the application each tick ([`PluginRuntime::drain_workspace_requests`]).
     workspace_requests: Rc<RefCell<WorkspaceRequestQueue>>,
@@ -825,6 +836,7 @@ impl PluginRuntime {
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             workspace_source: None,
+            history_provider: None,
             workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
             ))),
@@ -1091,6 +1103,15 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Install the composition-root history snapshot provider (CTX-1352).
+    ///
+    /// Shared with every activated generation; the per-source capability
+    /// head and the Core history gate remain authoritative per call. Without
+    /// a provider, granted queries deny with `E_HISTORY_UNAVAILABLE`.
+    pub fn set_history_provider(&mut self, provider: Rc<dyn history::HistoryProvider>) {
+        self.history_provider = Some(provider);
     }
 
     /// Seed the config directory for per-plugin user configuration files
@@ -2249,6 +2270,11 @@ impl PluginRuntime {
             self.workspace_source.clone(),
             Some(self.workspace_requests.clone()),
         );
+        // CTX-1352 (issue #2247): the composition-root history provider.
+        // Wired for every generation; the per-source grant head and the
+        // Core history gate still decide each call, so a provider alone
+        // grants nothing and an absent provider denies typed-unavailable.
+        plugin_services.set_history_provider(self.history_provider.clone());
         plugin_services.set_service_manifest(
             manifest.provided_services.clone(),
             manifest.required_services.clone(),

@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
-    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, WorkspaceAttention,
-    WorkspaceInfo, WorkspaceSource,
+    BoundedHistory, BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler,
+    PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
 use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
 use bitty_runtime::{ViewId, WorkspaceSummary};
@@ -537,6 +537,16 @@ pub(crate) fn discover_with_roots(
         Rc::clone(runtime.panel_pin_queue()),
         Rc::clone(&pin_state),
     )));
+    // CTX-1352 (issue #2247): install the history provider seam before
+    // activation so `init.lua` already observes a present
+    // `bitty.history` root. The provider starts unavailable (no durable
+    // history store in this slice): queries deny with the typed
+    // `E_HISTORY_UNAVAILABLE` code, never a nil-index. Installing the
+    // provider grants nothing; the per-source capability head and the Core
+    // history gate still decide every call.
+    let history = Rc::new(BoundedHistory::unavailable());
+    let host_history: Rc<dyn bitty_runtime::plugin_runtime::HistoryProvider> = history.clone();
+    runtime.set_history_provider(host_history);
     // CTX-1169 (issue #1976): seed the approved wallpaper roots before
     // activation so `init.lua` already observes a working
     // `bitty.image.read`. Activation captures the roots into

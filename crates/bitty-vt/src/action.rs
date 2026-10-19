@@ -26,6 +26,7 @@
 
 use crate::bounded::{BoundedBytes, BoundedString};
 use crate::kitty_apc::KittyControlKeys;
+use crate::kitty_font_query::KittyFontQuery;
 
 /// One printed cell candidate: the leading Unicode scalar of a grapheme
 /// cluster as delivered by the UTF-8 decoder.
@@ -1198,6 +1199,17 @@ pub enum TerminalAction {
         payload: Box<[u8]>,
         /// Advanced control keys (CTX-0950; default = direct transmission).
         control: KittyControlKeys,
+    },
+    /// A kitty font query request (`APC +q ...`, CTX-1370, issue #2263).
+    ///
+    /// The parser pre-scans the APC payload, hex-decodes each bounded key
+    /// token, and reports only the answerable keys. Font values are resolved
+    /// configuration state owned by the runtime, so terminal state treats
+    /// this as inert and the reply is synthesized through the existing
+    /// `Reply` channel (never echoed from the raw query).
+    KittyFontQuery {
+        /// Known keys requested by the sequence.
+        query: KittyFontQuery,
     },
 
     // Unknown escape families

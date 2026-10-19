@@ -16,6 +16,7 @@ use crate::action::{
     UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
+use crate::kitty_font_query::{looks_like_kitty_font_query, parse_kitty_font_query_body};
 use vte::{Params, Perform};
 
 impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
@@ -1227,6 +1228,9 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             // mapped string. Report the unknown sequence immediately and
             // leave the payload inert; `unhook` stays silent for it.
             self.dcs.active = false;
+            self.dcs.font_query = false;
+            self.dcs.font_len = 0;
+            self.dcs.font_overflow = false;
             self.emit(TerminalAction::Unknown(UnrecognizedSequence {
                 kind: SequenceKind::Dcs,
                 final_byte,
@@ -1238,11 +1242,56 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         capture.active = true;
         capture.final_byte = final_byte;
         capture.intermediates = packed;
+        // Kitty font queries share the XTGETTCAP envelope `ESC P +q ... ST`.
+        // Capture that payload under a fixed cap so `unhook` can classify it
+        // without a raw stream scan.
+        capture.font_query = intermediates == b"+" && final_byte == b'q';
+        capture.font_len = 0;
+        capture.font_overflow = false;
+    }
+
+    fn put(&mut self, byte: u8) {
+        let capture = &mut self.dcs;
+        if !capture.active || !capture.font_query {
+            return;
+        }
+        if capture.font_len < capture.font_payload.len() {
+            capture.font_payload[capture.font_len] = byte;
+            capture.font_len += 1;
+        } else {
+            capture.font_overflow = true;
+        }
     }
 
     fn unhook(&mut self) {
         if !self.dcs.active {
             return;
+        }
+        if self.dcs.font_query {
+            let overflow = self.dcs.font_overflow;
+            let len = self.dcs.font_len;
+            let parsed = if overflow {
+                None
+            } else {
+                parse_kitty_font_query_body(&self.dcs.font_payload[..len])
+            };
+            // A malformed, empty, or unknown-key font query still belongs to
+            // the reserved family: answer nothing rather than falling through
+            // to the XTGETTCAP negative reply.
+            let reserved_family =
+                len == 0 || looks_like_kitty_font_query(&self.dcs.font_payload[..len]);
+            self.dcs.font_query = false;
+            self.dcs.font_len = 0;
+            self.dcs.font_overflow = false;
+            if let Some(query) = parsed {
+                self.dcs.active = false;
+                self.emit(TerminalAction::KittyFontQuery { query });
+                return;
+            }
+            if reserved_family {
+                self.dcs.active = false;
+                return;
+            }
         }
         let reported = UnrecognizedSequence {
             kind: SequenceKind::Dcs,

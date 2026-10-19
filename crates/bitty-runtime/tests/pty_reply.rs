@@ -223,3 +223,92 @@ fn reply_loop_does_not_block_hot_path_and_is_fail_closed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// CTX-1370: kitty font-query replies (`APC +q ... ST`)
+// ---------------------------------------------------------------------------
+
+/// exact fastfetch `detectKitty` query bytes.
+const FASTFETCH_FONT_QUERY: &[u8] = b"\x1bP+q6b697474792d71756572792d666f6e745f66616d696c79\
+;6b697474792d71756572792d666f6e745f73697a65\x1b\\";
+
+const DEFAULT_FAMILY_HEX: &[u8] = b"4a6574427261696e734d6f6e6f204e65726420466f6e74"; // JetBrainsMono Nerd Font
+
+#[test]
+fn kitty_font_query_answers_exact_bytes_once() {
+    let mut rt = Runtime::with_defaults().expect("build");
+    rt.handle_pty_bytes(FASTFETCH_FONT_QUERY);
+
+    let replies = rt.take_replies();
+    assert_eq!(replies.len(), 2, "one answer per requested key");
+    let mut expected_family = b"\x1bP1+rkitty-query-font_family=".to_vec();
+    expected_family.extend_from_slice(DEFAULT_FAMILY_HEX);
+    expected_family.extend_from_slice(b"\x1b\\");
+    assert_eq!(&*replies[0], expected_family.as_slice());
+    assert_eq!(
+        &*replies[1],
+        b"\x1bP1+rkitty-query-font_size=3132\x1b\\".as_slice()
+    );
+
+    // Exactly once: a second drain sees nothing new.
+    assert!(rt.take_replies().is_empty());
+}
+
+#[test]
+fn kitty_font_query_uses_live_resolved_config() {
+    let cfg = bitty_runtime::RuntimeConfig {
+        font_family: "Maple Mono".to_string(),
+        font_size: 14.5,
+        ..bitty_runtime::RuntimeConfig::default()
+    };
+    let mut rt = Runtime::new(cfg).expect("build");
+    rt.handle_pty_bytes(FASTFETCH_FONT_QUERY);
+
+    let replies = rt.take_replies();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(
+        &*replies[0],
+        b"\x1bP1+rkitty-query-font_family=4d61706c65204d6f6e6f\x1b\\".as_slice()
+    );
+    assert_eq!(
+        &*replies[1],
+        b"\x1bP1+rkitty-query-font_size=31342e35\x1b\\".as_slice()
+    );
+}
+
+#[test]
+fn kitty_font_query_unknown_or_malformed_answers_nothing() {
+    for query in [
+        b"\x1bP+q6b697474792d71756572792d6e6f7065\x1b\\".as_slice(),
+        b"\x1bP+q6b697474792d71756572792dzz\x1b\\".as_slice(),
+        b"\x1bP+q\x1b\\".as_slice(),
+    ] {
+        let mut rt = Runtime::with_defaults().expect("build");
+        rt.handle_pty_bytes(query);
+        assert!(
+            rt.take_replies().is_empty(),
+            "query {query:?} must answer nothing"
+        );
+    }
+}
+
+#[test]
+fn real_pty_kitty_font_query_writes_once() {
+    let mut rt = Runtime::with_defaults().expect("build");
+    if let Err(err) = rt.spawn_shell_with_args("/bin/cat", &[]) {
+        eprintln!("skip real PTY font-query test: spawn failed: {err:?}");
+        return;
+    }
+    assert!(rt.has_pty_writer());
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = rt.poll_pty_timeout(Duration::from_millis(200));
+
+    rt.handle_pty_bytes(FASTFETCH_FONT_QUERY);
+    let expected = b"\x1bP1+rkitty-query-font_family=".len()
+        + DEFAULT_FAMILY_HEX.len()
+        + 2
+        + b"\x1bP1+rkitty-query-font_size=3132\x1b\\".len();
+    let written = rt.write_replies();
+    assert_eq!(written, expected, "both answers must reach the PTY once");
+    assert_eq!(rt.write_replies(), 0, "no duplicate reply write");
+}

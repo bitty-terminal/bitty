@@ -856,7 +856,7 @@ impl ConfigEval for LuaVm {
                             }
                             Taken::Values(out)
                         }
-                        Ok(Err(e)) => Taken::LuaErr(format!("{e}")),
+                        Ok(Err(e)) => Taken::LuaErr(crate::error::format_lua_error(ctx, &e)),
                         Err(e) => Taken::BadMode(format!("{e:?}")),
                     }
                 });

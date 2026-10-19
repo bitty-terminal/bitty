@@ -2896,7 +2896,7 @@ impl LuaVm {
                         Ok(Ok(value)) => {
                             LuaValue::from_lua(value, limits).map_err(|e| e.to_string())
                         }
-                        Ok(Err(err)) => Err(format!("{err}")),
+                        Ok(Err(err)) => Err(crate::error::format_lua_error(ctx, &err)),
                         Err(err) => Err(format!("{err:?}")),
                     }
                 });

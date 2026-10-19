@@ -15,6 +15,8 @@
 //! Messages are host-authored and bounded: they carry counters only, never
 //! untrusted content.
 
+use phodopus::{Context, Error, Table, Value};
+
 use crate::host::BridgeError;
 use crate::{SuspendReason, VmError};
 
@@ -151,5 +153,45 @@ pub fn bridge_error_for_vm_error(err: &VmError) -> Option<BridgeError> {
     match err {
         VmError::Suspended { reason } => Some(bridge_error_for_suspend(reason)),
         VmError::Load(_) | VmError::Runtime(_) | VmError::Budget(_) => None,
+    }
+}
+
+/// Render a Lua error value for host diagnostics (bitty#2237).
+///
+/// The bridge raises typed errors as plain tables
+/// (`{ class = ..., code = ..., message = ... }`). `Display` on a table only
+/// yields a pointer (`<table 0x...>`), which hides the diagnostic. When the
+/// raised value is a table carrying a string `code` and/or `message`, this
+/// renders `"<code>: <message>"` (or the single field present). Every other
+/// error keeps its existing `Display` form, so semantics for plain strings,
+/// numbers, userdata, and opaque tables are unchanged.
+pub(crate) fn format_lua_error<'gc>(ctx: Context<'gc>, error: &Error<'gc>) -> String {
+    if let Error::Lua(lua) = error {
+        if let Value::Table(table) = lua.value {
+            if let Some(rendered) = render_table_error(ctx, table) {
+                return rendered;
+            }
+        }
+    }
+    format!("{error}")
+}
+
+/// Decode a bridge error table into a readable diagnostic.
+fn render_table_error<'gc>(ctx: Context<'gc>, table: Table<'gc>) -> Option<String> {
+    let code = string_field(ctx, table, "code");
+    let message = string_field(ctx, table, "message");
+    match (code, message) {
+        (Some(code), Some(message)) => Some(format!("{code}: {message}")),
+        (Some(code), None) => Some(code),
+        (None, Some(message)) => Some(message),
+        (None, None) => None,
+    }
+}
+
+/// Read a string field from a table, ignoring nil and non-string values.
+fn string_field<'gc>(ctx: Context<'gc>, table: Table<'gc>, key: &'static str) -> Option<String> {
+    match table.get_value(ctx, key) {
+        Value::String(value) => Some(value.display_lossy().to_string()),
+        _ => None,
     }
 }

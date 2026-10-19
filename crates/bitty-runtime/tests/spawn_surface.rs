@@ -42,7 +42,7 @@ fn services_with(spawn_git: bool, backend: bool) -> Rc<PluginServices> {
     if backend {
         let seen: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
         let seen_clone = seen.clone();
-        services.set_spawn_backend(Some(Rc::new(move |args: &[String], _cwd: Option<&str>| {
+        services.set_spawn_backend(Some(Rc::new(move |args: &[String]| {
             seen_clone.borrow_mut().push(args.to_vec());
             Ok(LuaValue::table([
                 ("output", LuaValue::String(" M staged.lua".to_string())),

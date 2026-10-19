@@ -82,13 +82,16 @@ pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
 
 /// Injected spawn backend for one plugin generation.
 ///
-/// Receives the Lua-validated argv plus the optional absolute `{ cwd }`
-/// option and returns the bounded result table
+/// Receives the Lua-validated argv and returns the bounded result table
 /// (`output`/`stderr`/`truncated`/`exit_code`/`execution_id`/`untrusted`). The production
 /// backend is the consent-gated [`SpawnService`](super::spawn::SpawnService)
 /// path wired at activation; tests inject canned closures. `None` (no
 /// backend) fails closed with `E_SPAWN_UNAVAILABLE`.
-pub type SpawnHandler = Rc<dyn Fn(&[String], Option<&str>) -> Result<LuaValue, BridgeError>>;
+///
+/// The handler takes no working directory: CTX-1345 review F1 found that a
+/// plugin-controlled `{ cwd }` is unconfined, so the bridge rejects the
+/// option and the backend has no path to honor it.
+pub type SpawnHandler = Rc<dyn Fn(&[String]) -> Result<LuaValue, BridgeError>>;
 
 /// Read-only typed settings source (owned by `bitty-config` in the app).
 pub trait SettingsSource {
@@ -2600,22 +2603,6 @@ impl PluginServices {
             .clone()
             .ok_or_else(|| BridgeError::not_implemented("bitty.debug.trace"))
     }
-
-    /// Grant-gated spawn dispatch shared by the cwd-less and cwd-aware
-    /// [`HostServices`] entry points (CTX-1345).
-    fn spawn_with_cwd(&self, args: &[String], cwd: Option<&str>) -> Result<LuaValue, BridgeError> {
-        if !self.spawn_git.get() {
-            return Err(BridgeError::capability_denied("process.spawn:git"));
-        }
-        let backend = self.spawn_backend.borrow().clone().ok_or_else(|| {
-            BridgeError::new(
-                "runtime",
-                "E_SPAWN_UNAVAILABLE",
-                "host spawn backend is not configured",
-            )
-        })?;
-        backend(args, cwd)
-    }
 }
 
 impl HostServices for PluginServices {
@@ -2801,7 +2788,17 @@ impl HostServices for PluginServices {
     }
 
     fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
-        self.spawn_with_cwd(args, None)
+        if !self.spawn_git.get() {
+            return Err(BridgeError::capability_denied("process.spawn:git"));
+        }
+        let backend = self.spawn_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                "E_SPAWN_UNAVAILABLE",
+                "host spawn backend is not configured",
+            )
+        })?;
+        backend(args)
     }
 
     fn process_spawn_with_expiry(
@@ -2812,19 +2809,7 @@ impl HostServices for PluginServices {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        self.spawn_with_cwd(args, None)
-    }
-
-    fn process_spawn_with_cwd(
-        &self,
-        args: &[String],
-        cwd: Option<&str>,
-        expiry: Instant,
-    ) -> Result<LuaValue, BridgeError> {
-        if Instant::now() > expiry {
-            return Err(BridgeError::timeout());
-        }
-        self.spawn_with_cwd(args, cwd)
+        self.process_spawn(args)
     }
 
     fn ui_mount(&self, slot: &str, component: &UiNode) -> Result<i64, BridgeError> {
@@ -5384,10 +5369,8 @@ mod tests {
         services.set_spawn_git(true);
         let seen = Rc::new(RefCell::new(Vec::new()));
         let seen_clone = seen.clone();
-        services.set_spawn_backend(Some(Rc::new(move |args: &[String], cwd: Option<&str>| {
-            seen_clone
-                .borrow_mut()
-                .push((args.to_vec(), cwd.map(str::to_owned)));
+        services.set_spawn_backend(Some(Rc::new(move |args: &[String]| {
+            seen_clone.borrow_mut().push(args.to_vec());
             Ok(LuaValue::table([(
                 "output",
                 LuaValue::String("ok".to_owned()),
@@ -5402,24 +5385,7 @@ mod tests {
         );
         assert_eq!(
             seen.borrow().as_slice(),
-            &[(vec!["status".to_owned(), "--porcelain".to_owned()], None)]
-        );
-
-        // CTX-1345: the cwd-aware entry point forwards the validated path.
-        let result = services
-            .process_spawn_with_cwd(
-                &["status".to_owned()],
-                Some("/tmp/worktree"),
-                Instant::now() + Duration::from_secs(1),
-            )
-            .expect("backend serves");
-        assert_eq!(
-            result.get("output"),
-            Some(&LuaValue::String("ok".to_owned()))
-        );
-        assert_eq!(
-            seen.borrow().last(),
-            Some(&(vec!["status".to_owned()], Some("/tmp/worktree".to_owned())))
+            &[vec!["status".to_owned(), "--porcelain".to_owned()]]
         );
     }
 

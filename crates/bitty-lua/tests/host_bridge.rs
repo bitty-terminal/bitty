@@ -265,9 +265,6 @@ fn host_call_deadline_returns_typed_timeout() {
 struct SpawnServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
     calls: RefCell<Vec<Vec<String>>>,
-    /// Working directories received through the cwd-aware entry point
-    /// (CTX-1345): `Some` for an explicit option, `None` for no option.
-    cwds: RefCell<Vec<Option<String>>>,
     deny: bool,
 }
 
@@ -305,16 +302,6 @@ impl HostServices for SpawnServices {
             ("exit_code", LuaValue::Integer(0)),
             ("untrusted", LuaValue::Bool(true)),
         ]))
-    }
-
-    fn process_spawn_with_cwd(
-        &self,
-        args: &[String],
-        cwd: Option<&str>,
-        _expiry: std::time::Instant,
-    ) -> Result<LuaValue, BridgeError> {
-        self.cwds.borrow_mut().push(cwd.map(str::to_owned));
-        self.process_spawn(args)
     }
 }
 
@@ -365,7 +352,6 @@ fn process_spawn_serves_bounded_table() {
     let services = Rc::new(SpawnServices {
         store: RefCell::new(BTreeMap::new()),
         calls: RefCell::new(Vec::new()),
-        cwds: RefCell::new(Vec::new()),
         deny: false,
     });
     let mut vm = gate_vm("spawn-ok");
@@ -397,64 +383,92 @@ fn process_spawn_serves_bounded_table() {
     );
 }
 
-#[test]
-fn process_spawn_honors_absolute_cwd_option() {
-    // CTX-1345: the bridge used to read only stack.get(0), so a plugin's
-    // `{ cwd = ... }` was silently dropped and the child ran in the host
-    // process cwd. The validated option must reach the host backend.
-    let dir = std::env::temp_dir().join(format!("bitty-spawn-cwd-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp cwd");
+/// Run one `process.spawn` cwd case through the real bridge and assert the
+/// typed rejection without backend contact (CTX-1345 review F1/F7).
+fn assert_spawn_cwd_rejected(tag: &str, options: &str) {
     let services = Rc::new(SpawnServices {
         store: RefCell::new(BTreeMap::new()),
         calls: RefCell::new(Vec::new()),
-        cwds: RefCell::new(Vec::new()),
         deny: false,
     });
-    let mut vm = gate_vm("spawn-cwd");
+    let mut vm = gate_vm(format!("spawn-cwd-{tag}"));
     install_spawn(&mut vm, services.clone());
     let script = format!(
-        r#"local result = bitty.process.spawn({{ "status" }}, {{ cwd = "{cwd}" }})
-           bitty.store.set("output", result.output)"#,
-        cwd = lua_path(&dir),
+        r#"local ok, err = pcall(function()
+               bitty.process.spawn({{ "status" }}, {options})
+           end)
+           bitty.store.set("code", ok and "NONE" or err.code)
+           bitty.store.set("message", ok and "" or err.message)"#
     );
     let outcome = vm.execute_bounded(&script).expect("execute");
     assert!(
         matches!(outcome, BoundedExecution::Completed),
-        "{outcome:?}"
+        "{tag}: {outcome:?}"
     );
     assert_eq!(
-        services.cwds.borrow().as_slice(),
-        &[Some(dir.to_string_lossy().into_owned())],
-        "the absolute cwd reaches the host backend"
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_INVALID".to_string())),
+        "{tag}: the typed rejection code"
     );
-    assert_eq!(
-        services.calls.borrow().as_slice(),
-        &[vec!["status".to_string()]]
+    let store = services.store.borrow();
+    let Some(LuaValue::String(message)) = store.get("message") else {
+        panic!("{tag}: no error message");
+    };
+    assert!(message.contains("cwd is not supported"), "{tag}: {message}");
+    assert!(
+        services.calls.borrow().is_empty(),
+        "{tag}: a rejected cwd never reaches the spawn backend"
     );
 }
 
 #[test]
-fn process_spawn_rejects_invalid_options_instead_of_ignoring_them() {
-    // CTX-1345: unknown options and malformed cwd values fail closed with a
-    // typed error and never reach the backend, instead of being ignored or
-    // running relative to the host process cwd.
-    let dir = std::env::temp_dir().join(format!("bitty-spawn-bad-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp cwd");
-    let traversal = format!("{}/..", dir.to_string_lossy());
-    let cases = [
+fn process_spawn_rejects_plugin_controlled_cwd() {
+    // CTX-1345 review F1: the bridge used to read only stack.get(0), so a
+    // plugin's `{ cwd = ... }` was silently dropped. Honoring it would be an
+    // unconfined directory selector: absolute paths and symlinks escape the
+    // plugin `fs.read` grant, and the same capability is denied in argv as
+    // the `[tools.*]` `-C` repo escape. The bridge now parses the key and
+    // fails closed with a typed `E_DEF_INVALID` for every shape, so the
+    // child never runs in a plugin-chosen directory.
+    let root = std::env::temp_dir().join(format!("bitty-spawn-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("temp cwd");
+    let traversal = format!("{}/..", root.to_string_lossy());
+    let cases: Vec<(&str, String)> = vec![
+        ("absolute", format!(r#"{{ cwd = "{}" }}"#, lua_path(&root))),
+        ("relative", r#"{ cwd = "relative/dir" }"#.to_string()),
         (
-            "relative",
-            r#"bitty.process.spawn({ "status" }, { cwd = "relative/dir" })"#.to_string(),
-            "E_DEF_INVALID",
-        ),
-        (
-            "traversal",
+            "lexical-traversal",
             format!(
-                r#"bitty.process.spawn({{ "status" }}, {{ cwd = "{}" }})"#,
+                r#"{{ cwd = "{}" }}"#,
                 lua_path(std::path::Path::new(&traversal))
             ),
-            "E_DEF_INVALID",
         ),
+        ("empty", r#"{ cwd = "" }"#.to_string()),
+        ("oversize", format!(r#"{{ cwd = "{}" }}"#, "a".repeat(4097))),
+        ("nul", r#"{ cwd = "a\0b" }"#.to_string()),
+        ("control", r#"{ cwd = "a\nb" }"#.to_string()),
+    ];
+    for (tag, options) in cases {
+        assert_spawn_cwd_rejected(tag, &options);
+    }
+    #[cfg(unix)]
+    {
+        let escape = root.join("escape");
+        let _ = std::fs::remove_file(&escape);
+        std::os::unix::fs::symlink("/", &escape).expect("escape symlink");
+        assert_spawn_cwd_rejected(
+            "symlink-to-outside-root",
+            &format!(r#"{{ cwd = "{}" }}"#, lua_path(&escape)),
+        );
+    }
+}
+
+#[test]
+fn process_spawn_rejects_unknown_and_malformed_options() {
+    // CTX-1345: the options table is parsed, not dropped, so an unsupported
+    // option or a malformed value fails closed with a typed error and never
+    // reaches the backend.
+    let cases = [
         (
             "unknown-option",
             r#"bitty.process.spawn({ "status" }, { shell = true })"#.to_string(),
@@ -475,7 +489,6 @@ fn process_spawn_rejects_invalid_options_instead_of_ignoring_them() {
         let services = Rc::new(SpawnServices {
             store: RefCell::new(BTreeMap::new()),
             calls: RefCell::new(Vec::new()),
-            cwds: RefCell::new(Vec::new()),
             deny: false,
         });
         let mut vm = gate_vm(format!("spawn-bad-option-{tag}"));
@@ -498,10 +511,6 @@ fn process_spawn_rejects_invalid_options_instead_of_ignoring_them() {
             services.calls.borrow().is_empty(),
             "{tag}: rejected options never reach the spawn backend"
         );
-        assert!(
-            services.cwds.borrow().is_empty(),
-            "{tag}: no cwd reaches the spawn backend"
-        );
     }
 }
 
@@ -510,7 +519,6 @@ fn process_spawn_denied_stays_typed() {
     let services = Rc::new(SpawnServices {
         store: RefCell::new(BTreeMap::new()),
         calls: RefCell::new(Vec::new()),
-        cwds: RefCell::new(Vec::new()),
         deny: true,
     });
     let mut vm = gate_vm("spawn-denied");
@@ -561,7 +569,6 @@ fn process_spawn_rejects_malformed_argv() {
         let services = Rc::new(SpawnServices {
             store: RefCell::new(BTreeMap::new()),
             calls: RefCell::new(Vec::new()),
-            cwds: RefCell::new(Vec::new()),
             deny: false,
         });
         let mut vm = gate_vm(format!("spawn-bad-{tag}"));

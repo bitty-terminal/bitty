@@ -963,7 +963,7 @@ impl Runtime {
     ///
     /// A gated paste is never silent: while [`Self::has_pending_paste`] holds,
     /// this returns `Some` single line of the form
-    /// `Paste 2 lines, 11B [newline] "line1\nline2" (paste again to confirm, Esc cancels)`.
+    /// `Paste 2 lines, 11B [newline] "line1\nline2" (Enter to confirm, Esc to cancel)`.
     ///
     /// Multi-line pastes report `newline` (`[newline]`), not the generic `C0`
     /// control class, because LF is the expected multi-line trigger under the
@@ -985,7 +985,7 @@ impl Runtime {
         let preview = preview.escape_debug().to_string();
         let preview = truncate_str_to_bytes(&preview, 48);
         Some(format!(
-            "Paste {lines} lines, {bytes}B [{reasons}] \"{preview}\" (paste again to confirm, Esc cancels)"
+            "Paste {lines} lines, {bytes}B [{reasons}] \"{preview}\" (Enter to confirm, Esc to cancel)"
         ))
     }
 
@@ -1075,9 +1075,10 @@ impl Runtime {
     /// text (LF) and adversarial controls (NUL/ESC/CR/other C0/C1/Unicode
     /// BiDi and zero-width) require confirmation; other text is delivered
     /// immediately. Text needing confirmation is stored as a pending paste —
-    /// `confirm_pending_paste(true)`, repeating the identical paste while
-    /// pending (CTX-0186 second chord/right-click press with unchanged
-    /// clipboard), or `Esc` to cancel. The pending paste stays visible via
+    /// `confirm_pending_paste(true)` (`Enter` while the banner is up, CTX-1372),
+    /// repeating the identical paste while pending
+    /// (CTX-0186 second chord/right-click press with unchanged clipboard),
+    /// or `Esc` to cancel. The pending paste stays visible via
     /// [`Self::pending_paste_summary`]: there is no silent delivery path and
     /// no silent drop. Bracketed paste (`?2004`) is defense-in-depth only and
     /// wraps confirmed delivery when enabled in terminal state.
@@ -1337,6 +1338,51 @@ impl Runtime {
         self.pending_paste_since = None;
         self.paste_banner_collapsed = false;
         self.pending_full_redraw = true;
+        self.inspect_ring.push_key(
+            &key_inspect_label(event),
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+            Some(true),
+        );
+        self.publish_inspect_snapshot();
+        true
+    }
+
+    /// Scoped `Enter` routing (CTX-1372): confirm a pending paste.
+    ///
+    /// `Enter` is the banner's primary confirm gesture. While a paste pends
+    /// the press routes through [`Self::confirm_pending_paste`] — the same
+    /// seam as repeating the paste gesture — so the delivered bytes,
+    /// bracketed wrapping, and diagnostics are identical. The press is
+    /// consumed either way, so its CR can never reach the PTY behind the
+    /// gate (that would submit the line the confirmation was guarding).
+    /// With no paste pending the key keeps its normal binding/encoding.
+    ///
+    /// Only the paste gate is affected: workspace-close and view/window-close
+    /// arms keep their repeat-the-chord gesture (`Esc` remains their cancel).
+    /// Copy/search modes and IME preedit own the keyboard above the caller,
+    /// so this never fires there.
+    ///
+    /// Returns `true` when a pending paste was present and the press was
+    /// consumed; `false` otherwise.
+    pub(super) fn confirm_pending_paste_on_enter(&mut self, event: &KeyEvent) -> bool {
+        if event.state != PressState::Pressed {
+            return false;
+        }
+        if self.pending_paste.is_none() {
+            return false;
+        }
+        if !matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Enter)
+        ) {
+            return false;
+        }
+        // Issue #1438: `confirm_pending_paste` clears an expired gate first,
+        // so an expired paste delivers nothing. The press was still the
+        // confirm gesture for a visible banner and stays consumed.
+        let _ = self.confirm_pending_paste(true);
         self.inspect_ring.push_key(
             &key_inspect_label(event),
             self.shift_pressed,

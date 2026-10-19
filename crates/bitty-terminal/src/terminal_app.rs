@@ -3056,8 +3056,8 @@ impl AppHandler for TerminalApp {
         // ask the handler to exit the loop.
         //
         // CTX-0186: snapshot the paste-dialog state before routing so the
-        // right/middle-click and Esc-cancel paths can report loudly afterwards
-        // (a gated paste is never silent).
+        // right/middle-click, Esc-cancel, and Enter-confirm (CTX-1372) paths
+        // can report loudly afterwards (a gated paste is never silent).
         let paste_probe = match &event {
             PlatformEvent::Window { window_id: _, kind } => match kind {
                 WindowEventKind::MouseInput(mouse)
@@ -3072,10 +3072,18 @@ impl AppHandler for TerminalApp {
                 }
                 WindowEventKind::KeyboardInput(key)
                     if key.state == PressState::Pressed
-                        && matches!(&key.logical_key, LogicalKey::Named(NamedKey::Escape)) =>
+                        && matches!(
+                            &key.logical_key,
+                            LogicalKey::Named(NamedKey::Escape | NamedKey::Enter)
+                        ) =>
                 {
+                    let kind = if matches!(&key.logical_key, LogicalKey::Named(NamedKey::Escape)) {
+                        "esc"
+                    } else {
+                        "enter"
+                    };
                     Some((
-                        "esc",
+                        kind,
                         self.runtime.has_pending_paste(),
                         self.runtime.pending_input_len(),
                     ))

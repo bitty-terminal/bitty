@@ -500,6 +500,13 @@ impl Runtime {
         if self.cancel_pending_paste_on_ctrl_d(&event) {
             return None;
         }
+        // CTX-1372: Enter confirms a pending paste through the same
+        // `confirm_pending_paste` seam as repeating the paste gesture; the
+        // press is consumed so its CR never reaches the PTY behind the gate.
+        // With no paste pending Enter keeps its normal encoding.
+        if self.confirm_pending_paste_on_enter(&event) {
+            return None;
+        }
         // CTX-0159: retain a bounded input trace for screenshots-free probes.
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
@@ -617,6 +624,10 @@ impl Runtime {
         }
         // Issue #1336: Ctrl+D dismisses a pending paste (see owned path).
         if self.cancel_pending_paste_on_ctrl_d(event) {
+            return None;
+        }
+        // CTX-1372: Enter confirms a pending paste (see owned path).
+        if self.confirm_pending_paste_on_enter(event) {
             return None;
         }
         let pressed = Some(event.state == PressState::Pressed);

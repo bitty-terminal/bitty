@@ -442,8 +442,7 @@ pub fn terminal_text_runs(snapshot: &Snapshot) -> Vec<TextRun> {
             if cell.spacer {
                 continue;
             }
-            text.push(cell.glyph);
-            text.extend(cell.zerowidth.iter().copied());
+            cell.push_text_into(&mut text);
         }
         let trimmed = text.trim_end().to_string();
         if !trimmed.is_empty() {

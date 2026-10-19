@@ -438,7 +438,7 @@ impl View {
                 if cell.spacer {
                     continue;
                 }
-                s.push(cell.glyph);
+                cell.push_text_into(&mut s);
             }
             rows.push(s.trim_end().to_string());
         }
@@ -631,6 +631,20 @@ mod tests {
         let vis = v.visible_snapshot_rect(&s);
         assert_eq!(vis.width as usize, s.width.min(100));
         assert_eq!(vis.height as usize, s.height.min(40));
+    }
+
+    #[test]
+    fn visible_text_rows_keeps_zero_width_scalars() {
+        use bitty_vt::{GraphemeCell, TerminalAction};
+        let mut state = State::new();
+        for ch in "e\u{0301}\u{2764}\u{FE0F}".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        let view = View::new(ViewId::new(1), 10, state.height());
+        assert_eq!(
+            view.visible_text_rows(&state)[0],
+            "e\u{0301}\u{2764}\u{FE0F}"
+        );
     }
 
     #[test]

@@ -82,10 +82,9 @@ fn line_text_and_map(cells: &[Cell]) -> (String, Vec<usize>) {
             text.push(' ');
             map.push(col);
         } else {
-            text.push(cell.glyph);
-            map.push(col);
-            for mark in &cell.zerowidth {
-                text.push(*mark);
+            cell.push_text_into(&mut text);
+            // The glyph plus each zero-width scalar maps to this lead column.
+            for _ in 0..=cell.zerowidth.len() {
                 map.push(col);
             }
         }
@@ -400,6 +399,18 @@ mod tests {
             Some("https://example.com/x")
         );
         assert!(plaintext_span_at(&snap, 0, 4).is_none());
+    }
+
+    #[test]
+    fn decomposed_prefix_shifts_bytes_past_columns() {
+        // CTX-1367 (#2260): `e` + U+0301 is 3 bytes but one column, so the
+        // reconstructed row text must keep the mark and anchor at column 2.
+        let snap = snapshot_for_line("e\u{0301} https://example.com/x");
+        let spans = plaintext_spans_for_row(&snap.cells[..snap.width], 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].col_start, 2);
+        assert!(plaintext_span_at(&snap, 0, 2).is_some());
+        assert!(plaintext_span_at(&snap, 0, 1).is_none());
     }
 
     #[test]

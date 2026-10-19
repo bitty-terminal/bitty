@@ -1153,38 +1153,74 @@ impl TerminalApp {
             return;
         }
         if split_focused_leaf(&mut layout, target, axis, new_id, place_new_first) {
-            self.runtime.set_layout(layout);
-            // CTX-0176: the fresh leaf gets its own shell/PTY sized
-            // to its allocation — best-effort (startup parity). On
-            // failure the pane stays empty (CTX-0359: it never
-            // paints or feeds the primary grid) with a loud warning.
-            let (cols, rows) = self
-                .runtime
-                .layout_allocations()
-                .iter()
-                .find(|(id, _)| *id == new_id)
-                .map(|(_, r)| (r.width.max(1), r.height.max(1)))
-                .unwrap_or((80, 24));
-            let spawn_result =
-                spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
-            // CTX-0364: focus follows the fresh pane (kitty/ghostty
-            // parity). Set after the spawn so CTX-0357 cwd
-            // inheritance still reads the source pane as focused.
-            self.runtime.set_focus(new_id);
-            match spawn_result {
-                Ok(()) => eprintln!(
-                    "bitty: keymap {label} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
-                    self.runtime.leaf_count(),
-                    self.runtime.focused_view(),
-                    self.runtime.pane_pid(&new_id),
-                ),
-                Err(err) => eprintln!(
-                    "warning: keymap {label} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
-                ),
-            }
+            self.commit_new_leaf(layout, new_id, label);
         } else {
             eprintln!("warning: keymap {label} found no target pane — ignoring");
         }
+    }
+
+    /// Commit a freshly allocated leaf and give it its own shell.
+    ///
+    /// Shared by the split path and the empty-base `new_panel` path
+    /// (CTX-1338, #2223): install the layout, spawn the fresh pane's shell
+    /// sized to its allocation, and move focus to it.
+    fn commit_new_leaf(&mut self, layout: LayoutNode, new_id: ViewId, label: &str) {
+        self.runtime.set_layout(layout);
+        // CTX-0176: the fresh leaf gets its own shell/PTY sized
+        // to its allocation — best-effort (startup parity). On
+        // failure the pane stays empty (CTX-0359: it never
+        // paints or feeds the primary grid) with a loud warning.
+        let (cols, rows) = self
+            .runtime
+            .layout_allocations()
+            .iter()
+            .find(|(id, _)| *id == new_id)
+            .map(|(_, r)| (r.width.max(1), r.height.max(1)))
+            .unwrap_or((80, 24));
+        let spawn_result =
+            spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
+        // CTX-0364: focus follows the fresh pane (kitty/ghostty
+        // parity). Set after the spawn so CTX-0357 cwd
+        // inheritance still reads the source pane as focused.
+        self.runtime.set_focus(new_id);
+        match spawn_result {
+            Ok(()) => eprintln!(
+                "bitty: keymap {label} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
+                self.runtime.leaf_count(),
+                self.runtime.focused_view(),
+                self.runtime.pane_pid(&new_id),
+            ),
+            Err(err) => eprintln!(
+                "warning: keymap {label} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
+            ),
+        }
+    }
+
+    /// Materialize a tiled base for `new_panel` over an emptied workspace.
+    ///
+    /// CTX-1338 (#2223): after the CTX-1336/CTX-1337 close fixes a workspace
+    /// can survive with an empty live layout plus a detached float (or a
+    /// pinned panel) holding focus. `new_panel` used to treat that focus as
+    /// its split target, fail to find it in the layout, and silently no-op.
+    /// Install the fresh panel as the workspace's tiled base instead; the
+    /// float/pin stays composited exactly as it was.
+    fn create_panel_on_empty_base(&mut self, focused: ViewId) {
+        self.restore_zoom();
+        let new_id = self.runtime.next_view_id_global();
+        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+            eprintln!("warning: keymap new_panel refused: {err}");
+            return;
+        }
+        let container = self.runtime.container();
+        let view = View::new(
+            new_id,
+            usize::from(container.width.max(1)),
+            usize::from(container.height.max(1)),
+        );
+        self.commit_new_leaf(LayoutNode::leaf(view), new_id, "new_panel");
+        eprintln!(
+            "bitty: keymap new_panel -> materialized tiled base over empty workspace (was focused {focused:?})"
+        );
     }
 
     /// Execute one bound chrome action (single owner: the PTY never sees the
@@ -1418,6 +1454,16 @@ impl TerminalApp {
                 // must come from the restored layout that `apply_new_leaf`
                 // will split. Idempotent: `apply_new_leaf` restores again.
                 self.restore_zoom();
+                // CTX-1338 (#2223): an emptied workspace (its tiled base
+                // closed while a float/pin survived) has no leaf to split.
+                // The surviving focus target lives outside the layout, so
+                // the split below would refuse and silently drop the
+                // chord. Materialize the fresh panel as the tiled base
+                // instead; the surviving float/pin keeps its place.
+                if self.runtime.layout().leaf_count() == 0 {
+                    self.create_panel_on_empty_base(focused);
+                    return false;
+                }
                 let axis = self.runtime.panel_split_axis(focused);
                 let place_new_first = self.runtime.panel_split_place_new_first();
                 let target = if self.runtime.panel_layout_mode() == PanelLayoutMode::BisectLargest {

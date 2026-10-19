@@ -9886,6 +9886,81 @@ fn close_last_float_prunes_emptied_workspace_issue_2221() {
     );
 }
 
+/// Issue #2223 / CTX-1338: an emptied workspace (tiled base closed, one
+/// detached float survives) must still accept `new_panel`. The float is the
+/// only focus target, so the old split path refused and silently dropped the
+/// chord. The panel must materialize as the fresh tiled base while the float
+/// stays detached.
+#[test]
+#[cfg(unix)]
+fn new_panel_over_empty_tiled_base_with_float_materializes_tile_issue_2223() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let host = ViewId::new(1);
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
+        .expect("spawn float shell");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
+        .expect("detach float");
+    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "precondition: the tiled base is empty"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(float),
+        "precondition: the surviving float holds focus outside the layout"
+    );
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::NewPanel),
+        "new_panel over an empty base is a layout change, not a window close"
+    );
+
+    let leaves = app.runtime.layout().leaf_ids();
+    assert_eq!(
+        leaves.len(),
+        1,
+        "new_panel must materialize a tiled base instead of no-opping"
+    );
+    let panel = leaves[0];
+    assert_ne!(panel, host, "the closed host must not come back");
+    assert_ne!(
+        panel, float,
+        "the float must stay detached, not become tiled"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(panel),
+        "focus must follow the materialized panel"
+    );
+    assert_eq!(
+        app.runtime.floated_views(),
+        vec![float],
+        "the surviving float keeps its detached place"
+    );
+    assert!(
+        app.runtime.has_pane_session(&panel),
+        "the materialized panel must own its fresh shell"
+    );
+
+    let _ = app.drive_tick();
+    let frames = app.runtime.present_frames();
+    assert!(
+        frames.iter().any(|frame| frame.view == panel),
+        "the materialized panel must present"
+    );
+    assert!(
+        frames.iter().any(|frame| frame.view == float),
+        "the surviving float must keep presenting"
+    );
+}
+
 #[cfg(unix)]
 fn probe_rgba(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
     let idx = (y * width + x) * 4;

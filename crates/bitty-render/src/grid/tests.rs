@@ -3349,3 +3349,44 @@ fn join_controls_and_selectors_emit_no_glyph() {
     assert_eq!(glyphs, 2, "A plus the emoji; selector/joiner skipped");
     assert_eq!(counters.missing_glyphs, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Counter ownership: one classification per visited cell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blank_base_with_only_an_undrawn_mark_counts_one_skipped_cell() {
+    // A space whose only mark is a joiner paints nothing. It must still land
+    // in exactly one bucket: a blank skip, never in neither.
+    let state = state_from(&[print(' '), print('\u{200D}')]);
+    let damage = damage_all(&state);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    assert!(list.glyphs.is_empty());
+    let counters = grid.counters();
+    assert!(counters.cells_examined >= 1);
+    assert_eq!(counters.cells_drawn, 0);
+    assert_eq!(
+        counters.blank_cells_skipped, counters.cells_examined,
+        "every visited cell is a blank skip, including the marked space"
+    );
+}
+
+#[test]
+fn failed_base_with_a_drawn_mark_is_not_counted_blank() {
+    // The base scalar cannot rasterize but its mark does: the cell painted
+    // something, so it is drawn and must not also count as a blank skip.
+    let state = state_from(&[print('Q'), print('\u{0301}')]);
+    let damage = damage_all(&state);
+    let mut fake = FakeRasterizer::new();
+    fake.fail_next = true;
+    let mut grid = GridRenderer::new(fake, &font_query(), cell_metrics()).unwrap();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    assert_eq!(list.glyphs.len(), 1, "only the mark painted");
+    let counters = grid.counters();
+    assert_eq!(counters.glyphs_emitted, 1);
+    assert_eq!(counters.cells_drawn, 1);
+    assert_eq!(counters.blank_cells_skipped, 0);
+}

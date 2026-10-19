@@ -2897,11 +2897,12 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             };
             drew |= self.emit_zerowidth_marks(term_cell, row, col, pen_advance, fg, list);
             if !drew && decorations == 0 {
-                // Failure paths and skipped marks already counted their own
-                // blank; only a plain blank base is counted here.
-                if term_cell.glyph == ' ' && term_cell.zerowidth.is_empty() {
-                    self.counters.blank_cells_skipped += 1;
-                }
+                // Exactly one classification per visited cell: nothing drew
+                // it (blank base, dropped marks, or a failed rasterize), so
+                // it is the cell's single blank skip. `emit_glyph` never
+                // counts failures itself, which keeps a cell that painted
+                // only a mark or a decoration out of both buckets.
+                self.counters.blank_cells_skipped += 1;
                 return;
             }
         }
@@ -2994,6 +2995,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// the pen origin a following combining mark was drawn against. A blank
     /// or failed scalar reports the grid advance instead so marks still land
     /// inside their own cell.
+    ///
+    /// Counter ownership lives with the caller: `emit_glyph` never touches
+    /// `blank_cells_skipped`, so a cell is classified exactly once from the
+    /// per-cell result (glyph or decoration drawn vs. nothing drawn).
     fn emit_glyph(
         &mut self,
         character: char,
@@ -3007,7 +3012,6 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
             // The point size was validated at construction, so this is
             // unreachable; treating it as "nothing to draw" stays safe.
-            self.counters.blank_cells_skipped += 1;
             return (false, grid_advance);
         };
         let bitmap = match self.cache.cached_glyph(key) {
@@ -3023,7 +3027,6 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 // Rasterizer failure: skip this glyph instead of failing
                 // the whole frame. The failure stays observable through
                 // GlyphCache miss counters and upstream diagnostics.
-                self.counters.blank_cells_skipped += 1;
                 return (false, grid_advance);
             }
         };
@@ -3176,7 +3179,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             }
-            let _ = self.emit_glyph(ch, row, abs_col, 1, fg, list);
+            let (emitted, _) = self.emit_glyph(ch, row, abs_col, 1, fg, list);
+            if !emitted {
+                self.counters.blank_cells_skipped += 1;
+            }
         }
         self.counters.ascii_fast_path_runs = self.counters.ascii_fast_path_runs.saturating_add(1);
         vec![(dirty_start, dirty_end - dirty_start)]
@@ -3896,7 +3902,10 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         let mut col = abs_col;
         for ch in slice.chars() {
             let width = usize::from(bitty_term_state::char_cell_width(ch)).max(1);
-            let _ = self.emit_glyph(ch, row, col, width, fg, list);
+            let (emitted, _) = self.emit_glyph(ch, row, col, width, fg, list);
+            if !emitted {
+                self.counters.blank_cells_skipped += 1;
+            }
             col += width;
         }
     }

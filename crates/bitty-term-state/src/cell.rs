@@ -282,6 +282,21 @@ impl Cell {
         !self.spacer && self.glyph == ' ' && self.zerowidth.is_empty()
     }
 
+    /// Appends this cell's textual content to `out`: the leading
+    /// [`Cell::glyph`] followed by every retained zero-width scalar, in
+    /// arrival order (CTX-1367).
+    ///
+    /// Text extraction (selection copy, accessibility runs, inspection,
+    /// URL detection) uses this so combining marks, ZWJ, and variation
+    /// selectors survive. Paint does not call it. Callers iterate a row and
+    /// skip [`Cell::spacer`] trailing halves before invoking this.
+    pub fn push_text_into(&self, out: &mut String) {
+        out.push(self.glyph);
+        for mark in &self.zerowidth {
+            out.push(*mark);
+        }
+    }
+
     /// Appends a zero-width scalar to this cell's combining buffer.
     ///
     /// Returns `false` without mutating when the buffer already holds
@@ -742,6 +757,22 @@ mod tests {
         let mut spacer = Cell::wide_spacer(Style::default());
         assert!(!spacer.push_zerowidth('\u{0301}'));
         assert!(spacer.zerowidth.is_empty());
+    }
+
+    #[test]
+    fn push_text_into_emits_glyph_then_marks_in_order() {
+        let mut cell = Cell::erased(Style::default());
+        cell.glyph = 'e';
+        assert!(cell.push_zerowidth('\u{0301}'));
+        assert!(cell.push_zerowidth('\u{200D}'));
+        let mut out = String::from("prefix:");
+        cell.push_text_into(&mut out);
+        assert_eq!(out, "prefix:e\u{0301}\u{200D}");
+        // A spacer never carries marks, so it contributes only its blank.
+        let spacer = Cell::wide_spacer(Style::default());
+        let mut blank = String::new();
+        spacer.push_text_into(&mut blank);
+        assert_eq!(blank, " ");
     }
 
     #[test]

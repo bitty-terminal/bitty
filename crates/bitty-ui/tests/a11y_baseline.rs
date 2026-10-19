@@ -152,6 +152,16 @@ fn terminal_blank_rows_produce_no_runs() {
 }
 
 #[test]
+fn terminal_runs_keep_zero_width_scalars() {
+    // CTX-1367 (#2260): a11y runs must expose the same cluster copy does.
+    let mut state = State::new();
+    prints(&mut state, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+    let snapshot = state.snapshot();
+    let runs = terminal_text_runs(&snapshot);
+    assert_eq!(runs[0].text, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+}
+
+#[test]
 fn terminal_exposure_is_named_by_title_and_read_only() {
     let mut state = State::new();
     prints(&mut state, "data");

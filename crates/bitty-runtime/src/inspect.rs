@@ -381,11 +381,12 @@ pub struct GridTextSnapshot {
 
 /// Extract bounded grid text from a terminal [`Snapshot`].
 ///
-/// Skips wide-char spacers (trailing halves), emits each leading glyph once,
-/// trims trailing blanks per row, truncates each row to `max_cols`
-/// characters and rows to `max_rows` (top rows first). `max_rows`/`max_cols`
-/// are clamped to `1..=INSPECT_MAX_*`; `0` yields an empty snapshot
-/// (fail-closed). Pure and read-only: never mutates state.
+/// Skips wide-char spacers (trailing halves), emits each leading glyph once
+/// with its retained zero-width scalars, trims trailing blanks per row,
+/// truncates each row to `max_cols` cells and rows to `max_rows` (top rows
+/// first). `max_rows`/`max_cols` are clamped to `1..=INSPECT_MAX_*`; `0`
+/// yields an empty snapshot (fail-closed). Pure and read-only: never mutates
+/// state.
 #[must_use]
 pub fn grid_text_from_snapshot(
     snapshot: &Snapshot,
@@ -423,14 +424,15 @@ pub fn grid_text_from_snapshot(
             if cell.spacer {
                 continue;
             }
-            line.push(cell.glyph);
+            cell.push_text_into(&mut line);
             chars += 1;
         }
         // Trim trailing blanks (erased cells) so typed text is findable
         // without screenshot diffing; leading blanks are preserved.
-        let trimmed = line.trim_end().to_string();
-        // Re-truncate after trim (trim only shortens, so the char bound holds).
-        lines.push(truncate_chars(&trimmed, cols));
+        // CTX-1367: the column bound already holds at the cell level, so
+        // trimming (which only shortens) keeps it and never cuts a
+        // zero-width scalar off the last cell.
+        lines.push(line.trim_end().to_string());
     }
     GridTextSnapshot {
         lines,
@@ -606,6 +608,19 @@ mod tests {
         let joined = snap.lines.join("\n");
         assert!(joined.contains('a'));
         assert!(joined.contains('b'));
+    }
+
+    #[test]
+    fn grid_text_keeps_zero_width_scalars() {
+        // CTX-1367 (#2260): inspection text carries combining marks,
+        // variation selectors, and ZWJ instead of dropping them.
+        let mut state = State::new();
+        feed_print(&mut state, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+        let snap = grid_text_from_state(&state, 2, 16);
+        assert_eq!(snap.lines[0], "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+        // The column bound is a cell bound: a one-cell row keeps the mark.
+        let narrow = grid_text_from_state(&state, 1, 1);
+        assert_eq!(narrow.lines[0], "e\u{0301}");
     }
 
     #[test]

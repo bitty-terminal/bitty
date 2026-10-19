@@ -978,10 +978,7 @@ fn scrollback_tail_text(state: &State, max_lines: usize) -> Vec<String> {
                 if cell.spacer {
                     continue;
                 }
-                text.push(cell.glyph);
-                for mark in cell.zerowidth.iter() {
-                    text.push(*mark);
-                }
+                cell.push_text_into(&mut text);
             }
             truncate_bytes(text.trim_end(), MAX_SESSION_LINE_TEXT_BYTES).to_string()
         })

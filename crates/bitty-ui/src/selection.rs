@@ -399,9 +399,11 @@ impl Selection {
         SelectionRange::new(start, end)
     }
 
-    /// Produces selected text for this selection by concatenating glyphs of
-    /// covered cells row-major, respecting snapped columns and skipping spacer
-    /// halves. Lines are joined with `\n` when the selection spans multiple rows.
+    /// Produces selected text for this selection by concatenating the text
+    /// of covered cells row-major, respecting snapped columns and skipping
+    /// spacer halves. Each cell contributes its glyph plus retained
+    /// zero-width scalars (combining marks, ZWJ, variation selectors).
+    /// Lines are joined with `\n` when the selection spans multiple rows.
     ///
     /// Wide-char leaders emit their single glyph; spacers are never emitted.
     /// Trailing blanks are trimmed on any row whose span runs to the row's
@@ -434,8 +436,9 @@ impl Selection {
     /// window `[cmin, cmax]` (both snapped to leading, clamped to the grid),
     /// joined with `\n`. Unlike [`Selection::text`], no edge trim applies:
     /// the rectangle is preserved verbatim (padding spaces kept) so columnar
-    /// pastes realign. Wide leaders emit once; spacers are skipped. Total
-    /// over all inputs (empty grid yields empty text).
+    /// pastes realign. Wide leaders emit once with their zero-width scalars;
+    /// spacers are skipped. Total over all inputs (empty grid yields empty
+    /// text).
     #[must_use]
     pub fn block_text(self, snapshot: &Snapshot) -> String {
         if snapshot.width == 0 || snapshot.height == 0 {
@@ -625,7 +628,7 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
                 if cell.is_blank() {
                     line.push(' ');
                 } else {
-                    line.push(cell.glyph);
+                    cell.push_text_into(&mut line);
                 }
                 if cell.width == 2 {
                     col += 2;
@@ -674,7 +677,7 @@ fn selected_text_for_block(
                 if cell.is_blank() {
                     line.push(' ');
                 } else {
-                    line.push(cell.glyph);
+                    cell.push_text_into(&mut line);
                 }
                 if cell.width == 2 {
                     col += 2;
@@ -1026,7 +1029,7 @@ impl PersistentSelection {
                     if cell.is_blank() {
                         line.push(' ');
                     } else {
-                        line.push(cell.glyph);
+                        cell.push_text_into(&mut line);
                     }
                     if cell.width == 2 {
                         col += 2;
@@ -1134,6 +1137,35 @@ mod tests {
         template.height = height;
         template.cells = cells.into_boxed_slice();
         template
+    }
+
+    /// Builds a snapshot from explicit cells, one row per inner vector.
+    fn make_cell_snapshot(rows: Vec<Vec<Cell>>) -> Snapshot {
+        let height = rows.len();
+        let width = rows[0].len();
+        let cells: Vec<Cell> = rows.into_iter().flatten().collect();
+        assert_eq!(cells.len(), width * height);
+        let mut template = bitty_term_state::State::new().snapshot();
+        template.width = width;
+        template.height = height;
+        template.cells = cells.into_boxed_slice();
+        template
+    }
+
+    /// A non-spacer cell carrying `marks` in its bounded zero-width buffer.
+    fn marked_cell(glyph: char, width: u8, marks: &[char]) -> Cell {
+        let mut cell = Cell {
+            glyph,
+            style: Style::default(),
+            width,
+            spacer: false,
+            hyperlink: None,
+            zerowidth: Zerowidth::new(),
+        };
+        for mark in marks {
+            assert!(cell.push_zerowidth(*mark), "fixture exceeds the cap");
+        }
+        cell
     }
 
     #[test]
@@ -1384,5 +1416,64 @@ mod tests {
         let snap = make_snapshot(vec![vec!['A', '中', '\0', 'B']]);
         let sel = Selection::block(CellPos::new(0, 0), CellPos::new(0, 3));
         assert_eq!(sel.text(&snap), "A中B");
+    }
+
+    #[test]
+    fn selection_text_keeps_decomposed_combining_mark() {
+        // CTX-1367 (#2260): `e` + U+0301 lives in one cell; copy must carry
+        // the combining scalar or the pasted text loses the accent.
+        let snap = make_cell_snapshot(vec![vec![
+            marked_cell('e', 1, &['\u{0301}']),
+            marked_cell('x', 1, &[]),
+        ]]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 1));
+        assert_eq!(sel.text(&snap), "e\u{0301}x");
+    }
+
+    #[test]
+    fn selection_text_keeps_zwj_family_cluster_across_spacers() {
+        // Four wide emoji cells each carrying a ZWJ; spacers are skipped and
+        // every joiner survives in order.
+        let zwj = '\u{200D}';
+        let spacer = || Cell::wide_spacer(Style::default());
+        let snap = make_cell_snapshot(vec![vec![
+            marked_cell('\u{1F468}', 2, &[zwj]),
+            spacer(),
+            marked_cell('\u{1F469}', 2, &[zwj]),
+            spacer(),
+            marked_cell('\u{1F467}', 2, &[zwj]),
+            spacer(),
+            marked_cell('\u{1F466}', 2, &[zwj]),
+            spacer(),
+        ]]);
+        let expected = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}\u{200D}";
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 7));
+        assert_eq!(sel.text(&snap), expected);
+        let block = Selection::block(CellPos::new(0, 0), CellPos::new(0, 7));
+        assert_eq!(block.block_text(&snap), expected);
+    }
+
+    #[test]
+    fn selection_text_keeps_variation_selector() {
+        let snap = make_cell_snapshot(vec![vec![
+            marked_cell('\u{2764}', 1, &['\u{FE0F}']),
+            marked_cell('!', 1, &[]),
+        ]]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 1));
+        assert_eq!(sel.text(&snap), "\u{2764}\u{FE0F}!");
+    }
+
+    #[test]
+    fn selection_text_keeps_regional_indicator_pair() {
+        // Flags are two width-1 cells; each scalar is a leading glyph.
+        let snap = make_cell_snapshot(vec![vec![
+            marked_cell('\u{1F1EF}', 1, &[]),
+            marked_cell('\u{1F1F5}', 1, &[]),
+            marked_cell(' ', 1, &[]),
+        ]]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 2));
+        assert_eq!(sel.text(&snap), "\u{1F1EF}\u{1F1F5}");
+        let wide = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 1));
+        assert_eq!(wide.text(&snap), "\u{1F1EF}\u{1F1F5}");
     }
 }

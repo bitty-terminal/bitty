@@ -1393,7 +1393,15 @@ pub fn fit_plan(fit: BackgroundFit, image: (u32, u32), dest: RectPx, dpi: f64) -
     let native_h = ih_f * dpi;
     match fit {
         BackgroundFit::Fill => {
-            let factor = (dw / native_w).max(dh / native_h);
+            // Cover: `factor` is device px per image px, and the visible part
+            // of the image is `dest / factor` in image px. The window DPI
+            // factor cancels here (a cover crop is scale-invariant), so the
+            // ratio must use the raw image size: scoring it against the
+            // DPI-scaled `native_*` size divides the window by `dpi` again and
+            // makes `dest / factor` `dpi`x too large, which samples past the
+            // image and turns the uncovered band into clamped edge smear
+            // (#2278).
+            let factor = (dw / iw_f).max(dh / ih_f);
             let visible_w = dw / factor;
             let visible_h = dh / factor;
             Some(FitPlan {
@@ -2350,6 +2358,111 @@ mod tests {
         let stretch = fit_plan(BackgroundFit::Stretch, image, dest, 3.0).expect("stretch");
         assert_eq!(stretch.dest, dest);
         assert_eq!(stretch.src, [0.0, 0.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn fit_plan_fill_covers_within_image_bounds_at_any_dpi() {
+        // Regression (#2278): the 0.0.24 matrix host renders a 3840x2160
+        // wallpaper into a 2506x1496 device surface at dpi 1.6. Cover must
+        // crop the image, so its source window always stays inside the image
+        // and never relies on edge clamping (which smears the border pixels
+        // across the uncovered band).
+        let image = (3840_u32, 2160_u32);
+        let dest = RectPx::new(0, 0, 2506, 1496);
+        // Cover scale is device px per image px; the source window is
+        // `dest / scale` and the window DPI factor cancels entirely.
+        let expected_h = 2160.0_f64;
+        let expected_w = 2506.0_f64 / 1496.0 * expected_h;
+        for dpi in [1.0, 1.5, 1.6, 2.0, 3.0] {
+            let plan = fit_plan(BackgroundFit::Fill, image, dest, dpi).expect("cover plan");
+            assert_eq!(plan.dest, dest, "cover fills the whole content rect");
+            let [x, y, w, h] = plan.src;
+            assert!(
+                w <= 3840.0 + 1e-9 && h <= 2160.0 + 1e-9,
+                "cover source window must stay inside the image at dpi {dpi}: {plan:?}"
+            );
+            assert!(
+                x >= -1e-9 && y >= -1e-9,
+                "cover source origin must stay inside the image at dpi {dpi}: {plan:?}"
+            );
+            assert!(
+                (w - expected_w).abs() < 1e-6 && (h - expected_h).abs() < 1e-6,
+                "cover crop is scale-invariant at dpi {dpi}: {plan:?}"
+            );
+            assert!(
+                (x - (3840.0 - expected_w) * 0.5).abs() < 1e-6,
+                "cover crops evenly on both sides at dpi {dpi}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_plan_fit_is_contain_at_any_dpi() {
+        // Regression (#2278): `fit` is the contain mode and must letterbox the
+        // full image regardless of the window DPI factor.
+        let image = (3840_u32, 2160_u32);
+        let dest = RectPx::new(20, 30, 2506, 1496);
+        let expected_w = 2506_u32;
+        let expected_h = 1410_u32;
+        let expected_x = 20 + (2506 - expected_w) as i32 / 2;
+        let expected_y = 30 + (1496 - expected_h) as i32 / 2;
+        for dpi in [1.0, 1.5, 1.6, 2.0, 3.0] {
+            let plan = fit_plan(BackgroundFit::Fit, image, dest, dpi).expect("contain plan");
+            assert_eq!(
+                plan.dest,
+                RectPx::new(expected_x, expected_y, expected_w, expected_h),
+                "contain letterboxes the full image at dpi {dpi}"
+            );
+            assert_eq!(
+                plan.src,
+                [0.0, 0.0, 3840.0, 2160.0],
+                "contain samples the full image at dpi {dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_plan_fill_and_fit_are_not_interchangeable() {
+        // Mutation guard (#2278): swapping the two arms must fail, so the
+        // assertions pin cover (full dest, cropped source) against contain
+        // (letterboxed dest, full source) on an aspect-mismatched rect.
+        let image = (40_u32, 40_u32);
+        let dest = RectPx::new(0, 0, 100, 40);
+        let fill = fit_plan(BackgroundFit::Fill, image, dest, 2.0).expect("cover");
+        let fit = fit_plan(BackgroundFit::Fit, image, dest, 2.0).expect("contain");
+        assert_eq!(fill.dest, dest, "cover keeps the full dest rect");
+        assert_eq!(fill.src, [0.0, 12.0, 40.0, 16.0], "cover crops the source");
+        assert_eq!(fit.dest, RectPx::new(30, 0, 40, 40), "contain letterboxes");
+        assert_eq!(fit.src, [0.0, 0.0, 40.0, 40.0], "contain keeps the source");
+    }
+
+    #[test]
+    fn rasterize_fill_at_hidpi_does_not_clamp_edge_pixels() {
+        // Regression (#2278): at dpi 2 the cover source window used to be
+        // twice as wide as the image, so the rasterizer clamped the first and
+        // last source columns into 3-pixel smear bands. Cover must instead
+        // scale the whole image uniformly.
+        let image = BackgroundImage::try_new(
+            4,
+            2,
+            vec![
+                10, 0, 0, 0xFF, 20, 0, 0, 0xFF, 30, 0, 0, 0xFF, 40, 0, 0, 0xFF, // row 0
+                10, 0, 0, 0xFF, 20, 0, 0, 0xFF, 30, 0, 0, 0xFF, 40, 0, 0, 0xFF, // row 1
+            ],
+        )
+        .expect("image");
+        let dest = RectPx::new(0, 0, 8, 4);
+        let fill = rasterize_background(&image, BackgroundFit::Fill, dest, 2.0).expect("fill");
+        assert_eq!(fill.dest, dest);
+        for row in 0..4 {
+            let start = row * 8 * 4;
+            let reds: Vec<u8> = (0..8).map(|px| fill.rgba[start + px * 4]).collect();
+            assert_eq!(
+                reds,
+                vec![10, 10, 20, 20, 30, 30, 40, 40],
+                "row {row} must be a uniform 2x nearest-neighbor upscale, not edge smear"
+            );
+        }
     }
 
     #[test]

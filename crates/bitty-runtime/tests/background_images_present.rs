@@ -523,3 +523,63 @@ fn window_and_per_view_images_are_both_admitted() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 3x2 opaque PNG: column 0 solid green, column 1 solid red, column 2 solid
+/// blue (embedded so the DPI cover test is hermetic).
+const COLUMNS_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x9D, 0x74, 0x66,
+    0x1A, 0x00, 0x00, 0x00, 0x19, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60, 0x38, 0xC1, 0xF0,
+    0xFF, 0x04, 0x03, 0xC3, 0x7F, 0x06, 0x86, 0x13, 0xFF, 0x99, 0x18, 0x90, 0x00, 0x00, 0x64, 0xDE,
+    0x05, 0x58, 0xA0, 0x29, 0x38, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+    0x60, 0x82,
+];
+
+#[test]
+fn window_fill_cover_stays_inside_the_image_at_hidpi() {
+    // Regression (#2278): on a 1.6-scale surface (the 0.0.24 matrix host:
+    // 2506x1496 device px) `window.background_fit = "fill"` used to build a
+    // cover source window `dpi`x too wide. The image was clamped into smear
+    // bands and only covered 1/dpi of the width; `fit` (contain) looked like
+    // cover by comparison. Cover must span the full window and crop evenly.
+    let root = scratch("window-fill-hidpi");
+    let path = root.join("columns.png");
+    std::fs::write(&path, COLUMNS_PNG).expect("write fixture");
+    let mut rt = Runtime::new(RuntimeConfig {
+        window_background_image: Some(path.display().to_string()),
+        window_background_fit: "fill".to_string(),
+        window_background_opacity: 1.0,
+        window_background_position: "center".to_string(),
+        background_image_roots: vec![root.display().to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("approved window image builds");
+    single_leaf(&mut rt);
+    rt.apply_dpi_scale(1.6, Some(bitty_platform::PhysicalSize::new(2506, 1496)));
+    assert_eq!(rt.tick().expect("presents").backgrounds, 1);
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = usize::try_from(rt.surface_extent().expect("surface").width()).expect("width");
+    let frame = rt.present_frames()[0];
+    let pad = i64::from(rt.window_padding_physical());
+    let content_x = pad + i64::from(frame.content.x);
+    let content_w = i64::from(frame.content.width);
+    let y = pad + i64::from(frame.content.y) + i64::from(frame.content.height) / 2;
+    let at = |frac_num: i64| -> [u8; 4] {
+        let x = usize::try_from(content_x + content_w * frac_num / 100).expect("probe x");
+        probe(&rgba, width, x, usize::try_from(y).expect("probe y"))
+    };
+    // Covers the window: green/red/blue columns split the full width in
+    // thirds, so 8 % is green and 92 % is blue with no smear band.
+    assert_eq!(at(8), [0, 200, 0, 255], "left third is the image column 0");
+    assert_eq!(
+        at(92),
+        [0, 0, 200, 255],
+        "right third is the image column 2"
+    );
+    // 36 % and 64 % sit inside the middle third for a correct cover. The dpi
+    // double-count compressed the image to 62.5 % of the width, so those
+    // probes read the green/blue smear bands instead.
+    assert_eq!(at(36), [200, 0, 0, 255], "cover keeps the middle third");
+    assert_eq!(at(64), [200, 0, 0, 255], "cover keeps the middle third");
+    let _ = std::fs::remove_dir_all(&root);
+}

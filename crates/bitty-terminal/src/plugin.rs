@@ -604,10 +604,17 @@ pub fn plugin_help_text() -> String {
      \x20 ~/.config/bitty/...; an explicit --config path selects its own\n\
      \x20 directory). Never hand-edit it: it is the grant ledger, and a\n\
      \x20 malformed file fails closed.\n\
-     \x20 Per-plugin user files live next to it, one TOML file per plugin:\n\
+     \x20 Per-plugin user files live next to it, under plugins/.\n\
+     \x20 The canonical file is\n\
+     \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua: it returns a\n\
+     \x20 table and runs in a host-free, budgeted configuration VM. A\n\
+     \x20 <name>.lua short alias also works when exactly one discovered\n\
+     \x20 plugin claims that name. The legacy data-only form\n\
      \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.toml (flat\n\
-     \x20 `key = value` lines only; unknown keys are ignored, bad values\n\
-     \x20 fall back to the plugin's shipped defaults). Installed packages\n\
+     \x20 `key = value` lines only) applies only when no Lua file exists.\n\
+     \x20 Unknown keys are ignored, bad values fall back to the plugin's\n\
+     \x20 shipped defaults, and edits apply on the next activation, not\n\
+     \x20 live. Installed packages\n\
      \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
      \x20 (fallback ~/.local/share/...).\n\
      \x20 After a fresh local, Git, or archive install, the plugin is staged and\n\

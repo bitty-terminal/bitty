@@ -14,8 +14,8 @@
 //! |--------------|--------------------------------------------------------|
 //! | `top`        | top edge band                                          |
 //! | `bottom`     | bottom edge band                                       |
-//! | `left`       | left edge band — stored, not painted until vertical bands ship |
-//! | `right`      | right edge band — stored, not painted until vertical bands ship |
+//! | `left`       | rejected: no vertical band host in this build          |
+//! | `right`      | rejected: no vertical band host in this build          |
 //! | `tabline`    | rejected: reserved for PW-10 panel tabs, not a band surface |
 //! | `overlay`    | Core focusable-overlay host (CTX-0941): retained, not a band surface |
 //! | `terminal`   | rejected: no terminal-attached block host yet          |
@@ -61,9 +61,9 @@ pub enum BandEdge {
     Top,
     /// Bottom edge (full window width).
     Bottom,
-    /// Left edge (vertical bands are not painted yet).
+    /// Left edge (no vertical band host in this build; mounts fail closed).
     Left,
-    /// Right edge (vertical bands are not painted yet).
+    /// Right edge (no vertical band host in this build; mounts fail closed).
     Right,
 }
 
@@ -88,8 +88,12 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
     match slot {
         UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
         UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
-        UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
-        UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
+        // CTX-1341: no vertical band host exists yet. Admitting these mounts
+        // would return a handle the renderer can never paint, reserve, or
+        // hit-test, so they fail closed at mount time instead.
+        UiSlot::Left | UiSlot::Right => {
+            UiSlotPlacement::Unsupported("has no vertical band host in this build yet")
+        }
         UiSlot::Tabline => UiSlotPlacement::Unsupported(
             "is reserved for panel tabs (PW-10) and has no host surface yet",
         ),
@@ -224,10 +228,8 @@ mod tests {
             let expected = match slot {
                 UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
                 UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
-                UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
-                UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
                 UiSlot::Overlay => UiSlotPlacement::Overlay,
-                UiSlot::Tabline | UiSlot::Terminal => {
+                UiSlot::Left | UiSlot::Right | UiSlot::Tabline | UiSlot::Terminal => {
                     assert!(matches!(
                         ui_slot_placement(slot),
                         UiSlotPlacement::Unsupported(_)
@@ -245,8 +247,6 @@ mod tests {
             block("a", UiSlot::Top),
             block("b", UiSlot::Bottom),
             block("c", UiSlot::Bottom),
-            block("d", UiSlot::Left),
-            block("e", UiSlot::Right),
         ]);
         assert_eq!(unplaced, 0);
         let ids = |edge| {
@@ -261,8 +261,26 @@ mod tests {
             ids(BandEdge::Bottom),
             [("b", UiSlot::Bottom), ("c", UiSlot::Bottom)]
         );
-        assert_eq!(ids(BandEdge::Left), [("d", UiSlot::Left)]);
-        assert_eq!(ids(BandEdge::Right), [("e", UiSlot::Right)]);
+        assert!(ids(BandEdge::Left).is_empty());
+        assert!(ids(BandEdge::Right).is_empty());
+    }
+
+    #[test]
+    fn vertical_slots_are_unsupported_and_never_routed_to_a_band() {
+        // CTX-1341: left/right used to map to a band that nothing painted.
+        // The placement policy now fails closed at mount, and any block that
+        // somehow reaches routing is counted as unplaced rather than stored.
+        for slot in [UiSlot::Left, UiSlot::Right] {
+            let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(slot) else {
+                panic!("{slot} must be unsupported");
+            };
+            assert!(reason.contains("vertical band"));
+        }
+        let (bands, unplaced) =
+            ChromeBands::from_mounts([block("l", UiSlot::Left), block("r", UiSlot::Right)]);
+        assert_eq!(unplaced, 2);
+        assert!(bands.top.is_empty() && bands.bottom.is_empty());
+        assert!(bands.left.is_empty() && bands.right.is_empty());
     }
 
     #[test]
@@ -318,13 +336,15 @@ mod tests {
 
     #[test]
     fn unsupported_error_is_typed() {
-        let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(UiSlot::Tabline) else {
-            panic!("tabline must be unsupported");
-        };
-        let error = unsupported_slot_error(UiSlot::Tabline, reason);
-        assert_eq!(error.code, E_UI_UNAVAILABLE);
-        assert_eq!(error.class, "runtime");
-        assert!(error.message.contains("'tabline'"));
-        assert!(error.message.contains(reason));
+        for slot in [UiSlot::Tabline, UiSlot::Left, UiSlot::Right] {
+            let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(slot) else {
+                panic!("{slot} must be unsupported");
+            };
+            let error = unsupported_slot_error(slot, reason);
+            assert_eq!(error.code, E_UI_UNAVAILABLE);
+            assert_eq!(error.class, "runtime");
+            assert!(error.message.contains(&format!("'{slot}'")));
+            assert!(error.message.contains(reason));
+        }
     }
 }

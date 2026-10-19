@@ -3749,6 +3749,10 @@ impl Runtime {
         let default_bg = self.config.theme.background;
 
         // Owned snapshot first: the renderer takes `&mut self` below.
+        //
+        // Only horizontal edges exist here: `ui_slot_placement` rejects
+        // `left`/`right` at mount until a vertical band host ships
+        // (CTX-1341), so no vertical block can reach the paint plan.
         let mut plan: Vec<(BandEdge, u16, super::BandContent)> = Vec::new();
         for edge in [BandEdge::Top, BandEdge::Bottom] {
             for (index, band) in self.visible_edge_bands(edge).into_iter().enumerate() {

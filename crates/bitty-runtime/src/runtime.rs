@@ -394,9 +394,11 @@ pub struct ChromeBands {
     pub top: Vec<BandContent>,
     /// Bottom edge bands (index `0` at the window bottom, stacking upward).
     pub bottom: Vec<BandContent>,
-    /// Left edge bands (stacked left-to-right, deferred for v0.1).
+    /// Left edge bands (unused: no vertical band host yet; `left` mounts
+    /// fail closed at mount time under CTX-1341).
     pub left: Vec<BandContent>,
-    /// Right edge bands (stacked right-to-left, deferred for v0.1).
+    /// Right edge bands (unused: no vertical band host yet; `right` mounts
+    /// fail closed at mount time under CTX-1341).
     pub right: Vec<BandContent>,
 }
 
@@ -405,8 +407,9 @@ pub struct ChromeBands {
 pub struct BandContent {
     /// Owning plugin id.
     pub plugin_id: String,
-    /// Accepted slot the block was mounted into (`top`, `bottom`,
-    /// `left`, or `right`; see [`band_slots`]).
+    /// Accepted slot the block was mounted into (`top` or `bottom`;
+    /// `left`/`right` fail closed at mount until vertical bands ship; see
+    /// [`band_slots`]).
     pub slot: bitty_lua::ui::UiSlot,
     /// Root UiNode tree.
     pub root: bitty_lua::ui::UiNode,
@@ -633,8 +636,9 @@ pub struct Runtime {
     ///
     /// Populated from `PluginRuntime::ui_blocks()` each tick after plugin
     /// runtime tick, before present. Bands are reserved for plugins that
-    /// mount `UiNode` trees to top/bottom/left/right slots via
-    /// `bitty.ui.mount(slot, tree)`. Empty edges reserve no band. The
+    /// mount `UiNode` trees to top/bottom slots via `bitty.ui.mount(slot,
+    /// tree)`; left/right mounts fail closed until vertical bands ship.
+    /// Empty edges reserve no band. The
     /// container rect is computed from window_cells minus all reserved bands.
     /// Presentation-only: never grid truth.
     chrome_bands: ChromeBands,

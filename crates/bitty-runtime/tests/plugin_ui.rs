@@ -538,8 +538,6 @@ fn lua_band_slot_mounts_land_in_the_expected_band() {
         bitty.ui.mount("bottom", { kind = "Text", text = "status" })
         bitty.ui.mount("top", { kind = "Text", text = "top" })
         bitty.ui.mount("bottom", { kind = "Text", text = "bottom" })
-        bitty.ui.mount("left", { kind = "Text", text = "left" })
-        bitty.ui.mount("right", { kind = "Text", text = "right" })
         local ok, err = pcall(bitty.ui.mount, "nowhere", { kind = "Text", text = "x" })
         bitty.store.set("unknown_code", ok and "NONE" or err.code)
         return {}
@@ -567,8 +565,56 @@ fn lua_band_slot_mounts_land_in_the_expected_band() {
     assert_eq!(slots(BandEdge::Top), [UiSlot::Top]);
     // One plugin, two bottom-edge mounts: mount order is kept.
     assert_eq!(slots(BandEdge::Bottom), [UiSlot::Bottom, UiSlot::Bottom]);
-    assert_eq!(slots(BandEdge::Left), [UiSlot::Left]);
-    assert_eq!(slots(BandEdge::Right), [UiSlot::Right]);
+    assert!(slots(BandEdge::Left).is_empty());
+    assert!(slots(BandEdge::Right).is_empty());
+}
+
+/// CTX-1341 / #2226: `left` and `right` used to return a successful handle
+/// even though the renderer never painted them, reserved no columns, and had
+/// no hit target. They now fail closed at mount with the existing typed
+/// `E_UI_UNAVAILABLE` code, so silent success is impossible.
+#[test]
+fn vertical_band_slots_fail_closed_at_mount() {
+    let fixture = Fixture::activate(
+        "vertical-slots",
+        "bitty-featured.uivertical",
+        &["ui.rich"],
+        &[],
+        r#"
+        local left_ok, left_err = pcall(bitty.ui.mount, "left", { kind = "Text", text = "left" })
+        local right_ok, right_err = pcall(bitty.ui.mount, "right", { kind = "Text", text = "right" })
+        bitty.store.set("left_ok", left_ok)
+        bitty.store.set("left_code", left_ok and "NONE" or left_err.code)
+        bitty.store.set("left_message", left_ok and "" or left_err.message)
+        bitty.store.set("right_ok", right_ok)
+        bitty.store.set("right_code", right_ok and "NONE" or right_err.code)
+        bitty.store.set("right_message", right_ok and "" or right_err.message)
+        return {}
+        "#,
+    );
+
+    for slot in ["left", "right"] {
+        assert_eq!(
+            store_value(&fixture.runtime, &fixture.id, &format!("{slot}_ok")),
+            Some(LuaValue::Bool(false)),
+            "{slot} mount must not succeed silently"
+        );
+        assert_eq!(
+            store_value(&fixture.runtime, &fixture.id, &format!("{slot}_code")),
+            Some(LuaValue::String(E_UI_UNAVAILABLE.to_string())),
+            "{slot} mount must fail with the typed code"
+        );
+        let message = store_value(&fixture.runtime, &fixture.id, &format!("{slot}_message"));
+        let Some(LuaValue::String(message)) = message else {
+            panic!("{slot} mount must carry an error message");
+        };
+        assert!(message.contains(&format!("'{slot}'")), "{message}");
+        assert!(message.contains("vertical band"), "{message}");
+    }
+
+    // Nothing was retained: a rejected mount leaves no phantom block that
+    // could later be painted or routed.
+    assert!(fixture.runtime.ui_blocks().is_empty());
 }
 
 #[test]

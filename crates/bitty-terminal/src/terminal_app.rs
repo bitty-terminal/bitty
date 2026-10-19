@@ -1274,12 +1274,11 @@ impl TerminalApp {
         // Cold-tick only, never the input hot path (P0-AC-015); no-op
         // without a plugin runtime or armed timers.
         self.pump_plugin_timers();
-        // CTX-1327 (issue #2213, P0-AC-015): deliver Core-routed plugin band
-        // clicks/scrolls queued by the input callback. `handle_event` only
-        // enqueues into the runtime's bounded band queues; the owning-VM
-        // dispatch runs here on the cold tick, never on the input hot path,
-        // so input never enters a plugin VM synchronously.
-        self.deliver_band_input();
+        // CTX-1332 (issue #2213, P0-AC-015): input-triggered band commands are
+        // NOT delivered from this render/terminal tick. The cold delivery
+        // pump runs only from the `AboutToWait` arm after this tick returns
+        // (see `pump_cold_commands`), so redraw, PTY-readable, resize, and
+        // appearance arms never enter an owning plugin VM.
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
@@ -1592,17 +1591,34 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
             return;
         };
-        let blocks = plugin_runtime.ui_blocks();
+        // CTX-1332 C-D4: project the live mount registry with generation-owned
+        // handles so Runtime can capture an origin per painted band. The
+        // public `ui_blocks` shape and `ChromeBands::from_mounts` stay
+        // unchanged.
+        let blocks = plugin_runtime.ui_blocks_with_handles();
+        let mounts = blocks
+            .iter()
+            .map(
+                |(id, slot, _node, version, generation, handle)| bitty_runtime::BandMount {
+                    plugin_id: id.to_string(),
+                    slot: *slot,
+                    version: *version,
+                    generation: *generation,
+                    handle: *handle,
+                },
+            )
+            .collect();
         // CTX-0923: slot routing and stacking live in one place
         // (`bitty_runtime::ui_slot_placement` via `ChromeBands::from_mounts`),
         // the same policy the `ui.mount` gate uses: `bottom` mounts join the
         // bottom band, `tabline`/`terminal` mounts are rejected at mount time
         // with `E_UI_UNAVAILABLE`, and the focusable `overlay` slot (CTX-0941)
         // is hosted by the overlay surface rather than this band renderer.
-        let (bands, unplaced) =
-            bitty_runtime::ChromeBands::from_mounts(blocks.into_iter().map(
-                |(plugin_id, slot, node, version)| (plugin_id.to_string(), slot, node, version),
-            ));
+        let (bands, unplaced) = bitty_runtime::ChromeBands::from_mounts(blocks.into_iter().map(
+            |(plugin_id, slot, node, version, _generation, _handle)| {
+                (plugin_id.to_string(), slot, node, version)
+            },
+        ));
         if unplaced > 0
             && !UNPLACED_UI_BLOCK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -1612,7 +1628,10 @@ impl TerminalApp {
                 format!("bitty: {unplaced} mounted UI block(s) in an unhosted slot were not placed")
             });
         }
-        self.runtime.set_chrome_bands(bands);
+        // CTX-1332 C-D4/C-D5: set bands and the live origin projection
+        // atomically; this also eagerly cancels queued/armed admissions whose
+        // origin is no longer live without clearing the release swallow.
+        self.runtime.set_chrome_bands_with_mounts(bands, mounts);
     }
 
     /// Focusable-overlay transient input-capture application wiring (CTX-0943,
@@ -1863,13 +1882,32 @@ impl TerminalApp {
     /// Dispatches one Core-routed plugin band click (CTX-0946 C1).
     ///
     /// The click carries the band owner's declared command verb plus its
-    /// declared args as one named table (`run({id = 3})`). Fail-closed with
-    /// a loud diagnostic when the plugin id is invalid, the runtime is
-    /// gone, or the dispatch itself fails (unregistered verb, faulting
-    /// handler): the click is dropped and terminal state is untouched.
-    /// CTX-1033 (issue #1827): a successful dispatch surfaces its result on
-    /// the banner via [`Self::surface_dispatch_result`].
-    pub(crate) fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) {
+    /// declared args as one named table (`run({id = 3})`) and the origin
+    /// captured when the gesture was armed. Production callers only reach the
+    /// origin-validated path; a request without an origin is legacy/test-only
+    /// and is refused outside unit tests, so it can never mint an executable
+    /// action (CTX-1332 C-D4).
+    #[cfg(test)]
+    pub(crate) fn dispatch_band_click(&mut self, click: bitty_runtime::BandClickRequest) -> bool {
+        let Some(origin) = click.origin.clone() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' dropped (no presented origin)",
+                    click.plugin_id, click.command
+                )
+            });
+            return self.dispatch_band_click_legacy(click);
+        };
+        self.dispatch_band_click_with_origin(click, &origin)
+    }
+
+    /// Dispatches one origin-validated band click through the Active-only UI
+    /// entry (CTX-1332 C-D5/C-D6).
+    fn dispatch_band_click_with_origin(
+        &mut self,
+        click: bitty_runtime::BandClickRequest,
+        origin: &bitty_runtime::BandOrigin,
+    ) -> bool {
         let id = match bitty_plugin_host::manifest::PluginId::new(&click.plugin_id) {
             Ok(id) => id,
             Err(error) => {
@@ -1879,7 +1917,7 @@ impl TerminalApp {
                         click.plugin_id
                     )
                 });
-                return;
+                return false;
             }
         };
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
@@ -1889,15 +1927,12 @@ impl TerminalApp {
                     click.plugin_id, click.command
                 )
             });
-            return;
+            return false;
         };
         let args = bitty_runtime::band_click_args_table(&click.args);
-        let outcome = plugin_runtime.dispatch_command(&id, &click.command, &[args]);
+        let outcome = plugin_runtime.dispatch_ui_command(&id, &click.command, &[args], origin);
         match outcome {
             Ok(result) => {
-                // CTX-1033 (issue #1827): the dispatch result is user-visible
-                // output (user-paced gesture, never a hot loop); failures
-                // below stay loud and never disturb terminal state.
                 self.surface_dispatch_result(&click.plugin_id, &click.command, &result);
             }
             Err(error) => {
@@ -1909,6 +1944,52 @@ impl TerminalApp {
                 });
             }
         }
+        true
+    }
+
+    /// Legacy unfenced click dispatch for unit fixtures that predate the
+    /// presentation fence (CTX-1327 result-surfacing coverage). Never built
+    /// into production: `dispatch_band_click` reaches it only under
+    /// `cfg(test)`.
+    #[cfg(test)]
+    fn dispatch_band_click_legacy(&mut self, click: bitty_runtime::BandClickRequest) -> bool {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&click.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band click from '{}' dropped (invalid plugin id: {error})",
+                        click.plugin_id
+                    )
+                });
+                return false;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band click '{}:{}' dropped (plugin runtime is gone)",
+                    click.plugin_id, click.command
+                )
+            });
+            return false;
+        };
+        let args = bitty_runtime::band_click_args_table(&click.args);
+        let outcome = plugin_runtime.dispatch_command(&id, &click.command, &[args]);
+        match outcome {
+            Ok(result) => {
+                self.surface_dispatch_result(&click.plugin_id, &click.command, &result);
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band click '{}:{}' refused ({error})",
+                        click.plugin_id, click.command
+                    )
+                });
+            }
+        }
+        true
     }
 
     /// Dispatches one Core-routed plugin band scroll (CTX-1190, issue #2008).
@@ -1916,12 +1997,33 @@ impl TerminalApp {
     /// The scroll carries the band owner's declared command verb plus its
     /// declared args merged with the host-computed `delta` step as one named
     /// table (`run({id = 3, delta = 1})`; see
-    /// [`bitty_runtime::band_scroll_args_table`]). Fail-closed with a loud
-    /// diagnostic when the plugin id is invalid, the runtime is gone, or the
-    /// dispatch itself fails (unregistered verb, faulting handler): the
-    /// scroll is dropped and terminal state is untouched. A successful
-    /// dispatch surfaces its result on the banner like a band click.
-    pub(crate) fn dispatch_band_scroll(&mut self, scroll: bitty_runtime::BandScrollRequest) {
+    /// [`bitty_runtime::band_scroll_args_table`]). A request without a
+    /// presented origin is legacy/test-only and refused outside unit tests
+    /// (CTX-1332 C-D4).
+    #[cfg(test)]
+    pub(crate) fn dispatch_band_scroll(
+        &mut self,
+        scroll: bitty_runtime::BandScrollRequest,
+    ) -> bool {
+        let Some(origin) = scroll.origin.clone() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band scroll '{}:{}' dropped (no presented origin)",
+                    scroll.plugin_id, scroll.command
+                )
+            });
+            return self.dispatch_band_scroll_legacy(scroll);
+        };
+        self.dispatch_band_scroll_with_origin(scroll, &origin)
+    }
+
+    /// Dispatches one origin-validated band scroll through the Active-only UI
+    /// entry (CTX-1332 C-D5/C-D6).
+    fn dispatch_band_scroll_with_origin(
+        &mut self,
+        scroll: bitty_runtime::BandScrollRequest,
+        origin: &bitty_runtime::BandOrigin,
+    ) -> bool {
         let id = match bitty_plugin_host::manifest::PluginId::new(&scroll.plugin_id) {
             Ok(id) => id,
             Err(error) => {
@@ -1931,7 +2033,7 @@ impl TerminalApp {
                         scroll.plugin_id
                     )
                 });
-                return;
+                return false;
             }
         };
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
@@ -1941,7 +2043,50 @@ impl TerminalApp {
                     scroll.plugin_id, scroll.command
                 )
             });
-            return;
+            return false;
+        };
+        let args = bitty_runtime::band_scroll_args_table(&scroll.args, scroll.delta);
+        let outcome = plugin_runtime.dispatch_ui_command(&id, &scroll.command, &[args], origin);
+        match outcome {
+            Ok(result) => {
+                self.surface_dispatch_result(&scroll.plugin_id, &scroll.command, &result);
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band scroll '{}:{}' refused ({error})",
+                        scroll.plugin_id, scroll.command
+                    )
+                });
+            }
+        }
+        true
+    }
+
+    /// Legacy unfenced scroll dispatch for unit fixtures that predate the
+    /// presentation fence. Never built into production.
+    #[cfg(test)]
+    fn dispatch_band_scroll_legacy(&mut self, scroll: bitty_runtime::BandScrollRequest) -> bool {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&scroll.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band scroll from '{}' dropped (invalid plugin id: {error})",
+                        scroll.plugin_id
+                    )
+                });
+                return false;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band scroll '{}:{}' dropped (plugin runtime is gone)",
+                    scroll.plugin_id, scroll.command
+                )
+            });
+            return false;
         };
         let args = bitty_runtime::band_scroll_args_table(&scroll.args, scroll.delta);
         let outcome = plugin_runtime.dispatch_command(&id, &scroll.command, &[args]);
@@ -1958,31 +2103,80 @@ impl TerminalApp {
                 });
             }
         }
+        true
     }
 
-    /// Delivers Core-routed plugin band clicks and scrolls queued by input
-    /// (CTX-1327, issue #2213).
+    /// Runs the exclusive cold delivery phase (CTX-1332, C-D1/C-D4/C-D5).
     ///
-    /// The runtime owns the geometry (which band row, which declared
-    /// command/scroll target); the input callback only enqueues into its
-    /// bounded band queues. This cold pump drains them (at most the bounded
-    /// capacity, in press/tick order) and dispatches each through the normal
-    /// [`Self::dispatch_band_click`] / [`Self::dispatch_band_scroll`] path,
-    /// where registration and capability gates fail closed as usual.
-    /// Cold-tick only, never the input hot path (P0-AC-015), so an enabled
-    /// plugin VM is never entered synchronously from input. Returns the number
-    /// of requests delivered.
-    pub(crate) fn deliver_band_input(&mut self) -> usize {
-        let clicks = self.runtime.drain_band_clicks();
-        let scrolls = self.runtime.drain_band_scrolls();
-        let delivered = clicks.len().saturating_add(scrolls.len());
-        for click in clicks {
-            self.dispatch_band_click(click);
+    /// Called from exactly one place: the `AboutToWait` arm, after
+    /// [`Self::drive_tick`] has returned (present, IME sync, reply flush, and
+    /// runtime events are committed) and never from redraw, PTY-readable,
+    /// resize/DPI, headless `Resumed`, appearance, input, timers, overlays,
+    /// runtime events, config watcher, or global IPC. Input only enqueues; the
+    /// owning VM is entered here, on the cold phase.
+    ///
+    /// Selection is bounded by [`bitty_runtime::COLD_ADMISSION_SELECTION_MAX`]
+    /// (the literal 16 = 8 + 8 from the existing band queue caps), enforced
+    /// over the combined click/scroll/invalid-retry work; the unselected tail
+    /// stays queued. Each selected request is re-validated against the live
+    /// presented origin before the VM borrow. Returns the number of attempts
+    /// that reached dispatch (including refusals).
+    pub(crate) fn pump_cold_commands(&mut self) -> usize {
+        let admissions = self
+            .runtime
+            .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);
+        let mut attempted = 0usize;
+        for admission in admissions {
+            match admission {
+                bitty_runtime::BandAdmission::Click(click) => {
+                    let Some(origin) = click.origin.clone() else {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: cold click '{}:{}' dropped (no presented origin)",
+                                click.plugin_id, click.command
+                            )
+                        });
+                        continue;
+                    };
+                    if !self.runtime.band_origin_is_current(&origin) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: cold click '{}:{}' dropped (origin is stale)",
+                                click.plugin_id, click.command
+                            )
+                        });
+                        continue;
+                    }
+                    if self.dispatch_band_click_with_origin(click, &origin) {
+                        attempted = attempted.saturating_add(1);
+                    }
+                }
+                bitty_runtime::BandAdmission::Scroll(scroll) => {
+                    let Some(origin) = scroll.origin.clone() else {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: cold scroll '{}:{}' dropped (no presented origin)",
+                                scroll.plugin_id, scroll.command
+                            )
+                        });
+                        continue;
+                    };
+                    if !self.runtime.band_origin_is_current(&origin) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: cold scroll '{}:{}' dropped (origin is stale)",
+                                scroll.plugin_id, scroll.command
+                            )
+                        });
+                        continue;
+                    }
+                    if self.dispatch_band_scroll_with_origin(scroll, &origin) {
+                        attempted = attempted.saturating_add(1);
+                    }
+                }
+            }
         }
-        for scroll in scrolls {
-            self.dispatch_band_scroll(scroll);
-        }
-        delivered
+        attempted
     }
 
     /// Empty args value for argument-free host-mediated invocations
@@ -2914,13 +3108,13 @@ impl AppHandler for TerminalApp {
         // else the focused pane's `OSC 22` shape, else `Default`.
         // Change-gated inside, so steady hover costs no OS call.
         self.sync_cursor_icon();
-        // CTX-1327 (issue #2213, P0-AC-015): Core-routed plugin band clicks
+        // CTX-1332 (issue #2213, P0-AC-015): Core-routed plugin band clicks
         // (CTX-0946 C1) and scrolls (CTX-1190 / #2008) are queued by the
         // runtime here but deliberately NOT dispatched from this input
         // callback. Routing already resolved the band owner and declared
         // command into the runtime's bounded, fail-closed queues; the owning
-        // plugin VM is entered only on the cold tick pump
-        // ([`Self::deliver_band_input`], called from [`Self::drive_tick`]).
+        // plugin VM is entered only by the exclusive cold pump
+        // ([`Self::pump_cold_commands`], called from the `AboutToWait` arm).
         // This keeps the input hot path free of synchronous owning-VM
         // execution: the invariant issue #2213 flags.
         // CTX-0370: a window-close request that did not exit armed a bounded
@@ -3104,7 +3298,15 @@ impl AppHandler for TerminalApp {
                     ctx.exit();
                     return;
                 }
-                if self.drive_tick().is_some() {
+                // CTX-1332 C-D1: this is the only cold-delivery phase. Tick
+                // first so workspace/pin/FX/theme/submit/timer/overlay/
+                // notification/presentation work and the post-present reply
+                // flush are committed, then pump input-triggered plugin
+                // commands. Redraw/PTY-readable/resize/appearance arms never
+                // reach this pump.
+                let presented = self.drive_tick().is_some();
+                let delivered = self.pump_cold_commands();
+                if presented || delivered > 0 {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();
                     }

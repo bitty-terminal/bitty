@@ -28,7 +28,7 @@ mod input_vm_boundary {
     use bitty_platform::app::RecordingOperation;
     use bitty_platform::{
         AppHandler, CursorPosition, EventContext, ModifiersState, MouseButton, MouseEvent,
-        PressState, ScrollDelta, WindowId,
+        PhysicalSize, PressState, ScrollDelta, SystemAppearance, WindowId,
     };
     use bitty_plugin_host::manifest::PluginId;
     use bitty_runtime::plugin_runtime::{
@@ -133,19 +133,15 @@ return {}
             )
             .with_plugin_runtime(Some(plugins));
             app.set_session_persistence(false);
-            // Present the actual mounted tree without invoking startup or
-            // the application cold pump (no delivery mechanism is selected).
-            let blocks = app.plugin_runtime.as_ref().expect("plugins").ui_blocks();
-            let (bands, unplaced) = bitty_runtime::ChromeBands::from_mounts(
-                blocks
-                    .into_iter()
-                    .map(|(id, slot, node, version)| (id.to_string(), slot, node, version)),
+            // Present the actual mounted tree through the production tick so
+            // the band origin is captured and published exactly as in a real
+            // frame (CTX-1332 C-D4). No delivery is selected by this setup.
+            let _ = app.drive_tick();
+            assert_eq!(
+                app.runtime.published_band_origins().len(),
+                1,
+                "real authorized mount presented an executable origin"
             );
-            assert_eq!(unplaced, 0);
-            app.runtime.set_chrome_bands(bands);
-            app.runtime
-                .tick()
-                .expect("deterministic mount presentation");
             let fixture = Self {
                 app,
                 id,
@@ -180,6 +176,56 @@ return {}
             let after = self.entries();
             self.assert_no_sinks();
             after.checked_sub(before).expect("monotonic VM counter")
+        }
+
+        /// Drives one non-input platform event through the real `AppHandler`.
+        ///
+        /// Loop-control operations (`Poll`/`Wait`/`WaitUntil`) are expected
+        /// from `AboutToWait`; every sink operation must stay absent.
+        fn platform_event(&mut self, event: PlatformEvent) -> u64 {
+            self.operations.borrow_mut().clear();
+            let before = self.entries();
+            let mut context = EventContext::recording(&self.operations);
+            <TerminalApp as AppHandler>::handle_event(&mut self.app, &mut context, event);
+            let after = self.entries();
+            assert!(self.app.window.handle.is_none());
+            assert!(self.app.window.os_title_sink.is_none());
+            assert!(self.app.window.os_cursor_sink.is_none());
+            assert!(self.app.pty_rx.is_none());
+            assert!(self.app._pty_thread.is_none());
+            for operation in self.operations.borrow().iter() {
+                assert!(
+                    matches!(
+                        operation,
+                        RecordingOperation::Poll
+                            | RecordingOperation::Wait
+                            | RecordingOperation::WaitUntil(_)
+                    ),
+                    "unexpected sink operation: {operation:?}"
+                );
+            }
+            self.operations.borrow_mut().clear();
+            after.checked_sub(before).expect("monotonic VM counter")
+        }
+
+        /// Queues exactly one bound wheel admission through the real input
+        /// callback, with the cursor on the mounted band's bound column.
+        fn queue_bound_wheel(&mut self) {
+            self.cursor(BOUND_COLUMN);
+            let routed = self.app.runtime.band_host_stats().scrolls_routed;
+            assert_eq!(
+                self.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
+                    0.0,
+                    WHEEL_NOTCH
+                ))),
+                0,
+                "queueing must not enter the owning VM"
+            );
+            assert_eq!(
+                self.app.runtime.band_host_stats().scrolls_routed,
+                routed + 1,
+                "one admission queued"
+            );
         }
 
         fn cursor(&mut self, column: u16) {
@@ -312,7 +358,7 @@ return {}
         // (b) exactly-once later cold delivery: the distinct cold pump enters
         // the VM once and the queued command's bounded result surfaces.
         assert_eq!(
-            fixture.app.deliver_band_input(),
+            fixture.app.pump_cold_commands(),
             1,
             "one bounded request queued by the accepted input"
         );
@@ -329,7 +375,7 @@ return {}
         );
         // A second pump must not replay the already-consumed request.
         assert_eq!(
-            fixture.app.deliver_band_input(),
+            fixture.app.pump_cold_commands(),
             0,
             "cold pump delivers exactly once"
         );
@@ -373,12 +419,128 @@ return {}
         );
         assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 1);
         assert_eq!(fixture.entries(), before, "no VM entry during input");
-        assert_eq!(fixture.app.deliver_band_input(), 1, "one deferred delivery");
+        assert_eq!(fixture.app.pump_cold_commands(), 1, "one deferred delivery");
         assert_eq!(fixture.entries(), before + 1, "exactly one VM entry");
-        assert_eq!(fixture.app.deliver_band_input(), 0, "no replay");
+        assert_eq!(fixture.app.pump_cold_commands(), 0, "no replay");
         assert_eq!(fixture.entries(), before + 1, "still exactly one");
         assert_eq!(fixture.read_marker(), 1);
         println!("coldpump: input delta=0; cold pump delta=1 exactly once; marker=1");
+    }
+
+    #[test]
+    fn input_vm_boundary_about_to_wait_is_the_only_cold_phase() {
+        // CTX-1332 C-D1 phase gate (R-1/A-1): drive the real `AppHandler`.
+        // The first AboutToWait delivers exactly one owning-VM entry. A second
+        // AboutToWait with an empty queue must not replay it. Every prohibited
+        // arm (redraw, PTY-readable, resize, appearance) is probed with one
+        // admission queued immediately before it: zero VM entries and the
+        // admission must still be queued (proved by a following AboutToWait
+        // delivering exactly one).
+        let mut fixture = Fixture::new("phase");
+        let mut effective = bitty_config::EffectiveConfig::default();
+        effective.appearance.theme = Some("light:github-light,dark:dracula".to_string());
+        crate::config_reload::install_with(
+            effective.clone(),
+            Box::new(move || Ok(effective.clone())),
+            None,
+        );
+
+        // (1) First AboutToWait: exactly one owning-VM entry.
+        fixture.queue_bound_wheel();
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            1,
+            "AboutToWait must deliver the queued admission once"
+        );
+
+        // (2) Second AboutToWait with an empty queue: no replay.
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            0,
+            "a consumed admission must not replay"
+        );
+
+        let extent = fixture
+            .app
+            .runtime
+            .surface_extent()
+            .expect("headless surface extent");
+        let probes = [
+            (
+                "RedrawRequested",
+                PlatformEvent::Window {
+                    window_id: WindowId::from_raw_public(1),
+                    kind: WindowEventKind::RedrawRequested,
+                },
+            ),
+            ("PtyReadable", PlatformEvent::PtyReadable),
+            (
+                "Resized",
+                PlatformEvent::Window {
+                    window_id: WindowId::from_raw_public(1),
+                    kind: WindowEventKind::Resized(PhysicalSize::new(
+                        extent.width(),
+                        extent.height(),
+                    )),
+                },
+            ),
+            (
+                "SystemAppearanceChanged",
+                PlatformEvent::SystemAppearanceChanged(SystemAppearance::Light),
+            ),
+        ];
+
+        // (3) Prohibited arms: queue immediately before each probe, assert
+        // zero entries, then prove the admission is still queued.
+        for (name, probe) in probes {
+            let theme_before = fixture.app.runtime.config().theme;
+            fixture.queue_bound_wheel();
+            assert_eq!(
+                fixture.platform_event(probe),
+                0,
+                "{name} must not enter the owning VM"
+            );
+            if name == "SystemAppearanceChanged" {
+                assert_ne!(
+                    fixture.app.runtime.config().theme,
+                    theme_before,
+                    "the appearance probe must reach drive_tick, not early-return"
+                );
+            }
+            assert_eq!(
+                fixture.platform_event(PlatformEvent::AboutToWait),
+                1,
+                "{name} must not drain the queued admission"
+            );
+        }
+        crate::config_reload::clear();
+    }
+
+    #[test]
+    fn input_vm_boundary_suspend_cancels_queued_delivery() {
+        // CTX-1332 C-D5: an app-observed lifecycle transition (suspend drops
+        // the mounts) eagerly cancels the queued admission, and the cold pump
+        // enters no VM. The release swallow is owned separately and is not
+        // cleared by this cancellation path.
+        let mut fixture = Fixture::new("suspend-phase");
+        fixture.queue_bound_wheel();
+        fixture
+            .app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugins")
+            .suspend(&fixture.id)
+            .expect("suspend fixture");
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            0,
+            "a suspended generation must not enter the owning VM"
+        );
+        assert_eq!(
+            fixture.platform_event(PlatformEvent::AboutToWait),
+            0,
+            "the cancelled admission never replays"
+        );
     }
 
     #[test]
@@ -470,7 +632,7 @@ return {}
         );
         assert_eq!(fixture.entries(), before);
         assert_eq!(
-            fixture.app.deliver_band_input(),
+            fixture.app.pump_cold_commands(),
             0,
             "fall-through queued nothing for the cold pump"
         );
@@ -10724,6 +10886,8 @@ events = []
         plugin_id: id.to_string(),
         command: "report".to_string(),
         args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+        origin: None,
+        admission_seq: 0,
     });
     assert_eq!(
         app.runtime.notification_banner().as_deref(),
@@ -10865,6 +11029,8 @@ events = []
         plugin_id: id.to_string(),
         command: "focus".to_string(),
         args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+        origin: None,
+        admission_seq: 0,
     });
     assert_eq!(
         app.runtime.notification_banner(),
@@ -10984,6 +11150,8 @@ events = []
         command: "scroll".to_string(),
         args: vec![("step".to_string(), bitty_lua::ui::ClickArg::Number(2.0))],
         delta: 3,
+        origin: None,
+        admission_seq: 0,
     });
     assert_eq!(
         app.runtime.notification_banner().as_deref(),

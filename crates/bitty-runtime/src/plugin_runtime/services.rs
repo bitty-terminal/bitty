@@ -2743,6 +2743,19 @@ impl HostServices for PluginServices {
     }
 
     fn fs_list(&self, prefix: &str, max_entries: usize) -> Result<LuaValue, BridgeError> {
+        self.fs_list_with_expiry(
+            prefix,
+            max_entries,
+            Instant::now() + super::fs_list::LIST_SCAN_BUDGET,
+        )
+    }
+
+    fn fs_list_with_expiry(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
         // CTX-1348: the backend resolves only paths covered by this
         // generation's own `fs.read:` grants. It reads the activation
         // snapshot directly, so a revoked generation cannot list through a
@@ -2754,7 +2767,8 @@ impl HostServices for PluginServices {
             .borrow()
             .clone()
             .ok_or_else(|| BridgeError::not_implemented("bitty.fs.list"))?;
-        let entries: Vec<FsListEntry> = backend.list(&granted, prefix, max_entries)?;
+        let entries: Vec<FsListEntry> =
+            backend.list_with_expiry(&granted, prefix, max_entries, expiry)?;
         Ok(LuaValue::array(
             entries
                 .into_iter()

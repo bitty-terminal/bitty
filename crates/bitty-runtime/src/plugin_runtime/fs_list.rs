@@ -17,6 +17,11 @@
 //!   the same grant (the prefix before the first glob segment). A symlink
 //!   whose target leaves that root is denied; a `..` or absolute request is
 //!   hostile before any filesystem call.
+//! - **Symlinked grant roots fail closed.** A grant whose literal segments
+//!   below the home contain a symlink is unusable (`E_FS_MISSING_GRANT`).
+//!   A symlinked *home prefix* stays allowed: the home itself may be a
+//!   symlink, and its canonical form is the authority. This decision is
+//!   pinned by regression tests.
 //! - **No ambient enumeration.** Entries outside the authorizing grant,
 //!   sensitive paths without consent, hostile names, symlinks whose target
 //!   leaves the grant, and non-file/non-directory entries are silently
@@ -24,18 +29,29 @@
 //! - **Bounded result.** At most `max_entries` (bridge cap
 //!   [`FS_LIST_MAX_ENTRIES`]) entries are returned, deterministically sorted
 //!   by name, and the returned name bytes never exceed [`FS_LIST_MAX_BYTES`].
+//! - **Bounded time.** The walk checks its deadline every
+//!   [`SCAN_DEADLINE_CHECK_INTERVAL`] entries and aborts with `E_TIMEOUT`
+//!   instead of finishing an over-budget scan. Bridge calls pass the
+//!   enclosing callback expiry; direct calls use the accepted RC-1 wall
+//!   budget.
 //! - **Oracle-tight failures.** Typed `E_FS_*` denials carry no path or
-//!   content bytes; a missing directory is `E_NOT_FOUND`; every other I/O
-//!   failure fails closed as a scope denial.
+//!   content bytes. `E_NOT_FOUND` is returned only after the nearest
+//!   existing ancestor has been resolved and proven inside the grant, so a
+//!   missing in-grant leaf never distinguishes an out-of-grant target that
+//!   exists from one that does not.
 //!
 //! Relative grants (no `~` root) have no stable host base and therefore
 //! resolve to no usable grant: the call fails closed instead of guessing a
 //! working directory.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use bitty_lua::{BridgeError, FS_LIST_MAX_BYTES, FS_PATH_MAX_BYTES, validate_fs_list_max};
+use bitty_lua::{
+    BridgeError, FS_LIST_MAX_BYTES, FS_PATH_MAX_BYTES, RC1_WALL_CLOCK_BUDGET_MS,
+    validate_fs_list_max,
+};
 use bitty_plugin_host::{
     FilesystemScope, FsBridgeDenialKind, SensitivePathPolicy, is_hostile_fs_pattern,
 };
@@ -43,6 +59,20 @@ use bitty_rich::ResourcePolicy;
 
 /// Capability head that authorizes listing (`fs.read:PATTERN`).
 const FS_READ_HEAD: &str = "fs.read:";
+
+/// Entries between deadline checks inside one directory walk.
+///
+/// Checking every entry would add a clock read to the per-entry cost; every
+/// 64 entries keeps the abort close to the deadline while the scan still
+/// dominates the loop body.
+const SCAN_DEADLINE_CHECK_INTERVAL: usize = 64;
+
+/// Wall-clock budget for one direct [`FsListBackend::list`] call.
+///
+/// Reuses the accepted RC-1 per-callback wall budget; the Lua bridge passes
+/// its own callback expiry through [`FsListBackend::list_with_expiry`], so
+/// production calls never outlive the enclosing callback.
+pub(super) const LIST_SCAN_BUDGET: Duration = Duration::from_millis(RC1_WALL_CLOCK_BUDGET_MS);
 
 /// One visible directory entry (name plus file-kind metadata, no bytes).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,7 +109,9 @@ impl FsListBackend {
     /// `granted` is the calling generation's full activation grant snapshot;
     /// only `fs.read:` entries are considered. Results are deterministic
     /// (lexicographic name order), carry logical `~/...` names, and are
-    /// bounded by [`FS_LIST_MAX_ENTRIES`] and [`FS_LIST_MAX_BYTES`].
+    /// bounded by [`FS_LIST_MAX_ENTRIES`] and [`FS_LIST_MAX_BYTES`]. The
+    /// walk is bounded by the accepted RC-1 wall budget; use
+    /// [`Self::list_with_expiry`] to pass the enclosing callback deadline.
     ///
     /// # Errors
     ///
@@ -87,14 +119,37 @@ impl FsListBackend {
     /// `E_FS_MISSING_GRANT` when no usable read grant exists,
     /// `E_FS_HOSTILE_PATTERN` for traversal/absolute/device shapes,
     /// `E_FS_SENSITIVE_PATH` for a sensitive prefix, `E_FS_SCOPE_MISMATCH`
-    /// for an out-of-grant prefix or a symlink escape, and `E_NOT_FOUND` when
-    /// the granted directory does not exist. Other I/O failures fail closed
-    /// as `E_FS_SCOPE_MISMATCH`.
+    /// for an out-of-grant prefix or a symlink escape, `E_TIMEOUT` when the
+    /// scan deadline expires, and `E_NOT_FOUND` when the granted directory
+    /// does not exist *inside* the grant. Other I/O failures fail closed as
+    /// `E_FS_SCOPE_MISMATCH`.
     pub fn list(
         &self,
         granted: &[String],
         prefix: &str,
         max_entries: usize,
+    ) -> Result<Vec<FsListEntry>, BridgeError> {
+        self.list_with_expiry(
+            granted,
+            prefix,
+            max_entries,
+            Instant::now() + LIST_SCAN_BUDGET,
+        )
+    }
+
+    /// Expiry-aware [`Self::list`] for the bridge callback deadline.
+    ///
+    /// Same contract as [`Self::list`], except that the directory walk checks
+    /// `expiry` every [`SCAN_DEADLINE_CHECK_INTERVAL`] entries and aborts
+    /// with `E_TIMEOUT`. The deadline is checked before any per-entry
+    /// symlink resolution, so one escaping link cannot extend the scan past
+    /// the budget.
+    pub fn list_with_expiry(
+        &self,
+        granted: &[String],
+        prefix: &str,
+        max_entries: usize,
+        expiry: Instant,
     ) -> Result<Vec<FsListEntry>, BridgeError> {
         validate_fs_list_max(max_entries)?;
 
@@ -125,7 +180,17 @@ impl FsListBackend {
         let requested = self
             .real_path(&logical)
             .ok_or_else(|| denial(FsBridgeDenialKind::ScopeMismatch))?;
-        let canonical = canonicalize(&requested)?;
+        // Resolve the nearest existing ancestor on `NotFound` so the
+        // containment check runs before `E_NOT_FOUND` is decided: a missing
+        // leaf under an escaping symlink must not answer "absent" while an
+        // existing leaf under the same link answers "denied".
+        let (canonical, missing) = resolve_nearest_existing(&requested)?;
+        // Symlink resolution can introduce sensitive component names the
+        // logical-prefix policy never sees (`.ssh`, `authorized_keys`,
+        // `shadow`); deny them before any listing.
+        if resolved_sensitive(&canonical) {
+            return Err(denial(FsBridgeDenialKind::SensitivePath));
+        }
         let authorized: Vec<&GrantScope> = covering
             .into_iter()
             .filter(|scope| scope.root_covers(&canonical))
@@ -135,6 +200,11 @@ impl FsListBackend {
             // a symlink escape (or a grant root that no longer resolves).
             return Err(denial(FsBridgeDenialKind::ScopeMismatch));
         }
+        if missing {
+            // The nearest existing ancestor is inside the grant, so the leaf
+            // is a genuine in-grant absence.
+            return Err(not_found());
+        }
 
         let dir = std::fs::read_dir(&canonical).map_err(io_error)?;
 
@@ -142,7 +212,12 @@ impl FsListBackend {
         // smallest `max_entries` names without buffering an unbounded
         // directory in memory.
         let mut bounded: BTreeSet<(String, &'static str)> = BTreeSet::new();
-        for entry in dir {
+        for (index, entry) in dir.enumerate() {
+            if index % SCAN_DEADLINE_CHECK_INTERVAL == 0 && Instant::now() >= expiry {
+                // Abort mid-scan instead of returning after the budget: the
+                // host thread must not stay blocked for the whole walk.
+                return Err(BridgeError::timeout());
+            }
             let Ok(entry) = entry else {
                 // A failed directory read is a fail-closed omission, never a
                 // partial entry leak.
@@ -159,7 +234,10 @@ impl FsListBackend {
             if !authorized.iter().any(|scope| scope.scope.allows(&child)) {
                 continue;
             }
-            if policy.is_sensitive(&child) || is_hostile_fs_pattern(&child) {
+            if policy.is_sensitive(&child)
+                || is_hostile_fs_pattern(&child)
+                || is_sensitive_component(&name)
+            {
                 continue;
             }
             let Ok(file_type) = entry.file_type() else {
@@ -215,6 +293,13 @@ impl FsListBackend {
 
     /// Canonical real root of a grant's literal prefix (`~/docs/**` ->
     /// `$HOME/docs`), through the approved-path policy.
+    ///
+    /// A literal grant segment that is itself a symlink (or that passes
+    /// through one below the home) makes the grant unusable: it would
+    /// silently denote the link target, and `~/docs -> /` would turn a narrow
+    /// grant into host-wide enumeration. The home prefix itself may be a
+    /// symlink (mounted/redirected homes); its canonical form is the
+    /// authority, so only segments *below* the home are rejected.
     fn literal_root(&self, pattern: &str) -> Option<PathBuf> {
         let segments: Vec<&str> = pattern.split('/').collect();
         let literals: Vec<&str> = segments
@@ -235,6 +320,13 @@ impl FsListBackend {
         let mut root = self.home.clone();
         for literal in literals {
             root.push(literal);
+            // `symlink_metadata` does not follow the final component, so
+            // this rejects a symlinked grant root or intermediate literal
+            // while allowing a symlinked home prefix above it.
+            let metadata = std::fs::symlink_metadata(&root).ok()?;
+            if metadata.file_type().is_symlink() {
+                return None;
+            }
         }
         let policy = ResourcePolicy::new(vec![root]).ok()?;
         policy.roots().first().cloned()
@@ -346,8 +438,8 @@ fn entry_name_ok(name: &str) -> bool {
 
 /// File kind of one visible entry, following symlinks only inside the grant.
 ///
-/// Devices, FIFOs, sockets, broken links, and symlinks whose canonical target
-/// leaves every authorizing grant root are omitted.
+/// Devices, FIFOs, sockets, broken links, sensitive targets, and symlinks
+/// whose canonical target leaves every authorizing grant root are omitted.
 fn entry_kind(
     entry: &std::fs::DirEntry,
     file_type: &std::fs::FileType,
@@ -364,6 +456,9 @@ fn entry_kind(
         return None;
     }
     let target = std::fs::canonicalize(entry.path()).ok()?;
+    if resolved_sensitive(&target) {
+        return None;
+    }
     let inside = authorized
         .iter()
         .any(|scope| scope.root_covers(&target) && scope.scope.allows(child));
@@ -380,23 +475,100 @@ fn entry_kind(
     }
 }
 
-/// Canonicalize a requested directory, keeping missing paths distinct.
-fn canonicalize(path: &Path) -> Result<PathBuf, BridgeError> {
-    std::fs::canonicalize(path).map_err(io_error)
+/// Resolve `path`, reporting whether the leaf is missing.
+///
+/// On `NotFound`, the nearest existing ancestor is canonicalized instead so
+/// the caller can apply the canonical grant-root containment check *before*
+/// deciding `E_NOT_FOUND`. The returned path is therefore either the real
+/// requested directory (`missing == false`) or the real nearest existing
+/// ancestor (`missing == true`).
+fn resolve_nearest_existing(path: &Path) -> Result<(PathBuf, bool), BridgeError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok((canonical, false)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut probe = path.parent();
+            while let Some(candidate) = probe {
+                match std::fs::canonicalize(candidate) {
+                    Ok(canonical) => return Ok((canonical, true)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        probe = candidate.parent();
+                    }
+                    Err(error) => return Err(io_error(error)),
+                }
+            }
+            // No existing ancestor (only possible when the home itself is
+            // gone): fail closed without an existence signal.
+            Err(denial(FsBridgeDenialKind::ScopeMismatch))
+        }
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+/// Whether any resolved path component names a sensitive location.
+///
+/// `SensitivePathPolicy` matches logical `~/...` paths, so it cannot see
+/// names introduced by symlink resolution. The same default-deny names are
+/// checked per component here, covering `authorized_keys`, `shadow`, and
+/// `.ssh` reached through a resolved component.
+fn resolved_sensitive(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_str().is_none_or(is_sensitive_component),
+        _ => false,
+    })
+}
+
+/// Default-deny component names applied to resolved paths and entry names.
+///
+/// Mirrors the high-value file and directory names of the accepted
+/// `SensitivePathPolicy` default set; the policy still owns the full logical
+/// path matcher, this predicate only extends the same posture to components
+/// the logical path cannot show.
+fn is_sensitive_component(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    if name.ends_with(".pem") || name.contains("keychain") {
+        return true;
+    }
+    matches!(
+        name.as_str(),
+        ".ssh"
+            | ".gnupg"
+            | ".aws"
+            | ".kube"
+            | ".azure"
+            | ".npmrc"
+            | ".pypirc"
+            | ".netrc"
+            | "credentials.toml"
+            | "authorized_keys"
+            | "shadow"
+            | "gshadow"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+    )
 }
 
 /// Map an I/O failure to a typed bridge error without leaking host paths.
 fn io_error(error: std::io::Error) -> BridgeError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        return BridgeError::new("io", "E_NOT_FOUND", "fs directory not found");
+        return not_found();
     }
     // Permissions, races, and other failures stay indistinguishable from a
     // scope denial: fail closed, never an existence oracle.
     denial(FsBridgeDenialKind::ScopeMismatch)
 }
 
+/// Typed in-grant absence (decided only after ancestor containment).
+fn not_found() -> BridgeError {
+    BridgeError::new("io", "E_NOT_FOUND", "fs directory not found")
+}
+
 /// Typed, oracle-tight filesystem denial for the accepted family.
-fn denial(kind: FsBridgeDenialKind) -> BridgeError {
+pub(super) fn denial(kind: FsBridgeDenialKind) -> BridgeError {
     BridgeError::new(
         "runtime",
         kind.code(),
@@ -644,6 +816,219 @@ mod tests {
             .list(&grant("~/docs/**"), "~/docs/missing", 16)
             .expect_err("missing directory must fail");
         assert_eq!(error.code, "E_NOT_FOUND");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existence_oracle_outside_the_grant_is_closed() {
+        // A symlink inside the grant that leaves it must not distinguish an
+        // existing outside target from a missing one: both deny.
+        let home = temp_home("oracle");
+        touch(&home, "docs/inside.txt", "inside");
+        let outside = temp_home("oracle-outside");
+        touch(&outside, "exists.txt", "x");
+        std::os::unix::fs::symlink(&outside, home.join("docs/escape")).expect("symlink");
+        let backend = FsListBackend::new(&home);
+
+        let hit = backend
+            .list(&grant("~/docs/**"), "~/docs/escape/exists.txt", 16)
+            .expect_err("existing outside target must deny");
+        assert_eq!(hit.code, "E_FS_SCOPE_MISMATCH");
+        let miss = backend
+            .list(&grant("~/docs/**"), "~/docs/escape/missing-xyz", 16)
+            .expect_err("missing outside target must deny the same");
+        assert_eq!(miss.code, "E_FS_SCOPE_MISMATCH");
+
+        // A genuine in-grant absence stays typed: the nearest existing
+        // ancestor (`~/docs`) is inside the canonical grant root.
+        let in_grant = backend
+            .list(&grant("~/docs/**"), "~/docs/missing-xyz", 16)
+            .expect_err("in-grant absence must stay typed");
+        assert_eq!(in_grant.code, "E_NOT_FOUND");
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_sensitive_components_are_denied() {
+        // The logical prefix (`~/docs/alias/...`) never names `.ssh`,
+        // `authorized_keys`, or `shadow`; resolution does.
+        let home = temp_home("resolved-sensitive");
+        std::fs::create_dir_all(home.join("docs/.ssh")).expect("ssh dir");
+        touch(&home, "docs/.ssh/authorized_keys", "key");
+        touch(&home, "docs/shadow", "x");
+        touch(&home, "docs/notes.txt", "n");
+        std::os::unix::fs::symlink(home.join("docs/.ssh"), home.join("docs/alias"))
+            .expect("symlink");
+        let backend = FsListBackend::new(&home);
+
+        for request in [
+            "~/docs/shadow",
+            "~/docs/alias",
+            "~/docs/alias/authorized_keys",
+        ] {
+            let error = backend
+                .list(&grant("~/docs/**"), request, 16)
+                .expect_err("sensitive resolved component must deny");
+            assert_eq!(
+                error.code, "E_FS_SENSITIVE_PATH",
+                "request {request} must be sensitive"
+            );
+        }
+
+        // Entries naming sensitive locations are suppressed from a page,
+        // including the resolved symlink alias.
+        let entries = backend
+            .list(&grant("~/docs/**"), "~/docs", 16)
+            .expect("granted listing");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/docs/notes.txt"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_grant_root_fails_closed() {
+        // A grant root that is itself a symlink silently changes meaning
+        // (`~/docs -> /` would list the host); it is rejected at grant
+        // construction time.
+        let home = temp_home("root-symlink");
+        let outside = temp_home("root-symlink-outside");
+        touch(&outside, "secret.txt", "s");
+        std::os::unix::fs::symlink(&outside, home.join("docs")).expect("root symlink");
+        let backend = FsListBackend::new(&home);
+
+        let error = backend
+            .list(&grant("~/docs/**"), "~/docs", 16)
+            .expect_err("symlinked grant root must not resolve");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        // The same applies to an intermediate literal segment.
+        std::fs::create_dir_all(home.join("plain")).expect("plain");
+        std::os::unix::fs::symlink(&outside, home.join("link")).expect("segment symlink");
+        let error = backend
+            .list(&grant("~/link/docs/**"), "~/link/docs", 16)
+            .expect_err("symlinked intermediate segment must not resolve");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_home_prefix_still_resolves() {
+        // A mounted/redirected home is a symlink; the canonical home is the
+        // authority, so legitimate listings keep working. Removing the
+        // grant-root canonicalization makes this test deny.
+        let real_home = temp_home("home-real");
+        touch(&real_home, "docs/a.txt", "a");
+        let link = std::env::temp_dir().join(format!(
+            "bitty-ctx1348-home-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real_home, &link).expect("home symlink");
+        let backend = FsListBackend::new(&link);
+
+        let entries = backend
+            .list(&grant("~/docs/**"), "~/docs", 16)
+            .expect("symlinked home must resolve");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/docs/a.txt"]
+        );
+
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn star_grant_does_not_list_grandchildren() {
+        // `fs.read:~/docs/*` authorizes only immediate children. The
+        // per-entry scope filter must keep a request for an in-scope
+        // directory from widening by one level.
+        let home = temp_home("star");
+        touch(&home, "docs/sub/file.txt", "x");
+        let backend = FsListBackend::new(&home);
+
+        let entries = backend
+            .list(&grant("~/docs/*"), "~/docs/sub", 16)
+            .expect("in-scope directory lists");
+        assert_eq!(entries, Vec::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_entry_names_cannot_cross_the_bridge() {
+        // Separators, colon/stream prefixes, and control bytes are legal
+        // Linux file names but cannot cross the Lua bridge intact.
+        let home = temp_home("entry-names");
+        std::fs::create_dir_all(home.join("docs")).expect("docs");
+        for name in ["ok.txt", "a:b", "a\\b", "bad\nname", "CON", "NUL.txt"] {
+            std::fs::write(home.join("docs").join(name), "x").expect("entry");
+        }
+        let backend = FsListBackend::new(&home);
+
+        let entries = backend
+            .list(&grant("~/docs/**"), "~/docs", 16)
+            .expect("granted listing");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/docs/ok.txt"]
+        );
+    }
+
+    #[test]
+    fn large_directory_aborts_near_the_scan_deadline() {
+        let home = temp_home("deadline");
+        std::fs::create_dir_all(home.join("docs")).expect("docs");
+        for index in 0..20_000 {
+            std::fs::File::create(home.join(format!("docs/f{index:05}"))).expect("entry");
+        }
+        let backend = FsListBackend::new(&home);
+
+        // A past deadline aborts deterministically at the first check.
+        let error = backend
+            .list_with_expiry(
+                &grant("~/docs/**"),
+                "~/docs",
+                16,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .expect_err("expired deadline must abort");
+        assert_eq!(error.code, "E_TIMEOUT");
+
+        // A short live budget aborts mid-walk instead of finishing the scan.
+        let started = Instant::now();
+        let error = backend
+            .list_with_expiry(
+                &grant("~/docs/**"),
+                "~/docs",
+                16,
+                started + Duration::from_millis(2),
+            )
+            .expect_err("over-budget scan must abort");
+        let elapsed = started.elapsed();
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "scan must abort near the budget, took {elapsed:?}"
+        );
     }
 
     #[test]

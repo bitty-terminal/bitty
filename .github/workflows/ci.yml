@@ -233,6 +233,9 @@ jobs:
       # so the gate cannot be skipped by the default workspace invocation.
       - name: Run cold-delivery feature-on tests
         if: matrix.shard == 1
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo nextest run -p bitty-terminal --features input-vm-test-support --locked -E 'test(input_vm_boundary)'
           cargo nextest run -p bitty-runtime --features input-vm-test-support --locked -E 'test(dispatch_ui_command_fences_origin_and_lifecycle) | test(band_origin_publishes_only_after_a_presented_frame) | test(version_one_remount_and_edge_move_invalidate_the_old_origin) | test(cancellation_drops_queued_admissions_and_keeps_the_release_swallow) | test(chrome_band_versions_include_the_band_edge) | test(cold_selection_bound_is_sixteen_and_leaves_the_tail_queued)'

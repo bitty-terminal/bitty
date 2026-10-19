@@ -148,6 +148,51 @@ fn granted_plugin_without_backend_is_unavailable() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn granted_production_backend_runs_confined_git() {
+    // CTX-1376 regression, the allow arm of the grant/deny pair: the exact
+    // production wiring (`process.spawn:git` granted + `git_spawn_backend`)
+    // must actually start `git` under the inherited Landlock confinement.
+    // The confinement hook used to fail with `EPERM` because it skipped
+    // `no_new_privs`, so this call refused with `E_SPAWN_FAILED` on every
+    // unprivileged host even though the grant was present.
+    let services = services_with(true, false);
+    services.set_spawn_backend(Some(git_spawn_backend("bitty-terminal.git-panel")));
+    let mut vm = gate_vm("git-panel-granted-production");
+    install(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, result = pcall(bitty.process.spawn, { "status", "--porcelain" })
+            if ok then
+                bitty.store.set("code", "OK")
+                bitty.store.set("output", result.output)
+                bitty.store.set("exit_code", result.exit_code)
+                bitty.store.set("untrusted", result.untrusted)
+            else
+                bitty.store.set("code", result.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        stored(&services, "code"),
+        Some(LuaValue::String("OK".to_string())),
+        "granted production spawn must run confined"
+    );
+    assert!(
+        matches!(stored(&services, "output"), Some(LuaValue::String(_))),
+        "serves the bounded output string"
+    );
+    assert_eq!(stored(&services, "exit_code"), Some(LuaValue::Integer(0)));
+    assert_eq!(stored(&services, "untrusted"), Some(LuaValue::Bool(true)));
+}
+
+#[test]
 fn production_backend_denies_unallowlisted_verbs_without_spawning() {
     // CTX-0439: the activation-wired backend enforces the CTX-0444
     // `[tools.git]` allowlist. A write verb fails as E_SPAWN_DENIED without

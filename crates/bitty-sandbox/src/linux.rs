@@ -6,8 +6,9 @@
 //! below carries a `SAFETY` rationale. The public surface of this module is
 //! `pub(crate)`; safe callers go through the crate root.
 //!
-//! Only three raw syscalls are used (`SYS_landlock_*` via the workspace
-//! `libc`, numbers `444`/`445`/`446` on every supported Linux target). File
+//! Only four raw syscalls are used (`SYS_landlock_*` via the workspace
+//! `libc`, numbers `444`/`445`/`446` on every supported Linux target, plus
+//! `prctl` for Landlock's `no_new_privs` prerequisite). File
 //! opens stay in safe code (`O_PATH` via `OpenOptions::custom_flags`), so
 //! no path pointer ever crosses an `unsafe` boundary.
 
@@ -130,6 +131,30 @@ fn add_exec_rule(ruleset_fd: libc::c_int, file_fd: libc::c_int) -> Result<(), io
             0,
         )
     };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Set `no_new_privs` on the calling process (child side, `pre_exec` only).
+///
+/// Landlock's `landlock_restrict_self` requires the caller to have
+/// `PR_SET_NO_NEW_PRIVS` set (or `CAP_SYS_ADMIN`); without it the kernel
+/// refuses with `EPERM`. That prerequisite is not optional hardening: it is
+/// what makes the confined exec tree unable to regain privilege through a
+/// setuid/setgid binary, so it belongs with the ruleset rather than being a
+/// parent-side setting. It must be set *before* [`restrict_self`] and it runs
+/// only in the post-fork child, so the host process is never marked.
+fn set_no_new_privs() -> Result<(), io::Error> {
+    // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` takes scalar
+    // arguments only (option plus four unsigned longs); no pointer crosses
+    // this call, it reads no process memory, and the effect (this process
+    // may never gain privilege through exec) is exactly the fail-closed
+    // posture the child needs. It runs only in the single-threaded
+    // post-fork child, so it cannot observe a concurrent prctl.
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -351,16 +376,17 @@ pub(crate) fn apply(
     let fd = ruleset.raw();
     // SAFETY (`pre_exec` registration): the closure runs once in the
     // post-fork, single-threaded child, after stdio setup and immediately
-    // before `exec`. It performs exactly one raw syscall
-    // (`restrict_self`) with the captured fd number — no allocation, no
-    // locks, no std I/O, no access to parent memory beyond the copied
-    // integer — then returns. `Ok` proceeds to an exec the ruleset
+    // before `exec`. It performs exactly two raw syscalls with captured
+    // scalars — `set_no_new_privs` (Landlock's prerequisite) then
+    // `restrict_self` with the captured fd number — and no allocation, no
+    // locks, no std I/O, and no access to parent memory beyond the copied
+    // integer, then returns. `Ok` proceeds to an exec the ruleset
     // constrains; `Err` makes `Command::spawn` fail in the parent, so a
     // confinement failure can never silently run unconfined. The ruleset
     // fd itself is `CLOEXEC` (Landlock fds carry it by design), so it
     // never leaks into the exec'd program.
     unsafe {
-        command.pre_exec(move || restrict_self(fd));
+        command.pre_exec(move || set_no_new_privs().and_then(|()| restrict_self(fd)));
     }
     Ok(crate::ExecConfinement { ruleset })
 }

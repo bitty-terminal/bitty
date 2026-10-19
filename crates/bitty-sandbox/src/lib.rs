@@ -58,10 +58,12 @@
 //! fail-closed, since their interpreter closure cannot be enumerated safely
 //! (sequel work).
 //!
-//! Sequencing keeps post-fork work to a single syscall: the parent resolves
-//! the tool through its own `PATH` ([`resolve_tool_execs`]), creates the
-//! ruleset, pins each path with an `O_PATH` open plus `add_rule`, and only
-//! `restrict_self` runs in the child's `pre_exec` hook. The returned
+//! Sequencing keeps post-fork work to two syscalls: the parent resolves the
+//! tool through its own `PATH` ([`resolve_tool_execs`]), creates the
+//! ruleset, and pins each path with an `O_PATH` open plus `add_rule`; the
+//! child's `pre_exec` hook then sets `no_new_privs` (Landlock refuses
+//! `restrict_self` with `EPERM` for unprivileged callers without it) and
+//! only then calls `landlock_restrict_self`. The returned
 //! [`ExecConfinement`] guard owns the ruleset fd and must stay alive until
 //! `Command::spawn` returns; dropping it closes the fd. Any failure before
 //! the spawn returns [`SandboxError`] and no process is started.
@@ -540,36 +542,23 @@ mod tests {
         linux::probe_supported().expect("Landlock ABI v1+ must be present on Linux CI");
     }
 
-    /// Spawn `command`, skipping the test when the host kernel forbids
-    /// *unprivileged* `restrict_self` (raw `EPERM` from the child `pre_exec`
-    /// hook after a successful setup).
+    /// Spawn `command` for the confinement tests, failing (never skipping)
+    /// on any error.
     ///
-    /// Setup already proved the Landlock numbers, the LSM, and the rule
-    /// calls cooperate; a spawn-time `EPERM` therefore names the host, not
-    /// this code — typically a container/BPF policy that gates
-    /// self-confinement on privilege (observed on locked-down dev
-    /// sandboxes; GitHub-hosted runners enforce normally). The skip prints
-    /// loudly so capability-skips never pass silently, and the same tests
-    /// verify for real wherever the host permits (including under
-    /// `unshare -rm` locally).
-    ///
-    /// Any other spawn error panics: in particular a raw `EACCES` here is
-    /// meaningful (the confined exec itself was denied — the mechanism
-    /// working), never a skip.
+    /// CTX-1376: this used to skip on a raw `EPERM`, reading it as a host
+    /// policy against unprivileged self-confinement. That reading was wrong
+    /// and hid a real defect: `landlock_restrict_self` always answers
+    /// `EPERM` for an unprivileged caller that has not set `no_new_privs`
+    /// (see [`linux::set_no_new_privs`]), so the skip silenced every
+    /// confinement assertion on every ordinary host — and the same defect
+    /// refused every admitted plugin tool spawn at runtime. Setup failures
+    /// stay `SandboxError` before the fork; any spawn error here is a
+    /// regression.
     #[cfg(target_os = "linux")]
-    fn spawn_or_skip_restrict_blocked(
-        mut command: std::process::Command,
-    ) -> Option<std::process::Output> {
-        match command.output() {
-            Ok(out) => Some(out),
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                eprintln!(
-                    "SKIP: host forbids unprivileged landlock_restrict_self ({error}); re-run under `unshare -rm` or on CI for full verification"
-                );
-                None
-            }
-            Err(error) => panic!("confined spawn failed unexpectedly: {error:?}"),
-        }
+    fn spawn_confined(mut command: std::process::Command) -> std::process::Output {
+        command
+            .output()
+            .expect("confined spawn must start under the ruleset")
     }
 
     #[cfg(target_os = "linux")]
@@ -577,16 +566,44 @@ mod tests {
     fn admitted_exec_runs_under_confinement() {
         // Control: the allowlisted binary itself still execs under the
         // ruleset (reads/maps are unhandled, only exec is constrained).
+        // This is the CTX-1376 regression: without `no_new_privs` the
+        // child hook fails with `EPERM` and this spawn never starts.
         let sh = resolve_tool_execs("sh").expect("PATH must resolve sh on Linux CI");
         let mut command = std::process::Command::new(&sh[0]);
         command.arg("-c").arg("exit 0");
         let _guard = confine_command_to_execs(&mut command, &sh).expect("confinement sets up");
-        let Some(out) = spawn_or_skip_restrict_blocked(command) else {
-            return;
-        };
+        let out = spawn_confined(command);
         assert!(
             out.status.success(),
             "allowlisted exec must run, got {}",
+            out.status
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confined_child_sets_no_new_privs() {
+        // CTX-1376: the ruleset cannot be installed without the
+        // prerequisite. Assert it directly from inside the confined child
+        // so a future reordering (or a dropped syscall) fails here even if
+        // a privileged host would still accept `restrict_self`.
+        let sh = resolve_tool_execs("sh").expect("PATH must resolve sh on Linux CI");
+        // `read`/`test`/`echo` are shell builtins, so no second exec (which
+        // the ruleset would deny) is needed.
+        let script = r#"
+            while read -r key value; do
+                if [ "$key" = "NoNewPrivs:" ]; then echo "NNP:$value"; fi
+            done < /proc/self/status
+        "#;
+        let mut command = std::process::Command::new(&sh[0]);
+        command.arg("-c").arg(script);
+        let _guard = confine_command_to_execs(&mut command, &sh).expect("confinement sets up");
+        let out = spawn_confined(command);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.trim(),
+            "NNP:1",
+            "confined child must run with no_new_privs set, got stdout={stdout:?} status={}",
             out.status
         );
     }
@@ -606,9 +623,7 @@ mod tests {
         let mut confined = std::process::Command::new(&sh[0]);
         confined.arg("-c").arg(script).arg(&escape[0]);
         let _guard = confine_command_to_execs(&mut confined, &sh).expect("confinement sets up");
-        let Some(out) = spawn_or_skip_restrict_blocked(confined) else {
-            return;
-        };
+        let out = spawn_confined(confined);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.contains("REACHED:12"),
@@ -634,19 +649,14 @@ mod tests {
         // never starts. The kernel's `EACCES` surfaces as a spawn error
         // (Rust reports child exec failure through the spawn pipe, like
         // `ENOENT` for missing binaries), so a raw `EACCES` here *is* the
-        // OS-level denial — while a raw `EPERM` names a host that forbids
-        // unprivileged `restrict_self` and skips (see the helper above).
+        // OS-level denial; a non-zero exit is accepted as the same denial
+        // where the host reports it that way.
         let sh = resolve_tool_execs("sh").expect("PATH must resolve sh on Linux CI");
         let other = resolve_tool_execs("true").expect("PATH must resolve true on Linux CI");
         let mut command = std::process::Command::new(&other[0]);
         let _guard = confine_command_to_execs(&mut command, &sh).expect("confinement sets up");
         match command.output() {
             Err(error) if error.raw_os_error() == Some(libc::EACCES) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                eprintln!(
-                    "SKIP: host forbids unprivileged landlock_restrict_self ({error}); re-run under `unshare -rm` or on CI for full verification"
-                );
-            }
             Err(error) => panic!("expected EACCES denial, got {error:?}"),
             Ok(out) => assert!(
                 !out.status.success(),

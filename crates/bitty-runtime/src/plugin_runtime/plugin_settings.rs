@@ -1,17 +1,42 @@
-//! Per-plugin settings resolution: shipped defaults plus user files (CTX-1195).
+//! Per-plugin settings resolution: shipped defaults plus user files (CTX-1195,
+//! CTX-1294).
 //!
 //! This module merges the three values-plane layers for one plugin
 //! generation and serves them through the same [`SettingsSource`] that feeds
 //! `bitty.settings.get`. Authority never passes through here: the merge only
-//! reads `bitty-plugin-host` declarations and `bitty-config` file values, so
-//! no config value, however explicit, can grant anything (configs flow,
-//! informedness does not — deny-by-default is P0).
+//! reads `bitty-plugin-host` declarations and user-file values, so no config
+//! value, however explicit, can grant anything (configs flow, informedness
+//! does not — deny-by-default is P0).
+//!
+//! # File resolution (first present wins)
+//!
+//! A plugin's user configuration is resolved once per activation, in order:
+//!
+//! 1. `<config-dir>/plugins/<owner>.<name>.lua` — the canonical file. It is
+//!    evaluated by `bitty-lua`'s plain-config VM: the source returns one
+//!    table, no host APIs, modules, or plugin services are reachable, and
+//!    source bytes plus VM instructions, wall clock, memory, and output shape
+//!    are bounded. Duplicate literal keys are rejected before evaluation.
+//! 2. `<config-dir>/plugins/<name>.lua` — short alias, consulted only when
+//!    the canonical file is absent and exactly one discovered plugin claims
+//!    that name. An ambiguous or unprovable alias is ignored with a
+//!    diagnostic; an incomplete discovery snapshot disables aliases, and
+//!    safe mode skips the whole file layer.
+//! 3. `<config-dir>/plugins/<owner>.<name>.toml` — legacy data-only
+//!    fallback, parsed as the bounded flat-key subset in
+//!    [`bitty_config::plugin_file`] (never evaluated as code).
+//! 4. The manifest `[settings]` defaults.
+//!
+//! The first present file wins: when both the canonical `.lua` and the
+//! legacy `.toml` exist, only the Lua file is read (a chosen short alias
+//! shadows the TOML file the same way). A Lua file that exists but fails to
+//! parse or evaluate falls back to the lower layers for every key with
+//! `file_error` set; it does not silently fall through to the TOML file.
 //!
 //! # Precedence (per declared key, lowest first)
 //!
 //! ```text
-//! manifest shipped default < old home (shared host source) < new file
-//! (`<config-dir>/plugins/<owner>.<name>.toml`)
+//! manifest shipped default < old home (shared host source) < resolved user file
 //! ```
 //!
 //! - The **manifest default** always exists for a declared key (declarations
@@ -21,26 +46,30 @@
 //!   application wired — today `EmptySettings`, tomorrow main-config
 //!   values): a declared key served there keeps working, so the old four
 //!   scalar settings keep working from either home.
-//! - The **new file** wins per key when present and well-typed. A wrong-typed
-//!   file value falls back to the next lower layer for that key only
-//!   (garbage in, fail-to-default out — the `read_settings` pattern); a bad
-//!   value can hide a module at most, never crash the host.
+//! - The **user file** (Lua or legacy TOML) wins per key when present and
+//!   well-typed. A wrong-typed file value falls back to the next lower layer
+//!   for that key only (garbage in, fail-to-default out — the
+//!   `read_settings` pattern); a bad value can hide a module at most, never
+//!   crash the host.
 //! - A malformed or unreadable file falls back to the lower layers for every
-//!   key (recorded in [`ResolvedPluginSettings::file_error`]); an absent
-//!   file is not an error.
+//!   key (recorded in [`LoadedPluginSettings::file_error`]); an absent file
+//!   is not an error.
 //! - File keys no declaration names are dropped (recorded in
 //!   [`ResolvedPluginSettings::dropped`]): settings are never a side channel
 //!   between plugins, and a `[capabilities]`-looking file key grants nothing.
 //!
 //! # Wiring
 //!
-//! [`load_plugin_settings`] reads the file (bounded by the `bitty-config`
-//! parser caps) and returns the per-generation source plus diagnostics.
-//! Activation installs the source into the generation's [`PluginServices`]
-//! and pins the declared key set there, so reading an undeclared key fails
-//! closed (`E_SETTINGS_UNDECLARED`) at the bridge. Each generation holds its
-//! own resolved map: a cross-plugin read fails closed structurally (the key
-//! is absent) and at the gate (the key is undeclared).
+//! [`load_plugin_settings`] reads the resolved file (bounded by the
+//! `bitty-config` caps and, for Lua, the plain-config VM budgets) and returns
+//! the per-generation source plus diagnostics. Activation installs the source
+//! into the generation's [`PluginServices`] and pins the declared key set
+//! there, so reading an undeclared key fails closed
+//! (`E_SETTINGS_UNDECLARED`) at the bridge. Settings are pinned to that
+//! generation: editing a file on disk is not hot-reloaded, the plugin must be
+//! reactivated. Each generation holds its own resolved map: a cross-plugin
+//! read fails closed structurally (the key is absent) and at the gate (the
+//! key is undeclared).
 //!
 //! [`PluginServices`]: super::services::PluginServices
 //! [`SettingsSource`]: super::services::SettingsSource
@@ -658,6 +687,10 @@ fn read_bounded_regular_file(_path: &Path) -> Result<Vec<u8>, ConfigReadError> {
 }
 
 /// Load and resolve one plugin's settings (file I/O at the boundary).
+///
+/// Resolution is canonical `<owner>.<name>.lua`, then an unambiguous
+/// `<name>.lua` short alias, then the legacy `<owner>.<name>.toml`, then the
+/// manifest `[settings]` defaults; the first present file wins.
 ///
 /// `config_dir` is the `<config-root>/bitty` directory (env-derived by the
 /// application, never a literal here); `None` skips the file layer. An

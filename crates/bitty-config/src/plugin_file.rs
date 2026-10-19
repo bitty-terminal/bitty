@@ -1,8 +1,18 @@
-//! Per-plugin user config files with shipped defaults (CTX-1195, issue #2010).
+//! Legacy per-plugin TOML user files (CTX-1195, issue #2010).
 //!
-//! # File layout
+//! This module owns the bounded flat-key TOML subset and its path helpers.
+//! It is the **legacy data-only fallback** for per-plugin configuration; the
+//! canonical format is Lua, resolved by `bitty-runtime`'s plugin settings
+//! loader. The runtime reads, in order, the canonical
+//! `<config-dir>/plugins/<owner>.<name>.lua`, an unambiguous `<name>.lua`
+//! short alias, this module's `<config-dir>/plugins/<owner>.<name>.toml`, and
+//! finally the manifest `[settings]` defaults. The first present file wins,
+//! so a plugin with a Lua file never consults its TOML file.
 //!
-//! Every plugin owns one optional user file next to the managed manifest:
+//! # File layout (legacy fallback)
+//!
+//! A plugin may own one optional TOML user file next to the managed
+//! manifest:
 //!
 //! ```text
 //! $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.toml
@@ -19,15 +29,17 @@
 //! parameters); no home directory is ever hard-coded.
 //!
 //! An absent file (or an absent `plugins/` directory) is not an error: the
-//! plugin's shipped built-in defaults win (Waybar parity — ships working,
-//! user overrides). Present files override the defaults **per key**.
+//! next lower layer wins (the manifest's shipped built-in defaults when no
+//! other user file exists — Waybar parity: ships working, user overrides).
+//! Present files override the defaults **per key**.
 //!
 //! # Subset grammar (v1, data only)
 //!
-//! The file is parsed as data through this strict bounded TOML subset. It
-//! is never evaluated as Lua (arbitrary Lua rewrite is unsafe per
-//! package-management.md) and never executes anything: there is no
-//! `include`, no `exec`, no shell, no nesting.
+//! The TOML file is parsed as data through this strict bounded subset.
+//! Unlike the canonical Lua file it is never evaluated as code and never
+//! executes anything: there is no `include`, no `exec`, no shell, no nesting.
+//! (The canonical Lua file is likewise host-free, but it is evaluated as
+//! plain data in the `bitty-lua` configuration VM, not parsed here.)
 //!
 //! ```text
 //! # flat keys only (no [sections], no dotted keys)
@@ -70,10 +82,14 @@
 //!
 //! # Defaults rule
 //!
-//! Precedence per declared key, lowest first:
+//! This module supplies only the legacy TOML layer. Full per-plugin
+//! resolution belongs to the runtime: canonical Lua, unambiguous short
+//! alias, this TOML file, then manifest defaults; the first present file
+//! wins, so this file applies only when neither Lua file exists. Within a
+//! file, precedence per declared key, lowest first:
 //!
 //! ```text
-//! manifest shipped default < old home (shared host source) < new file (this module)
+//! manifest shipped default < old home (shared host source) < this TOML file
 //! ```
 //!
 //! A wrong-typed value at any layer falls back to the next lower layer for
@@ -117,7 +133,7 @@ use std::path::{Path, PathBuf};
 /// (`$XDG_CONFIG_HOME/bitty/plugins/`, CTX-1195).
 pub const PLUGINS_DIR_NAME: &str = "plugins";
 
-/// File extension of per-plugin user files.
+/// File extension of legacy per-plugin TOML user files.
 pub const PLUGIN_FILE_EXTENSION: &str = "toml";
 
 /// Maximum per-plugin file size in bytes (fail-closed).
@@ -184,7 +200,7 @@ pub fn valid_plugin_file_id(plugin_id: &str) -> bool {
     true
 }
 
-/// Pure per-plugin file path with injected environment values.
+/// Pure legacy per-plugin TOML file path with injected environment values.
 ///
 /// `<config-dir>/plugins/<plugin_id>.toml` under
 /// [`crate::file::config_dir_with_env`]. Returns `None` when no config root
@@ -199,7 +215,7 @@ pub fn plugin_file_path_with_env(
     plugin_file_path_with_platform_env(xdg_config_home, home, None, None, plugin_id)
 }
 
-/// Platform-aware per-plugin file path with Windows `%APPDATA%` /
+/// Platform-aware legacy per-plugin TOML file path with Windows `%APPDATA%` /
 /// `%LOCALAPPDATA%` injected (same precedence as
 /// [`crate::file::config_dir_with_platform_env`]).
 ///
@@ -227,8 +243,9 @@ pub fn plugin_file_path_with_platform_env(
     Some(dir.join(PLUGINS_DIR_NAME).join(file_name))
 }
 
-/// Reads the live environment for the per-plugin file path. Thin wrapper so
-/// unit tests stay hermetic via [`plugin_file_path_with_platform_env`].
+/// Reads the live environment for the legacy per-plugin TOML file path.
+/// Thin wrapper so unit tests stay hermetic via
+/// [`plugin_file_path_with_platform_env`].
 #[must_use]
 pub fn plugin_file_path(plugin_id: &str) -> Option<PathBuf> {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();

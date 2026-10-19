@@ -444,10 +444,12 @@ pub(crate) fn discover_with_roots(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
-    // CTX-1195 (issue #2010): seed the per-plugin user-file root before
-    // activation so every generation resolves its
-    // `plugins/<owner>.<name>.toml` file when its services are built
-    // (absent file serves shipped defaults plus the old home).
+    // CTX-1195 (issue #2010): seed the per-plugin user-config root before
+    // activation so every generation resolves its canonical
+    // `plugins/<owner>.<name>.lua`, unambiguous short alias, or legacy
+    // `plugins/<owner>.<name>.toml` when its services are built (the first
+    // present file wins; absent files serve shipped defaults plus the old
+    // home).
     runtime.set_settings_dir(settings_dir);
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the

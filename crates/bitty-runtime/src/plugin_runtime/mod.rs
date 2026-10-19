@@ -576,8 +576,9 @@ pub struct PluginRuntime {
     store_root: Option<PathBuf>,
     host: PluginHost,
     settings: Rc<dyn SettingsSource>,
-    /// Config directory (`<root>/bitty`) for per-plugin user files
-    /// (CTX-1195, issue #2010).
+    /// Config directory (`<root>/bitty`) for per-plugin user configuration
+    /// files: canonical Lua, an unambiguous short Lua alias, and the legacy
+    /// data-only TOML fallback (CTX-1195, issue #2010).
     ///
     /// `None` by default (no file layer): activation resolves every plugin
     /// from the shipped manifest defaults plus the shared [`settings`]
@@ -1092,12 +1093,16 @@ impl PluginRuntime {
         self.workspace_source = Some(source);
     }
 
-    /// Seed the config directory for per-plugin user files (CTX-1195, issue
-    /// #2010). Call before activation with the environment-derived
-    /// `<root>/bitty` directory: each generation resolves its
-    /// `plugins/<owner>.<name>.toml` file when its services are built
-    /// (absent file or `None` serves shipped defaults plus the old home).
-    /// Paths always derive from the environment; never pass a literal home.
+    /// Seed the config directory for per-plugin user configuration files
+    /// (CTX-1195, issue #2010). Call before activation with the
+    /// environment-derived `<root>/bitty` directory: each generation resolves
+    /// its canonical `plugins/<owner>.<name>.lua`, then an unambiguous
+    /// `plugins/<name>.lua` short alias, then the legacy
+    /// `plugins/<owner>.<name>.toml` when its services are built; the first
+    /// present file wins. Settings are pinned to that generation (no hot
+    /// reload); absent files or `None` serve shipped defaults plus the old
+    /// home, and safe mode passes `None`. Paths always derive from the
+    /// environment; never pass a literal home.
     pub fn set_settings_dir(&mut self, dir: Option<PathBuf>) {
         self.settings_dir = dir;
     }
@@ -2075,7 +2080,9 @@ impl PluginRuntime {
         let plugin_services = {
             // CTX-1195 (issue #2010): per-generation settings — manifest
             // shipped defaults, then the old home (the shared host source),
-            // then the per-plugin user file. Each generation holds its own
+            // then the per-plugin user file (canonical Lua, an unambiguous
+            // short Lua alias, or the legacy data-only TOML fallback; the
+            // first present file wins). Each generation holds its own
             // resolved map plus its declared key set, so a cross-plugin read
             // fails closed structurally and at the gate. A malformed file
             // resolves to lower layers (never aborts activation); grants are

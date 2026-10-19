@@ -464,11 +464,12 @@ impl PreparedLaunch {
     /// clearing close-on-exec on the placed copies. It runs post-fork in the
     /// single-threaded child and fails the spawn closed on any error.
     ///
-    /// On Unix, registration first reserves both placement numbers in the
-    /// parent with a close-on-exec placeholder pipe. The reservation must be
-    /// held across `Command::spawn` so std's exec-error channel is allocated
-    /// above the placement targets; [`Self::after_spawn`] releases it after
-    /// the spawn attempt, and dropping the launch releases it otherwise.
+    /// On Unix, registration first reserves the whole `0..=highest` placement
+    /// range in the parent with close-on-exec placeholder pipes. The
+    /// reservation must be held across `Command::spawn` so std's exec-error
+    /// channel is allocated above the placement targets; [`Self::after_spawn`]
+    /// releases it after the spawn attempt, and dropping the launch releases
+    /// it otherwise.
     pub fn install_child_descriptors(&mut self, command: &mut Command) -> Result<(), LaunchError> {
         self.handles
             .as_mut()

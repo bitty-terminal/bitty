@@ -563,9 +563,9 @@ fn publication_low_stdio_guard_child() {
     let mut launch = prepared("bitty-ai");
     drop(dummies);
 
-    // Free stdin and stderr; stdout stays open for libtest. Without a
-    // reservation covering the whole 0..=4 range, the next error channel
-    // would take 0 and 2, then placement would clobber 3 and 4.
+    // Free stdin and stderr; stdout stays open for libtest. The previous
+    // two-lowest reservation would hold 0/2 and leave 3/4 to std's error
+    // channel, whose write end at 4 the placement hook would clobber.
     super::platform::close_test_descriptor(0).expect("close stdin");
     super::platform::close_test_descriptor(2).expect("close stderr");
     assert!(descriptor_target(0).is_none(), "stdin must be free");

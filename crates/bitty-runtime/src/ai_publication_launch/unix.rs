@@ -1,11 +1,12 @@
 //! Unix launch-handle adapter for the provider-publication launch seam.
 //!
-//! This is the crate's only `#[allow(unsafe_code)]` module. The one unsafe
-//! operation is the `Command::pre_exec` registration that places the
-//! inherited child-side descriptors at their fixed launch numbers after
-//! `fork(2)` and before `execve(2)`. The hook performs raw descriptor
-//! arithmetic only: no allocation, no locks, no std I/O, and no access to
-//! parent memory beyond the copied descriptor numbers.
+//! Production unsafe code is confined to the `Command::pre_exec`
+//! registration that places the inherited child-side descriptors at their
+//! fixed launch numbers after `fork(2)` and before `execve(2)`. The hook
+//! performs raw descriptor arithmetic only: no allocation, no locks, no std
+//! I/O, and no access to parent memory beyond the copied descriptor numbers.
+//! A test-only `close_test_descriptor` helper is also `#[allow(unsafe_code)]`
+//! under `cfg(test, target_os = "linux")`; it never ships.
 //!
 //! The bootstrap channel is an anonymous pipe; the control channel is a
 //! `socketpair(2)` (via `UnixStream::pair`) so both directions of the
@@ -216,8 +217,10 @@ impl Handles {
     /// descriptor syscalls (`fcntl`, `dup2`, `close`) and performs no
     /// allocation, locking, or std I/O. A returned error aborts the spawn, so
     /// descriptor placement can never silently fail open. The parent-side
-    /// reservation keeps both placement targets occupied across the spawn, so
-    /// std's close-on-exec exec-error channel is allocated elsewhere.
+    /// reservation fills the placement range across the spawn, so std's
+    /// close-on-exec exec-error channel is allocated above it unless another
+    /// owner closes a range descriptor in the window (module-level residual
+    /// race).
     #[allow(unsafe_code)]
     pub(super) fn install_child_descriptors(
         &mut self,

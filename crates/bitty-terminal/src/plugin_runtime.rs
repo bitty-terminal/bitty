@@ -230,17 +230,23 @@ impl WorkspaceSource for LiveWorkspaces {
 /// ring (CTX-1352).
 ///
 /// Only the runtime-global primary terminal state is sampled, and rows carry
-/// the active workspace sequence plus the primary view id as their scope
+/// the workspace that owns the primary view plus that view id as their scope
 /// attribution. Inactive panes, background workspaces, and alternate content
-/// are never captured into another scope.
+/// are never captured into another scope. Capture-disabled ticks return before
+/// building workspace summaries.
 pub(crate) fn capture_history(runtime: &bitty_runtime::Runtime, history: &TranscriptHistory) {
+    use bitty_runtime::plugin_runtime::HistoryProvider as _;
+
+    if !history.capture_enabled(bitty_plugin_host::HistorySource::Transcript) {
+        return;
+    }
     let Some(view) = runtime.primary_view() else {
         return;
     };
     let Some(workspace) = runtime
         .workspace_summaries()
         .into_iter()
-        .find(|summary| summary.active)
+        .find(|summary| summary.panel_ids.contains(&view.0))
     else {
         return;
     };

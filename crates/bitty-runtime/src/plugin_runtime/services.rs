@@ -16,8 +16,9 @@ use bitty_config::theme::CustomPalette;
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, HistoryQueryOp,
-    HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm, OVERLAY_CALL_MAX_BYTES,
+    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES,
+    FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES, HistoryQueryOp, HistoryQueryRequest,
+    HistoryQuerySource, HostServices, LuaValue, LuaVm, OVERLAY_CALL_MAX_BYTES,
     OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll,
     SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, ThemeTable, WORKSPACE_LIST_MAX_ITEMS,
     WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok, validate_env_key,
@@ -39,9 +40,9 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use bitty_plugin_host::{
-    HISTORY_READ_VERSION, HistoryDenialKind, HistoryGate, HistoryGrant, HistoryScope,
-    HistorySource, PluginId, ProvidedService, QueryOp, SnapshotQuery, TrustLevel,
-    parse_service_reference, service_version_satisfies, value_satisfies_schema,
+    FsBridgeError, FsCaps, FsGate, HISTORY_READ_VERSION, HistoryDenialKind, HistoryGate,
+    HistoryGrant, HistoryScope, HistorySource, PluginId, ProvidedService, QueryOp, SnapshotQuery,
+    TrustLevel, parse_service_reference, service_version_satisfies, value_satisfies_schema,
 };
 
 use super::history::{
@@ -50,6 +51,7 @@ use super::history::{
 };
 
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
+use super::fs_list::{FsListBackend, FsListEntry};
 use super::overlay::{
     DEFAULT_RELEASE_REASON, OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture, is_owner_release_reason,
 };
@@ -77,6 +79,37 @@ pub const MAX_ENV_GRANTS: usize = 64;
 /// unbounded variable (e.g. a dumped keyring) fails closed with
 /// `E_DEF_LIMIT` instead of crossing the bridge.
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
+/// Per-plugin `bitty.fs.list` rate window.
+///
+/// Reuses the accepted RC-8 one-second rate window; the op and byte ceilings
+/// are the accepted listing bridge bounds ([`FS_LIST_MAX_ENTRIES`] and
+/// [`FS_LIST_MAX_BYTES`]), so the mechanism mints no new public limit.
+const FS_LIST_WINDOW: Duration = crate::runtime::bell::RC8_WINDOW;
+
+/// Accepted caps for the real-filesystem `bitty.fs.list` path.
+///
+/// Per-call bounds reuse the bridge constants; the per-plugin window reuses
+/// the same accepted entry/byte bounds as its op and byte ceilings.
+fn fs_list_caps() -> FsCaps {
+    FsCaps::new(
+        u32::try_from(FS_CONTENT_MAX_BYTES).unwrap_or(u32::MAX),
+        u32::try_from(FS_CONTENT_MAX_BYTES).unwrap_or(u32::MAX),
+        u32::try_from(FS_LIST_MAX_ENTRIES).unwrap_or(u32::MAX),
+        u32::try_from(FS_LIST_MAX_BYTES).unwrap_or(u32::MAX),
+        FS_LIST_MAX_ENTRIES as u64,
+        FS_LIST_MAX_BYTES as u64,
+    )
+    .expect("accepted fs.list bridge bounds are nonzero")
+}
+
+/// Map a gate window denial to the oracle-tight bridge error.
+fn fs_gate_error(error: FsBridgeError) -> BridgeError {
+    match error.denial_kind() {
+        Some(kind) => super::fs_list::denial(kind),
+        None => super::fs_list::denial(bitty_plugin_host::FsBridgeDenialKind::ScopeMismatch),
+    }
+}
 
 /// Canonical workspace claim (`workspaceline`).
 ///
@@ -1719,6 +1752,24 @@ pub struct PluginServices {
     /// `None` leaves native audio calls failing closed with
     /// `E_SERVICE_GONE`, like a parked provider.
     audio_host: RefCell<Option<Rc<RefCell<super::audio::AudioHost>>>>,
+    /// Real-filesystem backend for `bitty.fs.list` (CTX-1348).
+    ///
+    /// Shared at activation with every generation; the call-time grant gate
+    /// in [`HostServices::fs_list`] consults this generation's own `fs.read:`
+    /// snapshot, so the backend itself carries no authority. `None` leaves
+    /// the verb failing closed with `E_NOT_IMPLEMENTED`, like every other
+    /// host-mediated verb without a wired backend.
+    fs_backend: RefCell<Option<Rc<FsListBackend>>>,
+    /// Per-plugin window accounting for `bitty.fs.list` (CTX-1348,
+    /// `P0-AC-014`).
+    ///
+    /// This gate holds no grants: authorization stays in [`FsListBackend`]
+    /// against this generation's own snapshot. Only the usage map, accepted
+    /// caps, and the typed over-bound denial are used here, so an exhausted
+    /// window denies with `E_FS_OVER_BOUND` before any directory I/O.
+    fs_gate: RefCell<FsGate>,
+    /// Start of the current `fs.list` rate window.
+    fs_window_start: Cell<Instant>,
 }
 
 impl PluginServices {
@@ -1793,6 +1844,9 @@ impl PluginServices {
             sensor_host: RefCell::new(None),
             device_host: RefCell::new(None),
             audio_host: RefCell::new(None),
+            fs_backend: RefCell::new(None),
+            fs_gate: RefCell::new(FsGate::new(fs_list_caps())),
+            fs_window_start: Cell::new(Instant::now()),
         }
     }
 
@@ -1824,6 +1878,52 @@ impl PluginServices {
     /// `bitty-terminal.audio` calls fail closed with `E_SERVICE_GONE`.
     pub fn set_audio_host(&self, host: Option<Rc<RefCell<super::audio::AudioHost>>>) {
         *self.audio_host.borrow_mut() = host;
+    }
+
+    /// Attach the real-filesystem backend for `bitty.fs.list` (CTX-1348).
+    ///
+    /// Shared at activation with every generation; the call-time gate in
+    /// [`HostServices::fs_list`] reads this generation's own `fs.read:`
+    /// snapshot, so installing the backend never widens authority. Without
+    /// it the verb keeps failing closed with `E_NOT_IMPLEMENTED`.
+    pub fn set_fs_backend(&self, backend: Option<Rc<FsListBackend>>) {
+        *self.fs_backend.borrow_mut() = backend;
+    }
+
+    /// Reset the per-plugin `fs.list` window once the accepted window elapsed.
+    fn refresh_fs_window(&self) {
+        self.refresh_fs_window_at(Instant::now());
+    }
+
+    /// [`Self::refresh_fs_window`] at an explicit instant.
+    ///
+    /// The explicit clock keeps the window boundary testable without a
+    /// wall-clock sleep; production always passes [`Instant::now`].
+    fn refresh_fs_window_at(&self, now: Instant) {
+        if now.duration_since(self.fs_window_start.get()) >= FS_LIST_WINDOW {
+            self.fs_gate.borrow_mut().advance_window();
+            self.fs_window_start.set(now);
+        }
+    }
+
+    /// Admit one `bitty.fs.list` call before any directory I/O.
+    ///
+    /// Charges one operation against the per-plugin window and fails with
+    /// `E_FS_OVER_BOUND` once the window is exhausted.
+    fn admit_fs_list(&self) -> Result<(), BridgeError> {
+        self.refresh_fs_window();
+        self.fs_gate
+            .borrow_mut()
+            .admit_listing(&self.plugin_id)
+            .map_err(fs_gate_error)
+    }
+
+    /// Charge the returned name bytes of one successful listing.
+    fn charge_fs_list_bytes(&self, bytes: u64) -> Result<(), BridgeError> {
+        self.fs_gate
+            .borrow_mut()
+            .charge_listing_bytes(&self.plugin_id, bytes)
+            .map_err(fs_gate_error)
     }
 
     /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
@@ -2720,6 +2820,55 @@ impl HostServices for PluginServices {
             return Err(BridgeError::not_implemented("bitty.env.has"));
         }
         Ok(self.env_source.borrow().get(key).is_some())
+    }
+
+    fn fs_list(&self, prefix: &str, max_entries: usize) -> Result<LuaValue, BridgeError> {
+        self.fs_list_with_expiry(
+            prefix,
+            max_entries,
+            Instant::now() + super::fs_list::LIST_SCAN_BUDGET,
+        )
+    }
+
+    fn fs_list_with_expiry(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        // CTX-1348: the backend resolves only paths covered by this
+        // generation's own `fs.read:` grants. It reads the activation
+        // snapshot directly, so a revoked generation cannot list through a
+        // stale service handle. Without a wired backend the verb keeps its
+        // historical fail-closed behavior.
+        let granted = self.granted_capabilities.borrow().clone();
+        let backend = self
+            .fs_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.fs.list"))?;
+        // Per-plugin window (P0-AC-014): the operation is admitted before
+        // any directory I/O, so an exhausted plugin cannot keep scanning.
+        self.admit_fs_list()?;
+        let entries: Vec<FsListEntry> =
+            backend.list_with_expiry(&granted, prefix, max_entries, expiry)?;
+        let bytes = entries
+            .iter()
+            .map(|entry| entry.name.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        self.charge_fs_list_bytes(bytes)?;
+        Ok(LuaValue::array(
+            entries
+                .into_iter()
+                .map(|entry| {
+                    LuaValue::table([
+                        ("name", LuaValue::String(entry.name)),
+                        ("kind", LuaValue::String(entry.kind.to_string())),
+                        ("untrusted", LuaValue::Bool(true)),
+                    ])
+                })
+                .collect(),
+        ))
     }
 
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
@@ -4315,6 +4464,7 @@ mod tests {
     use crate::plugin_runtime::store::PluginStore;
     use bitty_lua::E_UI_ALREADY_CAPTURED;
     use bitty_lua::ENV_KEY_MAX_BYTES;
+    use bitty_lua::FS_LIST_MAX_ENTRIES;
     use bitty_lua::ui::{
         ClickArg, ClickCommand, UI_CLICK_MAX_ARGS, UI_MAX_NODES, UI_MAX_TEXT_BYTES,
     };
@@ -5350,6 +5500,167 @@ mod tests {
             .process_spawn(&["status".to_owned()])
             .expect_err("grant absent must deny");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    fn fs_list_test_home(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1348-services-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).expect("create docs");
+        std::fs::write(dir.join("docs/a.txt"), "a").expect("write a");
+        std::fs::write(dir.join("docs/b.txt"), "b").expect("write b");
+        dir
+    }
+
+    #[test]
+    fn fs_list_serves_granted_entries_with_untrusted_shape() {
+        let home = fs_list_test_home("granted");
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        let value = services.fs_list("~/docs", 16).expect("granted listing");
+        let LuaValue::Table(entries) = value else {
+            panic!("fs.list must return an array");
+        };
+        assert_eq!(entries.len(), 2);
+        for (index, expected) in ["~/docs/a.txt", "~/docs/b.txt"].iter().enumerate() {
+            let pair_key = LuaValue::Integer(index as i64 + 1);
+            let (_, entry) = entries
+                .iter()
+                .find(|(key, _)| *key == pair_key)
+                .expect("array entry");
+            assert_eq!(
+                entry.get("name"),
+                Some(&LuaValue::String((*expected).to_string()))
+            );
+            assert_eq!(
+                entry.get("kind"),
+                Some(&LuaValue::String("file".to_string()))
+            );
+            assert_eq!(entry.get("untrusted"), Some(&LuaValue::Bool(true)));
+        }
+    }
+
+    #[test]
+    fn fs_list_without_backend_or_grant_fails_closed() {
+        let home = fs_list_test_home("closed");
+        let services = services();
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("no backend must fail");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("no grant must fail");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+    }
+
+    #[test]
+    fn fs_list_tight_loop_hits_the_per_plugin_window() {
+        let home = fs_list_test_home("budget");
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        let mut denial = None;
+        for call in 1..=(FS_LIST_MAX_ENTRIES + 1) {
+            match services.fs_list("~/docs", 16) {
+                Ok(_) => {}
+                Err(error) => {
+                    denial = Some((call, error));
+                    break;
+                }
+            }
+        }
+        let (call, error) = denial.expect("a tight loop must exhaust the per-plugin window");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+        // Both window dimensions are charged: with the byte budget at one
+        // full listing page, the returned name bytes exhaust the window well
+        // before the operation cap. Removing the byte charge lets the loop
+        // reach the op cap instead.
+        assert!(
+            call < FS_LIST_MAX_ENTRIES,
+            "byte budget must deny before the op cap (denied at call {call})"
+        );
+    }
+
+    #[test]
+    fn fs_list_empty_pages_still_charge_the_op_window() {
+        // Empty pages return no bytes, so only the operation window can
+        // bound a polling loop. This is the admission path, distinct from
+        // the returned-byte charge.
+        let home = fs_list_test_home("budget-empty");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::remove_file(home.join("docs").join(name)).expect("clear fixture");
+        }
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        let mut denial = None;
+        for call in 1..=(FS_LIST_MAX_ENTRIES + 1) {
+            match services.fs_list("~/docs", 16) {
+                Ok(value) => {
+                    let LuaValue::Table(entries) = value else {
+                        panic!("fs.list must return an array");
+                    };
+                    assert!(entries.is_empty());
+                }
+                Err(error) => {
+                    denial = Some((call, error));
+                    break;
+                }
+            }
+        }
+        let (call, error) = denial.expect("empty pages must still exhaust the op window");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+        assert_eq!(call, FS_LIST_MAX_ENTRIES + 1);
+    }
+
+    #[test]
+    fn fs_list_window_reopens_after_the_accepted_window() {
+        // A plugin that exhausts the op window must regain capacity once the
+        // accepted window elapses. Drive the boundary through the explicit
+        // clock instead of sleeping, so the test is deterministic and fast.
+        let home = fs_list_test_home("window-reset");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::remove_file(home.join("docs").join(name)).expect("clear fixture");
+        }
+        let services = services();
+        services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
+        services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
+
+        // Empty pages return no bytes, so the op window is what runs out.
+        for _ in 0..FS_LIST_MAX_ENTRIES {
+            services.fs_list("~/docs", 16).expect("window has capacity");
+        }
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("exhausted window must deny");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+
+        // Still inside the same window: the usage is not cleared.
+        services.refresh_fs_window_at(
+            services.fs_window_start.get() + (FS_LIST_WINDOW - Duration::from_millis(1)),
+        );
+        let error = services
+            .fs_list("~/docs", 16)
+            .expect_err("usage must survive until the window elapses");
+        assert_eq!(error.code, "E_FS_OVER_BOUND");
+
+        // One full window later the usage clears and listing resumes.
+        services.refresh_fs_window_at(services.fs_window_start.get() + FS_LIST_WINDOW);
+        services
+            .fs_list("~/docs", 16)
+            .expect("elapsed window must restore capacity");
     }
 
     fn env_services(grants: &[&str], values: &[(&str, &str)]) -> PluginServices {

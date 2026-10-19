@@ -25,6 +25,7 @@ pub mod audio;
 pub mod debug;
 pub mod device_providers;
 pub mod fs;
+pub mod fs_list;
 pub mod history;
 pub mod manifest_toml;
 pub mod overlay;
@@ -66,6 +67,7 @@ pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
     write_atomic_durably,
 };
+pub use fs_list::{FsListBackend, FsListEntry};
 pub use history::{
     BoundedHistory, HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_MAX_BYTES_PER_QUERY,
     HISTORY_MAX_BYTES_PER_ROW, HISTORY_MAX_BYTES_PER_WINDOW, HISTORY_MAX_QUERIES_PER_WINDOW,
@@ -679,6 +681,12 @@ pub struct PluginRuntime {
     /// that hold `platform.image-file` only; empty (including `--safe`,
     /// whose effective config clears the roots) denies every read.
     image_roots: Vec<PathBuf>,
+    /// CTX-1348: real-filesystem backend for `bitty.fs.list`, seeded by the
+    /// composition root through [`PluginRuntime::set_fs_backend`]. Shared
+    /// with every generation; the per-generation `fs.read:` snapshot gates
+    /// each call. `None` leaves the verb failing closed with
+    /// `E_NOT_IMPLEMENTED`.
+    fs_backend: Option<Rc<FsListBackend>>,
     /// CTX-1169: bounded queue of `bitty.theme.preview`/`confirm` intents,
     /// drained by the application each tick
     /// ([`PluginRuntime::drain_theme_requests`]). The drain live-applies
@@ -845,6 +853,7 @@ impl PluginRuntime {
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
             image_roots: Vec::new(),
+            fs_backend: None,
             theme_requests: Rc::new(RefCell::new(ThemeRequestQueue::new(
                 THEME_REQUEST_QUEUE_CAPACITY,
             ))),
@@ -1156,6 +1165,18 @@ impl PluginRuntime {
     /// read.
     pub fn set_image_roots(&mut self, roots: Vec<PathBuf>) {
         self.image_roots = roots;
+    }
+
+    /// Install the real-filesystem backend for `bitty.fs.list` (CTX-1348).
+    ///
+    /// Call before activation with the environment-derived home directory;
+    /// each generation captures the backend when its services are built.
+    /// The backend carries no authority by itself: every call re-reads the
+    /// generation's own `fs.read:` snapshot, so an ungranted generation
+    /// fails closed with `E_FS_MISSING_GRANT`. `None` leaves granted calls
+    /// failing closed with `E_NOT_IMPLEMENTED`.
+    pub fn set_fs_backend(&mut self, backend: Option<Rc<FsListBackend>>) {
+        self.fs_backend = backend;
     }
 
     /// Install the durable-commit backend for confirmed colorschemes
@@ -2251,6 +2272,12 @@ impl PluginRuntime {
         if image_file {
             plugin_services.set_image_roots(Some(self.image_roots.clone()));
         }
+        // CTX-1348: real-filesystem `bitty.fs.list` backend. Shared with
+        // every generation; the call-time gate reads this generation's own
+        // `fs.read:` activation snapshot, so a generation without a read
+        // grant fails closed with `E_FS_MISSING_GRANT` and the backend never
+        // becomes ambient authority.
+        plugin_services.set_fs_backend(self.fs_backend.clone());
         plugin_services.set_theme_access(runtime_configure);
         if runtime_configure {
             plugin_services.set_theme_queue(Some(self.theme_requests.clone()));

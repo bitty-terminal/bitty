@@ -1048,6 +1048,24 @@ pub trait HostServices {
         let _ = (prefix, max_entries);
         Err(BridgeError::not_implemented("bitty.fs.list"))
     }
+    /// Expiry-aware [`HostServices::fs_list`] for the callback deadline.
+    ///
+    /// The host implementation must abort a directory walk that reaches
+    /// `expiry` with [`BridgeError::timeout`] instead of returning after the
+    /// scan, so one listing cannot block the host thread past RC-1. The
+    /// default fails closed before doing any work when already expired, then
+    /// delegates to [`HostServices::fs_list`].
+    fn fs_list_with_expiry(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() >= expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.fs_list(prefix, max_entries)
+    }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
     /// One bounded snapshot read for `bitty.history.<source>.query`
@@ -4350,7 +4368,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                 };
                 validate_fs_list_max(max_entries).map_err(|e| e.to_error(ctx))?;
                 let result = state
-                    .bounded(|_expiry| state.services.fs_list(&prefix, max_entries))
+                    .bounded(|expiry| {
+                        state
+                            .services
+                            .fs_list_with_expiry(&prefix, max_entries, expiry)
+                    })
                     .map_err(|e| e.to_error(ctx))?;
                 stack.replace(ctx, result.to_lua(ctx));
                 Ok(CallbackReturn::Return)

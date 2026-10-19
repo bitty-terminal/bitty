@@ -15,13 +15,14 @@
 //! environment (or `$HOME`), never literals.
 
 use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    BridgeError, EmptySettings, LuaValue, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
-    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TranscriptHistory,
-    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    BridgeError, EmptySettings, FsListBackend, LuaValue, PanelCreateHandler, PanelPinHandler,
+    PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
+    TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
 use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
 use bitty_runtime::{ViewId, WorkspaceSummary};
@@ -431,6 +432,32 @@ fn data_home() -> Option<PathBuf> {
     )
 }
 
+/// Process home used to resolve `~`-rooted `fs.read` grants (CTX-1348).
+///
+/// `HOME` is authoritative on Unix; `USERPROFILE` is the Windows fallback.
+/// An absent, empty, or relative home leaves the backend unwired, so
+/// `bitty.fs.list` fails closed with `E_NOT_IMPLEMENTED` rather than guessing
+/// a root: an empty or relative home would otherwise resolve `~/docs` against
+/// the process working directory.
+fn home_dir() -> Option<PathBuf> {
+    abs_home_for(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+}
+
+/// First absolute, non-empty home candidate from explicit environment values.
+///
+/// Taking the values as arguments keeps the fallback (an empty `HOME` must not
+/// mask `USERPROFILE`) testable without mutating the process environment.
+fn abs_home_for(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Option<PathBuf> {
+    [home, userprofile]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute())
+}
+
 /// Untrusted local-path development roots from `$BITTY_PLUGIN_DIR`.
 ///
 /// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
@@ -488,6 +515,9 @@ pub(crate) fn discover_and_activate(
         seed,
         store_root(),
         dev_roots(),
+        // CTX-1348: `~`-rooted `fs.read` grants resolve against the
+        // environment-derived home. No literal host path is embedded.
+        home_dir(),
         // CTX-1195: per-plugin user files resolve under the live
         // environment-derived config root (`$XDG_CONFIG_HOME/bitty`, …) —
         // never a literal home. `None` (no usable root) serves shipped
@@ -498,10 +528,11 @@ pub(crate) fn discover_and_activate(
 
 /// Env-free startup wiring behind [`discover_and_activate`] (CTX-1115 test seam).
 ///
-/// Production resolves both roots from the environment; tests pass explicit
-/// roots so the real backend installation plus activation path runs without
-/// process-global environment mutation (which `#![forbid(unsafe_code)]`
-/// rules out).
+/// Production resolves the store, development, and filesystem-home roots from
+/// the environment; tests pass explicit roots so the real backend installation
+/// plus activation path runs without process-global environment mutation
+/// (which `#![forbid(unsafe_code)]` rules out).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn discover_with_roots(
     safe_mode: bool,
     cols: usize,
@@ -509,6 +540,7 @@ pub(crate) fn discover_with_roots(
     seed: &StartupSeed<'_>,
     store_root: Option<PathBuf>,
     dev_roots: Vec<PathBuf>,
+    fs_home: Option<PathBuf>,
     settings_dir: Option<PathBuf>,
 ) -> Option<PluginSession> {
     let store_present = store_root.as_deref().is_some_and(Path::is_dir);
@@ -595,6 +627,12 @@ pub(crate) fn discover_with_roots(
     // slice: confirms drain to a warning with state untouched until the
     // config-file write path lands with its consent design.
     runtime.set_image_roots(seed.image_roots.iter().map(PathBuf::from).collect());
+    // CTX-1348: wire the real `bitty.fs.list` backend from the environment
+    // before activation. The backend resolves only paths covered by each
+    // generation's own `fs.read:` grants; no home root becomes ambient.
+    if let Some(home) = fs_home {
+        runtime.set_fs_backend(Some(Rc::new(FsListBackend::new(home))));
+    }
     let _ = runtime.discover();
     for (id, result) in runtime.activate_discovered() {
         match result {
@@ -686,6 +724,101 @@ mod tests {
             integer_of(&after, "snapshot_generation"),
             live,
             "snapshot_generation must track the same committed generation"
+        );
+    }
+
+    fn fs_list_probe_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-startup-fs-list-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp root");
+        dir
+    }
+
+    /// `home_dir` rejects an unsafe root instead of letting grants resolve
+    /// against the process working directory (CTX-1348 review).
+    #[test]
+    fn absent_empty_or_relative_home_is_rejected_with_fallback() {
+        let absolute = std::env::temp_dir();
+        assert!(abs_home_for(None, None).is_none());
+        assert!(abs_home_for(Some(OsStr::new("")), None).is_none());
+        assert!(abs_home_for(Some(OsStr::new("relative-home")), None).is_none());
+        assert_eq!(
+            abs_home_for(Some(absolute.as_os_str()), None),
+            Some(absolute.clone())
+        );
+        // An empty `HOME` must not mask the `USERPROFILE` fallback.
+        assert_eq!(
+            abs_home_for(Some(OsStr::new("")), Some(absolute.as_os_str())),
+            Some(absolute)
+        );
+    }
+
+    /// Composition-root wiring for `bitty.fs.list` (CTX-1348): a development
+    /// package granted `fs.read:~/docs/**` lists the seeded home through the
+    /// production backend installed by [`discover_with_roots`].
+    #[test]
+    fn discover_wires_bounded_fs_list_backend_from_home() {
+        let home = fs_list_probe_root("home");
+        std::fs::create_dir_all(home.join("docs")).expect("docs");
+        std::fs::write(home.join("docs/a.txt"), "a").expect("a");
+        std::fs::write(home.join("docs/b.txt"), "b").expect("b");
+        std::fs::create_dir_all(home.join("outside")).expect("outside");
+        std::fs::write(home.join("outside/secret.txt"), "s").expect("secret");
+
+        let root = fs_list_probe_root("plugins");
+        let id = "xuepoo.fslist";
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"FS list\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n\n[[capabilities.filesystem]]\naccess = \"read\"\npaths = [\"~/docs/**\"]\n\n[lazy]\ncommands = [\"{id}:list\"]\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            r#"
+            local function list()
+              local entries = bitty.fs.list("~/docs")
+              local out = {}
+              for i, entry in ipairs(entries) do
+                out[i] = entry.name .. ":" .. entry.kind .. ":" .. tostring(entry.untrusted)
+              end
+              return table.concat(out, ",")
+            end
+            bitty.commands.register({ id = "list", title = "List", run = list })
+            "#,
+        )
+        .expect("init");
+
+        let live = Runtime::with_defaults().expect("defaults");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
+            .expect("dev root must yield a session");
+        let mut runtime = session.runtime;
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        let value = runtime
+            .dispatch_command(&plugin_id, "list", &[])
+            .expect("dispatch fs.list command");
+        assert_eq!(
+            value,
+            LuaValue::String("~/docs/a.txt:file:true,~/docs/b.txt:file:true".to_string())
         );
     }
 
@@ -850,7 +983,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
         let pin_state = Rc::clone(&session.pin_state);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
@@ -1085,7 +1218,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
         let pin_state = Rc::clone(&session.pin_state);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
@@ -1245,7 +1378,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
         let pin_state = Rc::clone(&session.pin_state);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
@@ -1384,7 +1517,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
         };
-        discover_with_roots(false, 80, 24, &seed, None, vec![root], None)
+        discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session")
             .runtime
     }

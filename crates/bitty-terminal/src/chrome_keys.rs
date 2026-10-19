@@ -1234,6 +1234,39 @@ impl TerminalApp {
         );
     }
 
+    /// Routes one bound chrome action that originated on the input hot path
+    /// (CTX-1324, P0-AC-015).
+    ///
+    /// Only actions that can enter an owning plugin VM are deferred:
+    /// `invoke_command`, `toggle_palette`, and `open_composer` enqueue on the
+    /// bounded cold queue and return `false` (no exit request). Every other
+    /// action keeps the immediate in-process behavior; the Core-owned
+    /// `scratchpad` invocation is in that set because it never touches a VM.
+    ///
+    /// The cold pump re-runs the original [`Self::apply_chrome_action`], so
+    /// live composer ownership, plugin lifecycle, registration, schema, and
+    /// host-capability gates are evaluated at delivery time, not at input.
+    fn apply_input_chrome_action(&mut self, action: bitty_config::ChromeAction) -> bool {
+        use bitty_config::ChromeAction as A;
+        let scratchpad = matches!(
+            &action,
+            A::InvokeCommand(qualified)
+                if qualified.as_str() == bitty_runtime::SCRATCHPAD_CMD_TOGGLE
+        );
+        if scratchpad {
+            return self.apply_chrome_action(action);
+        }
+        let deferred = matches!(
+            &action,
+            A::InvokeCommand(_) | A::TogglePalette | A::OpenComposer
+        );
+        if deferred {
+            self.enqueue_input_command(action);
+            return false;
+        }
+        self.apply_chrome_action(action)
+    }
+
     /// Execute one bound chrome action (single owner: the PTY never sees the
     /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
     /// refusals warn and keep the current layout.
@@ -2467,7 +2500,7 @@ impl TerminalApp {
                 self.chrome.held.insert(keyref.key);
                 if !key.repeat {
                     eprintln!("bitty: prefix -> {}", action.canonical());
-                    if self.apply_chrome_action(action) {
+                    if self.apply_input_chrome_action(action) {
                         self.chrome_close_exit_requested = true;
                     }
                 }
@@ -2897,7 +2930,7 @@ impl TerminalApp {
                             self.chrome.held.insert(keyref.key);
                             // Repeats of a bound chord stay owned by chrome
                             // (no action, no PTY bytes).
-                            if !key.repeat && self.apply_chrome_action(action) {
+                            if !key.repeat && self.apply_input_chrome_action(action) {
                                 self.chrome_close_exit_requested = true;
                             }
                             if let Some(win) = self.window.handle.as_ref() {
@@ -7510,6 +7543,9 @@ claims = []
             drive_chrome(&mut app, char_press("P", "P", false)),
             "the bound palette chord is chrome-owned"
         );
+        // CTX-1324: the input intercept only enqueues the plugin-reaching
+        // action; the exclusive cold phase performs the dispatch.
+        assert_eq!(app.pump_cold_commands(), 1, "one deferred palette toggle");
         assert!(
             app.overlay_capture_active(),
             "the toggle must hold the focusable capture after dispatch"
@@ -7591,6 +7627,9 @@ claims = []
             drive_chrome(&mut app, char_press("e", "e", false)),
             "the bound composer chord is chrome-owned"
         );
+        // CTX-1324: the input intercept only enqueues the plugin-reaching
+        // action; the exclusive cold phase performs the dispatch.
+        assert_eq!(app.pump_cold_commands(), 1, "one deferred composer open");
         assert!(
             app.overlay_capture_active(),
             "the open must hold the focusable capture after dispatch"

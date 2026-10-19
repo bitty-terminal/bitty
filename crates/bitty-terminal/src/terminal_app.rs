@@ -255,6 +255,15 @@ pub(crate) const TERMINAL_CWD_MAX_BYTES: usize = 4096;
 /// Maximum bytes kept from a config path in a `config.reloaded` payload
 /// (issue #1828).
 pub(crate) const CONFIG_PATH_MAX_BYTES: usize = 1024;
+/// Maximum queued input-originated plugin command invocations (CTX-1324).
+///
+/// The static keybinding intercept enqueues `InvokeCommand`, `TogglePalette`,
+/// and `OpenComposer` here instead of entering the owning VM on the input hot
+/// path (P0-AC-015). The bound matches the runtime band-queue caps (8): one
+/// user gesture may fan out to a small burst, while a hostile autorepeat
+/// cannot queue unbounded work between two cold ticks. Overflow drops the
+/// newest request and emits one attributed diagnostic per drop.
+pub(crate) const INPUT_COMMAND_QUEUE_CAPACITY: usize = 8;
 
 /// Stable-id payload for a workspace event (identity only, no content).
 fn workspace_id_value(seq: u64) -> LuaValue {
@@ -625,6 +634,19 @@ pub(crate) struct TerminalApp {
     /// by [`Self::deliver_runtime_events`] on the same tick. At most one
     /// per tick; a second reload on the same tick overwrites the first.
     pending_config: Option<PendingConfigReload>,
+    /// Input-originated plugin command invocations awaiting the cold phase
+    /// (CTX-1324, P0-AC-015).
+    ///
+    /// The static keybinding intercept queues `InvokeCommand`,
+    /// `TogglePalette`, and `OpenComposer` here; [`Self::pump_cold_commands`]
+    /// drains them on `AboutToWait` and re-runs the original chrome action, so
+    /// lifecycle, registration, schema, origin, and host-capability gates are
+    /// revalidated at execution time. Bounded
+    /// ([`INPUT_COMMAND_QUEUE_CAPACITY`], drop-newest with an attributed
+    /// diagnostic); never drained from input, redraw, or PTY-readable arms.
+    pending_input_commands: std::collections::VecDeque<bitty_config::ChromeAction>,
+    /// Cumulative dropped input-path command invocations (CTX-1324).
+    pending_input_commands_dropped: u64,
 }
 
 /// Queued process-exit edge (issue #1828; bounded, see
@@ -695,6 +717,8 @@ impl TerminalApp {
             last_plugin_queue_dropped: 0,
             pending_exits: std::collections::VecDeque::new(),
             pending_config: None,
+            pending_input_commands: std::collections::VecDeque::new(),
+            pending_input_commands_dropped: 0,
         }
     }
 
@@ -736,6 +760,8 @@ impl TerminalApp {
             last_plugin_queue_dropped: 0,
             pending_exits: std::collections::VecDeque::new(),
             pending_config: None,
+            pending_input_commands: std::collections::VecDeque::new(),
+            pending_input_commands_dropped: 0,
         }
     }
 
@@ -2130,6 +2156,45 @@ impl TerminalApp {
         true
     }
 
+    /// Queues one input-originated plugin-reaching chrome action for the cold
+    /// phase (CTX-1324, P0-AC-015).
+    ///
+    /// Called only from [`crate::chrome_keys`]'s input intercept. Enforces the
+    /// payload bound on `command:<owner:command>` targets and
+    /// [`INPUT_COMMAND_QUEUE_CAPACITY`] on the queue; overflow and oversize
+    /// targets drop the newest request with one attributed diagnostic and a
+    /// counter, never a silent drop. The queued action is re-run by
+    /// [`Self::pump_cold_commands`], so no authority is captured here.
+    pub(crate) fn enqueue_input_command(&mut self, action: bitty_config::ChromeAction) {
+        if let bitty_config::ChromeAction::InvokeCommand(qualified) = &action {
+            if qualified.len() > bitty_config::keymap::MAX_INVOKE_COMMAND_LEN {
+                self.pending_input_commands_dropped =
+                    self.pending_input_commands_dropped.saturating_add(1);
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: input command '{qualified}' dropped (target exceeds {} bytes)",
+                        bitty_config::keymap::MAX_INVOKE_COMMAND_LEN
+                    )
+                });
+                return;
+            }
+        }
+        if self.pending_input_commands.len() >= INPUT_COMMAND_QUEUE_CAPACITY {
+            self.pending_input_commands_dropped =
+                self.pending_input_commands_dropped.saturating_add(1);
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: input command '{}' dropped (cold-delivery queue full at {}; total drops={})",
+                    action.canonical(),
+                    INPUT_COMMAND_QUEUE_CAPACITY,
+                    self.pending_input_commands_dropped
+                )
+            });
+            return;
+        }
+        self.pending_input_commands.push_back(action);
+    }
+
     /// Runs the exclusive cold delivery phase (CTX-1332, C-D1/C-D4/C-D5).
     ///
     /// Called from exactly one place: the `AboutToWait` arm, after
@@ -2143,8 +2208,10 @@ impl TerminalApp {
     /// (the literal 16 = 8 + 8 from the existing band queue caps), enforced
     /// over the combined click/scroll/invalid-retry work; the unselected tail
     /// stays queued. Each selected request is re-validated against the live
-    /// presented origin before the VM borrow. Returns the number of attempts
-    /// that reached dispatch (including refusals).
+    /// presented origin before the VM borrow. Static keybinding command
+    /// invocations queued by the input intercept (CTX-1324) drain on the same
+    /// phase, bounded by [`INPUT_COMMAND_QUEUE_CAPACITY`]. Returns the number
+    /// of attempts that reached dispatch (including refusals).
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
         let admissions = self
             .runtime
@@ -2205,6 +2272,17 @@ impl TerminalApp {
                     }
                 }
             }
+        }
+        // CTX-1324: static keybinding command invocations queued by the input
+        // intercept run on the same exclusive cold phase. Re-running the
+        // original chrome action (rather than a captured call) re-evaluates
+        // the live composer ownership, lifecycle, registration, schema, and
+        // host-capability gates immediately before the VM borrow.
+        while let Some(action) = self.pending_input_commands.pop_front() {
+            if self.apply_chrome_action(action) {
+                self.chrome_close_exit_requested = true;
+            }
+            attempted = attempted.saturating_add(1);
         }
         attempted
     }

@@ -374,6 +374,76 @@ fn shaped_cursor_policy_unshapes_under_cursor() {
 }
 
 #[test]
+fn shaped_cursor_policy_unshapes_after_leading_blanks() {
+    // Issue #2316: `shape_run` reports run-relative cluster columns, but the
+    // emitter used to compare them against the absolute cursor column. When
+    // the shaped run starts after leading blank cells (`"  fi"`), the cursor
+    // on the absolute `f` column never intersected the run-relative span and
+    // `LigaturePolicy::Cursor` left the ligature shaped.
+    let Some(raster) = live_chain_for("Noto Sans") else {
+        eprintln!("skipped: no host font stack or Noto Sans");
+        return;
+    };
+    let query = query_for("Noto Sans");
+    let mut renderer =
+        bitty_render::GridRenderer::new(raster, &query, CellMetrics::new(10, 22).unwrap())
+            .expect("renderer builds");
+    let mut state = bitty_term_state::State::new();
+    for ch in [' ', ' ', 'f', 'i'] {
+        state.apply(&bitty_term_state::TerminalAction::Print(
+            bitty_vt::GraphemeCell::from(ch),
+        ));
+    }
+    let mut snap = state.snapshot();
+    snap.cursor.position.row = 0;
+    snap.cursor.visible = true;
+    let damage = bitty_term_state::Damage {
+        generation: snap.generation,
+        regions: vec![bitty_term_state::DamagedRegion::Grid(
+            bitty_term_state::DamageRect::full(snap.height as u16, snap.width as u16),
+        )]
+        .into_boxed_slice(),
+    };
+    let never = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Never, &[])
+        .expect("never renders");
+    assert_eq!(
+        never.glyphs.len(),
+        1,
+        "Never keeps the post-blank ligature: {never:?}"
+    );
+    // Cursor on the absolute column of `f` (two leading blanks).
+    snap.cursor.position.col = 2;
+    let cursor = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Cursor, &[])
+        .expect("cursor renders");
+    let always = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Always, &[])
+        .expect("always renders");
+    assert_eq!(
+        cursor.glyphs.len(),
+        2,
+        "Cursor on the absolute `f` column must un-shape the post-blank run: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.glyphs.len(),
+        always.glyphs.len(),
+        "Cursor-on-ligature must equal Always after leading blanks"
+    );
+    // A cursor on a leading blank belongs to no run and must not un-shape
+    // the following ligature.
+    snap.cursor.position.col = 0;
+    let leading = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Cursor, &[])
+        .expect("leading cursor renders");
+    assert_eq!(
+        leading.glyphs.len(),
+        1,
+        "cursor on a leading blank keeps the ligature: {leading:?}"
+    );
+}
+
+#[test]
 fn shaped_cjk_rows_stay_double_width() {
     let Some(raster) = live_chain_for("Noto Sans CJK SC") else {
         eprintln!("skipped: no CJK face on this host");

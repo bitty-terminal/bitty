@@ -458,3 +458,165 @@ fn combining_sequence_renders_without_splitting_truth() {
         "grid truth untouched by mark rendering"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2315: block elements cover the shaped render path.
+// ---------------------------------------------------------------------------
+
+/// Shaped renderer at the owner configuration: 10x22 design cell scaled by
+/// 1.6 to a 16x35 physical cell (the size where font block outlines expose
+/// partial-coverage boundary columns).
+fn scaled_shaped_renderer(
+    family: &str,
+) -> Option<bitty_render::GridRenderer<FallbackRasterizer<SwashSingle>>> {
+    let raster = live_chain_for(family)?;
+    let query = query_for(family);
+    let base = CellMetrics::new(10, 22).expect("valid base cell");
+    let mut renderer = bitty_render::GridRenderer::new(raster, &query, base).ok()?;
+    let applied = renderer.apply_dpi_scale(base, &query, 1.6).ok()?;
+    assert_eq!(
+        applied.cell,
+        CellMetrics::new(16, 35).expect("valid scaled cell"),
+        "the regression must run at the reported 16x35 cell"
+    );
+    Some(renderer)
+}
+
+/// Composites every emitted glyph mask into a coverage frame (`0` background
+/// .. `255` full ink), the same independent proof the unshaped #2307 tests
+/// use, so block coverage is measured rather than inferred from geometry.
+fn coverage_frame(
+    renderer: &bitty_render::GridRenderer<FallbackRasterizer<SwashSingle>>,
+    list: &bitty_render::grid::DrawList,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let dims = renderer.atlas_dims();
+    let texels = renderer.atlas_texels();
+    let mut frame = vec![0u8; (width * height) as usize];
+    for glyph in &list.glyphs {
+        let (gw, gh) = (glyph.size[0], glyph.size[1]);
+        for y in 0..gh {
+            for x in 0..gw {
+                let coverage = match &glyph.source {
+                    GlyphSource::Atlas { slot } => {
+                        let sx = u32::from(slot.x) + x;
+                        let sy = u32::from(slot.y) + y;
+                        texels[(sy * u32::from(dims.width) + sx) as usize]
+                    }
+                    GlyphSource::Inline { mask, width, .. } => mask[(y * width + x) as usize],
+                };
+                let dx = glyph.dest[0] + x as i32;
+                let dy = glyph.dest[1] + y as i32;
+                if dx >= 0 && dy >= 0 && (dx as u32) < width && (dy as u32) < height {
+                    let index = (dy as u32 * width + dx as u32) as usize;
+                    frame[index] = frame[index].max(coverage);
+                }
+            }
+        }
+    }
+    frame
+}
+
+#[test]
+fn shaped_block_elements_tile_on_the_cell_box() {
+    // Two adjacent U+2588 cells must emit the shared cell-box mask through
+    // `render_shaped` (not the font outline), so every pixel including the
+    // 16/17 boundary column is full coverage.
+    let Some(mut renderer) = scaled_shaped_renderer("JetBrainsMono Nerd Font") else {
+        eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
+        return;
+    };
+    let state = state_from(&[print_action('\u{2588}'), print_action('\u{2588}')]);
+    let snap = state.snapshot();
+    let damage = full_damage(&state);
+    let shaped = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Never, &[])
+        .expect("shaped block frame renders");
+    assert_eq!(
+        shaped.glyphs.len(),
+        2,
+        "one cell-box glyph per block cell: {shaped:?}"
+    );
+    assert_eq!(shaped.glyphs[0].dest, [0, 0]);
+    assert_eq!(shaped.glyphs[0].size, [16, 35]);
+    assert_eq!(shaped.glyphs[1].dest, [16, 0]);
+    assert_eq!(shaped.glyphs[1].size, [16, 35]);
+
+    let frame = coverage_frame(&renderer, &shaped, 32, 35);
+    for y in 0..35u32 {
+        for x in 0..32u32 {
+            assert_eq!(
+                frame[(y * 32 + x) as usize],
+                255,
+                "background pixel at ({x},{y}) across the shaped block boundary"
+            );
+        }
+    }
+
+    // Shaped and unshaped block coverage are identical by construction.
+    let plain = renderer.render(&snap, &damage).expect("plain renders");
+    assert_eq!(
+        frame,
+        coverage_frame(&renderer, &plain, 32, 35),
+        "shaped block coverage must equal the unshaped cell-box path"
+    );
+}
+
+#[test]
+fn shaped_block_base_with_combining_mark_keeps_the_cell_box() {
+    // A multi-scalar cluster whose base is a block element (`U+2588` +
+    // combining acute) must keep the cell-box base; the shaped font outline
+    // would reintroduce the partial-coverage edge. Zero-width marks still
+    // paint over the box through the shared per-cell mark path.
+    let Some(mut renderer) = scaled_shaped_renderer("JetBrainsMono Nerd Font") else {
+        eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
+        return;
+    };
+    let state = state_from(&[print_action('\u{2588}'), print_action('\u{301}')]);
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.cells[0].glyph, '\u{2588}',
+        "the mark must attach to the block cell"
+    );
+    assert!(
+        snap.cells[0].zerowidth.iter().any(|&c| c == '\u{301}'),
+        "the mark must stay in Terminal Truth"
+    );
+    let damage = full_damage(&state);
+    let shaped = renderer
+        .render_shaped(&snap, &damage, LigaturePolicy::Never, &[])
+        .expect("shaped block + mark frame renders");
+    let block = shaped
+        .glyphs
+        .iter()
+        .find(|glyph| glyph.dest == [0, 0])
+        .expect("the block base emits at the cell origin");
+    assert_eq!(
+        block.size,
+        [16, 35],
+        "the block base must be the exact cell box, not a font bitmap"
+    );
+    let frame = coverage_frame(&renderer, &shaped, 16, 35);
+    for y in 0..35u32 {
+        assert_eq!(
+            frame[(y * 16 + 15) as usize],
+            255,
+            "the shaped cell's right edge must stay fully covered"
+        );
+    }
+
+    // The shaped cell matches the unshaped cell byte for byte (base box +
+    // mark), so the multi-scalar branch keeps both paths identical.
+    let plain = renderer.render(&snap, &damage).expect("plain renders");
+    assert_eq!(
+        frame,
+        coverage_frame(&renderer, &plain, 16, 35),
+        "shaped block + mark must equal the unshaped cell path"
+    );
+    assert_eq!(
+        state.snapshot(),
+        snap,
+        "grid truth untouched by shaped block emission"
+    );
+}

@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use bitty_lua::LuaValue;
 use bitty_plugin_host::{CapabilityId, GrantRecord, PluginId, PluginState};
 use bitty_runtime::Runtime;
-use bitty_runtime::component::{ComponentHostError, ComponentWarnSink, executable_file_name};
+use bitty_runtime::component::{
+    ActivationDenial, ActivationState, ComponentHostError, ComponentWarnSink, executable_file_name,
+    read_activation,
+};
 use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir};
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
@@ -1016,6 +1019,155 @@ fn disposed_generation_loses_mirrored_authority() {
         ),
         other => panic!("the disposed generation must be refused, got {other:?}"),
     }
+}
+
+/// Follow-up to bitty#2323 (issue #2325): a same-hash policy-host entry that
+/// was explicitly suspended is not a stale generation. A mirror run must not
+/// replace, re-grant, or re-activate it; only an explicit resume clears the
+/// suspension.
+#[test]
+fn suspended_generation_survives_a_mirror_run() {
+    let mut fixture = reload_fixture("suspended-mirror");
+    let id = fixture.id.clone();
+    fixture
+        .runtime
+        .suspend_plugin(&id)
+        .expect("suspend the mirrored generation");
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("suspended generation stays registered")
+            .state,
+        PluginState::Suspended
+    );
+
+    // Any re-grant would overwrite this marker with the mirror's `decided_at`
+    // (0), so the marker proves the mirror left the grant record untouched.
+    let regrant_marker = 9_999;
+    let mut record = fixture
+        .runtime
+        .plugin_host()
+        .grants()
+        .get(&id)
+        .cloned()
+        .expect("the mirrored generation keeps its grant record");
+    record.decided_at = regrant_marker;
+    fixture
+        .runtime
+        .plugin_host_mut()
+        .grants_mut()
+        .insert(record);
+
+    let mut warnings = Vec::new();
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            warnings.push(format!("{plugin}: {reason}"));
+        }),
+        0,
+        "a suspended generation is already mirrored and must not be re-activated"
+    );
+    assert!(
+        warnings.is_empty(),
+        "a suspended generation must be neither refused nor retried: {warnings:?}"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("the suspended generation must survive the mirror")
+            .state,
+        PluginState::Suspended,
+        "the mirror must not replace the suspended entry"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .grants()
+            .get(&id)
+            .expect("the grant record must survive the mirror")
+            .decided_at,
+        regrant_marker,
+        "the mirror must not re-grant the suspended generation"
+    );
+    match fixture
+        .runtime
+        .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+    {
+        Err(ComponentHostError::PluginNotActive { state, .. }) => {
+            assert_eq!(state, "Suspended")
+        }
+        other => panic!("a suspended generation must fail closed, got {other:?}"),
+    }
+
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    assert_eq!(
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        "err:E_COMPONENT_NOT_ACTIVE",
+        "a component request under a suspended generation must fail closed"
+    );
+    // `bitty extension list` reads this projection: the fail-closed request is
+    // recorded as the stable `plugin_not_active` class, never as an activation.
+    assert_eq!(
+        read_activation(&fixture._scratch.path().join("extensions").join(ECHO)),
+        ActivationState::Denied(ActivationDenial::PluginNotActive),
+        "the extension-list projection must report the fail-closed denial"
+    );
+
+    // An explicit resume returns the policy-host entry to `Registered`; the
+    // caller may then activate it without another mirror.
+    fixture.runtime.resume_plugin(&id).expect("explicit resume");
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("resumed generation")
+            .state,
+        PluginState::Registered
+    );
+    fixture
+        .runtime
+        .activate_plugin(&id)
+        .expect("explicit activation after resume");
+    assert!(
+        !fixture
+            .runtime
+            .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+            .expect("explicitly resumed generation is authorized")
+            .is_offline(),
+        "explicit resume restores component authority"
+    );
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    assert_eq!(
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        format!("ok:200:{URL}|grant:{EGRESS_HOST}:{EGRESS_PORT}"),
+        "the explicitly resumed generation serves again"
+    );
+
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        0,
+        "the explicitly resumed generation is current and is not churned"
+    );
 }
 
 /// Manifest-shaped types are not needed by the surface test except through

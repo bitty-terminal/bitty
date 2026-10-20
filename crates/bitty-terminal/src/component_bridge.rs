@@ -52,19 +52,25 @@ fn remove_mirrored(
 ///
 /// Returns the number of generations mirrored. Idempotent for the current
 /// generation: an `Activated` id whose manifest hash already matches the
-/// plugin runtime's active package is left as is. A matching hash alone is not
-/// enough: if `register_plugin` succeeded but `activate_plugin` failed (for
-/// example an explicit capability denial), the entry stays `Registered` and a
-/// later mirror retries the grant and activation instead of skipping the id
-/// forever. When the hash changed (a hot reload, `PluginRuntime::reload`), the
+/// plugin runtime's active package is left as is. A same-hash `Suspended` id is
+/// also left suspended: suspension is an explicit policy decision, and only an
+/// explicit resume (which returns the entry to `Registered`, where the retry
+/// below may re-activate it) clears it. A matching hash alone is not enough:
+/// if `register_plugin` succeeded but `activate_plugin` failed (for example an
+/// explicit capability denial), the entry stays `Registered` and a later
+/// mirror retries the grant and activation instead of skipping the id forever.
+/// When the hash changed (a hot reload, `PluginRuntime::reload`), the
 /// predecessor is removed and the new generation is registered from scratch,
 /// so component requests carry the new manifest hash instead of being denied
 /// against a stale mirror. A plugin the runtime refuses is reported through
 /// `warn` and stays unmirrored (or loses its predecessor), so its component
 /// requests fail closed instead of inheriting another generation's authority.
 ///
-/// Two security invariants hold across a refresh:
+/// Three security invariants hold across a refresh:
 ///
+/// - a same-hash `Suspended` entry stays suspended: a mirror run neither
+///   replaces nor re-activates it, so only an explicit resume restores
+///   authority;
 /// - an explicit plugin-level denial in the policy host is sticky: the
 ///   reloaded generation is neither re-granted nor activated;
 /// - an id the plugin runtime no longer keeps `Active` (disposed, failed, or
@@ -112,7 +118,16 @@ pub fn mirror_plugin_authority(
         let registered_hash = current.map(|entry| entry.manifest.manifest_hash());
         let registered_state = current.map(|entry| entry.state);
         let same_hash = registered_hash.as_deref() == Some(hash.as_str());
-        if same_hash && registered_state == Some(PluginState::Activated) {
+        if same_hash
+            && matches!(
+                registered_state,
+                Some(PluginState::Activated | PluginState::Suspended)
+            )
+        {
+            // An activated mirror is already current; a suspended mirror is an
+            // explicit decision (#2325) and must not be replaced, re-granted,
+            // or re-activated by a later run. `resume` returns the entry to
+            // `Registered`; the retry path below may then activate it.
             continue;
         }
         // A host denial is an explicit decision that a reload cannot clear.

@@ -127,6 +127,10 @@ pub trait ControlRecordIo {
 }
 
 /// Write one length-prefixed control record.
+// Used by the Unix authenticated transport and by the cross-platform
+// state-machine tests. On non-Unix the shipped transport fails closed before
+// framing, so the non-test lib has no caller.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn send_record<W: Write + ?Sized>(
     writer: &mut W,
     record: &ControlRecord,
@@ -144,6 +148,10 @@ pub(super) fn send_record<W: Write + ?Sized>(
 }
 
 /// Read one length-prefixed control record.
+// Used by the Unix authenticated transport and by the cross-platform
+// state-machine tests. On non-Unix the shipped transport fails closed before
+// framing, so the non-test lib has no caller.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn receive_record<R: Read + ?Sized>(
     reader: &mut R,
 ) -> Result<ControlRecord, ControlIoError> {
@@ -170,6 +178,10 @@ pub(super) fn receive_record<R: Read + ?Sized>(
     ControlRecord::decode(&frame).map_err(ControlIoError::Codec)
 }
 
+// Used by the Unix authenticated transport and by the cross-platform
+// state-machine tests. On non-Unix the shipped transport fails closed before
+// framing, so the non-test lib has no caller.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn read_prefix<R: Read + ?Sized>(
     reader: &mut R,
     prefix: &mut [u8; CONTROL_FRAME_PREFIX_BYTES],
@@ -187,6 +199,10 @@ fn read_prefix<R: Read + ?Sized>(
     Ok(())
 }
 
+// Used by the Unix authenticated transport and by the cross-platform
+// state-machine tests. On non-Unix the shipped transport fails closed before
+// framing, so the non-test lib has no caller.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn read_body<R: Read + ?Sized>(reader: &mut R, body: &mut [u8]) -> Result<(), ControlIoError> {
     let mut filled = 0_usize;
     while filled < body.len() {
@@ -205,6 +221,10 @@ fn read_body<R: Read + ?Sized>(reader: &mut R, body: &mut [u8]) -> Result<(), Co
     Ok(())
 }
 
+// Used by the Unix authenticated transport and by the cross-platform
+// state-machine tests. On non-Unix the shipped transport fails closed before
+// framing, so the non-test lib has no caller.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn write_all<W: Write + ?Sized>(writer: &mut W, mut bytes: &[u8]) -> Result<(), ControlIoError> {
     while !bytes.is_empty() {
         match writer.write(bytes) {

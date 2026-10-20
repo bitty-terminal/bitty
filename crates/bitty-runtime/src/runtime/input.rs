@@ -1802,6 +1802,11 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // Issue #2337: losing window focus is capture loss for a pointer
+            // gesture. Cancel the tiled drag without committing; the
+            // present-only ghost clears on the next frame and the layout is
+            // still the pre-drag tree.
+            self.cancel_tiled_drag();
         }
         if self.focused == focused {
             return;

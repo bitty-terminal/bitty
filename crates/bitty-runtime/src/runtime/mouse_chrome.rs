@@ -10,17 +10,26 @@
 //! per OQ-052; Super also accepted for Hyprland muscle memory) on a tiled
 //! leaf grabs it for a tiled move via the headless
 //! [`DragMoveSession`](bitty_ui::DragMoveSession) primitive: motion tracks
-//! a live preview (advisory hovered target), release re-parents with
-//! Hyprland-like placement
-//! ([`drop_spec_for_point`](bitty_ui::drop_spec_for_point): nearest-edge
-//! docking with position-based sizing, so small panels grow by dropping
-//! centrally and large ones shrink by dropping near an edge; corner-zone
-//! drops resolve through the accepted #1804 balanced policy at `0.5`).
+//! a live preview (advisory hovered target), release commits one
+//! [`DropPlan`](bitty_ui::DropPlan) mutation
+//! ([`drop_plan_for_point`](bitty_ui::drop_plan_for_point): center targets
+//! swap in place, edge targets insert at a balanced split).
+//!
+//! Issue #2337: the press immediately paints a bounded, present-only ghost
+//! of the dragged panel that follows the pointer one-to-one from the grab
+//! point, plus the candidate-tile highlight. Solver geometry, leaf grids,
+//! and PTYs are untouched until release; the committed layout is the only
+//! place PTY sizes change. `Esc`, pointer leave, and window focus loss cancel
+//! without residue; a mid-drag layout install (close, zoom, workspace switch)
+//! abandons the drop while keeping that install's own layout change, so a
+//! stale release can never commit against the new tree. The bounded subset
+//! and its Hyprland deviations are documented in the workspace-compositor
+//! specification.
 //!
 //! Issue #1811 (CTX-1070): the tiled move shows continuous feedback — the
-//! grab arms the drag transition on the dragged frame (ghost outline) and
-//! the first hover arms it on the hovered drop target (drop-target
-//! highlight), all through the existing Core-owned chrome-ring fade
+//! grab arms the drag transition on the dragged frame and the first hover
+//! arms it on the hovered drop target (drop-target highlight), all through
+//! the existing Core-owned chrome-ring fade
 //! (geometry and terminal content are never interpolated). CTX-1167:
 //! motion holds those arms so progress accumulates toward full visibility
 //! instead of restarting near 0 on every motion. Gesture-scoped flags
@@ -56,8 +65,8 @@
 use super::*;
 use bitty_platform::CursorPosition;
 use bitty_ui::{
-    DragMoveSession, DropSpec, Point as UiPoint, RESIZE_HANDLE_CELLS, ResizeEdge, SplitAxis,
-    detect_resize_edge, drop_spec_for_point, resize_floating_rect,
+    DragMoveSession, DropPlan, DropSpec, Point as UiPoint, RESIZE_HANDLE_CELLS, ResizeEdge,
+    SplitAxis, detect_resize_edge, drop_plan_for_point, resize_floating_rect,
 };
 use std::time::Instant;
 
@@ -127,13 +136,16 @@ pub struct FloatResizeState {
     pub anchor_row: i32,
 }
 
-/// Active Mod+drag tiled-panel move (issue #1694, CTX-0966).
+/// Active Mod+drag tiled-panel move (issue #1694, CTX-0966; issue #2337).
 ///
 /// Wraps the headless [`DragMoveSession`] primitive: press lifts the tiled
-/// leaf under the cursor, motion tracks the advisory preview target live,
-/// release commits via [`drop_spec_for_point`] + `reparent_leaf` with
-/// position-based sizing. Floating (overlay-tier) leaves never start here;
-/// the Alt+drag floating path owns them.
+/// leaf under the cursor and immediately arms a bounded, present-only ghost
+/// plus the candidate-tile highlight; motion moves that ghost with the
+/// pointer and tracks the advisory preview target, while the solver tree and
+/// PTY geometry stay untouched; release commits exactly one swap (center
+/// target) or insert (edge target) through [`Runtime::set_layout`]. Floating
+/// (overlay-tier) leaves never start here; the Alt+drag floating path owns
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TiledDragState {
     /// Headless move session (source + advisory preview target).
@@ -150,6 +162,27 @@ pub struct TiledDragState {
     /// arm holds its final visible state until release. Same retry rule as
     /// the source: refused arms stay unrecorded and retry.
     armed_target: Option<ViewId>,
+    /// Pointer position at grab in physical pixels (rounded). Ghost motion
+    /// is the pointer delta from here, so the grab point stays under the
+    /// cursor exactly like a Hyprland window drag.
+    press_px: (i32, i32),
+    /// Last pointer position in physical pixels (rounded). The drop plan and
+    /// release read this instead of the global cursor, so a stale
+    /// `last_cursor` can never hit-test a different tile.
+    last_px: (i32, i32),
+    /// Present-only ghost translation from the source's committed frame,
+    /// bounded so the ghost stays inside the container.
+    ghost_dx: i32,
+    /// Present-only ghost vertical translation.
+    ghost_dy: i32,
+    /// Permitted horizontal ghost translation range at grab.
+    ghost_min_dx: i32,
+    /// Maximum horizontal ghost translation at grab.
+    ghost_max_dx: i32,
+    /// Permitted vertical ghost translation range at grab.
+    ghost_min_dy: i32,
+    /// Maximum vertical ghost translation at grab.
+    ghost_max_dy: i32,
 }
 
 /// Active border-drag resize: which split divider(s) are grabbed plus the
@@ -651,23 +684,114 @@ impl Runtime {
             .and_then(|drag| drag.session.preview_target())
     }
 
-    /// Hyprland-like drop placement for the active Mod+drag at the last
-    /// known cursor (issue #1811, CTX-1070 test seam and live-preview paint
-    /// hook): the [`DropSpec`] a release would commit — target, edge axis,
-    /// ratio, and side — or `None` over background, over a floating
-    /// overlay, on the source itself, or when no drag is active. Pure query;
-    /// the tree is never mutated here.
+    /// Hyprland-style bounded drop plan for the active Mod+drag at the last
+    /// motion position (issue #2337 test seam and live-preview hook): the
+    /// [`DropPlan`] a release would commit — a center swap or an edge insert
+    /// — or `None` over background, over a floating overlay, on the source
+    /// itself, or when no drag is active. The drag's own recorded pointer is
+    /// used (never the global `last_cursor`), so the plan cannot go stale.
+    /// Pure query; the tree is never mutated here.
     #[must_use]
-    pub fn tiled_drag_drop_spec(&self) -> Option<DropSpec> {
+    pub fn tiled_drag_drop_plan(&self) -> Option<DropPlan> {
         let drag = self.tiled_drag.as_ref()?;
-        let cursor = self.last_cursor?;
+        let cursor = CursorPosition {
+            x: f64::from(drag.last_px.0),
+            y: f64::from(drag.last_px.1),
+        };
         let point = self.cursor_to_layout_point(cursor)?;
-        drop_spec_for_point(
+        drop_plan_for_point(
             &self.layout,
             self.container,
             self.gaps(),
             drag.session.source(),
             point,
+        )
+    }
+
+    /// Insert-only compatibility view of [`Self::tiled_drag_drop_plan`]:
+    /// returns the edge [`DropSpec`] when the release would insert, and
+    /// `None` for a center swap or no plan.
+    #[must_use]
+    pub fn tiled_drag_drop_spec(&self) -> Option<DropSpec> {
+        match self.tiled_drag_drop_plan()? {
+            DropPlan::Insert(spec) => Some(spec),
+            DropPlan::Swap { .. } => None,
+        }
+    }
+
+    /// Present-only ghost translation from the source's committed frame, in
+    /// physical pixels, bounded inside the container (issue #2337). `None`
+    /// when no drag is active.
+    #[must_use]
+    pub fn tiled_drag_ghost_offset(&self) -> Option<(i32, i32)> {
+        self.tiled_drag
+            .as_ref()
+            .map(|drag| (drag.ghost_dx, drag.ghost_dy))
+    }
+
+    /// The translated paint frame of the dragged panel (issue #2337 test
+    /// seam): the source's committed [`PresentFrame`](super::layout_focus::PresentFrame)
+    /// moved by the bounded ghost offset. Solver truth, PTY geometry, and
+    /// hit-testing continue to read [`Self::present_frames`], which stays
+    /// byte-identical during the gesture.
+    #[must_use]
+    pub fn tiled_drag_preview_frame(&self) -> Option<super::layout_focus::PresentFrame> {
+        let drag = self.tiled_drag.as_ref()?;
+        let mut frame = self
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == drag.session.source())?;
+        let (dx, dy) = self.clamp_tiled_drag_delta(&frame.frame);
+        frame.frame.x = frame.frame.x.saturating_add(dx);
+        frame.frame.y = frame.frame.y.saturating_add(dy);
+        frame.content.x = frame.content.x.saturating_add(dx);
+        frame.content.y = frame.content.y.saturating_add(dy);
+        Some(frame)
+    }
+
+    /// Physical container area in the coordinate space of
+    /// [`PresentFrame`](super::layout_focus::PresentFrame) rectangles.
+    fn container_pixel_area(&self) -> bitty_render::geometry::RectPx {
+        let live = self.live_cell_metrics();
+        let scale = |value: u16, cell: u32| -> i32 {
+            let raw = i64::from(value) * i64::from(cell);
+            raw.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        bitty_render::geometry::RectPx::new(
+            scale(self.container.x, live.width),
+            scale(self.container.y, live.height),
+            (u64::from(self.container.width) * u64::from(live.width)).min(u64::from(u32::MAX))
+                as u32,
+            (u64::from(self.container.height) * u64::from(live.height)).min(u64::from(u32::MAX))
+                as u32,
+        )
+    }
+
+    /// Clamps the stored ghost translation so `frame` stays fully inside the
+    /// container. Recomputed at paint time, so a container resize mid-drag
+    /// can never paint the ghost off-screen.
+    fn clamp_tiled_drag_delta(&self, frame: &bitty_render::geometry::RectPx) -> (i32, i32) {
+        let Some(drag) = self.tiled_drag.as_ref() else {
+            return (0, 0);
+        };
+        let area = self.container_pixel_area();
+        let min_dx = area.x.saturating_sub(frame.x);
+        let max_dx = area
+            .x
+            .saturating_add(area.width as i32)
+            .saturating_sub(frame.width as i32)
+            .saturating_sub(frame.x)
+            .max(min_dx);
+        let min_dy = area.y.saturating_sub(frame.y);
+        let max_dy = area
+            .y
+            .saturating_add(area.height as i32)
+            .saturating_sub(frame.height as i32)
+            .saturating_sub(frame.y)
+            .max(min_dy);
+        (
+            drag.ghost_dx.clamp(min_dx, max_dx),
+            drag.ghost_dy.clamp(min_dy, max_dy),
         )
     }
 
@@ -764,16 +888,61 @@ impl Runtime {
         if self.layout.leaf_count() < 2 {
             return false;
         }
-        let Ok(session) = DragMoveSession::start(leaf, true) else {
+        let Ok(mut session) = DragMoveSession::start(leaf, true) else {
             return false;
         };
+        // Issue #2337: capture the committed frame once at grab so the ghost
+        // is pointer-relative and bounded for the whole gesture. A missing
+        // frame means the leaf is not paintable; fail soft rather than arm a
+        // drag that cannot show feedback.
+        let Some(frame) = self
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == leaf)
+        else {
+            return false;
+        };
+        let area = self.container_pixel_area();
+        let min_dx = area.x.saturating_sub(frame.frame.x);
+        let max_dx = area
+            .x
+            .saturating_add(area.width as i32)
+            .saturating_sub(frame.frame.width as i32)
+            .saturating_sub(frame.frame.x)
+            .max(min_dx);
+        let min_dy = area.y.saturating_sub(frame.frame.y);
+        let max_dy = area
+            .y
+            .saturating_add(area.height as i32)
+            .saturating_sub(frame.frame.height as i32)
+            .saturating_sub(frame.frame.y)
+            .max(min_dy);
+        let press_px = round_cursor_px(cursor);
+        // Issue #2337: the candidate tile is live from pointer-down. The
+        // press point normally resolves to the source itself (a no-op), so
+        // no foreign tile is highlighted until motion reaches one.
+        if let Some(point) = self.cursor_to_layout_point(cursor) {
+            session.preview(&self.layout, self.container, self.gaps(), point);
+        }
         self.tiled_drag = Some(TiledDragState {
             session,
             source_armed: false,
             armed_target: None,
+            press_px,
+            last_px: press_px,
+            ghost_dx: 0,
+            ghost_dy: 0,
+            ghost_min_dx: min_dx,
+            ghost_max_dx: max_dx,
+            ghost_min_dy: min_dy,
+            ghost_max_dy: max_dy,
         });
         self.set_focus(leaf);
         self.clear_hover_pending();
+        // Issue #2337: the grab itself must present a frame — the ghost sits
+        // at the source and the candidate highlight is armed below, so the
+        // gesture never waits for a first motion to show feedback.
+        self.pending_full_redraw = true;
         // CTX-1070 (issue #1811): the grab arms the drag transition on the
         // dragged frame (ghost outline). The layout is untouched — only the
         // leaf's chrome ring fades — and the gesture holds the arm so
@@ -805,22 +974,40 @@ impl Runtime {
     /// [`Self::update_tiled_drag`] with an explicit wall clock (CTX-0967
     /// virtual-clock seam: tests arm the drag transition deterministically).
     pub fn update_tiled_drag_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
-        let Some(point) = self.cursor_to_layout_point(pos) else {
-            return self.tiled_drag.is_some();
-        };
-        // Disjoint-field borrow: preview against the current tree while
-        // holding the session mutably.
+        let point = self.cursor_to_layout_point(pos);
         let (container, gaps) = (self.container, self.gaps());
         let Some(drag) = self.tiled_drag.as_mut() else {
             return false;
         };
         if self.layout.find_leaf(drag.session.source()).is_none() {
             self.tiled_drag = None;
+            self.pending_full_redraw = true;
             return false;
         }
+        // Issue #2337: the ghost follows the pointer one-to-one from the
+        // grab point, clamped inside the container. This is present-only
+        // motion: the solver tree, leaf grids, and PTYs are never touched.
+        let (px_x, px_y) = round_cursor_px(pos);
+        let raw_dx = px_x.saturating_sub(drag.press_px.0);
+        let raw_dy = px_y.saturating_sub(drag.press_px.1);
+        let next_dx = raw_dx.clamp(drag.ghost_min_dx, drag.ghost_max_dx);
+        let next_dy = raw_dy.clamp(drag.ghost_min_dy, drag.ghost_max_dy);
+        let moved =
+            (next_dx, next_dy) != (drag.ghost_dx, drag.ghost_dy) || (px_x, px_y) != drag.last_px;
+        drag.ghost_dx = next_dx;
+        drag.ghost_dy = next_dy;
+        drag.last_px = (px_x, px_y);
         let before = drag.session.preview_target();
-        drag.session.preview(&self.layout, container, gaps, point);
-        if drag.session.preview_target() != before {
+        match point {
+            Some(point) => {
+                drag.session.preview(&self.layout, container, gaps, point);
+            }
+            // Pointer left the container: clear the candidate rather than
+            // keeping a stale highlight from the last mapped cell.
+            None => drag.session.clear_preview(),
+        }
+        let target_changed = drag.session.preview_target() != before;
+        if moved || target_changed {
             self.pending_full_redraw = true;
         }
         // CTX-1167 (issue #1981): accumulate, never restart. The grab
@@ -872,15 +1059,17 @@ impl Runtime {
         true
     }
 
-    /// Ends the active Mod+drag, committing the drop when it lands on
-    /// another leaf (issue #1694).
+    /// Ends the active Mod+drag, committing exactly one move when it lands
+    /// on another leaf (issue #1694; issue #2337 reflow).
     ///
-    /// Computes Hyprland-like placement via [`drop_spec_for_point`]
-    /// (nearest-edge docking with position-based sizing) at the last known
-    /// cursor and re-parents through [`Runtime::set_layout`] so leaf Views,
-    /// pane sessions, and the primary grid reflow exactly like a keyboard
-    /// move. Self-drops, background drops, unmappable releases, and
-    /// mid-drag closes end the gesture with the tree untouched. Always
+    /// Computes the bounded Hyprland-style [`DropPlan`](bitty_ui::DropPlan)
+    /// at the drag's own recorded pointer: a center target swaps the two
+    /// panels in place, an edge target inserts beside it at a balanced split.
+    /// The chosen mutation runs once through [`Runtime::set_layout`], so leaf
+    /// Views, pane sessions, PTYs, and the primary grid reflow exactly like a
+    /// keyboard move. Self-drops, background drops, unmappable releases, and
+    /// releases after a mid-drag layout install end the gesture without a
+    /// drop (the install's own tree remains). Always
     /// returns `true` when a drag was active (caller skips the
     /// selection-release commit/copy: the grabbing press never started a
     /// selection, so there is nothing to commit and stale highlights must
@@ -892,23 +1081,33 @@ impl Runtime {
     /// [`Self::end_tiled_drag`] with an explicit wall clock (CTX-0967
     /// virtual-clock seam: tests arm the drop transition deterministically).
     pub fn end_tiled_drag_at(&mut self, now: Instant) -> bool {
-        let Some(drag) = self.tiled_drag.take() else {
+        let Some(drag) = self.tiled_drag.as_ref() else {
             return false;
         };
         let source = drag.session.source();
-        let Some(cursor) = self.last_cursor else {
-            return true;
+        let cursor = CursorPosition {
+            x: f64::from(drag.last_px.0),
+            y: f64::from(drag.last_px.1),
         };
-        let Some(point) = self.cursor_to_layout_point(cursor) else {
-            return true;
-        };
-        let Some(drop) =
-            drop_spec_for_point(&self.layout, self.container, self.gaps(), source, point)
-        else {
+        let plan = self.cursor_to_layout_point(cursor).and_then(|point| {
+            drop_plan_for_point(&self.layout, self.container, self.gaps(), source, point)
+        });
+        self.tiled_drag = None;
+        let Some(plan) = plan else {
+            // Background, overlay, or self: a release is a no-op, never a
+            // fallback insert.
+            self.pending_full_redraw = true;
             return true;
         };
         let mut next = self.layout.clone();
-        if !next.reparent_leaf(source, drop.target, drop.axis, drop.ratio, drop.after) {
+        let committed = match plan {
+            DropPlan::Swap { target } => next.swap_leaves(source, target),
+            DropPlan::Insert(spec) => {
+                next.reparent_leaf(source, spec.target, spec.axis, spec.ratio, spec.after)
+            }
+        };
+        if !committed {
+            self.pending_full_redraw = true;
             return true;
         }
         self.set_layout(next);
@@ -924,17 +1123,49 @@ impl Runtime {
     }
 
     /// Cancels the active Mod+drag without committing (cursor left the
-    /// window, or `Esc` cancelled mid-drag). The preview never mutates the
-    /// tree, so cancel restores the pre-drag layout byte-identically: no
-    /// re-parent, no selection, no residue. Arms a repaint when a drag was
-    /// active so the ghost outline and drop-target highlight clear on the
-    /// next frame. Returns `true` when a drag was active.
+    /// window, `Esc` cancelled mid-drag, or a layout install replaced the
+    /// tree). The preview never mutates the tree, so cancel restores the
+    /// pre-drag layout byte-identically for pointer/Esc cancellation; a
+    /// layout install keeps its own new tree (for example a close) and only
+    /// the drop is abandoned. No re-parent, no selection, no residue. Arms a
+    /// repaint when a drag was active so the ghost and drop-target highlight
+    /// clear on the next frame. Returns `true` when a drag was active.
     pub fn cancel_tiled_drag(&mut self) -> bool {
         if self.tiled_drag.is_none() {
             return false;
         }
         self.tiled_drag = None;
         self.pending_full_redraw = true;
+        true
+    }
+
+    /// Applies the active Mod+drag ghost to the paint-only allocation list
+    /// (issue #2337): translates the source frame by the bounded pointer
+    /// delta, lifts it to the float tier, and moves it last so it paints
+    /// above the untouched tiled layout. Logical allocations, hit-testing,
+    /// leaf grids, and PTY sizes never see this transform.
+    pub(super) fn apply_tiled_drag_paint(
+        &self,
+        frames: &mut Vec<super::layout_focus::PresentFrame>,
+    ) -> bool {
+        let Some(drag) = self.tiled_drag.as_ref() else {
+            return false;
+        };
+        let source = drag.session.source();
+        let Some(index) = frames.iter().position(|frame| frame.view == source) else {
+            return false;
+        };
+        let mut frame = frames.remove(index);
+        let (dx, dy) = self.clamp_tiled_drag_delta(&frame.frame);
+        frame.frame.x = frame.frame.x.saturating_add(dx);
+        frame.frame.y = frame.frame.y.saturating_add(dy);
+        frame.content.x = frame.content.x.saturating_add(dx);
+        frame.content.y = frame.content.y.saturating_add(dy);
+        // A dragged panel is a transient overlay: painting it last (with the
+        // float tier) keeps its content above every tiled sibling without
+        // reflowing them.
+        frame.tier = Some(OverlayTier::Float);
+        frames.push(frame);
         true
     }
 
@@ -945,7 +1176,7 @@ impl Runtime {
     /// (CTX-1168, issue #1983) and converts with live cell
     /// metrics, keeping the point in container coordinates: layout
     /// hit-tests (`hit_test_leaf`, `hit_test_split_handle(s)`,
-    /// `drop_spec_for_point`) apply the cell outer gap inset themselves via
+    /// `drop_plan_for_point`) apply the cell outer gap inset themselves via
     /// `layout_with_gaps`, so subtracting cell `gaps_out` here would shift the
     /// drop target with nonzero outer gaps. The px decoration outer gap is
     /// different: cell allocations never include it, so headed frames sit

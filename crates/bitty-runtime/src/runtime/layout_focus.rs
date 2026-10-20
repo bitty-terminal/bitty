@@ -622,7 +622,13 @@ impl Runtime {
     #[must_use]
     pub fn paint_frames_at(&self, now: std::time::Instant) -> Vec<PresentFrame> {
         let frames = self.present_frames();
-        self.paint_frames_from(&frames, now).unwrap_or(frames)
+        let mut painted = self.paint_frames_from(&frames, now).unwrap_or(frames);
+        // Issue #2337: the Mod+drag ghost is paint-only and lives on the
+        // same seam as geometry interpolation.
+        if self.tiled_drag_active() {
+            self.apply_tiled_drag_paint(&mut painted);
+        }
+        painted
     }
 
     /// Applies active geometry interpolation to already-computed logical
@@ -2361,6 +2367,13 @@ impl Runtime {
     }
 
     fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>, sync_geometry: bool) {
+        // Issue #2337: any layout install abandons an in-flight Mod+drag. A
+        // close changes the tree under the drag pointer whether or not it
+        // removed the dragged source; the ghost and candidate preview must
+        // clear now, and a later release must never commit a drop against
+        // the new tree. The close's own layout change remains; only the drop
+        // is abandoned.
+        self.cancel_tiled_drag();
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();

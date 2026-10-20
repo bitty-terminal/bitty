@@ -32,7 +32,7 @@
 #![forbid(unsafe_code)]
 
 use crate::geometry::{Gaps, Point, Rect, SplitAxis};
-use crate::layout::{LayoutNode, balanced_split_axis};
+use crate::layout::LayoutNode;
 use crate::panel::CommandRegistry;
 use crate::view::ViewId;
 
@@ -148,20 +148,45 @@ impl DropSpec {
     }
 }
 
-/// Fraction of the drop-target rect (per axis, from each edge) that
-/// counts as a corner zone for Mod+drag drops (issue #1811, CTX-1070).
+/// Reflow a Mod+drag release commits (issue #2337).
 ///
-/// A drop inside the outer quarter on *both* axes is directionally
-/// ambiguous (near two edges at once), so the nearest-edge rule would
-/// guess between them. Corner drops instead resolve through the accepted
-/// #1804 balanced policy ([`balanced_split_axis`](crate::layout::balanced_split_axis))
-/// at a balanced `0.5` ratio, so repeated corner drops nest balanced
-/// quadrant-like cells instead of position-sized slivers.
-pub const DROP_CORNER_FRACTION: f32 = 0.25;
+/// Center drops swap the dragged panel with the hovered tile; edge drops
+/// insert the dragged panel beside it at a balanced split. Both are single
+/// layout mutations, so a release can never both swap and insert.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DropPlan {
+    /// Exchange the dragged panel and the target panel in place.
+    Swap {
+        /// Hovered tile whose panel swaps with the source.
+        target: ViewId,
+    },
+    /// Re-parent the dragged panel beside the target.
+    Insert(DropSpec),
+}
 
-/// Balanced ratio for corner-zone drops: both new cells split evenly,
-/// matching the all-`50/50` #1804 quadrant policy.
-pub const DROP_CORNER_RATIO: f32 = 0.5;
+impl DropPlan {
+    /// Anchor leaf the release targets (swap partner or insert sibling).
+    #[must_use]
+    pub const fn target(self) -> ViewId {
+        match self {
+            Self::Swap { target } => target,
+            Self::Insert(spec) => spec.target,
+        }
+    }
+}
+
+/// Fraction of the drop-target rect (per axis) reserved as the center zone
+/// for Mod+drag drops (issue #2337).
+///
+/// A drop inside `[DROP_CENTER_FRACTION, 1 - DROP_CENTER_FRACTION]` on both
+/// axes swaps the dragged panel with the hovered tile. Outside that band the
+/// drop is an edge insert. Boundaries are inclusive (the exact `0.25`/`0.75`
+/// lines are center) so classification stays deterministic on the cell grid.
+pub const DROP_CENTER_FRACTION: f32 = 0.25;
+
+/// Balanced split ratio for edge inserts: both cells keep half the target's
+/// slot, matching Hyprland dwindle's default `0.5` split on a mouse drop.
+pub const DROP_INSERT_RATIO: f32 = 0.5;
 
 /// Cross-workspace drop plan (UX-09): which leaf moves and where it docks
 /// in the destination tree.
@@ -270,6 +295,12 @@ impl DragMoveSession {
         hit
     }
 
+    /// Clears the advisory preview (issue #2337): the pointer left the
+    /// container, so no tile may stay highlighted from a stale hit test.
+    pub fn clear_preview(&mut self) {
+        self.preview = None;
+    }
+
     /// Commits the move: validates `command` against [`DRAG_MOVE_CMD`] and
     /// the workspace [`CommandRegistry`], records a `history` snapshot, and
     /// re-parents the source leaf beside `drop.target`.
@@ -318,7 +349,7 @@ impl DragMoveSession {
 /// covers a base-layout gap; routing that into `reparent_leaf` would insert
 /// the tiled source into the overlay subtree and tier-flip it to floating.
 /// Overlay-tier hits are background for tiled moves, so both
-/// [`DragMoveSession::preview`] and [`drop_spec_for_point`] route through
+/// [`DragMoveSession::preview`] and [`drop_plan_for_point`] route through
 /// here. Tiled (tier-less) targets pass through unchanged.
 fn tiled_drop_target(tree: &LayoutNode, bounds: Rect, gaps: Gaps, point: Point) -> Option<ViewId> {
     let target = tree.hit_test_leaf(bounds, gaps, point)?;
@@ -332,40 +363,37 @@ fn tiled_drop_target(tree: &LayoutNode, bounds: Rect, gaps: Gaps, point: Point) 
     Some(target)
 }
 
-/// Computes Hyprland-like drop placement for a Mod+drag release
-/// (issue #1694, CTX-0966; overlay guard issue #1710; corner rule issue
-/// #1811, CTX-1070).
+/// Computes the Hyprland-style bounded drop plan for a Mod+drag release
+/// (issue #2337, bounded subset of issue #1694; overlay guard issue #1710).
 ///
 /// Hit-tests `point` against `tree` allocations; returns `None` when the
 /// point lands on background, over a floating overlay, or on `source`
-/// itself (self-drop no-op).
-/// Otherwise docks beside the hovered target:
-/// - Edge/center drops use nearest-edge docking with position-based sizing:
-///   the edge nearest the drop point wins (left/right dock horizontally,
-///   top/bottom vertically), and the split ratio follows the drop position
-///   within the target rect (clamped to
-///   [`LayoutNode::MIN_RATIO`](crate::layout::LayoutNode::MIN_RATIO) /
-///   [`LayoutNode::MAX_RATIO`](crate::layout::LayoutNode::MAX_RATIO)) so a
-///   small panel can grow by dropping centrally and a large one shrinks by
-///   dropping near an edge. Ties break deterministically toward horizontal
-///   (side-by-side) and toward first (left/top).
-/// - Corner-zone drops (inside [`DROP_CORNER_FRACTION`] on *both* axes, so
-///   the point is near two edges at once) resolve through the accepted #1804
-///   balanced policy instead of guessing between the edges: the axis is the
-///   physical-aspect [`balanced_split_axis`](crate::layout::balanced_split_axis)
-///   of the target rect, the side is the corner side along that axis, and
-///   the ratio is the balanced [`DROP_CORNER_RATIO`], so repeated corner
-///   drops nest even quadrant-like cells.
+/// itself (self-drop no-op). Otherwise the hovered tile is classified by
+/// its normalized drop position `(fx, fy)` inside the target rect:
 ///
-/// Pure, total, headless; never mutates the tree.
+/// - **Center zone** — [`DROP_CENTER_FRACTION`] band on both axes:
+///   [`DropPlan::Swap`]. The two panels exchange places in one mutation;
+///   split axes and ratios are untouched, so the arrangement is byte-stable
+///   (Hyprland's tiled swap).
+/// - **Edge zone** — anywhere else: [`DropPlan::Insert`] beside the target.
+///   The nearest normalized edge wins: left/right insert on a horizontal
+///   split, top/bottom on a vertical split, with the dragged panel before
+///   the target for left/top and after it for right/bottom. Every insert is
+///   a balanced [`DROP_INSERT_RATIO`] split, matching dwindle's default on a
+///   mouse drop.
+///
+/// Ties are deterministic: an equal horizontal/vertical distance prefers
+/// the horizontal edge, and an equal left/right (or top/bottom) distance
+/// prefers the first (left/top). Exact center boundaries (`0.25`/`0.75`)
+/// belong to the center zone. Pure, total, headless; never mutates the tree.
 #[must_use]
-pub fn drop_spec_for_point(
+pub fn drop_plan_for_point(
     tree: &LayoutNode,
     bounds: Rect,
     gaps: Gaps,
     source: ViewId,
     point: Point,
-) -> Option<DropSpec> {
+) -> Option<DropPlan> {
     let target = tiled_drop_target(tree, bounds, gaps, point)?;
     if target == source {
         return None;
@@ -380,18 +408,8 @@ pub fn drop_spec_for_point(
     }
     let fx = ((f32::from(point.x.saturating_sub(rect.x))) / f32::from(rect.width)).clamp(0.0, 1.0);
     let fy = ((f32::from(point.y.saturating_sub(rect.y))) / f32::from(rect.height)).clamp(0.0, 1.0);
-    // CTX-1070 (issue #1811): corner-zone drops are directionally
-    // ambiguous, so the balanced #1804 policy breaks the tie instead of
-    // the nearest-edge rule guessing between two edges.
-    if is_drop_corner(fx, fy) {
-        return Some(match balanced_split_axis(rect) {
-            SplitAxis::Horizontal => {
-                DropSpec::new(target, SplitAxis::Horizontal, DROP_CORNER_RATIO, fx > 0.5)
-            }
-            SplitAxis::Vertical => {
-                DropSpec::new(target, SplitAxis::Vertical, DROP_CORNER_RATIO, fy > 0.5)
-            }
-        });
+    if is_drop_center(fx, fy) {
+        return Some(DropPlan::Swap { target });
     }
     let dist_left = fx;
     let dist_right = 1.0 - fx;
@@ -400,25 +418,31 @@ pub fn drop_spec_for_point(
     let min_h = dist_left.min(dist_right);
     let min_v = dist_top.min(dist_bottom);
     if min_h <= min_v {
-        let after = dist_right < dist_left;
-        let ratio = fx.clamp(LayoutNode::MIN_RATIO, LayoutNode::MAX_RATIO);
-        Some(DropSpec::new(target, SplitAxis::Horizontal, ratio, after))
+        Some(DropPlan::Insert(DropSpec::new(
+            target,
+            SplitAxis::Horizontal,
+            DROP_INSERT_RATIO,
+            dist_right < dist_left,
+        )))
     } else {
-        let after = dist_bottom < dist_top;
-        let ratio = fy.clamp(LayoutNode::MIN_RATIO, LayoutNode::MAX_RATIO);
-        Some(DropSpec::new(target, SplitAxis::Vertical, ratio, after))
+        Some(DropPlan::Insert(DropSpec::new(
+            target,
+            SplitAxis::Vertical,
+            DROP_INSERT_RATIO,
+            dist_bottom < dist_top,
+        )))
     }
 }
 
-/// Whether fractional drop position `(fx, fy)` inside the target rect
-/// falls in a corner zone (issue #1811, CTX-1070): inside
-/// [`DROP_CORNER_FRACTION`] on *both* axes, so the point sits near two
-/// edges at once. Boundary-inclusive and deterministic.
+/// Whether fractional drop position `(fx, fy)` inside the target rect falls
+/// in the center swap zone (issue #2337): inside
+/// [`DROP_CENTER_FRACTION`] from every edge on both axes. Boundary-inclusive
+/// and deterministic, so the cell grid cannot classify one point twice.
 #[must_use]
-pub fn is_drop_corner(fx: f32, fy: f32) -> bool {
-    let edge_x = fx <= DROP_CORNER_FRACTION || fx >= 1.0 - DROP_CORNER_FRACTION;
-    let edge_y = fy <= DROP_CORNER_FRACTION || fy >= 1.0 - DROP_CORNER_FRACTION;
-    edge_x && edge_y
+pub fn is_drop_center(fx: f32, fy: f32) -> bool {
+    let in_x = (DROP_CENTER_FRACTION..=1.0 - DROP_CENTER_FRACTION).contains(&fx);
+    let in_y = (DROP_CENTER_FRACTION..=1.0 - DROP_CENTER_FRACTION).contains(&fy);
+    in_x && in_y
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,14 +1223,14 @@ mod tests {
         assert_eq!(dst.leaf_count(), MAX_VIEWS_PER_WORKSPACE_TREE);
     }
 
-    // -- Issue #1694 (CTX-0966) position-based drop placement ---------------
+    // -- Issue #2337 Hyprland-style bounded drop plan ---------------------
 
     #[test]
-    fn drop_spec_self_and_background_are_none() {
+    fn drop_plan_self_and_background_are_none() {
         let tree = pair();
         let bounds = Rect::new(0, 0, 80, 24);
         assert_eq!(
-            drop_spec_for_point(
+            drop_plan_for_point(
                 &tree,
                 bounds,
                 Gaps::ZERO,
@@ -1217,7 +1241,7 @@ mod tests {
             "self-drop is a no-op"
         );
         assert_eq!(
-            drop_spec_for_point(
+            drop_plan_for_point(
                 &tree,
                 bounds,
                 Gaps::ZERO,
@@ -1230,188 +1254,153 @@ mod tests {
     }
 
     #[test]
-    fn drop_spec_docks_by_nearest_edge_with_position_ratio() {
+    fn drop_plan_center_swaps_the_panels() {
         let tree = pair();
         let bounds = Rect::new(0, 0, 80, 24);
-        // Right pane occupies 40..80 x 0..24. Drop near its right edge:
-        // docks right with a small dragged size.
-        let spec = drop_spec_for_point(
-            &tree,
-            bounds,
-            Gaps::ZERO,
-            ViewId::new(1),
-            Point::new(70, 12),
-        )
-        .expect("right-edge drop must dock");
-        assert_eq!(spec.target, ViewId::new(2));
-        assert_eq!(spec.axis, SplitAxis::Horizontal);
-        assert!(spec.after, "right edge docks after");
-        assert!(
-            (spec.ratio - 0.75).abs() < 1e-6,
-            "ratio follows the drop x (70-40)/40 = 0.75), got {}",
-            spec.ratio
-        );
-        // Drop near its left edge: docks before with a small dragged size.
-        let spec = drop_spec_for_point(
-            &tree,
-            bounds,
-            Gaps::ZERO,
-            ViewId::new(1),
-            Point::new(45, 12),
-        )
-        .expect("left-edge drop must dock");
-        assert_eq!(spec.target, ViewId::new(2));
-        assert_eq!(spec.axis, SplitAxis::Horizontal);
-        assert!(!spec.after, "left edge docks before");
-        assert!((spec.ratio - 0.125).abs() < 1e-6);
-        // Drop near the top: docks above with position-based height.
-        let spec =
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(60, 2))
-                .expect("top-edge drop must dock");
-        assert_eq!(spec.target, ViewId::new(2));
-        assert_eq!(spec.axis, SplitAxis::Vertical);
-        assert!(!spec.after, "top edge docks before");
-        assert!((spec.ratio - LayoutNode::MIN_RATIO).abs() < 1e-6);
-    }
-
-    #[test]
-    fn drop_spec_center_tie_breaks_deterministically() {
-        let tree = pair();
-        let bounds = Rect::new(0, 0, 80, 24);
-        let spec = drop_spec_for_point(
-            &tree,
-            bounds,
-            Gaps::ZERO,
-            ViewId::new(1),
-            Point::new(60, 12),
-        )
-        .expect("center drop must dock");
-        assert_eq!(spec.target, ViewId::new(2));
-        assert_eq!(spec.axis, SplitAxis::Horizontal, "tie prefers side-by-side");
-        assert!(!spec.after, "tie prefers first (left)");
-        assert!((spec.ratio - 0.5).abs() < 1e-6);
-    }
-
-    // -- Issue #1811 (CTX-1070) corner-zone balanced placement ------------
-
-    #[test]
-    fn is_drop_corner_flags_outer_quarters_on_both_axes() {
-        assert!(is_drop_corner(0.0, 0.0));
-        assert!(is_drop_corner(1.0, 1.0));
-        assert!(is_drop_corner(0.25, 0.25), "boundary is inclusive");
-        assert!(is_drop_corner(0.75, 0.75), "boundary is inclusive");
-        assert!(!is_drop_corner(0.5, 0.5), "center is not a corner");
-        assert!(!is_drop_corner(0.1, 0.5), "edge alone is not a corner");
-        assert!(!is_drop_corner(0.5, 0.1), "edge alone is not a corner");
-        assert!(
-            !is_drop_corner(0.26, 0.26),
-            "just inside the threshold is not a corner"
-        );
-    }
-
-    #[test]
-    fn drop_spec_tall_target_corners_stack_balanced() {
-        // Right pane of pair() is 40x24: physically tall (24 cells * 2.0
-        // aspect = 48 > 40), so corner drops stack vertically at 0.5.
-        let tree = pair();
-        let bounds = Rect::new(0, 0, 80, 24);
-        let source = ViewId::new(1);
-        // Top-right corner: above the target, balanced.
         assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(78, 2)),
-            Some(DropSpec::new(
-                ViewId::new(2),
-                SplitAxis::Vertical,
-                DROP_CORNER_RATIO,
-                false
-            ))
-        );
-        // Bottom-right corner: below the target, balanced.
-        assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(78, 22)),
-            Some(DropSpec::new(
-                ViewId::new(2),
-                SplitAxis::Vertical,
-                DROP_CORNER_RATIO,
-                true
-            ))
-        );
-        // Bottom-left corner: below, from the left side.
-        assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(42, 22)),
-            Some(DropSpec::new(
-                ViewId::new(2),
-                SplitAxis::Vertical,
-                DROP_CORNER_RATIO,
-                true
-            ))
-        );
-    }
-
-    #[test]
-    fn drop_spec_wide_target_corners_dock_side_by_side_balanced() {
-        // Top row leaf of a V[H[1,2],3] tree is 40x12: physically wide
-        // (12 cells * 2.0 aspect = 24 < 40), so corner drops dock
-        // side-by-side at 0.5.
-        let tree = LayoutNode::split(SplitAxis::Vertical, 0.5, pair(), leaf(3));
-        let bounds = Rect::new(0, 0, 80, 24);
-        let source = ViewId::new(3);
-        // Top-left corner of leaf 1: left of the target, balanced.
-        assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(2, 1)),
-            Some(DropSpec::new(
+            drop_plan_for_point(
+                &tree,
+                bounds,
+                Gaps::ZERO,
                 ViewId::new(1),
-                SplitAxis::Horizontal,
-                DROP_CORNER_RATIO,
-                false
-            ))
+                Point::new(60, 12)
+            ),
+            Some(DropPlan::Swap {
+                target: ViewId::new(2)
+            }),
+            "center drop exchanges the panels in place"
         );
-        // Bottom-right corner of leaf 2: right of the target, balanced.
+        // Center boundaries are inclusive: fx/fy exactly 0.25 stays center.
         assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(78, 11)),
-            Some(DropSpec::new(
-                ViewId::new(2),
-                SplitAxis::Horizontal,
-                DROP_CORNER_RATIO,
-                true
-            ))
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(50, 6)),
+            Some(DropPlan::Swap {
+                target: ViewId::new(2)
+            })
         );
     }
 
     #[test]
-    fn drop_spec_corner_boundary_prefers_corner_over_nearest_edge() {
-        // Pair tree, right pane 40..80 x 0..24. Col 70 is exactly fx = 0.75
-        // (inclusive corner boundary); row 0 adds the second axis, row 12
-        // keeps the existing position-sized edge behavior.
+    fn drop_plan_edges_insert_balanced() {
         let tree = pair();
         let bounds = Rect::new(0, 0, 80, 24);
-        let source = ViewId::new(1);
-        let corner = drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(70, 0))
-            .expect("corner drop must dock");
-        assert_eq!(corner.target, ViewId::new(2));
-        assert_eq!(corner.axis, SplitAxis::Vertical, "tall target stacks");
-        assert!((corner.ratio - DROP_CORNER_RATIO).abs() < 1e-6);
-        assert!(!corner.after, "top corner docks before");
-        // Same column at mid-height: still the nearest-edge position rule.
-        let edge = drop_spec_for_point(&tree, bounds, Gaps::ZERO, source, Point::new(70, 12))
-            .expect("edge drop must dock");
-        assert_eq!(edge.axis, SplitAxis::Horizontal);
-        assert!((edge.ratio - 0.75).abs() < 1e-6);
+        for (point, axis, after) in [
+            (Point::new(79, 12), SplitAxis::Horizontal, true),
+            (Point::new(41, 12), SplitAxis::Horizontal, false),
+            (Point::new(60, 1), SplitAxis::Vertical, false),
+            (Point::new(60, 23), SplitAxis::Vertical, true),
+        ] {
+            assert_eq!(
+                drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), point),
+                Some(DropPlan::Insert(DropSpec::new(
+                    ViewId::new(2),
+                    axis,
+                    DROP_INSERT_RATIO,
+                    after
+                ))),
+                "edge drop at {point:?} must insert at the nearest edge"
+            );
+        }
     }
 
     #[test]
-    fn drop_spec_corner_self_and_overlay_still_none() {
+    fn drop_plan_corner_uses_nearest_normalized_edge() {
+        // Top-right corner of the right pane: the horizontal distance
+        // (1/40) is smaller than the vertical (1/24), so the horizontal
+        // edge wins deterministically instead of guessing a quadrant.
+        let tree = pair();
+        let bounds = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(79, 1)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(2),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                true
+            )))
+        );
+    }
+
+    #[test]
+    fn drop_plan_boundaries_are_deterministic() {
+        let tree = pair();
+        let bounds = Rect::new(0, 0, 80, 24);
+        // Just inside the left edge band (fx = 0.225) inserts before.
+        assert_eq!(
+            drop_plan_for_point(
+                &tree,
+                bounds,
+                Gaps::ZERO,
+                ViewId::new(1),
+                Point::new(49, 12)
+            ),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(2),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                false
+            )))
+        );
+        // Point (60, 5) is at fy = 5/24 ~= 0.208, just below the center
+        // band's 0.25 boundary, so the nearest edge is the top edge.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(60, 5)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(2),
+                SplitAxis::Vertical,
+                DROP_INSERT_RATIO,
+                false
+            )))
+        );
+    }
+
+    #[test]
+    fn drop_plan_exact_diagonal_tie_prefers_horizontal() {
+        // A 24x24 target with equal normalized x/y offsets: the `min_h <=
+        // min_v` tie-break must choose the horizontal edge (left) and must
+        // not silently flip to vertical.
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 24, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 24, 24)),
+        );
+        let bounds = Rect::new(0, 0, 48, 24);
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(26, 2)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(2),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                false
+            ))),
+            "exact diagonal tie must prefer the horizontal edge"
+        );
+    }
+
+    #[test]
+    fn is_drop_center_flags_the_middle_half() {
+        assert!(is_drop_center(0.5, 0.5));
+        assert!(is_drop_center(0.25, 0.25), "boundary is inclusive");
+        assert!(is_drop_center(0.75, 0.75), "boundary is inclusive");
+        assert!(!is_drop_center(0.24, 0.5));
+        assert!(!is_drop_center(0.5, 0.76));
+        assert!(!is_drop_center(0.0, 0.0));
+        assert!(!is_drop_center(1.0, 1.0));
+    }
+
+    #[test]
+    fn drop_plan_corner_self_and_overlay_still_none() {
         let tree = pair();
         let bounds = Rect::new(0, 0, 80, 24);
         // Self-drop in the source's own corner stays a no-op.
         assert_eq!(
-            drop_spec_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(2), Point::new(78, 2)),
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(2), Point::new(78, 2)),
             None
         );
         // Overlay-tier hits stay background even in the overlay corner.
         let (overlay_tree, overlay_bounds, gaps) = overlay_over_gap();
         assert_eq!(
-            drop_spec_for_point(
+            drop_plan_for_point(
                 &overlay_tree,
                 overlay_bounds,
                 gaps,
@@ -1435,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_spec_over_overlay_is_none() {
+    fn drop_plan_over_overlay_is_none() {
         let (tree, bounds, gaps) = overlay_over_gap();
         // Sanity: the gap point really hits the overlay leaf before the
         // tiled guard runs.
@@ -1444,13 +1433,13 @@ mod tests {
             Some(ViewId::new(3))
         );
         assert_eq!(
-            drop_spec_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(40, 12)),
+            drop_plan_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(40, 12)),
             None,
             "drop over a floating overlay must not tier-flip the tiled source"
         );
-        // Tiled targets still dock.
+        // Tiled targets still plan a drop.
         assert!(
-            drop_spec_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(60, 12)).is_some()
+            drop_plan_for_point(&tree, bounds, gaps, ViewId::new(1), Point::new(60, 12)).is_some()
         );
     }
 
@@ -1468,5 +1457,7 @@ mod tests {
             session.preview(&tree, bounds, gaps, Point::new(60, 12)),
             Some(ViewId::new(2))
         );
+        session.clear_preview();
+        assert_eq!(session.preview_target(), None, "leave clears the preview");
     }
 }

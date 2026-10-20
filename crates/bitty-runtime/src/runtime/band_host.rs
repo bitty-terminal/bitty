@@ -1334,11 +1334,15 @@ impl Runtime {
         // A different button while one is armed is still chrome *on a band
         // row*: consume it without disturbing the armed gesture, and remember
         // its release so the pair never falls through to clipboard/capture.
-        if self.band_press_button.is_some() {
-            if self.band_extra_press.is_none() {
-                self.band_extra_press = Some(button);
+        // A repeated press of the *same* button is a lost-release recovery:
+        // fall through and re-arm instead of wedging the band forever.
+        if let Some(armed) = self.band_press_button {
+            if armed != button {
+                if self.band_extra_press.is_none() {
+                    self.band_extra_press = Some(button);
+                }
+                return true;
             }
-            return true;
         }
         if self.band_region_overflow(row_hit.edge, row_hit.visible_index) {
             self.band_stats.region_overflows = self.band_stats.region_overflows.saturating_add(1);

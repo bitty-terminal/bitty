@@ -6,8 +6,7 @@
 //! distribution packed by `scripts/make-component-dist.sh` (issue #1792),
 //! verifies it fail-closed, and stages it into the user tier through the
 //! same atomic publish path as `component add`. The full manager takes over
-//! after: the seed does nothing else (no registry index, no version solving,
-//! no UI).
+//! after: the seed does nothing else (no version solving, no UI).
 //!
 //! # Contract (implemented, seed only)
 //!
@@ -22,9 +21,21 @@
 //!   aggregate `SHA256SUMS` manifest (the authoritative checksum record per
 //!   `packaging/README.md`); the tarball holds exactly `bitty-component.toml`
 //!   plus `bitty-<name>` at the archive root.
+//! - Registry backend (issue #2111): the bounded
+//!   `extensions/catalog.v1` object maps `(name, version, target)` to the
+//!   published tarball SHA-256. When available, its digest joins
+//!   `SHA256SUMS` and the optional caller `--digest` in the
+//!   all-available-must-match rule. A fetched catalog missing the requested
+//!   entry, or one that is malformed or oversize, fails closed; a catalog
+//!   transport failure (offline, 404, 5xx) falls back to the original
+//!   single-release `SHA256SUMS` path with explicit consent. The fallback
+//!   never skips hash verification, the member audit, or the TOFU pin, and
+//!   never authorizes silent installation.
 //! - Trust: unsigned 0.1.0 verifies by hash only (Windows ships unsigned per
-//!   #1810, so hash-only is the uniform story). Sigstore/cosign stays a
-//!   follow-up, not a silent addition.
+//!   #1810, so hash-only is the uniform story). The catalog is canonical
+//!   metadata, not a signature: a CDN compromise can substitute both the
+//!   catalog and the artifact, which the TOFU pin detects after first
+//!   contact. Sigstore/cosign stays a follow-up, not a silent addition.
 //! - Environment: `curl` 7.68.0 or newer (preflighted once per invocation;
 //!   absent or too-old curl fails closed with a manual-placement
 //!   diagnostic, exit `1`) plus a `tar --version` presence preflight (a
@@ -43,8 +54,8 @@
 //! [`SeedError::exit_code`] maps onto the component command taxonomy: `2`
 //! for CLI-derived input failures (bad name/version), `1` for environmental
 //! failures (unsupported host, missing or too-old `curl`, missing `tar`,
-//! download or filesystem I/O), `4` for artifact-integrity failures
-//! (manifest, digest, member, or descriptor mismatch).
+//! download or filesystem I/O), `4` for metadata and artifact-integrity
+//! failures (catalog, manifest, digest, member, or descriptor mismatch).
 //!
 //! # Bounds (fail closed before any filesystem mutation of the user tier)
 //!
@@ -56,6 +67,9 @@
 //!   `--target` flag, so foreign-target confusion is unrepresentable).
 //! - URLs: at most [`SEED_URL_MAX_BYTES`] bytes, `https` on
 //!   [`SEED_CDN_HOST`] only, audited after construction.
+//! - Catalog: at most [`SEED_CATALOG_MAX_BYTES`] bytes, at most
+//!   [`SEED_CATALOG_MAX_LINES`] lines, [`SEED_CATALOG_LINE_MAX_BYTES`] bytes
+//!   per line, and at most [`SEED_CATALOG_MAX_ENTRIES`] entries.
 //! - Manifest: at most [`SEED_MANIFEST_MAX_BYTES`] bytes via curl
 //!   `--max-filesize`.
 //! - Tarball: at most [`SEED_TARBALL_MAX_BYTES`] bytes via curl
@@ -65,6 +79,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -215,15 +230,17 @@ pub fn digests_equal_ct(left: &str, right: &str) -> bool {
     diff == 0
 }
 
-/// Whether the dual-digest rule holds (issue #1906, checked locally): both
-/// the registry/expected digest and the CDN `SHA256SUMS` digest are present,
-/// well-formed, and both equal the fetched bytes' digest.
+/// Whether the dual-digest rule holds (issue #1906/#2111, checked locally):
+/// both the registry-catalog digest and the release `SHA256SUMS` digest are
+/// present, well-formed, and both equal the fetched bytes' digest.
 ///
-/// - `registry_digest`: the out-of-CDN pin (`None` means single-source-only,
-///   which returns `false` so the caller takes the confirm path).
-/// - `cdn_digest` / `actual`: the `SHA256SUMS` entry and the `sha256_hex` of
-///   the fetched bytes. Comparison is constant-shape case-insensitive via
-///   [`digests_equal_ct`].
+/// - `registry_digest`: the catalog pin from `extensions/catalog.v1` (same
+///   canonical CDN, but an independent metadata object; `None` means
+///   single-source-only, which returns `false` so the caller takes the
+///   confirm path).
+/// - `cdn_digest` / `actual`: the release `SHA256SUMS` entry and the
+///   `sha256_hex` of the fetched bytes. Comparison is constant-shape
+///   case-insensitive via [`digests_equal_ct`].
 /// - Any malformed digest or any mismatch returns `false` (never a silent
 ///   pick: mismatch is an integrity failure upstream, single-source is a
 ///   confirm, per #1905/#1906).
@@ -242,20 +259,18 @@ pub fn is_dual_digest_verified(
     digests_equal_ct(registry, actual) && digests_equal_ct(cdn_digest, actual)
 }
 
-/// Registry digest seam for one component release (issue #1906, Core side).
+/// Registry catalog key under the `extensions/` prefix (issue #2111).
 ///
-/// The registry index does NOT exist yet (`bitty-plugin-manager#11` open):
-/// this always returns `None` today, so installs are single-source-only
-/// (CDN `SHA256SUMS`) and always take the confirm path. When the index lands,
-/// this returns `Some(lowercase-hex)` for the release and the pipeline
-/// generalizes from both-must-match (`--digest` today) to
-/// all-available-must-match (CDN + registry + `--digest` when provided), with
-/// [`installer_consent_level`] silent activating for builtin+dual. No caller
-/// may treat `None` as verified: `None` always yields confirm, never silent.
-#[must_use]
-pub fn registry_digest_for(_name: &str, _version: &str) -> Option<String> {
-    None
-}
+/// A single mutable metadata object maps `(name, version, target)` to the
+/// published tarball SHA-256. The `.v1` suffix versions the grammar so a
+/// future schema can publish `catalog.v2` without breaking older clients.
+pub const SEED_CATALOG_KEY: &str = "extensions/catalog.v1";
+
+/// Canonical URL of the bounded extension catalog.
+pub const SEED_CATALOG_URL: &str = "https://cdn.bitty.run/extensions/catalog.v1";
+
+/// Catalog schema version accepted by this client.
+pub const SEED_CATALOG_SCHEMA: u32 = 1;
 
 /// R2 key prefix for prebuilt component distributions.
 pub const SEED_KEY_PREFIX: &str = "extensions";
@@ -268,6 +283,23 @@ pub const SEED_TARGET_MAX_BYTES: usize = 64;
 
 /// Maximum bytes of a constructed seed URL.
 pub const SEED_URL_MAX_BYTES: usize = 512;
+
+/// Maximum bytes of a fetched extension catalog.
+///
+/// One line per published target artifact at roughly 90 bytes each; 1024
+/// entries fit well under this bound. The object is mutable metadata, so it
+/// is fetched with a short cache policy; the bound keeps a hostile or broken
+/// publisher from turning every install into an unbounded parse.
+pub const SEED_CATALOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// Maximum catalog lines parsed (bounded iteration over bounded bytes).
+pub const SEED_CATALOG_MAX_LINES: usize = 4096;
+
+/// Maximum bytes of one catalog line.
+pub const SEED_CATALOG_LINE_MAX_BYTES: usize = 1024;
+
+/// Maximum catalog entries accepted (one per name/version/target).
+pub const SEED_CATALOG_MAX_ENTRIES: usize = 1024;
 
 /// Maximum bytes of a fetched `SHA256SUMS` manifest (one line per target;
 /// a handful of targets fit in well under one KiB).
@@ -323,6 +355,9 @@ pub const SEED_CURL_FLOOR: &str = "7.68.0";
 /// Maximum bytes of `tar -tzf` output parsed for the member audit.
 pub const SEED_TAR_LIST_MAX_BYTES: usize = 8192;
 
+/// curl exit code `CURLE_FILESIZE_EXCEEDED` (`--max-filesize` abort).
+const SEED_CURL_FILESIZE_EXCEEDED_CODE: i32 = 63;
+
 /// Fetch the tarball and manifest URLs for one component release.
 ///
 /// [`SeedUrls`] is pure (no spawn, no filesystem writes): inputs are
@@ -337,6 +372,206 @@ pub struct SeedUrls {
     pub manifest_url: String,
     /// Tarball file name (`<target>.tar.gz`, the manifest lookup key).
     pub tarball_file: String,
+}
+
+/// Bounded registry catalog: `(name, version, target) -> tarball SHA-256`.
+///
+/// Parsed from the canonical mutable `extensions/catalog.v1` object. The map
+/// rejects duplicate keys at parse time, so every lookup has exactly one
+/// answer. Absence is meaningful: a catalog that does not list a release
+/// refuses the install rather than guessing that the release exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionCatalog {
+    entries: BTreeMap<(String, String, String), String>,
+}
+
+impl ExtensionCatalog {
+    /// Digest for exactly (`name`, `version`, `target`), if published.
+    #[must_use]
+    pub fn digest_for(&self, name: &str, version: &str, target: &str) -> Option<&str> {
+        self.entries
+            .get(&(name.to_owned(), version.to_owned(), target.to_owned()))
+            .map(String::as_str)
+    }
+}
+
+/// Outcome of one catalog fetch.
+///
+/// `Unavailable` is only for transport failures (offline, DNS, TLS, HTTP
+/// 4xx/5xx): the caller may fall back to the original single-release
+/// `SHA256SUMS` path with explicit consent. A catalog that arrived but is
+/// malformed, oversize, or missing the requested entry is an error, never
+/// `Unavailable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogFetch {
+    /// Parsed catalog metadata.
+    Available(ExtensionCatalog),
+    /// Transport failure (bounded, user-facing reason); fallback allowed.
+    Unavailable(String),
+}
+
+/// Parse the bounded `extensions/catalog.v1` grammar.
+///
+/// Format (strict, line-oriented, UTF-8):
+///
+/// ```text
+/// # comments and blank lines are ignored
+/// schema 1
+/// extension <name> <version> <target> <sha256>
+/// ```
+///
+/// Exactly one `schema 1` line is required before any record. Record fields
+/// use the same name/version/target grammars as the installer, and the digest
+/// must be exactly 64 lowercase hex characters. Duplicate
+/// `(name, version, target)` keys fail closed. Unknown directives, extra
+/// fields, records before the schema, and non-UTF-8 input are rejected.
+/// Error text names the line number and reason but never echoes untrusted
+/// field content.
+pub fn parse_catalog(text: &str) -> Result<ExtensionCatalog, SeedError> {
+    if text.len() as u64 > SEED_CATALOG_MAX_BYTES {
+        return Err(SeedError::Catalog(format!(
+            "bitty extension: extension catalog exceeds {SEED_CATALOG_MAX_BYTES} bytes (refusing to parse)"
+        )));
+    }
+    let mut catalog = ExtensionCatalog::default();
+    let mut schema_seen = false;
+    for (index, raw) in text.lines().enumerate() {
+        let line_number = index + 1;
+        if index >= SEED_CATALOG_MAX_LINES {
+            return Err(catalog_refusal("too many lines"));
+        }
+        // Tolerate one trailing carriage return (CRLF mirrors); anything
+        // longer than the line bound fails closed.
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.len() > SEED_CATALOG_LINE_MAX_BYTES {
+            return Err(catalog_refusal(format!(
+                "line {line_number} exceeds {SEED_CATALOG_LINE_MAX_BYTES} bytes"
+            )));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        match fields.as_slice() {
+            ["schema", value] => {
+                if schema_seen {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: duplicate schema line"
+                    )));
+                }
+                if *value != "1" || value.parse::<u32>().ok() != Some(SEED_CATALOG_SCHEMA) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: unsupported schema (want {SEED_CATALOG_SCHEMA})"
+                    )));
+                }
+                schema_seen = true;
+            }
+            ["extension", name, version, target, digest] => {
+                if !schema_seen {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: record before `schema {SEED_CATALOG_SCHEMA}`"
+                    )));
+                }
+                if let Err(error) = validate_component_name(name) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: invalid component name ({error})"
+                    )));
+                }
+                if !valid_seed_version(version) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: invalid version (want strict X.Y.Z)"
+                    )));
+                }
+                if !valid_seed_target(target) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: invalid target triple"
+                    )));
+                }
+                if !is_lowercase_hex_digest(digest) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: digest is not 64 lowercase hex characters"
+                    )));
+                }
+                if catalog.entries.len() >= SEED_CATALOG_MAX_ENTRIES {
+                    return Err(catalog_refusal(format!(
+                        "more than {SEED_CATALOG_MAX_ENTRIES} entries"
+                    )));
+                }
+                let key = (name.to_string(), version.to_string(), target.to_string());
+                if catalog.entries.contains_key(&key) {
+                    return Err(catalog_refusal(format!(
+                        "line {line_number}: duplicate entry for '{name}' {version} ({target})"
+                    )));
+                }
+                catalog.entries.insert(key, (*digest).to_string());
+            }
+            _ => {
+                return Err(catalog_refusal(format!(
+                    "line {line_number}: malformed record"
+                )));
+            }
+        }
+    }
+    if !schema_seen {
+        return Err(catalog_refusal(format!(
+            "missing `schema {SEED_CATALOG_SCHEMA}` line"
+        )));
+    }
+    Ok(catalog)
+}
+
+/// Catalog refusal with the shared prefix (exit `4` via [`SeedError::Catalog`]).
+fn catalog_refusal(why: impl std::fmt::Display) -> SeedError {
+    SeedError::Catalog(format!(
+        "bitty extension: invalid extension catalog ({why})"
+    ))
+}
+
+/// Strict lowercase 64-character SHA-256 hex.
+///
+/// The catalog is machine-generated metadata, so uppercase is rejected rather
+/// than normalized (the manifest parser is lenient because it accepts
+/// third-party `sha256sum` output; this object is first-party).
+fn is_lowercase_hex_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Fetch and parse the canonical extension catalog (bounded).
+///
+/// A transport failure is returned as [`CatalogFetch::Unavailable`] so the
+/// caller can fall back to the single-release `SHA256SUMS` path; oversize
+/// bodies ([`SeedError::Oversize`]), missing tools, and I/O failures
+/// propagate as errors. A successful fetch that is malformed or oversize
+/// fails closed as [`SeedError::Catalog`].
+pub fn fetch_catalog(transport: &mut dyn SeedTransport) -> Result<CatalogFetch, SeedError> {
+    // Posture pin: the URL is always the canonical key on the single
+    // allowlisted host, so the key contract and the fetch URL cannot drift.
+    debug_assert!(SEED_CATALOG_URL.ends_with(SEED_CATALOG_KEY));
+    let stage = ScopedDir::create("catalog")?;
+    let path = stage.path.join("catalog.v1");
+    match transport.fetch(SEED_CATALOG_URL, &path, SEED_CATALOG_MAX_BYTES) {
+        Ok(()) => {}
+        Err(SeedError::Fetch(reason)) => return Ok(CatalogFetch::Unavailable(reason)),
+        Err(error) => return Err(error),
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        SeedError::Io(format!(
+            "bitty extension: cannot read fetched extension catalog: {error}"
+        ))
+    })?;
+    if bytes.len() as u64 > SEED_CATALOG_MAX_BYTES {
+        return Err(SeedError::Catalog(format!(
+            "bitty extension: fetched extension catalog exceeds {SEED_CATALOG_MAX_BYTES} bytes (refusing to parse)"
+        )));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        SeedError::Catalog("bitty extension: fetched extension catalog is not UTF-8".to_string())
+    })?;
+    parse_catalog(text).map(CatalogFetch::Available)
 }
 
 /// Why the seed refused (all variants carry owned, user-facing context).
@@ -361,6 +596,11 @@ pub enum SeedError {
     Fetch(String),
     /// The `SHA256SUMS` manifest is missing, malformed, or has no entry.
     Manifest(String),
+    /// The extension catalog is malformed, oversize, or lacks the requested
+    /// release entry (registry metadata integrity).
+    Catalog(String),
+    /// A fetched body exceeded its hard byte bound (`curl --max-filesize`).
+    Oversize(String),
     /// The fetched bytes do not match the manifest digest (tamper).
     DigestMismatch(String),
     /// The extracted payload is not exactly the two expected members.
@@ -386,6 +626,8 @@ impl SeedError {
             | Self::Fetch(_)
             | Self::Io(_) => 1,
             Self::Manifest(_)
+            | Self::Catalog(_)
+            | Self::Oversize(_)
             | Self::DigestMismatch(_)
             | Self::MemberViolation(_)
             | Self::DescriptorMismatch(_) => 4,
@@ -413,6 +655,8 @@ impl SeedError {
             Self::CurlTooOld(detail) => detail.clone(),
             Self::Fetch(detail) => detail.clone(),
             Self::Manifest(detail) => detail.clone(),
+            Self::Catalog(detail) => detail.clone(),
+            Self::Oversize(detail) => detail.clone(),
             Self::DigestMismatch(detail) => detail.clone(),
             Self::MemberViolation(detail) => detail.clone(),
             Self::DescriptorMismatch(detail) => detail.clone(),
@@ -912,33 +1156,69 @@ impl SystemTransport {
                 }
             })?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: String = stderr
-                .chars()
-                .rev()
-                .take(SEED_FETCH_STDERR_MAX_BYTES)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            let tail = tail
-                .chars()
-                .map(|c| {
-                    if c.is_control() && c != '\n' && c != '\t' {
-                        '\u{fffd}'
-                    } else {
-                        c
-                    }
-                })
-                .collect::<String>();
             return Err(SeedError::Fetch(format!(
                 "bitty extension: `{tool}` failed ({}; {tail})",
                 output.status,
-                tail = tail.trim(),
+                tail = bounded_stderr_tail(&output.stderr).trim(),
             )));
         }
         Ok(())
     }
+
+    /// Run one fixed-argv curl fetch, distinguishing the hard size bound.
+    ///
+    /// curl exits `63` (`CURLE_FILESIZE_EXCEEDED`) when `--max-filesize`
+    /// aborts a body. That is a bounded-metadata/artifact refusal (exit `4`),
+    /// not a transport failure, so it must never be mistaken for the
+    /// catalog's offline-fallback path.
+    fn run_curl(argv: &[String], max_bytes: u64) -> Result<(), SeedError> {
+        let output = scrubbed_command("curl")
+            .args(argv)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    SeedError::ToolMissing(curl_missing_diagnostic())
+                } else {
+                    SeedError::Io(format!("bitty extension: cannot run `curl`: {error}"))
+                }
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if output.status.code() == Some(SEED_CURL_FILESIZE_EXCEEDED_CODE) {
+            return Err(SeedError::Oversize(format!(
+                "bitty extension: fetched body exceeds {max_bytes} bytes (curl --max-filesize; refusing to read further)"
+            )));
+        }
+        Err(SeedError::Fetch(format!(
+            "bitty extension: `curl` failed ({}; {tail})",
+            output.status,
+            tail = bounded_stderr_tail(&output.stderr).trim(),
+        )))
+    }
+}
+
+/// Last [`SEED_FETCH_STDERR_MAX_BYTES`] of a failed tool's stderr, with
+/// control characters replaced (never raw terminal escapes in diagnostics).
+fn bounded_stderr_tail(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let tail: String = stderr
+        .chars()
+        .rev()
+        .take(SEED_FETCH_STDERR_MAX_BYTES)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    tail.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 impl SeedTransport for SystemTransport {
@@ -949,7 +1229,7 @@ impl SeedTransport for SystemTransport {
         preflight_tar()?;
         preflight_curl()?;
         let argv = Self::curl_argv(url, dest, max_bytes);
-        Self::run_tool("curl", &argv)
+        Self::run_curl(&argv, max_bytes)
     }
 
     fn list_members(&mut self, archive: &Path) -> Result<Vec<String>, SeedError> {
@@ -1148,13 +1428,13 @@ fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, See
     }
 }
 
-/// Fetch the tarball plus its manifest and verify the digest (fail closed).
+/// Fetch the tarball plus its manifest and verify every available digest.
 ///
-/// Both-must-match (#1906): the CDN `SHA256SUMS` entry and the
-/// caller-supplied `expected_digest` (`--digest` today, registry value later
-/// via [`registry_digest_for`]) must EACH match the downloaded bytes.
-/// Any mismatch is an integrity failure (exit 4), never a silent pick.
-/// A malformed `expected_digest` fails closed as [`SeedError::InvalidDigest`]
+/// All-available-must-match (#1906, #2111): the CDN `SHA256SUMS` entry, the
+/// optional registry-catalog digest, and the optional caller-supplied
+/// `expected_digest` (`--digest`) must EACH match the downloaded bytes. Any
+/// mismatch is an integrity failure (exit 4), never a silent pick.
+/// A malformed expected digest fails closed as [`SeedError::InvalidDigest`]
 /// (exit 2). Returns the verified bytes plus the CDN digest for the TOFU pin.
 ///
 /// The manifest remains the authoritative checksum record; a missing entry,
@@ -1163,11 +1443,20 @@ fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, See
 fn fetch_verified_tarball(
     urls: &SeedUrls,
     expected_digest: Option<&str>,
+    registry_digest: Option<&str>,
     transport: &mut dyn SeedTransport,
 ) -> Result<(Vec<u8>, String), SeedError> {
     if let Some(expected) = expected_digest {
         if !is_hex_digest(expected) {
             return Err(SeedError::InvalidDigest(expected.to_owned()));
+        }
+    }
+    if let Some(registry) = registry_digest {
+        if !is_hex_digest(registry) {
+            return Err(SeedError::Catalog(
+                "bitty extension: extension catalog digest is not 64 hex characters (refusing to install)"
+                    .to_string(),
+            ));
         }
     }
     let stage = ScopedDir::create("fetch")?;
@@ -1196,7 +1485,7 @@ fn fetch_verified_tarball(
         ))
     })?;
     if bytes.len() as u64 > SEED_TARBALL_MAX_BYTES {
-        return Err(SeedError::Fetch(format!(
+        return Err(SeedError::Oversize(format!(
             "bitty extension: fetched tarball exceeds {SEED_TARBALL_MAX_BYTES} bytes"
         )));
     }
@@ -1211,10 +1500,18 @@ fn fetch_verified_tarball(
             "bitty extension: tarball digest {actual} does not match SHA256SUMS entry {expected} (tampered or corrupt download; refusing to install)"
         )));
     }
+    if let Some(registry) = registry_digest {
+        if !digests_equal_ct(&actual, registry) {
+            return Err(SeedError::DigestMismatch(format!(
+                "bitty extension: tarball digest {actual} does not match extension catalog digest {} (catalog out of sync or tampered; refusing to install)",
+                registry.to_ascii_lowercase(),
+            )));
+        }
+    }
     if let Some(caller) = expected_digest {
         if !digests_equal_ct(&actual, caller) {
             return Err(SeedError::DigestMismatch(format!(
-                "bitty extension: tarball digest {actual} does not match expected digest {} (both CDN SHA256SUMS {expected} and the caller-supplied digest must match; refusing to install)",
+                "bitty extension: tarball digest {actual} does not match expected digest {} (CDN SHA256SUMS {expected}, extension catalog, and the caller-supplied digest must all match; refusing to install)",
                 caller.to_ascii_lowercase(),
             )));
         }
@@ -1420,11 +1717,15 @@ fn unpack_and_validate(
 /// Fetch, verify, and unpack one component release (no staging).
 ///
 /// Pure pipeline over `transport`: builds allowlisted URLs (zero spawn on
-/// hostile input), fetches manifest + tarball, verifies both digests
-/// (CDN `SHA256SUMS` plus caller-supplied `expected_digest` when present,
-/// both-must-match per #1906), audits the members, and binds the descriptor
-/// to the request. The caller stages the payload through the shared
-/// `install_staged` path plus the TOFU pin.
+/// hostile input), fetches manifest + tarball, verifies every available
+/// digest (CDN `SHA256SUMS`, the registry catalog digest when supplied, and
+/// the caller-supplied `expected_digest` when present), audits the members,
+/// and binds the descriptor to the request. The caller stages the payload
+/// through the shared `install_staged` path plus the TOFU pin.
+///
+/// The registry digest is optional only for the explicit offline fallback;
+/// when present it is mandatory. The single-release `SHA256SUMS` check and
+/// the exact-two-member audit are identical in both modes.
 pub fn fetch_seed_payload(
     name: &str,
     version: &str,
@@ -1432,8 +1733,21 @@ pub fn fetch_seed_payload(
     expected_digest: Option<&str>,
     transport: &mut dyn SeedTransport,
 ) -> Result<SeedPayload, SeedError> {
+    fetch_seed_payload_with_registry(name, version, target, expected_digest, None, transport)
+}
+
+/// [`fetch_seed_payload`] plus the registry-catalog digest half (#2111).
+pub fn fetch_seed_payload_with_registry(
+    name: &str,
+    version: &str,
+    target: &str,
+    expected_digest: Option<&str>,
+    registry_digest: Option<&str>,
+    transport: &mut dyn SeedTransport,
+) -> Result<SeedPayload, SeedError> {
     let urls = seed_urls(name, version, target)?;
-    let (tarball, cdn_digest) = fetch_verified_tarball(&urls, expected_digest, transport)?;
+    let (tarball, cdn_digest) =
+        fetch_verified_tarball(&urls, expected_digest, registry_digest, transport)?;
     unpack_and_validate(&tarball, &cdn_digest, name, version, transport)
 }
 
@@ -1458,6 +1772,8 @@ mod tests {
         extract_links: Vec<(String, String)>,
         /// When true, `fetch` fails instead of serving.
         fetch_fails: bool,
+        /// Injected fetch failure (checked before `fetch_fails`).
+        fetch_error: Option<SeedError>,
         /// Canned `list_members` output; defaults to the extract file names.
         listed_members: Option<Vec<String>>,
     }
@@ -1490,6 +1806,9 @@ mod tests {
         fn fetch(&mut self, url: &str, dest: &Path, max_bytes: u64) -> Result<(), SeedError> {
             let argv = SystemTransport::curl_argv(url, dest, max_bytes);
             self.spawns.push(("curl".to_string(), argv));
+            if let Some(error) = &self.fetch_error {
+                return Err(error.clone());
+            }
             if self.fetch_fails {
                 return Err(SeedError::Fetch("stub fetch failed".to_string()));
             }
@@ -1549,6 +1868,11 @@ mod tests {
     /// Manifest pinning `tarball_file` to `digest`.
     fn manifest_for(tarball_file: &str, digest: &str) -> String {
         format!("{digest}  {tarball_file}\n")
+    }
+
+    /// One valid registry-catalog record line.
+    fn catalog_line(name: &str, version: &str, target: &str, digest: &str) -> String {
+        format!("extension {name} {version} {target} {digest}\n")
     }
 
     /// Stub serving a fully valid release for (`name`, `version`, `target`)
@@ -1679,6 +2003,330 @@ mod tests {
             "https://cdn.bitty.run/extensions/net/0.0.23/SHA256SUMS"
         );
         assert_eq!(urls.tarball_file, "x86_64-unknown-linux-gnu.tar.gz");
+    }
+
+    #[test]
+    fn catalog_url_is_the_canonical_builtin_key() {
+        assert_eq!(
+            SEED_CATALOG_URL,
+            format!("{SEED_CDN_BASE}/{SEED_CATALOG_KEY}")
+        );
+        assert!(is_builtin_installer_url(SEED_CATALOG_URL));
+        assert!(SEED_CATALOG_URL.len() <= SEED_URL_MAX_BYTES);
+    }
+
+    // --- registry catalog: parse, lookup, fail-closed ---------------------
+
+    #[test]
+    fn catalog_parses_todays_published_artifacts() {
+        // Digests read from the live CDN on 2026-10-20:
+        // extensions/graphics/0.0.24/ and extensions/net/0.0.1/ SHA256SUMS.
+        let text = format!(
+            "# bitty extension catalog v1\nschema 1\n{}{}",
+            catalog_line(
+                "graphics",
+                "0.0.24",
+                "x86_64-unknown-linux-gnu",
+                "7e331044e6bbede32909fb04729f563e4645d5c1f1ba8c32d00aeb79a8631a02",
+            ),
+            catalog_line(
+                "net",
+                "0.0.1",
+                "x86_64-unknown-linux-gnu",
+                "1764de2db9eb1a00dd80535dfcf744b28d4d74dae2af12c4a31e01c4156b1615",
+            ),
+        );
+        let catalog = parse_catalog(&text).expect("catalog");
+        assert_eq!(
+            catalog.digest_for("graphics", "0.0.24", "x86_64-unknown-linux-gnu"),
+            Some("7e331044e6bbede32909fb04729f563e4645d5c1f1ba8c32d00aeb79a8631a02")
+        );
+        assert_eq!(
+            catalog.digest_for("net", "0.0.1", "x86_64-unknown-linux-gnu"),
+            Some("1764de2db9eb1a00dd80535dfcf744b28d4d74dae2af12c4a31e01c4156b1615")
+        );
+        // Exact selection: no cross-version or cross-target guessing.
+        assert_eq!(
+            catalog.digest_for("net", "0.0.24", "x86_64-unknown-linux-gnu"),
+            None
+        );
+        assert_eq!(
+            catalog.digest_for("net", "0.0.1", "aarch64-apple-darwin"),
+            None
+        );
+        assert_eq!(
+            catalog.digest_for("graphics", "0.0.1", "x86_64-unknown-linux-gnu"),
+            None
+        );
+        assert_eq!(
+            catalog.digest_for("evil", "0.0.1", "x86_64-unknown-linux-gnu"),
+            None
+        );
+    }
+
+    #[test]
+    fn catalog_accepts_comments_blank_lines_and_crlf() {
+        let digest = "a".repeat(64);
+        let text = format!(
+            "# header\r\n\r\nschema 1\r\n# comment\r\n{}\r\n",
+            catalog_line("net", "0.0.1", "x86_64-unknown-linux-gnu", &digest).trim_end()
+        );
+        let catalog = parse_catalog(&text).expect("catalog");
+        assert_eq!(
+            catalog.digest_for("net", "0.0.1", "x86_64-unknown-linux-gnu"),
+            Some(digest.as_str())
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_malformed_metadata() {
+        let good = "a".repeat(64);
+        let record = catalog_line("net", "0.0.1", "x86_64-unknown-linux-gnu", &good);
+        let cases: &[(&str, String)] = &[
+            ("empty", String::new()),
+            ("missing schema", record.clone()),
+            ("unsupported schema", format!("schema 2\n{record}")),
+            ("duplicate schema", format!("schema 1\nschema 1\n{record}")),
+            (
+                "unknown directive",
+                format!("schema 1\nlatest net\n{record}"),
+            ),
+            (
+                "extra field",
+                format!("schema 1\nextension net 0.0.1 x86_64-unknown-linux-gnu {good} extra\n"),
+            ),
+            (
+                "invalid name",
+                format!("schema 1\nextension Net 0.0.1 x86_64-unknown-linux-gnu {good}\n"),
+            ),
+            (
+                "invalid version",
+                format!("schema 1\nextension net 0.0.1-alpha x86_64-unknown-linux-gnu {good}\n"),
+            ),
+            (
+                "invalid target",
+                format!("schema 1\nextension net 0.0.1 X86_64-unknown-linux-gnu {good}\n"),
+            ),
+            (
+                "short digest",
+                "schema 1\nextension net 0.0.1 x86_64-unknown-linux-gnu abc\n".to_string(),
+            ),
+            (
+                "uppercase digest",
+                format!(
+                    "schema 1\nextension net 0.0.1 x86_64-unknown-linux-gnu {}\n",
+                    good.to_ascii_uppercase()
+                ),
+            ),
+            ("duplicate entry", format!("schema 1\n{record}{record}")),
+            (
+                "path name",
+                format!("schema 1\nextension ../net 0.0.1 x86_64-unknown-linux-gnu {good}\n"),
+            ),
+        ];
+        for (why, text) in cases {
+            let error = parse_catalog(text).expect_err(&format!("catalog must fail ({why})"));
+            assert_eq!(error.exit_code(), 4, "{why}: {error}");
+            assert!(
+                error.message().contains("extension catalog"),
+                "{why}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_invalid_target_reaches_the_target_grammar() {
+        // One target token keeps the field count valid, so the refusal comes
+        // from the target grammar rather than the malformed-record arm.
+        let text = format!(
+            "schema 1\nextension net 0.0.1 X86_64-unknown-linux-gnu {}\n",
+            "a".repeat(64)
+        );
+        let error = parse_catalog(&text).expect_err("uppercase target must fail");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("invalid target triple"), "{error}");
+    }
+
+    #[test]
+    fn catalog_rejects_oversize_shapes() {
+        // One overlong line.
+        let long = format!(
+            "schema 1\n# {}\n",
+            "x".repeat(SEED_CATALOG_LINE_MAX_BYTES + 1)
+        );
+        assert!(parse_catalog(&long).is_err());
+
+        // Too many records.
+        let mut many = String::from("schema 1\n");
+        for index in 0..=SEED_CATALOG_MAX_ENTRIES {
+            many.push_str(&format!(
+                "extension net 0.0.1 target-{index} {}\n",
+                "a".repeat(64)
+            ));
+        }
+        // The entry cap trips before the byte cap at this line size.
+        let error = parse_catalog(&many).expect_err("entry cap");
+        assert!(error.message().contains("entries"), "{error}");
+
+        // Too many lines (comments count toward the line cap).
+        let mut lines = String::from("schema 1\n");
+        for _ in 0..SEED_CATALOG_MAX_LINES {
+            lines.push_str("# filler\n");
+        }
+        assert!(parse_catalog(&lines).is_err());
+
+        // Over the byte cap, checked before any line parsing.
+        let oversized = "x".repeat(SEED_CATALOG_MAX_BYTES as usize + 1);
+        let error = parse_catalog(&oversized).expect_err("byte cap");
+        assert!(error.message().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn fetch_catalog_parses_served_bytes() {
+        let digest = "a".repeat(64);
+        let catalog = format!(
+            "schema 1\n{}",
+            catalog_line("net", "0.0.1", "x86_64-unknown-linux-gnu", &digest)
+        );
+        let mut stub = StubTransport::default();
+        stub.fetches
+            .insert(SEED_CATALOG_URL.to_string(), catalog.into_bytes());
+        let fetched = fetch_catalog(&mut stub).expect("catalog fetch");
+        let CatalogFetch::Available(catalog) = fetched else {
+            panic!("catalog must be available: {fetched:?}");
+        };
+        assert_eq!(
+            catalog.digest_for("net", "0.0.1", "x86_64-unknown-linux-gnu"),
+            Some(digest.as_str())
+        );
+        // Exactly one metadata fetch, with the catalog URL last.
+        assert_eq!(stub.spawn_count("curl"), 1);
+        assert_eq!(
+            stub.argv_for("curl")[0].last().map(String::as_str),
+            Some(SEED_CATALOG_URL)
+        );
+        assert_eq!(stub.spawn_count("tar"), 0);
+    }
+
+    #[test]
+    fn fetch_catalog_reports_transport_unavailable_for_offline_fallback() {
+        let mut stub = StubTransport {
+            fetch_fails: true,
+            ..StubTransport::default()
+        };
+        let fetched = fetch_catalog(&mut stub).expect("offline is not a parse error");
+        let CatalogFetch::Unavailable(reason) = fetched else {
+            panic!("offline must be unavailable, not malformed: {fetched:?}");
+        };
+        assert!(reason.contains("stub fetch failed"), "{reason}");
+        // The caller can still run the single-release path (fallback test
+        // below), but the catalog itself never becomes an empty allow-all.
+    }
+
+    #[test]
+    fn fetch_catalog_propagates_oversize_instead_of_falling_back() {
+        let mut stub = StubTransport {
+            fetch_error: Some(SeedError::Oversize(
+                "bitty extension: fetched body exceeds 1 bytes".to_string(),
+            )),
+            ..StubTransport::default()
+        };
+        let error = fetch_catalog(&mut stub).expect_err("oversize must fail closed");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn fetch_catalog_propagates_malformed_served_bytes() {
+        let mut stub = StubTransport::default();
+        stub.fetches.insert(
+            SEED_CATALOG_URL.to_string(),
+            b"schema 1\nlatest net\n".to_vec(),
+        );
+        let error = fetch_catalog(&mut stub).expect_err("malformed must fail closed");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("malformed"), "{error}");
+    }
+
+    #[test]
+    fn fetch_catalog_rejects_non_utf8_bytes() {
+        let mut stub = StubTransport::default();
+        stub.fetches
+            .insert(SEED_CATALOG_URL.to_string(), vec![0xff, 0xfe, 0x00, 0x62]);
+        let error = fetch_catalog(&mut stub).expect_err("non-UTF-8 must fail closed");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("not UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn offline_fallback_still_runs_the_single_release_pipeline() {
+        // Transport failure: the caller gets `Unavailable`, then runs the
+        // original SHA256SUMS path with no registry digest.
+        let mut stub = StubTransport {
+            fetch_fails: true,
+            ..StubTransport::default()
+        };
+        let fetched = fetch_catalog(&mut stub).expect("offline");
+        assert!(matches!(fetched, CatalogFetch::Unavailable(_)));
+
+        // The existing pipeline (manifest + tarball + member audit) is
+        // unchanged and remains mandatory in fallback mode.
+        let exe = b"fallback-net-bytes";
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        let payload = fetch_seed_payload_with_registry(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            None,
+            None,
+            &mut stub,
+        )
+        .expect("fallback payload");
+        assert_eq!(payload.bytes, exe);
+        assert_eq!(stub.spawn_count("curl"), 2);
+        assert_eq!(stub.spawn_count("tar"), 2);
+    }
+
+    #[test]
+    fn registry_digest_mismatch_fails_before_unpack() {
+        let exe = b"fake-net-bytes";
+        let (mut stub, _) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        let other = "d".repeat(64);
+        let error = fetch_seed_payload_with_registry(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            None,
+            Some(&other),
+            &mut stub,
+        )
+        .expect_err("catalog mismatch must fail");
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            error.message().contains("extension catalog digest"),
+            "{error}"
+        );
+        // Refused before unpacking: tar never ran.
+        assert_eq!(stub.spawn_count("tar"), 0);
+    }
+
+    #[test]
+    fn registry_digest_matches_and_rides_with_the_manifest_digest() {
+        let exe = b"fake-net-bytes";
+        let (mut stub, urls) = valid_stub("net", "0.0.1", "x86_64-unknown-linux-gnu", exe);
+        let tarball_bytes = b"fake-tarball-for-net-0.0.1-x86_64-unknown-linux-gnu".to_vec();
+        let digest = bitty_package::integrity::sha256_hex(&tarball_bytes);
+        let payload = fetch_seed_payload_with_registry(
+            "net",
+            "0.0.1",
+            "x86_64-unknown-linux-gnu",
+            Some(&digest),
+            Some(&digest.to_ascii_uppercase()),
+            &mut stub,
+        )
+        .expect("all matching digests must pass");
+        assert_eq!(payload.tarball_digest, digest);
+        assert!(urls.tarball_url.ends_with(".tar.gz"));
     }
 
     /// Hostile corpus (mirrors the `make-component-dist.sh --print-url`
@@ -1960,7 +2608,7 @@ mod tests {
         );
     }
 
-    // --- digest arbitration (#1906: both-must-match + constant-shape) ----
+    // --- digest arbitration (#1906/#2111: all-available-must-match + constant-shape) ----
 
     #[test]
     fn hex_digest_check_is_constant_shape() {
@@ -2009,17 +2657,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_seam_is_none_until_manager_index_lands() {
-        // Registry index does NOT exist yet (manager#11 open): Core side only.
-        assert_eq!(registry_digest_for("net", "0.0.23"), None);
-        assert_eq!(registry_digest_for("evil", "9.9.9"), None);
+    fn registry_catalog_digest_is_required_when_present() {
         // Single-source-only never verifies (confirm path, not silent).
         let digest = "c".repeat(64);
-        assert!(!is_dual_digest_verified(
-            registry_digest_for("net", "0.0.23").as_deref(),
-            &digest,
-            &digest
-        ));
+        assert!(!is_dual_digest_verified(None, &digest, &digest));
+        // A catalog digest only verifies when it matches the CDN digest and
+        // the fetched bytes.
+        assert!(is_dual_digest_verified(Some(&digest), &digest, &digest));
+        let other = "d".repeat(64);
+        assert!(!is_dual_digest_verified(Some(&other), &digest, &digest));
         assert_eq!(
             installer_consent_level(true, false),
             InstallerConsentLevel::Confirm
@@ -2832,6 +3478,8 @@ mod tests {
         assert_eq!(SeedError::Fetch("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Io("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Manifest("x".into()).exit_code(), 4);
+        assert_eq!(SeedError::Catalog("x".into()).exit_code(), 4);
+        assert_eq!(SeedError::Oversize("x".into()).exit_code(), 4);
         assert_eq!(SeedError::DigestMismatch("x".into()).exit_code(), 4);
         assert_eq!(SeedError::MemberViolation("x".into()).exit_code(), 4);
         assert_eq!(SeedError::DescriptorMismatch("x".into()).exit_code(), 4);

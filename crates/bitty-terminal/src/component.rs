@@ -61,14 +61,19 @@
 //!   fetch one prebuilt release from R2 through the minimal install seed
 //!   (`crate::component_seed`, issue #1791 option A): fixed-argv system
 //!   `curl` 7.68.0 or newer (preflighted, pinned to `https://cdn.bitty.run`,
-//!   `SHA256SUMS` hash verify fail-closed with both-must-match against
-//!   `--digest` when provided (#1906, constant-shape compare, exit 4 on any
-//!   mismatch), exact member audit, TOFU pin of the verified CDN digest into
+//!   `SHA256SUMS` hash verify fail-closed with all-available-must-match
+//!   against the registry catalog digest and `--digest` when present (#1906,
+//!   #2111, constant-shape compare, exit 4 on any mismatch), exact member
+//!   audit, TOFU pin of the verified CDN digest into
 //!   `<user>/<name>/tarball.sha256` (later differing digests fail closed as
 //!   pin-mismatch unless `--force` re-pins, never auto-updated), then the
-//!   same atomic publish path as `add`. The version is required and exact
-//!   (no registry, no solving; registry index lands with manager#11); the
-//!   full manager takes over after the install.
+//!   same atomic publish path as `add`. The bounded
+//!   `extensions/catalog.v1` metadata is fetched after consent and must list
+//!   exactly the requested `(name, version, host target)`; malformed,
+//!   oversize, or missing entries fail closed, while a catalog transport
+//!   failure falls back to the single-release `SHA256SUMS` path with confirm.
+//!   The version is required and exact (no version solving); the full
+//!   manager takes over after the install.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -79,9 +84,9 @@
 //! operand fails closed naming the local-path form. This keeps Core
 //! network-free (package-manager-boundary DIR-016/DIR-017) and install
 //! offline-capable. The narrow exception is `install`: the minimal seed
-//! fetches exactly one allowlisted R2 release (fixed-argv `curl`, no shell,
-//! hash-verified before unpack), and nothing else in Core touches the
-//! network.
+//! fetches the catalog plus exactly one allowlisted R2 release (fixed-argv
+//! `curl`, no shell, hash-verified before unpack), and nothing else in Core
+//! touches the network.
 //!
 //! # Exit codes (stable taxonomy, cli-contract-rfc.md)
 //!
@@ -266,11 +271,12 @@ pub struct ComponentRequest {
     /// `install --yes`: approve the download consent non-interactively.
     pub yes: bool,
     /// `install --digest <hex>`: caller-supplied expected tarball digest.
-    /// Both-must-match with CDN `SHA256SUMS`; malformed fails as usage.
+    /// All-available-must-match with CDN `SHA256SUMS` and the registry
+    /// catalog; malformed fails as usage.
     pub digest: Option<String>,
     /// `install --force`: re-pin the TOFU pin to the new verified digest.
     /// Never bypasses digest verification; only overwrites the pin after
-    /// both-must-match passes.
+    /// all-available-must-match passes.
     pub force: bool,
     /// `add --distro <name>`: WSL2 guest distro for component execution on
     /// Windows (explicit selection; `default` means the `wsl.exe` default
@@ -790,12 +796,14 @@ pub fn component_usage() -> String {
      \n\
      Components are upstream native binaries resolved user-first:\n\
      $XDG_DATA_HOME/bitty/extensions/ wins over /usr/lib/bitty/extensions/.\n\
-     `add` stages from a local path only (v1 has no registry download);\n\
-     `install` fetches one R2 prebuilt release through the hash-verified\n\
-     seed (builtin cdn.bitty.run:443 egress, dual-digest verified silent\n\
-     else explicit consent, TOFU-pinned; --force re-pins, update-diff preview\n\
-     rendered before any pin change), then the full\n\
-     manager takes over; `remove` only touches the user tier (no root required).\n\
+     `add` stages from a local path only (v1 has no ad-hoc URL download);\n\
+     `install` fetches the bounded extension catalog plus one R2 prebuilt\n\
+     release through the hash-verified seed (builtin cdn.bitty.run:443 egress,\n\
+     all-available-must-match, explicit consent for unsigned 0.1.0,\n\
+     TOFU-pinned; catalog unavailable falls back to SHA256SUMS-only;\n\
+     --force re-pins, update-diff preview rendered before any pin change),\n\
+     then the full manager takes over; `remove` only touches the user tier\n\
+     (no root required).\n\
      `show-source` prints the exact pinned executable bytes (hash-verified,\n\
      provenance on stderr so stdout stays byte-identical).\n\
      On Windows, `add --distro` routes execution through the WSL2 trampoline\n\
@@ -835,14 +843,17 @@ pub fn component_help_text() -> String {
      \x20                             the executable; a bare bitty-<name> file\n\
      \x20                             needs --version <semver>. The digest is\n\
      \x20                             computed and ABI compat verified before\n\
-     \x20                             anything is written. URLs fail closed (v1\n\
-     \x20                             has no registry download).\n\
-     \x20 install <name> --version V Fetch one prebuilt release from R2\n\
-     \x20 [--digest H] [--force]      (https://cdn.bitty.run, SHA256SUMS hash\n\
-     \x20 [--yes]                     verified, TOFU-pinned) into the user tier,\n\
-     \x20                             then hand off to the full manager. The version\n\
-     \x20                             is required and exact: the seed keeps no\n\
-     \x20                             registry and does no solving.\n\
+     \x20                             anything is written. URLs fail closed (add\n\
+     \x20                             accepts local paths only).\n\
+     \x20 install <name> --version V Fetch the bounded extension catalog plus one\n\
+     \x20 [--digest H] [--force]      prebuilt release from R2\n\
+     \x20 [--yes]                     (https://cdn.bitty.run; SHA256SUMS and catalog\n\
+     \x20                             digest verified, TOFU-pinned) into the user\n\
+     \x20                             tier, then hand off to the full manager. The\n\
+     \x20                             version is required and exact: the seed does\n\
+     \x20                             no solving. A fetched catalog missing the\n\
+     \x20                             release fails closed; an unavailable catalog\n\
+     \x20                             falls back to SHA256SUMS-only.\n\
      \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
      \x20                             user version when none is named. Removing\n\
      \x20                             the active version also drops `current`.\n\
@@ -872,14 +883,14 @@ pub fn component_help_text() -> String {
      \x20 --version <semver>          add: version for a bare executable.\n\
      \x20                             install: required exact R2 release.\n\
      \x20 --digest <hex>              install only: caller-supplied expected tarball\n\
-     \x20                             digest (64 hex, SHA-256). Both-must-match with\n\
-     \x20                             CDN SHA256SUMS; any mismatch is an integrity\n\
-     \x20                             failure (exit 4), never a silent pick. Malformed\n\
-     \x20                             values fail as usage (exit 2). Stands in for the\n\
-     \x20                             registry value until the index lands (manager#11).\n\
+     \x20                             digest (64 hex, SHA-256). All-available-must-\n\
+     \x20                             match with CDN SHA256SUMS and the registry\n\
+     \x20                             catalog when published; any mismatch is an\n\
+     \x20                             integrity failure (exit 4), never a silent pick.\n\
+     \x20                             Malformed values fail as usage (exit 2).\n\
      \x20 --force                     install only: re-pin the TOFU pin to the new\n\
-     \x20                             verified digest after both-must-match passes. Does\n\
-     \x20                             NOT bypass digest verification.\n\
+     \x20                             verified digest after all-available-must-match\n\
+     \x20                             passes. Does NOT bypass digest verification.\n\
      \x20 --yes                       install only: approve the download consent\n\
      \x20                             non-interactively (no prompt).\n\
      \x20 --distro <name|default>     add only: WSL2 guest distro for component\n\
@@ -937,10 +948,21 @@ pub fn component_help_text() -> String {
      \x20 system tar; no Rust network stack.\n\
      \n\
      digest arbitration:\n\
-     \x20 Both-must-match: CDN SHA256SUMS and the caller-supplied --digest\n\
-     \x20 (registry value later) must EACH match the downloaded bytes.\n\
-     \x20 Any mismatch exits 4, never a silent pick. Hex compare is\n\
-     \x20 constant-shape (pass/fail only, no position oracle).\n\
+     \x20 All-available-must-match: CDN SHA256SUMS, the extension catalog\n\
+     \x20 digest when the release is published there, and the caller-supplied\n\
+     \x20 --digest when provided must EACH match the downloaded bytes. Any\n\
+     \x20 mismatch exits 4, never a silent pick. Hex compare is constant-shape\n\
+     \x20 (pass/fail only, no position oracle).\n\
+     \n\
+     registry catalog:\n\
+     \x20 `install` fetches https://cdn.bitty.run/extensions/catalog.v1 after\n\
+     \x20 consent. The bounded line format is `schema 1` plus\n\
+     \x20 `extension <name> <version> <target> <sha256>` records. A fetched\n\
+     \x20 catalog that is malformed, oversize, or missing the requested\n\
+     \x20 name/version/host-target fails closed (exit 4) before the tarball;\n\
+     \x20 there is no allow-all fallback. A catalog *transport* failure\n\
+     \x20 (offline, 404, 5xx) falls back to the single-release SHA256SUMS path\n\
+     \x20 with the same explicit consent, TOFU pin, and exact-two-member audit.\n\
      \n\
      TOFU pinning:\n\
      \x20 First install of a component records (pins) the verified CDN\n\
@@ -950,16 +972,13 @@ pub fn component_help_text() -> String {
      \x20 use --force to re-pin after verification. The pin never auto-updates.\n\
      \n\
      download consent:\n\
-     \x20 Silent only when the fetch targets the builtin CDN host AND both\n\
-     \x20 digests verify (registry digest and CDN SHA256SUMS both\n\
-     \x20 match, per the dual-digest rule); anything else (third-party host,\n\
-     \x20 single-digest-only, digest mismatch history) needs explicit\n\
-     \x20 confirm. The registry half is absent today (manager#11 open), so\n\
-     \x20 installs always confirm; --digest does NOT grant silent. Without --yes\n\
-     \x20 the installer prompts `Grant download\n\
+     \x20 Consent precedes every transport contact, so a decline or EOF exits\n\
+     \x20 1 with nothing fetched or staged. Unsigned 0.1.0 therefore always\n\
+     \x20 takes the explicit-confirm path for executable downloads; --digest\n\
+     \x20 and the catalog digest do NOT grant silent. Without --yes the\n\
+     \x20 installer prompts `Grant download\n\
      \x20 <name> <version>? [y/N]` (up to 3 attempts, 64 bytes per answer);\n\
-     \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts. A\n\
-     \x20 decline or EOF exits 1 with nothing staged or fetched.\n\
+     \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
      \n\
      fetch environment:\n\
      \x20 `install` preflights `curl --version` once per invocation and needs\n\
@@ -1648,28 +1667,6 @@ fn write_tofu_pin(user: &Path, name: &str, digest: &str) -> Result<(), Component
     publish_bytes_atomic(&path, format!("{digest}\n").as_bytes(), None)
 }
 
-/// Enforce the registry half of both-must-match (issue #1906 seam).
-///
-/// `None` (registry index absent today, manager#11 open) is a no-op so the
-/// seam stays live without changing behavior. `Some` must constant-shape
-/// match the verified tarball digest; any mismatch or malformed value fails
-/// closed as integrity failure (exit 4), never a silent pick.
-fn check_registry_digest(
-    registry: Option<&str>,
-    tarball_digest: &str,
-) -> Result<(), ComponentFailure> {
-    let Some(expected) = registry else {
-        return Ok(());
-    };
-    if !crate::component_seed::digests_equal_ct(expected, tarball_digest) {
-        return Err(ComponentFailure::component(format!(
-            "bitty extension: install failed: registry digest {} does not match verified tarball digest {tarball_digest} (refusing to install)",
-            expected.to_ascii_lowercase(),
-        )));
-    }
-    Ok(())
-}
-
 // Nine args: install needs name/version/digest/force/roots/stdio/consent/
 // transport together (all bounded, fail-closed before mutation). A params
 // struct would obscure the call-site audit, so allow the lint here.
@@ -1740,23 +1737,16 @@ fn op_install(
     // always takes the confirm path.
     let is_builtin = crate::component_seed::is_builtin_installer_url(&urls.tarball_url)
         && crate::component_seed::is_builtin_installer_url(&urls.manifest_url);
-    // Dual-digest (#1906, Core side only): the registry index does NOT exist
-    // yet (manager#11 open), so `registry_digest_for` returns `None` today
-    // and installs are single-source-only for consent purposes: always take
-    // the confirm path. The check runs through the real predicate so the
-    // dual-digest rule stays live in non-test builds. `--digest` is the
-    // caller-supplied half for integrity (both-must-match in the fetch
-    // below) but does NOT grant silent: silent requires the registry half,
-    // keeping today always-confirm until both halves exist. Do NOT weaken.
-    let registry_digest = crate::component_seed::registry_digest_for(name, version);
-    let dual_verified =
-        crate::component_seed::is_dual_digest_verified(registry_digest.as_deref(), "", "");
+    // Consent precedes *every* transport contact: a decline/EOF exits 1 with
+    // zero spawn and no staging (pinned by the no-fetch decline tests). The
+    // registry catalog therefore cannot inform this prompt, and unsigned
+    // 0.1.0 keeps the explicit-confirm path for every executable download.
+    // The predicate is still evaluated so the builtin+dual-digest rule
+    // cannot drift silently into an accidental silent path.
+    let dual_verified = crate::component_seed::is_dual_digest_verified(None, "", "");
     let level = crate::component_seed::installer_consent_level(is_builtin, dual_verified);
     let needs_consent = level == crate::component_seed::InstallerConsentLevel::Confirm;
     if needs_consent && !yes {
-        // Consent precedes any fetch: a decline/EOF exits 1 with no spawn
-        // and no staging (provable by the zero-spawn hostile corpus plus
-        // the no-staging decline tests).
         match ask_component_install_consent(input, output, name, version, &urls)? {
             true => {}
             false => {
@@ -1772,13 +1762,54 @@ fn op_install(
             crate::component_seed::BUILTIN_INSTALLER_EGRESS
         );
     }
-    let payload =
+    // Registry backend (#2111): fetch the bounded catalog after consent and
+    // resolve exactly (name, version, host target). A transport failure is
+    // the explicit offline fallback (single-release SHA256SUMS, confirm
+    // already taken); malformed/oversize metadata and a missing entry fail
+    // closed, never "allow all".
+    let registry_digest = match crate::component_seed::fetch_catalog(transport)
+        .map_err(|error| seed_failure(&error))?
+    {
+        crate::component_seed::CatalogFetch::Available(catalog) => {
+            match catalog.digest_for(name, version, target) {
+                Some(digest) => {
+                    let _ = writeln!(
+                        output,
+                        "bitty extension: catalog pins tarball digest {digest} for '{name}' {version} ({target})"
+                    );
+                    Some(digest.to_owned())
+                }
+                None => {
+                    return Err(ComponentFailure::component(format!(
+                        "bitty extension: install failed: extension catalog has no entry for '{name}' version {version} target {target} (refusing to guess; publish the release in {} first)",
+                        crate::component_seed::SEED_CATALOG_URL,
+                    )));
+                }
+            }
+        }
+        crate::component_seed::CatalogFetch::Unavailable(reason) => {
+            let _ = writeln!(
+                output,
+                "bitty extension: extension catalog unavailable ({reason}); falling back to single-release SHA256SUMS verification (no registry pin; explicit consent already required)"
+            );
+            None
+        }
+    };
+    let payload = if let Some(registry_digest) = registry_digest.as_deref() {
+        crate::component_seed::fetch_seed_payload_with_registry(
+            name,
+            version,
+            target,
+            digest_flag,
+            Some(registry_digest),
+            transport,
+        )
+    } else {
+        // Explicit offline fallback: the original single-release pipeline,
+        // unchanged (manifest + tarball + exact-two-member audit + TOFU).
         crate::component_seed::fetch_seed_payload(name, version, target, digest_flag, transport)
-            .map_err(|error| seed_failure(&error))?;
-    // Registry seam (manager#11): when the index lands, the registry digest
-    // joins both-must-match here (all-available-must-match). Today it is
-    // `None`, so this is a no-op. A mismatching `Some` fails closed (exit 4).
-    check_registry_digest(registry_digest.as_deref(), &payload.tarball_digest)?;
+    }
+    .map_err(|error| seed_failure(&error))?;
     // ABI-compat check before any mutation (same gate as `add`).
     let core = bitty_runtime::component::PROTOCOL_VERSION;
     if !(payload.protocol_min..=payload.protocol_max).contains(&core) {
@@ -1928,7 +1959,12 @@ fn ask_component_install_consent(
     let _ = writeln!(output, "  tarball:  {}", urls.tarball_url);
     let _ = writeln!(
         output,
-        "  trust: CDN SHA256SUMS verified (both-must-match with --digest when provided); TOFU-pinned, registry pin arrives with manager#11 — explicit confirm required."
+        "  catalog:  {} (optional registry metadata)",
+        crate::component_seed::SEED_CATALOG_URL
+    );
+    let _ = writeln!(
+        output,
+        "  trust: CDN SHA256SUMS plus the extension catalog digest when published (all-available-must-match); TOFU-pinned, unsigned 0.1.0 — explicit confirm required."
     );
     for attempt in 1..=MAX_COMPONENT_CONSENT_ATTEMPTS {
         let _ = write!(
@@ -3751,8 +3787,10 @@ mod tests {
     struct InstallStub {
         tarball: Vec<u8>,
         manifest: String,
+        catalog: String,
         descriptor: Vec<u8>,
         executable: Vec<u8>,
+        catalog_unavailable: bool,
         fetch_calls: usize,
     }
 
@@ -3762,10 +3800,10 @@ mod tests {
             let tarball_digest = bitty_package::integrity::sha256_hex(&tarball);
             let exe_digest = bitty_package::integrity::sha256_hex(exe);
             // The stub fetch returns the same tarball bytes for any tarball
-            // URL, so the stub is host-independent: the manifest carries one
-            // line per mapped host triple (see `host_target_triple`) all
-            // pointing at that single digest, so the real host lookup always
-            // hits regardless of where the test runs.
+            // URL, so the stub is host-independent: the manifest and catalog
+            // carry one line per mapped host triple (see `host_target_triple`)
+            // all pointing at that single digest, so the real host lookup
+            // always hits regardless of where the test runs.
             const HOST_TRIPLES: [&str; 7] = [
                 "x86_64-unknown-linux-gnu",
                 "aarch64-unknown-linux-gnu",
@@ -3776,8 +3814,12 @@ mod tests {
                 "aarch64-pc-windows-msvc",
             ];
             let mut manifest = String::new();
+            let mut catalog = String::from("schema 1\n");
             for triple in HOST_TRIPLES {
                 manifest.push_str(&format!("{tarball_digest}  {triple}.tar.gz\n"));
+                catalog.push_str(&format!(
+                    "extension {name} {version} {triple} {tarball_digest}\n"
+                ));
             }
             let descriptor = format!(
                 "[component]\nname = \"{name}\"\nversion = \"{version}\"\nprotocol = [1, 1]\nexecutable = \"bitty-{name}\"\nsha256 = \"{exe_digest}\"\n"
@@ -3786,8 +3828,10 @@ mod tests {
             Self {
                 tarball,
                 manifest,
+                catalog,
                 descriptor,
                 executable: exe.to_vec(),
+                catalog_unavailable: false,
                 fetch_calls: 0,
             }
         }
@@ -3801,7 +3845,14 @@ mod tests {
             _max: u64,
         ) -> Result<(), crate::component_seed::SeedError> {
             self.fetch_calls += 1;
-            let bytes = if url.ends_with("SHA256SUMS") {
+            if url == crate::component_seed::SEED_CATALOG_URL && self.catalog_unavailable {
+                return Err(crate::component_seed::SeedError::Fetch(
+                    "stub catalog offline".to_string(),
+                ));
+            }
+            let bytes = if url == crate::component_seed::SEED_CATALOG_URL {
+                self.catalog.as_bytes()
+            } else if url.ends_with("SHA256SUMS") {
                 self.manifest.as_bytes()
             } else {
                 &self.tarball
@@ -4157,19 +4208,203 @@ mod tests {
             &mut stub,
         )
         .expect_err("expected mismatch must fail");
-        // Both-must-match: integrity failure (exit 4), never a silent pick.
+        // All-available-must-match: integrity failure (exit 4), never a
+        // silent pick.
         assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
         assert!(
             error.message.contains("does not match expected digest"),
             "{}",
             error.message
         );
-        // Fetched (2 calls: manifest + tarball) but never unpacked or staged.
-        assert_eq!(stub.fetch_calls, 2);
+        // Fetched (3 calls: catalog + manifest + tarball) but never unpacked
+        // or staged.
+        assert_eq!(stub.fetch_calls, 3);
         assert!(!user.join("net").exists(), "mismatch must not stage");
         assert!(
             !user.join("net").join(TARBALL_PIN_FILE).exists(),
             "mismatch must not pin"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_refuses_catalog_missing_entry_before_tarball_fetch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-catalog-missing");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.23",
+            "x86_64-unknown-linux-gnu",
+            b"seed-net-bytes",
+        );
+        // Valid catalog, but the requested release is not listed: fail closed,
+        // never guess from SHA256SUMS alone once the catalog answered.
+        stub.catalog = "schema 1\n".to_string();
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("missing catalog entry must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(error.message.contains("no entry"), "{}", error.message);
+        assert_eq!(stub.fetch_calls, 1, "only the catalog may be fetched");
+        assert!(!user.join("net").exists(), "must not stage");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_refuses_catalog_digest_mismatch_before_unpack() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-catalog-mismatch");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.23",
+            "x86_64-unknown-linux-gnu",
+            b"seed-net-bytes",
+        );
+        let digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        stub.catalog = stub.catalog.replace(&digest, &"0".repeat(64));
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("catalog mismatch must fail");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("extension catalog digest"),
+            "{}",
+            error.message
+        );
+        assert_eq!(stub.fetch_calls, 3);
+        assert!(!user.join("net").exists(), "must not stage");
+        assert!(
+            !user.join("net").join(TARBALL_PIN_FILE).exists(),
+            "must not pin"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_refuses_malformed_or_oversize_catalog_before_tarball_fetch() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let cases: &[(&str, String)] = &[
+            ("malformed", "schema 1\nlatest net\n".to_string()),
+            (
+                "oversize",
+                "x".repeat(crate::component_seed::SEED_CATALOG_MAX_BYTES as usize + 1),
+            ),
+        ];
+        for (why, catalog) in cases {
+            let base = scratch(&format!("install-catalog-{why}"));
+            let user = base.join("user");
+            std::fs::create_dir_all(&user).expect("user dir");
+            let mut stub = InstallStub::canned(
+                "net",
+                "0.0.23",
+                "x86_64-unknown-linux-gnu",
+                b"seed-net-bytes",
+            );
+            stub.catalog = catalog.clone();
+            let mut out = Vec::new();
+            let mut input = std::io::BufReader::new(&b""[..]);
+            let error = op_install(
+                "net",
+                Some("0.0.23"),
+                None,
+                false,
+                Some(&user),
+                &mut out,
+                &mut input,
+                true,
+                &mut stub,
+            )
+            .expect_err(&format!("{why} catalog must fail"));
+            assert_eq!(error.exit, EXIT_COMPONENT, "{why}: {}", error.message);
+            assert!(
+                error.message.contains("extension catalog"),
+                "{why}: {}",
+                error.message
+            );
+            assert_eq!(
+                stub.fetch_calls, 1,
+                "{why}: only the catalog may be fetched"
+            );
+            assert!(!user.join("net").exists(), "{why}: must not stage");
+            assert!(
+                !user.join("net").join(TARBALL_PIN_FILE).exists(),
+                "{why}: must not pin"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn install_falls_back_when_catalog_transport_is_unavailable() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-catalog-offline");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.23",
+            "x86_64-unknown-linux-gnu",
+            b"seed-net-bytes",
+        );
+        stub.catalog_unavailable = true;
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("offline fallback must still install");
+        assert!(summary.contains("installed"), "{summary}");
+        let note = String::from_utf8_lossy(&out);
+        assert!(note.contains("catalog unavailable"), "{note}");
+        assert!(note.contains("single-release SHA256SUMS"), "{note}");
+        // Catalog + manifest + tarball: fallback never skips the release
+        // manifest, member audit, or TOFU pin.
+        assert_eq!(stub.fetch_calls, 3);
+        assert!(
+            user.join("net").join(TARBALL_PIN_FILE).is_file(),
+            "fallback must pin"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4285,10 +4520,13 @@ mod tests {
                 "aarch64-pc-windows-msvc",
             ];
             let mut manifest = String::new();
+            let mut catalog = String::from("schema 1\n");
             for triple in HOST_TRIPLES {
                 manifest.push_str(&format!("{rotated_digest}  {triple}.tar.gz\n"));
+                catalog.push_str(&format!("extension net 0.0.23 {triple} {rotated_digest}\n"));
             }
             stub.manifest = manifest;
+            stub.catalog = catalog;
         }
         let mut out = Vec::new();
         let mut input = std::io::BufReader::new(&b""[..]);
@@ -4336,10 +4574,13 @@ mod tests {
                 "aarch64-pc-windows-msvc",
             ];
             let mut manifest = String::new();
+            let mut catalog = String::from("schema 1\n");
             for triple in HOST_TRIPLES {
                 manifest.push_str(&format!("{rotated_digest}  {triple}.tar.gz\n"));
+                catalog.push_str(&format!("extension net 0.0.23 {triple} {rotated_digest}\n"));
             }
             stub.manifest = manifest;
+            stub.catalog = catalog;
         }
         let mut out = Vec::new();
         let mut input = std::io::BufReader::new(&b""[..]);
@@ -4444,12 +4685,10 @@ mod tests {
 
     #[test]
     fn install_single_digest_only_takes_confirm_path() {
-        // Registry half absent today: dual never verifies, consent is Confirm.
+        // Single-source-only never verifies; unsigned 0.1.0 stays Confirm.
         let digest = "f".repeat(64);
         assert!(!crate::component_seed::is_dual_digest_verified(
-            crate::component_seed::registry_digest_for("net", "0.0.23").as_deref(),
-            &digest,
-            &digest
+            None, &digest, &digest
         ));
         assert_eq!(
             crate::component_seed::installer_consent_level(true, false),
@@ -4459,31 +4698,6 @@ mod tests {
             crate::component_seed::installer_consent_level(false, false),
             crate::component_seed::InstallerConsentLevel::Confirm
         );
-    }
-
-    #[test]
-    fn registry_check_enforces_some_path() {
-        // None (index absent today) is a no-op.
-        assert!(check_registry_digest(None, &"a".repeat(64)).is_ok());
-        // Matching registry digests pass (lower and upper).
-        let digest = "b".repeat(64);
-        assert!(check_registry_digest(Some(&digest), &digest).is_ok());
-        assert!(check_registry_digest(Some(&digest.to_ascii_uppercase()), &digest).is_ok());
-        // Mismatching or malformed registry values fail closed (exit 4).
-        let other = "c".repeat(64);
-        let error =
-            check_registry_digest(Some(&other), &digest).expect_err("registry mismatch must fail");
-        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
-        assert!(
-            error.message.contains("registry digest"),
-            "{}",
-            error.message
-        );
-        for malformed in ["abc".to_string(), "g".repeat(64), "a".repeat(63)] {
-            let error = check_registry_digest(Some(&malformed), &digest)
-                .expect_err("malformed registry must fail");
-            assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
-        }
     }
 
     #[test]

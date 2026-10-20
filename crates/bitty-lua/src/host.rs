@@ -3093,11 +3093,22 @@ impl BridgeState {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        let out = f(expiry)?;
-        if mark.read().charged > deadline {
+        // No host-call credit here: this guard also wraps `commands.invoke`
+        // and `services.*` method dispatch, which execute callee/provider Lua
+        // through `vm.call_function`. Crediting it would credit Lua execution
+        // and let a caller loop sub-deadline dispatches to accumulate credit
+        // (bitty #2285 review). Only supervised `process.spawn` waits are
+        // credited, in `bounded_spawn`.
+        //
+        // The cheap-call deadline is measured in raw time minus store commit
+        // credit only, so an enclosing host-call credit can never relax it.
+        let out = f(expiry);
+        let reading = mark.read();
+        let charged = reading.raw.saturating_sub(reading.credit);
+        if charged > deadline {
             return Err(BridgeError::timeout());
         }
-        Ok(out)
+        out
     }
 
     /// [`Self::bounded_mutation`] for the plugin store write
@@ -3181,7 +3192,14 @@ impl BridgeState {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        let out = f(expiry)?;
+        // A supervised spawn carries its own deadline; the wait for the child
+        // is host time, not Lua work, so it is credited against the enclosing
+        // callback's RC-1 wall budget (bitty #2285) instead of suspending a
+        // plugin for time the host spent outside the VM.
+        let window = crate::HostCallWindow::at(start);
+        let out = f(expiry);
+        window.close();
+        let out = out?;
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }

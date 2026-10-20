@@ -31,6 +31,7 @@
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
+//! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
@@ -132,7 +133,10 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 ///   clone, RC-11 quota checks, and JSON encoding are plugin-driven CPU and
 ///   stay charged. In-memory stores (no persistence path) perform no commit
 ///   I/O and receive no credit. Refused or failed writes receive no credit.
-///   Every other host call is charged in full.
+///   Supervised spawn waits are covered separately by
+///   [`HOST_CALL_CREDIT_MAX_MS`]; service/snapshot/filesystem reads are not
+///   credited, and their own deadlines are checked in raw time and are not
+///   relaxed by either credit.
 /// - Scope: the credit applies uniformly to every callback on the thread
 ///   that is running while the commit happens: the writing VM's own callback
 ///   and every VM whose callback waits on it through a cross-VM service call
@@ -153,6 +157,59 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 ///   A write that never returns blocks the owning thread; the synchronous
 ///   commit contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
+
+/// RC-1 host-call I/O credit cap (`5 s` = the bridge's supervised-call
+/// deadline, [`crate::host::SPAWN_TIMEOUT_MS`]).
+///
+/// A supervised `process.spawn` call is host work, not Lua work: the time a
+/// callback spends blocked waiting for the child must not consume the RC-1
+/// wall budget, so a bounded plugin command is not suspended for time the
+/// host spent outside the VM (bitty #2285; two real `git` invocations measured
+/// ~70 ms for a callback that used ~140k instructions). No other host call is
+/// covered — see "Credited" below.
+///
+/// The cap matches the deadline the bridge itself grants a supervised call. A
+/// smaller fixed cap (the first revision used `200 ms`) charged a callback for
+/// waits the bridge had legally allowed: on a loaded macOS runner two 35 ms
+/// spawns took ~300 ms, so 102 ms of forced wait became "charged Lua time"
+/// and would have suspended a plugin for something it did not do. The cap is a
+/// policy bound on *chaining*, not on one call — the call is already bounded
+/// by its own raw deadline, which the host enforces whether or not the credit
+/// covers it.
+///
+/// - Credited: wall time spent inside a supervised `process.spawn` call, minus
+///   any store commit I/O already credited for the same span (no double
+///   credit). **Nothing else is credited**: the generic read-only bridge guard
+///   also wraps `bitty.commands.invoke` and `bitty.services.*` dispatch, and
+///   those execute callee/provider Lua, so crediting them would credit Lua
+///   execution and let a caller loop sub-deadline dispatches to accumulate
+///   credit. Snapshot reads, filesystem reads, and every other cheap call stay
+///   charged (they are bounded by the 50 ms cheap-call deadline). The
+///   cheap-call deadline and the spawn deadline are unaffected: they are
+///   checked in raw time by the bridge, and a call that misses its own
+///   deadline still fails closed as before.
+/// - Scope: per callback, cumulative across every supervised `process.spawn`
+///   wait made while that callback runs, capped at this value. Spawn-wait time
+///   past the cap is charged like any other time, so a callback whose spawn
+///   waits exceed the supervised budget (including one that raised its spawn
+///   deadline above it) suspends fail-closed at the next slice boundary.
+/// - Not credited: Lua execution, chunk compilation, marshalling outside the
+///   call, and any time the host does not spend inside the bridge call.
+/// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
+///
+/// This credit composes with [`STORE_COMMIT_CREDIT_MAX_MS`] because they cover
+/// disjoint spans (store commit time is subtracted from the spawn-wait
+/// window). The budget values are unchanged; the credit caps are per-callback
+/// **credit bounds, not a proven hard wall ceiling**: the wall limit is
+/// checked at slice boundaries, and a callback that completes without
+/// crossing one is not suspended (completion-point enforcement is tracked in
+/// bitty#2314). The credit bound is the sum
+/// `RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS +
+/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 ms), and every credited span must
+/// be measured by the host, never chosen by the plugin. The policy is
+/// documented in the isolation RFC (RC-1 row and
+/// `R-RC1-HOST-CALL-CREDIT`, bitty-plugins-docs#169).
+pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
 
 /// RC-1 warning threshold (candidate): `8 ms` — sets `warning_triggered` but
 /// does not suspend.
@@ -216,6 +273,9 @@ thread_local! {
     /// service call runs the provider callback on the consumer's thread, so
     /// every nested callback observes the same ledger through its own mark.
     static STORE_COMMIT_CREDIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Total credited bounded host-call time on this thread (see
+    /// [`HOST_CALL_CREDIT_MAX_MS`]).
+    static HOST_CALL_CREDIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     /// Commit I/O reported inside the open `bitty.store.set` window, or
     /// `None` when no store write is in progress on this thread.
     static STORE_COMMIT_WINDOW: Cell<Option<Duration>> = const { Cell::new(None) };
@@ -280,6 +340,40 @@ fn store_commit_credit_total() -> Duration {
     STORE_COMMIT_CREDIT.with(Cell::get)
 }
 
+fn host_call_credit_total() -> Duration {
+    HOST_CALL_CREDIT.with(Cell::get)
+}
+
+/// One bounded host call on this thread, measured for the RC-1 host-call
+/// credit (see [`HOST_CALL_CREDIT_MAX_MS`]).
+///
+/// Opened immediately before the bridge invokes a host service and closed
+/// where the call returns (including on the error path). The recorded credit
+/// excludes any store commit I/O reported during the same span, so the two
+/// credits never double-count one interval.
+pub(crate) struct HostCallWindow {
+    started: Instant,
+    store_at_start: Duration,
+}
+
+impl HostCallWindow {
+    /// Start measuring a host call at `started` (the bridge's own call origin).
+    pub(crate) fn at(started: Instant) -> Self {
+        Self {
+            started,
+            store_at_start: store_commit_credit_total(),
+        }
+    }
+
+    /// Finish the measurement and credit the host-only part of the span.
+    pub(crate) fn close(self) {
+        let elapsed = self.started.elapsed();
+        let store_during = store_commit_credit_total().saturating_sub(self.store_at_start);
+        let credited = elapsed.saturating_sub(store_during);
+        HOST_CALL_CREDIT.with(|credit| credit.set(credit.get().saturating_add(credited)));
+    }
+}
+
 /// One RC-1 wall-clock reading (see [`STORE_COMMIT_CREDIT_MAX_MS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BudgetReading {
@@ -287,31 +381,43 @@ pub(crate) struct BudgetReading {
     pub(crate) raw: Duration,
     /// Store commit I/O credit applied, capped at the per-callback maximum.
     pub(crate) credit: Duration,
-    /// `raw - credit`: the time charged against the hard wall limit.
+    /// Bounded host-call time credit applied, capped at the per-callback
+    /// maximum and excluding time already covered by `credit`.
+    pub(crate) host_call_credit: Duration,
+    /// `raw - credit - host_call_credit`: the Lua execution time charged
+    /// against the hard wall limit.
     pub(crate) charged: Duration,
 }
 
 impl BudgetReading {
-    /// Pure reading from raw elapsed and accrued credit under `cap`.
-    fn new(raw: Duration, accrued: Duration, cap: Duration) -> Self {
-        let credit = accrued.min(cap).min(raw);
+    /// Pure reading from raw elapsed and the accrued credits under their caps.
+    fn new(raw: Duration, accrued: Duration, host_call_accrued: Duration) -> Self {
+        let credit = accrued
+            .min(Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS))
+            .min(raw);
+        let host_call_credit = host_call_accrued
+            .min(Duration::from_millis(HOST_CALL_CREDIT_MAX_MS))
+            .min(raw.saturating_sub(credit));
         Self {
             raw,
             credit,
-            charged: raw - credit,
+            host_call_credit,
+            charged: raw - credit - host_call_credit,
         }
     }
 }
 
 /// Origin of one RC-1 wall-clock measurement.
 ///
-/// Records the wall instant and the thread's store commit credit at the
-/// origin; [`BudgetMark::read`] reports raw time, the capped credit accrued
-/// since the origin, and the charged time used by the hard wall limit.
+/// Records the wall instant and the thread's store commit and host-call
+/// credits at the origin; [`BudgetMark::read`] reports raw time, the capped
+/// credits accrued since the origin, and the charged time used by the hard
+/// wall limit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BudgetMark {
     start: Instant,
     credit_at_start: Duration,
+    host_call_credit_at_start: Duration,
 }
 
 impl BudgetMark {
@@ -320,6 +426,7 @@ impl BudgetMark {
         Self {
             start: Instant::now(),
             credit_at_start: store_commit_credit_total(),
+            host_call_credit_at_start: host_call_credit_total(),
         }
     }
 
@@ -330,11 +437,10 @@ impl BudgetMark {
 
     /// Current reading since the origin.
     pub(crate) fn read(&self) -> BudgetReading {
-        let accrued = store_commit_credit_total().saturating_sub(self.credit_at_start);
         BudgetReading::new(
             self.start.elapsed(),
-            accrued,
-            Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS),
+            store_commit_credit_total().saturating_sub(self.credit_at_start),
+            host_call_credit_total().saturating_sub(self.host_call_credit_at_start),
         )
     }
 }
@@ -465,6 +571,9 @@ pub struct VmBudgetSnapshot {
     /// Store commit I/O credit (ms) applied to the RC-1 hard wall limit in
     /// the last execute, capped at [`STORE_COMMIT_CREDIT_MAX_MS`].
     pub store_commit_credit_ms: u64,
+    /// Bounded host-call time credit (ms) applied to the RC-1 hard wall limit
+    /// in the last execute, capped at [`HOST_CALL_CREDIT_MAX_MS`].
+    pub host_call_credit_ms: u64,
     /// Memory used (total_allocation).
     pub memory_used: usize,
     /// Whether warning threshold was triggered.
@@ -546,6 +655,7 @@ pub struct LuaVm {
     instructions_used: u64,
     wall_elapsed_ms: u64,
     store_commit_credit_ms: u64,
+    host_call_credit_ms: u64,
     memory_used: usize,
     warning_triggered: bool,
     warning_count: u64,
@@ -679,6 +789,7 @@ impl LuaVm {
             instructions_used: 0,
             wall_elapsed_ms: 0,
             store_commit_credit_ms: 0,
+            host_call_credit_ms: 0,
             memory_used: 0,
             warning_triggered: false,
             warning_count: 0,
@@ -806,6 +917,13 @@ impl LuaVm {
         self.store_commit_credit_ms
     }
 
+    /// Bounded host-call time credit (ms) applied to the RC-1 hard wall limit
+    /// by the last execution (see [`HOST_CALL_CREDIT_MAX_MS`]).
+    #[must_use]
+    pub fn host_call_credit_ms(&self) -> u64 {
+        self.host_call_credit_ms
+    }
+
     /// Memory used (total_allocation) after last execution.
     #[must_use]
     pub fn memory_used(&self) -> usize {
@@ -878,6 +996,7 @@ impl LuaVm {
         self.instructions_used = 0;
         self.wall_elapsed_ms = 0;
         self.store_commit_credit_ms = 0;
+        self.host_call_credit_ms = 0;
     }
 
     /// Replace budgets (for tuning without recreation).
@@ -962,6 +1081,7 @@ impl LuaVm {
             instructions_used: self.instructions_used,
             wall_elapsed_ms: self.wall_elapsed_ms,
             store_commit_credit_ms: self.store_commit_credit_ms,
+            host_call_credit_ms: self.host_call_credit_ms,
             memory_used: self.memory_used,
             warning_triggered: self.warning_triggered,
             suspended,
@@ -1050,6 +1170,7 @@ impl LuaVm {
             self.instructions_used = 0;
             self.wall_elapsed_ms = elapsed_ms;
             self.store_commit_credit_ms = duration_ms(reading.credit);
+            self.host_call_credit_ms = duration_ms(reading.host_call_credit);
             self.memory_used = self.lua.total_memory();
             if elapsed_ms >= self.warning_ms {
                 self.warning_triggered = true;
@@ -1139,6 +1260,8 @@ impl LuaVm {
         stashed: StashedExecutor,
         start: BudgetMark,
     ) -> Result<DriveOutcome, VmError> {
+        // Re-based when a parked host operation is cancelled (see below).
+        let mut start = start;
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
@@ -1150,6 +1273,7 @@ impl LuaVm {
         self.instructions_used = 0;
         self.wall_elapsed_ms = 0;
         self.store_commit_credit_ms = 0;
+        self.host_call_credit_ms = 0;
         self.memory_used = self.lua.total_memory();
 
         // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
@@ -1196,6 +1320,7 @@ impl LuaVm {
             let charged_ms = duration_ms(reading.charged);
             self.wall_elapsed_ms = elapsed_ms;
             self.store_commit_credit_ms = duration_ms(reading.credit);
+            self.host_call_credit_ms = duration_ms(reading.host_call_credit);
 
             // Warning threshold — counted, not suspending.
             if elapsed_ms >= self.warning_ms && !self.warning_triggered {
@@ -1203,8 +1328,9 @@ impl LuaVm {
                 self.warning_count = self.warning_count.wrapping_add(1);
             }
 
-            // Wall hard limit on charged time (raw minus capped store commit
-            // I/O credit); the reason reports the charged time it compares.
+            // Wall hard limit on charged time (raw minus the capped store
+            // commit and supervised spawn-wait credits); the reason reports
+            // the charged time it compares.
             if charged_ms >= self.wall_budget_ms {
                 let reason = SuspendReason::WallClockExceeded {
                     elapsed_ms: charged_ms,
@@ -1301,9 +1427,22 @@ impl LuaVm {
             if done {
                 // A parked host operation reports done without being
                 // finished: route it through the host trampoline and keep
-                // stepping instead of completing. Wall-clock policy stays
-                // host-side — the loop-top checks still bound the resume.
+                // stepping instead of completing.
+                //
+                // A park is host-side state, not plugin wall time, and Bitty
+                // registers no host futures, so every park is cancelled
+                // fail-closed. Cancellation must win deterministically: on a
+                // loaded runner the thread can be descheduled around the park
+                // and the next loop-top wall check would suspend the callback
+                // for scheduler delay before the cancellation unwinds through
+                // `pcall` (measured: 43 instructions, 58 ms elapsed). Restart
+                // the wall window at cancellation so the unwind and any work
+                // after it get a fresh budget; running Lua is still bounded by
+                // the unchanged wall and instruction limits. Lua cannot
+                // trigger this path (host-op sequences are Rust-only), so it
+                // is not a plugin-reachable credit.
                 if self.pump_host_suspended(&stashed)? {
+                    start = BudgetMark::now();
                     continue;
                 }
                 // Step reports the executor finished (Result/Stopped/yielded).
@@ -1343,6 +1482,7 @@ impl LuaVm {
         let reading = start.read();
         self.wall_elapsed_ms = duration_ms(reading.raw);
         self.store_commit_credit_ms = duration_ms(reading.credit);
+        self.host_call_credit_ms = duration_ms(reading.host_call_credit);
         self.memory_used = self.lua.total_memory();
 
         // Final wall warning check (if warning threshold hit during successful run).
@@ -1540,20 +1680,89 @@ mod vm_unit_tests {
         let cap = Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS);
         let ms = Duration::from_millis;
         // Fully credited commit I/O: nothing charged, raw preserved.
-        let full = BudgetReading::new(ms(60), ms(60), cap);
+        let full = BudgetReading::new(ms(60), ms(60), Duration::ZERO);
         assert_eq!(
             (full.raw, full.credit, full.charged),
             (ms(60), ms(60), ms(0))
         );
         // No credit: everything charged.
-        let none = BudgetReading::new(ms(60), Duration::ZERO, cap);
+        let none = BudgetReading::new(ms(60), Duration::ZERO, Duration::ZERO);
         assert_eq!(none.charged, ms(60));
         // Credit past the cap: the excess is charged.
-        let over = BudgetReading::new(cap + ms(80), cap + ms(80), cap);
+        let over = BudgetReading::new(cap + ms(80), cap + ms(80), Duration::ZERO);
         assert_eq!((over.credit, over.charged), (cap, ms(80)));
         // Credit never exceeds raw time.
-        let bounded = BudgetReading::new(ms(5), ms(9), cap);
+        let bounded = BudgetReading::new(ms(5), ms(9), Duration::ZERO);
         assert_eq!((bounded.credit, bounded.charged), (ms(5), ms(0)));
+    }
+
+    #[test]
+    fn budget_reading_credits_host_call_time_under_its_own_cap() {
+        let ms = Duration::from_millis;
+        // Two real spawn waits inside one callback: nothing charged.
+        let two_spawns = BudgetReading::new(ms(70), Duration::ZERO, ms(70));
+        assert_eq!(
+            (
+                two_spawns.host_call_credit,
+                two_spawns.charged,
+                two_spawns.raw
+            ),
+            (ms(70), ms(0), ms(70))
+        );
+        // A bounded spawn wait longer than the old fixed 200 ms cap is fully
+        // credited: the cap now matches the supervised-call deadline.
+        let slow_wait = BudgetReading::new(ms(300), Duration::ZERO, ms(300));
+        assert_eq!(
+            (slow_wait.host_call_credit, slow_wait.charged),
+            (ms(300), ms(0))
+        );
+        // Host time past the cap is charged like any other time.
+        let cap = Duration::from_millis(HOST_CALL_CREDIT_MAX_MS);
+        let over = BudgetReading::new(cap + ms(80), Duration::ZERO, cap + ms(80));
+        assert_eq!((over.host_call_credit, over.charged), (cap, ms(80)));
+        // Both credits compose without double counting or exceeding raw.
+        let both = BudgetReading::new(ms(100), ms(30), ms(90));
+        assert_eq!(
+            (both.credit, both.host_call_credit, both.charged),
+            (ms(30), ms(70), ms(0))
+        );
+    }
+
+    #[test]
+    fn host_call_window_credits_wall_time_except_store_commit() {
+        let ms = Duration::from_millis;
+        // A blocking host call is credited.
+        let before = host_call_credit_total();
+        let window = HostCallWindow::at(Instant::now());
+        std::thread::sleep(ms(5));
+        window.close();
+        assert!(
+            host_call_credit_total() >= before + ms(5),
+            "host call time must be credited"
+        );
+
+        // Store commit I/O reported inside the same span is not credited a
+        // second time. The reported duration is deliberately larger than the
+        // span so the assertion is exact and independent of sleep overshoot
+        // (macOS runners can oversleep by several milliseconds).
+        let host_before = host_call_credit_total();
+        let store_before = store_commit_credit_total();
+        let window = HostCallWindow::at(Instant::now());
+        let store = StoreCommitWindow::open();
+        std::thread::sleep(ms(1));
+        record_store_commit_io(ms(1_000));
+        store.close(true, ms(1_000));
+        window.close();
+        assert_eq!(
+            store_commit_credit_total(),
+            store_before + ms(1_000),
+            "store commit I/O must be credited once"
+        );
+        assert_eq!(
+            host_call_credit_total(),
+            host_before,
+            "store commit I/O must not be credited twice"
+        );
     }
 
     #[test]
@@ -1797,6 +2006,40 @@ mod vm_unit_tests {
         assert!(
             matches!(outcome, ExecuteOutcome::Completed { .. }),
             "cancelled park must unwind through pcall, got {outcome:?}"
+        );
+        assert!(!vm.is_suspended());
+        assert_eq!(vm.suspension_count(), 0);
+    }
+
+    #[test]
+    fn park_cancelled_after_the_wall_budget_still_unwinds() {
+        // A runner can deschedule the thread around a park: the callback then
+        // resumes with only a few dozen instructions executed but more than the
+        // 50 ms wall budget elapsed. Cancellation is host-side and must win
+        // over that wall check, otherwise the callback suspends for scheduler
+        // delay instead of unwinding through `pcall` (CI failure at 43
+        // instructions / 58 ms, bitty#2285).
+        let mut vm = LuaVm::new("xuepoo.trampoline-slow");
+        vm.lua.enter(|ctx| {
+            let park = phodopus::Callback::from_fn(&ctx, |ctx, _, _| {
+                // Model the deschedule inside the slice that parks.
+                std::thread::sleep(std::time::Duration::from_millis(
+                    RC1_WALL_CLOCK_BUDGET_MS + 10,
+                ));
+                let sequence = phodopus::async_sequence(&ctx, |_, mut seq| async move {
+                    seq.suspend(phodopus::HostOpHandle::from_raw(1)).await?;
+                    Ok(phodopus::SequenceReturn::Return)
+                });
+                Ok(phodopus::CallbackReturn::Sequence(sequence))
+            });
+            ctx.set_global("park_once", park);
+        });
+        let outcome = vm
+            .execute("local ok, err = pcall(park_once) assert(ok == false) assert(err ~= nil)")
+            .unwrap();
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "a cancelled park must unwind through pcall even past the wall budget, got {outcome:?}"
         );
         assert!(!vm.is_suspended());
         assert_eq!(vm.suspension_count(), 0);

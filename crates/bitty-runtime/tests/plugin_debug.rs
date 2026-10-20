@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
@@ -46,8 +46,19 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Wall-clock headroom for this fixture's plugin callbacks.
+///
+/// Debug introspection marshals host tables inside one RC-1 wall window, and
+/// these assertions measure the debug surface, not runner speed: under Xvfb
+/// load the inspector's `plugins` callback measured 67 ms. Only the wall
+/// dimension is widened; instruction and memory stay at RC defaults, so the
+/// fixture still runs under production-adjacent budgets. Production never
+/// sets this (same treatment as `command_invoke.rs` / `plugin_ui.rs`,
+/// bitty#1727/bitty#1744/bitty#2259).
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
+
 fn runtime(root: PathBuf) -> PluginRuntime {
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: None,
         store_root: None,
@@ -55,7 +66,9 @@ fn runtime(root: PathBuf) -> PluginRuntime {
         third_party_roots: vec![root],
         settings: Rc::new(MapSettings::default()),
         snapshot: Rc::new(NoSnapshot),
-    })
+    });
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    rt
 }
 
 /// Write a plugin package under `root/<id>/` with the given capability

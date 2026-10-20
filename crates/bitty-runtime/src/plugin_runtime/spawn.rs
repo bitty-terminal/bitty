@@ -129,7 +129,9 @@
 //! # Bridge accounting (no orphan leak)
 //!
 //! The Lua bridge exempts `process.spawn` from its post-hoc cheap-call
-//! deadline (`BridgeState::bounded_spawn` keeps only the re-entrancy guard):
+//! deadline (`BridgeState::bounded_spawn` keeps the re-entrancy guard, enforces
+//! the spawn deadline in raw time, and credits the wait against the enclosing
+//! callback's RC-1 wall budget, capped per callback at the spawn deadline):
 //! a slow-but-successful spawn is delivered to its caller instead of being
 //! run to completion, stored, and then discarded as `E_TIMEOUT` — which
 //! would orphan a registry slot Lua can never reconcile (64 such orphans =

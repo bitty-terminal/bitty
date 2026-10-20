@@ -113,14 +113,15 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
     assert!(pack.status.success(), "pack failed: {pack:?}");
     let tarball_file = format!("{target}.tar.gz");
     let manifest = home.join("SHA256SUMS");
+    let tarball_digest =
+        bitty_package::integrity::sha256_hex(&std::fs::read(&tarball).expect("tarball"));
+    std::fs::write(&manifest, format!("{tarball_digest}  {tarball_file}\n")).expect("manifest");
+    let catalog = home.join("catalog.v1");
     std::fs::write(
-        &manifest,
-        format!(
-            "{}  {tarball_file}\n",
-            bitty_package::integrity::sha256_hex(&std::fs::read(&tarball).expect("tarball"))
-        ),
+        &catalog,
+        format!("schema 1\nextension net 0.0.23 {target} {tarball_digest}\n"),
     )
-    .expect("manifest");
+    .expect("catalog");
 
     // Fake `curl`: reports a new version for the preflight, dumps each
     // fetch child's environment, then serves the fixture bytes by URL.
@@ -144,6 +145,7 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
          done\n\
          { echo \"--- fetch $url\"; env | cut -d= -f1 | sort; echo '--- end'; } >> \"$FAKE_CURL_ENV_DUMP\"\n\
          case \"$url\" in\n\
+         \x20 */catalog.v1) cat \"$FAKE_CURL_CATALOG\" > \"$dest\" ;;\n\
          \x20 */SHA256SUMS) cat \"$FAKE_CURL_MANIFEST\" > \"$dest\" ;;\n\
          \x20 *) cat \"$FAKE_CURL_TARBALL\" > \"$dest\" ;;\n\
          esac\n",
@@ -185,6 +187,7 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
         .env("PATH", &path)
         .env("FAKE_CURL_MANIFEST", &manifest)
         .env("FAKE_CURL_TARBALL", &tarball)
+        .env("FAKE_CURL_CATALOG", &catalog)
         .env("FAKE_CURL_ENV_DUMP", &dump)
         .env("BITTY_CTX1112_GITHUB_TOKEN", "poison-token")
         .env("BITTY_CTX1112_AWS_SECRET_ACCESS_KEY", "poison-secret")
@@ -209,9 +212,9 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
         "0.0.23\n"
     );
 
-    // Dump audit: both fetches ran, no poisoned NAME reached either child,
-    // no secret VALUE appears anywhere (the dump holds names only), and
-    // proxy/canary inheritance stayed intact.
+    // Dump audit: every fetch ran (catalog, manifest, tarball), no poisoned
+    // NAME reached any child, no secret VALUE appears anywhere (the dump
+    // holds names only), and proxy/canary inheritance stayed intact.
     let dump_text = std::fs::read_to_string(&dump).expect("dump");
     assert!(
         dump_text.contains("--- fetch https://cdn.bitty.run/"),
@@ -251,6 +254,117 @@ fn fetch_env_hostile_secrets_scrubbed_and_fetch_still_works() {
     assert!(
         dump_text.lines().any(|line| line == "no_proxy"),
         "child env must inherit no_proxy: {dump_text}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Unix-only: a fake `curl` that exits `63` (`CURLE_FILESIZE_EXCEEDED`) on a
+/// fetch must map to the catalog `Oversize` refusal (exit `4`), not to the
+/// offline fallback. This exercises the real `SystemTransport::run_curl`
+/// status-code mapping; the unit tests inject `Oversize` directly.
+#[cfg(unix)]
+#[test]
+fn catalog_curl_filesize_exceeded_maps_to_oversize_without_fallback() {
+    if Command::new("tar").arg("--version").output().is_err() {
+        eprintln!("SKIP: tar not found (preflight precedes the catalog fetch)");
+        return;
+    }
+    if host_seed_triple().is_none() {
+        eprintln!("SKIP: host has no seed triple");
+        return;
+    }
+    let home = scratch_dir("catalog-oversize");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let fakebin = home.join("fakebin");
+    std::fs::create_dir_all(&fakebin).expect("fakebin");
+    let dump = home.join("curl.dump");
+    std::fs::write(
+        fakebin.join("curl"),
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+         \x20 echo 'curl 8.22.0 (x86_64-pc-linux-gnu) libcurl/8.22.0 OpenSSL/3.6.4'\n\
+         \x20 exit 0\n\
+         fi\n\
+         url=''\n\
+         prev=''\n\
+         max=''\n\
+         for arg in \"$@\"; do\n\
+         \x20 if [ \"$prev\" = '--max-filesize' ]; then max=\"$arg\"; fi\n\
+         \x20 prev=\"$arg\"\n\
+         \x20 url=\"$arg\"\n\
+         done\n\
+         if [ -n \"$max\" ]; then\n\
+         \x20 echo \"$url max=$max\" >> \"$FAKE_CURL_DUMP\"\n\
+         \x20 exit 63\n\
+         fi\n\
+         exit 1\n",
+    )
+    .expect("fake curl");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(fakebin.join("curl"), std::fs::Permissions::from_mode(0o755))
+            .expect("mode");
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = if old_path.is_empty() {
+        fakebin.display().to_string()
+    } else {
+        format!("{}:{old_path}", fakebin.display())
+    };
+
+    let output = Command::new(BITTY_BIN)
+        .args([
+            "extension",
+            "install",
+            "net",
+            "--version",
+            "0.0.23",
+            "--yes",
+        ])
+        .env("XDG_CONFIG_HOME", &home)
+        .env("XDG_DATA_HOME", &home)
+        .env("HOME", &home)
+        .env("BITTY_SYSTEM_COMPONENTS_DIR", &system)
+        .env("NO_COLOR", "1")
+        .env_remove("BITTY_CONFIG")
+        .env_remove("BITTY_COMPONENTS_DIR")
+        .env_remove("BITTY_PLUGIN_DIR")
+        .env("PATH", &path)
+        .env("FAKE_CURL_DUMP", &dump)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run bitty");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "filesize-exceeded must be an integrity refusal: {}",
+        stderr(&output)
+    );
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("fetched body exceeds"),
+        "diagnostic must name the bound: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("curl --max-filesize"),
+        "diagnostic must name the curl bound: {diagnostic}"
+    );
+    assert!(
+        !user_root(&home).join("net").exists(),
+        "oversize catalog must stage nothing"
+    );
+    let dump_text = std::fs::read_to_string(&dump).expect("dump");
+    assert!(
+        dump_text.contains("https://cdn.bitty.run/extensions/catalog.v1"),
+        "the oversize refusal must come from the catalog fetch: {dump_text}"
+    );
+    assert!(
+        dump_text.contains("max=262144"),
+        "the catalog fetch must carry the 256 KiB --max-filesize bound: {dump_text}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

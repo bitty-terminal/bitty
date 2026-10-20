@@ -250,6 +250,7 @@ mod logging;
 mod observability;
 mod plugin_runtime;
 mod prefix_dispatch;
+mod profile;
 mod storage_backends;
 mod version;
 

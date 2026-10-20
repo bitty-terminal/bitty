@@ -7964,18 +7964,31 @@ fn init_dispatch_yes_force_idempotent() {
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
-    let written = std::fs::read_to_string(&target).expect("written");
-    assert!(written.contains("shell = \"/bin/bash\""));
-    assert!(written.contains("theme = \"dark\""));
-    assert!(written.contains("close_confirm = \"when_busy\""));
+    let profile = dir.join("profiles").join("default.lua");
+    let written_profile = std::fs::read_to_string(&profile).expect("profile written");
+    assert!(written_profile.contains("shell = \"/bin/bash\""));
+    assert!(written_profile.contains("theme = \"dark\""));
+    assert!(written_profile.contains("close_confirm = \"when_busy\""));
+    let written_selector = std::fs::read_to_string(&target).expect("selector written");
+    assert!(written_selector.contains("format = \"bitty-profile-v1\""));
+    assert!(written_selector.contains("profile = \"default\""));
 
-    // Second --yes run refuses without --force (idempotent, exit 2).
+    // Second --yes run refuses without --force (idempotent, exit 2) and
+    // leaves both generated files byte-identical.
     assert_eq!(
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         2
     );
+    assert_eq!(
+        std::fs::read_to_string(&profile).expect("profile intact"),
+        written_profile
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("selector intact"),
+        written_selector
+    );
 
-    // --force overwrites with a backup, exit 0.
+    // --force overwrites with backups, exit 0.
     args.init_force = true;
     let sh_env = init_env(None, Some("/bin/sh"), None, Some(&home), false);
     assert_eq!(
@@ -7983,10 +7996,18 @@ fn init_dispatch_yes_force_idempotent() {
         0
     );
     let backup = target.with_extension("lua.bak");
-    assert_eq!(std::fs::read_to_string(&backup).expect("backup"), written);
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("selector backup"),
+        written_selector
+    );
+    let profile_backup = profile.with_extension("lua.bak");
+    assert_eq!(
+        std::fs::read_to_string(&profile_backup).expect("profile backup"),
+        written_profile
+    );
     assert!(
-        std::fs::read_to_string(&target)
-            .expect("rewritten")
+        std::fs::read_to_string(&profile)
+            .expect("rewritten profile")
             .contains("shell = \"/bin/sh\"")
     );
 
@@ -8041,8 +8062,14 @@ fn init_dispatch_xdg_and_bitty_config_paths() {
     );
     let xdg_target = xdg.join("bitty").join("init.lua");
     assert!(xdg_target.exists(), "XDG path honored");
-    let content = std::fs::read_to_string(&xdg_target).expect("xdg file");
+    let xdg_profile = xdg.join("bitty").join("profiles").join("default.lua");
+    let content = std::fs::read_to_string(&xdg_profile).expect("xdg profile");
     assert!(content.contains("scrollback"), "always writes scrollback");
+    assert!(
+        std::fs::read_to_string(&xdg_target)
+            .expect("xdg selector")
+            .contains("profile = \"default\"")
+    );
 
     // HOME fallback: <home>/.config/bitty/init.lua.
     let home = init_test_dir("home");
@@ -8052,7 +8079,13 @@ fn init_dispatch_xdg_and_bitty_config_paths() {
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
-    assert!(home.join(".config").join("bitty").join("init.lua").exists());
+    assert!(
+        home.join(".config")
+            .join("bitty")
+            .join("profiles")
+            .join("default.lua")
+            .exists()
+    );
 
     // BITTY_CONFIG wins over XDG; --config would win over both.
     let env_dir = init_test_dir("bittycfg");
@@ -8070,6 +8103,10 @@ fn init_dispatch_xdg_and_bitty_config_paths() {
         0
     );
     assert!(explicit.exists(), "BITTY_CONFIG honored");
+    assert!(
+        env_dir.join("profiles").join("default.lua").exists(),
+        "profile lives beside the explicit selector"
+    );
     assert!(!xdg.join("bitty").join("custom.lua").exists());
 
     // No XDG and no HOME: fail closed before any write.
@@ -8116,7 +8153,8 @@ fn init_dispatch_yes_value_flags_apply_and_fail_closed() {
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
-    let written = std::fs::read_to_string(&target).expect("written");
+    let written =
+        std::fs::read_to_string(dir.join("profiles").join("default.lua")).expect("written");
     assert!(written.contains("theme = \"tokyo-night\""));
     assert!(written.contains("family = \"Fira Code\", size = 14"));
     assert!(written.contains("decoration = { gaps_in = 2, gaps_out = 4, border = 1, radius = 0 }"));

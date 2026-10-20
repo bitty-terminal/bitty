@@ -24,6 +24,19 @@ use crate::types::{
 /// Current schema version is owned by [`crate::migration`].
 pub use crate::migration::CURRENT_SCHEMA_VERSION;
 
+/// Persisted profile selector read from a User-layer envelope (CTX-1404).
+///
+/// Selector metadata is activation state, not an effective configuration
+/// value: it is deliberately absent from [`crate::EffectiveConfig`]. The
+/// envelope is recognized only when `format` equals
+/// [`crate::file::PROFILE_SELECTOR_FORMAT`], so a legacy `init.lua` is never
+/// reinterpreted merely because it contains a `profile`-like key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSelector {
+    /// Selected profile name (already validated by `validate_profile_name`).
+    pub profile: String,
+}
+
 /// The declarative plan returned from a configuration module.
 ///
 /// Each field is `Option` because a single layer may declare only the
@@ -106,6 +119,9 @@ pub struct ConfigPlan {
     pub profile_name: Option<String>,
     /// Single-parent `extends` target; cycle detection is enforced.
     pub extends: Option<String>,
+    /// Persisted User-layer profile selector (CTX-1404). `None` means the
+    /// layer is a legacy plain configuration (no persisted activation).
+    pub selector: Option<ProfileSelector>,
     /// Undeclared / unknown fields captured for strict validation.
     ///
     /// The RFC requires that undeclared fields fail validation rather than
@@ -378,6 +394,7 @@ impl ConfigPlan {
             && self.plugins.is_none()
             && self.panel_rules.is_none()
             && self.extends.is_none()
+            && self.selector.is_none()
             && self.profile_name.is_none()
             && self.session.is_none()
     }

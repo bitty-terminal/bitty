@@ -1808,6 +1808,31 @@ pub struct AtlasUpload {
     pub data: Vec<u8>,
 }
 
+/// Identifies one cell-box block mask in the atlas namespace.
+///
+/// Block masks are cell geometry, not font glyphs: their coverage depends on
+/// the exact mask extent, so the atlas key carries `(scalar, width, height)`
+/// instead of the char-keyed [`RasterKey`] (which only distinguishes scalar,
+/// face, and point size). Two partial blocks of the same scalar at different
+/// cell sizes therefore never share a slot (issue #2317).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct BlockMaskKey {
+    character: char,
+    width: u32,
+    height: u32,
+}
+
+impl BlockMaskKey {
+    /// Builds the mask key from the block scalar and its pixel extent.
+    pub(crate) const fn new(character: char, width: u32, height: u32) -> Self {
+        Self {
+            character,
+            width,
+            height,
+        }
+    }
+}
+
 /// Shelf-packed glyph atlas plus its CPU-side coverage texture and upload
 /// queue.
 ///
@@ -1832,6 +1857,8 @@ pub struct GlyphAtlas {
     slots: HashMap<RasterKey, AtlasSlot>,
     /// Shaped-glyph placements by glyph-id key (Phase B ligature spans).
     shaped_slots: HashMap<crate::shaped::ShapedGlyphKey, AtlasSlot>,
+    /// Cell-box block-mask placements by `(scalar, width, height)` (#2317).
+    block_slots: HashMap<BlockMaskKey, AtlasSlot>,
     texels: Vec<u8>,
     pending: Vec<AtlasUpload>,
     /// Generation of the current placement set, bumped by every wholesale
@@ -1886,6 +1913,7 @@ impl GlyphAtlas {
             layout,
             slots: HashMap::new(),
             shaped_slots: HashMap::new(),
+            block_slots: HashMap::new(),
             texels: vec![0; len],
             pending: Vec::new(),
             epoch: 0,
@@ -1944,6 +1972,7 @@ impl GlyphAtlas {
         self.layout.reset();
         self.slots.clear();
         self.shaped_slots.clear();
+        self.block_slots.clear();
         self.texels.fill(0);
         self.pending.clear();
         self.epoch = self.epoch.wrapping_add(1);
@@ -1980,13 +2009,13 @@ impl GlyphAtlas {
     /// Number of placements currently held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slots.len() + self.shaped_slots.len()
+        self.slots.len() + self.shaped_slots.len() + self.block_slots.len()
     }
 
     /// True when no placement is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty() && self.shaped_slots.is_empty()
+        self.slots.is_empty() && self.shaped_slots.is_empty() && self.block_slots.is_empty()
     }
 
     /// Fraction of atlas texels covered by issued slots.
@@ -2075,7 +2104,12 @@ impl GlyphAtlas {
         // since we're only expanding the canvas, not changing existing slots).
         let old_stride = usize::from(current);
         let new_stride = usize::from(next);
-        for slot in self.slots.values().chain(self.shaped_slots.values()) {
+        for slot in self
+            .slots
+            .values()
+            .chain(self.shaped_slots.values())
+            .chain(self.block_slots.values())
+        {
             let slot_w = usize::from(slot.width);
             for row in 0..usize::from(slot.height) {
                 let Some(old_offset) = (usize::from(slot.y) + row)
@@ -2117,7 +2151,12 @@ impl GlyphAtlas {
 
         // Mark all slots for re-upload since the texture changed.
         self.pending.clear();
-        for slot in self.slots.values().chain(self.shaped_slots.values()) {
+        for slot in self
+            .slots
+            .values()
+            .chain(self.shaped_slots.values())
+            .chain(self.block_slots.values())
+        {
             let slot_w = usize::from(slot.width);
             let slot_h = usize::from(slot.height);
             let Some(slot_len) = slot_w.checked_mul(slot_h) else {
@@ -2236,6 +2275,60 @@ impl GlyphAtlas {
             return GlyphSource::Atlas { slot: *slot };
         }
         self.misses += 1;
+        match self.place_mask(metrics, coverage) {
+            GlyphSource::Atlas { slot } => {
+                self.slots.insert(key, slot);
+                GlyphSource::Atlas { slot }
+            }
+            other => other,
+        }
+    }
+
+    /// Returns the placed slot for one block mask and counts the atlas hit.
+    ///
+    /// Separate from [`Self::ensure_block_mask`] so the emitter can resolve
+    /// the cached mask without rebuilding or cloning its coverage bytes;
+    /// already-placed block slots therefore show up in
+    /// [`Self::hits`] like every other atlas lookup (issue #2317).
+    pub(crate) fn block_slot(&mut self, key: &BlockMaskKey) -> Option<AtlasSlot> {
+        let slot = self.block_slots.get(key).copied()?;
+        self.hits += 1;
+        Some(slot)
+    }
+
+    /// Places one cell-box block mask under its `(scalar, width, height)`
+    /// key (issue #2317).
+    ///
+    /// Same CTX-0531 discipline as [`Self::ensure_mask`], but the placement
+    /// lives in its own keyed namespace: block masks are cell geometry whose
+    /// coverage depends on the exact mask extent, so a scalar-only key would
+    /// hand a different cell size the previous mask's slot.
+    pub(crate) fn ensure_block_mask(
+        &mut self,
+        key: BlockMaskKey,
+        metrics: GlyphMetrics,
+        coverage: Vec<u8>,
+    ) -> GlyphSource {
+        if let Some(slot) = self.block_slots.get(&key) {
+            self.hits += 1;
+            return GlyphSource::Atlas { slot: *slot };
+        }
+        self.misses += 1;
+        match self.place_mask(metrics, coverage) {
+            GlyphSource::Atlas { slot } => {
+                self.block_slots.insert(key, slot);
+                GlyphSource::Atlas { slot }
+            }
+            other => other,
+        }
+    }
+
+    /// Places `coverage` at `metrics` dimensions and queues its upload.
+    ///
+    /// Shared placement body for char-keyed and block masks: sizing checks,
+    /// the CTX-1206 growth gate, exhaustion flag, texel write, and upload
+    /// queue. Hit/miss counters and the key map stay with the caller.
+    fn place_mask(&mut self, metrics: GlyphMetrics, coverage: Vec<u8>) -> GlyphSource {
         let width = u16::try_from(metrics.width.max(0));
         let height = u16::try_from(metrics.height.max(0));
         let (width, height) = match (width, height) {
@@ -2254,7 +2347,6 @@ impl GlyphAtlas {
             slot,
             data: coverage,
         });
-        self.slots.insert(key, slot);
         GlyphSource::Atlas { slot }
     }
 
@@ -2464,14 +2556,6 @@ pub struct GridRenderer<R: GlyphRasterizer> {
     cache: GlyphCache<R>,
     atlas: GlyphAtlas,
     font: FontId,
-    /// Reserved atlas namespace for cell-box block masks (issue #2307).
-    ///
-    /// Block elements are rasterized from Unicode geometry rather than the
-    /// font outline, so their atlas slots must never collide with a
-    /// font-rasterized slot for the same scalar (for example a block scalar
-    /// emitted by the overlay-text path). The renderer's real faces are
-    /// issued from zero upward, so the maximum handle stays free.
-    block_font: FontId,
     /// Cached cell-box masks keyed by `(scalar, width, height)`.
     ///
     /// One mask per distinct block scalar and cell size; every cell of that
@@ -2533,13 +2617,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             .ok()
             .flatten();
         let baseline_offset = resolve_baseline_offset(cell.height, measured);
-        let mut synthetic_font_counter = u64::MAX;
-        let block_font = FontId::next(&mut synthetic_font_counter);
         Ok(Self {
             cache,
             atlas: GlyphAtlas::new(dimension)?,
             font,
-            block_font,
             block_masks: HashMap::new(),
             point_size: query.point_size,
             cell,
@@ -3107,10 +3188,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         );
         let height = self.cell.height;
         let mask_key = (character, width, height);
-        let Ok(key) = RasterKey::new(character, self.block_font, self.point_size) else {
-            return false;
-        };
-        let source = match self.atlas.slot(&key) {
+        let key = BlockMaskKey::new(character, width, height);
+        let source = match self.atlas.block_slot(&key) {
             Some(slot) => GlyphSource::Atlas { slot },
             None => {
                 let mask = match self.block_masks.get(&mask_key) {
@@ -3131,7 +3210,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     height: i32::try_from(height).unwrap_or(i32::MAX),
                     advance: [i32::try_from(width).unwrap_or(i32::MAX), 0],
                 };
-                self.atlas.ensure_mask(key, metrics, mask)
+                self.atlas.ensure_block_mask(key, metrics, mask)
             }
         };
         let dest_x = col as i64 * i64::from(self.cell.width);

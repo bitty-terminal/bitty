@@ -3555,3 +3555,66 @@ fn block_tile_golden_frame_hash_matches() {
     let (frame, _) = render_scaled_blocks(&script, 2, 1);
     assert_eq!(fnv1a(&frame), 0xd86f_265d_11fc_1845);
 }
+
+#[test]
+fn block_atlas_slots_are_keyed_by_mask_dimensions() {
+    // Issue #2317: the block atlas namespace must distinguish masks by
+    // `(scalar, width, height)`. A character-only key would hand a partial
+    // block the slot of the previous cell size (reachable from any future
+    // cell-metric change that does not clear the atlas).
+    use super::{BlockMaskKey, GlyphAtlas};
+
+    let mut atlas = GlyphAtlas::new(256).unwrap();
+    let small = BlockMaskKey::new('\u{2588}', 8, 16);
+    let large = BlockMaskKey::new('\u{2588}', 16, 35);
+    let mask_metrics = |width: i32, height: i32| GlyphMetrics {
+        left: 0,
+        top: 0,
+        width,
+        height,
+        advance: [width, 0],
+    };
+    let small_source = atlas.ensure_block_mask(small, mask_metrics(8, 16), vec![0x40; 8 * 16]);
+    let large_source = atlas.ensure_block_mask(large, mask_metrics(16, 35), vec![0x80; 16 * 35]);
+    let (GlyphSource::Atlas { slot: small_slot }, GlyphSource::Atlas { slot: large_slot }) =
+        (small_source, large_source)
+    else {
+        panic!("both block masks must fit the atlas");
+    };
+    assert_ne!(
+        small_slot, large_slot,
+        "different mask dimensions must never share one slot"
+    );
+    assert_eq!((small_slot.width, small_slot.height), (8, 16));
+    assert_eq!((large_slot.width, large_slot.height), (16, 35));
+
+    // Both keys keep resolving to their own slot and count as atlas hits.
+    let hits_before = atlas.hits();
+    assert_eq!(atlas.block_slot(&small), Some(small_slot));
+    assert_eq!(atlas.block_slot(&large), Some(large_slot));
+    assert_eq!(atlas.hits(), hits_before + 2);
+}
+
+#[test]
+fn block_atlas_hits_are_counted_in_atlas_stats() {
+    // Issue #2317: `emit_block_glyph` used to bypass `ensure_mask`'s hit
+    // counter for already-placed masks, so renderer diagnostics reported
+    // zero block hits on every steady-state frame.
+    let mut grid = scaled_block_renderer();
+    let state = state_from(&[print('\u{2588}')]);
+    let damage = full_damage(&state);
+    let _ = grid.render(&state.snapshot(), &damage).unwrap();
+    let (hits_before, misses_before, _, _) = grid.atlas_stats();
+    assert_eq!(misses_before, 1, "first frame places the block mask");
+    let _ = grid.render(&state.snapshot(), &damage).unwrap();
+    let (hits_after, misses_after, _, _) = grid.atlas_stats();
+    assert_eq!(
+        misses_after, misses_before,
+        "second frame must not re-place"
+    );
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "second frame must count one block atlas hit"
+    );
+}

@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=e6a2c0c#e6a2c0c2d23fefebc61ca300c14f5017d0c2f83f"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-auth",
@@ -221,12 +221,12 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=e6a2c0c#e6a2c0c2d23fefebc61ca300c14f5017d0c2f83f"
 
 [[package]]
 name = "bitty-ipc-auth"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=e6a2c0c#e6a2c0c2d23fefebc61ca300c14f5017d0c2f83f"
 dependencies = [
  "bitty-ipc-api",
  "getrandom 0.4.3",
@@ -237,7 +237,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-core"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=e6a2c0c#e6a2c0c2d23fefebc61ca300c14f5017d0c2f83f"
 dependencies = [
  "bitty-ipc-api",
 ]
@@ -245,7 +245,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-devtools"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=aa7259d#aa7259d78e50d46e5362c341f2dfdd98b4db4ed6"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=e6a2c0c#e6a2c0c2d23fefebc61ca300c14f5017d0c2f83f"
 dependencies = [
  "base16ct",
  "bitty-ipc-api",
@@ -280,12 +280,12 @@ dependencies = [
 [[package]]
 name = "bitty-network-wire"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c69fe57#c69fe577e93e8ec5ef5f6a09ca49c0d733844428"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c8710e0#c8710e0c6f86a44a91398c121123d5b7e43ba3c1"
 
 [[package]]
 name = "bitty-observability-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-observability?rev=7b3bb74#7b3bb74e9b09014695210b3dfd4afb577f3f83a8"
+source = "git+https://github.com/bitty-terminal/bitty-observability?rev=f1d08f4#f1d08f4f3c2e95cd52e91796a73fb443657fa46d"
 
 [[package]]
 name = "bitty-package"
@@ -310,7 +310,7 @@ dependencies = [
 [[package]]
 name = "bitty-platform-services"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-platform-services?rev=3a8a7ed#3a8a7ed13e20be1ef0c2a8d3c2d35b471a670b99"
+source = "git+https://github.com/bitty-terminal/bitty-platform-services?rev=7c6b84b#7c6b84b795b02afde5f4507f3f5a25d8474bf8fe"
 
 [[package]]
 name = "bitty-plugin-host"
@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "bitty-storage"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-storage?rev=5e720b4#5e720b4c6932e7991577dacff629d1b618bec609"
+source = "git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177#7bf5177c668fb72ec683c7cb8270049f6400f204"
 
 [[package]]
 name = "bitty-term-state"
@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "bitty-url-detector"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=d211490#d211490efba42276244668bb029733dbbcc56cdd"
+source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=be035a0#be035a0612617ee88fbfbc24ff4c2fb079f9cd7b"
 
 [[package]]
 name = "bitty-vt"

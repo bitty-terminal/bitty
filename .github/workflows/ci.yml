@@ -381,6 +381,24 @@ jobs:
         if: always()
         run: ${SCCACHE_PATH} --show-stats
 
+  # CTX-1363 (#2255): extracted-extension pins move only in a dedicated task,
+  # so the table must show the distance from upstream main. Policy: a pin not
+  # reachable from upstream main fails; over-threshold drift (default 10
+  # commits) annotates a warning; an unreachable upstream (offline) skips
+  # with a clear message. The fixture test is hermetic and runs first.
+  pins:
+    name: Extension pin drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check extracted-extension pin drift
+        run: |
+          bash scripts/tests/check-extension-pins.test.sh
+          bash scripts/check-extension-pins.sh
+
   msrv:
     name: MSRV 1.85 check
     runs-on: ubuntu-24.04

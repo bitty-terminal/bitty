@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.25] - unreleased
+
+### Fixed
+
+- **Resumable RC-1 completion enforcement (CTX-1407, #2314):** app-dispatched
+  plugin commands that reach the 50 ms charged wall budget now park with their
+  executor, fuel, and cumulative clock intact and resume on later cold ticks
+  instead of being refused. The callback body is never restarted, so host
+  calls that already returned never run twice. Every callback is bounded at
+  completion by `RC1_CALLBACK_CEILING_MS` (50 + 200 + 5000 = 5250 ms): a
+  resumable command that exhausts it suspends instead of parking, and a
+  slice-only init/config/event/timer/nested-dispatch callback that completes
+  past it is suspended fail-closed with the documented `WallClockExceeded`
+  outcome. At most one invocation is parked per plugin; suspend, dispose, and
+  reload cancel the park and drop the executor, and input-path
+  `command:<owner:command>`, `toggle_palette`, and `open_composer` no longer
+  lose real commands such as `bar:audio-toggle` (68 ms) and `composer:open`
+  (212 ms).
+
 ## [0.0.24] - unreleased
 
 Prepared from `v0.0.23..origin/main` (audited through `60c3d544`). The owner

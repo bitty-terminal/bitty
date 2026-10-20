@@ -31,8 +31,9 @@ use std::time::Duration;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
-    BridgeError, ExecuteOutcome, HOST_CALL_CREDIT_MAX_MS, HostServices, LuaValue, LuaVm,
-    MarshallingLimits, ServiceRoute, SuspendReason,
+    BridgeError, ExecuteOutcome, HOST_CALL_CREDIT_MAX_MS, HostServices, InvocationOutcome,
+    LuaValue, LuaVm, MarshallingLimits, RC1_CALLBACK_CEILING_MS, ServiceRoute, SuspendReason,
+    VmError,
 };
 
 /// One real `git` invocation measured ~35 ms on the reporting host.
@@ -62,11 +63,13 @@ const GSUB_MIN_FUEL: u64 = 20_000;
 
 /// Host stub that blocks like a real tool spawn and a real callee/provider
 /// dispatch, and records every effect.
-#[derive(Default)]
 struct BlockingSpawn {
     waits: Cell<u32>,
     /// Time the spawn stub actually spent blocked, measured around each sleep.
     waited: Cell<Duration>,
+    /// Requested block time for each `process_spawn` call. Defaults to
+    /// [`SPAWN_WAIT_MS`]; the #2314 ceiling probe chains much longer waits.
+    spawn_delay_ms: u64,
     /// Delay injected into `commands.invoke` / `services.*` dispatch.
     dispatch_delay_ms: u64,
     dispatches: Cell<u32>,
@@ -74,6 +77,21 @@ struct BlockingSpawn {
     dispatch_waited: Cell<Duration>,
     snapshot_delay_ms: u64,
     store: RefCell<BTreeMap<String, LuaValue>>,
+}
+
+impl Default for BlockingSpawn {
+    fn default() -> Self {
+        Self {
+            waits: Cell::new(0),
+            waited: Cell::new(Duration::ZERO),
+            spawn_delay_ms: SPAWN_WAIT_MS,
+            dispatch_delay_ms: 0,
+            dispatches: Cell::new(0),
+            dispatch_waited: Cell::new(Duration::ZERO),
+            snapshot_delay_ms: 0,
+            store: RefCell::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl BlockingSpawn {
@@ -121,7 +139,7 @@ impl HostServices for BlockingSpawn {
     fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
         self.waits.set(self.waits.get() + 1);
         let started = std::time::Instant::now();
-        std::thread::sleep(Duration::from_millis(SPAWN_WAIT_MS));
+        std::thread::sleep(Duration::from_millis(self.spawn_delay_ms));
         self.waited.set(self.waited.get() + started.elapsed());
         let output = tool_output(&args.join(" "));
         Ok(LuaValue::table([
@@ -544,5 +562,230 @@ fn slow_cheap_host_call_still_fails_closed_with_timeout() {
         services.stored_str("code").as_deref(),
         Some("E_TIMEOUT"),
         "a slow cheap call must still time out"
+    );
+}
+
+/// One app-dispatched command parked at the RC-1 wall budget resumes without
+/// re-running its already-completed body (bitty #2314).
+#[test]
+fn slow_resumable_command_completes_exactly_once() {
+    let (mut vm, _services) = vm_with(BlockingSpawn {
+        snapshot_delay_ms: 10,
+        ..BlockingSpawn::default()
+    });
+    vm.execute(
+        r#"
+        local runs = 0
+        bitty.commands.register({
+          id = "slow",
+          title = "Slow command",
+          run = function(_args)
+            for _ = 1, 8 do
+              pcall(bitty.terminal.snapshot, { scope = "semantic" })
+            end
+            runs = runs + 1
+            return "done:" .. runs
+          end,
+        })
+        bitty.commands.register({
+          id = "runs",
+          title = "Read run count",
+          run = function(_args) return tostring(runs) end,
+        })
+        "#,
+    )
+    .expect("init");
+    let capture = vm.take_registrations();
+    let slow = capture.commands[0].run.clone();
+    let runs = capture.commands[1].run.clone();
+
+    match vm.call_function_resumable(&slow, &[]).expect("start") {
+        InvocationOutcome::Parked => {}
+        other => panic!("80 ms of charged work must park, got {other:?}"),
+    }
+    assert!(
+        vm.is_parked(),
+        "the VM must hold exactly one parked callback"
+    );
+    assert!(!vm.is_suspended(), "a park is not a fail-closed suspension");
+
+    let mut result = None;
+    for _ in 0..200 {
+        match vm.resume_parked_call().expect("resume") {
+            InvocationOutcome::Completed(value) => {
+                result = Some(value);
+                break;
+            }
+            InvocationOutcome::Parked => {}
+        }
+    }
+    match result {
+        Some(LuaValue::String(value)) => {
+            assert_eq!(value, "done:1", "the callback body must run exactly once");
+        }
+        other => panic!("resumed callback must complete with its result, got {other:?}"),
+    }
+    assert!(!vm.is_parked());
+    let count = vm.call_function(&runs, &[]).expect("read run count");
+    assert_eq!(
+        count,
+        LuaValue::String("1".to_string()),
+        "no duplicate side effect on resume"
+    );
+}
+
+/// Cancelling a park drops the executor and leaves the VM usable; the
+/// interrupted callback body must not continue (bitty #2314).
+#[test]
+fn cancelled_park_never_resumes_or_duplicates_effects() {
+    let (mut vm, _services) = vm_with(BlockingSpawn {
+        snapshot_delay_ms: 10,
+        ..BlockingSpawn::default()
+    });
+    vm.execute(
+        r#"
+        local runs = 0
+        bitty.commands.register({
+          id = "slow",
+          title = "Slow command",
+          run = function(_args)
+            for _ = 1, 20 do
+              pcall(bitty.terminal.snapshot, { scope = "semantic" })
+              local sum = 0
+              for j = 1, 500 do sum = sum + j end
+            end
+            runs = runs + 1
+            return runs
+          end,
+        })
+        bitty.commands.register({
+          id = "runs",
+          title = "Read run count",
+          run = function(_args) return tostring(runs) end,
+        })
+        "#,
+    )
+    .expect("init");
+    let capture = vm.take_registrations();
+    let slow = capture.commands[0].run.clone();
+    let runs = capture.commands[1].run.clone();
+
+    assert!(matches!(
+        vm.call_function_resumable(&slow, &[]).expect("start"),
+        InvocationOutcome::Parked
+    ));
+    assert!(vm.cancel_parked_call(), "the park must be present");
+    assert!(!vm.is_parked());
+    assert!(!vm.is_suspended());
+    assert!(
+        vm.resume_parked_call().is_err(),
+        "a cancelled park cannot be resumed"
+    );
+    let count = vm.call_function(&runs, &[]).expect("read run count");
+    assert_eq!(count, LuaValue::String("0".to_string()));
+}
+
+/// A callback that chains bounded supervised spawns past the 5250 ms envelope
+/// is refused with the documented `WallClockExceeded` suspension (bitty #2314).
+#[test]
+fn chained_spawns_past_the_callback_ceiling_are_refused() {
+    let (mut vm, services) = vm_with(BlockingSpawn {
+        spawn_delay_ms: 1_900,
+        ..BlockingSpawn::default()
+    });
+    vm.execute(
+        r#"
+        bitty.commands.register({
+          id = "chain",
+          title = "Chain spawns",
+          run = function(_args)
+            bitty.process.spawn({ "one" })
+            bitty.process.spawn({ "two" })
+            bitty.process.spawn({ "three" })
+            return "chain-done"
+          end,
+        })
+        "#,
+    )
+    .expect("init");
+    let capture = vm.take_registrations();
+    let chain = capture.commands[0].run.clone();
+
+    match vm.call_function_resumable(&chain, &[]) {
+        Err(VmError::Suspended {
+            reason:
+                SuspendReason::WallClockExceeded {
+                    elapsed_ms,
+                    budget_ms,
+                },
+        }) => {
+            assert!(
+                elapsed_ms >= RC1_CALLBACK_CEILING_MS,
+                "ceiling reason must report cumulative wall time, got {elapsed_ms} ms"
+            );
+            assert_eq!(
+                budget_ms, RC1_CALLBACK_CEILING_MS,
+                "the reason must name the callback ceiling"
+            );
+        }
+        other => panic!("chained spawns past the ceiling must be refused, got {other:?}"),
+    }
+    assert_eq!(services.waits.get(), 3, "the probe must exercise the chain");
+    assert!(
+        !vm.is_parked(),
+        "a ceiling breach is terminal, not resumable"
+    );
+    assert!(
+        vm.is_suspended(),
+        "the VM must stay suspended fail-closed after the ceiling"
+    );
+}
+
+/// The completion ceiling also covers slice-only callbacks (init/config/event/
+/// timer and synchronous nested dispatch), which cannot resume (bitty #2314
+/// F1). A callback that chains bounded spawns past 5250 ms raw must suspend at
+/// completion instead of reporting success.
+#[test]
+fn slice_only_callback_past_the_ceiling_suspends() {
+    let (mut vm, services) = vm_with(BlockingSpawn {
+        spawn_delay_ms: 1_900,
+        ..BlockingSpawn::default()
+    });
+    let outcome = vm
+        .execute(
+            r#"
+            bitty.process.spawn({ "one" })
+            bitty.process.spawn({ "two" })
+            bitty.process.spawn({ "three" })
+            bitty.store.set("chain", 1)
+            "#,
+        )
+        .expect("execute");
+    match outcome {
+        ExecuteOutcome::Suspended {
+            reason:
+                SuspendReason::WallClockExceeded {
+                    elapsed_ms,
+                    budget_ms,
+                },
+            ..
+        } => {
+            assert!(
+                elapsed_ms >= RC1_CALLBACK_CEILING_MS,
+                "slice-only ceiling must report cumulative wall time, got {elapsed_ms} ms"
+            );
+            assert_eq!(
+                budget_ms, RC1_CALLBACK_CEILING_MS,
+                "the reason must name the callback ceiling"
+            );
+        }
+        other => {
+            panic!("slice-only chained spawns past the ceiling must be refused, got {other:?}")
+        }
+    }
+    assert_eq!(services.waits.get(), 3, "the probe must exercise the chain");
+    assert!(
+        vm.is_suspended(),
+        "a slice-only ceiling breach is terminal fail-closed"
     );
 }

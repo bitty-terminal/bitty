@@ -34,15 +34,138 @@ mod input_vm_boundary {
     };
     use bitty_plugin_host::manifest::PluginId;
     use bitty_runtime::plugin_runtime::{
-        LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig, VmExecutionCountError,
+        BridgeError, LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+        VmExecutionCountError,
     };
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     const PLUGIN: &str = "bitty-featured.input-boundary";
     const BOUND_COLUMN: u16 = 1;
+    const SLOW_COLUMN: u16 = 10;
     const UNBOUND_COLUMN: u16 = 7;
     const WHEEL_NOTCH: f32 = 1.0;
     const EXTRA_SCROLLBACK_LINES: usize = 8;
+
+    /// Snapshot source that charges real host wall time without consuming the
+    /// Lua instruction budget: the slow-command regression needs >50 ms of
+    /// charged time that is not a busy loop (bitty #2314).
+    struct SlowSnapshot;
+
+    impl SnapshotSource for SlowSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    /// Minimal composer-owned app fixture for the bitty#2314 F2 composer arm.
+    struct ComposerFixture {
+        app: TerminalApp,
+        id: PluginId,
+        root: std::path::PathBuf,
+    }
+
+    impl ComposerFixture {
+        fn new(case: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("ctx2314-composer-{}-{case}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let plugin = root.join(crate::composer_owner::COMPOSER_PLUGIN_ID);
+            std::fs::create_dir_all(plugin.join("lua")).expect("composer module dir");
+            std::fs::write(
+                plugin.join("bitty-plugin.toml"),
+                format!(
+                    r#"[plugin]
+id = "{}"
+name = "Composer fixture"
+version = "0.0.1"
+description = "bitty#2314 slow composer open"
+[compat]
+plugin-api = "^1.0"
+[capabilities]
+ui.overlay.focus = true
+terminal.input.submit = true
+process.editor = true
+terminal.semantic-read = true
+[lazy]
+commands = ["{}:open", "{}:runs"]
+events = []
+"#,
+                    crate::composer_owner::COMPOSER_PLUGIN_ID,
+                    crate::composer_owner::COMPOSER_PLUGIN_ID,
+                    crate::composer_owner::COMPOSER_PLUGIN_ID,
+                ),
+            )
+            .expect("composer manifest");
+            std::fs::write(
+                plugin.join("lua/init.lua"),
+                r#"
+local runs = 0
+bitty.commands.register({ id = "open", title = "Open", run = function(_args)
+  for _ = 1, 8 do
+    pcall(bitty.terminal.snapshot, { scope = "semantic" })
+  end
+  runs = runs + 1
+  return "open:" .. runs
+end })
+bitty.commands.register({ id = "runs", title = "Runs", run = function(_args)
+  return tostring(runs)
+end })
+return {}
+"#,
+            )
+            .expect("composer init");
+            let mut plugins = PluginRuntime::new(PluginRuntimeConfig {
+                third_party_roots: vec![root.clone()],
+                snapshot: Rc::new(SlowSnapshot),
+                ..PluginRuntimeConfig::default()
+            });
+            let id = PluginId::new(crate::composer_owner::COMPOSER_PLUGIN_ID).expect("composer id");
+            plugins.discover();
+            let activation = plugins.activate(&id).expect("composer activation");
+            assert_eq!(activation.state, LifecycleState::Active);
+            let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("default keymaps");
+            let mut app = TerminalApp::with_theme(
+                Runtime::with_defaults().expect("headless runtime"),
+                bitty_config::theme::DEFAULT_THEME_NAME,
+                "composer",
+                maps,
+                SpawnSpec::default(),
+            )
+            .with_plugin_runtime(Some(plugins));
+            app.set_session_persistence(false);
+            Self { app, id, root }
+        }
+
+        fn parked(&self) -> usize {
+            self.app
+                .plugin_runtime
+                .as_ref()
+                .expect("plugins")
+                .parked_command_count()
+        }
+
+        fn pump_until_unparked(&mut self) -> usize {
+            for pumps in 1..=200 {
+                self.app.pump_cold_commands();
+                if self.parked() == 0 {
+                    return pumps;
+                }
+            }
+            panic!("composer park did not complete within 200 cold ticks");
+        }
+    }
+
+    impl Drop for ComposerFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     struct Fixture {
         app: TerminalApp,
@@ -74,6 +197,21 @@ mod input_vm_boundary {
             Self::build(case, maps)
         }
 
+        /// Same real keybinding path, targeting the slow command (bitty#2314
+        /// F2): a chord must park on the cold phase and resume on later ticks.
+        fn with_slow_command_keybinding(case: &str) -> Self {
+            let effective = bitty_config::EffectiveConfig {
+                keymaps: vec![bitty_config::KeymapEntry {
+                    chord: "ctrl+alt+y".to_string(),
+                    action: format!("command:{PLUGIN}:slow"),
+                    context: "global".to_string(),
+                }],
+                ..bitty_config::EffectiveConfig::default()
+            };
+            let maps = bitty_config::resolve_keymaps(&effective).expect("fixture keymap");
+            Self::build(case, maps)
+        }
+
         fn build(case: &str, maps: Vec<bitty_config::ResolvedKeymap>) -> Self {
             // Only fixture-owned files are touched. No user configuration,
             // startup path, native clipboard, window, watcher, or PTY exists.
@@ -93,8 +231,9 @@ description = "Finite application input boundary regression"
 plugin-api = "^1.0"
 [capabilities]
 ui.rich = true
+terminal.semantic-read = true
 [lazy]
-commands = ["{PLUGIN}:step", "{PLUGIN}:read"]
+commands = ["{PLUGIN}:step", "{PLUGIN}:read", "{PLUGIN}:slow"]
 events = []
 "#
                 ),
@@ -111,10 +250,19 @@ end })
 bitty.commands.register({ id = "read", title = "Read", run = function(args)
   return count
 end })
+bitty.commands.register({ id = "slow", title = "Slow", run = function(args)
+  for _ = 1, 8 do
+    pcall(bitty.terminal.snapshot, { scope = "semantic" })
+  end
+  count = count + 1
+  return "slow:" .. count
+end })
 bitty.ui.mount("bottom", { kind = "Row", children = {
   { kind = "Text", text = "bound", on_click = { command = "step" },
     on_scroll = { command = "step" } },
-  { kind = "Text", text = " free" }
+  { kind = "Text", text = " free" },
+  { kind = "Text", text = " slow", on_click = { command = "slow" },
+    on_scroll = { command = "slow" } }
 } })
 return {}
 "#,
@@ -122,6 +270,7 @@ return {}
             .expect("finite local fixture source");
             let mut plugins = PluginRuntime::new(PluginRuntimeConfig {
                 third_party_roots: vec![root.clone()],
+                snapshot: Rc::new(SlowSnapshot),
                 ..PluginRuntimeConfig::default()
             });
             let id = PluginId::new(PLUGIN).expect("fixture identity");
@@ -134,7 +283,7 @@ return {}
             assert!(discovery[0].1.is_ok(), "{discovery:?}");
             let activation = plugins.activate(&id).expect("fixture activation");
             assert_eq!(activation.state, LifecycleState::Active);
-            assert_eq!(activation.commands, 2);
+            assert_eq!(activation.commands, 3);
             assert_eq!(activation.events, 0);
             assert_eq!(plugins.ui_blocks().len(), 1, "real authorized mount");
             assert!(plugins.timer_deadline().is_none());
@@ -234,7 +383,14 @@ return {}
         /// Queues exactly one bound wheel admission through the real input
         /// callback, with the cursor on the mounted band's bound column.
         fn queue_bound_wheel(&mut self) {
-            self.cursor(BOUND_COLUMN);
+            let routed = self.queue_wheel_at(BOUND_COLUMN);
+            assert_eq!(routed, 1, "one admission queued");
+        }
+
+        /// Queues one wheel admission at `column` and returns the routing
+        /// delta. Input must not enter a VM.
+        fn queue_wheel_at(&mut self, column: u16) -> u64 {
+            self.cursor(column);
             let routed = self.app.runtime.band_host_stats().scrolls_routed;
             assert_eq!(
                 self.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
@@ -244,11 +400,25 @@ return {}
                 0,
                 "queueing must not enter the owning VM"
             );
-            assert_eq!(
-                self.app.runtime.band_host_stats().scrolls_routed,
-                routed + 1,
-                "one admission queued"
-            );
+            self.app.runtime.band_host_stats().scrolls_routed - routed
+        }
+
+        /// Pump cold ticks until no command remains parked (bitty#2314 F2).
+        fn pump_until_unparked(&mut self) -> usize {
+            for pumps in 1..=200 {
+                self.app.pump_cold_commands();
+                if self
+                    .app
+                    .plugin_runtime
+                    .as_ref()
+                    .expect("plugins")
+                    .parked_command_count()
+                    == 0
+                {
+                    return pumps;
+                }
+            }
+            panic!("parked command did not complete within 200 cold ticks");
         }
 
         fn cursor(&mut self, column: u16) {
@@ -471,6 +641,144 @@ return {}
         assert_eq!(fixture.entries(), before + 1, "still exactly one");
         assert_eq!(fixture.read_marker(), 1);
         println!("coldpump: input delta=0; cold pump delta=1 exactly once; marker=1");
+    }
+
+    #[test]
+    fn parked_command_resumes_on_a_later_cold_pump() {
+        // bitty #2314: an app-dispatched command that reaches the RC-1 wall
+        // budget parks instead of being refused. The next cold pump resumes
+        // the same executor and surfaces the result exactly once.
+        let mut fixture = Fixture::new("rc1park");
+        let before = fixture.entries();
+        let error = fixture
+            .app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugins")
+            .dispatch_command(&fixture.id, "slow", &[])
+            .expect_err("80 ms of charged work must park");
+        assert!(error.is_parked(), "expected a park, got {error:?}");
+        assert_eq!(
+            fixture
+                .app
+                .plugin_runtime
+                .as_ref()
+                .expect("plugins")
+                .parked_command_count(),
+            1
+        );
+        let mut completed = 0usize;
+        for _ in 0..200 {
+            completed = fixture.app.pump_cold_commands();
+            if completed > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            completed, 1,
+            "a later cold pump completes the parked command"
+        );
+        assert_eq!(
+            fixture.entries(),
+            before + 1,
+            "one dispatch, many resume windows"
+        );
+        assert_eq!(
+            fixture.app.pump_cold_commands(),
+            0,
+            "a completed command never replays"
+        );
+        assert_eq!(fixture.read_marker(), 1, "the body ran exactly once");
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.input-boundary:slow: slow:1"),
+            "the resumed result surfaces on the banner"
+        );
+    }
+
+    #[test]
+    fn slow_keybinding_command_parks_and_resumes_on_cold_pumps() {
+        // bitty#2314 F2: the real `command:<owner:command>` input path must
+        // park the slow callback and resume it on later cold ticks, exactly
+        // once, with its result surfaced after completion.
+        let mut fixture = Fixture::with_slow_command_keybinding("slow-keybinding");
+        let before = fixture.entries();
+        assert_eq!(
+            fixture.press_command_chord(),
+            0,
+            "keybinding input must not enter the owning VM"
+        );
+        assert_eq!(fixture.entries(), before, "no VM entry during input");
+        let pumps = fixture.pump_until_unparked();
+        assert!(pumps >= 2, "the slow command must span several cold ticks");
+        assert_eq!(fixture.entries(), before + 1, "one dispatch, no replay");
+        assert_eq!(fixture.read_marker(), 1, "the slow body ran exactly once");
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.input-boundary:slow: slow:1"),
+            "the resumed result surfaces exactly once"
+        );
+        assert_eq!(
+            fixture.app.pump_cold_commands(),
+            0,
+            "a completed command never replays"
+        );
+    }
+
+    #[test]
+    fn slow_band_scroll_parks_and_resumes_on_cold_pumps() {
+        // bitty#2314 F2: the real band scroll arm (bar-shaped host command)
+        // parks and resumes through the same cold phase.
+        let mut fixture = Fixture::new("slow-band");
+        assert_eq!(
+            fixture.queue_wheel_at(SLOW_COLUMN),
+            1,
+            "one admission queued"
+        );
+        let before = fixture.entries();
+        assert_eq!(fixture.entries(), before, "no VM entry during input");
+        let pumps = fixture.pump_until_unparked();
+        assert!(pumps >= 2, "the slow command must span several cold ticks");
+        assert_eq!(fixture.entries(), before + 1, "one dispatch, no replay");
+        assert_eq!(fixture.read_marker(), 1, "the slow body ran exactly once");
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.input-boundary:slow: slow:1"),
+            "the resumed band result surfaces exactly once"
+        );
+        assert_eq!(
+            fixture.app.pump_cold_commands(),
+            0,
+            "a completed band command never replays"
+        );
+    }
+
+    #[test]
+    fn slow_composer_open_parks_and_resumes_on_cold_pumps() {
+        // bitty#2314 F2: the 212 ms composer-shaped arm parks its `open`
+        // command and resumes on later cold ticks without losing the result.
+        let mut fixture = ComposerFixture::new("slow");
+        assert!(fixture.app.composer_plugin_owns());
+        // Route through the same cold queue the input intercept uses, so the
+        // dispatch tick and the resume ticks are both real cold phases.
+        fixture
+            .app
+            .enqueue_input_command(bitty_config::ChromeAction::OpenComposer);
+        let pumps = fixture.pump_until_unparked();
+        assert!(pumps >= 2, "composer open must span several cold ticks");
+        let runs = fixture
+            .app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugins")
+            .dispatch_command(&fixture.id, "runs", &[])
+            .expect("composer runs command");
+        assert_eq!(runs, LuaValue::String("1".to_string()));
+        assert_eq!(
+            fixture.app.runtime.notification_banner().as_deref(),
+            Some("bitty-terminal.composer:open: open:1"),
+            "the resumed composer result surfaces exactly once"
+        );
     }
 
     #[test]
@@ -9197,7 +9505,7 @@ fn hosted_grandchild_gone(pid: u32) -> bool {
             Ok(stat) => {
                 let state = stat.rsplit(')').next().unwrap_or("").trim_start();
                 if !state.starts_with('Z') {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
                 return true;
@@ -9236,7 +9544,7 @@ fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
@@ -9290,7 +9598,7 @@ fn reap_exited_primary_with_active_pane_closes_primary_pane() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
@@ -9335,7 +9643,7 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::AppExiting);
@@ -9383,7 +9691,7 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     assert_eq!(
@@ -9463,7 +9771,7 @@ fn reap_exited_shell_in_inactive_workspace_leaves_no_ghost_issue_2167() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(
         outcome,
@@ -9511,7 +9819,7 @@ fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(
         outcome,
@@ -9579,7 +9887,7 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     assert_eq!(
@@ -9632,7 +9940,7 @@ fn reap_until_change_2169(app: &mut TerminalApp, secs: u64) -> terminal_app::She
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     outcome
 }
@@ -9882,7 +10190,7 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
         if outcome != terminal_app::ShellExitOutcome::NoExit {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(
         outcome,
@@ -10187,7 +10495,7 @@ fn wait_for_pane_text_ctx1347(app: &mut TerminalApp, view: ViewId, needle: &str)
         if text.contains(needle) || std::time::Instant::now() >= deadline {
             return text;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

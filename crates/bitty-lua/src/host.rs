@@ -3316,6 +3316,12 @@ impl LuaVm {
         function: &StashedFunction,
         args: &[LuaValue],
     ) -> Result<LuaValue, VmError> {
+        if self.is_parked() {
+            return Err(VmError::Runtime(
+                "vm holds a parked invocation; resume or cancel it before other callbacks"
+                    .to_string(),
+            ));
+        }
         let limits = self.marshalling_limits;
         let stashed = self.lua.enter(|ctx| {
             let func: Function = ctx.fetch(function);

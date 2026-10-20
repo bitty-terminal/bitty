@@ -588,11 +588,31 @@ fn runaway_callee_is_contained_and_the_host_serves_on() {
     // load-sensitive assertions while still proving a real overrun is stopped
     // here rather than only during activation.
     let mut world = World::activate("budget-runaway");
+    // The command first parks at the RC-1 wall budget (bitty #2314); the cold
+    // pump keeps resuming it until the unchanged instruction budget gives the
+    // terminal fail-closed decision.
     let error = world
         .runtime
         .invoke_command("bitty-featured.devtools:runaway", &empty_args())
-        .expect_err("a runaway callee must be suspended");
-    let rendered = error.to_string();
+        .expect_err("a runaway callee must not complete");
+    let rendered = if error.is_parked() {
+        let mut terminal = None;
+        for _ in 0..200 {
+            let mut completions = world.runtime.pump_parked_commands();
+            if let Some(completion) = completions.pop() {
+                terminal = Some(completion.outcome);
+                break;
+            }
+        }
+        match terminal.expect("runaway must reach a terminal budget decision") {
+            Err(error) => error.to_string(),
+            Ok(value) => panic!("a runaway callee must never return {value:?}"),
+        }
+    } else {
+        // The instruction dimension can win before the first wall window ends;
+        // that terminal suspension is already the fail-closed decision.
+        error.to_string()
+    };
     assert!(
         rendered.contains("InstructionBudgetExceeded") || rendered.contains("WallClockExceeded"),
         "got {rendered}"

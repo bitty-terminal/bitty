@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bitty_lua::LuaValue;
-use bitty_plugin_host::{GrantRecord, PluginId, PluginState};
+use bitty_plugin_host::{CapabilityId, GrantRecord, PluginId, PluginState};
 use bitty_runtime::Runtime;
 use bitty_runtime::component::{ComponentHostError, ComponentWarnSink, executable_file_name};
 use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir};
@@ -36,6 +36,9 @@ const OUT_OF_GRANT_URL: &str = "http://api.example.com/v1/ping";
 const EGRESS_HOST: &str = "api.example.com";
 const EGRESS_PORT: u16 = 443;
 const CAPABILITY: &str = "network.connect:api.example.com:443";
+/// Second declared capability so a per-capability revocation leaves the grant
+/// record in place (the last capability revoke escalates to a plugin denial).
+const SECOND_CAPABILITY: &str = "terminal.semantic-read";
 const POLL_BUDGET: Duration = Duration::from_millis(10);
 const POLL_ATTEMPTS: usize = 400;
 const RELOAD_PLUGIN: &str = "acme.reload";
@@ -120,7 +123,7 @@ fn install_via_add(root: &Path, name: &str, executable: &Path, mode: &str) {
 
 /// One dev plugin whose Lua exposes `go` (queue a request) and `poll`.
 fn write_plugin(root: &Path, id: &str, lua: &str, capability: Option<&str>, egress: Option<&str>) {
-    write_versioned_plugin(root, id, "0.1.0", lua, capability, egress);
+    write_versioned_plugin(root, id, "0.1.0", lua, capability, &[], egress);
 }
 
 /// One plugin source at an explicit version, used by the reload regression.
@@ -130,13 +133,17 @@ fn write_versioned_plugin(
     version: &str,
     lua: &str,
     capability: Option<&str>,
+    extra_capabilities: &[&str],
     egress: Option<&str>,
 ) {
     let plugin = root.join(id);
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
-    let capabilities = capability
+    let mut capabilities = capability
         .map(|capability| format!("\"{capability}\" = true\n"))
         .unwrap_or_default();
+    for capability in extra_capabilities {
+        capabilities.push_str(&format!("\"{capability}\" = true\n"));
+    }
     let network = egress
         .map(|host| format!("\n[[network.egress]]\nhost = \"{host}\"\nports = [{EGRESS_PORT}]\n"))
         .unwrap_or_default();
@@ -535,6 +542,7 @@ fn reload_fixture(tag: &str) -> ReloadFixture {
         "0.1.0",
         &surface_lua(ECHO, URL, 5_000),
         Some(CAPABILITY),
+        &[SECOND_CAPABILITY],
         Some(EGRESS_HOST),
     );
     write_versioned_plugin(
@@ -543,6 +551,7 @@ fn reload_fixture(tag: &str) -> ReloadFixture {
         "0.2.0",
         &surface_lua(ECHO, RELOAD_V2_URL, 5_000),
         Some(CAPABILITY),
+        &[SECOND_CAPABILITY],
         Some(EGRESS_HOST),
     );
     install_approved(&store, &source_v1.join(RELOAD_PLUGIN));
@@ -752,6 +761,226 @@ fn explicit_denial_survives_reload_and_mirror_refresh() {
             .iter()
             .any(|warning| warning.contains("explicit policy-host denial")),
         "the refusal must be reported: {warnings:?}"
+    );
+}
+
+/// Leave the live generation `Registered` after a failed mirror activation.
+///
+/// Revoking the network capability keeps the second declared capability
+/// granted, so the grant record survives and this stays a per-capability
+/// denial rather than a plugin-level denial. The mirrored entry is dropped so
+/// the next mirror registers from scratch and reaches activation, which fails
+/// on the explicit denial.
+fn mirror_with_failed_activation(fixture: &mut ReloadFixture) {
+    let id = fixture.id.clone();
+    let network = CapabilityId::parse(CAPABILITY).expect("network capability");
+    let report = fixture
+        .runtime
+        .revoke_grant(&id, Some(&network))
+        .expect("revoke network capability");
+    assert!(
+        !report.fully_revoked,
+        "the fixture must keep a second granted capability"
+    );
+    fixture
+        .runtime
+        .plugin_host_mut()
+        .remove(&id)
+        .expect("drop the mirrored generation");
+    let mut warnings = Vec::new();
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            warnings.push(format!("{plugin}: {reason}"));
+        }),
+        0,
+        "activation must fail while the capability denial persists"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("failed activation keeps the registration")
+            .state,
+        PluginState::Registered,
+        "a failed activation leaves the generation Registered"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("explicitly denied capabilities")),
+        "the failed activation must be reported: {warnings:?}"
+    );
+}
+
+/// Follow-up to bitty#2311 / bitty#2318: a generation left `Registered` by a
+/// failed activation is retried on the next mirror once the explicit denial is
+/// cleared, and its component authority appears only with that activation.
+#[test]
+fn registered_generation_is_reactivated_after_grant_repair() {
+    let mut fixture = reload_fixture("registered-retry");
+    let id = fixture.id.clone();
+    let network = CapabilityId::parse(CAPABILITY).expect("network capability");
+    mirror_with_failed_activation(&mut fixture);
+
+    // Before the repair the request surface fails closed as not active.
+    match fixture
+        .runtime
+        .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+    {
+        Err(ComponentHostError::PluginNotActive { state, .. }) => {
+            assert_eq!(state, "Registered");
+        }
+        other => panic!("a Registered generation must fail closed, got {other:?}"),
+    }
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    assert_eq!(
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        "err:E_COMPONENT_NOT_ACTIVE",
+        "a request before the retried activation must fail closed"
+    );
+
+    // The denial is still present, so the mirror retry must not activate.
+    let mut warnings = Vec::new();
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            warnings.push(format!("{plugin}: {reason}"));
+        }),
+        0,
+        "the denial must prevent the retry from activating"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("denied retry keeps the registration")
+            .state,
+        PluginState::Registered
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("explicitly denied capabilities")),
+        "the denied retry must be reported: {warnings:?}"
+    );
+
+    // Explicit user action clears the denial; authority still requires the
+    // retried activation and does not appear with the clearance alone.
+    assert!(
+        fixture
+            .runtime
+            .plugin_host_mut()
+            .grants_mut()
+            .clear_cap_denial(&id, &network),
+        "the explicit denial must be present before it is cleared"
+    );
+    match fixture
+        .runtime
+        .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+    {
+        Err(ComponentHostError::PluginNotActive { .. }) => {}
+        other => panic!("grant must stay unavailable until activation is retried, got {other:?}"),
+    }
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        1,
+        "the repaired grant must reactivate the existing registration"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .expect("retried generation registered")
+            .state,
+        PluginState::Activated
+    );
+    assert!(
+        !fixture
+            .runtime
+            .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+            .expect("component grant available after the retry")
+            .is_offline(),
+        "the retried activation restores the granted network authority"
+    );
+
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    assert_eq!(
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        format!("ok:200:{URL}|grant:{EGRESS_HOST}:{EGRESS_PORT}"),
+        "the request is authorized only after the retried activation"
+    );
+
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        0,
+        "the retried generation is idempotent once Activated"
+    );
+}
+
+/// Negative follow-up to bitty#2311 / bitty#2318: a plugin-level denial must
+/// prevent the retry even when the manifest hash matches a `Registered`
+/// entry, and the denial marker must not be cleared by re-inserting a grant.
+#[test]
+fn explicit_denial_prevents_retrying_a_registered_activation() {
+    let mut fixture = reload_fixture("denied-retry");
+    let id = fixture.id.clone();
+    mirror_with_failed_activation(&mut fixture);
+    fixture
+        .runtime
+        .insert_grant(GrantRecord::denied(id.clone(), fixture.v1_hash.clone(), 11));
+
+    let mut warnings = Vec::new();
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            warnings.push(format!("{plugin}: {reason}"));
+        }),
+        0,
+        "an explicit denial must not be re-granted for a Registered generation"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("explicit policy-host denial")),
+        "the denied retry must be reported: {warnings:?}"
+    );
+    assert!(
+        fixture.runtime.plugin_host().registry().get(&id).is_none(),
+        "a denied Registered generation must lose its registration, not activate"
+    );
+    assert!(
+        fixture.runtime.plugin_host().grants().is_denied(&id),
+        "the plugin-level denial marker must survive the mirror"
+    );
+
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    assert_eq!(
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        "err:E_COMPONENT_CAPABILITY_DENIED",
+        "a denied generation must keep denying requests"
     );
 }
 

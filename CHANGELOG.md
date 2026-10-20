@@ -212,6 +212,15 @@ or a published artifact.
   leaves the live set (disposed or failed) loses its mirrored entry, so
   predecessor authority cannot outlive its generation. Included in the 0.0.24
   release.
+- **Retried mirror activation for `Registered` generations (CTX-1392,
+  #2318):** the policy-host mirror now treats an id as already mirrored only
+  when the manifest hash matches and the entry is `Activated`. A generation
+  whose first activation failed (for example on an explicit per-capability
+  denial) stays `Registered` and is re-granted and re-activated on the next
+  mirror once the denial is cleared; component requests remain refused as
+  `plugin_not_active` until then. Explicit plugin-level denials are still
+  checked before any re-grant, so a denied generation is removed rather than
+  revived, and disposed generations still lose their mirror.
 - **Copy keeps combining marks and joiners (CTX-1367, #2260, #2266):** text
   extraction pushed only `Cell::glyph` and dropped `Cell::zerowidth`, so a
   decomposed `é` (`e` + U+0301) copied as `e` and a ZWJ family emoji copied

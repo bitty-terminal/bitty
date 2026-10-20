@@ -575,6 +575,11 @@ pub fn parse_plugin_request(
             "bitty plugin: --force only applies to `config scaffold`".to_string(),
         ));
     }
+    if config_action == Some(ConfigAction::Scaffold) && format != PluginFormat::Table {
+        return Err(PluginParseError::Usage(
+            "bitty plugin: --format/--json only apply to `config show`".to_string(),
+        ));
+    }
 
     Ok(PluginRequest {
         verb,
@@ -5298,6 +5303,9 @@ mod tests {
         assert!(parse_error(&["config", "show", "xuepoo.hello", "--init"]).contains("conflicts"));
         assert!(parse_error(&["config", "show", "xuepoo.hello", "--force"]).contains("--force"));
         assert!(parse_error(&["list", "--init"]).contains("--init"));
+        assert!(
+            parse_error(&["config", "scaffold", "xuepoo.hello", "--json"]).contains("--format")
+        );
         assert!(parse_error(&["config"]).contains("needs a plugin id"));
         assert!(parse_error(&["config", "show"]).contains("needs a plugin id"));
     }

@@ -1686,12 +1686,6 @@ mod tests {
         assert_eq!(manifest.dependencies[0].req, ">=2.0");
         assert!(manifest.dependencies[0].prerelease);
         assert!(!manifest.dependencies[1].prerelease);
-        // The prerelease bit plumbs through to the resolver edge.
-        let edge = manifest.dependencies[0]
-            .as_package_edge()
-            .expect("plugin id converts to package id");
-        assert!(edge.prerelease);
-        assert_eq!(edge.version_req, ">=2.0");
     }
 
     #[test]

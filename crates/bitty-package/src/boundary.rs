@@ -48,9 +48,12 @@
 //! Classification of every current consumer of this crate. "Core-retained"
 //! means the consumer is on the read-only startup validation / runtime loading
 //! path; "External-manager" means the consumer is install-time mechanics that
-//! moves to `bitty-plugin-manager` once that replacement exists. Nothing is
-//! deleted by this audit; the install-time consumer stays until the external
-//! manager replaces it (`W-72` migration rule).
+//! moves to `bitty-plugin-manager` once that replacement exists. The draft
+//! dependency resolver was the one external-manager module with no retained
+//! Core consumer, and bitty#1999 retired it; every remaining install-time
+//! consumer stays until the external manager replaces it (`W-72` migration
+//! rule: install and verification behavior is not removed before the
+//! replacement boundary exists).
 //!
 //! | Consumer (path)                                              | Operation                              | Class            |
 //! | ------------------------------------------------------------ | -------------------------------------- | ---------------- |
@@ -61,7 +64,7 @@
 //! | `crates/bitty-package/src/requirement.rs`                    | Closed requirement grammar            | Core-retained    |
 //! | `crates/bitty-package/src/error.rs`                          | Owned error vocabulary                 | Core-retained    |
 //! | `crates/bitty-package/src/startup.rs`                        | Read-only startup re-verification      | Core-retained    |
-//! | `crates/bitty-package/src/resolver.rs`                       | Dependency resolution                  | External-manager |
+//! | `crates/bitty-package/src/resolver.rs` (retired, bitty#1999) | Dependency resolution                  | External-manager |
 //! | `crates/bitty-package/src/source.rs`                         | Source declarations / fetch framing    | External-manager |
 //! | `crates/bitty-package/src/lifecycle.rs`                      | Install state machine                  | External-manager |
 //! | `crates/bitty-package/src/activation.rs`                     | Transactional activation / rollback    | External-manager |
@@ -69,7 +72,7 @@
 //! | `crates/bitty-plugin-host/src/manifest.rs`                   | Host manifest / compat validation      | Core-retained    |
 //! | `crates/bitty-plugin-host/src/capability.rs`                 | Closed capability check                | Core-retained    |
 //! | `crates/bitty-plugin-host/src/install.rs`                    | Install-time verification pipeline     | External-manager |
-//! | `crates/bitty-plugin-host/src/registry.rs`                   | Resolver use in tests only             | External-manager |
+//! | `crates/bitty-plugin-host/src/registry.rs`                   | Runtime dependency-graph check (`resolve_all`); no version solving | Core-retained |
 //! | `crates/bitty-runtime/src/plugin_runtime/resolution.rs`      | Read-only installed-record load invoking the retained `startup::validate_staged_tree_generation` (`H-A` via the shared `source::canonical_tree_bytes` scheme, `H-B` + grants re-derived; live-dev drift stays `unverified` per RFC B.5) | Core-retained |
 //! | `crates/bitty-runtime/src/plugin_runtime/package.rs`         | Compat grammar                         | Core-retained    |
 //! | `crates/bitty-runtime/src/plugin_runtime/package.rs`         | Local install / uninstall / enable     | External-manager |
@@ -77,12 +80,21 @@
 //! | `crates/bitty-runtime/src/component/descriptor.rs`           | Native descriptor digest validation    | Core-retained    |
 //! | `crates/bitty-ui/src/provider.rs`                            | Doc reference to `layout.provider`     | none (no `use`)  |
 //!
+//! `bitty-package` no longer implements dependency or version solving: the
+//! draft `resolver` module was retired under bitty#1999. The
+//! [`PackageOperation::DependencyResolution`] operation still belongs to the
+//! external manager and has no Core implementation; the closed
+//! `version`/`requirement` grammar remains for manifest and compatibility
+//! validation. A named guard
+//! (`tests/distribution_boundary.rs::resolver_module_is_retired_from_core`)
+//! fails if the module or its public symbols reappear in Core.
+//!
 //! # Known blocker for removing install-time code
 //!
-//! The install-time consumer (`bitty-plugin-host::install`, the
-//! `bitty-package` resolver/activation/trust modules, and the
-//! `bitty-runtime` local install path) cannot be removed until
-//! `bitty-plugin-manager` exists. The read-only runtime load path digests the
+//! The remaining install-time consumer (`bitty-plugin-host::install`, the
+//! `bitty-package` activation/trust modules, and the `bitty-runtime` local
+//! install path) cannot be removed until `bitty-plugin-manager` replaces it
+//! (manager #11). The read-only runtime load path digests the
 //! staged Lua module tree; `H-A` is reconciled by sharing the single canonical
 //! tree scheme in [`crate::source::canonical_tree_bytes`], and
 //! `resolve_record` invokes the retained

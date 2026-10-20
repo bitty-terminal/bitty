@@ -1534,7 +1534,7 @@ pub fn service_version_satisfies(provided: &str, requirement: &str) -> bool {
 ///
 /// String form (`"owner.name" = ">=2.0"`) carries `prerelease = false`.
 /// Table form (`"owner.name" = { version = ">=2.0", prerelease = true }`)
-/// opts this edge into prerelease selection in the resolver.
+/// opts this edge into prerelease selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginDependency {
     /// Required plugin id.
@@ -1560,22 +1560,6 @@ impl PluginDependency {
     pub fn validate(&self) -> Result<(), PluginError> {
         validate_version_req(&self.req, "dependencies")?;
         Ok(())
-    }
-
-    /// Convert to a package-resolver edge, plumbing the manifest
-    /// prerelease bit through to the resolver's per-edge flag.
-    ///
-    /// Returns `None` when the plugin id is not a valid package id (the two
-    /// share the `owner.name` grammar; divergence fails closed here rather
-    /// than silently resolving a different package).
-    #[must_use]
-    pub fn as_package_edge(&self) -> Option<bitty_package::PackageDependency> {
-        let id = bitty_package::PackageId::new(self.id.as_str()).ok()?;
-        Some(bitty_package::PackageDependency::with_prerelease(
-            id,
-            self.req.clone(),
-            self.prerelease,
-        ))
     }
 }
 

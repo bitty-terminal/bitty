@@ -12,8 +12,9 @@ Bitty: owned manifest and lockfile types with digest binding, the staged
 lifecycle from discovery through activation to retention, the integrity
 verification chain applied identically to every source type, publisher trust
 options, atomic activation with rollback, and the closed constraint grammar
-with its deterministic resolver. The pipeline shape is documented in
-`src/lib.rs`.
+used by manifest and compatibility validation. Dependency resolution is
+manager-owned and no longer lives in Core (bitty#1999). The pipeline shape is
+documented in `src/lib.rs`.
 
 ## Status
 
@@ -51,8 +52,10 @@ caller's manifest canonical bytes), the pure read-only entry points Core uses
 to re-derive integrity, manifest binding, and the grant snapshot of an
 already-installed generation without fetching, installing, or mutating the
 store. `bitty-runtime` `resolve_record` invokes the staged-tree entry on its
-read-only load path. The install-time resolver, activation, and trust modules
-stay in place until `bitty-plugin-manager` replaces them.
+read-only load path. The install-time activation and trust modules stay in
+place until `bitty-plugin-manager` replaces them; Core's draft dependency
+resolver was retired under bitty#1999 because W-72 assigns resolution to the
+external manager and no Core path consumed it.
 
 ## Layout
 
@@ -63,8 +66,8 @@ stay in place until `bitty-plugin-manager` replaces them.
 - `src/integrity.rs` — integrity verification chain.
 - `src/trust.rs` — publisher trust options and re-approval.
 - `src/activation.rs` — atomic activation, retention, and rollback.
-- `src/version.rs`, `src/requirement.rs`, `src/resolver.rs` — constraint
-  grammar and deterministic resolution.
+- `src/version.rs`, `src/requirement.rs` — closed constraint grammar used by
+  manifest and compatibility validation.
 - `src/source.rs` — source declarations.
 - `src/error.rs` — owned error types.
 - `src/boundary.rs` — W-101 package-manager boundary audit (operation/consumer

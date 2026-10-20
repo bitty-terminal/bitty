@@ -1,4 +1,5 @@
-//! Strict SemVer version parsing and precedence for the resolver.
+//! Strict SemVer version parsing and precedence for manifest and compatibility
+//! validation.
 //!
 //! Versions are `X.Y.Z` with optional prerelease and build metadata.
 //! Build metadata is ignored for precedence. Prerelease precedence follows

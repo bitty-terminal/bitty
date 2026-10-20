@@ -187,6 +187,7 @@
 
 pub mod atlas;
 pub mod batch;
+mod block;
 pub mod cache;
 pub mod crossfont_backend;
 pub mod error;

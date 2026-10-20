@@ -1836,9 +1836,9 @@ fn renderer_adopts_metric_baseline_and_keeps_legacy_fallback() {
 
 #[test]
 fn metric_baseline_fits_measured_tall_glyphs_with_zero_overhang() {
-    // Full block U+2588 measured top=17 h=22: dest lands exactly on the
-    // cell origin and the bitmap spans exactly the cell — no overhang for
-    // neighbor repaints to erase (the CTX-0237 clip mechanism).
+    // Full block U+2588 is cell-box rasterized (issue #2307): dest lands
+    // exactly on the cell origin and the mask spans exactly the cell — no
+    // overhang for neighbor repaints to erase (the CTX-0237 clip mechanism).
     let state = state_from(&[print('\u{2588}')]);
     let damage = damage_all(&state);
     let mut grid = metric_renderer();
@@ -3181,8 +3181,8 @@ fn marks_renderer() -> GridRenderer<MarksRasterizer> {
 
 /// Composites every glyph instance from the renderer's atlas/inline masks
 /// into a coverage frame (`0` background .. `255` full ink).
-fn glyph_frame(
-    renderer: &GridRenderer<MarksRasterizer>,
+fn glyph_frame<R: GlyphRasterizer>(
+    renderer: &GridRenderer<R>,
     list: &crate::grid::DrawList,
     width: u32,
     height: u32,
@@ -3389,4 +3389,169 @@ fn failed_base_with_a_drawn_mark_is_not_counted_blank() {
     assert_eq!(counters.glyphs_emitted, 1);
     assert_eq!(counters.cells_drawn, 1);
     assert_eq!(counters.blank_cells_skipped, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2307: block elements tile on the cell box at fractional scale
+// ---------------------------------------------------------------------------
+
+/// Renderer at the owner-reported Hyprland configuration: 10x22 design cell
+/// (JetBrainsMono 12pt) scaled by 1.6 to a 16x35 physical cell.
+fn scaled_block_renderer() -> GridRenderer<FakeRasterizer> {
+    let base = CellMetrics::new(10, 22).unwrap();
+    let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), base).unwrap();
+    let applied = grid.apply_dpi_scale(base, &font_query(), 1.6).unwrap();
+    assert_eq!(applied.cell, CellMetrics::new(16, 35).unwrap());
+    grid
+}
+
+/// Renders `script` at the 1.6x cell and composites the emitted glyph
+/// coverage into a frame covering `width_cells` x `height_cells`.
+fn render_scaled_blocks(
+    script: &[TerminalAction],
+    width_cells: u32,
+    height_cells: u32,
+) -> (Vec<u8>, crate::grid::DrawList) {
+    let state = state_from(script);
+    let snapshot = state.snapshot();
+    let damage = full_damage(&state);
+    let mut grid = scaled_block_renderer();
+    let list = grid.render(&snapshot, &damage).expect("render");
+    let frame = glyph_frame(&grid, &list, width_cells * 16, height_cells * 35);
+    (frame, list)
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[test]
+fn adjacent_full_blocks_tile_across_the_vertical_cell_boundary() {
+    // Two U+2588 cells, different colors, at scale 1.6. The shared cell
+    // boundary is a pixel column: every pixel there and across both cells
+    // must be fully covered, with no background pixel surviving.
+    let script = [
+        sgr(&[AttributeChange::Foreground(Color::Indexed(1))]),
+        print('\u{2588}'),
+        sgr(&[AttributeChange::Foreground(Color::Indexed(2))]),
+        print('\u{2588}'),
+    ];
+    let (frame, list) = render_scaled_blocks(&script, 2, 1);
+    assert_eq!(list.glyphs.len(), 2);
+    assert_ne!(list.glyphs[0].color, list.glyphs[1].color);
+    assert_eq!(list.glyphs[0].dest, [0, 0]);
+    assert_eq!(list.glyphs[0].size, [16, 35]);
+    assert_eq!(list.glyphs[1].dest, [16, 0]);
+    assert_eq!(list.glyphs[1].size, [16, 35]);
+
+    for y in 0..35u32 {
+        for x in 0..32u32 {
+            assert_eq!(
+                frame[(y * 32 + x) as usize],
+                255,
+                "background pixel at ({x},{y}) across the block boundary"
+            );
+        }
+    }
+}
+
+#[test]
+fn adjacent_full_blocks_tile_across_the_horizontal_cell_boundary() {
+    // Same proof for vertically adjacent rows: U+2588 on row 0 and row 1.
+    let mut script = vec![
+        sgr(&[AttributeChange::Foreground(Color::Indexed(1))]),
+        print('\u{2588}'),
+    ];
+    script.extend(newline_actions());
+    script.push(sgr(&[AttributeChange::Foreground(Color::Indexed(2))]));
+    script.push(print('\u{2588}'));
+    let (frame, list) = render_scaled_blocks(&script, 1, 2);
+    assert_eq!(list.glyphs.len(), 2);
+    assert_ne!(list.glyphs[0].color, list.glyphs[1].color);
+    assert_eq!(list.glyphs[0].dest, [0, 0]);
+    assert_eq!(list.glyphs[1].dest, [0, 35]);
+    assert_eq!(list.glyphs[1].size, [16, 35]);
+
+    for y in 0..70u32 {
+        for x in 0..16u32 {
+            assert_eq!(
+                frame[(y * 16 + x) as usize],
+                255,
+                "background pixel at ({x},{y}) across the block boundary"
+            );
+        }
+    }
+}
+
+#[test]
+fn block_shades_keep_quarter_half_three_quarter_coverage() {
+    for (character, expected) in [
+        ('\u{2591}', 0.25f64),
+        ('\u{2592}', 0.50f64),
+        ('\u{2593}', 0.75f64),
+    ] {
+        let (frame, list) = render_scaled_blocks(&[print(character)], 1, 1);
+        assert_eq!(list.glyphs.len(), 1, "{character:?}");
+        let total: u64 = frame.iter().map(|&v| u64::from(v)).sum();
+        let coverage = total as f64 / (255.0 * f64::from(16 * 35));
+        assert!(
+            (coverage - expected).abs() <= 0.02,
+            "{character:?} coverage {coverage:.3} != {expected:.2}"
+        );
+    }
+}
+
+#[test]
+fn every_block_scalar_emits_an_exact_cell_box_glyph() {
+    for cp in 0x2580u32..=0x259F {
+        let character = char::from_u32(cp).expect("block range is valid");
+        let (frame, list) = render_scaled_blocks(&[print(character)], 1, 1);
+        assert_eq!(list.glyphs.len(), 1, "U+{cp:04X}");
+        assert_eq!(list.glyphs[0].dest, [0, 0], "U+{cp:04X}");
+        assert_eq!(list.glyphs[0].size, [16, 35], "U+{cp:04X}");
+        assert!(frame.iter().any(|&v| v > 0), "U+{cp:04X} must paint ink");
+    }
+}
+
+#[test]
+fn box_drawing_and_braille_stay_on_the_font_path() {
+    // U+2502 and U+28FF are outside the block-element range and keep the
+    // font bitmap path (the fake serves the measured 2x25 box vertical and
+    // a 7x6 braille bitmap); nothing here may snap them to the cell box.
+    let script = [print('\u{2502}'), print('\u{28FF}')];
+    let state = state_from(&script);
+    let damage = full_damage(&state);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).expect("render");
+    assert_eq!(list.glyphs.len(), 2);
+    assert_eq!(
+        list.glyphs[0].size,
+        [2, 25],
+        "box drawing stays font-sourced"
+    );
+    assert_eq!(list.glyphs[1].size, [7, 6], "braille stays font-sourced");
+}
+
+#[test]
+fn block_tile_golden_frame_hash_matches() {
+    // Golden update justification (issue #2307):
+    //   old (font bitmap path): 0b6845d31fa25c75
+    //     The fake 10x22 U+2588 bitmap inside a 16x35 cell leaves six
+    //     background columns between the two cells.
+    //   new (cell-box path):   d86f265d11fc1845
+    //     Every one of the 32x35 pixels is full coverage (0xFF), so the
+    //     frame is uniform and the only stable hash is the all-255 frame.
+    let script = [
+        sgr(&[AttributeChange::Foreground(Color::Indexed(1))]),
+        print('\u{2588}'),
+        sgr(&[AttributeChange::Foreground(Color::Indexed(2))]),
+        print('\u{2588}'),
+    ];
+    let (frame, _) = render_scaled_blocks(&script, 2, 1);
+    assert_eq!(fnv1a(&frame), 0xd86f_265d_11fc_1845);
 }

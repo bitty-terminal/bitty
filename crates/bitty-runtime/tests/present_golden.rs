@@ -330,9 +330,13 @@ fn golden_grapheme_variation_selector() {
 #[test]
 fn golden_cjk_wide_and_box_drawing() {
     // CJK wide leads keep their spacer; box-drawing stays one narrow cell.
+    // Re-recorded under issue #2307: U+2588 now rasterizes from the native
+    // cell-box block mask instead of the font bitmap, so this deterministic
+    // frame intentionally changes. The U+6F22 CJK wide lead and the U+2502 /
+    // U+2500 box-drawing cells still take the font path unchanged.
     let mut rt = make_runtime();
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("A\u{6F22}\u{2502}\u{2500}\u{2588}B".as_bytes());
     let frame = rt.tick().expect("CJK and box drawing presents");
-    assert_digest("cjk_box_drawing", &rt, &frame, 0xb240_f9d6_a8d0_2e6d);
+    assert_digest("cjk_box_drawing", &rt, &frame, 0xd642_d55b_d615_83c0);
 }

@@ -9,9 +9,9 @@
 //!
 //! # Contract (implemented)
 //!
-//! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info`
-//!   with `list`/`info` accepting `--format table|json|jsonl` (default
-//!   table) and `--no-color` (accepted; tables are plain text).
+//! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info|config`
+//!   with `list`/`info`/`config show` accepting `--format table|json|jsonl`
+//!   (default table) and `--no-color` (accepted; tables are plain text).
 //! - `install <id>` resolves a **bundled** plugin manifest, pins its
 //!   `PluginManifest::manifest_hash()`, and grants the requested capability
 //!   set only after explicit consent (`--yes`, or an interactive `[y/N]`
@@ -53,6 +53,20 @@
 //!   manifest's declared `[settings]` defaults, manifest-provided `[hints]`
 //!   lines when declared, and the `info` pointer. Display-only: no grants,
 //!   no state, no plugin code runs.
+//! - `config show <id>` prints the declared `[settings]` schema (key, type,
+//!   default, description when the schema carries one), the canonical/alias/
+//!   legacy paths and which file is selected, and the effective value plus
+//!   serving layer (`manifest-default`, `host`, `user-file`) per key. The
+//!   bounded plain settings VM resolves the file exactly as activation does;
+//!   the plugin VM is never created or executed. Undeclared/wrong-typed keys
+//!   and rejected files fail closed with exit 4 after the report prints.
+//! - `config scaffold <id>` writes a commented canonical
+//!   `<config-dir>/plugins/<owner>.<name>.lua` template from the manifest
+//!   `[settings]` defaults only (no invented values). It refuses to overwrite
+//!   without `--force`, always refuses symlinked targets/directories, keeps
+//!   the write inside the environment-derived config root, and commits
+//!   atomically (temp file with `create_new`; hard-link no-clobber or rename
+//!   with `--force`). `--init` is the issue-shape alias for `scaffold`.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
 //!   code is ever loaded or executed**; safe-mode clean).
 //!
@@ -110,7 +124,11 @@ use bitty_config::plugin_file::{PLUGIN_FILE_EXTENSION, PLUGINS_DIR_NAME};
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
 use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
-use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl};
+use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl, SettingDefault};
+use bitty_runtime::plugin_runtime::plugin_settings::{
+    self, LoadedPluginSettings, PluginConfigKind, PluginConfigPaths, SelectedPluginFile,
+    SettingLayer,
+};
 use bitty_runtime::plugin_runtime::{
     load_index, manifest_toml,
     package::{self, LocalInstallOptions, PackageOpError},
@@ -153,6 +171,12 @@ pub const HEX_HASH_LEN: usize = 64;
 pub const MAX_CONSENT_LINE_BYTES: usize = 64;
 /// Consent attempts before aborting (mirrors `bitty init`).
 pub const MAX_CONSENT_ATTEMPTS: usize = 3;
+/// Prefix for the scaffold temp file created beside the target (atomic write).
+pub const SCAFFOLD_TEMP_PREFIX: &str = ".bitty-plugin-config-";
+/// Maximum rendered scaffold bytes (declared defaults are already bounded).
+pub const MAX_SCAFFOLD_BYTES: usize = 64 * 1024;
+/// Largest single value rendered in a `config show` table cell.
+pub const CONFIG_TABLE_CELL_BYTES: usize = 48;
 
 // ---------------------------------------------------------------------------
 // Parsed request (headless, bounded, fail-closed)
@@ -210,6 +234,29 @@ pub enum PluginVerb {
     Info,
     /// `revoke <id> [--cap <capability>]`: drop grants (durable denial).
     Revoke,
+    /// `config [show|scaffold] <id>`: inspect or scaffold per-plugin settings.
+    Config,
+}
+
+/// Which `bitty plugin config` action to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// Print the declared schema, selected file, and effective values.
+    Show,
+    /// Write a commented settings template at the canonical path.
+    Scaffold,
+}
+
+impl ConfigAction {
+    /// Parse an explicit action token.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "show" => Some(Self::Show),
+            "scaffold" => Some(Self::Scaffold),
+            _ => None,
+        }
+    }
 }
 
 impl PluginVerb {
@@ -224,6 +271,7 @@ impl PluginVerb {
             "disable" => Some(Self::Disable),
             "info" => Some(Self::Info),
             "revoke" => Some(Self::Revoke),
+            "config" => Some(Self::Config),
             _ => None,
         }
     }
@@ -239,6 +287,7 @@ impl PluginVerb {
             Self::Disable => "disable",
             Self::Info => "info",
             Self::Revoke => "revoke",
+            Self::Config => "config",
         }
     }
 
@@ -266,6 +315,8 @@ pub struct PluginRequest {
     pub cap: Option<String>,
     /// `--no-color` (accepted for parity; tables are plain text).
     pub no_color: bool,
+    /// `config` action (`show` default, `scaffold` via the verb or `--init`).
+    pub config_action: Option<ConfigAction>,
 }
 
 /// Why parsing failed.
@@ -307,6 +358,8 @@ pub fn parse_plugin_request(
     let mut force = false;
     let mut cap: Option<String> = None;
     let mut no_color = false;
+    let mut config_action: Option<ConfigAction> = None;
+    let mut init = false;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -320,6 +373,16 @@ pub fn parse_plugin_request(
             }
             "--force" => {
                 force = true;
+                index += 1;
+                continue;
+            }
+            "--init" => {
+                init = true;
+                index += 1;
+                continue;
+            }
+            "--json" => {
+                format = Some("json".to_string());
                 index += 1;
                 continue;
             }
@@ -405,12 +468,19 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info|revoke)"
+                         (want list|install|remove|enable|disable|info|revoke|config)"
                     )));
                 }
             }
             index += 1;
             continue;
+        }
+        if verb == Some(PluginVerb::Config) && config_action.is_none() {
+            if let Some(action) = ConfigAction::parse(token) {
+                config_action = Some(action);
+                index += 1;
+                continue;
+            }
         }
         if id.is_none() {
             id = Some(token.to_string());
@@ -424,7 +494,7 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke)"
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke|config)"
                 .to_string(),
         )
     })?;
@@ -451,12 +521,6 @@ pub fn parse_plugin_request(
             verb.name()
         )));
     }
-    if force && verb != PluginVerb::Remove {
-        return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --force only applies to `remove` (got `{}`)",
-            verb.name()
-        )));
-    }
     if cap.is_some() && verb != PluginVerb::Revoke {
         return Err(PluginParseError::Usage(format!(
             "bitty plugin: --cap only applies to `revoke` (got `{}`)",
@@ -464,12 +528,52 @@ pub fn parse_plugin_request(
         )));
     }
     if (format != PluginFormat::Table || no_color)
-        && !matches!(verb, PluginVerb::List | PluginVerb::Info)
+        && !matches!(
+            verb,
+            PluginVerb::List | PluginVerb::Info | PluginVerb::Config
+        )
     {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --format/--no-color only apply to `list` and `info` (got `{}`)",
+            "bitty plugin: --format/--no-color only apply to `list`, `info`, and `config` (got `{}`)",
             verb.name()
         )));
+    }
+    if config_action.is_some() && verb != PluginVerb::Config {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: `show`/`scaffold` only apply to `config` (got `{}`)",
+            verb.name()
+        )));
+    }
+    if init && verb != PluginVerb::Config {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --init only applies to `config` (got `{}`)",
+            verb.name()
+        )));
+    }
+    let config_action = if verb == PluginVerb::Config {
+        match (config_action, init) {
+            (Some(ConfigAction::Show), true) => {
+                return Err(PluginParseError::Usage(
+                    "bitty plugin: `config show` conflicts with --init (scaffold)".to_string(),
+                ));
+            }
+            (Some(action), _) => Some(action),
+            (None, true) => Some(ConfigAction::Scaffold),
+            (None, false) => Some(ConfigAction::Show),
+        }
+    } else {
+        None
+    };
+    if force && !matches!(verb, PluginVerb::Remove | PluginVerb::Config) {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --force only applies to `remove` and `config scaffold` (got `{}`)",
+            verb.name()
+        )));
+    }
+    if force && config_action == Some(ConfigAction::Show) {
+        return Err(PluginParseError::Usage(
+            "bitty plugin: --force only applies to `config scaffold`".to_string(),
+        ));
     }
 
     Ok(PluginRequest {
@@ -480,6 +584,7 @@ pub fn parse_plugin_request(
         force,
         cap,
         no_color,
+        config_action,
     })
 }
 
@@ -496,6 +601,8 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin revoke <id> [--cap <capability>]\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
+     \x20      bitty plugin config show <id> [--format table|json|jsonl] [--no-color]\n\
+     \x20      bitty plugin config scaffold <id> [--force]\n\
      \n\
      Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.toml\n\
      (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
@@ -568,12 +675,23 @@ pub fn plugin_help_text() -> String {
      \x20                             Re-grant with `install` (explicit consent).\n\
      \x20 info <id>                   Manifest + recorded state, with the plain-\
      \x20                             language effect per capability.\n\
+     \x20 config show <id>            Print the declared [settings] schema, the\n\
+     \x20                             selected user file, and the effective\n\
+     \x20                             value plus serving layer per key. No\n\
+     \x20                             plugin VM is created.\n\
+     \x20 config scaffold <id>        Write a commented Lua settings template\n\
+     \x20                             (canonical <owner>.<name>.lua path) from\n\
+     \x20                             the manifest [settings] defaults. Refuses\n\
+     \x20                             to overwrite without --force.\n\
      \n\
      flags:\n\
-     \x20 --format table|json|jsonl   list/info output shape (default table).\n\
+     \x20 --format table|json|jsonl   list/info/config show output (default table).\n\
+     \x20 --json                      Alias for --format json.\n\
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
      \x20 --yes                       install only: approve capability consent.\n\
-     \x20 --force                     remove only: confirm the destructive drop.\n\
+     \x20 --force                     remove/config scaffold: confirm overwrite or\n\
+     \x20                             the destructive drop.\n\
+     \x20 --init                      config only: alias for `config scaffold`.\n\
      \x20 --cap <capability>          revoke only: revoke one capability.\n\
      \n\
      download consent:\n\
@@ -616,7 +734,9 @@ pub fn plugin_help_text() -> String {
      \x20 shipped defaults, and edits apply on the next activation, not\n\
      \x20 live. Installed packages\n\
      \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
-     \x20 (fallback ~/.local/share/...).\n\
+     \x20 (fallback ~/.local/share/...). Inspect with\n\
+     \x20 `bitty plugin config show <id>`; scaffold with\n\
+     \x20 `bitty plugin config scaffold <id>`.\n\
      \x20 After a fresh local, Git, or archive install, the plugin is staged and\n\
      \x20 disabled; updates preserve the existing enabled/disabled state. Enable\n\
      \x20 it explicitly with:\n\
@@ -651,6 +771,8 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin install ./my-plugin.tar.gz --yes\n\
      \x20 bitty plugin install ./my-plugin.zip --yes\n\
      \x20 bitty plugin info xuepoo.hello\n\
+     \x20 bitty plugin config show xuepoo.hello\n\
+     \x20 bitty plugin config scaffold xuepoo.hello\n\
      \x20 bitty plugin disable bitty-terminal.shell-integration\n\
      \x20 bitty plugin remove xuepoo.hello --force"
         .to_string()
@@ -1944,6 +2066,654 @@ pub fn format_error_envelope(verb: &str, class: &str, code: &str, message: &str)
 }
 
 // ---------------------------------------------------------------------------
+// Per-plugin config inspection and scaffolding (`bitty plugin config`, #2246)
+// ---------------------------------------------------------------------------
+
+/// One declared setting in a `config show` report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSettingRow {
+    /// Declared key.
+    pub key: String,
+    /// Declared type spelling (`bool`, `int`, `string`, `string-array`).
+    pub kind: &'static str,
+    /// Rendered shipped manifest default.
+    pub default: String,
+    /// Declared description, when the manifest schema carries one.
+    ///
+    /// v1 `[settings]` declarations have no description field, so this is
+    /// `None`; the table renders `-` and JSON renders `null`. No copy is
+    /// invented for it.
+    pub description: Option<String>,
+    /// Rendered effective value after resolution.
+    pub value: String,
+    /// Layer that served `value`.
+    pub layer: SettingLayer,
+}
+
+/// Read-only inspection result for one plugin's settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigReport {
+    /// Plugin id.
+    pub id: String,
+    /// Environment-derived config root (parent of `bitty-plugins.toml`).
+    pub config_dir: PathBuf,
+    /// Candidate user-file paths.
+    pub paths: PluginConfigPaths,
+    /// File selected by resolution, when one was read.
+    pub selected: Option<SelectedPluginFile>,
+    /// Whether the canonical Lua file exists (symlinks count as present but
+    /// are rejected by the loader).
+    pub canonical_exists: bool,
+    /// Whether the unambiguous short-name alias exists.
+    pub alias_exists: bool,
+    /// Whether the legacy TOML fallback exists.
+    pub legacy_exists: bool,
+    /// One row per declared setting, sorted by key.
+    pub rows: Vec<ConfigSettingRow>,
+    /// File keys that changed nothing (undeclared, wrong-typed, skipped).
+    pub dropped: Vec<String>,
+    /// Whole-file rejection diagnostic, if any.
+    pub file_error: Option<String>,
+}
+
+/// Render a resolved/declared plain value as a single bounded token.
+fn render_lua_value(value: &bitty_runtime::plugin_runtime::LuaValue) -> String {
+    use bitty_runtime::plugin_runtime::LuaValue;
+    match value {
+        LuaValue::Nil => "nil".to_string(),
+        LuaValue::Bool(flag) => flag.to_string(),
+        LuaValue::Integer(number) => number.to_string(),
+        LuaValue::Number(number) => number.to_string(),
+        LuaValue::String(text) => format!("\"{}\"", escape_toml_basic(text)),
+        LuaValue::Table(pairs) => {
+            let items: Vec<String> = pairs
+                .iter()
+                .map(|(_, item)| render_lua_value(item))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+    }
+}
+
+/// Bound one table cell so a hostile default cannot flood the terminal.
+fn bounded_cell(text: &str) -> String {
+    if text.chars().count() <= CONFIG_TABLE_CELL_BYTES {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(CONFIG_TABLE_CELL_BYTES).collect();
+    out.push_str("...");
+    out
+}
+
+fn exists_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Build the inspection report (no plugin VM; the bounded plain settings VM
+/// resolves the selected user file exactly as activation does).
+fn build_config_report(
+    state: &PluginState,
+    store_root: Option<&Path>,
+    config_dir: &Path,
+    id: &str,
+    manifest: &PluginManifest,
+) -> PluginConfigReport {
+    let discovered = known_plugin_ids(state, store_root);
+    let paths = plugin_settings::plugin_config_paths(config_dir, id, Some(&discovered))
+        .expect("plugin id validated before report construction");
+    let loaded: LoadedPluginSettings = plugin_settings::load_plugin_settings_with_plugins(
+        Some(config_dir),
+        id,
+        &manifest.settings,
+        None,
+        Some(&discovered),
+    );
+    let mut rows: Vec<ConfigSettingRow> = manifest
+        .settings
+        .iter()
+        .map(|decl| ConfigSettingRow {
+            key: decl.key.clone(),
+            kind: decl.kind.as_str(),
+            default: render_lua_value(&plugin_settings::default_to_lua(&decl.default)),
+            description: None,
+            value: loaded
+                .source
+                .values()
+                .get(&decl.key)
+                .map_or_else(|| "-".to_string(), render_lua_value),
+            layer: loaded
+                .layers
+                .get(&decl.key)
+                .copied()
+                .unwrap_or(SettingLayer::ManifestDefault),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    PluginConfigReport {
+        id: id.to_string(),
+        config_dir: config_dir.to_path_buf(),
+        canonical_exists: exists_no_follow(&paths.canonical_lua),
+        alias_exists: paths.alias_lua.as_deref().is_some_and(exists_no_follow),
+        legacy_exists: exists_no_follow(&paths.legacy_toml),
+        selected: loaded.selected_file,
+        paths,
+        rows,
+        dropped: loaded.dropped,
+        file_error: loaded.file_error,
+    }
+}
+
+fn presence(exists: bool) -> &'static str {
+    if exists { "present" } else { "absent" }
+}
+
+/// Human table for `config show`.
+fn format_config_table(report: &PluginConfigReport, no_color: bool) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", bold(&format!("plugin {}", report.id), color));
+    let _ = writeln!(out, "  config dir:     {}", report.config_dir.display());
+    let _ = writeln!(
+        out,
+        "  canonical lua:  {} ({})",
+        report.paths.canonical_lua.display(),
+        presence(report.canonical_exists)
+    );
+    match &report.paths.alias_lua {
+        Some(alias) => {
+            let _ = writeln!(
+                out,
+                "  alias lua:      {} ({})",
+                alias.display(),
+                presence(report.alias_exists)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  alias lua:      - (short name not unambiguous)");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  legacy toml:    {} ({})",
+        report.paths.legacy_toml.display(),
+        presence(report.legacy_exists)
+    );
+    match &report.selected {
+        Some(selected) => {
+            let _ = writeln!(
+                out,
+                "  selected:       {} ({})",
+                selected.path.display(),
+                selected.kind.as_str()
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  selected:       - (manifest defaults only)");
+        }
+    }
+    if report
+        .selected
+        .as_ref()
+        .is_some_and(|selected| selected.kind == PluginConfigKind::LegacyToml)
+    {
+        out.push_str(
+            "  note:           legacy TOML is the active source; the canonical surface is \
+             <owner>.<name>.lua\n",
+        );
+    }
+    out.push('\n');
+    let header = format!(
+        "{:<24} {:<12} {:<20} {:<20} {:<16} {}",
+        "KEY", "TYPE", "DEFAULT", "VALUE", "SOURCE", "DESCRIPTION"
+    );
+    let _ = writeln!(out, "{}", bold(&header, color));
+    if report.rows.is_empty() {
+        out.push_str("(no settings declared)\n");
+    }
+    for row in &report.rows {
+        let _ = writeln!(
+            out,
+            "{:<24} {:<12} {:<20} {:<20} {:<16} {}",
+            bounded_cell(&row.key),
+            row.kind,
+            bounded_cell(&row.default),
+            bounded_cell(&row.value),
+            row.layer.as_str(),
+            row.description.as_deref().unwrap_or("-")
+        );
+    }
+    if !report.dropped.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n  dropped (undeclared or wrong-typed) keys: {}",
+            report.dropped.join(", ")
+        );
+    }
+    if let Some(error) = &report.file_error {
+        let _ = writeln!(out, "\n  file error: {error}");
+    }
+    out
+}
+
+/// Versioned JSON envelope for `config show`.
+#[must_use]
+pub fn format_config_envelope(report: &PluginConfigReport) -> String {
+    let mut out = String::from(
+        "{\"v\":1,\"command\":\"plugin\",\"ok\":true,\"result\":{\"verb\":\"config\",\"action\":\"show\",",
+    );
+    let _ = write!(out, "\"plugin\":\"{}\",", json_escape(&report.id));
+    let _ = write!(
+        out,
+        "\"config_dir\":\"{}\",",
+        json_escape(&report.config_dir.display().to_string())
+    );
+    let _ = write!(
+        out,
+        "\"candidates\":{{\"canonical_lua\":\"{}\",\"canonical_exists\":{},\"alias_lua\":{},\"alias_exists\":{},\"legacy_toml\":\"{}\",\"legacy_exists\":{}}},",
+        json_escape(&report.paths.canonical_lua.display().to_string()),
+        report.canonical_exists,
+        match &report.paths.alias_lua {
+            Some(path) => format!("\"{}\"", json_escape(&path.display().to_string())),
+            None => "null".to_string(),
+        },
+        report.alias_exists,
+        json_escape(&report.paths.legacy_toml.display().to_string()),
+        report.legacy_exists
+    );
+    out.push_str("\"selected\":");
+    match &report.selected {
+        Some(selected) => {
+            let _ = write!(
+                out,
+                "{{\"path\":\"{}\",\"kind\":\"{}\"}}",
+                json_escape(&selected.path.display().to_string()),
+                selected.kind.as_str()
+            );
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"settings\":[");
+    for (index, row) in report.rows.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"key\":\"{}\",\"type\":\"{}\",\"default\":{},\"description\":{},\"value\":{},\"source\":\"{}\"}}",
+            json_escape(&row.key),
+            row.kind,
+            row.default,
+            match &row.description {
+                Some(description) => format!("\"{}\"", json_escape(description)),
+                None => "null".to_string(),
+            },
+            row.value,
+            row.layer.as_str()
+        );
+    }
+    out.push_str("],\"dropped\":[");
+    for (index, key) in report.dropped.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{}\"", json_escape(key));
+    }
+    out.push_str("],\"file_error\":");
+    match &report.file_error {
+        Some(error) => {
+            let _ = write!(out, "\"{}\"", json_escape(error));
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str("}}");
+    out
+}
+
+/// Escape one string for a Lua short string literal in scaffold templates.
+///
+/// Manifest string defaults are bounded but attacker-controlled; control
+/// characters must never reach the file raw. Multi-byte UTF-8 passes through;
+/// C0/C1 controls and DEL become decimal escapes, which every Lua version
+/// accepts and which reproduce the exact original bytes.
+fn escape_lua_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
+                for byte in c.to_string().as_bytes() {
+                    let _ = write!(out, "\\{byte:03}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the canonical Lua settings template from manifest declarations only.
+fn render_config_scaffold(id: &str, settings: &[SettingDecl]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "-- Per-plugin settings for {id}.");
+    out.push_str("-- Generated by `bitty plugin config scaffold`; edit values freely.\n");
+    out.push_str(
+        "-- Values are data only: no setting grants capability, authority, or plugin code.\n",
+    );
+    out.push_str("-- Settings load on the next activation of this plugin.\n");
+    out.push_str("--\n");
+    out.push_str("-- Declared keys and shipped defaults:\n");
+    for decl in settings {
+        let _ = writeln!(
+            out,
+            "--   {}: {} = {}",
+            decl.key,
+            decl.kind.as_str(),
+            render_scaffold_default(&decl.default)
+        );
+    }
+    out.push_str("--\n");
+    out.push_str("-- Delete a line to keep its shipped default.\n");
+    out.push_str("return {\n");
+    for decl in settings {
+        let _ = writeln!(
+            out,
+            "    {} = {},",
+            decl.key,
+            render_scaffold_default(&decl.default)
+        );
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Render one default as a Lua literal (`true`, `32`, `"x"`, `{ "a" }`).
+fn render_scaffold_default(default: &SettingDefault) -> String {
+    match default {
+        SettingDefault::Bool(value) => value.to_string(),
+        SettingDefault::Int(value) => value.to_string(),
+        SettingDefault::String(value) => format!("\"{}\"", escape_lua_string(value)),
+        SettingDefault::Strings(items) => {
+            let quoted: Vec<String> = items
+                .iter()
+                .map(|item| format!("\"{}\"", escape_lua_string(item)))
+                .collect();
+            format!("{{ {} }}", quoted.join(", "))
+        }
+    }
+}
+
+/// Every statically known plugin id (bundled catalog plus installed store).
+fn known_plugin_ids(state: &PluginState, store_root: Option<&Path>) -> Vec<String> {
+    let mut ids: BTreeSet<String> = all_bundled_manifests()
+        .iter()
+        .map(|manifest| manifest.id().as_str().to_string())
+        .collect();
+    ids.extend(state.ids().cloned());
+    if let Some(root) = store_root {
+        if let Ok(records) = load_index(root) {
+            ids.extend(records.into_iter().map(|record| record.plugin_id));
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn unknown_plugin_failure(id: &str) -> PluginFailure {
+    PluginFailure::plugin(
+        "UnknownPlugin",
+        format!("bitty plugin: unknown plugin '{id}' (see `bitty plugin list`)"),
+    )
+}
+
+/// Resolve the static manifest for any known plugin, failing closed on an
+/// unknown id or an unreadable stored manifest body.
+fn config_manifest_for_id(
+    store_root: Option<&Path>,
+    id: &str,
+) -> Result<PluginManifest, PluginFailure> {
+    if let Some(manifest) = bundled_manifest_for(id) {
+        manifest.validate().map_err(|error| {
+            PluginFailure::plugin(
+                "SchemaUnreadable",
+                format!("bitty plugin: bundled settings schema for '{id}' is invalid: {error}"),
+            )
+        })?;
+        return Ok(manifest);
+    }
+    let Some(root) = store_root else {
+        return Err(unknown_plugin_failure(id));
+    };
+    let records = load_store_index(root)?;
+    let Some(record) = records.iter().find(|record| record.plugin_id == id) else {
+        return Err(unknown_plugin_failure(id));
+    };
+    let Some(package_root) =
+        bitty_runtime::plugin_runtime::resolution::store_package_root(root, record)
+    else {
+        return Err(PluginFailure::plugin(
+            "SchemaUnreadable",
+            format!("bitty plugin: package root for '{id}' is not a safe store path"),
+        ));
+    };
+    let path = package_root.join(package::MANIFEST_FILE_NAME);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        PluginFailure::plugin(
+            "SchemaUnreadable",
+            format!(
+                "bitty plugin: cannot read the manifest for '{id}' at '{}': {error}",
+                path.display()
+            ),
+        )
+    })?;
+    manifest_toml::parse_manifest(&bytes).map_err(|error| {
+        PluginFailure::plugin(
+            "SchemaUnreadable",
+            format!("bitty plugin: settings schema for '{id}' is unreadable: {error}"),
+        )
+    })
+}
+
+/// Create or verify `<config-dir>/plugins` without ever following a symlink
+/// out of the user config root.
+fn ensure_plugins_dir(config_dir: &Path) -> Result<PathBuf, PluginFailure> {
+    std::fs::create_dir_all(config_dir).map_err(|error| {
+        PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot create config dir '{}': {error}",
+                config_dir.display()
+            ),
+        )
+    })?;
+    let root = std::fs::canonicalize(config_dir).map_err(|error| {
+        PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot resolve config dir '{}': {error}",
+                config_dir.display()
+            ),
+        )
+    })?;
+    let plugins = config_dir.join(PLUGINS_DIR_NAME);
+    if let Ok(metadata) = std::fs::symlink_metadata(&plugins) {
+        if metadata.file_type().is_symlink() {
+            return Err(PluginFailure::plugin(
+                "SymlinkTarget",
+                format!(
+                    "bitty plugin: refusing to write through symlinked plugins dir '{}'",
+                    plugins.display()
+                ),
+            ));
+        }
+    }
+    std::fs::create_dir_all(&plugins).map_err(|error| {
+        PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot create plugins dir '{}': {error}",
+                plugins.display()
+            ),
+        )
+    })?;
+    let canonical = std::fs::canonicalize(&plugins).map_err(|error| {
+        PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot resolve plugins dir '{}': {error}",
+                plugins.display()
+            ),
+        )
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(PluginFailure::plugin(
+            "UnsafePath",
+            format!(
+                "bitty plugin: plugins dir '{}' resolves outside the config root '{}'",
+                canonical.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(plugins)
+}
+
+/// Write the scaffold atomically (temp + no-clobber commit or rename).
+///
+/// `--force` replaces an existing regular file via an atomic rename. Without
+/// `--force` the commit uses a hard link, which fails atomically if the target
+/// appeared after the pre-check. Symlinked targets and directories are always
+/// refused, even with `--force`.
+fn write_config_scaffold(
+    config_dir: &Path,
+    id: &str,
+    settings: &[SettingDecl],
+    force: bool,
+) -> Result<PathBuf, PluginFailure> {
+    if settings.is_empty() {
+        return Err(PluginFailure::plugin(
+            "NoSettings",
+            format!("bitty plugin: '{id}' declares no [settings]; nothing to scaffold"),
+        ));
+    }
+    let paths = plugin_settings::plugin_config_paths(config_dir, id, None).ok_or_else(|| {
+        PluginFailure::plugin(
+            "UnsafePath",
+            format!("bitty plugin: '{id}' cannot name a per-plugin config file"),
+        )
+    })?;
+    let target = paths.canonical_lua;
+    let plugins = ensure_plugins_dir(config_dir)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(PluginFailure::plugin(
+                "SymlinkTarget",
+                format!(
+                    "bitty plugin: refusing to write '{}': it is a symlink",
+                    target.display()
+                ),
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(PluginFailure::plugin(
+                "InvalidTarget",
+                format!(
+                    "bitty plugin: refusing to write '{}': it is a directory",
+                    target.display()
+                ),
+            ));
+        }
+        Ok(_) if !force => {
+            return Err(PluginFailure::plugin(
+                "AlreadyExists",
+                format!(
+                    "bitty plugin: '{}' already exists; pass --force to overwrite",
+                    target.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PluginFailure::plugin(
+                "IoError",
+                format!(
+                    "bitty plugin: cannot inspect '{}': {error}",
+                    target.display()
+                ),
+            ));
+        }
+    }
+
+    let rendered = render_config_scaffold(id, settings);
+    if rendered.len() > MAX_SCAFFOLD_BYTES {
+        return Err(PluginFailure::plugin(
+            "ScaffoldTooLarge",
+            format!("bitty plugin: rendered scaffold exceeds {MAX_SCAFFOLD_BYTES} bytes"),
+        ));
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = plugins.join(format!(
+        "{SCAFFOLD_TEMP_PREFIX}{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::io::Write::write_all(&mut file, rendered.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot write scaffold temp file '{}': {error}",
+                temp.display()
+            ),
+        ));
+    }
+    let commit = if force {
+        std::fs::rename(&temp, &target)
+    } else {
+        std::fs::hard_link(&temp, &target).and_then(|()| std::fs::remove_file(&temp))
+    };
+    if let Err(error) = commit {
+        let _ = std::fs::remove_file(&temp);
+        let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "AlreadyExists"
+        } else {
+            "IoError"
+        };
+        return Err(PluginFailure::plugin(
+            code,
+            format!(
+                "bitty plugin: cannot create '{}': {error}{}",
+                target.display(),
+                if code == "AlreadyExists" {
+                    "; pass --force to overwrite"
+                } else {
+                    ""
+                }
+            ),
+        ));
+    }
+    Ok(target)
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -2161,6 +2931,73 @@ pub fn run_plugin_subcommand(
                 Err(failure) => {
                     eprintln!("{}", failure.message);
                     failure.exit
+                }
+            }
+        }
+        PluginVerb::Config => {
+            let id = request.id.as_deref().expect("config requires an id");
+            if let Err(failure) = resolve_plugin_id(id) {
+                return fail_read_only(&request, &failure, output);
+            }
+            let manifest = match config_manifest_for_id(store_root.as_deref(), id) {
+                Ok(manifest) => manifest,
+                Err(failure) => return fail_read_only(&request, &failure, output),
+            };
+            let config_dir = config_dir.as_deref().expect("state path has a parent");
+            match request.config_action.unwrap_or(ConfigAction::Show) {
+                ConfigAction::Show => {
+                    let report = build_config_report(
+                        &state,
+                        store_root.as_deref(),
+                        config_dir,
+                        id,
+                        &manifest,
+                    );
+                    match request.format {
+                        PluginFormat::Table => {
+                            let _ =
+                                output.write_all(format_config_table(&report, no_color).as_bytes());
+                        }
+                        PluginFormat::Json | PluginFormat::Jsonl => {
+                            let _ = writeln!(output, "{}", format_config_envelope(&report));
+                        }
+                    }
+                    // Fail closed after reporting: an unreadable file or a
+                    // key the schema does not declare is a hard error for an
+                    // inspection command, never a silent success.
+                    if let Some(error) = &report.file_error {
+                        eprintln!(
+                            "bitty plugin: ConfigRejected: settings file for '{id}' was \
+                             rejected: {error}"
+                        );
+                        return EXIT_PLUGIN;
+                    }
+                    if !report.dropped.is_empty() {
+                        eprintln!(
+                            "bitty plugin: UndeclaredKey: settings file for '{id}' carries \
+                             undeclared or wrong-typed keys: {}",
+                            report.dropped.join(", ")
+                        );
+                        return EXIT_PLUGIN;
+                    }
+                    EXIT_OK
+                }
+                ConfigAction::Scaffold => {
+                    match write_config_scaffold(config_dir, id, &manifest.settings, request.force) {
+                        Ok(target) => {
+                            let _ = writeln!(
+                                output,
+                                "bitty plugin: scaffolded '{}' (edit values, then restart bitty \
+                                 to apply)",
+                                target.display()
+                            );
+                            EXIT_OK
+                        }
+                        Err(failure) => {
+                            eprintln!("{}: {}", failure.code, failure.message);
+                            failure.exit
+                        }
+                    }
                 }
             }
         }
@@ -4433,6 +5270,197 @@ mod tests {
     }
 
     // ── request parsing ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_config_actions_and_aliases() {
+        let request = parse_ok(&["config", "show", "xuepoo.hello"]);
+        assert_eq!(request.verb, PluginVerb::Config);
+        assert_eq!(request.config_action, Some(ConfigAction::Show));
+        assert_eq!(request.id.as_deref(), Some("xuepoo.hello"));
+
+        let request = parse_ok(&["config", "scaffold", "xuepoo.hello"]);
+        assert_eq!(request.config_action, Some(ConfigAction::Scaffold));
+
+        // Issue shape: `config <id>` inspects, `config <id> --init` scaffolds.
+        let request = parse_ok(&["config", "xuepoo.hello"]);
+        assert_eq!(request.config_action, Some(ConfigAction::Show));
+        let request = parse_ok(&["config", "xuepoo.hello", "--init"]);
+        assert_eq!(request.config_action, Some(ConfigAction::Scaffold));
+
+        let request = parse_ok(&["config", "show", "xuepoo.hello", "--json"]);
+        assert_eq!(request.format, PluginFormat::Json);
+        let request = parse_ok(&["config", "scaffold", "xuepoo.hello", "--force"]);
+        assert!(request.force);
+    }
+
+    #[test]
+    fn parse_config_rejects_conflicting_flags() {
+        assert!(parse_error(&["config", "show", "xuepoo.hello", "--init"]).contains("conflicts"));
+        assert!(parse_error(&["config", "show", "xuepoo.hello", "--force"]).contains("--force"));
+        assert!(parse_error(&["list", "--init"]).contains("--init"));
+        assert!(parse_error(&["config"]).contains("needs a plugin id"));
+        assert!(parse_error(&["config", "show"]).contains("needs a plugin id"));
+    }
+
+    fn config_decls() -> Vec<SettingDecl> {
+        vec![
+            SettingDecl::new(
+                "show".to_string(),
+                bitty_plugin_host::manifest::SettingKind::Bool,
+                SettingDefault::Bool(true),
+            )
+            .expect("decl"),
+            SettingDecl::new(
+                "edge".to_string(),
+                bitty_plugin_host::manifest::SettingKind::String,
+                SettingDefault::String("bottom".to_string()),
+            )
+            .expect("decl"),
+            SettingDecl::new(
+                "modules".to_string(),
+                bitty_plugin_host::manifest::SettingKind::StringArray,
+                SettingDefault::Strings(vec!["workspaces".to_string(), "clock".to_string()]),
+            )
+            .expect("decl"),
+        ]
+    }
+
+    #[test]
+    fn config_scaffold_writes_canonical_lua_and_refuses_overwrite() {
+        let dir = scratch_dir("config-scaffold");
+        let target = write_config_scaffold(&dir, "xuepoo.cfg", &config_decls(), false)
+            .expect("scaffold writes");
+        assert_eq!(target, dir.join("plugins").join("xuepoo.cfg.lua"));
+        let body = std::fs::read_to_string(&target).expect("scaffold body");
+        assert!(body.contains("return {"), "{body}");
+        assert!(body.contains("show = true,"), "{body}");
+        assert!(body.contains("edge = \"bottom\","), "{body}");
+        assert!(
+            body.contains("modules = { \"workspaces\", \"clock\" },"),
+            "{body}"
+        );
+        // The template is valid plain settings Lua and round-trips.
+        let mut vm = bitty_lua::ConfigLuaVm::with_limits(
+            "xuepoo.cfg",
+            bitty_lua::PlainConfigLimits::default(),
+        )
+        .expect("vm");
+        let parsed = vm.eval_plain_config(&body).expect("template parses");
+        let bitty_lua::PlainConfigValue::Table(values) = parsed else {
+            panic!("template must return a table");
+        };
+        assert_eq!(
+            values.get("show"),
+            Some(&bitty_lua::PlainConfigValue::Bool(true))
+        );
+        assert_eq!(
+            values.get("edge"),
+            Some(&bitty_lua::PlainConfigValue::String("bottom".to_string()))
+        );
+
+        // Refuse to clobber without --force; the bytes stay untouched.
+        let failure = write_config_scaffold(&dir, "xuepoo.cfg", &config_decls(), false)
+            .expect_err("overwrite refused");
+        assert_eq!(failure.code, "AlreadyExists");
+        assert_eq!(failure.exit, EXIT_PLUGIN);
+        assert_eq!(std::fs::read_to_string(&target).expect("unchanged"), body);
+
+        // --force rewrites atomically and leaves no temp files behind.
+        let rewritten = write_config_scaffold(&dir, "xuepoo.cfg", &config_decls(), true)
+            .expect("force overwrite");
+        assert_eq!(rewritten, target);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("plugins"))
+            .expect("plugins dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SCAFFOLD_TEMP_PREFIX)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_scaffold_refuses_no_settings_and_unsafe_ids() {
+        let dir = scratch_dir("config-scaffold-empty");
+        let failure =
+            write_config_scaffold(&dir, "xuepoo.cfg", &[], false).expect_err("no settings refused");
+        assert_eq!(failure.code, "NoSettings");
+        let failure = write_config_scaffold(&dir, "../escape", &config_decls(), false)
+            .expect_err("unsafe id refused");
+        assert_eq!(failure.code, "UnsafePath");
+        assert!(!dir.join("plugins").join("xuepoo.cfg.lua").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_scaffold_refuses_symlink_target_and_symlink_dir() {
+        let dir = scratch_dir("config-scaffold-symlink");
+        let plugins = dir.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("plugins dir");
+        let outside = dir.join("outside.lua");
+        std::fs::write(&outside, "return { show = false }\n").expect("outside target");
+        let target = plugins.join("xuepoo.cfg.lua");
+        std::os::unix::fs::symlink(&outside, &target).expect("symlink target");
+        let failure = write_config_scaffold(&dir, "xuepoo.cfg", &config_decls(), true)
+            .expect_err("symlink refused even with force");
+        assert_eq!(failure.code, "SymlinkTarget");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside unchanged"),
+            "return { show = false }\n"
+        );
+
+        std::fs::remove_file(&target).expect("remove target symlink");
+        let evil = scratch_dir("config-scaffold-evil");
+        std::fs::remove_dir(&plugins).expect("remove plugins dir");
+        std::os::unix::fs::symlink(&evil, &plugins).expect("symlink plugins dir");
+        let failure = write_config_scaffold(&dir, "xuepoo.cfg", &config_decls(), false)
+            .expect_err("symlinked plugins dir refused");
+        assert_eq!(failure.code, "SymlinkTarget");
+        assert!(!evil.join("xuepoo.cfg.lua").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&evil);
+    }
+
+    #[test]
+    fn config_scaffold_escapes_hostile_string_defaults() {
+        let decls = vec![
+            SettingDecl::new(
+                "text".to_string(),
+                bitty_plugin_host::manifest::SettingKind::String,
+                SettingDefault::String("a\"b\\c\nd\te\u{1b}".to_string()),
+            )
+            .expect("decl"),
+        ];
+        let rendered = render_config_scaffold("xuepoo.cfg", &decls);
+        assert!(rendered.contains("\\\""), "{rendered}");
+        assert!(rendered.contains("\\\\"), "{rendered}");
+        assert!(rendered.contains("\\n"), "{rendered}");
+        assert!(rendered.contains("\\t"), "{rendered}");
+        assert!(rendered.contains("\\027"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+        let mut vm = bitty_lua::ConfigLuaVm::with_limits(
+            "xuepoo.cfg",
+            bitty_lua::PlainConfigLimits::default(),
+        )
+        .expect("vm");
+        let parsed = vm
+            .eval_plain_config(&rendered)
+            .expect("escaped template parses");
+        let bitty_lua::PlainConfigValue::Table(values) = parsed else {
+            panic!("template must return a table");
+        };
+        assert_eq!(
+            values.get("text"),
+            Some(&bitty_lua::PlainConfigValue::String(
+                "a\"b\\c\nd\te\u{1b}".to_string()
+            ))
+        );
+    }
 
     #[test]
     fn parse_list_defaults() {

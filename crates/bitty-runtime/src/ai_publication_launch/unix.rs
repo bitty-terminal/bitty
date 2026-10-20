@@ -108,7 +108,12 @@ impl SpawnReservation {
         }
     }
 
-    #[cfg(test)]
+    /// Test-only view of the reserved descriptor set.
+    ///
+    /// Gated on the fixture feature as well as `test`: the fixture modules are
+    /// compiled only with `publication-control-test-support`, so a plain
+    /// `--all-targets` build would otherwise see this as dead code.
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     fn descriptors(&self) -> Vec<RawFd> {
         self._placeholders
             .iter()
@@ -185,7 +190,7 @@ impl Handles {
     }
 
     /// Test-only view of the live spawn reservation descriptors.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     pub(super) fn spawn_reservation_descriptors(&self) -> Vec<RawFd> {
         self.spawn_reservation
             .as_ref()
@@ -194,13 +199,13 @@ impl Handles {
     }
 
     /// Test-only raw number of the parent bootstrap read end.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     pub(super) fn bootstrap_reader_descriptor(&self) -> Option<RawFd> {
         self.bootstrap_reader.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// Test-only raw number of the child-side control stream.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     pub(super) fn control_child_descriptor(&self) -> Option<RawFd> {
         self.control_child.as_ref().map(AsRawFd::as_raw_fd)
     }
@@ -436,8 +441,12 @@ fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 /// The low-stdio regression needs to free descriptors after launch
 /// preparation, which safe std APIs cannot express. This is the only added
 /// unsafe operation and exists solely in the audited Unix adapter under
-/// `cfg(test)`.
-#[cfg(all(test, target_os = "linux"))]
+/// `cfg(test)` plus the fixture feature.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "publication-control-test-support"
+))]
 #[allow(unsafe_code)]
 pub(super) fn close_test_descriptor(fd: RawFd) -> io::Result<()> {
     // SAFETY: the caller passes a descriptor the test process owns and no

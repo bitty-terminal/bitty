@@ -648,6 +648,9 @@ impl Drop for PreparedLaunch {
 /// separated from its authenticated channel.
 pub struct EstablishedControl {
     session: bitty_network_publication::ControlSession,
+    /// Present only where a real transport exists: the non-Unix adapter never
+    /// establishes, so its `ControlStream` placeholder is never stored.
+    #[cfg(unix)]
     stream: platform::ControlStream,
     helper_cert_sha256: [u8; 32],
 }
@@ -658,8 +661,14 @@ impl EstablishedControl {
         stream: platform::ControlStream,
         helper_cert_sha256: [u8; 32],
     ) -> Self {
+        // Keep the constructor signature platform-neutral: on non-Unix the
+        // adapter cannot establish, so the placeholder stream is discarded
+        // instead of being stored in a field that does not exist there.
+        #[cfg(not(unix))]
+        let _ = stream;
         Self {
             session,
+            #[cfg(unix)]
             stream,
             helper_cert_sha256,
         }
@@ -785,19 +794,30 @@ fn validate_identity_string(field: &'static str, value: &str) -> Result<(), Laun
 }
 
 /// Internal establishment outcome, shared by both platform adapters.
+///
+/// Every variant is `cfg`-gated on the adapter that constructs it: a shared
+/// enum would otherwise carry variants that are dead code on one platform,
+/// which `-D warnings` rejects in the Windows feature-graph check.
 enum EstablishFailure {
     /// Constructed only by the non-Unix adapter.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg(not(unix))]
     Unsupported,
+    /// Constructed only by the Unix adapter's deadline path.
+    #[cfg(unix)]
     Timeout,
+    /// Constructed only by the Unix adapter's TLS path.
+    #[cfg(unix)]
     Tls(bitty_network_publication::ControlError),
 }
 
 impl EstablishFailure {
     fn into_launch_error(self) -> LaunchError {
         match self {
+            #[cfg(not(unix))]
             Self::Unsupported => LaunchError::UnsupportedPlatform,
+            #[cfg(unix)]
             Self::Timeout => LaunchError::EstablishTimeout,
+            #[cfg(unix)]
             Self::Tls(error) => LaunchError::TlsRefused(TlsRefusal::from(error)),
         }
     }

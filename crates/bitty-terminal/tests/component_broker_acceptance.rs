@@ -118,8 +118,10 @@ fn extension_list(data_home: &Path, format: Option<&str>) -> String {
         .args(["extension", "list"])
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home)
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("HOME", &home)
         .env_remove("BITTY_COMPONENTS_DIR")
+        .env_remove("BITTY_COMPONENT_STATE_DIR")
         .env_remove("BITTY_CONFIG")
         .env("NO_COLOR", "1");
     if let Some(format) = format {

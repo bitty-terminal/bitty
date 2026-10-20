@@ -47,11 +47,13 @@ fn run_in(home: &Path, system: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("XDG_CONFIG_HOME", home)
         .env("XDG_DATA_HOME", home)
+        .env("XDG_STATE_HOME", home.join("state"))
         .env("HOME", home)
         .env("BITTY_SYSTEM_COMPONENTS_DIR", system)
         .env("NO_COLOR", "1")
         .env_remove("BITTY_CONFIG")
         .env_remove("BITTY_COMPONENTS_DIR")
+        .env_remove("BITTY_COMPONENT_STATE_DIR")
         .env_remove("BITTY_PLUGIN_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -77,11 +79,13 @@ fn run_with_env(home: &Path, system: &Path, args: &[&str], extra_env: &[(&str, &
         .args(args)
         .env("XDG_CONFIG_HOME", home)
         .env("XDG_DATA_HOME", home)
+        .env("XDG_STATE_HOME", home.join("state"))
         .env("HOME", home)
         .env("BITTY_SYSTEM_COMPONENTS_DIR", system)
         .env("NO_COLOR", "1")
         .env_remove("BITTY_CONFIG")
         .env_remove("BITTY_COMPONENTS_DIR")
+        .env_remove("BITTY_COMPONENT_STATE_DIR")
         .env_remove("BITTY_PLUGIN_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -963,5 +967,51 @@ fn extension_list_reports_recorded_activation_state() {
     let output = run_in(&home, &system, &["extension", "remove", "net", "0.0.1"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(!component_dir.exists(), "component dir must be pruned");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_list_prints_state_record_once_on_the_active_version() {
+    let home = scratch_dir("activation-state-per-version");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    for version in ["0.0.1", "0.0.2"] {
+        let source = write_source_dir(
+            &home.join(format!("source-{version}")),
+            "net",
+            version,
+            "[1, 1]",
+        );
+        let output = run_in(
+            &home,
+            &system,
+            &["extension", "add", &source.display().to_string()],
+        );
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+    let state_dir = home
+        .join("state")
+        .join("bitty")
+        .join("extensions")
+        .join("net");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(state_dir.join("activation"), "v1 active\n").expect("state record");
+
+    let output = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("net "))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    let column = |version: &str| {
+        rows.iter()
+            .find(|line| line.split_whitespace().nth(1) == Some(version))
+            .and_then(|line| line.split_whitespace().nth(5))
+            .map(str::to_owned)
+    };
+    assert_ne!(column("0.0.1").as_deref(), Some("active"), "{text}");
+    assert_eq!(column("0.0.2").as_deref(), Some("active"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }

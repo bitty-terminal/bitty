@@ -697,6 +697,13 @@ fn activation_marks_a_crashed_component() {
         Err(BrokerError::Backoff { .. })
     ));
     assert_eq!(read_activation(&component_dir), ActivationState::Crashed);
+    // A different plugin's capability denial must not rewrite the latch:
+    // only a later spawn records a new transition.
+    broker.record_activation(
+        NAME,
+        ActivationState::Denied(ActivationDenial::CapabilityDenied),
+    );
+    assert_eq!(read_activation(&component_dir), ActivationState::Crashed);
 }
 
 #[test]
@@ -749,19 +756,28 @@ fn activation_names_a_denial_class_and_never_escapes_the_root() {
 }
 
 #[test]
-fn system_only_components_are_not_recorded() {
-    // The system tier is read-only: a broker configured without a user root
-    // never writes an activation record (the component lists as installed).
+fn system_only_components_record_into_the_state_root() {
+    // The system tier is read-only, but the shared state root is writable:
+    // a system-only install records activation there and lists it without
+    // touching the install tree.
     let scratch = Scratch::new("activation-system");
     install(&scratch.0, "echo");
+    let state_root = scratch.0.join("state");
     let mut broker = ComponentBroker::new(
-        BrokerConfig::new(None, ComponentEnv::empty()).with_system_root(Some(scratch.0.clone())),
+        BrokerConfig::new(None, ComponentEnv::empty())
+            .with_system_root(Some(scratch.0.clone()))
+            .with_activation_root(Some(state_root.clone())),
     );
     let now = Instant::now();
     let id = broker
         .submit(now, NAME, &grant(), request())
         .expect("submit");
     until_terminal(&mut broker, now, id);
+    assert_eq!(
+        read_activation(&state_root.join(NAME)),
+        ActivationState::Active
+    );
+    // The install tree stays untouched.
     assert_eq!(
         read_activation(&scratch.0.join(NAME)),
         ActivationState::Installed

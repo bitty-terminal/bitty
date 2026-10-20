@@ -4,18 +4,27 @@
 //! instance, opens IPC, or executes a component, so it cannot read a live
 //! broker's in-memory slots. Instead, the broker records each activation
 //! transition it already makes (spawn, crash, idle/shutdown stop) and each
-//! fail-closed denial into one bounded plain-text record beside the
-//! component's `current` pointer:
+//! fail-closed denial into one bounded plain-text record under the user state
+//! directory:
 //!
 //! ```text
-//! <user-root>/<name>/activation     # "v1 active\n", "v1 denied:capability_denied\n"
+//! <state-root>/<name>/activation     # "v1 active\n", "v1 denied:capability_denied\n"
 //! ```
+//!
+//! The state root is `$XDG_STATE_HOME/bitty/extensions`
+//! (`$HOME/.local/state/bitty/extensions` when `XDG_STATE_HOME` is unset).
+//! It is independent of the install tiers, so the record covers user and
+//! system installs alike and survives reinstalls. A user-tier record written
+//! beside `current` by older builds is still read as a fallback; new writes
+//! only go to the state directory.
 //!
 //! This is a projection of [`ComponentState`](super::ComponentState) and the
 //! stable [`ComponentHostError::class`](super::ComponentHostError) labels, not
 //! a second state machine: the broker writes it exactly at the transition
 //! points it already handles, and [`read_activation`] is the only reader.
-//! A missing, oversized, non-regular, or malformed record reads as
+//! The label is a last-recorded transition, never a liveness probe: `active`
+//! means a spawn was recorded, not that the process is running now. A
+//! missing, oversized, non-regular, or malformed record reads as
 //! [`ActivationState::Installed`] ("no activation recorded"), never as an
 //! unearned `active`.
 //!
@@ -26,22 +35,33 @@
 //!   handle, and reads at most
 //!   [`COMPONENT_ACTIVATION_MAX_BYTES`]` + 1` bytes through it, so a symlink
 //!   swapped in after a separate `symlink_metadata` cannot redirect or unbound
-//!   the read.
+//!   the read. A symlinked component record directory is refused too.
 //! - The writer creates a fresh sibling temp record with `create_new` (which
 //!   refuses a planted symlink), writes and flushes it, renames it over
 //!   `activation`, and flushes the directory. A failed creation never removes
-//!   an entry the writer did not create.
-//!
-//! Only the writable user tier is recorded. The system tier is read-only
-//! (owned by the package manager), so a system-only component lists as
-//! `installed` until a later user-tier activation overwrites the record.
+//!   an entry the writer did not create. A symlinked component record
+//!   directory is refused; only a missing real directory is created.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Record file name beside `current` in a user-tier component directory.
+/// Record file name inside one component's state directory.
 pub const COMPONENT_ACTIVATION_FILE: &str = "activation";
+
+/// Directory under the Bitty state directory holding activation records.
+///
+/// Uses the approved `extensions/` name: the directory-semantics contract
+/// freezes `components/` for boot-required units and historic identifiers,
+/// and forbids new on-disk roots under that name.
+pub const COMPONENT_ACTIVATION_DIR_NAME: &str = "extensions";
+
+/// Test-only override for the component state root (not a user
+/// configuration surface; mirrors [`super::COMPONENTS_DIR_ENV`]).
+pub const COMPONENT_STATE_DIR_ENV: &str = "BITTY_COMPONENT_STATE_DIR";
+
+/// Prefix the writer uses for temporary records beside `activation`.
+const ACTIVATION_TEMP_PREFIX: &str = "activation.tmp-";
 
 /// Maximum bytes read from or written to one activation record.
 ///
@@ -172,10 +192,46 @@ impl ActivationState {
     }
 }
 
-/// Record path inside one user-tier component directory.
+/// Record path inside one component state directory.
 #[must_use]
 pub fn activation_path(component_dir: &Path) -> PathBuf {
     component_dir.join(COMPONENT_ACTIVATION_FILE)
+}
+
+/// `$XDG_STATE_HOME` or `$HOME/.local/state` from explicit environment
+/// values (empty or whitespace-only values count as unset).
+///
+/// Component activation diagnostics live under this user-owned tree rather
+/// than under either install tier.
+#[must_use]
+pub fn state_home_for(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_state_home {
+        if !xdg.trim().is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    home.filter(|home| !home.trim().is_empty())
+        .map(|home| PathBuf::from(home).join(".local").join("state"))
+}
+
+/// Component activation state root (`<state-home>/bitty/extensions`).
+///
+/// The explicit override wins when non-empty (tests). Unlike the install
+/// roots, this root is not a trust boundary for executable resolution: it
+/// only holds last-recorded diagnostic records.
+#[must_use]
+pub fn component_state_root_for(
+    override_dir: Option<&str>,
+    xdg_state_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(dir) = override_dir {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    state_home_for(xdg_state_home, home)
+        .map(|base| base.join("bitty").join(COMPONENT_ACTIVATION_DIR_NAME))
 }
 
 /// Open the record for reading without following a link at that path.
@@ -292,6 +348,12 @@ fn read_record_bytes(file: &std::fs::File, metadata: &std::fs::Metadata) -> Opti
 /// read use that handle.
 #[must_use]
 pub fn read_activation(component_dir: &Path) -> ActivationState {
+    match std::fs::symlink_metadata(component_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return ActivationState::Installed;
+        }
+        Ok(_) | Err(_) => {}
+    }
     let path = activation_path(component_dir);
     let Ok(file) = open_record_no_follow(&path) else {
         return ActivationState::Installed;
@@ -311,9 +373,9 @@ pub fn read_activation(component_dir: &Path) -> ActivationState {
 
 /// Read the recorded activation for `name` across both tiers.
 ///
-/// The user tier wins (it is the writable tier the broker records into);
-/// the system tier is read as a fallback for installations that were
-/// activated before a user-tier record existed. An invalid name reads as
+/// The state directory wins (it is where the broker records now); a legacy
+/// user-tier record beside `current` is the next fallback, then a legacy
+/// system-tier record. An invalid name reads as
 /// [`ActivationState::Installed`] instead of touching an escaped path.
 #[must_use]
 pub fn read_component_activation(
@@ -321,10 +383,24 @@ pub fn read_component_activation(
     system_root: Option<&Path>,
     name: &str,
 ) -> ActivationState {
+    read_component_activation_with_state(user_root, system_root, None, name)
+}
+
+/// [`read_component_activation`] with the explicit state root.
+///
+/// The state root covers both install tiers and survives reinstalls; when it
+/// holds no record, legacy records beside `current` are still honored.
+#[must_use]
+pub fn read_component_activation_with_state(
+    user_root: Option<&Path>,
+    system_root: Option<&Path>,
+    state_root: Option<&Path>,
+    name: &str,
+) -> ActivationState {
     if super::descriptor::validate_component_name(name).is_err() {
         return ActivationState::Installed;
     }
-    for root in [user_root, system_root].into_iter().flatten() {
+    for root in [state_root, user_root, system_root].into_iter().flatten() {
         let state = read_activation(&root.join(name));
         if state != ActivationState::Installed {
             return state;
@@ -343,6 +419,10 @@ pub fn read_component_activation(
 pub(crate) enum ActivationWriteError {
     /// The record path exists and is not a regular file (symlink, directory).
     RecordNotRegular,
+    /// The component record directory is a symlink or not a directory.
+    ComponentDirNotRegular,
+    /// Creating a missing component record directory failed.
+    DirCreate(std::io::Error),
     /// The record would exceed [`COMPONENT_ACTIVATION_MAX_BYTES`].
     RecordOversize,
     /// Every candidate temporary name already existed (`AlreadyExists`).
@@ -361,6 +441,10 @@ impl std::fmt::Display for ActivationWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RecordNotRegular => f.write_str("activation record path is not a regular file"),
+            Self::ComponentDirNotRegular => {
+                f.write_str("activation component directory is not a real directory")
+            }
+            Self::DirCreate(error) => write!(f, "activation directory create failed: {error}"),
             Self::RecordOversize => f.write_str("activation record exceeds the byte ceiling"),
             Self::TempNameExhausted => f.write_str("no free activation temp name"),
             Self::TempCreate(error) => write!(f, "activation temp create failed: {error}"),
@@ -377,8 +461,12 @@ impl std::error::Error for ActivationWriteError {
             Self::TempCreate(error)
             | Self::TempWrite(error)
             | Self::Rename(error)
-            | Self::SyncDir(error) => Some(error),
-            Self::RecordNotRegular | Self::RecordOversize | Self::TempNameExhausted => None,
+            | Self::SyncDir(error)
+            | Self::DirCreate(error) => Some(error),
+            Self::RecordNotRegular
+            | Self::ComponentDirNotRegular
+            | Self::RecordOversize
+            | Self::TempNameExhausted => None,
         }
     }
 }
@@ -416,6 +504,66 @@ fn next_temp_serial() -> u64 {
     NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Create one missing component record directory, never through a symlink.
+///
+/// The state record directory may not exist on first activation. An existing
+/// symlink or non-directory is refused instead of followed, matching the
+/// record-path rule; creating parent directories is delegated to the OS but
+/// the created component directory itself is re-checked.
+fn ensure_record_dir(dir: &Path) -> Result<(), ActivationWriteError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ActivationWriteError::ComponentDirNotRegular);
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ActivationWriteError::DirCreate(error)),
+    }
+    std::fs::create_dir_all(dir).map_err(ActivationWriteError::DirCreate)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(ActivationWriteError::ComponentDirNotRegular)
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(ActivationWriteError::DirCreate(error)),
+    }
+}
+
+/// Remove one component's record and any stale writer temporaries.
+///
+/// A process killed between temp creation and rename leaves an
+/// `activation.tmp-*` entry behind. Such entries are never records, but they
+/// keep an otherwise empty component directory from being pruned, so a
+/// removed component can linger as "(missing version dir)". Callers that
+/// remove the last installed version sweep both the record and those
+/// temporaries; unrelated files are left untouched.
+pub fn remove_activation_artifacts(component_dir: &Path) {
+    let _ = std::fs::remove_file(activation_path(component_dir));
+    let Ok(entries) = std::fs::read_dir(component_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(ACTIVATION_TEMP_PREFIX)
+        {
+            // Remove the entry itself, including a planted symlink (a
+            // symlink reports `is_dir == false`), and never follow it to a
+            // target. A same-name directory is writer litter too: versions
+            // are strict semver and can never carry this prefix.
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+                _ => {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
 /// Write one activation record (the broker drops the typed error).
 ///
 /// The write goes through a sibling temp file created with `create_new` and a
@@ -441,6 +589,7 @@ fn write_activation_with(
     state: ActivationState,
     next_serial: &dyn Fn() -> u64,
 ) -> Result<(), ActivationWriteError> {
+    ensure_record_dir(component_dir)?;
     let path = activation_path(component_dir);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -456,7 +605,7 @@ fn write_activation_with(
     let mut created = None;
     for _ in 0..ACTIVATION_TEMP_ATTEMPTS {
         let temp = component_dir.join(format!(
-            "{COMPONENT_ACTIVATION_FILE}.tmp-{}-{}",
+            "{ACTIVATION_TEMP_PREFIX}{}-{}",
             std::process::id(),
             next_serial()
         ));
@@ -741,5 +890,101 @@ mod tests {
             ActivationState::Installed
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn state_root_resolves_from_xdg_then_home() {
+        assert_eq!(
+            component_state_root_for(Some("override"), Some("xdg-state"), Some("home")),
+            Some(PathBuf::from("override"))
+        );
+        assert_eq!(
+            component_state_root_for(None, Some("xdg-state"), Some("home")),
+            Some(PathBuf::from("xdg-state/bitty/extensions"))
+        );
+        assert_eq!(
+            component_state_root_for(Some("  "), Some(" "), Some("home")),
+            Some(PathBuf::from("home/.local/state/bitty/extensions"))
+        );
+        assert_eq!(component_state_root_for(None, Some(" "), Some(" ")), None);
+    }
+
+    #[test]
+    fn state_record_covers_system_tier_and_survives_reinstall() {
+        let base = scratch("state-tier");
+        let system = base.join("system");
+        let state = base.join("state");
+        std::fs::create_dir_all(system.join("net")).expect("system dir");
+        // No legacy record exists; the state directory wins and is created
+        // on first write, including for a system-only install.
+        assert_eq!(
+            read_component_activation_with_state(None, Some(&system), Some(&state), "net"),
+            ActivationState::Installed
+        );
+        let component_state = state.join("net");
+        write_activation(&component_state, ActivationState::Active).expect("state record");
+        assert_eq!(
+            read_component_activation_with_state(None, Some(&system), Some(&state), "net"),
+            ActivationState::Active
+        );
+        // A reinstalled component keeps the last transition until the next
+        // activation overwrites it.
+        assert_eq!(
+            read_component_activation_with_state(None, None, Some(&state), "net"),
+            ActivationState::Active
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_component_dir_is_refused() {
+        let base = scratch("state-symlink-dir");
+        let outside = base.join("outside");
+        let state = base.join("state");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::create_dir_all(&state).expect("state");
+        std::os::unix::fs::symlink(&outside, state.join("net")).expect("symlink");
+        assert!(matches!(
+            write_activation(&state.join("net"), ActivationState::Active),
+            Err(ActivationWriteError::ComponentDirNotRegular)
+        ));
+        assert!(!outside.join(COMPONENT_ACTIVATION_FILE).exists());
+        // Reading through the symlinked directory never claims a state.
+        std::fs::write(outside.join(COMPONENT_ACTIVATION_FILE), "v1 active\n")
+            .expect("outside record");
+        assert_eq!(
+            read_activation(&state.join("net")),
+            ActivationState::Installed
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_temp_removal_sweeps_only_activation_artifacts() {
+        let dir = scratch("sweep");
+        std::fs::write(activation_path(&dir), "v1 active\n").expect("record");
+        std::fs::write(dir.join(format!("{ACTIVATION_TEMP_PREFIX}7-0")), "partial").expect("temp");
+        std::fs::write(dir.join(format!("{ACTIVATION_TEMP_PREFIX}7-1")), "partial").expect("temp");
+        std::fs::create_dir(dir.join(format!("{ACTIVATION_TEMP_PREFIX}8-0"))).expect("temp dir");
+        std::fs::write(dir.join("unrelated"), "keep").expect("unrelated");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, "v1 active\n").expect("outside");
+        std::os::unix::fs::symlink(&outside, dir.join(format!("{ACTIVATION_TEMP_PREFIX}9-0")))
+            .expect("temp link");
+        remove_activation_artifacts(&dir);
+        assert_eq!(read_activation(&dir), ActivationState::Installed);
+        assert!(!dir.join(format!("{ACTIVATION_TEMP_PREFIX}7-0")).exists());
+        assert!(!dir.join(format!("{ACTIVATION_TEMP_PREFIX}7-1")).exists());
+        assert!(!dir.join(format!("{ACTIVATION_TEMP_PREFIX}8-0")).exists());
+        assert!(!dir.join(format!("{ACTIVATION_TEMP_PREFIX}9-0")).exists());
+        assert!(dir.join("unrelated").exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside"),
+            "v1 active\n",
+            "sweeping a temp link must not follow it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,11 +20,16 @@
 //! mistakes that send nothing ([`PublicationControlError::NotReady`] and
 //! [`PublicationControlError::Busy`]) are reported without revoking.
 //!
-//! Core assigns the publication identity and version. The tuple's
-//! `snapshot_version` is that same Core-assigned version: `1` for the first
-//! adopted projection and strictly increasing for every later initial or
-//! rotation projection. No rotation resets the version or the per-direction
-//! record sequence.
+//! Core owns two independent monotonic counters. The publication version lives
+//! in the tuple's `PublicationId` and advances for every publication attempt.
+//! The tuple's `snapshot_version` is the R1 source-view snapshot version: `1`
+//! for the first adopted Projection, then one greater each time Core replaces
+//! its accepted source view (every later rotation Projection, including reset
+//! and source-mutation rotations). It is never inferred from the helper feed
+//! revision, from the publication version, or from the generic IPC
+//! `snapshot_version` field, and it does not advance merely because the
+//! publication version does. Neither counter resets on rotation, and the
+//! per-direction record sequence never resets.
 //!
 //! # Deliberately out of scope
 //!
@@ -320,7 +325,9 @@ pub enum ControlEvent {
         lifetime_id: LifetimeId,
         /// Registry feed revision.
         feed_revision: u64,
-        /// Fresh Core publication version.
+        /// Core-minted R1 source-view snapshot version.
+        snapshot_version: u64,
+        /// Fresh Core publication version (in the tuple's publication identity).
         publication_version: u64,
     },
     /// The exact pending publication was acknowledged.
@@ -535,6 +542,13 @@ struct InvalidationWait {
     crossed_consumed: bool,
 }
 
+/// First Core publication version minted for the initial adopted projection.
+const INITIAL_PUBLICATION_VERSION: u64 = 1;
+
+/// First R1 source-view snapshot version minted for the initial adopted
+/// projection.
+const INITIAL_SOURCE_VIEW_VERSION: u64 = 1;
+
 /// Core-side provider-publication control driver.
 ///
 /// `T` is any [`ControlRecordIo`] implementation; production uses
@@ -557,7 +571,9 @@ pub struct PublicationControl<T> {
     retirement_crossed: bool,
     invalidation: Option<InvalidationWait>,
     retired_receipt: Option<ReceiptId>,
+    snapshot_version: Option<u64>,
     next_version: u64,
+    next_snapshot_version: u64,
     revocation: Option<RevocationReason>,
 }
 
@@ -587,7 +603,9 @@ impl<T: ControlRecordIo> PublicationControl<T> {
             retirement_crossed: false,
             invalidation: None,
             retired_receipt: None,
-            next_version: 1,
+            snapshot_version: None,
+            next_version: INITIAL_PUBLICATION_VERSION,
+            next_snapshot_version: INITIAL_SOURCE_VIEW_VERSION,
             revocation: None,
         })
     }
@@ -632,7 +650,17 @@ impl<T: ControlRecordIo> PublicationControl<T> {
         self.receipt.map(|receipt| receipt.receipt)
     }
 
-    /// Publication version the next adopted projection will allocate.
+    /// R1 source-view snapshot version of the current adopted view, if one is
+    /// current.
+    ///
+    /// This is the tuple's `snapshot_version`; it is independent of the
+    /// publication version and of the helper feed revision.
+    #[must_use]
+    pub const fn snapshot_version(&self) -> Option<u64> {
+        self.snapshot_version
+    }
+
+    /// Publication version the next publication mint will allocate.
     #[must_use]
     pub const fn next_publication_version(&self) -> u64 {
         self.next_version
@@ -996,26 +1024,18 @@ impl<T: ControlRecordIo> PublicationControl<T> {
 
         let canonical = payload.canonical_bytes();
         let digest = Digest::of(&canonical);
-        let version = self.next_version;
-        let Some(next) = version.checked_add(1) else {
-            return Err(self.fail(
-                PublicationControlError::VersionExhausted,
-                RevocationReason::ResourceLimit,
-            ));
-        };
-        let tuple = Tuple::new(
-            PublicationId::from_parts(self.binding.launch_nonce, version),
-            version,
-            digest,
-        )
-        .map_err(|error| {
-            self.fail(
-                PublicationControlError::Record(error),
-                RevocationReason::ProtocolViolation,
-            )
-        })?;
+        let publication_version = self.allocate_publication_version()?;
+        let snapshot_version = self.allocate_source_view_version()?;
+        let tuple = self
+            .mint_tuple(publication_version, snapshot_version, digest)
+            .map_err(|error| {
+                self.fail(
+                    PublicationControlError::Record(error),
+                    RevocationReason::ProtocolViolation,
+                )
+            })?;
 
-        self.next_version = next;
+        self.snapshot_version = Some(snapshot_version);
         self.feed_revision = Some(feed_revision);
         self.view = Some(MetadataView {
             projection: payload,
@@ -1031,8 +1051,58 @@ impl<T: ControlRecordIo> PublicationControl<T> {
         Ok(ControlEvent::ProjectionAdopted {
             lifetime_id,
             feed_revision,
-            publication_version: version,
+            snapshot_version,
+            publication_version,
         })
+    }
+
+    /// Mint the next Core publication version.
+    ///
+    /// This counter advances for every publication attempt and is independent
+    /// of the R1 source-view snapshot version.
+    fn allocate_publication_version(&mut self) -> Result<u64, PublicationControlError> {
+        let version = self.next_version;
+        let Some(next) = version.checked_add(1) else {
+            return Err(self.fail(
+                PublicationControlError::VersionExhausted,
+                RevocationReason::ResourceLimit,
+            ));
+        };
+        self.next_version = next;
+        Ok(version)
+    }
+
+    /// Mint the next Core source-view snapshot version.
+    ///
+    /// The counter advances only when Core adopts a replacement source view.
+    /// In this state machine every `Projection` in `AwaitProjection` is such a
+    /// replacement: the initial adoption mints `1`, and each rotation
+    /// (source mutation, registry mutation, reset, or supersession) mints the
+    /// next value. A publication-only re-mint would not call this method.
+    fn allocate_source_view_version(&mut self) -> Result<u64, PublicationControlError> {
+        let version = self.next_snapshot_version;
+        let Some(next) = version.checked_add(1) else {
+            return Err(self.fail(
+                PublicationControlError::VersionExhausted,
+                RevocationReason::ResourceLimit,
+            ));
+        };
+        self.next_snapshot_version = next;
+        Ok(version)
+    }
+
+    /// Build one tuple from the two independent Core-owned versions.
+    fn mint_tuple(
+        &self,
+        publication_version: u64,
+        snapshot_version: u64,
+        digest: Digest,
+    ) -> Result<Tuple, ControlError> {
+        Tuple::new(
+            PublicationId::from_parts(self.binding.launch_nonce, publication_version),
+            snapshot_version,
+            digest,
+        )
     }
 
     fn handle_ack(&mut self, body: RecordBody) -> Result<ControlEvent, PublicationControlError> {
@@ -1291,6 +1361,7 @@ impl<T: ControlRecordIo> PublicationControl<T> {
         }
         self.view = None;
         self.pending = None;
+        self.snapshot_version = None;
     }
 
     fn stale(&mut self) -> PublicationControlError {
@@ -1347,6 +1418,7 @@ impl<T: ControlRecordIo> PublicationControl<T> {
         self.retirement_crossed = false;
         self.invalidation = None;
         self.retired_receipt = None;
+        self.snapshot_version = None;
         // Dropping the transport closes the authenticated session.
         self.io = None;
     }

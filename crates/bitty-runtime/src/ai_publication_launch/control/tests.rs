@@ -296,6 +296,7 @@ fn drive_to_ready(script: &mut Script, control: &mut PublicationControl<TestPeer
         control.receive().expect("projection"),
         ControlEvent::ProjectionAdopted {
             feed_revision: 1,
+            snapshot_version: 1,
             publication_version: 1,
             ..
         }
@@ -389,12 +390,14 @@ fn golden_establish_projection_publish_ack_bind_bound() {
         ControlEvent::ProjectionAdopted {
             lifetime_id: lifetime(),
             feed_revision: 1,
+            snapshot_version: 1,
             publication_version: 1,
         }
     );
     assert_eq!(control.phase(), ControlPhase::Ready);
     let view: &MetadataView = control.view().expect("adopted view");
     assert_eq!(view.feed_revision(), 1);
+    assert_eq!(control.snapshot_version(), Some(1));
     assert_eq!(view.providers(), &[]);
     assert_eq!(
         view.canonical_bytes(),
@@ -467,6 +470,42 @@ fn golden_establish_projection_publish_ack_bind_bound() {
     // Slice boundary: no data-channel admission record is ever sent.
     let sent = script.take_sent();
     assert!(sent.is_empty());
+}
+
+#[test]
+fn publication_version_can_advance_without_a_new_source_view() {
+    let mut script = Script::new();
+    let mut control = script.control();
+    drive_to_ready(&mut script, &mut control);
+    assert_eq!(control.snapshot_version(), Some(1));
+    assert_eq!(control.next_publication_version(), 2);
+
+    // A publication-only mint does not adopt a new source view: only the
+    // publication version advances, while the tuple keeps snapshot version 1.
+    let publication_version = control
+        .allocate_publication_version()
+        .expect("publication version");
+    assert_eq!(publication_version, 2);
+    assert_eq!(control.next_publication_version(), 3);
+    assert_eq!(control.snapshot_version(), Some(1), "source view unchanged");
+
+    let tuple = control
+        .mint_tuple(
+            publication_version,
+            control.snapshot_version().expect("snapshot"),
+            empty_projection().digest(),
+        )
+        .expect("tuple");
+    assert_eq!(tuple.publication_id.version(), 2);
+    assert_eq!(tuple.snapshot_version, 1);
+
+    // Minting the next source-view version does not adopt it; the current
+    // view keeps its snapshot until a Projection replaces it.
+    let next_snapshot = control
+        .allocate_source_view_version()
+        .expect("source-view version");
+    assert_eq!(next_snapshot, 2);
+    assert_eq!(control.snapshot_version(), Some(1));
 }
 
 #[test]
@@ -788,9 +827,11 @@ fn helper_registry_mutation_rotates_and_republishes() {
         ControlEvent::ProjectionAdopted {
             lifetime_id: second_lifetime(),
             feed_revision: 2,
+            snapshot_version: 2,
             publication_version: 2,
         }
     );
+    assert_eq!(control.snapshot_version(), Some(2));
     let new_tuple = control.send_publish().expect("republish");
     assert_eq!(new_tuple.publication_id.version(), 2);
     assert_eq!(new_tuple.snapshot_version, 2);
@@ -847,9 +888,11 @@ fn core_invalidation_rotates_and_republishes() {
         ControlEvent::ProjectionAdopted {
             lifetime_id: second_lifetime(),
             feed_revision: 1,
+            snapshot_version: 2,
             publication_version: 2,
         }
     );
+    assert_eq!(control.snapshot_version(), Some(2));
     let tuple = control.send_publish().expect("republish");
     assert_eq!(tuple.publication_id.version(), 2);
     assert_eq!(tuple.snapshot_version, 2);

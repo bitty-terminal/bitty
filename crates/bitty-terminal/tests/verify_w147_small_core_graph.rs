@@ -1,5 +1,6 @@
 //! W-147 final verification gate: small-core dependency graph + safe startup
-//! (CTX-0940, issue #1621).
+//! (CTX-0940, issue #1621; extended to every extracted extension crate by
+//! CTX-1364 / #2256).
 //!
 //! These tests pin the program end-state so a later change cannot silently
 //! re-grow the retired surface:
@@ -9,25 +10,34 @@
 //!   edge;
 //! - harness-only crates (`bitty-test-support`, `bitty-test-vm`) are
 //!   dev-dependencies only: no production (`[dependencies]`) edge anywhere;
-//! - extension mechanics (`bitty-storage`, `bitty-graphics`, `bitty-execution`,
-//!   `bitty-a11y`) link only through the composition root (`bitty-terminal`),
-//!   behind Core-owned traits; Core library sources never name an extension
-//!   implementation (`Core-never-imports-extension`, W-146 DEC-W146-2,
-//!   generalized to all four by CTX-1086 / #1890);
+//! - every extracted extension crate is fenced. Implementation crates
+//!   (`bitty-storage`, `bitty-execution`, `bitty-graphics`, `bitty-a11y`,
+//!   `bitty-agent`, `bitty-agent-api`, `bitty-observability`,
+//!   `bitty-observability-core`, `bitty-network`, `bitty-net`) must have no
+//!   normal dependency edge and no Core source identifier; `bitty-storage` is
+//!   the single composition-root seam, linked only by `bitty-terminal` and
+//!   named only in `storage_backends.rs`. Seam crates
+//!   (`bitty-ipc`, `bitty-network-wire`, `bitty-network-publication`,
+//!   `bitty-observability-api`, `bitty-platform-services`,
+//!   `bitty-url-detector`) are contract/codec/transport seams Core is expected
+//!   to link; `SEAM_CRATES` records the exact consumers allowed and Core may
+//!   name them by design;
+//! - a new direct git dependency from an extension repository fails
+//!   `every_direct_extension_dependency_is_fenced` until its crate is added to
+//!   `EXTENSION_CRATES`;
 //! - `bitty --safe` starts with zero third-party plugins: the safe load
 //!   policy selects nothing hostile, and the built binary skips a hostile
 //!   dev-root plugin with no VM.
 //!
 //! Source-level vs manifest-level: the `Cargo.toml` gate
-//! (`only_composition_root_links_storage_extension`) proves no production
-//! dependency edge exists, but it stays green when Core duplicates extension
-//! logic without declaring a dependency (audit CTX-1085 F10: kitty
+//! (`extension_crate_edges_match_fence_policy`) proves every dependency edge
+//! matches its fence policy, but it stays green when Core duplicates
+//! extension logic without declaring a dependency (audit CTX-1085 F10: kitty
 //! decode/raster, process supervisors, a11y model). The
-//! `core_library_sources_never_name_extension_impls` scan adds a source-reference
-//! fence by rejecting the `bitty_storage` / `bitty_execution` /
-//! `bitty_graphics` / `bitty_a11y` identifiers in Core library sources. It does
-//! not detect copied logic that contains none of these identifiers. To fence a fifth
-//! extension crate, add one entry to `EXTENSION_CRATES` (storage stays first).
+//! `core_library_sources_never_name_extension_impls` scan adds a
+//! source-reference fence by rejecting every implementation identifier in Core
+//! library sources. It does not detect copied logic that contains none of
+//! these identifiers.
 //!
 //! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the
 //! CTX-0940 verification report) shows `bitty-storage` reachable only from
@@ -49,15 +59,57 @@ const TEST_ONLY_CRATES: &[&str] = &[
     "bitty-test-vm",
 ];
 
-/// Extension crates that must link only where the seam requires (W-140..W-146).
-/// `bitty-storage` is the single permitted production edge, owned by the
-/// composition root; execution/graphics/a11y must not appear at all.
+/// Every extracted extension crate covered by the W-147 fence. Crates absent
+/// from `SEAM_CRATES` are implementation crates: no normal dependency edge and
+/// no Core source identifier. `bitty-storage` stays first because it is the
+/// only implementation crate linked by the composition root
+/// (`bitty-terminal`), and only `storage_backends.rs` may name it.
+///
+/// Crates in `SEAM_CRATES` are contract/codec seams Core is expected to link;
+/// that table records the exact allowed consumers. Adding a direct extension
+/// dependency fails `every_direct_extension_dependency_is_fenced` until the
+/// crate is listed here.
 const EXTENSION_CRATES: &[&str] = &[
     "bitty-storage",
     "bitty-execution",
     "bitty-graphics",
     "bitty-a11y",
+    "bitty-agent",
+    "bitty-agent-api",
+    "bitty-observability",
+    "bitty-observability-core",
+    "bitty-network",
+    "bitty-net",
+    "bitty-ipc",
+    "bitty-network-wire",
+    "bitty-network-publication",
+    "bitty-observability-api",
+    "bitty-platform-services",
+    "bitty-url-detector",
 ];
+
+/// Composition-root seam crates and the exact workspace members allowed to
+/// declare a normal dependency on each. These carry contracts or codecs, not
+/// extension mechanics, so Core naming them is expected. Every crate in
+/// `EXTENSION_CRATES` that is absent here must have no normal edge at all.
+const SEAM_CRATES: &[(&str, &[&str])] = &[
+    (
+        "bitty-ipc",
+        &["bitty-rich", "bitty-runtime", "bitty-terminal"],
+    ),
+    ("bitty-network-wire", &["bitty-runtime"]),
+    // Feature-gated publication-control transport (CTX-1373, bitty#2199):
+    // intentionally linked by the runtime, default-off.
+    ("bitty-network-publication", &["bitty-runtime"]),
+    ("bitty-observability-api", &["bitty-terminal"]),
+    ("bitty-platform-services", &["bitty-runtime"]),
+    ("bitty-url-detector", &["bitty-runtime"]),
+];
+
+/// Crates published from the bitty-terminal org that are intentionally not
+/// extension crates: `phodopus` is the Lua VM linked by `bitty-lua`, not an
+/// extracted extension.
+const NON_EXTENSION_ORG_CRATES: &[&str] = &["phodopus"];
 
 /// Workspace root derived from this crate's manifest dir (no hardcoded checkout
 /// paths): `<workspace>/crates/bitty-terminal` -> `<workspace>`.
@@ -134,11 +186,12 @@ fn normal_dependency_lines(manifest: &str) -> Vec<String> {
     lines
 }
 
-/// Classifies a section header: `Some(None)` for a normal dependency list
-/// section, `Some(Some(name))` for a `[dependencies.<name>]`-style table
-/// header (the edge is the table name), `None` for anything else
-/// (dev/build sections, `[package]`, `[features]`, ...).
-fn normal_dep_section(header: &str) -> Option<Option<String>> {
+/// Classifies a section header: `Some(None)` for a dependency list section,
+/// `Some(Some(name))` for a `[dependencies.<name>]`-style table header (the
+/// edge is the table name), `None` for anything else. With
+/// `include_non_production`, dev/build sections count too (dependency-crate
+/// discovery); the production fence passes `false`.
+fn dependency_section(header: &str, include_non_production: bool) -> Option<Option<String>> {
     let inner = header.strip_prefix('[')?.strip_suffix(']')?;
     let parts: Vec<String> = inner
         .split('.')
@@ -148,18 +201,32 @@ fn normal_dep_section(header: &str) -> Option<Option<String>> {
                 .to_string()
         })
         .collect();
+    let is_dep_section = |part: &str| {
+        part == "dependencies"
+            || (include_non_production && matches!(part, "dev-dependencies" | "build-dependencies"))
+    };
     match parts
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["dependencies"] => Some(None),
-        ["dependencies", name] => Some(Some((*name).to_string())),
-        ["target", .., "dependencies"] => Some(None),
-        ["target", .., "dependencies", name] => Some(Some((*name).to_string())),
+        [deps] if is_dep_section(deps) => Some(None),
+        [deps, name] if is_dep_section(deps) => Some(Some((*name).to_string())),
+        ["workspace", deps] if is_dep_section(deps) => Some(None),
+        ["workspace", deps, name] if is_dep_section(deps) => Some(Some((*name).to_string())),
+        ["target", .., deps] if is_dep_section(deps) => Some(None),
+        ["target", .., deps, name] if is_dep_section(deps) => Some(Some((*name).to_string())),
         _ => None,
     }
+}
+
+fn normal_dep_section(header: &str) -> Option<Option<String>> {
+    dependency_section(header, false)
+}
+
+fn any_dependency_section(header: &str) -> Option<Option<String>> {
+    dependency_section(header, true)
 }
 
 /// True when a comment-stripped normal-dependency line declares `dep`:
@@ -195,6 +262,117 @@ fn normal_consumers_of(root: &Path, members: &[String], dep: &str) -> Vec<String
         })
         .cloned()
         .collect()
+}
+
+/// Exact normal consumers the fence policy allows for an extension crate:
+/// `bitty-terminal` for the storage composition-root seam, the table entry for
+/// a seam crate, and none for every implementation crate.
+fn allowed_consumers(extension: &str) -> BTreeSet<String> {
+    if extension == "bitty-storage" {
+        return BTreeSet::from(["bitty-terminal".to_string()]);
+    }
+    SEAM_CRATES
+        .iter()
+        .find(|(name, _)| *name == extension)
+        .map(|(_, allowed)| allowed.iter().map(|name| (*name).to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Manifest-level fence violations: every extension crate must have exactly
+/// the normal consumers its policy allows.
+fn extension_edge_violations(root: &Path) -> Vec<String> {
+    let members = workspace_members(root);
+    let mut violations = Vec::new();
+    for extension in EXTENSION_CRATES {
+        let expected = allowed_consumers(extension);
+        let actual: BTreeSet<String> = normal_consumers_of(root, &members, extension)
+            .into_iter()
+            .collect();
+        if actual != expected {
+            violations.push(format!(
+                "`{extension}`: expected normal consumers {expected:?}, found {actual:?}"
+            ));
+        }
+    }
+    violations
+}
+
+/// Reads a `package = "..."` rename from a dependency line or table body.
+fn package_rename(line: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(offset) = line[search_from..].find("package") {
+        let start = search_from + offset;
+        let end = start + "package".len();
+        let bounded_before = start == 0
+            || !line.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && line.as_bytes()[start - 1] != b'_'
+                && line.as_bytes()[start - 1] != b'-';
+        let bounded_after = end == line.len()
+            || !line.as_bytes()[end].is_ascii_alphanumeric()
+                && line.as_bytes()[end] != b'_'
+                && line.as_bytes()[end] != b'-';
+        if bounded_before && bounded_after {
+            let rest = line[end..].trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                let quote = rest.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let value_end = rest[1..].find(quote)?;
+                    return Some(rest[1..1 + value_end].to_string());
+                }
+            }
+        }
+        search_from = end;
+    }
+    None
+}
+
+/// Direct git dependencies on `github.com/bitty-terminal/*` declared by one
+/// manifest, in any dependency section (normal, dev, build, target). The
+/// returned name is the package name (`package = ...` wins over an alias).
+fn direct_org_git_dependencies(manifest: &str) -> Vec<String> {
+    let mut in_dependencies = false;
+    let mut table_crate = None;
+    let mut table_package = None;
+    let mut dependencies = Vec::new();
+    for raw in manifest.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            (in_dependencies, table_crate) = match any_dependency_section(line) {
+                Some(Some(name)) => (true, Some(name)),
+                Some(None) => (true, None),
+                None => (false, None),
+            };
+            table_package = None;
+            continue;
+        }
+        if !in_dependencies {
+            continue;
+        }
+        if table_crate.is_some() {
+            if let Some(renamed) = package_rename(line) {
+                table_package = Some(renamed);
+            }
+        }
+        if !line.contains("github.com/bitty-terminal/") || !line.contains("git") {
+            continue;
+        }
+        let inline_name = line
+            .split_once('=')
+            .map(|(key, _)| key.trim())
+            .filter(|key| !key.is_empty() && !key.contains(char::is_whitespace) && *key != "git");
+        let name = package_rename(line)
+            .or(table_package.clone())
+            .or_else(|| inline_name.map(std::string::ToString::to_string))
+            .or(table_crate.clone());
+        if let Some(name) = name {
+            dependencies.push(name);
+        }
+    }
+    dependencies
 }
 
 #[test]
@@ -303,30 +481,180 @@ fn no_normal_edge_to_test_only_crates() {
 }
 
 #[test]
-fn only_composition_root_links_storage_extension() {
-    // W-146 DEC-W146-2: the composition root owns the extracted storage
-    // mechanics; Core library crates consume persistence through Core-owned
-    // traits. Execution/graphics/a11y have no production edge at all.
-    let root = workspace_root();
-    let members = workspace_members(&root);
-    let (linked, unlinked) = EXTENSION_CRATES
-        .split_first()
-        .expect("EXTENSION_CRATES names the linked seam first");
+fn extension_crate_edges_match_fence_policy() {
+    // W-146 DEC-W146-2 plus W-147: the composition root owns the extracted
+    // storage mechanics, seam crates link only through their exact allowlist,
+    // and every implementation crate has no production edge at all.
+    let violations = extension_edge_violations(&workspace_root());
+    assert!(
+        violations.is_empty(),
+        "extension fence violations: {violations:#?}"
+    );
+}
+
+#[test]
+fn extension_fence_lists_are_consistent() {
+    // Guard the fence data itself: `EXTENSION_CRATES[0]` stays the storage
+    // composition-root seam, duplicates hide policy conflicts, and every seam
+    // entry must also be part of the covered crate set.
+    let unique: BTreeSet<&str> = EXTENSION_CRATES.iter().copied().collect();
     assert_eq!(
-        *linked, "bitty-storage",
+        unique.len(),
+        EXTENSION_CRATES.len(),
+        "EXTENSION_CRATES contains duplicates"
+    );
+    assert_eq!(
+        EXTENSION_CRATES.first().copied(),
+        Some("bitty-storage"),
         "test contract: EXTENSION_CRATES[0] is the composition-root seam"
     );
-    let storage_consumers = normal_consumers_of(&root, &members, linked);
-    assert_eq!(
-        storage_consumers,
-        vec!["bitty-terminal".to_string()],
-        "only the composition root may link `bitty-storage`, got: {storage_consumers:?}"
-    );
-    for dep in unlinked {
-        let consumers = normal_consumers_of(&root, &members, dep);
+    for (seam, _) in SEAM_CRATES {
         assert!(
-            consumers.is_empty(),
-            "extension crate `{dep}` must have no `[dependencies]` edge, found in: {consumers:?}"
+            EXTENSION_CRATES.contains(seam),
+            "seam crate `{seam}` must also be listed in EXTENSION_CRATES"
+        );
+    }
+}
+
+#[test]
+fn every_direct_extension_dependency_is_fenced() {
+    // A new direct git dependency on a bitty-terminal extension crate must not
+    // slip past the fence. Discovery is manifest-level (all dependency
+    // sections, including target overlays and renamed packages) so adding a
+    // crate fails here until it is classified in `EXTENSION_CRATES`.
+    let root = workspace_root();
+    let members = workspace_members(&root);
+    let mut manifests = vec![(
+        "<workspace>".to_string(),
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml"),
+    )];
+    manifests.extend(
+        members
+            .iter()
+            .map(|member| (member.clone(), member_manifest(&root, member))),
+    );
+    let mut unfenced = Vec::new();
+    for (member, manifest) in manifests {
+        for dep in direct_org_git_dependencies(&manifest) {
+            if NON_EXTENSION_ORG_CRATES.contains(&dep.as_str()) {
+                continue;
+            }
+            if !EXTENSION_CRATES.contains(&dep.as_str()) {
+                unfenced.push(format!("{member} -> {dep}"));
+            }
+        }
+    }
+    assert!(
+        unfenced.is_empty(),
+        "extension dependencies without a fence entry: {unfenced:#?}"
+    );
+}
+
+/// Writes a synthetic workspace layout for the negative fence tests:
+/// `<root>/Cargo.toml` members plus one manifest per member and optional
+/// source files relative to the root.
+fn write_probe_workspace(
+    tag: &str,
+    manifests: &[(&str, &str)],
+    sources: &[(&str, &str)],
+) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "w147-fence-{}-{tag}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create probe workspace");
+    let members: String = manifests
+        .iter()
+        .map(|(member, _)| format!("  \"crates/{member}\",\n"))
+        .collect();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nmembers = [\n{members}]\n"),
+    )
+    .expect("write probe workspace");
+    for (member, manifest) in manifests {
+        let dir = root.join("crates").join(member);
+        std::fs::create_dir_all(&dir).expect("probe member dir");
+        std::fs::write(dir.join("Cargo.toml"), manifest).expect("probe member manifest");
+    }
+    for (path, body) in sources {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().expect("probe source parent"))
+            .expect("probe source dir");
+        std::fs::write(file, body).expect("probe source");
+    }
+    root
+}
+
+#[test]
+fn injected_manifest_edge_fails_fence() {
+    // Negative test: inject one real `[dependencies]` edge for every fenced
+    // crate into an otherwise unlisted workspace member. The edge scan must
+    // flag each one, so a future Core dependency cannot pass unnoticed.
+    let mut deps = String::new();
+    for extension in EXTENSION_CRATES {
+        deps.push_str(&format!("{extension} = \"0.0.1\"\n"));
+    }
+    let root = write_probe_workspace(
+        "edge",
+        &[
+            ("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n"),
+            (
+                "bitty-untrusted",
+                &format!("[package]\nname = \"bitty-untrusted\"\n\n[dependencies]\n{deps}"),
+            ),
+        ],
+        &[],
+    );
+    let violations = extension_edge_violations(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    for extension in EXTENSION_CRATES {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(&format!("`{extension}`"))),
+            "injected manifest edge `{extension}` must be rejected: {violations:#?}"
+        );
+    }
+}
+
+#[test]
+fn injected_source_identifier_fails_fence() {
+    // Negative test: a Core source naming an implementation crate identifier
+    // must be rejected even with no manifest edge. Seam identifiers stay legal
+    // by design, so only the implementation set is injected here.
+    let seams: BTreeSet<&str> = SEAM_CRATES.iter().map(|(name, _)| *name).collect();
+    let implementations: Vec<&str> = EXTENSION_CRATES
+        .iter()
+        .copied()
+        .filter(|extension| !seams.contains(extension))
+        .collect();
+    let source: String = implementations
+        .iter()
+        .map(|extension| format!("use {} as _;\n", extension.replace('-', "_")))
+        .collect();
+    let root = write_probe_workspace(
+        "source",
+        &[
+            ("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n"),
+            ("bitty-runtime", "[package]\nname = \"bitty-runtime\"\n"),
+        ],
+        &[("crates/bitty-runtime/src/lib.rs", &source)],
+    );
+    let violations = extension_source_violations(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    for extension in implementations {
+        let ident = extension.replace('-', "_");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(&format!("`{ident}`"))),
+            "injected source identifier `{ident}` must be rejected: {violations:#?}"
         );
     }
 }
@@ -348,36 +676,23 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn core_library_sources_never_name_extension_impls() {
-    // Core-never-imports-extension at the source level (CTX-1086 / #1890,
-    // generalizing W-146 DEC-W146-2): no Core library source may name an
-    // extension implementation. The manifest-level gate stays green when Core
-    // duplicates extension logic without a `Cargo.toml` edge (audit CTX-1085
-    // F10), so this scan rejects the Rust identifiers directly. The only
-    // exception is the composition-root seam (`storage_backends.rs`), which
-    // may name `bitty_storage` to implement the Core-owned backends behind
-    // Core validation; every other crate reaches persistence through the
-    // `SessionFileBackend` / `KvCommitBackend` traits. `EXTENSION_CRATES[0]`
-    // stays the storage seam so the storage case runs first; to fence a fifth
-    // extension crate, add one entry to `EXTENSION_CRATES`.
-    let root = workspace_root();
-    let members = workspace_members(&root);
-    let (first, _) = EXTENSION_CRATES
-        .split_first()
-        .expect("EXTENSION_CRATES names the linked seam first");
-    assert_eq!(
-        *first, "bitty-storage",
-        "test contract: EXTENSION_CRATES[0] is the composition-root seam"
-    );
-    let seam = root
+/// Source-level fence violations: Core library sources may not name an
+/// implementation crate. Seam crates are legal by design; `bitty-storage` is
+/// legal only in its composition-root seam file.
+fn extension_source_violations(root: &Path) -> Vec<String> {
+    let members = workspace_members(root);
+    let storage_seam = root
         .join("crates")
         .join("bitty-terminal")
         .join("src")
         .join("storage_backends.rs");
-    for dep in EXTENSION_CRATES {
-        let ident = dep.replace('-', "_");
-        let mut offenders = Vec::new();
+    let mut violations = Vec::new();
+    for extension in EXTENSION_CRATES {
+        let is_storage = *extension == "bitty-storage";
+        if !is_storage && SEAM_CRATES.iter().any(|(seam, _)| seam == extension) {
+            continue;
+        }
+        let ident = extension.replace('-', "_");
         for member in &members {
             let src = root.join("crates").join(member).join("src");
             if !src.is_dir() {
@@ -386,23 +701,42 @@ fn core_library_sources_never_name_extension_impls() {
             let mut files = Vec::new();
             rust_files(&src, &mut files);
             for file in files {
-                // Only the storage seam may name its implementation; the
-                // graphics/execution/a11y identifiers are banned everywhere,
+                // Only the storage seam may name its implementation; every
+                // other implementation identifier is banned everywhere,
                 // including the seam.
-                if *dep == "bitty-storage" && file == seam {
+                if is_storage && file == storage_seam {
                     continue;
                 }
                 let text = std::fs::read_to_string(&file).expect("read rs file");
                 if names_crate(&text, &ident) {
-                    offenders.push(file);
+                    violations.push(format!("{} names `{ident}`", file.display()));
                 }
             }
         }
-        assert!(
-            offenders.is_empty(),
-            "Core library sources must not name the {ident} implementation: {offenders:?}"
-        );
     }
+    violations
+}
+
+#[test]
+fn core_library_sources_never_name_extension_impls() {
+    // Core-never-imports-extension at the source level (CTX-1086 / #1890,
+    // generalizing W-146 DEC-W146-2 and extended by CTX-1364 / #2256): no Core
+    // library source may name an implementation. The manifest-level gate stays
+    // green when Core duplicates extension logic without a `Cargo.toml` edge
+    // (audit CTX-1085 F10), so this scan rejects the Rust identifiers directly.
+    // The only exception is the composition-root seam
+    // (`storage_backends.rs`), which may name `bitty_storage` to implement the
+    // Core-owned backends behind Core validation; every other crate reaches
+    // persistence through the `SessionFileBackend` / `KvCommitBackend` traits.
+    // Seam crates (`bitty-ipc`, `bitty-network-wire`,
+    // `bitty-network-publication`, `bitty-observability-api`,
+    // `bitty-platform-services`, `bitty-url-detector`) are linked contracts
+    // Core may name by design.
+    let violations = extension_source_violations(&workspace_root());
+    assert!(
+        violations.is_empty(),
+        "Core library sources must not name extension implementations: {violations:#?}"
+    );
 }
 
 #[test]

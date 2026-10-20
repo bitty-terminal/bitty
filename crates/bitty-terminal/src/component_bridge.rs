@@ -40,7 +40,11 @@ pub fn mirror_plugin_authority(
     plugins: &PluginRuntime,
     mut warn: impl FnMut(&str, &str),
 ) -> usize {
-    let mut mirrored = 0usize;
+    // Snapshot first, then register every generation before activating any:
+    // `register_plugin` resolves dependencies against the runtime registry, so
+    // a dependent plugin must not lose the race against its dependency's id
+    // order.
+    let mut pending = Vec::new();
     for id in plugins.discovered_ids() {
         if plugins.state(&id) != Some(&LifecycleState::Active) {
             continue;
@@ -66,17 +70,25 @@ pub fn mirror_plugin_authority(
                 }
             },
         };
-        if let Err(error) = runtime.register_plugin(manifest) {
-            warn(id.as_str(), &error.to_string());
-            continue;
+        pending.push((id, manifest, hash, granted));
+    }
+
+    let mut registered = Vec::with_capacity(pending.len());
+    for (id, manifest, hash, granted) in pending {
+        match runtime.register_plugin(manifest) {
+            Ok(()) => registered.push((id, hash, granted)),
+            Err(error) => warn(id.as_str(), &error.to_string()),
         }
+    }
+
+    let mut mirrored = 0usize;
+    for (id, hash, granted) in registered {
         let plugin_id = PluginId::new(id.as_str()).expect("discovered ids are valid");
         runtime.insert_grant(GrantRecord::granted(plugin_id.clone(), hash, granted, 0));
-        if let Err(error) = runtime.activate_plugin(&plugin_id) {
-            warn(id.as_str(), &error.to_string());
-            continue;
+        match runtime.activate_plugin(&plugin_id) {
+            Ok(()) => mirrored += 1,
+            Err(error) => warn(id.as_str(), &error.to_string()),
         }
-        mirrored += 1;
     }
     mirrored
 }

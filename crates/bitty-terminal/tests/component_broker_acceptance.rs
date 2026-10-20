@@ -4,7 +4,8 @@
 //! `bitty extension list` reporting the recorded activation state.
 //!
 //! Ignored by default because it needs a `bitty-net` install produced by the
-//! real CLI:
+//! real CLI. When it runs without that fixture it fails instead of returning:
+//! a green `--run-ignored ignored-only` run always means the flow executed.
 //!
 //! ```text
 //! build/debug/bitty extension add <staging-dir>     # XDG_DATA_HOME=<scratch>
@@ -143,11 +144,25 @@ fn activation_column(text: &str) -> Option<String> {
 #[test]
 #[ignore = "requires BITTY_NET_COMPONENTS_DIR pointing at an install made by `bitty extension add`"]
 fn real_bitty_net_serves_and_denies_with_a_named_class() {
-    let Ok(root) = std::env::var("BITTY_NET_COMPONENTS_DIR") else {
-        eprintln!("BITTY_NET_COMPONENTS_DIR not set; skipping the bitty-net acceptance run");
-        return;
+    // A green `--run-ignored ignored-only` run must mean the acceptance flow
+    // actually executed. Without the fixture this test fails loudly instead
+    // of returning early, so a missing environment can never look like a pass.
+    let root = match std::env::var("BITTY_NET_COMPONENTS_DIR") {
+        Ok(root) => PathBuf::from(root),
+        Err(std::env::VarError::NotPresent) => {
+            panic!(
+                "BITTY_NET_COMPONENTS_DIR is not set: the bitty-net acceptance run needs an \
+                 install made by `bitty extension add` (see the module docs); refusing to \
+                 report a vacuous PASS"
+            );
+        }
+        Err(error) => panic!("BITTY_NET_COMPONENTS_DIR is not valid unicode: {error}"),
     };
-    let root = PathBuf::from(root);
+    assert!(
+        root.join(COMPONENT).is_dir(),
+        "{} must hold the installed `{COMPONENT}` component produced by `bitty extension add`",
+        root.display()
+    );
     // <data>/bitty/extensions -> <data>
     let data_home = root
         .parent()

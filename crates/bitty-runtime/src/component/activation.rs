@@ -19,10 +19,24 @@
 //! [`ActivationState::Installed`] ("no activation recorded"), never as an
 //! unearned `active`.
 //!
+//! Both sides treat the record path as hostile filesystem input:
+//!
+//! - The reader opens the record once without following a link
+//!   (`O_NOFOLLOW`/`FILE_FLAG_OPEN_REPARSE_POINT`), takes its length from that
+//!   handle, and reads at most
+//!   [`COMPONENT_ACTIVATION_MAX_BYTES`]` + 1` bytes through it, so a symlink
+//!   swapped in after a separate `symlink_metadata` cannot redirect or unbound
+//!   the read.
+//! - The writer creates a fresh sibling temp record with `create_new` (which
+//!   refuses a planted symlink), writes and flushes it, renames it over
+//!   `activation`, and flushes the directory. A failed creation never removes
+//!   an entry the writer did not create.
+//!
 //! Only the writable user tier is recorded. The system tier is read-only
 //! (owned by the package manager), so a system-only component lists as
 //! `installed` until a later user-tier activation overwrites the record.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,6 +51,13 @@ pub const COMPONENT_ACTIVATION_MAX_BYTES: u64 = 64;
 
 /// Record format prefix (`v1`).
 const ACTIVATION_FORMAT_PREFIX: &str = "v1";
+
+/// Fresh temporary names the writer tries before giving up.
+///
+/// A planted `activation.tmp-*` entry only costs one attempt; eight attempts
+/// make an accidental collision vanishingly unlikely without an unbounded
+/// loop in a broker transition path.
+const ACTIVATION_TEMP_ATTEMPTS: u32 = 8;
 
 /// Why the last request for a component failed closed before a process ran.
 ///
@@ -157,24 +178,128 @@ pub fn activation_path(component_dir: &Path) -> PathBuf {
     component_dir.join(COMPONENT_ACTIVATION_FILE)
 }
 
-/// Read the recorded activation of one component directory.
+/// Open the record for reading without following a link at that path.
 ///
-/// Best-effort and bounded: a missing, oversized, symlinked, non-file, or
-/// malformed record reads as [`ActivationState::Installed`]. Reading never
-/// creates anything and never follows a symlink at the record path.
-#[must_use]
-pub fn read_activation(component_dir: &Path) -> ActivationState {
-    let path = activation_path(component_dir);
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-        return ActivationState::Installed;
-    };
+/// Linux/Android use `rustix` and the BSD/macOS family uses `nix`:
+/// `O_NOFOLLOW` makes a symlink fail with `ELOOP` (the record then reads as
+/// "not installed"), and `O_NONBLOCK` keeps a planted FIFO from blocking the
+/// open. Windows passes `FILE_FLAG_OPEN_REPARSE_POINT` through `std`. Any
+/// other platform fails closed instead of reading a path it cannot open
+/// without following a link.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_record_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK
+        | rustix::fs::OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty())?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Open the record for reading without following a link at that path.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn open_record_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_NONBLOCK
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let fd = nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Open the record for reading without following a link at that path.
+#[cfg(windows)]
+fn open_record_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Open the record for reading without following a link at that path.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn open_record_no_follow(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "activation records are unreadable on this platform",
+    ))
+}
+
+/// Open the record for reading without following a link at that path.
+#[cfg(not(any(unix, windows)))]
+fn open_record_no_follow(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "activation records are unreadable on this platform",
+    ))
+}
+
+/// Read at most one bounded record through an already-opened handle.
+///
+/// `metadata` must come from the same handle, so the ceiling and the
+/// regular-file test describe the object actually read. A record that grew
+/// (or shrank) between the metadata snapshot and the read is rejected rather
+/// than parsed: the caller records one short line, and a mismatch means
+/// someone else is writing the path.
+fn read_record_bytes(file: &std::fs::File, metadata: &std::fs::Metadata) -> Option<Vec<u8>> {
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > COMPONENT_ACTIVATION_MAX_BYTES
     {
-        return ActivationState::Installed;
+        return None;
     }
-    let Ok(bytes) = std::fs::read(&path) else {
+    let mut bytes = Vec::new();
+    if file
+        .take(COMPONENT_ACTIVATION_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return None;
+    }
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > COMPONENT_ACTIVATION_MAX_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Read the recorded activation of one component directory.
+///
+/// Best-effort and bounded: a missing, oversized, symlinked, non-file, or
+/// malformed record reads as [`ActivationState::Installed`]. Reading never
+/// creates anything, never follows a symlink at the record path, and never
+/// reads more than [`COMPONENT_ACTIVATION_MAX_BYTES`] bytes: the file is
+/// opened once without following a link, and both the size check and the
+/// read use that handle.
+#[must_use]
+pub fn read_activation(component_dir: &Path) -> ActivationState {
+    let path = activation_path(component_dir);
+    let Ok(file) = open_record_no_follow(&path) else {
+        return ActivationState::Installed;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return ActivationState::Installed;
+    };
+    let Some(bytes) = read_record_bytes(&file, &metadata) else {
         return ActivationState::Installed;
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -208,36 +333,160 @@ pub fn read_component_activation(
     ActivationState::Installed
 }
 
-/// Write one activation record (best effort; never fails the caller).
+/// Why one activation-record write failed.
 ///
-/// The write goes through a sibling temp file and a rename, so a concurrent
-/// `bitty extension list` never observes a partial record. Symlinked or
-/// non-regular record paths are refused (a planted link must not redirect a
-/// write), and any I/O or path failure is dropped: activation state is
-/// diagnostics, never a correctness gate.
-pub(crate) fn write_activation(component_dir: &Path, state: ActivationState) {
+/// The projection is diagnostics, so the broker drops this value instead of
+/// failing a request; it is typed so the writer's guarantees stay testable
+/// (a planted link is refused, a taken temp name is retried) and a future
+/// caller can tell the cases apart.
+#[derive(Debug)]
+pub(crate) enum ActivationWriteError {
+    /// The record path exists and is not a regular file (symlink, directory).
+    RecordNotRegular,
+    /// The record would exceed [`COMPONENT_ACTIVATION_MAX_BYTES`].
+    RecordOversize,
+    /// Every candidate temporary name already existed (`AlreadyExists`).
+    TempNameExhausted,
+    /// Creating the temporary record failed.
+    TempCreate(std::io::Error),
+    /// Writing or flushing the temporary record failed.
+    TempWrite(std::io::Error),
+    /// Renaming the temporary record over `activation` failed.
+    Rename(std::io::Error),
+    /// Flushing the component directory after the rename failed.
+    SyncDir(std::io::Error),
+}
+
+impl std::fmt::Display for ActivationWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordNotRegular => f.write_str("activation record path is not a regular file"),
+            Self::RecordOversize => f.write_str("activation record exceeds the byte ceiling"),
+            Self::TempNameExhausted => f.write_str("no free activation temp name"),
+            Self::TempCreate(error) => write!(f, "activation temp create failed: {error}"),
+            Self::TempWrite(error) => write!(f, "activation temp write failed: {error}"),
+            Self::Rename(error) => write!(f, "activation rename failed: {error}"),
+            Self::SyncDir(error) => write!(f, "activation directory sync failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ActivationWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TempCreate(error)
+            | Self::TempWrite(error)
+            | Self::Rename(error)
+            | Self::SyncDir(error) => Some(error),
+            Self::RecordNotRegular | Self::RecordOversize | Self::TempNameExhausted => None,
+        }
+    }
+}
+
+/// Create one fresh, empty temporary record without following a link.
+///
+/// `create_new` maps to `O_CREAT | O_EXCL`, which fails with `AlreadyExists`
+/// on a pre-existing entry (including a planted symlink) instead of opening
+/// it; Unix additionally requests mode `0600` so the record is owner-only.
+fn create_temp_record(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Flush a directory entry so a completed rename survives a crash.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Flush a directory entry so a completed rename survives a crash.
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn next_temp_serial() -> u64 {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Write one activation record (the broker drops the typed error).
+///
+/// The write goes through a sibling temp file created with `create_new` and a
+/// rename, so a concurrent `bitty extension list` never observes a partial
+/// record. A symlinked or non-regular record path is refused, and a temp name
+/// that already exists (for example a pre-planted link with the same
+/// `<pid>-<serial>` shape) is retried under a fresh name rather than opened:
+/// a planted link must never redirect or truncate the write. Failures remove
+/// the temp file best-effort and are surfaced as
+/// [`ActivationWriteError`]; activation state is diagnostics, never a
+/// correctness gate.
+pub(crate) fn write_activation(
+    component_dir: &Path,
+    state: ActivationState,
+) -> Result<(), ActivationWriteError> {
+    write_activation_with(component_dir, state, &next_temp_serial)
+}
+
+/// [`write_activation`] with an injectable temp-name serial (tests plant
+/// links at the exact names a write would choose).
+fn write_activation_with(
+    component_dir: &Path,
+    state: ActivationState,
+    next_serial: &dyn Fn() -> u64,
+) -> Result<(), ActivationWriteError> {
     let path = activation_path(component_dir);
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(ActivationWriteError::RecordNotRegular);
+        }
         Ok(_) | Err(_) => {}
     }
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = component_dir.join(format!(
-        "{COMPONENT_ACTIVATION_FILE}.tmp-{}-{serial}",
-        std::process::id()
-    ));
     let record = state.record();
     if record.len() as u64 > COMPONENT_ACTIVATION_MAX_BYTES {
-        return; // unreachable by construction; never write an oversize record
+        return Err(ActivationWriteError::RecordOversize);
     }
-    if std::fs::write(&temp, record.as_bytes()).is_err() {
+
+    let mut created = None;
+    for _ in 0..ACTIVATION_TEMP_ATTEMPTS {
+        let temp = component_dir.join(format!(
+            "{COMPONENT_ACTIVATION_FILE}.tmp-{}-{}",
+            std::process::id(),
+            next_serial()
+        ));
+        match create_temp_record(&temp) {
+            Ok(file) => {
+                created = Some((temp, file));
+                break;
+            }
+            // Never remove an entry this writer did not create.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(ActivationWriteError::TempCreate(error)),
+        }
+    }
+    let Some((temp, mut file)) = created else {
+        return Err(ActivationWriteError::TempNameExhausted);
+    };
+
+    let flushed = file
+        .write_all(record.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = flushed {
         let _ = std::fs::remove_file(&temp);
-        return;
+        return Err(ActivationWriteError::TempWrite(error));
     }
-    if std::fs::rename(&temp, &path).is_err() {
+    if let Err(error) = std::fs::rename(&temp, &path) {
         let _ = std::fs::remove_file(&temp);
+        return Err(ActivationWriteError::Rename(error));
     }
+    sync_directory(component_dir).map_err(ActivationWriteError::SyncDir)
 }
 
 #[cfg(test)]
@@ -272,7 +521,7 @@ mod tests {
             ActivationState::Denied(ActivationDenial::Untrusted),
             ActivationState::Denied(ActivationDenial::Unavailable),
         ] {
-            write_activation(&dir, state);
+            write_activation(&dir, state).expect("write record");
             assert_eq!(read_activation(&dir), state, "{}", state.label());
             assert!(
                 std::fs::metadata(activation_path(&dir))
@@ -281,6 +530,8 @@ mod tests {
                     <= COMPONENT_ACTIVATION_MAX_BYTES
             );
         }
+        // The atomic write leaves exactly the record: no temp remnant.
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -341,12 +592,124 @@ mod tests {
         std::fs::write(&outside, "v1 active\n").expect("outside");
         std::os::unix::fs::symlink(&outside, activation_path(&dir)).expect("symlink");
         assert_eq!(read_activation(&dir), ActivationState::Installed);
-        // Writing must not clobber the link target.
-        write_activation(&dir, ActivationState::Crashed);
+        // Writing must not clobber the link target, and must say why.
+        assert!(matches!(
+            write_activation(&dir, ActivationState::Crashed),
+            Err(ActivationWriteError::RecordNotRegular)
+        ));
         assert_eq!(
             std::fs::read_to_string(&outside).expect("outside"),
             "v1 active\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_temp_link_is_refused_and_the_write_retries_under_a_fresh_name() {
+        let dir = scratch("temp-link");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "v1 active\n").expect("victim");
+        // A same-user process pre-creates the exact temp name shape a write
+        // would pick, as a link to a file it must not be able to redirect.
+        let planted_serial = 7;
+        let planted = dir.join(format!(
+            "{COMPONENT_ACTIVATION_FILE}.tmp-{}-{planted_serial}",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&victim, &planted).expect("planted link");
+        let next = AtomicU64::new(planted_serial);
+        let result = write_activation_with(&dir, ActivationState::Stopped, &|| {
+            next.fetch_add(1, Ordering::Relaxed)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        // The write followed neither the planted link nor any other entry.
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "v1 active\n"
+        );
+        assert_eq!(
+            read_activation(&dir),
+            ActivationState::Stopped,
+            "the retried temp name must land on the record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_temp_names_surface_a_typed_error() {
+        let dir = scratch("temp-exhausted");
+        for serial in 0..u64::from(ACTIVATION_TEMP_ATTEMPTS) {
+            let planted = dir.join(format!(
+                "{COMPONENT_ACTIVATION_FILE}.tmp-{}-{serial}",
+                std::process::id()
+            ));
+            std::os::unix::fs::symlink(dir.join("victim"), &planted).expect("planted link");
+        }
+        let next = AtomicU64::new(0);
+        let result = write_activation_with(&dir, ActivationState::Active, &|| {
+            next.fetch_add(1, Ordering::Relaxed)
+        });
+        assert!(
+            matches!(result, Err(ActivationWriteError::TempNameExhausted)),
+            "{result:?}"
+        );
+        // A refused write never creates a record or a link target.
+        assert_eq!(read_activation(&dir), ActivationState::Installed);
+        assert!(!dir.join("victim").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grown_record_is_rejected_by_the_handle_bound() {
+        let dir = scratch("grown");
+        let path = dir.join("record");
+        std::fs::write(&path, "v1 active\n").expect("seed");
+        let file = std::fs::File::open(&path).expect("open");
+        let metadata = file.metadata().expect("metadata");
+        // A second writer grows the file after the metadata snapshot. The
+        // read through the already-open handle must reject the mismatch
+        // instead of parsing an unbounded record.
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writer
+                .write_all(&[b'x'; COMPONENT_ACTIVATION_MAX_BYTES as usize * 4])
+                .expect("grow");
+            writer.sync_all().expect("sync");
+        }
+        assert!(read_record_bytes(&file, &metadata).is_none());
+        // The bound still accepts the unchanged short record it validated.
+        let unchanged = dir.join("unchanged");
+        std::fs::write(&unchanged, "v1 stopped\n").expect("unchanged");
+        let file = std::fs::File::open(&unchanged).expect("open");
+        let metadata = file.metadata().expect("metadata");
+        assert_eq!(
+            read_record_bytes(&file, &metadata).as_deref(),
+            Some(b"v1 stopped\n".as_slice())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_oversize_record_is_rejected_without_reading_it() {
+        let dir = scratch("symlink-oversize");
+        let outside = dir.join("outside");
+        std::fs::write(
+            &outside,
+            format!(
+                "v1 active\n{}\n",
+                "a".repeat(COMPONENT_ACTIVATION_MAX_BYTES as usize * 8)
+            ),
+        )
+        .expect("outside");
+        std::os::unix::fs::symlink(&outside, activation_path(&dir)).expect("symlink");
+        assert_eq!(read_activation(&dir), ActivationState::Installed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -361,8 +724,8 @@ mod tests {
             read_component_activation(Some(&user), Some(&system), "net"),
             ActivationState::Installed
         );
-        write_activation(&user.join("net"), ActivationState::Active);
-        write_activation(&system.join("net"), ActivationState::Stopped);
+        write_activation(&user.join("net"), ActivationState::Active).expect("user record");
+        write_activation(&system.join("net"), ActivationState::Stopped).expect("system record");
         assert_eq!(
             read_component_activation(Some(&user), Some(&system), "net"),
             ActivationState::Active

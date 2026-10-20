@@ -735,7 +735,8 @@ impl ComponentBroker {
                 candidate
             }
         };
-        write_activation(&dir, state);
+        // Diagnostics only: a typed write failure never fails the request.
+        let _ = write_activation(&dir, state);
     }
 
     fn peek_request_id(&self) -> RequestId {
@@ -839,7 +840,7 @@ impl ComponentBroker {
             super::inventory::ComponentSource::System => None,
         };
         if let Some(dir) = slot.activation_dir.as_deref() {
-            write_activation(dir, ActivationState::Active);
+            let _ = write_activation(dir, ActivationState::Active);
         }
         Ok(())
     }
@@ -1491,7 +1492,8 @@ fn record_stop(slot: &Slot, outcome: StopOutcome) {
         StopOutcome::Exited | StopOutcome::Killed => ActivationState::Stopped,
         StopOutcome::Crashed => ActivationState::Crashed,
     };
-    write_activation(dir, state);
+    // Diagnostics only: a typed write failure never changes stop handling.
+    let _ = write_activation(dir, state);
 }
 
 #[cfg(test)]

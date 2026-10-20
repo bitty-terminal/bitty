@@ -1175,12 +1175,28 @@ impl TerminalApp {
         // to its allocation — best-effort (startup parity). On
         // failure the pane stays empty (CTX-0359: it never
         // paints or feeds the primary grid) with a loud warning.
+        //
+        // Issue #2145: size the shell to the decorated content frame the
+        // leaf is actually presented in, never the larger raw slot
+        // allocation. `set_layout` has already reflowed the leaf to the
+        // content frame, so spawning at the slot makes the first present
+        // shrink grid and PTY immediately after the shell starts; that
+        // post-spawn SIGWINCH repaints the prompt and can leave a stray
+        // blank first row above it. `workspace_new` and session restore
+        // already spawn at the present frame.
         let (cols, rows) = self
             .runtime
-            .layout_allocations()
+            .present_frames()
             .iter()
-            .find(|(id, _)| *id == new_id)
-            .map(|(_, r)| (r.width.max(1), r.height.max(1)))
+            .find(|frame| frame.view == new_id)
+            .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+            .or_else(|| {
+                self.runtime
+                    .layout_allocations()
+                    .iter()
+                    .find(|(id, _)| *id == new_id)
+                    .map(|(_, r)| (r.width.max(1), r.height.max(1)))
+            })
             .unwrap_or((80, 24));
         let spawn_result = spawn_pane_shell_in(
             &mut self.runtime,
@@ -4611,6 +4627,58 @@ mod tests {
     }
 
     #[test]
+    fn new_leaf_spawns_at_its_presented_content_frame() {
+        // Issue #2145: a fresh pane must be born at the decorated content
+        // frame it is presented in, not the larger raw slot allocation.
+        // Spawning at the slot makes the first present shrink the grid and
+        // PTY right after the shell starts; the resulting SIGWINCH repaints
+        // the prompt and can leave a stray blank first row above it.
+        bitty_test_support::require_pty!();
+        use bitty_config::{ChromeAction, SplitDir};
+        for action in [
+            ChromeAction::NewSplit(SplitDir::Right),
+            ChromeAction::NewPanel,
+        ] {
+            let mut app = workspace_test_app_with_spec(platform_spawn_spec());
+            let before = app.runtime.focused_view().expect("seed focus");
+            app.apply_chrome_action(action.clone());
+            let fresh = app.runtime.focused_view().expect("fresh pane focused");
+            assert_ne!(fresh, before, "{action:?} must focus the fresh pane");
+            let frame = app
+                .runtime
+                .present_frames()
+                .into_iter()
+                .find(|frame| frame.view == fresh)
+                .expect("fresh pane has a present frame");
+            assert_eq!(
+                app.runtime.pane_pty_size(&fresh),
+                Some((frame.cols, frame.rows)),
+                "{action:?}: the fresh shell must start at the decorated content frame"
+            );
+            let snap = app.runtime.pane_snapshot(&fresh).expect("fresh grid");
+            assert_eq!(
+                (snap.width, snap.height),
+                (usize::from(frame.cols), usize::from(frame.rows)),
+                "{action:?}: the fresh grid must start at the decorated content frame"
+            );
+            // The first present's geometry sync must be a no-op: a post-spawn
+            // resize is the SIGWINCH that disturbs the first prompt row.
+            let _ = app.runtime.tick();
+            assert_eq!(
+                app.runtime.pane_pty_size(&fresh),
+                Some((frame.cols, frame.rows)),
+                "{action:?}: the first present must not resize the fresh shell"
+            );
+            let snap = app.runtime.pane_snapshot(&fresh).expect("fresh grid");
+            assert_eq!(
+                (snap.width, snap.height),
+                (usize::from(frame.cols), usize::from(frame.rows)),
+                "{action:?}: the first present must not resize the fresh grid"
+            );
+        }
+    }
+
+    #[test]
     fn chrome_new_panel_wide_splits_side_by_side_new_second_focus_follows() {
         // CTX-0838 (#1441): Mod+N `new_panel` uses Hyprland-dwindle axis.
         // Default headless container is wide, so the split is side-by-side
@@ -5625,6 +5693,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn workspace_test_app() -> TerminalApp {
+        workspace_test_app_with_spec(SpawnSpec::default())
+    }
+
+    fn workspace_test_app_with_spec(spec: SpawnSpec) -> TerminalApp {
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         TerminalApp::with_theme(
@@ -5632,8 +5704,32 @@ mod tests {
             bitty_config::theme::DEFAULT_THEME_NAME,
             "default",
             maps,
-            SpawnSpec::default(),
+            spec,
         )
+    }
+
+    /// Platform interactive shell for live-pane tests.
+    ///
+    /// `SpawnSpec::default()` resolves to the POSIX fallback `/bin/sh`, which
+    /// does not exist on Windows; the Windows leg names its own shell instead.
+    /// `COMSPEC` is the OS-declared command interpreter, with the standard
+    /// executable name as a fail-open fallback.
+    fn platform_spawn_spec() -> SpawnSpec {
+        #[cfg(windows)]
+        {
+            let program = std::env::var("COMSPEC").unwrap_or_else(|_| String::from("cmd.exe"));
+            SpawnSpec {
+                program: Some(program),
+                ..SpawnSpec::default()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            SpawnSpec {
+                program: Some(String::from("/bin/sh")),
+                ..SpawnSpec::default()
+            }
+        }
     }
 
     // Live-spawn helper: the live-close test below spawns /bin/sh. The test

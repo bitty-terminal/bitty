@@ -2464,6 +2464,20 @@ pub struct GridRenderer<R: GlyphRasterizer> {
     cache: GlyphCache<R>,
     atlas: GlyphAtlas,
     font: FontId,
+    /// Reserved atlas namespace for cell-box block masks (issue #2307).
+    ///
+    /// Block elements are rasterized from Unicode geometry rather than the
+    /// font outline, so their atlas slots must never collide with a
+    /// font-rasterized slot for the same scalar (for example a block scalar
+    /// emitted by the overlay-text path). The renderer's real faces are
+    /// issued from zero upward, so the maximum handle stays free.
+    block_font: FontId,
+    /// Cached cell-box masks keyed by `(scalar, width, height)`.
+    ///
+    /// One mask per distinct block scalar and cell size; every cell of that
+    /// size reuses the same atlas slot. Cleared when the cell is rescaled so
+    /// previous-DPI masks never survive a DPI change.
+    block_masks: HashMap<(char, u32, u32), Vec<u8>>,
     point_size: f32,
     cell: CellMetrics,
     /// Resolved terminal palette (CTX-0355) used for default cell colors,
@@ -2519,10 +2533,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             .ok()
             .flatten();
         let baseline_offset = resolve_baseline_offset(cell.height, measured);
+        let mut synthetic_font_counter = u64::MAX;
+        let block_font = FontId::next(&mut synthetic_font_counter);
         Ok(Self {
             cache,
             atlas: GlyphAtlas::new(dimension)?,
             font,
+            block_font,
+            block_masks: HashMap::new(),
             point_size: query.point_size,
             cell,
             palette: ThemePalette::default(),
@@ -2609,6 +2627,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.baseline_offset = resolve_baseline_offset(cell.height, measured);
         self.cache.clear();
         self.atlas.clear();
+        self.block_masks.clear();
         Ok(AppliedDpiScale {
             scale: sanitized,
             cell,
@@ -3009,6 +3028,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         list: &mut DrawList,
     ) -> (bool, i32) {
         let grid_advance = self.grid_advance(span_cols);
+        // Issue #2307: block elements are cell geometry. Font outlines carry
+        // side bearings and antialiased edge columns that do not reach the
+        // cell box at fractional scales, so adjacent blocks meet with a
+        // partial-coverage boundary column (the figlet/lolcat grid seam).
+        // Rasterize the Unicode box on the cell rectangle instead; box
+        // drawing, braille, CJK, and every other scalar keep the font path.
+        if crate::fallback::is_block_element(character) {
+            let emitted = self.emit_block_glyph(character, row, col, span_cols, color, list);
+            return (emitted, grid_advance);
+        }
         let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
             // The point size was validated at construction, so this is
             // unreachable; treating it as "nothing to draw" stays safe.
@@ -3050,6 +3079,92 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             grid_advance
         };
         (true, advance)
+    }
+
+    /// Emits one block element (`U+2580-U+259F`) from cell-box geometry.
+    ///
+    /// The mask spans exactly the cell rectangle (`span_cols` wide), so
+    /// adjacent block cells share full-coverage edges regardless of font
+    /// bearings, baseline rounding, or fractional DPI scale. Masks are
+    /// keyed by scalar and cell size and reused through one reserved atlas
+    /// slot each; the glyph still lives on the normal glyph layer, so
+    /// selection/cursor overlays and Terminal Truth behave exactly as for a
+    /// font glyph. A missing mask (only reachable for degenerate dimensions)
+    /// paints nothing and is classified by the caller like a failed glyph.
+    fn emit_block_glyph(
+        &mut self,
+        character: char,
+        row: usize,
+        col: usize,
+        span_cols: usize,
+        color: Rgba8,
+        list: &mut DrawList,
+    ) -> bool {
+        let width = saturating_u32(
+            u64::try_from(span_cols)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(self.cell.width)),
+        );
+        let height = self.cell.height;
+        let mask_key = (character, width, height);
+        let Ok(key) = RasterKey::new(character, self.block_font, self.point_size) else {
+            return false;
+        };
+        let source = match self.atlas.slot(&key) {
+            Some(slot) => GlyphSource::Atlas { slot },
+            None => {
+                let mask = match self.block_masks.get(&mask_key) {
+                    Some(mask) => mask.clone(),
+                    None => {
+                        let Some(mask) = crate::block::coverage_mask(character, width, height)
+                        else {
+                            return false;
+                        };
+                        self.block_masks.insert(mask_key, mask.clone());
+                        mask
+                    }
+                };
+                let metrics = GlyphMetrics {
+                    left: 0,
+                    top: 0,
+                    width: i32::try_from(width).unwrap_or(i32::MAX),
+                    height: i32::try_from(height).unwrap_or(i32::MAX),
+                    advance: [i32::try_from(width).unwrap_or(i32::MAX), 0],
+                };
+                self.atlas.ensure_mask(key, metrics, mask)
+            }
+        };
+        let dest_x = col as i64 * i64::from(self.cell.width);
+        let dest_y = row as i64 * i64::from(self.cell.height);
+        let instance = match source {
+            GlyphSource::Atlas { slot } => GlyphInstance {
+                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                size: [width, height],
+                uv: slot.uv(self.atlas.dims()),
+                color,
+                clip: None,
+                source: GlyphSource::Atlas { slot },
+            },
+            GlyphSource::Inline {
+                mask,
+                width,
+                height,
+            } => GlyphInstance {
+                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                size: [width, height],
+                uv: [0.0; 4],
+                color,
+                clip: None,
+                source: GlyphSource::Inline {
+                    mask,
+                    width,
+                    height,
+                },
+            },
+        };
+        list.glyphs.push(instance);
+        self.counters.glyphs_emitted += 1;
+        true
     }
 
     /// Emits a cell's zero-width scalars over their base glyph (CR-TERM-01).
@@ -3763,6 +3878,21 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             // Resolve the run fg for this run (runs group identical
             // style, so the first covered cell names it).
             let fg = self.shaped_run_fg(snapshot, row, cols, run);
+            // Issue #2307: a single block scalar never needs the shaped
+            // cluster path. Emit it through the shared cell-box block
+            // emitter so the opt-in shaped path tiles identically to the
+            // default unshaped path. Multi-scalar clusters fall through.
+            if count == 1 {
+                let mut chars = slice.chars();
+                if let (Some(block), None) = (chars.next(), chars.next()) {
+                    if crate::fallback::is_block_element(block)
+                        && self.emit_glyph(block, row, abs_start, count, fg, list).0
+                    {
+                        idx = group_end;
+                        continue;
+                    }
+                }
+            }
             // A shaper cluster may emit several glyphs at one byte offset.
             // When the cluster text spans more than one base cell and the
             // group is not a single ligated glyph, those members are a

@@ -1386,9 +1386,12 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
 /// `NotFound` (stale registry entry); a present-but-inaccessible pipe fails
 /// `PermissionDenied`; a busy pipe waits at most 50 ms. The connect never
 /// blocks unboundedly, mirroring the fail-fast Unix probe.
+/// Bounded wait for a free pipe instance during discovery probes.
+#[cfg(windows)]
+const WINDOWS_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[cfg(windows)]
 fn probe_windows_pipe(pipe_path: &str) -> (bool, String) {
-    const WINDOWS_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
     match bitty_ipc::winpipe::connect(pipe_path, WINDOWS_PROBE_WAIT) {
         Ok(_) => (true, "live".to_string()),
         Err(err) => {
@@ -1661,7 +1664,7 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
 fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceError> {
     if is_windows_pipe_path(path_str) {
         let instance = windows_explicit_instance_label(path_str);
-        return match bitty_ipc::winpipe::connect(path_str, std::time::Duration::from_millis(50)) {
+        return match bitty_ipc::winpipe::connect(path_str, WINDOWS_PROBE_WAIT) {
             Ok(_) => Ok(vec![InstanceInfo {
                 instance,
                 socket: path_str.to_string(),
@@ -1692,7 +1695,7 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path_str.to_string());
             let pipe = bitty_ipc::devtools::windows_pipe_name(&instance);
-            match bitty_ipc::winpipe::connect(&pipe, std::time::Duration::from_millis(50)) {
+            match bitty_ipc::winpipe::connect(&pipe, WINDOWS_PROBE_WAIT) {
                 Ok(_) => Ok(vec![InstanceInfo {
                     instance,
                     socket: path_str.to_string(),

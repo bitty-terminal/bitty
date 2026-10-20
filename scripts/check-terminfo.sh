@@ -99,22 +99,32 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 tic -x -o "$TMPDIR" "$TI" 2>"$TMPDIR/tic.err" ||
   fail "tic -x failed on terminfo/bitty.ti: $(cat "$TMPDIR/tic.err")"
-INFO="$(TERMINFO="$TMPDIR" infocmp -x bitty 2>"$TMPDIR/infocmp.err")" ||
-  fail "infocmp -x bitty failed after tic: $(cat "$TMPDIR/infocmp.err")"
+# `-1` prints one capability per line so each probe can be anchored to a
+# capability line. The header comment still embeds the random TERMINFO path,
+# so drop it before matching (#2320): a path containing "Tc" must never
+# satisfy the audited-capability checks.
+INFO="$(TERMINFO="$TMPDIR" infocmp -1 -x bitty 2>"$TMPDIR/infocmp.err")" ||
+  fail "infocmp -1 -x bitty failed after tic: $(cat "$TMPDIR/infocmp.err")"
+CAPS="$(sed '/^#/d' <<<"$INFO")"
+
+has_cap() {
+  local name="$1"
+  grep -qE "^[[:space:]]*${name}([=#,]|\$)" <<<"$CAPS"
+}
 
 # 3e. Audited flags must survive the round-trip.
-for cap in 'Tc' 'Su' 'Smulx=' 'Setulc=' 'Sync=' 'Hls='; do
-  grep -qF "$cap" <<<"$INFO" ||
+for cap in 'Tc' 'Su' 'Smulx' 'Setulc' 'Sync' 'Hls'; do
+  has_cap "$cap" ||
     fail "compiled bitty entry missing audited capability '$cap' (tic/infocmp round-trip)"
 done
 # pairs#32767 compiles as pairs#0x7fff.
-grep -q 'pairs#0x7fff' <<<"$INFO" ||
+has_cap 'pairs#0x7fff' ||
   fail "compiled bitty entry missing pairs#32767 (pairs#0x7fff)"
-grep -q 'colors#0x100' <<<"$INFO" ||
+has_cap 'colors#0x100' ||
   fail "compiled bitty entry missing colors#256 (colors#0x100, inherited from xterm-256color)"
 # Inherited Ms must stay cancelled: the compiled entry must not contain Ms=
 # (use Ms= with equals so the Ms@ cancellation marker does not trip).
-if grep -qF 'Ms=' <<<"$INFO"; then
+if grep -qE '^[[:space:]]*Ms[=,]' <<<"$CAPS"; then
   fail "compiled bitty entry contains Ms (OSC 52 clipboard, inherited from xterm-256color); cancel it in terminfo/bitty.ti with 'Ms@'"
 fi
 

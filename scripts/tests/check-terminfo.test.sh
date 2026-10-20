@@ -91,12 +91,18 @@ grep -v 'use=xterm-256color' "$root/terminfo/bitty.ti" >"$root/terminfo/bitty.ti
 mv "$root/terminfo/bitty.ti.tmp" "$root/terminfo/bitty.ti"
 expect_fail_tag 'use=xterm-256color' 'missing use line' --root "$root"
 
-# 7. Missing audited cap (drop Tc) fails the round-trip.
+# 7. Missing audited cap (drop Tc) fails the round-trip even when the gate's
+# temp path contains "Tc". infocmp's header embeds the TERMINFO path, so
+# matching raw output would let the path satisfy the removed capability
+# (#2320).
 root="$TMP/notc"
 make_root "$root"
 grep -v '^[[:space:]]*Tc,' "$root/terminfo/bitty.ti" >"$root/terminfo/bitty.ti.tmp"
 mv "$root/terminfo/bitty.ti.tmp" "$root/terminfo/bitty.ti"
-expect_fail_tag "audited capability 'Tc'" 'missing Tc' --root "$root"
+hostile_tmp="$TMP/Tc-tmpdir"
+mkdir -p "$hostile_tmp"
+TMPDIR="$hostile_tmp" expect_fail_tag "audited capability 'Tc'" \
+  'missing Tc with Tc in TMPDIR' --root "$root"
 
 # 7b. Missing Ms@ cancellation fails: the use-chain inherits Ms from
 # xterm-256color, so the compiled entry contains Ms= even though the source

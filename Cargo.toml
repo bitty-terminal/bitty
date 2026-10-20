@@ -58,6 +58,20 @@ libc = { version = "0.2", default-features = false }
 # the 0.61.2 line already in the lockfile; no new crate version.
 windows-sys = { version = "0.61", default-features = false }
 
+# bitty#2249: the execution extension is compiled against the workspace's
+# current Core mechanism crates instead of its own older `bitty` git pin.
+# Without this patch Cargo builds two `bitty-pty`/`bitty-plugin-host` trees
+# (0.0.21 from the extension pin and 0.0.24 path crates), which duplicates
+# Core code in the shipped graph and makes the compat-lab `live_compat` link
+# exceed the Linux runner's linker budget. The patch does not change the
+# extension's public contract or its exact `bitty-execution` pin; it aligns
+# the one-way extension -> Core mechanism edge with this workspace
+# (the W-132 contract's "workspace path dependency vs pinned dependency"
+# integration choice).
+[patch."https://github.com/bitty-terminal/bitty"]
+bitty-pty = { path = "crates/bitty-pty" }
+bitty-plugin-host = { path = "crates/bitty-plugin-host" }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "bitty-execution"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-execution?rev=57714f7#57714f7df8e4038de54a91989a42c0d1e87c88cc"
+source = "git+https://github.com/bitty-terminal/bitty-execution?rev=637afc2#637afc21b3136bc57f38426bbf9d828d40d266bf"
 dependencies = [
  "bitty-ipc",
  "bitty-plugin-host 0.0.21",

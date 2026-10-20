@@ -135,6 +135,33 @@ pub struct WorkspaceInfo {
     pub attention: WorkspaceAttention,
 }
 
+/// One bounded row from `bitty.ui.targets.snapshot` (W-29 successor).
+///
+/// Identity, kind, and anchor metadata only. `handle` stays the historical
+/// snapshot-local row handle; `id` is the stable semantic target id within
+/// its kind. `generation` is the generation captured by this read-only
+/// snapshot, not a cross-session handle: dispatch still revalidates the live
+/// registry (fail closed). `workspace` and `rect` are present when the host
+/// has a live anchor for the target (panel/workspace surfaces today); plugin
+/// lens targets may omit them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSnapshotRow {
+    /// Snapshot-local row handle (1-based, compatibility field).
+    pub handle: i64,
+    /// Stable semantic target id within `kind`.
+    pub id: u64,
+    /// Surface kind (`panel`, `workspace`, `block`, `node`, `link`).
+    pub kind: String,
+    /// Contributing provider tier (`core`, `plugin`, `derived`).
+    pub tier: String,
+    /// Owning workspace id, when workspace-scoped.
+    pub workspace: Option<u64>,
+    /// Screen region in window cells (`x`, `y`, `width`, `height`).
+    pub rect: Option<(u16, u16, u16, u16)>,
+    /// Generation captured by this snapshot.
+    pub generation: u64,
+}
+
 /// One validated workspace mutation request from Lua (CTX-0889).
 ///
 /// The bridge validates argument shapes; the host gates on
@@ -1748,24 +1775,24 @@ pub trait HostServices {
     /// Collect a bounded, read-only target snapshot (W-29, CTX-0942, DEC-0085 thin host).
     ///
     /// Returns at most `max` entries of the current cold-path collection over
-    /// the Core terminal provider plus registered generic lenses, in tier
+    /// the Core target provider plus registered generic lenses, in tier
     /// priority then registration order. The engine stages every offer before
     /// any registry insert and fails closed with `E_DEF_LIMIT` on an oversized
     /// collection; the snapshot is ephemeral and never published to the Event
-    /// Bus. Each entry is `(handle, kind, tier)` with `handle` an opaque
-    /// 1-based token local to this read, `kind` one of
-    /// `panel`/`workspace`/`block`/`node`/`link`, and `tier` one of
-    /// `core`/`plugin`/`derived`. Handles carry no generation wire shape and
-    /// are never transferable across sessions; dispatch revalidates against
-    /// the live registry and fails closed with [`E_UI_NOT_OWNER`] on stale.
-    /// The implementation owns capability gating (`ui.overlay`,
-    /// deny-by-default) and the Core `ProviderMediator` bounds. Safe mode is
-    /// unaffected: with zero plugins the Core provider yields an empty
-    /// snapshot. The default fails closed with [`E_UI_UNAVAILABLE`], so a host
-    /// without a targeting surface has no ambient authority. No new capability
-    /// identifier is introduced.
-    #[allow(clippy::type_complexity)]
-    fn ui_targets_snapshot(&self, _max: usize) -> Result<Vec<(i64, String, String)>, BridgeError> {
+    /// Bus. Each entry is a [`TargetSnapshotRow`]: `handle` is an opaque
+    /// 1-based token local to this read, `id` is the stable semantic id within
+    /// `kind` (`panel`/`workspace`/`block`/`node`/`link`), `tier` is one of
+    /// `core`/`plugin`/`derived`, and `workspace`/`rect` carry the live anchor
+    /// when the host has one. `generation` is the epoch captured by this
+    /// snapshot; it is not a cross-session handle, and dispatch still
+    /// revalidates against the live registry, failing closed with
+    /// [`E_UI_NOT_OWNER`] on stale. The implementation owns capability gating
+    /// (`ui.overlay`, deny-by-default) and the Core `ProviderMediator` bounds.
+    /// Safe mode is unaffected: with zero plugins the Core provider yields an
+    /// empty snapshot. The default fails closed with [`E_UI_UNAVAILABLE`], so a
+    /// host without a targeting surface has no ambient authority. No new
+    /// capability identifier is introduced.
+    fn ui_targets_snapshot(&self, _max: usize) -> Result<Vec<TargetSnapshotRow>, BridgeError> {
         Err(BridgeError::new(
             "runtime",
             E_UI_UNAVAILABLE,
@@ -5925,11 +5952,34 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         .map_err(|e| e.to_error(ctx))?;
                     let items = entries
                         .into_iter()
-                        .map(|(handle, kind, tier)| {
+                        .map(|row| {
+                            let rect = row.rect.map_or(LuaValue::Nil, |(x, y, w, h)| {
+                                LuaValue::array(vec![
+                                    LuaValue::Integer(i64::from(x)),
+                                    LuaValue::Integer(i64::from(y)),
+                                    LuaValue::Integer(i64::from(w)),
+                                    LuaValue::Integer(i64::from(h)),
+                                ])
+                            });
+                            let workspace = row.workspace.map_or(LuaValue::Nil, |id| {
+                                LuaValue::Integer(i64::try_from(id).unwrap_or(i64::MAX))
+                            });
                             LuaValue::table([
-                                ("handle", LuaValue::Integer(handle)),
-                                ("kind", LuaValue::String(kind)),
-                                ("tier", LuaValue::String(tier)),
+                                ("handle", LuaValue::Integer(row.handle)),
+                                (
+                                    "id",
+                                    LuaValue::Integer(i64::try_from(row.id).unwrap_or(i64::MAX)),
+                                ),
+                                ("kind", LuaValue::String(row.kind)),
+                                ("tier", LuaValue::String(row.tier)),
+                                ("workspace", workspace),
+                                ("rect", rect),
+                                (
+                                    "generation",
+                                    LuaValue::Integer(
+                                        i64::try_from(row.generation).unwrap_or(i64::MAX),
+                                    ),
+                                ),
                             ])
                         })
                         .collect();

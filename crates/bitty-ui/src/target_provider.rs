@@ -171,7 +171,7 @@ impl std::fmt::Display for ProviderTarget {
 }
 
 /// Surface kind for filtering snapshot offers into derived lenses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TargetKind {
     /// Hosted panels.
     Panel,
@@ -183,6 +183,38 @@ pub enum TargetKind {
     UiNode,
     /// Hyperlinks.
     Link,
+}
+
+impl TargetKind {
+    /// Kind of a resolved target handle.
+    #[must_use]
+    pub const fn of(target: &TargetRef) -> Self {
+        match target {
+            TargetRef::Panel(_) => Self::Panel,
+            TargetRef::Workspace(_) => Self::Workspace,
+            TargetRef::CommandBlock(_) => Self::CommandBlock,
+            TargetRef::UiNode(_) => Self::UiNode,
+            TargetRef::Link(_) => Self::Link,
+        }
+    }
+
+    /// Canonical wire spelling used by the host bridge.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Panel => "panel",
+            Self::Workspace => "workspace",
+            Self::CommandBlock => "block",
+            Self::UiNode => "node",
+            Self::Link => "link",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +439,63 @@ impl TargetProvider for CommandBlockProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Core target provider (W-29 successor)
+// ---------------------------------------------------------------------------
+
+/// The live Core target set as one provider (Core tier, reserved name
+/// `terminal`).
+///
+/// Generalizes [`CommandBlockProvider`] to every Core-owned surface the host
+/// can enumerate (panels, workspaces, command blocks, UI nodes, links). The
+/// host supplies the offers from its last committed live state; this provider
+/// is a pure enumeration and carries no generations. Collection order is the
+/// caller's offer order, which keeps the snapshot deterministic.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreTargetProvider {
+    targets: Vec<ProviderTarget>,
+}
+
+impl CoreTargetProvider {
+    /// Creates the Core provider over `targets`.
+    #[must_use]
+    pub fn new(targets: Vec<ProviderTarget>) -> Self {
+        Self { targets }
+    }
+
+    /// Owned offers, in collection order.
+    #[must_use]
+    pub fn targets(&self) -> &[ProviderTarget] {
+        &self.targets
+    }
+
+    /// Number of owned offers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// True when no offer is owned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+impl TargetProvider for CoreTargetProvider {
+    fn tier(&self) -> ProviderTier {
+        ProviderTier::Core
+    }
+
+    fn name(&self) -> &str {
+        CORE_TERMINAL_PROVIDER_NAME
+    }
+
+    fn collect(&self) -> Vec<ProviderTarget> {
+        self.targets.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Derived provider
 // ---------------------------------------------------------------------------
 
@@ -606,10 +695,22 @@ impl ProviderMediator {
     /// over `blocks`.
     #[must_use]
     pub fn with_core(blocks: Vec<CommandBlockId>) -> Self {
+        Self::with_core_targets(
+            blocks
+                .into_iter()
+                .map(ProviderTarget::CommandBlock)
+                .collect(),
+        )
+    }
+
+    /// Creates a mediator with the Core target provider pre-registered over
+    /// already-enumerated live `targets`.
+    #[must_use]
+    pub fn with_core_targets(targets: Vec<ProviderTarget>) -> Self {
         let mut mediator = Self::new();
         // Infallible by construction: the reserved name is valid for Core.
         mediator
-            .register(Box::new(CommandBlockProvider::new(blocks)), true)
+            .register(Box::new(CoreTargetProvider::new(targets)), true)
             .expect("core terminal provider registers");
         mediator
     }
@@ -854,6 +955,49 @@ mod tests {
             ]
         );
         assert!(CommandBlockProvider::new(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn core_target_provider_collects_every_surface() {
+        let offers = vec![
+            ProviderTarget::Panel(PanelId::new(1)),
+            ProviderTarget::Workspace(crate::targeting::WorkspaceId::new(2)),
+            ProviderTarget::CommandBlock(CommandBlockId::new(3)),
+            ProviderTarget::UiNode(crate::uitree::UiNodeId::new(4)),
+            ProviderTarget::Link(LinkId::new(5)),
+        ];
+        let provider = CoreTargetProvider::new(offers.clone());
+        assert_eq!(provider.tier(), ProviderTier::Core);
+        assert_eq!(provider.name(), CORE_TERMINAL_PROVIDER_NAME);
+        assert_eq!(provider.len(), 5);
+        assert!(!provider.is_empty());
+        assert_eq!(provider.targets(), offers.as_slice());
+        assert_eq!(provider.collect(), offers);
+        assert!(CoreTargetProvider::new(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn with_core_targets_feeds_mediator_in_offer_order() {
+        let offers = vec![
+            ProviderTarget::Workspace(crate::targeting::WorkspaceId::new(2)),
+            ProviderTarget::Panel(PanelId::new(1)),
+        ];
+        let mediator = ProviderMediator::with_core_targets(offers.clone());
+        let mut registry = TargetRegistry::new();
+        let snapshot = mediator.collect(&mut registry).expect("collect");
+        let kinds: Vec<TargetKind> = snapshot
+            .entries()
+            .iter()
+            .map(|entry| TargetKind::of(&entry.target()))
+            .collect();
+        assert_eq!(kinds, vec![TargetKind::Workspace, TargetKind::Panel]);
+        assert_eq!(
+            snapshot
+                .offered()
+                .into_iter()
+                .collect::<Vec<ProviderTarget>>(),
+            offers
+        );
     }
 
     #[test]

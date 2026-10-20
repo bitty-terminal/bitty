@@ -1842,6 +1842,7 @@ impl Runtime {
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_chrome_bands(basis.pad_px, &mut layers);
         self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
+        self.paint_target_annotations(basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
         if let Some(paint) = cursor {
             layers.any_needs_draw |= self.paint_cursor_on_top(
@@ -4003,6 +4004,66 @@ impl Runtime {
             layers.combined_glyphs.extend(glyphs);
         }
         layers.any_needs_draw = true;
+    }
+
+    /// Present-time target annotation batch (W-29 successor, issue #2253).
+    ///
+    /// Paints one bounded layer of label pills at the annotation anchors, in
+    /// batch (paint) order, above the plugin overlay and below kitty images.
+    /// Presentation-only: no grid, cursor, scrollback, or layout mutation.
+    /// Anchors are window cell coordinates; the window-padding inset is added
+    /// exactly like every other overlay phase. No-op with no batch.
+    fn paint_target_annotations(&mut self, pad_px: i32, layers: &mut FrameLayers) {
+        let Some(annotations) = self.target_annotations.clone() else {
+            return;
+        };
+        let live = self.live_cell_metrics();
+        let cell_w = live.width.max(1);
+        let cell_h = live.height.max(1);
+        if cell_w == 0 || cell_h == 0 {
+            return;
+        }
+        let viewport = annotations.viewport();
+        let mut painted = false;
+        for annotation in annotations.annotations() {
+            if !viewport.contains_point(annotation.anchor) {
+                continue;
+            }
+            let cols_left = viewport
+                .right()
+                .saturating_sub(u32::from(annotation.anchor.x))
+                .min(u32::from(u16::MAX)) as u16;
+            if cols_left == 0 {
+                continue;
+            }
+            let (text, text_cells) = clip_to_width_cells(&annotation.label, cols_left);
+            if text_cells == 0 {
+                continue;
+            }
+            let origin_x = px_add(pad_px, px_offset_cells(0, annotation.anchor.x, cell_w));
+            let origin_y = px_add(pad_px, px_offset_cells(0, annotation.anchor.y, cell_h));
+            layers.combined_overlay.push(bitty_render::grid::FillRect {
+                rect: bitty_render::geometry::RectPx::new(
+                    origin_x,
+                    origin_y,
+                    px_span_usize(text_cells, cell_w),
+                    px_span(1, cell_h),
+                ),
+                color: self.config.theme.background,
+            });
+            layers
+                .combined_glyphs
+                .extend(self.renderer.overlay_text_glyphs(
+                    &text,
+                    (origin_x, origin_y),
+                    text_cells,
+                    self.config.theme.foreground,
+                ));
+            painted = true;
+        }
+        if painted {
+            layers.any_needs_draw = true;
+        }
     }
 
     /// One text row per scene line for the overlay surface (CTX-1170).

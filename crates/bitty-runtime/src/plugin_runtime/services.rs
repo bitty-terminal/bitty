@@ -20,9 +20,9 @@ use bitty_lua::{
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm,
     OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
-    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, ThemeTable,
-    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, component_bridge_error,
-    env_grant_shape_ok, validate_env_key,
+    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
+    TargetSnapshotRow, ThemeTable, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest,
+    component_bridge_error, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_rich::{
@@ -31,9 +31,9 @@ use bitty_rich::{
     validate_resource_path,
 };
 use bitty_ui::{
-    CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, LabelAllocator,
-    LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget, QualifiedCommand, Rect,
-    TargetDispatcher, TargetProvider, TargetRef, TargetRegistry,
+    CommandBlockId, DerivedProvider, DispatchError, HintAnnotationLayer, HintAnnotationSpec,
+    LabelAllocator, LabelPolicy, LinkId, ProviderError, ProviderMediator, ProviderTarget,
+    QualifiedCommand, Rect, TargetDispatcher, TargetProvider, TargetRef, TargetRegistry,
 };
 use bitty_ui::{MAX_HINT_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_BINDINGS, MAX_TARGET_PROVIDERS};
 use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
@@ -174,6 +174,53 @@ pub struct UnavailableWorkspaces;
 impl WorkspaceSource for UnavailableWorkspaces {
     fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
         Err(BridgeError::not_implemented("bitty.workspace.list"))
+    }
+}
+
+/// One live Core target with its presentation anchor (W-29 successor).
+///
+/// Plain data published by the application once per tick (the `LiveSnapshot`
+/// pattern): the runtime never reaches into live layout state from a plugin
+/// call, and the plugin never sees terminal content. `rect` is in window cell
+/// coordinates and may be absent for surfaces the host cannot anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreTargetInfo {
+    /// Surface kind (`panel`, `workspace`, `block`, `node`, `link`).
+    pub kind: String,
+    /// Stable semantic id within `kind`.
+    pub id: u64,
+    /// Owning workspace id, when workspace-scoped.
+    pub workspace: Option<u64>,
+    /// Screen region in window cells (`x`, `y`, `width`, `height`).
+    pub rect: Option<(u16, u16, u16, u16)>,
+}
+
+/// Read-only Core target/anchor source for target sessions (W-29 successor).
+///
+/// The application publishes live panel and workspace anchors into its
+/// implementation once per tick. Collection is cold-path only: the mediator
+/// reads this source when a session enters, never per frame or per input
+/// event.
+pub trait TargetSource {
+    /// Current Core targets in deterministic order, bounded by
+    /// [`MAX_SNAPSHOT_TARGETS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the source cannot serve state.
+    fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError>;
+}
+
+/// Target source for hosts without a target backend: an honest empty set.
+///
+/// The Core provider is then empty and plugin lenses still work; no plugin
+/// gains authority from the absence of a source.
+#[derive(Debug, Default)]
+pub struct UnavailableTargets;
+
+impl TargetSource for UnavailableTargets {
+    fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+        Ok(Vec::new())
     }
 }
 
@@ -1555,6 +1602,28 @@ fn targets_kind_string(target: &TargetRef) -> String {
     }
 }
 
+/// Stable semantic id of a resolved target within its kind (W-29 successor).
+fn target_raw_id(target: &TargetRef) -> u64 {
+    match target {
+        TargetRef::Panel(r) => r.id.0,
+        TargetRef::Workspace(r) => r.id.0,
+        TargetRef::CommandBlock(r) => r.id.0,
+        TargetRef::UiNode(r) => r.id.0,
+        TargetRef::Link(r) => r.id.0,
+    }
+}
+
+/// Generation captured inside a resolved target (W-29 successor).
+fn target_generation(target: &TargetRef) -> u64 {
+    match target {
+        TargetRef::Panel(r) => r.generation,
+        TargetRef::Workspace(r) => r.generation,
+        TargetRef::CommandBlock(r) => r.generation,
+        TargetRef::UiNode(r) => r.generation,
+        TargetRef::Link(r) => r.generation,
+    }
+}
+
 /// Build one Core offer from a Lua `(kind, id)` pair (W-29).
 ///
 /// Kinds are the five `TargetRef` variants; `ViewId` is deliberately absent.
@@ -1584,6 +1653,14 @@ fn targets_offer(kind: &str, id: u64) -> Result<ProviderTarget, BridgeError> {
 /// the live generation count; dead entries are pruned on activation and on
 /// disposal.
 pub type OverlayPeers = Rc<RefCell<BTreeMap<String, Vec<Weak<PluginServices>>>>>;
+
+/// Runtime-shared present-time annotation channel (W-29 successor).
+///
+/// The current generation publishes its batched [`HintAnnotationLayer`] here
+/// on session start, replaces it on presentation sync, and clears it on
+/// dispatch/cancel/timeout/unload. The application reads it once per tick and
+/// hands it to the scene/compositor; plugins never draw into the layer.
+pub type SharedTargetAnnotations = Rc<RefCell<Option<Rc<HintAnnotationLayer>>>>;
 
 #[allow(clippy::type_complexity)]
 pub struct PluginServices {
@@ -1662,6 +1739,17 @@ pub struct PluginServices {
     /// type); this handle only coordinates dispatcher lifetime with capture
     /// release. `None` means no session.
     target_session_overlay: RefCell<Option<i64>>,
+    /// Read-only Core target/anchor source (W-29 successor).
+    ///
+    /// Wired at activation from the application's live publisher; `None`
+    /// leaves the Core provider empty (plugin lenses still work). Reads are
+    /// cold-path collection only.
+    target_source: RefCell<Option<Rc<dyn TargetSource>>>,
+    /// Runtime-shared present-time annotation channel (W-29 successor).
+    ///
+    /// `None` leaves the channel unwired; session start then fails closed with
+    /// `E_UI_UNAVAILABLE` rather than presenting an unowned batch.
+    target_annotations: RefCell<Option<SharedTargetAnnotations>>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
     /// Safe-mode flag for this generation (CTX-0941, W-28 host API).
@@ -1826,6 +1914,8 @@ impl PluginServices {
             label_allocator: RefCell::new(None),
             target_dispatcher: RefCell::new(TargetDispatcher::new()),
             target_session_overlay: RefCell::new(None),
+            target_source: RefCell::new(None),
+            target_annotations: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
             safe_mode: Cell::new(false),
@@ -2158,6 +2248,16 @@ impl PluginServices {
         *self.workspace_requests.borrow_mut() = requests;
     }
 
+    /// Attach the live Core target/anchor source (W-29 successor).
+    ///
+    /// `None` leaves the Core provider empty (plugin lenses still work).
+    /// Presence never grants authority: the session still requires the
+    /// accepted `ui.overlay` capability, and dispatch still returns a typed
+    /// command the registry executes under its owner's grants.
+    pub fn set_target_source(&self, source: Option<Rc<dyn TargetSource>>) {
+        *self.target_source.borrow_mut() = source;
+    }
+
     /// Attach the composition-root history snapshot provider (CTX-1352).
     ///
     /// Only the provider supplies persisted rows; the per-source capability
@@ -2326,20 +2426,23 @@ impl PluginServices {
 
     /// Attach the runtime-shared targeting mechanism state (W-29, CTX-0942).
     ///
-    /// The runtime wires one registry, lens set, and allocator across every
-    /// generation so the provider set spans plugins and survives reload. A
-    /// generation built without wiring keeps `None` and every targeting call
-    /// fails closed with `E_UI_UNAVAILABLE`. Uses only existing `bitty-ui`
-    /// types; no new targeting type is introduced.
+    /// The runtime wires one registry, lens set, allocator, and present-time
+    /// annotation channel across every generation so the provider set spans
+    /// plugins and survives reload. A generation built without wiring keeps
+    /// `None` and every targeting call fails closed with
+    /// `E_UI_UNAVAILABLE`. Uses only existing `bitty-ui` types; no new
+    /// targeting type is introduced.
     pub fn set_targeting_state(
         &self,
         registry: Rc<RefCell<TargetRegistry>>,
         lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>>,
         allocator: Rc<RefCell<LabelAllocator>>,
+        annotations: SharedTargetAnnotations,
     ) {
         *self.target_registry.borrow_mut() = Some(registry);
         *self.target_lenses.borrow_mut() = Some(lenses);
         *self.label_allocator.borrow_mut() = Some(allocator);
+        *self.target_annotations.borrow_mut() = Some(annotations);
     }
 
     /// The `bitty.ui.targets`/`bitty.ui.labels` capability gate (W-29).
@@ -2400,6 +2503,9 @@ impl PluginServices {
     pub fn clear_targeting_session(&self) {
         *self.target_dispatcher.borrow_mut() = TargetDispatcher::new();
         *self.target_session_overlay.borrow_mut() = None;
+        if let Some(annotations) = self.target_annotations.borrow().clone() {
+            *annotations.borrow_mut() = None;
+        }
     }
 
     /// Drop every lens this generation registered (suspend/dispose/rollback).
@@ -2417,15 +2523,50 @@ impl PluginServices {
         had_session
     }
 
+    /// Read the live Core target set from the injected source.
+    ///
+    /// Cold path only. The source is bounded by the provider snapshot cap;
+    /// an over-cap or malformed set fails closed before any registry insert.
+    fn core_target_infos(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+        let Some(source) = self.target_source.borrow().clone() else {
+            return Ok(Vec::new());
+        };
+        let targets = source.targets()?;
+        if targets.len() > MAX_SNAPSHOT_TARGETS {
+            return Err(BridgeError::new(
+                "budget",
+                "E_DEF_LIMIT",
+                format!("too many snapshot targets: max {MAX_SNAPSHOT_TARGETS}"),
+            ));
+        }
+        Ok(targets)
+    }
+
+    /// Build the Core provider offers from live `infos`.
+    ///
+    /// Unknown kinds fail closed with the existing `E_DEF_INVALID`.
+    fn core_target_offers(
+        &self,
+        infos: &[CoreTargetInfo],
+    ) -> Result<Vec<ProviderTarget>, BridgeError> {
+        infos
+            .iter()
+            .map(|info| targets_offer(&info.kind, info.id))
+            .collect()
+    }
+
     /// Build a fresh mediator from the Core provider plus shared lenses.
     ///
-    /// The Core terminal provider is empty (no scrollback blocks are sourced
-    /// in this thin slice; semantic derivation from Terminal Truth stays with
-    /// `bitty.terminal.snapshot`); lenses are collected in registration order.
+    /// `core_offers` is the live Core target set read once per collection
+    /// (panels/workspaces today; command blocks, UI nodes, and links when
+    /// their providers land). Lenses are collected in registration order.
     /// Registration errors propagate with existing codes.
-    fn targeting_mediator(&self) -> Result<ProviderMediator, BridgeError> {
+    fn targeting_mediator(
+        &self,
+        core_offers: Vec<ProviderTarget>,
+    ) -> Result<ProviderMediator, BridgeError> {
         let lenses = self.require_target_lenses()?;
-        let mut mediator = ProviderMediator::with_core(Vec::new());
+        let mut mediator = ProviderMediator::with_core_targets(core_offers);
         for (_, lens) in lenses.borrow().iter() {
             let rebuilt = DerivedProvider::new(lens.name(), lens.collect())
                 .map_err(map_targets_provider_error)?;
@@ -2436,12 +2577,35 @@ impl PluginServices {
         Ok(mediator)
     }
 
+    /// Shared present-time annotation channel or typed `E_UI_UNAVAILABLE`.
+    fn require_target_annotations(&self) -> Result<SharedTargetAnnotations, BridgeError> {
+        self.target_annotations.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no ui annotation surface",
+            )
+        })
+    }
+
+    /// Find the live Core anchor metadata for a collected snapshot target.
+    fn core_info_for<'a>(
+        infos: &'a [CoreTargetInfo],
+        target: &TargetRef,
+    ) -> Option<&'a CoreTargetInfo> {
+        let kind = targets_kind_string(target);
+        let id = target_raw_id(target);
+        infos.iter().find(|info| info.kind == kind && info.id == id)
+    }
+
     /// Inner session start after the W-28 capture was acquired (W-29).
     ///
-    /// Collects a fresh snapshot, validates lengths, allocates labels,
-    /// builds the annotation layer, and binds the dispatcher. All failures
-    /// are typed with existing codes and leave no partial session; the caller
-    /// releases capture on error. Nothing is published to the Event Bus.
+    /// Collects a fresh snapshot, validates lengths, allocates labels, builds
+    /// one anchored annotation layer (Core rectangles from the live source,
+    /// plugin anchors otherwise), publishes it to the present-time channel,
+    /// and binds the dispatcher. All failures are typed with existing codes
+    /// and leave no partial session; the caller releases capture on error.
+    /// Nothing is published to the Event Bus.
     #[allow(clippy::type_complexity)]
     fn targets_session_start_inner(
         &self,
@@ -2450,7 +2614,9 @@ impl PluginServices {
         commands: &[String],
     ) -> Result<Vec<String>, BridgeError> {
         let registry = self.require_target_registry()?;
-        let mediator = self.targeting_mediator()?;
+        let infos = self.core_target_infos()?;
+        let offers = self.core_target_offers(&infos)?;
+        let mediator = self.targeting_mediator(offers)?;
         let snapshot = mediator
             .collect(&mut registry.borrow_mut())
             .map_err(map_targets_provider_error)?;
@@ -2475,12 +2641,27 @@ impl PluginServices {
             ));
         }
         let allocator = self.require_label_allocator()?;
-        let points: Vec<Point> = anchors.iter().map(|(x, y)| Point::new(*x, *y)).collect();
+        // A live Core panel anchor owns its label position; workspace anchors
+        // and plugin targets keep the caller-supplied anchor so policy can
+        // place workspace hints on the rail rather than over the panels.
+        let points: Vec<Point> = entries
+            .iter()
+            .zip(anchors.iter())
+            .map(
+                |(entry, anchor)| match Self::core_info_for(&infos, &entry.target()) {
+                    Some(info) if info.kind == "panel" => info
+                        .rect
+                        .map_or(Point::new(anchor.0, anchor.1), |(x, y, _, _)| {
+                            Point::new(x, y)
+                        }),
+                    _ => Point::new(anchor.0, anchor.1),
+                },
+            )
+            .collect();
         let labels = allocator
             .borrow()
             .assign(&points, width)
             .map_err(map_targets_label_error)?;
-        let targets: Vec<TargetRef> = entries.iter().map(|entry| entry.target()).collect();
         let mut parsed = Vec::with_capacity(commands.len());
         for command in commands {
             match QualifiedCommand::parse(command) {
@@ -2494,23 +2675,47 @@ impl PluginServices {
                 }
             }
         }
+        let specs: Vec<HintAnnotationSpec> = entries
+            .iter()
+            .zip(points.iter())
+            .map(
+                |(entry, point)| match Self::core_info_for(&infos, &entry.target()) {
+                    Some(info) => HintAnnotationSpec {
+                        target: entry.target(),
+                        workspace: info.workspace.map(WorkspaceId::new),
+                        rect: info
+                            .rect
+                            .map_or(Rect::zero(), |(x, y, w, h)| Rect::new(x, y, w, h)),
+                    },
+                    None => HintAnnotationSpec {
+                        target: entry.target(),
+                        workspace: None,
+                        rect: Rect::new(point.x, point.y, 1, 1),
+                    },
+                },
+            )
+            .collect();
         let height = points
             .iter()
             .map(|point| point.y)
             .max()
             .map_or(1, |y| y.saturating_add(1));
-        let layer =
-            HintAnnotationLayer::build(&targets, &labels, &points, Rect::new(0, 0, width, height))
-                .map_err(|error| match error {
-                    bitty_ui::AnnotationLayerError::TooManyAnnotations { requested, max } => {
-                        BridgeError::new(
-                            "budget",
-                            "E_DEF_LIMIT",
-                            format!("too many annotations: requested {requested}, max {max}"),
-                        )
-                    }
-                    other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
-                })?;
+        let layer = HintAnnotationLayer::build_anchored(
+            &specs,
+            &labels,
+            &points,
+            Rect::new(0, 0, width, height),
+        )
+        .map_err(|error| match error {
+            bitty_ui::AnnotationLayerError::TooManyAnnotations { requested, max } => {
+                BridgeError::new(
+                    "budget",
+                    "E_DEF_LIMIT",
+                    format!("too many annotations: requested {requested}, max {max}"),
+                )
+            }
+            other => BridgeError::new("validation", "E_DEF_INVALID", other.to_string()),
+        })?;
         if layer.len() + self.target_dispatcher.borrow().len() > MAX_TARGET_BINDINGS {
             return Err(BridgeError::new(
                 "budget",
@@ -2522,6 +2727,8 @@ impl PluginServices {
         dispatcher
             .bind_layer(&layer, &parsed)
             .map_err(map_targets_dispatch_error)?;
+        let annotations = self.require_target_annotations()?;
+        *annotations.borrow_mut() = Some(Rc::new(layer));
         *self.target_dispatcher.borrow_mut() = dispatcher;
         Ok(labels)
     }
@@ -3517,6 +3724,16 @@ impl HostServices for PluginServices {
         if guard.is_owner(&self.plugin_id, handle) {
             guard.release_with_reason(&self.plugin_id, handle, &disposition);
             drop(guard);
+            // W-29 successor: a direct overlay release also ends this
+            // generation's targeting session, so annotations, bindings, and
+            // the session marker cannot outlive the capture.
+            if self
+                .target_session_overlay
+                .borrow()
+                .is_some_and(|owned| owned == handle)
+            {
+                self.clear_targeting_session();
+            }
             // The ended session's transient surface leaves with it; a
             // retained mechanism-path block is untouched (never spec-created).
             self.remove_spec_overlay_block(handle);
@@ -3569,14 +3786,15 @@ impl HostServices for PluginServices {
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<(i64, String, String)>, BridgeError> {
+    fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<TargetSnapshotRow>, BridgeError> {
         self.require_targets_capability()?;
         // Read-only: collect into a scratch registry, never the shared one
         // that live sessions bind their generations against.
         let _ = self.require_target_registry()?;
+        let infos = self.core_target_infos()?;
+        let offers = self.core_target_offers(&infos)?;
         let mut scratch = TargetRegistry::new();
-        let mediator = self.targeting_mediator()?;
+        let mediator = self.targeting_mediator(offers)?;
         let snapshot = mediator
             .collect(&mut scratch)
             .map_err(map_targets_provider_error)?;
@@ -3587,12 +3805,24 @@ impl HostServices for PluginServices {
             .take(take)
             .enumerate()
             .map(|(index, entry)| {
-                let handle = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
-                (
-                    handle,
-                    targets_kind_string(&entry.target()),
-                    entry.tier().to_string(),
-                )
+                let target = entry.target();
+                let kind = targets_kind_string(&target);
+                let id = target_raw_id(&target);
+                let info = Self::core_info_for(&infos, &target);
+                let workspace = info.map_or_else(
+                    || (kind == "workspace").then_some(id),
+                    |info| info.workspace,
+                );
+                let hint = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
+                TargetSnapshotRow {
+                    handle: hint,
+                    id,
+                    kind,
+                    tier: entry.tier().to_string(),
+                    workspace,
+                    rect: info.and_then(|info| info.rect),
+                    generation: target_generation(&target),
+                }
             })
             .collect())
     }
@@ -3746,12 +3976,18 @@ impl HostServices for PluginServices {
             ));
         }
         let registry = self.require_target_registry()?;
-        match self
-            .target_dispatcher
-            .borrow()
-            .dispatch(label, &registry.borrow())
-        {
-            Ok(command) => Ok(command.as_str().to_string()),
+        let outcome = {
+            let dispatcher = self.target_dispatcher.borrow();
+            let live = registry.borrow();
+            dispatcher.dispatch(label, &live)
+        };
+        match outcome {
+            Ok(command) => {
+                // Single-shot: the annotation batch and bindings leave with
+                // the selection, so a replayed label fails closed.
+                self.clear_targeting_session();
+                Ok(command.as_str().to_string())
+            }
             Err(error) => Err(map_targets_dispatch_error(error)),
         }
     }
@@ -8298,6 +8534,7 @@ mod tests {
                 Rc::new(RefCell::new(TargetRegistry::new())),
                 Rc::new(RefCell::new(Vec::new())),
                 Rc::new(RefCell::new(LabelAllocator::default())),
+                Rc::new(RefCell::new(None::<Rc<HintAnnotationLayer>>)),
             );
             services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
         }
@@ -8314,6 +8551,16 @@ mod tests {
 
     fn targeting_commands(n: u64) -> Vec<String> {
         (0..n).map(|i| format!("acme.cmd:c{i}")).collect()
+    }
+
+    /// Fixed live Core target source for anchor/presentation tests.
+    #[derive(Debug)]
+    struct FixedTargets(Vec<CoreTargetInfo>);
+
+    impl TargetSource for FixedTargets {
+        fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+            Ok(self.0.clone())
+        }
     }
 
     #[test]
@@ -8375,6 +8622,158 @@ mod tests {
     }
 
     #[test]
+    fn targeting_core_source_publishes_anchored_annotations() {
+        let services = targeting_services(true, true);
+        services.set_target_source(Some(Rc::new(FixedTargets(vec![
+            CoreTargetInfo {
+                kind: "workspace".to_string(),
+                id: 7,
+                workspace: Some(7),
+                rect: Some((0, 0, 80, 24)),
+            },
+            CoreTargetInfo {
+                kind: "panel".to_string(),
+                id: 11,
+                workspace: Some(7),
+                rect: Some((1, 2, 20, 10)),
+            },
+        ]))));
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        let rows = services.ui_targets_snapshot(16).expect("snapshot");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "workspace");
+        assert_eq!(rows[0].id, 7);
+        assert_eq!(rows[0].workspace, Some(7));
+        assert_eq!(rows[0].rect, Some((0, 0, 80, 24)));
+        assert_eq!(rows[1].kind, "panel");
+        assert_eq!(rows[1].id, 11);
+        assert_eq!(rows[1].workspace, Some(7));
+        assert_eq!(rows[1].rect, Some((1, 2, 20, 10)));
+
+        let labels = services
+            .ui_targets_session_start(
+                handle,
+                80,
+                &[(0, 0), (0, 0)],
+                &[
+                    "acme.cmd:workspace".to_string(),
+                    "acme.cmd:panel".to_string(),
+                ],
+            )
+            .expect("start");
+        let layer = services
+            .target_annotations
+            .borrow()
+            .clone()
+            .expect("annotation channel")
+            .borrow()
+            .clone()
+            .expect("published layer");
+        assert_eq!(layer.len(), 2);
+        let panel = layer
+            .annotation_for_label(&labels[1])
+            .expect("panel annotation");
+        assert_eq!(panel.kind, bitty_ui::TargetKind::Panel);
+        assert_eq!(panel.workspace, Some(WorkspaceId::new(7)));
+        assert_eq!(panel.rect, Rect::new(1, 2, 20, 10));
+        // The label anchor follows the live Core rectangle, not the
+        // caller-supplied (0, 0) placeholder.
+        assert_eq!(panel.anchor, Point::new(1, 2));
+        assert_eq!(
+            layer
+                .hit_test(Point::new(5, 5))
+                .map(|annotation| annotation.label.clone()),
+            Some(labels[1].clone())
+        );
+    }
+
+    #[test]
+    fn targeting_presented_annotation_drop_revokes_label() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(2))
+            .expect("register");
+        let labels = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(2), &targeting_commands(2))
+            .expect("start");
+        let shared = services
+            .target_annotations
+            .borrow()
+            .clone()
+            .expect("annotation channel");
+        let dropped = labels[0].clone();
+        let mut updated = (**shared.borrow().as_ref().expect("layer")).clone();
+        assert!(updated.drop_annotation(&dropped));
+        *shared.borrow_mut() = Some(Rc::new(updated.clone()));
+        assert_eq!(
+            services
+                .target_dispatcher
+                .borrow_mut()
+                .retain_presented(&updated),
+            1
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch(&dropped)
+                .expect_err("dropped label fails closed")
+                .code,
+            "E_DEF_INVALID"
+        );
+        // The sibling label still dispatches; the session remains live.
+        assert!(
+            services
+                .ui_targets_dispatch(&labels[1])
+                .expect("sibling dispatch")
+                .starts_with("acme.cmd:")
+        );
+    }
+
+    #[test]
+    fn targeting_direct_overlay_release_ends_session() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        let labels = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(1), &targeting_commands(1))
+            .expect("start");
+        assert!(
+            services
+                .target_annotations
+                .borrow()
+                .as_ref()
+                .expect("channel")
+                .borrow()
+                .is_some()
+        );
+        assert!(services.ui_overlay_release(handle).expect("release"));
+        assert!(
+            services
+                .target_annotations
+                .borrow()
+                .as_ref()
+                .expect("channel")
+                .borrow()
+                .is_none()
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("session ended")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
     fn targeting_session_lifecycle_over_overlay_capture() {
         let services = targeting_services(true, true);
         let handle = services
@@ -8406,9 +8805,9 @@ mod tests {
         assert_eq!(
             services
                 .ui_targets_dispatch("zz")
-                .expect_err("unknown")
+                .expect_err("single-shot session ended")
                 .code,
-            "E_DEF_INVALID"
+            E_UI_NOT_OWNER
         );
         // No target or annotation internal is published: the lifecycle
         // touches no notification queue.
@@ -8555,6 +8954,7 @@ mod tests {
         let registry = Rc::new(RefCell::new(TargetRegistry::new()));
         let lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>> = Rc::new(RefCell::new(Vec::new()));
         let allocator = Rc::new(RefCell::new(LabelAllocator::default()));
+        let annotations: SharedTargetAnnotations = Rc::new(RefCell::new(None));
         let capture = Rc::new(RefCell::new(OverlayCapture::new()));
         let first_party = generation_services("bitty.first", 1, &capture);
         let out_of_tree = generation_services("beacon.ext", 2, &capture);
@@ -8562,11 +8962,13 @@ mod tests {
             Rc::clone(&registry),
             Rc::clone(&lenses),
             Rc::clone(&allocator),
+            Rc::clone(&annotations),
         );
         out_of_tree.set_targeting_state(
             Rc::clone(&registry),
             Rc::clone(&lenses),
             Rc::clone(&allocator),
+            Rc::clone(&annotations),
         );
 
         // Provider composition is generic registration: each consumer's lens
@@ -8630,7 +9032,7 @@ mod tests {
         // A newer collection epoch stales the bound handles: dispatch then
         // fails closed instead of resolving to a moved target.
         let _ = out_of_tree
-            .targeting_mediator()
+            .targeting_mediator(Vec::new())
             .expect("mediator")
             .collect(&mut registry.borrow_mut())
             .expect("recollect bumps generations");

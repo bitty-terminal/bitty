@@ -116,6 +116,31 @@ impl TargetDispatcher {
         Ok(())
     }
 
+    /// Rebinds the dispatcher to the currently presented annotations.
+    ///
+    /// Keeps only bindings whose label is still present with the same target
+    /// in `layer`; labels that disappeared or moved to another target are
+    /// dropped. This is the mutation-safe present-time sync: a target removed
+    /// from the annotation batch cannot dispatch through its old label even
+    /// when the live registry still resolves it.
+    ///
+    /// Returns the number of bindings dropped.
+    pub fn retain_presented(&mut self, layer: &HintAnnotationLayer) -> usize {
+        let before = self.bindings.len();
+        self.bindings.retain(|label, (target, _)| {
+            layer
+                .annotation_for_label(label)
+                .is_some_and(|annotation| annotation.target == *target)
+        });
+        before - self.bindings.len()
+    }
+
+    /// True when `label` currently has a binding.
+    #[must_use]
+    pub fn is_bound(&self, label: &str) -> bool {
+        self.bindings.contains_key(label)
+    }
+
     /// Number of bound labels.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -286,5 +311,70 @@ mod tests {
             Err(DispatchError::UnknownLabel(_))
         ));
         assert!(dispatcher.is_empty());
+    }
+
+    #[test]
+    fn dropped_annotation_revokes_its_binding() {
+        let mut registry = TargetRegistry::new();
+        let mut layer = layer_two(&mut registry);
+        let link_target = layer.annotation_for_label("a").expect("label").target;
+        let mut dispatcher = TargetDispatcher::new();
+        dispatcher
+            .bind_layer(
+                &layer,
+                &[
+                    command("bitty.workspace:focus-panel"),
+                    command("bitty.links:open-link"),
+                ],
+            )
+            .expect("bind");
+        assert!(dispatcher.is_bound("a"));
+        assert!(layer.drop_annotation("a"));
+        assert_eq!(dispatcher.retain_presented(&layer), 1);
+        assert!(!dispatcher.is_bound("a"));
+        // The target itself is still live in the registry; the binding is
+        // gone because the presentation dropped it, not because it went
+        // stale. Fail closed, never dispatch a vanished label.
+        assert!(registry.resolve(&link_target).is_ok());
+        assert!(matches!(
+            dispatcher.dispatch("a", &registry),
+            Err(DispatchError::UnknownLabel(_))
+        ));
+        // The sibling label still resolves.
+        assert!(dispatcher.dispatch("g", &registry).is_ok());
+    }
+
+    #[test]
+    fn retargeted_annotation_revokes_its_binding() {
+        let mut registry = TargetRegistry::new();
+        let layer = layer_two(&mut registry);
+        let mut dispatcher = TargetDispatcher::new();
+        dispatcher
+            .bind_layer(
+                &layer,
+                &[
+                    command("bitty.workspace:focus-panel"),
+                    command("bitty.links:open-link"),
+                ],
+            )
+            .expect("bind");
+        // Rebuild the same label against a fresh generation; the old binding
+        // must not survive the presentation swap.
+        let mut next_registry = TargetRegistry::new();
+        // Burn one generation so the replacement handle differs from the
+        // original registry's generation-0 handle.
+        let _ = next_registry.insert_link(LinkId::new(99)).expect("link");
+        let replacement = next_registry.insert_link(LinkId::new(1)).expect("link");
+        let unchanged = layer.annotation_for_label("g").expect("label").target;
+        let next = HintAnnotationLayer::build(
+            &[TargetRef::Link(replacement), unchanged],
+            &["a".to_string(), "g".to_string()],
+            &[Point::new(1, 0), Point::new(70, 0)],
+            Rect::new(0, 0, 80, 24),
+        )
+        .expect("layer");
+        assert_eq!(dispatcher.retain_presented(&next), 1);
+        assert!(!dispatcher.is_bound("a"));
+        assert!(dispatcher.is_bound("g"));
     }
 }

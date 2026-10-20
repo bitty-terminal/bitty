@@ -576,6 +576,10 @@ pub(crate) struct TerminalApp {
     /// Core's workspace summaries here so `bitty.workspace.list()` serves
     /// committed state. `None` without a plugin runtime.
     pub(crate) live_workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
+    /// Live Core target/anchor source shared with the plugin runtime
+    /// (issue #2253): `drive_tick` publishes the runtime's plain-data rows so
+    /// target sessions read last-tick state without reaching live layout.
+    pub(crate) live_targets: Option<std::rc::Rc<crate::plugin_runtime::LiveTargets>>,
     /// Shared live pin-target snapshot (CTX-1115): `drive_tick` publishes
     /// the active-workspace leaf ids plus the window-global pinned ids here
     /// so the deferred `bitty.panel.set_pinned` backend validates against
@@ -706,6 +710,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_targets: None,
             live_pin_state: None,
             live_history: None,
             plugin_runtime: None,
@@ -749,6 +754,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_targets: None,
             live_pin_state: None,
             live_history: None,
             plugin_runtime: None,
@@ -867,6 +873,18 @@ impl TerminalApp {
         workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
     ) -> Self {
         self.live_workspaces = workspaces;
+        self
+    }
+
+    /// Attaches the shared live target/anchor source (issue #2253).
+    /// Production startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; plugin-less runs
+    /// leave it `None`.
+    pub(crate) fn with_live_targets(
+        mut self,
+        targets: Option<std::rc::Rc<crate::plugin_runtime::LiveTargets>>,
+    ) -> Self {
+        self.live_targets = targets;
         self
     }
 
@@ -1359,6 +1377,9 @@ impl TerminalApp {
         // session.
         self.deliver_overlay_input_available();
         self.update_plugin_overlay();
+        // Issue #2253: sync the active targeting session's bounded annotation
+        // batch into the scene before present. `None` clears the layer.
+        self.update_target_annotations();
         // CTX-0943 + #1759/#1760: while a focusable overlay capture holds,
         // suppress underlying hyperlink hover affordances (the modal owns
         // input and obscures the grid). The runtime clears hovers on
@@ -1496,6 +1517,12 @@ impl TerminalApp {
         let workspaces = self.runtime.workspace_summaries();
         if let Some(live) = self.live_workspaces.as_ref() {
             live.publish(&workspaces);
+        }
+        // Issue #2253: publish the live target/anchor snapshot on the same
+        // cold path, so a targeting session started by a handler on this tick
+        // sees the geometry this tick presented.
+        if let Some(targets) = self.live_targets.as_ref() {
+            targets.publish(&self.runtime.target_anchor_summaries());
         }
         // CTX-1115: publish the pin-target snapshot alongside the workspace
         // source, so handlers running on this tick validate against the
@@ -1957,6 +1984,24 @@ impl TerminalApp {
             })
             .next();
         self.runtime.set_plugin_overlay(surface);
+    }
+
+    /// Sync the plugin targeting session's present-time annotation batch
+    /// (issue #2253).
+    ///
+    /// Called once per tick after [`Self::update_plugin_overlay`] and before
+    /// present. `Runtime::set_target_annotations` is change-gated, so an
+    /// unchanged session stays idle. No-op without a plugin runtime; a
+    /// plugin-less run clears any stale layer.
+    fn update_target_annotations(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
+            if self.runtime.target_annotations().is_some() {
+                self.runtime.set_target_annotations(None);
+            }
+            return;
+        };
+        self.runtime
+            .set_target_annotations(plugin_runtime.target_annotations());
     }
 
     /// Dispatches one Core-routed plugin band click (CTX-0946 C1).

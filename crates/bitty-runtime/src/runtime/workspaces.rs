@@ -289,6 +289,113 @@ impl Runtime {
             .collect()
     }
 
+    /// Stable panel target identity for a hosted leaf.
+    ///
+    /// Assigned on first sight and preserved across moves, rebalances, and
+    /// workspace switches. The raw compositor `ViewId` never leaves as a
+    /// target; only the issued [`bitty_ui::PanelId`] does.
+    fn panel_target_id(&self, view: ViewId) -> bitty_ui::PanelId {
+        if let Some(id) = self.panel_target_ids.borrow().get(&view) {
+            return *id;
+        }
+        let raw = self.next_panel_target_raw.get().saturating_add(1);
+        self.next_panel_target_raw.set(raw);
+        let id = bitty_ui::PanelId::new(raw);
+        self.panel_target_ids.borrow_mut().insert(view, id);
+        id
+    }
+
+    /// Drop identity entries for leaves that no longer exist anywhere in the
+    /// window (layouts, pinned floats, workspace floats, scratchpad).
+    fn retain_live_panel_target_ids(&self) {
+        let mut live: std::collections::BTreeSet<u64> = self
+            .workspace_summaries()
+            .iter()
+            .flat_map(|workspace| workspace.panel_ids.iter().copied())
+            .collect();
+        for workspace in &self.workspaces {
+            live.extend(workspace.floats.paint_ids().iter().map(|view| view.0));
+        }
+        live.extend(self.pinned.ids().iter().map(|view| view.0));
+        live.extend(self.floats.paint_ids().iter().map(|view| view.0));
+        if let Some(parked) = self.scratchpad.peek() {
+            live.insert(parked.id().0);
+        }
+        self.panel_target_ids
+            .borrow_mut()
+            .retain(|view, _| live.contains(&view.0));
+    }
+
+    /// Plain-data live target anchors for the plugin targeting source
+    /// (W-29 successor, issue #2253).
+    ///
+    /// Visible panels come from one present-frame solve (the same geometry the
+    /// compositor paints) converted to window cell coordinates; every
+    /// workspace carries its stable id, and only the active workspace has a
+    /// visible rectangle. Panel identity is the hosted leaf id, stable across
+    /// moves and rebalances. Bounded by
+    /// [`bitty_ui::MAX_HINT_ANNOTATIONS`]; deterministic order.
+    ///
+    /// Time O(f + w) over present frames and workspaces; space O(f + w).
+    #[must_use]
+    pub fn target_anchor_summaries(&self) -> Vec<TargetAnchorSummary> {
+        self.retain_live_panel_target_ids();
+        let live = self.live_cell_metrics();
+        let cw = live.width;
+        let ch = live.height;
+        let active_seq = self
+            .workspaces
+            .get(self.active_workspace)
+            .map(|slot| slot.seq);
+        let mut out = Vec::new();
+        // Workspaces first: their container rectangle overlaps every panel, so
+        // panels must be painted later for hit testing to prefer the panel.
+        for (index, slot) in self.workspaces.iter().take(MAX_WORKSPACES).enumerate() {
+            if out.len() >= bitty_ui::MAX_HINT_ANNOTATIONS {
+                break;
+            }
+            let active = index == self.active_workspace;
+            out.push(TargetAnchorSummary {
+                kind: "workspace".to_string(),
+                id: slot.seq,
+                workspace: Some(slot.seq),
+                rect: active.then_some((
+                    self.container.x,
+                    self.container.y,
+                    self.container.width,
+                    self.container.height,
+                )),
+            });
+        }
+        if cw > 0 && ch > 0 {
+            let cell_w = cw.max(1);
+            let cell_h = ch.max(1);
+            for frame in self.present_frames() {
+                if out.len() >= bitty_ui::MAX_HINT_ANNOTATIONS {
+                    break;
+                }
+                let x = u32::from(self.container.x)
+                    .saturating_add(u32::try_from(frame.frame.x.max(0)).unwrap_or(0) / cell_w);
+                let y = u32::from(self.container.y)
+                    .saturating_add(u32::try_from(frame.frame.y.max(0)).unwrap_or(0) / cell_h);
+                let width = frame.frame.width.div_ceil(cell_w).max(1);
+                let height = frame.frame.height.div_ceil(cell_h).max(1);
+                out.push(TargetAnchorSummary {
+                    kind: "panel".to_string(),
+                    id: self.panel_target_id(frame.view).get(),
+                    workspace: active_seq,
+                    rect: Some((
+                        x.min(u32::from(u16::MAX)) as u16,
+                        y.min(u32::from(u16::MAX)) as u16,
+                        width.min(u32::from(u16::MAX)) as u16,
+                        height.min(u32::from(u16::MAX)) as u16,
+                    )),
+                });
+            }
+        }
+        out
+    }
+
     /// Parked panels in the window scratchpad slot: `0` (empty) or `1`
     /// (occupied) (CTX-0954).
     ///
@@ -2555,6 +2662,117 @@ mod tests {
         assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
         assert!(!rt.has_pending_ws_close());
         assert_eq!(rt.workspace_live_count(0), 0);
+    }
+
+    #[test]
+    fn target_anchor_summaries_are_live_and_deterministic() {
+        let rt = fresh();
+        let summaries = rt.target_anchor_summaries();
+        assert_eq!(summaries.len(), 2, "one workspace plus one panel");
+        assert_eq!(summaries[0].kind, "workspace");
+        assert_eq!(summaries[0].id, 1);
+        assert_eq!(summaries[0].workspace, Some(1));
+        assert!(summaries[0].rect.is_some());
+        assert_eq!(summaries[1].kind, "panel");
+        assert_eq!(summaries[1].id, 1);
+        assert_eq!(summaries[1].workspace, Some(1));
+        let rect = summaries[1].rect.expect("visible panel rect");
+        assert!(rect.2 > 0 && rect.3 > 0);
+        // Same state -> same rows: no wall-clock or iteration-order input.
+        assert_eq!(summaries, rt.target_anchor_summaries());
+    }
+
+    #[test]
+    fn panel_target_identity_survives_layout_change() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let before = rt
+            .target_anchor_summaries()
+            .into_iter()
+            .find(|summary| summary.kind == "panel")
+            .expect("panel anchor")
+            .id;
+        let leaf = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(ViewId::new(99), 40, 24)),
+        ));
+        let after: Vec<_> = rt
+            .target_anchor_summaries()
+            .into_iter()
+            .filter(|summary| summary.kind == "panel")
+            .collect();
+        assert_eq!(after.len(), 2);
+        assert!(
+            after.iter().any(|summary| summary.id == before),
+            "the moved panel keeps its issued target id"
+        );
+        assert!(
+            after.iter().any(|summary| summary.id != before),
+            "the new panel receives a distinct id"
+        );
+        // Re-reading is stable: the mapping is not reissued per tick.
+        let again: Vec<_> = rt
+            .target_anchor_summaries()
+            .into_iter()
+            .filter(|summary| summary.kind == "panel")
+            .collect();
+        assert_eq!(after, again);
+    }
+
+    #[test]
+    fn target_annotation_hit_test_and_present_round_trip() {
+        use bitty_ui::{
+            HintAnnotationLayer, HintAnnotationSpec, LinkId, Point, Rect, TargetRef, TargetRegistry,
+        };
+
+        let mut rt = fresh();
+        let summaries = rt.target_anchor_summaries();
+        let panel = summaries
+            .iter()
+            .find(|summary| summary.kind == "panel")
+            .expect("panel anchor");
+        let (x, y, w, h) = panel.rect.expect("visible panel rect");
+        let mut registry = TargetRegistry::new();
+        let link = registry.insert_link(LinkId::new(1)).expect("link");
+        let specs = [HintAnnotationSpec {
+            target: TargetRef::Link(link),
+            workspace: None,
+            rect: Rect::new(x, y, w, h),
+        }];
+        let layer = HintAnnotationLayer::build_anchored(
+            &specs,
+            &["a".to_string()],
+            &[Point::new(x, y)],
+            Rect::new(0, 0, 80, 24),
+        )
+        .expect("layer");
+        rt.set_target_annotations(Some(std::rc::Rc::new(layer)));
+        assert!(rt.target_annotations().is_some());
+
+        let live = rt.live_cell_metrics();
+        let pad = f64::from(rt.window_padding_physical());
+        let pos = CursorPosition {
+            x: pad + f64::from(x) * f64::from(live.width) + 1.0,
+            y: pad + f64::from(y) * f64::from(live.height) + 1.0,
+        };
+        assert_eq!(
+            rt.target_annotation_at(pos).map(|hit| hit.label),
+            Some("a".to_string())
+        );
+        assert!(
+            rt.target_annotation_at(CursorPosition { x: 1.0e9, y: 1.0e9 })
+                .is_none()
+        );
+
+        // Present consumes the batch: the label contributes at least one
+        // glyph on the next frame.
+        let stats = rt.tick().expect("annotation frame presents");
+        assert!(stats.glyphs >= 1, "annotation label must paint glyphs");
+        rt.set_target_annotations(None);
+        assert!(rt.target_annotations().is_none());
     }
 
     #[test]

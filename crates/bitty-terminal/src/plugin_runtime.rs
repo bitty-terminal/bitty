@@ -20,12 +20,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    BridgeError, EmptySettings, FsListBackend, LuaValue, PanelCreateHandler, PanelPinHandler,
-    PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
-    TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, LuaValue, PanelCreateHandler,
+    PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest,
+    SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo,
+    WorkspaceSource,
 };
 use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
-use bitty_runtime::{ViewId, WorkspaceSummary};
+use bitty_runtime::{TargetAnchorSummary, ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
 ///
@@ -227,6 +228,44 @@ impl WorkspaceSource for LiveWorkspaces {
     }
 }
 
+/// Live Core target/anchor source for `bitty.ui.targets` (issue #2253).
+///
+/// Same publish pattern as [`LiveWorkspaces`]: the tick loop publishes the
+/// runtime's plain-data [`TargetAnchorSummary`] rows once per tick, and a
+/// cold-path targeting session reads the last committed copy. Plugin calls
+/// never reach the live runtime and never see terminal content. Rows are
+/// already bounded by Core (`bitty_ui::MAX_TARGET_ANCHORS`).
+#[derive(Default)]
+pub(crate) struct LiveTargets {
+    rows: RefCell<Vec<TargetAnchorSummary>>,
+}
+
+impl LiveTargets {
+    /// Commit the given summaries (already bounded by Core).
+    pub(crate) fn publish(&self, rows: &[TargetAnchorSummary]) {
+        let mut current = self.rows.borrow_mut();
+        if current.as_slice() != rows {
+            *current = rows.to_vec();
+        }
+    }
+}
+
+impl TargetSource for LiveTargets {
+    fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+        Ok(self
+            .rows
+            .borrow()
+            .iter()
+            .map(|row| CoreTargetInfo {
+                kind: row.kind.clone(),
+                id: row.id,
+                workspace: row.workspace,
+                rect: row.rect,
+            })
+            .collect())
+    }
+}
+
 /// Sample the active session's completed scrollback into the bounded history
 /// ring (CTX-1352).
 ///
@@ -266,6 +305,8 @@ pub(crate) struct PluginSession {
     pub(crate) snapshot: Rc<LiveSnapshot>,
     /// Live workspace source (CTX-0889).
     pub(crate) workspaces: Rc<LiveWorkspaces>,
+    /// Live Core target/anchor source (issue #2253).
+    pub(crate) targets: Rc<LiveTargets>,
     /// Live pin-target snapshot (CTX-1115).
     pub(crate) pin_state: Rc<LivePinState>,
     /// Bounded transcript provider published by the tick loop (CTX-1352).
@@ -483,6 +524,8 @@ pub(crate) fn dev_roots() -> Vec<PathBuf> {
 pub(crate) struct StartupSeed<'a> {
     /// Workspace summaries for the live workspace source.
     pub(crate) workspaces: &'a [WorkspaceSummary],
+    /// Live Core target/anchor rows for the targeting source.
+    pub(crate) targets: &'a [TargetAnchorSummary],
     /// Active-workspace leaf ids for the pin-target snapshot.
     pub(crate) leaves: &'a [ViewId],
     /// Window-global pinned ids for the pin-target snapshot.
@@ -594,6 +637,12 @@ pub(crate) fn discover_with_roots(
     let workspaces = Rc::new(LiveWorkspaces::default());
     workspaces.publish(seed.workspaces);
     runtime.set_workspace_source(workspaces.clone());
+    // Issue #2253: seed the live Core target/anchor rows before activation so
+    // `init.lua` already observes panels and workspaces through
+    // `bitty.ui.targets.snapshot`. The tick loop keeps them fresh.
+    let targets = Rc::new(LiveTargets::default());
+    targets.publish(seed.targets);
+    runtime.set_target_source(targets.clone());
     // CTX-1115: seed the pin snapshot and install the deferred pin backend
     // before activation so `init.lua` already observes a working
     // `set_pinned`. Activation captures the backend into `panel.focus`
@@ -669,6 +718,7 @@ pub(crate) fn discover_with_roots(
         runtime,
         snapshot,
         workspaces,
+        targets,
         pin_state,
         history,
     })
@@ -804,6 +854,7 @@ mod tests {
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            targets: &[],
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
@@ -978,6 +1029,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            targets: &[],
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
@@ -1213,6 +1265,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            targets: &[],
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
@@ -1373,6 +1426,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            targets: &[],
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],
@@ -1512,6 +1566,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            targets: &[],
             leaves: &leaves,
             pinned: &pinned,
             image_roots: &[],

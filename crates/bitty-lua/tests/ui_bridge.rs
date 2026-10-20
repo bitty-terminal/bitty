@@ -15,7 +15,7 @@ use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
     BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, OverlayInput,
-    OverlayKeyChord, OverlayPoll, UiNode,
+    OverlayKeyChord, OverlayPoll, TargetSnapshotRow, UiNode,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -37,6 +37,7 @@ struct UiServices {
     overlay_releases: RefCell<Vec<(i64, Option<String>)>>,
     overlay_polls: RefCell<Vec<(i64, usize)>>,
     overlay_events: RefCell<Vec<OverlayInput>>,
+    snapshot_rows: Vec<TargetSnapshotRow>,
 }
 
 impl HostServices for UiServices {
@@ -92,6 +93,10 @@ impl HostServices for UiServices {
         }
         self.updates.borrow_mut().push((handle, component.clone()));
         Ok(handle == 11)
+    }
+
+    fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<TargetSnapshotRow>, BridgeError> {
+        Ok(self.snapshot_rows.iter().take(max).cloned().collect())
     }
 
     fn ui_overlay_acquire(&self, handle: i64) -> Result<(), BridgeError> {
@@ -1018,6 +1023,61 @@ fn targets_surface_fails_closed_and_has_no_event_bus() {
     assert_eq!(
         services.store.borrow().get("has_event_api"),
         Some(&LuaValue::Bool(false))
+    );
+}
+
+/// Issue #2253: the target snapshot carries stable identity, workspace, and
+/// anchor geometry so a Leader overlay can place hints without private APIs.
+#[test]
+fn targets_snapshot_exposes_identity_workspace_and_rect() {
+    let services = Rc::new(UiServices {
+        snapshot_rows: vec![TargetSnapshotRow {
+            handle: 1,
+            id: 11,
+            kind: "panel".to_string(),
+            tier: "core".to_string(),
+            workspace: Some(7),
+            rect: Some((1, 2, 20, 10)),
+            generation: 42,
+        }],
+        ..UiServices::default()
+    });
+    let mut vm = gate_vm("targets-rows");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local rows = bitty.ui.targets.snapshot(4)
+        bitty.store.set("row_count", #rows)
+        bitty.store.set("row_id", rows[1].id)
+        bitty.store.set("row_kind", rows[1].kind)
+        bitty.store.set("row_tier", rows[1].tier)
+        bitty.store.set("row_workspace", rows[1].workspace)
+        bitty.store.set("row_rect", table.concat(rows[1].rect, ","))
+        bitty.store.set("row_generation", rows[1].generation)
+        "#,
+    );
+    assert_eq!(stored(&services, "row_count"), Some(LuaValue::Integer(1)));
+    assert_eq!(stored(&services, "row_id"), Some(LuaValue::Integer(11)));
+    assert_eq!(
+        stored(&services, "row_kind"),
+        Some(LuaValue::String("panel".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "row_tier"),
+        Some(LuaValue::String("core".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "row_workspace"),
+        Some(LuaValue::Integer(7))
+    );
+    assert_eq!(
+        stored(&services, "row_rect"),
+        Some(LuaValue::String("1,2,20,10".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "row_generation"),
+        Some(LuaValue::Integer(42))
     );
 }
 

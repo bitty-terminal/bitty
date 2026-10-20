@@ -419,6 +419,24 @@ pub struct BandContent {
     pub version: u32,
 }
 
+/// One live Core target anchor published to the plugin targeting source
+/// (W-29 successor, issue #2253).
+///
+/// Plain data in window cell coordinates: the runtime never hands plugin code
+/// a compositor or PTY handle. `rect` is `None` for a target that exists but
+/// has no visible geometry (an inactive workspace).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetAnchorSummary {
+    /// Surface kind (`panel` or `workspace` today).
+    pub kind: String,
+    /// Stable semantic id within `kind`.
+    pub id: u64,
+    /// Owning workspace id, when workspace-scoped.
+    pub workspace: Option<u64>,
+    /// Screen region in window cells (`x`, `y`, `width`, `height`).
+    pub rect: Option<(u16, u16, u16, u16)>,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -668,6 +686,20 @@ pub struct Runtime {
     /// `None` with no capture, so the present path is byte-identical to the
     /// pre-overlay frame. Presentation-only: never grid truth.
     plugin_overlay: Option<BandContent>,
+    /// Present-time target annotation batch (W-29 successor, issue #2253).
+    ///
+    /// Populated from `PluginRuntime::target_annotations()` each tick and
+    /// painted as one bounded overlay layer. Presentation-only: never grid
+    /// truth and never an input authority. `None` with no active session.
+    target_annotations: Option<std::rc::Rc<bitty_ui::HintAnnotationLayer>>,
+    /// Stable panel target identities (issue #2253): one [`bitty_ui::PanelId`]
+    /// per hosted leaf, assigned on first sight and preserved across moves,
+    /// rebalances, and workspace switches. The raw compositor `ViewId` never
+    /// leaves as a target; this map is the translation. Bounded by the live
+    /// window panel set and pruned when a leaf retires.
+    panel_target_ids: std::cell::RefCell<BTreeMap<ViewId, bitty_ui::PanelId>>,
+    /// Monotonic panel target identity issuer (never reuses a value).
+    next_panel_target_raw: std::cell::Cell<u64>,
     /// Full window grid in cells. The layout `container` is this rect minus
     /// the budgeted plugin bands; resize and the `set_window_cells` seam
     /// set it.
@@ -1913,6 +1945,9 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            target_annotations: None,
+            panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
+            next_panel_target_raw: std::cell::Cell::new(0),
             pointer_stacks: pointer::PointerStacks::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
@@ -2187,6 +2222,9 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            target_annotations: None,
+            panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
+            next_panel_target_raw: std::cell::Cell::new(0),
             pointer_stacks: pointer::PointerStacks::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
@@ -2435,6 +2473,67 @@ impl Runtime {
         if changed {
             self.pending_full_redraw = true;
         }
+    }
+
+    /// Present-time target annotation batch (W-29 successor, issue #2253).
+    ///
+    /// The application pushes the active targeting session's bounded batch
+    /// here once per cold tick. `None` clears it. Presentation-only: this
+    /// never mutates grid, cursor, scrollback, or layout.
+    pub fn set_target_annotations(
+        &mut self,
+        annotations: Option<std::rc::Rc<bitty_ui::HintAnnotationLayer>>,
+    ) {
+        let changed = match (&self.target_annotations, &annotations) {
+            (None, None) => false,
+            (Some(current), Some(next)) => {
+                !std::rc::Rc::ptr_eq(current, next) && **current != **next
+            }
+            _ => true,
+        };
+        self.target_annotations = annotations;
+        if changed {
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Current target annotation batch, if any.
+    #[must_use]
+    pub fn target_annotations(&self) -> Option<&bitty_ui::HintAnnotationLayer> {
+        self.target_annotations.as_deref()
+    }
+
+    /// Deterministic hit test for the annotated target regions.
+    ///
+    /// `pos` is the physical cursor position; the window-padding inset is
+    /// removed and the point is converted to window cells before consulting
+    /// the batch. `None` outside every annotated region, with no batch, or
+    /// with degenerate cell metrics. Reads only: it never dispatches.
+    #[must_use]
+    pub fn target_annotation_at(&self, pos: CursorPosition) -> Option<bitty_ui::HintAnnotation> {
+        let annotations = self.target_annotations.as_ref()?;
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return None;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad;
+        let y = pos.y - pad;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let cell_w = f64::from(live.width);
+        let cell_h = f64::from(live.height);
+        let col = (x / cell_w).floor();
+        let row = (y / cell_h).floor();
+        if col < 0.0 || row < 0.0 || col > f64::from(u16::MAX) || row > f64::from(u16::MAX) {
+            return None;
+        }
+        let point = bitty_ui::Point::new(col as u16, row as u16);
+        if !annotations.viewport().contains_point(point) {
+            return None;
+        }
+        annotations.hit_test(point).cloned()
     }
 
     /// Sets the panel-overlay modal bit (CTX-0482, issue #763).

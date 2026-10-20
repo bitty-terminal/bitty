@@ -1046,12 +1046,14 @@ fn main() {
     // CTX-1115: the live pin-target snapshot is seeded the same way and the
     // deferred pin backend is installed before activation, so `init.lua`
     // already observes a working `bitty.panel.set_pinned`.
+    let startup_targets = runtime.target_anchor_summaries();
     let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
         runtime.config().cols,
         runtime.config().rows,
         &plugin_runtime::StartupSeed {
             workspaces: &runtime.workspace_summaries(),
+            targets: &startup_targets,
             leaves: &runtime.layout().leaf_ids(),
             pinned: &runtime.pinned_views(),
             image_roots: &runtime.config().background_image_roots,
@@ -1064,6 +1066,9 @@ fn main() {
     let live_workspaces = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.workspaces));
+    let live_targets = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.targets));
     let live_pin_state = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.pin_state));
@@ -1234,6 +1239,7 @@ fn main() {
     .with_live_snapshot(live_snapshot)
     // CTX-0889: publish the live workspace source from the tick loop.
     .with_live_workspaces(live_workspaces)
+    .with_live_targets(live_targets)
     // CTX-1115: publish the live pin-target snapshot from the tick loop.
     .with_live_pin_state(live_pin_state)
     // CTX-1352: sample completed scrollback into the bounded history ring.

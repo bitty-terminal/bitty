@@ -3763,6 +3763,19 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             // Resolve the run fg for this run (runs group identical
             // style, so the first covered cell names it).
             let fg = self.shaped_run_fg(snapshot, row, cols, run);
+            // A shaper cluster may emit several glyphs at one byte offset.
+            // When the cluster text spans more than one base cell and the
+            // group is not a single ligated glyph, those members are a
+            // per-base fallback (join controls and selectors shape as
+            // separate zero-advance glyphs). Positioning every member at
+            // the cluster origin would stack the bases in one cell, so the
+            // deterministic per-cell path emits each base at its own grid
+            // column instead; Terminal Truth is unchanged.
+            if group.len() > 1 && cluster_base_scalar_count(slice) > 1 {
+                self.emit_unshaped_slice(slice, row, abs_start, fg, list);
+                idx = group_end;
+                continue;
+            }
             // Coverage is per glyph: when no group member is drawable
             // the leading position names one tofu box for the whole span,
             // while a covered base still emits when only a trailing mark
@@ -3890,7 +3903,16 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
     }
 
     /// Emits one cluster's text per cell through the unshaped path
-    /// (CJK-epsilon fallback; every scalar keeps grid-true placement).
+    /// (CJK-epsilon fallback; every visible scalar keeps grid-true
+    /// placement).
+    ///
+    /// Zero-width scalars own no cell. Join controls, variation selectors,
+    /// and tags are skipped: advancing them would shift a ZWJ sequence into
+    /// spacer columns and paint a stray glyph over the following cell.
+    /// Visible combining marks paint at the preceding base's pen origin,
+    /// mirroring the #2279 cell path, so a per-base fallback never drops a
+    /// diacritic. All bytes stay in Terminal Truth for selection, copy,
+    /// search, and accessibility.
     fn emit_unshaped_slice(
         &mut self,
         slice: &str,
@@ -3900,12 +3922,26 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         list: &mut DrawList,
     ) {
         let mut col = abs_col;
+        let mut last_base: Option<(usize, i32)> = None;
         for ch in slice.chars() {
-            let width = usize::from(bitty_term_state::char_cell_width(ch)).max(1);
-            let (emitted, _) = self.emit_glyph(ch, row, col, width, fg, list);
+            let width = usize::from(bitty_term_state::char_cell_width(ch));
+            if width == 0 {
+                if is_paintable_zerowidth(ch) {
+                    if let Some((base_col, pen_advance)) = last_base {
+                        if let Some(advance) =
+                            self.emit_mark(ch, row, base_col, pen_advance, fg, list)
+                        {
+                            last_base = Some((base_col, pen_advance.saturating_add(advance)));
+                        }
+                    }
+                }
+                continue;
+            }
+            let (emitted, advance) = self.emit_glyph(ch, row, col, width, fg, list);
             if !emitted {
                 self.counters.blank_cells_skipped += 1;
             }
+            last_base = Some((col, advance.max(0)));
             col += width;
         }
     }
@@ -3998,6 +4034,18 @@ fn is_paintable_zerowidth(ch: char) -> bool {
 /// rather than panics on hostile input.
 fn shaped_dest_x(abs_col: usize, cell_width: u32, left_bearing: i32, x_offset_px: f32) -> i64 {
     abs_col as i64 * i64::from(cell_width) + i64::from(left_bearing) + x_offset_px.round() as i64
+}
+
+/// Counts base scalars in one cluster slice (issue #2262).
+///
+/// Zero-width scalars (join controls, variation selectors, combining marks)
+/// contribute nothing. A count above one means the cluster spans more than
+/// one grid position, so a multi-glyph shaper group is a per-base fallback
+/// rather than one ligated glyph and must keep per-cell placement.
+fn cluster_base_scalar_count(text: &str) -> usize {
+    text.chars()
+        .filter(|ch| bitty_term_state::char_cell_width(*ch) > 0)
+        .count()
 }
 
 /// End byte of the cluster group starting at `idx`: the next *distinct*

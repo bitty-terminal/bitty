@@ -292,3 +292,47 @@ fn golden_wide_and_combining_glyphs() {
     let mixed = rt.tick().expect("mixed-width present");
     assert_digest("wide_combining", &rt, &mixed, 0xe9ea_3dd7_45ca_5be5);
 }
+
+#[test]
+fn golden_grapheme_zwj_family() {
+    // Issue #2262: the grid keeps four wide leads, four spacers, and the
+    // join controls; the unshaped headless fallback still paints one glyph
+    // per base and never a glyph for a spacer or joiner. This digest pins
+    // that Terminal-Truth-preserving fallback while the shaped path (live
+    // font tests) covers the one-cluster ligature.
+    let mut rt = make_runtime();
+    let _ = rt.tick().expect("first tick presents");
+    rt.handle_pty_bytes("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".as_bytes());
+    let frame = rt.tick().expect("ZWJ family presents");
+    assert_digest("zwj_family", &rt, &frame, 0x48c4_44c6_46f0_c639);
+}
+
+#[test]
+fn golden_grapheme_regional_indicator_pair() {
+    // Flag sequences are two width-1 cells; no spacer or width change.
+    let mut rt = make_runtime();
+    let _ = rt.tick().expect("first tick presents");
+    rt.handle_pty_bytes("\u{1F1EF}\u{1F1F5}".as_bytes());
+    let frame = rt.tick().expect("regional indicator pair presents");
+    assert_digest("regional_pair", &rt, &frame, 0x6a5b_d5e7_4846_ae49);
+}
+
+#[test]
+fn golden_grapheme_variation_selector() {
+    // U+2764 U+FE0F stays one width-1 cell with the selector in zerowidth.
+    let mut rt = make_runtime();
+    let _ = rt.tick().expect("first tick presents");
+    rt.handle_pty_bytes("\u{2764}\u{FE0F}".as_bytes());
+    let frame = rt.tick().expect("variation selector presents");
+    assert_digest("variation_selector", &rt, &frame, 0x162e_18ef_fa55_533e);
+}
+
+#[test]
+fn golden_cjk_wide_and_box_drawing() {
+    // CJK wide leads keep their spacer; box-drawing stays one narrow cell.
+    let mut rt = make_runtime();
+    let _ = rt.tick().expect("first tick presents");
+    rt.handle_pty_bytes("A\u{6F22}\u{2502}\u{2500}\u{2588}B".as_bytes());
+    let frame = rt.tick().expect("CJK and box drawing presents");
+    assert_digest("cjk_box_drawing", &rt, &frame, 0xb240_f9d6_a8d0_2e6d);
+}

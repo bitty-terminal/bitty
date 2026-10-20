@@ -182,16 +182,16 @@ fn typographic_ligature_stays_shaped_under_never() {
 }
 
 #[test]
-fn mixed_ascii_cjk_row_splits_fast_and_shaped() {
+fn mixed_ascii_cjk_row_stays_one_shaped_run() {
     let Some(mut renderer) = live_renderer_for("JetBrainsMono Nerd Font") else {
         eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
         return;
     };
-    // `A` fast-paths; `漢B`... precisely: the wide leading cell fuses with
-    // the same-style `A` into one mixed run (`A漢`, spacer breaks after),
-    // which stays shaped, while the trailing `B` run fast-paths. The CJK
-    // scalar shapes through dynamic fallback (double-width single glyph,
-    // spacer paints background only).
+    // Issue #2262: a wide lead's spacer stays inside the run so a following
+    // same-style cell can continue a ZWJ grapheme cluster. The whole
+    // `A漢B` row therefore shapes as one mixed run; the trailing `B` no
+    // longer fast-paths separately. The CJK scalar shapes through dynamic
+    // fallback (double-width single glyph, spacer paints background only).
     let snap = snapshot_for("A漢B");
     assert_eq!(snap.cells[0].glyph, 'A');
     assert_eq!(snap.cells[1].glyph, '漢');
@@ -210,8 +210,8 @@ fn mixed_ascii_cjk_row_splits_fast_and_shaped() {
     );
     assert_eq!(
         renderer.counters().ascii_fast_path_runs,
-        1,
-        "the trailing ASCII run must fast-path: {:?}",
+        0,
+        "a run after a wide spacer must stay shaped for cluster continuity: {:?}",
         renderer.counters()
     );
     assert_eq!(

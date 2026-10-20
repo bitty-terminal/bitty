@@ -930,10 +930,7 @@ pub fn collect_run_text(cells: &[bitty_term_state::Cell]) -> String {
         if cell.spacer {
             continue;
         }
-        out.push(cell.glyph);
-        for mark in cell.zerowidth.iter() {
-            out.push(*mark);
-        }
+        cell.push_text_into(&mut out);
     }
     out
 }
@@ -954,11 +951,17 @@ pub struct ShapedRun {
 
 /// Groups one snapshot row into shapeable runs (design 2.2).
 ///
-/// Groups contiguous non-spacer cells with identical `Style` into runs;
-/// spacers break runs (trailing halves paint background only). Blank
-/// (erased) cells break runs too — shaping never crosses an erased gap,
-/// so ligatures cannot bridge unrelated content. Returns runs in column
-/// order, each with its start column and text. Grid truth is only read.
+/// Groups contiguous cells with identical `Style` into runs. Trailing
+/// spacer halves stay inside the run: they add no text (a spacer is the
+/// background-only half of a wide lead) but keeping the run open lets a
+/// contiguous grapheme cluster — a ZWJ emoji sequence, for example — reach
+/// the shaper as one cluster instead of one base per run. The lead already
+/// counted both grid columns, so spacers never inflate [`ShapedRun::col_count`].
+/// Blank (erased) cells still break runs — shaping never crosses an erased
+/// gap, so ligatures cannot bridge unrelated content. A spacer cannot open
+/// a run (orphans are invalid grid truth); it only extends the preceding
+/// lead's run. Returns runs in column order, each with its start column and
+/// text. Grid truth is only read.
 #[must_use]
 pub fn form_runs_for_row(
     row_cells: &[bitty_term_state::Cell],
@@ -982,7 +985,20 @@ pub fn form_runs_for_row(
 
     for (offset, cell) in row_cells.iter().enumerate() {
         let col = row_start_col + offset;
-        if cell.spacer || cell.is_blank() {
+        if cell.spacer {
+            // The trailing half of the preceding wide lead. Keep the active
+            // run open (a cluster may continue after the lead's spacer) but
+            // never add text or a column: the lead's `width == 2` already
+            // counted this column. An orphan spacer has no lead to continue,
+            // so it paints background only and cannot open a run.
+            if current_style.is_some() {
+                continue;
+            }
+            flush(&mut runs, &mut current_text, current_start, current_cols);
+            current_cols = 0;
+            continue;
+        }
+        if cell.is_blank() {
             flush(&mut runs, &mut current_text, current_start, current_cols);
             current_style = None;
             current_cols = 0;
@@ -990,30 +1006,16 @@ pub fn form_runs_for_row(
         }
         match &current_style {
             Some(style) if *style == cell.style => {
-                current_text.push(cell.glyph);
-                for mark in cell.zerowidth.iter() {
-                    current_text.push(*mark);
-                }
-                current_cols += 1;
-                // Wide cells occupy two columns but one text position;
-                // the column count tracks grid span for cluster mapping.
-                if cell.width == 2 {
-                    current_cols += 1;
-                }
+                cell.push_text_into(&mut current_text);
+                current_cols += usize::from(cell.width).max(1);
             }
             _ => {
                 flush(&mut runs, &mut current_text, current_start, current_cols);
                 current_style = Some(cell.style);
                 current_start = col;
                 current_text = String::new();
-                current_text.push(cell.glyph);
-                for mark in cell.zerowidth.iter() {
-                    current_text.push(*mark);
-                }
-                current_cols = 1;
-                if cell.width == 2 {
-                    current_cols += 1;
-                }
+                cell.push_text_into(&mut current_text);
+                current_cols = usize::from(cell.width).max(1);
             }
         }
     }
@@ -1489,10 +1491,11 @@ struct ShapeInput<'a> {
 impl SwashSingle {
     /// Shapes one LTR run over the face `chain` (primary first).
     ///
-    /// Shapes with the primary face, then re-shapes each maximal uncovered
-    /// char range against the tail faces in order (first fully-covering
-    /// face wins — the `cosmic-text shape_run` pattern reduced to the grid);
-    /// ranges no face covers keep `uncovered = true` for the tofu path.
+    /// Shapes with the primary face, then re-shapes each uncovered grapheme
+    /// cluster (all glyphs sharing one shaper byte offset) against the tail
+    /// faces in order (first fully-covering face wins — the `cosmic-text
+    /// shape_run` pattern reduced to the grid); clusters no face covers keep
+    /// `uncovered = true` for the grid's deterministic per-cell fallback.
     /// Combining marks stay attached to their base: cluster byte ranges map
     /// back onto `text`, and cell counts sum grid truth over those ranges.
     ///
@@ -1585,28 +1588,60 @@ impl SwashSingle {
             validated: &attrs.features,
         };
         let mut clusters = self.shape_with(primary_input)?;
-        // Fallback reshape: maximal uncovered char ranges, tails in order.
+        // Fallback reshape: one grapheme cluster at a time, tails in order.
+        //
+        // A shaper cluster may emit several glyphs sharing one byte offset
+        // (base + join controls, base + combining mark). The fallback treats
+        // that whole group as the unit: a single uncovered joiner must not
+        // strand the other members of a ZWJ sequence on the primary face.
+        // Reshaping the group's full text lets an emoji tail return the one
+        // ligated family glyph instead of a per-base partial splice.
         let mut index = 0;
         while index < clusters.len() {
-            if !clusters[index].uncovered {
-                index += 1;
-                continue;
-            }
+            let byte_start = clusters[index].byte_offset;
             let mut end = index + 1;
-            while end < clusters.len() && clusters[end].uncovered {
+            while end < clusters.len() && clusters[end].byte_offset == byte_start {
                 end += 1;
             }
-            let byte_start = clusters[index].byte_offset;
-            let byte_end = if end < clusters.len() {
-                clusters[end].byte_offset
-            } else {
-                text.len()
-            };
+            if clusters[index..end].iter().all(|c| !c.uncovered) {
+                index = end;
+                continue;
+            }
+            // Coalesce adjacent fully-uncovered single-glyph clusters into
+            // one gap, preserving the old batched reshape for long
+            // unsupported stretches (for example a row of rare CJK).
+            // Multi-glyph clusters stay separate: their glyph group is the
+            // reshape unit and must not be split across tail calls.
+            if end == index + 1 {
+                while end < clusters.len() {
+                    let next_start = clusters[end].byte_offset;
+                    let mut next_end = end + 1;
+                    while next_end < clusters.len() && clusters[next_end].byte_offset == next_start
+                    {
+                        next_end += 1;
+                    }
+                    if !clusters[end].uncovered
+                        || next_end != end + 1
+                        || next_start <= clusters[end - 1].byte_offset
+                    {
+                        break;
+                    }
+                    end = next_end;
+                }
+            }
+            // End of this grapheme cluster in the run text: the next strictly
+            // greater cluster offset. Non-monotone shaper output widens the
+            // slice (never panics) via the trailing `text.len()` fallback.
+            let byte_end = clusters[end..]
+                .iter()
+                .map(|c| c.byte_offset)
+                .find(|&offset| offset > byte_start)
+                .unwrap_or(text.len());
             let gap = text.get(byte_start..byte_end).ok_or_else(|| {
                 RenderError::UpstreamRasterizer("shaper returned an out-of-range gap".to_string())
             })?;
-            // Outer-run column where the gap starts (gap clusters are
-            // contiguous, so the first uncovered cluster names it).
+            // Outer-run column where the cluster starts (the first member
+            // carries the group's prefix-derived column).
             let col_base = clusters[index].cells.0;
             let mut covered = false;
             for tail in tails {
@@ -2123,6 +2158,79 @@ mod tests {
         // Never shapes (ligature may form).
         assert!(ascii_fast_path_eligible(&ligature_text, &always));
         assert!(!ascii_fast_path_eligible(&ligature_text, &never));
+    }
+
+    #[test]
+    fn run_formation_spans_wide_spacers_for_zwj_clusters() {
+        // Issue #2262: a ZWJ family sequence is stored as four wide leads
+        // (each carrying the following join control) plus four trailing
+        // spacers. Run formation must keep every spacer inside the same run
+        // so HarfBuzz sees the full cluster; before this fix each spacer
+        // broke the run and the family painted as four separate glyphs.
+        use bitty_term_state::{Cell, Style};
+        let style = Style::default();
+        let bases = ['\u{1F468}', '\u{1F469}', '\u{1F467}', '\u{1F466}'];
+        let mut row = Vec::with_capacity(bases.len() * 2);
+        for (index, base) in bases.into_iter().enumerate() {
+            let mut lead = Cell::erased(style);
+            lead.glyph = base;
+            lead.width = 2;
+            if index + 1 < bases.len() {
+                assert!(lead.push_zerowidth('\u{200D}'));
+            }
+            row.push(lead);
+            row.push(Cell::wide_spacer(style));
+        }
+        let runs = form_runs_for_row(&row, 0);
+        assert_eq!(runs.len(), 1, "ZWJ family must form one run: {runs:?}");
+        assert_eq!(
+            runs[0].text,
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+        );
+        assert_eq!(runs[0].start_col, 0);
+        assert_eq!(runs[0].col_count, 8, "spacers are counted by their lead");
+        // A viewport slice starting mid-row shifts the run origin without
+        // changing the text or the span.
+        let offset = form_runs_for_row(&row, 3);
+        assert_eq!(offset.len(), 1, "offset row keeps one run: {offset:?}");
+        assert_eq!(offset[0].start_col, 3);
+        assert_eq!(offset[0].col_count, 8);
+    }
+
+    #[test]
+    fn run_formation_counts_spacers_once_for_cjk_and_box_drawing() {
+        // Wide CJK leads keep their spacer in the run (no double count); box
+        // drawing and narrow cells after them still share one style run.
+        use bitty_term_state::{Cell, Style};
+        let style = Style::default();
+        let mut row = Vec::new();
+        let mut ascii = Cell::erased(style);
+        ascii.glyph = 'A';
+        row.push(ascii);
+        let mut cjk = Cell::erased(style);
+        cjk.glyph = '\u{6F22}';
+        cjk.width = 2;
+        row.push(cjk);
+        row.push(Cell::wide_spacer(style));
+        for glyph in ['\u{2502}', '\u{2500}', 'B'] {
+            let mut cell = Cell::erased(style);
+            cell.glyph = glyph;
+            row.push(cell);
+        }
+        let runs = form_runs_for_row(&row, 0);
+        assert_eq!(runs.len(), 1, "same-style cells fuse: {runs:?}");
+        assert_eq!(runs[0].text, "A\u{6F22}\u{2502}\u{2500}B");
+        assert_eq!(
+            runs[0].col_count, 6,
+            "wide lead counts its spacer exactly once"
+        );
+        // A leading orphan spacer cannot open or extend a run.
+        let mut orphaned = vec![Cell::wide_spacer(style)];
+        orphaned.extend(row);
+        let orphan_runs = form_runs_for_row(&orphaned, 0);
+        assert_eq!(orphan_runs.len(), 1, "orphan spacer is background only");
+        assert_eq!(orphan_runs[0].start_col, 1);
+        assert_eq!(orphan_runs[0].col_count, 6);
     }
 
     #[test]

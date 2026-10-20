@@ -864,9 +864,12 @@ mod tests {
     #[test]
     fn timeout_revokes_at_the_deadline() {
         let mut capture = OverlayCapture::new();
-        capture.acquire("a", 1, future(1000)).expect("acquire");
-        assert!(!capture.revoke_expired_at(Instant::now()));
-        assert!(capture.revoke_expired_at(future(1000)));
+        let deadline = future(1000);
+        capture.acquire("a", 1, deadline).expect("acquire");
+        // Both sides of the boundary are explicit instants: one millisecond
+        // before the deadline the owner lives, at the deadline it dies.
+        assert!(!capture.revoke_expired_at(deadline - Duration::from_millis(1)));
+        assert!(capture.revoke_expired_at(deadline));
         assert!(!capture.is_active());
     }
 

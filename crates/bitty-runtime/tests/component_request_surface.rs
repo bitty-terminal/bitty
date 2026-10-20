@@ -28,7 +28,10 @@ const VERSION: &str = "0.0.1";
 const ECHO: &str = "fixture";
 const CRASHY: &str = "crashy";
 const HOLDY: &str = "holdy";
-const URL: &str = "http://api.example.com/v1/ping";
+const URL: &str = "https://api.example.com/v1/ping";
+/// Same host over the other scheme's default port: outside the granted
+/// `443` egress, so the component must refuse it.
+const OUT_OF_GRANT_URL: &str = "http://api.example.com/v1/ping";
 const EGRESS_HOST: &str = "api.example.com";
 const EGRESS_PORT: u16 = 443;
 const CAPABILITY: &str = "network.connect:api.example.com:443";
@@ -175,12 +178,22 @@ bitty.commands.register({{
     local ticket = tonumber((args or {{}}).ticket)
     local ok, result = pcall(bitty.component.poll, ticket)
     if not ok then
-      return "err:" .. tostring(result.code)
+      local report = "err:" .. tostring(result.code)
+      if result.code == "E_COMPONENT_REQUEST_FAILED" then
+        report = report .. ":" .. tostring(result.message)
+      end
+      return report
     end
     if result == nil then
       return "pending"
     end
-    return "ok:" .. tostring(result.status) .. ":" .. result.body
+    local grant = ""
+    for _, header in ipairs(result.headers or {{}}) do
+      if header.name == "x-grant" then
+        grant = header.value
+      end
+    end
+    return "ok:" .. tostring(result.status) .. ":" .. result.body .. "|grant:" .. grant
   end,
 }})
 
@@ -252,6 +265,7 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     std::fs::create_dir_all(&plugins_root).expect("plugin root");
     let allowed = "acme.surface-allowed";
     let denied = "acme.surface-denied";
+    let out_of_grant = "acme.surface-out-of-grant";
     let oversize = "acme.surface-oversize";
     let crashed = "acme.surface-crashed";
     let held = "acme.surface-held";
@@ -268,6 +282,16 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
         &plugins_root,
         denied,
         &surface_lua(ECHO, URL, 5_000),
+        Some(CAPABILITY),
+        Some(EGRESS_HOST),
+    );
+    // Same declared authority as the allowed plugin, but the request URL's
+    // effective port (80) is outside the granted `443` egress. The component
+    // enforces the Core-issued grant, so this must fail closed.
+    write_plugin(
+        &plugins_root,
+        out_of_grant,
+        &surface_lua(ECHO, OUT_OF_GRANT_URL, 5_000),
         Some(CAPABILITY),
         Some(EGRESS_HOST),
     );
@@ -318,7 +342,7 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
             eprintln!("discovery refused {id}: {error}");
         }
     }
-    assert_eq!(discovered.len(), 5, "five dev plugins discovered");
+    assert_eq!(discovered.len(), 6, "six dev plugins discovered");
     for (id, result) in plugins.activate_discovered() {
         let report = result.unwrap_or_else(|error| panic!("activation failed for {id}: {error}"));
         assert_eq!(report.state, LifecycleState::Active);
@@ -327,15 +351,15 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     let mirrored = mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
         panic!("mirror refused {plugin}: {reason}");
     });
-    assert_eq!(mirrored, 5, "every active generation must be mirrored");
+    assert_eq!(mirrored, 6, "every active generation must be mirrored");
 
     // ── one request/response round trip through the production surface ─────
     let ticket = queue_request(&mut plugins, allowed);
     let report = poll_until_settled(&mut runtime, &mut plugins, allowed, &ticket);
     assert_eq!(
         report,
-        format!("ok:200:{URL}"),
-        "fixture echoes the requested URL as its body"
+        format!("ok:200:{URL}|grant:{EGRESS_HOST}:{EGRESS_PORT}"),
+        "the served request echoes the URL and the Core-issued grant host:port"
     );
     let status = runtime
         .component_status(ECHO)
@@ -368,6 +392,30 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     );
     eprintln!("denied: {report}");
 
+    // ── an out-of-grant port is refused by the component's grant check ───
+    // The granted egress is `api.example.com:443`; `http://` resolves to port
+    // 80. Core hands the exact grant to the component and the component
+    // refuses the destination before any connection, so the ticket fails
+    // closed instead of echoing the URL.
+    let ticket = queue_request(&mut plugins, out_of_grant);
+    let report = poll_until_settled(&mut runtime, &mut plugins, out_of_grant, &ticket);
+    assert!(
+        report.starts_with("err:E_COMPONENT_REQUEST_FAILED"),
+        "an out-of-grant destination must fail closed: {report}"
+    );
+    assert!(
+        report.contains("grant denied: api.example.com:80"),
+        "the fixture must refuse the destination against the Core-issued grant: {report}"
+    );
+    assert_eq!(
+        runtime
+            .component_status(ECHO)
+            .map(|status| status.last_stop),
+        Some(None),
+        "a grant denial is not a component crash"
+    );
+    eprintln!("out-of-grant: {report}");
+
     // ── an over-bound payload is rejected before any send ─────────────────
     let report = match plugins
         .invoke_command(&format!("{oversize}:big"), &LuaValue::Nil)
@@ -386,9 +434,9 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     // ── a crashed component fails the request with a typed class ──────────
     let ticket = queue_request(&mut plugins, crashed);
     let report = poll_until_settled(&mut runtime, &mut plugins, crashed, &ticket);
-    assert_eq!(
-        report, "err:E_COMPONENT_REQUEST_FAILED",
-        "a component lost mid-request fails the ticket"
+    assert!(
+        report.starts_with("err:E_COMPONENT_REQUEST_FAILED"),
+        "a component lost mid-request fails the ticket: {report}"
     );
     assert_eq!(
         runtime

@@ -7,8 +7,10 @@
 //! component version directory), because the broker clears the environment
 //! and passes no arguments:
 //!
-//! - `echo` (default): `ResponseHead` 200 with `x-plugin-id`, `x-grant`,
-//!   `x-env`, and `x-cwd-mode` headers, then the URL as a one-chunk body.
+//! - `echo` (default): refuses a destination outside the Core-issued request
+//!   grant with `ErrorKind::Denied`; otherwise answers `ResponseHead` 200 with
+//!   `x-plugin-id`, `x-grant`, `x-env`, and `x-cwd-mode` headers, then the URL
+//!   as a one-chunk body.
 //! - `hold`: never answers requests (in-flight and idle tests).
 //! - `crash`: exits with status 3 on the first request.
 //! - `ignore-eof`: answers like `echo`, but keeps running after stdin EOF
@@ -25,7 +27,7 @@ use std::io::{BufReader, BufWriter, Write, stdin, stdout};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use bitty_network_wire::{FrameReader, Message, PROTOCOL_VERSION, write_frame};
+use bitty_network_wire::{ErrorKind, FrameReader, Grant, Message, PROTOCOL_VERSION, write_frame};
 
 /// File in the working directory selecting the fixture behavior.
 const MODE_FILE: &str = "fixture-mode";
@@ -92,42 +94,60 @@ fn main() -> ExitCode {
                     ]
                 }
                 _ => {
-                    let grant_text = grant
-                        .hosts
-                        .iter()
-                        .map(|host| {
-                            let ports: Vec<String> =
-                                host.ports.iter().map(u16::to_string).collect();
-                            format!("{}:{}", host.host, ports.join("+"))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let mut env_names: Vec<String> = std::env::vars_os()
-                        .map(|(name, _)| name.to_string_lossy().into_owned())
-                        .collect();
-                    env_names.sort();
-                    let cwd_mode = if std::path::Path::new(MODE_FILE).exists() {
-                        "version-dir"
+                    let destination = destination(&url);
+                    if !destination.is_some_and(|(host, port)| grant_allows(&grant, host, port)) {
+                        // Mirror the component's grant check: the Core-issued
+                        // grant is the only authority, and a destination
+                        // outside it is refused before any I/O.
+                        let message = match destination {
+                            Some((host, port)) => format!("grant denied: {host}:{port}"),
+                            None => {
+                                "grant denied: request URL has no http(s) destination".to_owned()
+                            }
+                        };
+                        vec![Message::Error {
+                            id,
+                            kind: ErrorKind::Denied,
+                            message,
+                        }]
                     } else {
-                        "unknown"
-                    };
-                    vec![
-                        Message::ResponseHead {
-                            id,
-                            status: 200,
-                            headers: vec![
-                                ("x-plugin-id".to_owned(), plugin_id),
-                                ("x-grant".to_owned(), grant_text),
-                                ("x-env".to_owned(), env_names.join(",")),
-                                ("x-cwd-mode".to_owned(), cwd_mode.to_owned()),
-                            ],
-                        },
-                        Message::ResponseBody {
-                            id,
-                            data: url.into_bytes(),
-                            last: true,
-                        },
-                    ]
+                        let grant_text = grant
+                            .hosts
+                            .iter()
+                            .map(|host| {
+                                let ports: Vec<String> =
+                                    host.ports.iter().map(u16::to_string).collect();
+                                format!("{}:{}", host.host, ports.join("+"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let mut env_names: Vec<String> = std::env::vars_os()
+                            .map(|(name, _)| name.to_string_lossy().into_owned())
+                            .collect();
+                        env_names.sort();
+                        let cwd_mode = if std::path::Path::new(MODE_FILE).exists() {
+                            "version-dir"
+                        } else {
+                            "unknown"
+                        };
+                        vec![
+                            Message::ResponseHead {
+                                id,
+                                status: 200,
+                                headers: vec![
+                                    ("x-plugin-id".to_owned(), plugin_id),
+                                    ("x-grant".to_owned(), grant_text),
+                                    ("x-env".to_owned(), env_names.join(",")),
+                                    ("x-cwd-mode".to_owned(), cwd_mode.to_owned()),
+                                ],
+                            },
+                            Message::ResponseBody {
+                                id,
+                                data: url.into_bytes(),
+                                last: true,
+                            },
+                        ]
+                    }
                 }
             },
             Message::Shutdown => break,
@@ -149,4 +169,56 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Effective `(host, port)` of an absolute `http`/`https` URL.
+///
+/// The fixture only needs the fields the wire grant check needs: the
+/// authority host and the explicit or scheme-default port. Userinfo is
+/// discarded, IPv6 literals are unwrapped, and any other shape is refused.
+fn destination(url: &str) -> Option<(&str, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match tail {
+            "" => default_port,
+            tail => tail.strip_prefix(':')?.parse().ok()?,
+        };
+        return Some((host, port));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (host, port.parse().ok()?)
+        }
+        Some(_) => return None,
+        None => (authority, default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Whether the Core-issued grant names exactly `host:port`.
+fn grant_allows(grant: &Grant, host: &str, port: u16) -> bool {
+    grant
+        .hosts
+        .iter()
+        .any(|entry| entry.host == host && entry.ports.contains(&port))
 }

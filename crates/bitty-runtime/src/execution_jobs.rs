@@ -75,8 +75,10 @@ pub(crate) use bitty_execution::JobId;
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) use bitty_execution::{
-        ExecutionOutcome, JobCancel, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
-        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
+        CancelOutcome, CancelReceipt, CancelRequest, ExecutionGeneration, ExecutionHandle,
+        ExecutionOutcome, JobCancel, JobError, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
+        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts, OutputStream,
+        ReadOutput, SidecarPolicy,
     };
 }
 
@@ -179,18 +181,22 @@ impl ToolJobSupervisor {
         })?;
         let stdout = self.read_stream(principal, job, OutputStream::Stdout)?;
         let stderr = self.read_stream(principal, job, OutputStream::Stderr)?;
+        let stdout_total = stdout.total_bytes;
+        let stderr_total = stderr.total_bytes;
+        let stdout_registry_truncated = stdout.truncated;
+        let stderr_registry_truncated = stderr.truncated;
         let (status, effect_state, exit_code, mut evidence) =
-            classify_outcome(job, outcome, request, &stdout, &stderr);
+            classify_outcome(job, outcome, request, stdout_total, stderr_total);
         if matches!(outcome, ExecutionOutcome::SpawnFailed) {
             return Err(IpcError::Unavailable {
                 reason: format!("job {job} failed to spawn under the execution supervisor"),
             });
         }
         let budget = request.effective_stream_budget() as u64;
-        let truncated = stdout.truncated
-            || stderr.truncated
-            || stdout.total_bytes > budget
-            || stderr.total_bytes > budget;
+        let truncated = stdout_registry_truncated
+            || stderr_registry_truncated
+            || stdout_total > budget
+            || stderr_total > budget;
         if truncated {
             evidence.push(format!(
                 "job {job} output was bounded; newest bytes preserved"
@@ -202,8 +208,8 @@ impl ToolJobSupervisor {
                 target_id: request.target.clone(),
                 status,
                 exit_code,
-                stdout: stdout.text,
-                stderr: stderr.text,
+                stdout: restore_trailing_newline(stdout),
+                stderr: restore_trailing_newline(stderr),
                 evidence_refs: evidence,
                 effect_state,
             },
@@ -344,8 +350,8 @@ fn classify_outcome(
     job: JobId,
     outcome: ExecutionOutcome,
     request: &ExecutionRequest,
-    stdout: &OutputView,
-    stderr: &OutputView,
+    stdout_total: u64,
+    stderr_total: u64,
 ) -> (ExecutionStatus, EffectState, Option<i32>, Vec<String>) {
     match outcome {
         ExecutionOutcome::Success => (
@@ -380,8 +386,8 @@ fn classify_outcome(
                 "spawn timeout after {} ms; job {job} timed out ({}) and its owned tree was killed and reaped; stdout {} bytes, stderr {} bytes preserved",
                 request.timeout_ms,
                 clock.as_str(),
-                stdout.total_bytes,
-                stderr.total_bytes
+                stdout_total,
+                stderr_total
             )],
         ),
         ExecutionOutcome::SpawnFailed => (
@@ -544,20 +550,38 @@ impl SpawnPreparer for SandboxPreparer {
     }
 }
 
-/// Truncates `text` to `budget` bytes at a char boundary.
+/// Keeps the newest `budget` bytes of `text` at a char boundary.
 ///
-/// Returns the bounded text and whether any byte was cut. Used by the
-/// synchronous spawn surface so `ExecutionResult` summaries stay within the
-/// accepted per-stream ceiling.
-pub(crate) fn truncate_to_budget(text: &str, budget: usize) -> (String, bool) {
+/// The registry's retained store is newest-wins, so the synchronous summary
+/// must take the **end** of that tail rather than its prefix; a prefix of a
+/// tail larger than the 256 KiB store would deliver a middle chunk of the
+/// child's output. Returns the bounded tail and whether any byte was cut.
+pub(crate) fn truncate_to_budget_tail(text: &str, budget: usize) -> (String, bool) {
     if text.len() <= budget {
         return (text.to_owned(), false);
     }
-    let mut end = budget;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    let mut start = text.len() - budget;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
     }
-    (text[..end].to_owned(), true)
+    (text[start..].to_owned(), true)
+}
+
+/// Restores the trailing newline the registry's line-joined view drops.
+///
+/// The registry decodes retained bytes and joins the split lines without a
+/// trailing newline. When the stored payload ended in `\n`, the joined text is
+/// exactly one byte shorter than the stored bytes; append that byte so the
+/// synchronous summary preserves the child's exact line semantics (and the
+/// byte-length truncation signal stays honest). Lossy invalid UTF-8 may not
+/// satisfy the one-byte relation; that output is rejected downstream by the
+/// NUL/shape validation.
+fn restore_trailing_newline(view: OutputView) -> String {
+    let mut text = view.text;
+    if view.stored_bytes > 0 && text.len().saturating_add(1) == view.stored_bytes {
+        text.push('\n');
+    }
+    text
 }
 
 /// Bounded diagnostic truncation (char-boundary safe).

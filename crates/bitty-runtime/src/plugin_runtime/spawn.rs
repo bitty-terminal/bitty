@@ -175,7 +175,8 @@ use bitty_plugin_host::tools::{
 use bitty_pty::TreeBackend;
 
 use crate::execution_jobs::{
-    DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised, truncate_to_budget,
+    DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised,
+    truncate_to_budget_tail,
 };
 
 /// Panel-path per-stream output budget (`8 KiB`).
@@ -985,21 +986,21 @@ impl fmt::Debug for SpawnService {
 }
 
 impl SpawnService {
-    /// Service with the real-process provider and `authorizer` routing under
-    /// the core-default mechanics policy.
+    /// Service with the registry-backed provider and `authorizer` routing
+    /// under the core-default mechanics policy.
     #[must_use]
     pub fn new(authorizer: Box<dyn SpawnAuthorizer>) -> Self {
         Self::with_policy(authorizer, SpawnMechanicsPolicy::core_defaults())
     }
 
-    /// Service with the real-process provider, `authorizer` routing, and an
-    /// explicit mechanics policy (composition-root injection).
+    /// Service with the registry-backed provider, `authorizer` routing, and
+    /// an explicit mechanics policy (composition-root injection).
     ///
     /// The policy governs the service surface: the tracked-outcome ceiling,
-    /// cancel grace bounds, and handle generations minted below. The
-    /// synchronous provider slot itself runs [`spawn_process`] (core
-    /// defaults); drain mechanics are owned by the extracted supervisor, and
-    /// per-spawn poll tuning flows through [`spawn_process_with_policy`].
+    /// cancel grace bounds, handle generations minted below, and the
+    /// supervisor wait poll. The service applies the six gates and constructs
+    /// the bounded `ExecutionResult` directly; drain mechanics are owned by
+    /// the extracted supervisor.
     #[must_use]
     pub fn with_policy(authorizer: Box<dyn SpawnAuthorizer>, policy: SpawnMechanicsPolicy) -> Self {
         Self {
@@ -1037,11 +1038,11 @@ impl SpawnService {
         self.job_ids.get(&execution_id).copied()
     }
 
-    /// Cloneable supervisor handle for host cancellation and diagnostics.
+    /// Test-only cloneable supervisor handle for registry assertions.
     ///
-    /// A host may hand this clone to another thread while a synchronous
-    /// dispatch waits; cancellation still goes through the registry's
-    /// principal/operation gate and the owned-tree kill, never a pid.
+    /// Production callers do not receive live handles in phase 1; exposing the
+    /// async job surface to plugins is a phase-2 API decision. The clone still
+    /// uses the registry's principal/operation gate and owned-tree kill.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn supervisor(&self) -> ToolJobSupervisor {
@@ -1274,8 +1275,8 @@ impl SpawnService {
         drop(scope);
         let run = run?;
         let budget = exec_request.effective_stream_budget();
-        let (stdout, stdout_cut) = truncate_to_budget(&run.raw.stdout, budget);
-        let (stderr, stderr_cut) = truncate_to_budget(&run.raw.stderr, budget);
+        let (stdout, stdout_cut) = truncate_to_budget_tail(&run.raw.stdout, budget);
+        let (stderr, stderr_cut) = truncate_to_budget_tail(&run.raw.stderr, budget);
         let result = ExecutionResult::new(
             execution_id,
             client_id.to_owned(),
@@ -1465,7 +1466,33 @@ pub(crate) fn spawn_process_with_policy(
     // The registry never mints id zero; keep the invariant visible to the
     // bridge so a future registry regression fails here, not downstream.
     debug_assert!(run.job.get() > 0, "supervised job ids start at one");
-    Ok(run.raw)
+    let mut raw = run.raw;
+    if run.truncated {
+        let budget = request.effective_stream_budget();
+        raw.stdout = newest_for_execution_service(raw.stdout, budget);
+        raw.stderr = newest_for_execution_service(raw.stderr, budget);
+    }
+    Ok(raw)
+}
+
+/// Bounds one stream to the newest `budget` bytes for the `bitty-ipc`
+/// `ExecutionService` provider slot.
+///
+/// `ExecutionService` marks truncation from the input length and then keeps
+/// the **prefix** of what the provider returns. The provider therefore returns
+/// the newest tail followed by one sentinel newline: the service trims the
+/// sentinel and delivers the newest bytes, while still setting `truncated`
+/// from the over-budget input length. The sentinel is never delivered for
+/// ASCII/valid-UTF-8 tails of exactly `budget` bytes; a char-boundary tail one
+/// or two bytes shorter may retain a bounded sentinel newline, and the
+/// evidence ref still names the bounding.
+fn newest_for_execution_service(text: String, budget: usize) -> String {
+    if text.len() <= budget {
+        return text;
+    }
+    let (mut tail, _) = truncate_to_budget_tail(&text, budget);
+    tail.push('\n');
+    tail
 }
 
 // ── Lua bridge mapping ──────────────────────────────────────────────────────
@@ -1710,9 +1737,13 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use bitty_ipc::ExecutionService;
+
     use crate::execution_jobs::test_support::{
-        ExecutionOutcome, JobCancel, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
-        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
+        CancelOutcome, CancelReceipt, CancelRequest, ExecutionGeneration, ExecutionHandle,
+        ExecutionOutcome, JobCancel, JobError, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
+        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts, OutputStream,
+        ReadOutput, SidecarPolicy,
     };
 
     // ── portable child helper ──────────────────────────────────────────
@@ -1740,6 +1771,16 @@ mod tests {
                 // while the line-joined view collapses to nothing; #2249
                 // must still report truncation from the byte totals.
                 eprint!("{}", "\n".repeat(200_000));
+            }
+            Ok("lines") => {
+                // Exact line/trailing-newline semantics probe.
+                eprint!("alpha\nbeta\n");
+            }
+            Ok("newest") => {
+                // Distinguishable bytes: the registry retains the newest
+                // 256 KiB (A then B), so a newest-tail summary is all B.
+                eprint!("{}", "A".repeat(300_000));
+                eprint!("{}", "B".repeat(20_000));
             }
             Ok("append") => {
                 // One line per spawned child; the #2249 tests use this to
@@ -2236,6 +2277,70 @@ mod tests {
             result.stderr_summary.len() <= SPAWN_PANEL_OUTPUT_BUDGET,
             "the summary must stay within the caller budget, got {} bytes",
             result.stderr_summary.len()
+        );
+    }
+
+    #[test]
+    fn output_preserves_lines_and_trailing_newline() {
+        // The registry's line-joined view drops one trailing newline; the
+        // bridge restores it so v1 spawn output keeps exact line semantics.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let result = dispatch_ok(&mut service, &allowed_request("lines"), 53).expect("lines serve");
+        assert_eq!(result.stderr_summary, "alpha\nbeta\n");
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn newest_bytes_are_delivered_not_a_middle_chunk() {
+        // 300 KB of A then 20 KB of B; the registry retains the newest 256 KiB
+        // (236 KB A + 20 KB B), so an 8 KiB newest tail is all B. A prefix
+        // truncation would return A instead.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let request = allowed_request("newest")
+            .with_timeout_ms(10_000)
+            .with_output_budget(SPAWN_PANEL_OUTPUT_BUDGET);
+        let result = dispatch_ok(&mut service, &request, 54).expect("newest serves");
+        assert!(result.truncated);
+        assert_eq!(result.stderr_summary.len(), SPAWN_PANEL_OUTPUT_BUDGET);
+        assert!(
+            result.stderr_summary.bytes().all(|byte| byte == b'B'),
+            "the newest tail must be all B, got prefix {:?}",
+            &result.stderr_summary[..result.stderr_summary.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn execution_service_provider_preserves_newest_tail_and_truncation() {
+        // The direct IPC provider slot keeps the byte-total truncation signal
+        // through `ExecutionService`: the sentinel is trimmed and the summary
+        // is the newest tail, not the prefix of the retained store.
+        let request = bitty_ipc::execution::ExecutionRequest::new(helper_exe(), helper_args())
+            .with_env_policy(
+                EnvPolicy::explicit(vec![(HELPER_ENV.to_owned(), "newest".to_owned())])
+                    .expect("explicit env"),
+            )
+            .with_timeout_ms(10_000)
+            .with_output_budget(SPAWN_PANEL_OUTPUT_BUDGET)
+            .with_allow_effects(true);
+        let mut service = ExecutionService::with_provider(super::spawn_process);
+        let result = service
+            .dispatch(
+                &request,
+                &granted_spawn(),
+                &consented(1_000),
+                "plugin-test",
+                1_000,
+                55,
+            )
+            .expect("provider serves");
+        assert!(result.truncated);
+        assert_eq!(result.stderr_summary.len(), SPAWN_PANEL_OUTPUT_BUDGET);
+        assert!(
+            result.stderr_summary.bytes().all(|byte| byte == b'B'),
+            "the provider must deliver the newest bytes, got {:?}",
+            &result.stderr_summary[..result.stderr_summary.len().min(32)]
         );
     }
 
@@ -3218,6 +3323,182 @@ mod tests {
     }
 
     #[test]
+    fn cross_principal_job_operations_are_denied() {
+        let supervisor = ToolJobSupervisor::with_capacity(2);
+        let registry = supervisor.registry();
+        let owner = JobPrincipal::new("owner-a").expect("owner");
+        let stranger = JobPrincipal::new("owner-b").expect("stranger");
+        let job = registry
+            .spawn_as(owner.clone(), helper_job_spec("sleep"))
+            .expect("tracked");
+        wait_snapshot(&registry, &owner, job, "running", |snapshot| {
+            snapshot.state == JobState::Running
+        });
+        assert!(
+            matches!(
+                registry.get_as(&stranger, job),
+                Err(JobError::Denied { .. })
+            ),
+            "observe must hide existence from a cross-principal caller"
+        );
+        assert!(
+            matches!(
+                registry.cancel_as(&stranger, job),
+                Err(JobError::Denied { .. })
+            ),
+            "cancel must deny a cross-principal caller"
+        );
+        assert!(
+            matches!(
+                registry.read_output_as(&stranger, job, ReadOutput::new(OutputStream::Stderr)),
+                Err(JobError::Denied { .. })
+            ),
+            "read_output must deny a cross-principal caller"
+        );
+        assert_eq!(
+            registry.get_as(&owner, job).expect("owner observes").state,
+            JobState::Running,
+            "denied operations must not touch the job"
+        );
+        registry.cancel_as(&owner, job).expect("owner cancels");
+        wait_snapshot(&registry, &owner, job, "terminal", |snapshot| {
+            snapshot.state.is_terminal()
+        });
+    }
+
+    #[test]
+    fn stale_generation_cancel_is_rejected_without_touching_the_job() {
+        let supervisor = ToolJobSupervisor::with_capacity(2);
+        let registry = supervisor.registry();
+        let owner = JobPrincipal::new("owner-a").expect("owner");
+        let job = registry
+            .spawn_as(owner.clone(), helper_job_spec("sleep"))
+            .expect("tracked");
+        let snapshot = wait_snapshot(&registry, &owner, job, "running", |snapshot| {
+            snapshot.state == JobState::Running
+        });
+        let stale_raw = snapshot
+            .generation
+            .get()
+            .checked_add(1)
+            .expect("generation has room");
+        let stale_generation =
+            ExecutionGeneration::from_raw(stale_raw).expect("stale generation is non-zero");
+        let request = CancelRequest::immediate(ExecutionHandle {
+            id: job,
+            generation: stale_generation,
+        });
+        let receipt = registry
+            .cancel_typed_as(&owner, request)
+            .expect("typed cancel answers");
+        assert!(
+            matches!(
+                receipt,
+                CancelReceipt::Resolved(CancelOutcome::StaleGeneration)
+            ),
+            "a fabricated generation must answer stale: {receipt:?}"
+        );
+        assert_eq!(
+            registry.get_as(&owner, job).expect("still tracked").state,
+            JobState::Running,
+            "a stale handle must not signal or stop the job"
+        );
+        registry.cancel_as(&owner, job).expect("owner cancels");
+        wait_snapshot(&registry, &owner, job, "terminal", |snapshot| {
+            snapshot.state.is_terminal()
+        });
+    }
+
+    #[test]
+    fn drain_detach_preserves_partial_output() {
+        // The leader exits at once; a grandchild holds the pipes for ~10 s.
+        // The supervisor's bounded drain join detaches, publishes Stopped,
+        // and the synchronous bridge returns the partial output instead of
+        // hanging for the grandchild's lifetime.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let request = SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                (HELPER_ENV.to_owned(), "detach-hold".to_owned()),
+                (
+                    HELPER_PAYLOAD_ENV.to_owned(),
+                    "detach-partial-2249".to_owned(),
+                ),
+            ])
+            .with_timeout_ms(30_000)
+            .with_allow_effects(true);
+        let start = std::time::Instant::now();
+        let result = dispatch_ok(&mut service, &request, 706).expect("detach serves");
+        assert!(
+            start.elapsed() < Duration::from_secs(12),
+            "drain detach hung for {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            result.status,
+            bitty_ipc::execution::ExecutionStatus::Completed
+        );
+        assert!(
+            result.stdout_summary.contains("detach-partial-2249")
+                || result.stderr_summary.contains("detach-partial-2249"),
+            "detach must preserve partial output: stdout={:?} stderr={:?}",
+            result.stdout_summary,
+            result.stderr_summary
+        );
+    }
+
+    #[test]
+    fn sidecar_crash_policy_parity_matches_component_constants() {
+        // #2249 parity: the extracted sidecar contract's crash/deadline
+        // numbers stay exactly the Core component numbers. Component crash
+        // supervision itself remains in `component/` (phase 1 routes the
+        // tool/plugin spawn surface, not the native-component broker).
+        let policy = SidecarPolicy::core_defaults();
+        assert_eq!(
+            policy.backoff_initial,
+            crate::component::COMPONENT_BACKOFF_INITIAL
+        );
+        assert_eq!(policy.backoff_max, crate::component::COMPONENT_BACKOFF_MAX);
+        assert_eq!(policy.crash_limit, crate::component::COMPONENT_CRASH_LIMIT);
+        assert_eq!(
+            policy.crash_window,
+            crate::component::COMPONENT_CRASH_WINDOW
+        );
+        assert_eq!(
+            policy.deadline_crash_threshold,
+            crate::component::COMPONENT_DEADLINE_CRASH_THRESHOLD
+        );
+        assert_eq!(
+            policy.request_default_timeout,
+            crate::component::COMPONENT_REQUEST_DEFAULT_TIMEOUT
+        );
+        assert_eq!(
+            policy.request_max_timeout,
+            crate::component::COMPONENT_REQUEST_MAX_TIMEOUT
+        );
+        assert_eq!(
+            policy.deadline_grace,
+            crate::component::COMPONENT_REQUEST_DEADLINE_GRACE
+        );
+        assert_eq!(
+            policy.shutdown_grace,
+            crate::component::COMPONENT_SHUTDOWN_GRACE
+        );
+        assert_eq!(
+            policy.handshake_timeout,
+            crate::component::COMPONENT_HANDSHAKE_TIMEOUT
+        );
+        assert_eq!(
+            policy.idle_timeout,
+            crate::component::COMPONENT_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            policy.max_in_flight,
+            crate::component::COMPONENT_MAX_IN_FLIGHT
+        );
+    }
+
+    #[test]
     fn denied_authority_never_registers_a_job() {
         let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
         let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
@@ -3324,21 +3605,52 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    /// Production half of `spawn.rs`: stop at the real test-module delimiter,
+    /// not the first `#[cfg(test)]` method (which sits inside production code).
+    fn spawn_production_source(source: &'static str) -> &'static str {
+        source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("spawn.rs must retain the test-module delimiter")
+    }
+
+    /// Source guard over a production slice. Returns every violation; the
+    /// provider anchor is required so a split that skips the provider cannot
+    /// pass vacuously.
+    fn spawn_guard_violations(production: &str) -> Vec<&'static str> {
+        let mut violations = Vec::new();
+        let provider = production
+            .find("fn spawn_process_with_policy")
+            .map(|start| &production[start..]);
+        if provider.is_none() {
+            violations.push("missing spawn_process_with_policy anchor");
+        }
+        if !provider.is_some_and(|provider| provider.contains("spawn_supervised")) {
+            violations.push("provider does not delegate to spawn_supervised");
+        }
+        for needle in ["Command::new", ".spawn()", ".kill()", "pkill", "killall"] {
+            if production.contains(needle) {
+                violations.push(needle);
+            }
+        }
+        violations
+    }
+
     #[test]
     fn production_spawn_path_has_no_direct_command_or_pid_kill() {
-        // Source-level mutation guard: the production halves must route
-        // through the registry. The test-only helper may spawn its grandchild,
-        // so the scan stops at `#[cfg(test)]`.
-        let spawn_prod = include_str!("spawn.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production half");
-        for needle in ["Command::new", ".spawn()", ".kill()", "pkill", "killall"] {
-            assert!(
-                !spawn_prod.contains(needle),
-                "spawn.rs production path still contains `{needle}`"
-            );
-        }
+        // Source-level guard: the production half must route through the
+        // registry. The provider anchor proves the slice actually includes
+        // `spawn_process_with_policy`; the import alone cannot satisfy it.
+        let spawn_prod = spawn_production_source(include_str!("spawn.rs"));
+        assert!(
+            spawn_prod.contains("fn spawn_process_with_policy"),
+            "the production slice must include the provider"
+        );
+        let violations = spawn_guard_violations(spawn_prod);
+        assert!(
+            violations.is_empty(),
+            "spawn.rs production path violates the registry delegation: {violations:?}"
+        );
         // `execution_jobs.rs` has no inline test module; its test-only
         // constructors are `#[cfg(test)]` methods and contain no spawn/kill
         // call, so scan the whole module.
@@ -3349,13 +3661,6 @@ mod tests {
                 "execution_jobs.rs still contains `{needle}`"
             );
         }
-        // The main bridge must still delegate to the registry, and the
-        // confinement pre-validation may build a probe command only; it must
-        // never spawn it.
-        assert!(
-            spawn_prod.contains("spawn_supervised"),
-            "spawn_process must delegate to the registry-backed bridge"
-        );
         assert!(
             jobs_prod.contains("spawn_as("),
             "execution_jobs must create jobs through the registry"
@@ -3363,6 +3668,21 @@ mod tests {
         assert!(
             jobs_prod.contains("confine_command_to_execs"),
             "the tool confinement seam must stay wired"
+        );
+    }
+
+    #[test]
+    fn direct_command_mutation_fails_the_spawn_guard() {
+        // Mutation proof: injecting a direct Command spawn into the provider
+        // must be caught by the same guard that protects the real file.
+        let production = spawn_production_source(include_str!("spawn.rs"));
+        let mutated = format!(
+            "{production}\nfn mutated_provider() {{ let _ = std::process::Command::new(\"x\").spawn(); }}\n#[cfg(test)]\nmod tests {{}}\n"
+        );
+        let violations = spawn_guard_violations(&mutated);
+        assert!(
+            violations.contains(&"Command::new") && violations.contains(&".spawn()"),
+            "the guard must reject a direct Command mutation: {violations:?}"
         );
     }
 

@@ -1,4 +1,4 @@
-//! Accessibility seam parity tests (CTX-1362, closes #2257).
+//! Accessibility seam parity tests (CTX-1362, Refs #2257).
 //!
 //! Pins Core's `SnapshotHost` implementation on the `bitty-a11y` seam against
 //! the accepted contract: role vocabulary equivalence, byte-exact terminal
@@ -294,6 +294,33 @@ fn standard_host() -> UiSnapshotHost {
     host
 }
 
+/// Builds a host with content distinguishable from another prefix.
+fn prefixed_host(prefix: &str) -> UiSnapshotHost {
+    let root = format!("{prefix} window");
+    let title = format!("{prefix} shell");
+    let row = format!("{prefix} row");
+    let chrome = format!("{prefix} status");
+    let action = format!("{prefix} action");
+    let mut host = UiSnapshotHost::new(&root, &title);
+    host.push_row(0, &row);
+    host.push_chrome(ChromeKind::Bar, &chrome, None);
+    host.push_interactive(InteractivePurpose::Button, &action, true);
+    host.set_focus_label(Some(&title));
+    host
+}
+
+/// Reads the live terminal-row content, in snapshot order.
+fn live_row_texts(adapter: &Adapter) -> Vec<String> {
+    let snapshot = adapter.snapshot().expect("live snapshot");
+    snapshot
+        .preorder()
+        .filter_map(|handle| match snapshot.get(handle) {
+            Some(bitty_a11y::NodeView::TerminalRow { text }) => Some(text.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn host_ingest_expose_round_trip() {
     let host = standard_host();
@@ -316,6 +343,39 @@ fn host_ingest_expose_round_trip() {
     assert_eq!(drained, 1);
 }
 
+/// Independently reads the expected rows from the live grid cells.
+///
+/// This deliberately does not call `terminal_runs`: a mutation in the
+/// projection (for example dropping zero-width scalars) must fail the
+/// round-trip test, not move the expected value with it.
+fn expected_runs_from_cells(snapshot: &bitty_term_state::Snapshot) -> Vec<(u32, String)> {
+    let mut rows = Vec::new();
+    for row in 0..snapshot.height {
+        let start = row.saturating_mul(snapshot.width);
+        let end = start
+            .saturating_add(snapshot.width)
+            .min(snapshot.cells.len());
+        let Some(cells) = snapshot.cells.get(start..end) else {
+            continue;
+        };
+        let mut text = String::new();
+        for cell in cells {
+            if cell.spacer {
+                continue;
+            }
+            text.push(cell.glyph);
+            for mark in &cell.zerowidth {
+                text.push(*mark);
+            }
+        }
+        let trimmed = text.trim_end();
+        if !trimmed.is_empty() {
+            rows.push((u32::try_from(row).unwrap_or(u32::MAX), trimmed.to_string()));
+        }
+    }
+    rows
+}
+
 /// The Core projection round-trips through `SnapshotHost` byte-exactly.
 ///
 /// Grid text comes from the same live terminal `Snapshot` the renderer reads;
@@ -327,6 +387,9 @@ fn host_ingest_expose_round_trip() {
 fn round_trip_matches_grid_text_and_selection_byte_exactly() {
     let mut state = State::new();
     feed_line(&mut state, "hello");
+    // `feed_line` uses LF only; return to column zero so row 1 starts at the
+    // left margin and the literal expectation stays readable.
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
     // A wide character and a combining mark exercise the same cell-walk the
     // renderer uses; neither may be split or normalized by the seam.
     prints(&mut state, "wide界");
@@ -336,7 +399,7 @@ fn round_trip_matches_grid_text_and_selection_byte_exactly() {
     });
     let terminal = state.snapshot();
     let before = terminal.clone();
-    let expected = terminal_runs(&terminal);
+    let expected_rows = expected_runs_from_cells(&terminal);
 
     let mut host = UiSnapshotHost::from_terminal(&terminal);
     host.push_chrome(ChromeKind::Bar, "status bar", Some("utf-8"));
@@ -361,10 +424,14 @@ fn round_trip_matches_grid_text_and_selection_byte_exactly() {
         };
         actual_rows.push((*row, text.to_string()));
     }
-    let expected_rows: Vec<(u32, String)> = expected
-        .iter()
-        .map(|run| (run.row, run.text.clone()))
-        .collect();
+    assert_eq!(
+        expected_rows,
+        vec![
+            (0, String::from("hello")),
+            (1, String::from("wide界e\u{0301}")),
+        ],
+        "the independent cell walk must see the literal grid text"
+    );
     assert_eq!(actual_rows.len(), expected_rows.len());
     for (actual, expected) in actual_rows.iter().zip(&expected_rows) {
         assert_eq!(actual.0, expected.0, "row ordinal must be preserved");
@@ -496,6 +563,29 @@ fn host_rejects_overlong_announcement_text() {
     assert!(adapter.snapshot().is_none());
 }
 
+#[test]
+fn host_announcement_overflow_drops_oldest_not_fail_closed() {
+    // W-134: the 8-pending bound is a drop-oldest queue, not a fail-closed
+    // ingest error. The newest state wins; the ingest itself succeeds.
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(None);
+    let overflow = MAX_PENDING_ANNOUNCEMENTS + 2;
+    for index in 0..overflow {
+        host.push_notice(AnnouncementKind::AsyncState, &format!("state {index}"));
+    }
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overflow drops the oldest, it does not fail the ingest");
+    let pending = adapter.pending_announcements();
+    assert_eq!(pending.len(), MAX_PENDING_ANNOUNCEMENTS);
+    assert_eq!(pending.first().expect("nonempty").text(), "state 2");
+    assert_eq!(
+        pending.last().expect("nonempty").text(),
+        format!("state {}", overflow - 1).as_str()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Structural mutation: a dropped field fails closed with nothing swapped
 // ---------------------------------------------------------------------------
@@ -526,13 +616,23 @@ impl SnapshotHost for DroppedTerminalHost {
 }
 
 #[test]
-fn dropped_field_fails_closed_with_nothing_swapped() {
+fn dropped_field_fails_closed_and_live_snapshot_preserved() {
+    let old = prefixed_host("old");
     let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&old, Generation::initial(), None)
+        .expect("old ingest");
     assert_eq!(
         adapter.ingest_host(&DroppedTerminalHost, Generation::initial(), None),
         Err(A11yError::InvalidStructure)
     );
-    assert!(adapter.snapshot().is_none());
+    let live = adapter.snapshot().expect("old snapshot preserved");
+    assert!(live.lookup_label("old shell").is_some());
+    assert!(
+        live.lookup_label("window").is_none(),
+        "no partial root-only tree"
+    );
+    assert_eq!(live_row_texts(&adapter), vec!["old row"]);
     assert_eq!(adapter.generation(), Generation::initial());
 }
 
@@ -565,25 +665,37 @@ fn disabled_extension_fallback_keeps_core_baseline() {
 }
 
 // ---------------------------------------------------------------------------
-// Stale generations: rejected with nothing swapped
+// Stale generations: rejected and the previous snapshot is preserved
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stale_generation_rejected_with_nothing_swapped() {
-    let host = standard_host();
+fn stale_generation_rejected_and_live_snapshot_preserved() {
+    // The old and new hosts carry different labels, rows, and actions, so a
+    // swap to the rejected snapshot would be visible in the assertions below.
+    let old = prefixed_host("old");
+    let new = prefixed_host("new");
     let mut adapter = Adapter::new();
     let advanced = Generation::initial().advance().advance();
     adapter
-        .ingest_host(&host, advanced, None)
+        .ingest_host(&old, advanced, None)
         .expect("advanced ingest");
     let live_generation = adapter.generation();
     assert_eq!(live_generation, advanced);
-    let stale = standard_host();
     let err = adapter
-        .ingest_host(&stale, Generation::initial(), None)
+        .ingest_host(&new, Generation::initial(), None)
         .expect_err("stale ingest must fail");
     assert!(matches!(err, A11yError::StaleGeneration { .. }));
-    assert_eq!(adapter.generation(), live_generation);
+    assert_eq!(
+        adapter.generation(),
+        live_generation,
+        "generation unchanged"
+    );
+    let live = adapter.snapshot().expect("old snapshot preserved");
+    assert!(live.lookup_label("old shell").is_some());
+    assert!(live.lookup_label("new shell").is_none());
+    assert!(live.lookup_label("old status").is_some());
+    assert!(live.lookup_label("new status").is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["old row"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -591,21 +703,56 @@ fn stale_generation_rejected_with_nothing_swapped() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn host_retains_no_handles_across_generations() {
-    let host = standard_host();
+fn fresh_ingest_rebinds_handles_without_retaining_old_ones() {
+    // The second host differs from the first in labels and row content, and
+    // the first generation's handles/focus must not resolve against the new
+    // live projection.
+    let old = prefixed_host("old");
+    let new = prefixed_host("new");
     let mut adapter = Adapter::new();
     let first = Generation::initial();
     adapter
-        .ingest_host(&host, first, None)
+        .ingest_host(&old, first, None)
         .expect("first ingest");
+    let old_handles: Vec<_> = adapter
+        .snapshot()
+        .expect("first snapshot")
+        .preorder()
+        .collect();
+    let old_owner = adapter.focus().owner().expect("old focus").handle();
+    assert!(old_handles.contains(&old_owner));
+
     let second = first.advance();
     adapter
-        .ingest_host(&host, second, None)
+        .ingest_host(&new, second, None)
         .expect("second ingest re-binds fresh");
     assert_eq!(adapter.generation(), second);
-    let stale = standard_host();
+
+    let live = adapter.snapshot().expect("second snapshot");
+    let new_handles: Vec<_> = live.preorder().collect();
+    assert!(
+        new_handles
+            .iter()
+            .all(|handle| !old_handles.contains(handle)),
+        "handles from the previous generation must not be reused"
+    );
+    let err = adapter
+        .resolve(old_owner)
+        .expect_err("old-generation handle must not resolve");
     assert!(matches!(
-        adapter.ingest_host(&stale, first, None),
+        err,
+        A11yError::UnknownHandle | A11yError::StaleGeneration { .. }
+    ));
+
+    let new_owner = adapter.focus().owner().expect("new focus");
+    assert_eq!(adapter.focus().generation(), second);
+    assert!(new_handles.contains(&new_owner.handle()));
+    assert!(live.lookup_label("new shell").is_some());
+    assert!(live.lookup_label("old shell").is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["new row"]);
+
+    assert!(matches!(
+        adapter.ingest_host(&old, first, None),
         Err(A11yError::StaleGeneration { .. })
     ));
 }

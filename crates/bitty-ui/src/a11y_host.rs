@@ -9,9 +9,9 @@
 //!
 //! What this module provides:
 //!
-//! - [`a11y_role_of`] — the accessibility mapping for every [`UiNodeKind`]
-//!   primitive, returning the extension [`Role`] vocabulary so no second role
-//!   table exists in Core.
+//! - [`a11y_role_of`] — the single accessibility mapping for every
+//!   [`crate::uitree::UiNodeKind`] primitive, re-exported from [`crate::uitree`]
+//!   and returning the extension [`Role`] vocabulary.
 //! - [`terminal_runs`] — readable text runs from a terminal snapshot, with
 //!   the stated [`FIDELITY_BOUNDARY`]. Styling, graphics protocols, and
 //!   images are never promised as structure.
@@ -25,7 +25,8 @@
 //!   tokens. The extension crate is dependency-free and cannot own these; they
 //!   stay here by construction and never take plugin input.
 //!
-//! Bounded inputs (fail-closed, never silently truncated):
+//! Bounded inputs (fail-closed, never silently truncated, except the
+//! announcement queue's documented drop-oldest overflow):
 //!
 //! - Names, labels, chrome state: at most 256 characters
 //!   ([`MAX_ACCESSIBLE_NAME_LEN`](bitty_a11y::MAX_ACCESSIBLE_NAME_LEN)).
@@ -35,6 +36,8 @@
 //!   ([`MAX_ANNOUNCEMENT_TEXT_LEN`](bitty_a11y::MAX_ANNOUNCEMENT_TEXT_LEN)).
 //! - Pending announcements: at most 8
 //!   ([`MAX_PENDING_ANNOUNCEMENTS`](bitty_a11y::MAX_PENDING_ANNOUNCEMENTS)).
+//!   A full queue drops the oldest notice so the newest state wins (W-134);
+//!   overflow does not fail the ingest.
 //!
 //! The projection is derived and read-only: every constructor takes shared
 //! references and returns owned data. It never mutates terminal state, is
@@ -51,7 +54,6 @@ use bitty_a11y::{
 
 use crate::motion::MotionSpec;
 use crate::theme::{SAFE_BORDER_FOCUSED, SAFE_BORDER_IDLE, TokenColor};
-use crate::uitree::UiNodeKind;
 
 /// Re-export of the extension's fixed v1 role vocabulary.
 ///
@@ -78,24 +80,12 @@ absolute cursor addressing, SGR styling as semantic structure, graphics protocol
 // Accessibility mapping for retained primitives
 // ---------------------------------------------------------------------------
 
-/// Maps a retained primitive to its accessible role.
+/// Re-export of the single primitive-to-role table owned by [`crate::uitree`].
 ///
-/// Total: every [`UiNodeKind`] maps, reusing the extension [`Role`]
-/// vocabulary. Interactive semantics stay disciplined — `TextInput`
-/// exposes `input`; no primitive guesses a button role. Visual styling is
-/// free; this mapping is the fixed semantic half.
-#[must_use]
-pub fn a11y_role_of(kind: &UiNodeKind) -> Role {
-    match kind {
-        UiNodeKind::Box | UiNodeKind::ScrollView | UiNodeKind::Canvas | UiNodeKind::Overlay => {
-            Role::Group
-        }
-        UiNodeKind::Text(_) | UiNodeKind::Terminal => Role::Text,
-        UiNodeKind::Image => Role::Image,
-        UiNodeKind::VirtualList => Role::List,
-        UiNodeKind::TextInput { .. } => Role::Input,
-    }
-}
+/// Keeping the table next to [`crate::uitree::UiNodeKind`] avoids a second
+/// copy in the a11y host; the host only names the extension [`Role`]
+/// vocabulary.
+pub use crate::uitree::a11y_role_of;
 
 // ---------------------------------------------------------------------------
 // Terminal projection (text runs only, never styling)
@@ -265,6 +255,15 @@ impl UiSnapshotHost {
     }
 
     /// Queues one notice reported by the next ingest.
+    ///
+    /// The notice is retained on the host until the host is rebuilt or the
+    /// caller clears it; there is deliberately no `clear`/`drain` on this
+    /// candidate API yet. A host value reused across ingests therefore
+    /// re-reports its accumulated notices, not only the current transition.
+    /// The adapter still bounds delivery at
+    /// [`MAX_PENDING_ANNOUNCEMENTS`](bitty_a11y::MAX_PENDING_ANNOUNCEMENTS)
+    /// with drop-oldest, so this is a reuse limitation, not an unbounded
+    /// path (follow-up: bitty#2352).
     pub fn push_notice(&mut self, kind: AnnouncementKind, text: &str) {
         self.notices.push((kind, text.to_string()));
     }
@@ -443,36 +442,6 @@ mod tests {
     use super::*;
 
     use bitty_a11y::Generation;
-
-    #[test]
-    fn role_mapping_is_total_over_primitives() {
-        let kinds = [
-            UiNodeKind::Box,
-            UiNodeKind::Text(String::from("t")),
-            UiNodeKind::Image,
-            UiNodeKind::ScrollView,
-            UiNodeKind::VirtualList,
-            UiNodeKind::TextInput {
-                value: String::new(),
-                placeholder: String::new(),
-            },
-            UiNodeKind::Canvas,
-            UiNodeKind::Terminal,
-            UiNodeKind::Overlay,
-        ];
-        for kind in &kinds {
-            let _ = a11y_role_of(kind);
-        }
-        assert_eq!(a11y_role_of(&UiNodeKind::Terminal), Role::Text);
-        assert_eq!(
-            a11y_role_of(&UiNodeKind::TextInput {
-                value: String::new(),
-                placeholder: String::new(),
-            }),
-            Role::Input
-        );
-        assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), Role::List);
-    }
 
     #[test]
     fn host_holds_owned_values_only() {

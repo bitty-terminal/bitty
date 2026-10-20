@@ -190,36 +190,68 @@ fn blocking_spawn_wait_does_not_consume_the_wall_budget() {
 
 #[test]
 fn gmatch_over_bounded_tool_output_stays_linear() {
-    let (mut vm, services) = vm_with(BlockingSpawn::default());
-    // The git-panel parse loop: one gmatch pass over the capped 8 KiB output.
-    let outcome = vm
-        .execute(
-            r#"
-            local output = bitty.process.spawn({ "branch", "-a" }).output
-            local count = 0
-            local bytes = 0
-            for line in string.gmatch(output, "[^\n]+") do
-              local trimmed = string.gsub(string.gsub(line, "^%s+", ""), "%s+$", "")
-              if #trimmed > 0 then
-                count = count + 1
-                bytes = bytes + #trimmed
-              end
-            end
-            bitty.store.set("parsed", count)
-            bitty.store.set("parsed_bytes", bytes)
-        "#,
-        )
-        .expect("execute");
+    // The defect this pins is *fuel*, so the proof is deterministic fuel
+    // accounting, not wall time. The wall budget is generous on purpose:
+    // unoptimized CI builds execute these ~290k instructions in ~50 ms on
+    // Windows, and gating a linearity proof on a wall deadline would measure
+    // runner speed instead of the charge model. Wall budgeting is covered by
+    // the spawn-wait and slow-call tests above.
+    let mut vm = build_plugin_vm(
+        "xuepoo.gmatch-2285",
+        Some(VmBudgets {
+            wall_budget_ms: 60_000,
+            ..VmBudgets::default()
+        }),
+    )
+    .expect("budgets");
+    let services = Rc::new(BlockingSpawn::default());
+    let host: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(host, MarshallingLimits::default(), 50)
+        .expect("install");
 
-    match outcome {
-        ExecuteOutcome::Completed {
-            instructions_used, ..
-        } => assert!(
-            instructions_used < BOUNDED_WORKLOAD_FUEL_CEILING,
-            "an 8 KiB gmatch scan must stay linear and bounded, used {instructions_used}"
-        ),
-        other => panic!("bounded tool-output parse must not suspend RC-1, got {other:?}"),
+    // A git-panel-shaped line: leading spaces plus a ref name.
+    fn parse(vm: &mut LuaVm, lines: usize) -> u64 {
+        let outcome = vm
+            .execute(&format!(
+                r#"
+                local line = "  remotes/origin/feature/branch-00042\n"
+                local text = string.rep(line, {lines})
+                local count = 0
+                for item in string.gmatch(text, "[^\n]+") do
+                  local trimmed = string.gsub(string.gsub(item, "^%s+", ""), "%s+$", "")
+                  if #trimmed > 0 then
+                    count = count + 1
+                  end
+                end
+                bitty.store.set("parsed", count)
+                "#
+            ))
+            .expect("execute");
+        match outcome {
+            ExecuteOutcome::Completed {
+                instructions_used, ..
+            } => instructions_used,
+            other => panic!("bounded tool-output parse must not suspend RC-1, got {other:?}"),
+        }
     }
+
+    // `TOOL_OUTPUT_BYTES` (8 KiB) is the consumer's hard cap, so that is the
+    // worst case; a quarter of it is the linear-scaling reference.
+    let small_lines = TOOL_OUTPUT_BYTES / 4 / 43;
+    let large_lines = TOOL_OUTPUT_BYTES / 43;
+    let small_cost = parse(&mut vm, small_lines);
+    let large_cost = parse(&mut vm, large_lines);
+
+    assert!(
+        large_cost < BOUNDED_WORKLOAD_FUEL_CEILING,
+        "an 8 KiB gmatch scan must stay linear and bounded, used {large_cost}"
+    );
+    // Four times the input costs about four times the fuel. The pre-fix
+    // quadratic charge grew ~16x (and suspended at 10M before completing).
+    assert!(
+        large_cost <= small_cost.saturating_mul(6),
+        "gmatch fuel must grow linearly with input: {small_cost} -> {large_cost}"
+    );
     assert!(
         services.stored_int("parsed").unwrap_or(0) > 100,
         "the fixture must parse many lines, got {:?}",

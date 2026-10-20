@@ -1698,17 +1698,26 @@ mod vm_unit_tests {
             "host call time must be credited"
         );
 
-        // A window whose span is already credited as store commit I/O adds no
-        // second credit for the same interval.
-        let before = host_call_credit_total();
+        // Store commit I/O reported inside the same span is not credited a
+        // second time. The reported duration is deliberately larger than the
+        // span so the assertion is exact and independent of sleep overshoot
+        // (macOS runners can oversleep by several milliseconds).
+        let host_before = host_call_credit_total();
+        let store_before = store_commit_credit_total();
         let window = HostCallWindow::at(Instant::now());
         let store = StoreCommitWindow::open();
-        std::thread::sleep(ms(5));
-        record_store_commit_io(ms(5));
-        store.close(true, ms(10));
+        std::thread::sleep(ms(1));
+        record_store_commit_io(ms(1_000));
+        store.close(true, ms(1_000));
         window.close();
-        assert!(
-            host_call_credit_total() - before < ms(2),
+        assert_eq!(
+            store_commit_credit_total(),
+            store_before + ms(1_000),
+            "store commit I/O must be credited once"
+        );
+        assert_eq!(
+            host_call_credit_total(),
+            host_before,
             "store commit I/O must not be credited twice"
         );
     }

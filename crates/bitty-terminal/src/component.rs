@@ -25,11 +25,13 @@
 //!   `--format table|json|jsonl` (default table) and `--no-color`.
 //! - `list`: read-only enumeration across both tiers (merged, user shadows
 //!   system on the same version). Shows name, version, active marker, source,
-//!   ABI compat, path, and the activation state the broker last recorded for
-//!   that component (`installed`, `active`, `denied:<class>`, `crashed`,
-//!   `stopped`; `installed` when no record exists). The state is read through
-//!   the runtime's single activation reader, never re-derived here. Empty
-//!   when nothing is installed; never fails on a missing root.
+//!   ABI compat, path, and the last activation transition the broker recorded
+//!   for that component name (`installed`, `active`, `denied:<class>`,
+//!   `crashed`, `stopped`; `installed` when no record exists). The label is
+//!   diagnostics, not a liveness probe: `active` means a spawn was recorded.
+//!   It is printed once per component, on the active-version row. The state is
+//!   read through the runtime's single activation reader, never re-derived
+//!   here. Empty when nothing is installed; never fails on a missing root.
 //! - `add <path> [--version <semver>]`: stage a pre-built binary from a local
 //!   path into the user tier only. A directory must hold a source
 //!   `bitty-component.toml` (name, version, protocol, executable, optional
@@ -110,9 +112,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_runtime::component::{
     ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
-    ComponentSummary, activation_path, component_search_roots_for, data_home_for,
+    ComponentSummary, component_search_roots_for, component_state_root_for, data_home_for,
     discover_components, executable_file_name, incompatible_component_hint, missing_component_hint,
-    read_component_activation, validate_component_name,
+    read_component_activation_with_state, remove_activation_artifacts, validate_component_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -817,9 +819,16 @@ pub fn component_help_text() -> String {
      \x20 list                        Show installed components across both tiers:\n\
      \x20                             name, version, active marker, source\n\
      \x20                             (user|system), ABI compat, path, and the\n\
-     \x20                             activation state the broker last recorded\n\
+     \x20                             last activation transition the broker\n\
+     \x20                             recorded for that component name\n\
      \x20                             (installed|active|denied:<class>|crashed|\n\
      \x20                             stopped; installed when never activated).\n\
+     \x20                             This is last-recorded diagnostics, not a\n\
+     \x20                             liveness probe: active means a spawn was\n\
+     \x20                             recorded, not that the process is running\n\
+     \x20                             now. The label is shown once per component,\n\
+     \x20                             on the active-version row, and covers both\n\
+     \x20                             install tiers via $XDG_STATE_HOME.\n\
      \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
      \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
      \x20                             A directory holds bitty-component.toml plus\n\
@@ -1017,6 +1026,10 @@ pub struct ComponentContext<'a> {
     /// `BITTY_SYSTEM_COMPONENTS_DIR` override (tests; default is the
     /// platform system path).
     pub system_components_dir: Option<&'a str>,
+    /// `XDG_STATE_HOME` environment value (activation record parent).
+    pub xdg_state_home: Option<&'a str>,
+    /// `BITTY_COMPONENT_STATE_DIR` override (tests; wins over XDG state).
+    pub component_state_dir: Option<&'a str>,
     /// `BITTY_WSL_DISTRO` environment/config value for guest distro
     /// selection (tests pass values in; production reads the environment).
     pub wsl_distro_env: Option<&'a str>,
@@ -1144,6 +1157,11 @@ pub fn run_component_subcommand(
         data_home.as_deref(),
         context.system_components_dir,
     );
+    let state_root = component_state_root_for(
+        context.component_state_dir,
+        context.xdg_state_home,
+        context.home,
+    );
 
     // WSL2 trampoline gate (#1908): `add` stages guest helpers (validates,
     // probes on Windows, persists placement); `install` fetches the host
@@ -1183,7 +1201,12 @@ pub fn run_component_subcommand(
     match request.verb {
         ComponentVerb::List => {
             let summaries = discover_components(user_root.as_deref(), system_root.as_deref());
-            let listed = summarize_list(&summaries, user_root.as_deref(), system_root.as_deref());
+            let listed = summarize_list(
+                &summaries,
+                user_root.as_deref(),
+                system_root.as_deref(),
+                state_root.as_deref(),
+            );
             match request.format {
                 ComponentFormat::Table => {
                     let no_color = request.no_color || context.pre_no_color;
@@ -1303,12 +1326,18 @@ fn summarize_list(
     summaries: &[ComponentSummary],
     user_root: Option<&Path>,
     system_root: Option<&Path>,
+    state_root: Option<&Path>,
 ) -> Vec<ListedComponent> {
     summaries
         .iter()
         .map(|summary| ListedComponent {
             summary: summary.clone(),
-            activation: read_component_activation(user_root, system_root, &summary.name),
+            activation: read_component_activation_with_state(
+                user_root,
+                system_root,
+                state_root,
+                &summary.name,
+            ),
         })
         .collect()
 }
@@ -1318,7 +1347,7 @@ fn format_list_table(listed: &[ListedComponent], _no_color: bool) -> String {
     let _ = writeln!(
         out,
         "{:<16} {:<12} {:<7} {:<8} {:<9} {:<30}  PATH",
-        "NAME", "VERSION", "ACTIVE", "SOURCE", "ABI", "ACTIVATION"
+        "NAME", "VERSION", "ACTIVE", "SOURCE", "ABI", "LAST ACTIVATION"
     );
     let mut rows = 0usize;
     for entry in listed {
@@ -1335,12 +1364,23 @@ fn format_list_table(listed: &[ListedComponent], _no_color: bool) -> String {
             rows += 1;
             continue;
         }
-        for installed in &summary.versions {
+        // The record is name-scoped: print it once, on the active-version
+        // row. If `current` names no installed row, the first row carries it
+        // so the label is never duplicated or silently dropped.
+        let active_row = summary.versions.iter().position(|installed| {
+            summary.active_version.as_deref() == Some(installed.version.as_str())
+        });
+        for (index, installed) in summary.versions.iter().enumerate() {
             let is_active = summary.active_version.as_deref() == Some(installed.version.as_str());
             let abi = if installed.compatible {
                 "ok"
             } else {
                 "mismatch"
+            };
+            let activation = if is_active || (active_row.is_none() && index == 0) {
+                activation.as_str()
+            } else {
+                ""
             };
             let _ = writeln!(
                 out,
@@ -1390,7 +1430,8 @@ fn json_escape(value: &str) -> String {
 /// `activation` / `activation_class` were added for #2254 at the end of each
 /// component object: existing fields keep their order and meaning, and
 /// `activation` is the same `installed|active|denied:<class>|crashed|stopped`
-/// label the table shows.
+/// last-recorded transition the table shows. It appears once per component
+/// (the table puts it on the active-version row), never once per version.
 #[must_use]
 pub fn format_list_envelope(listed: &[ListedComponent]) -> String {
     let mut out = String::from(
@@ -2471,9 +2512,9 @@ fn op_remove(
                 }
             }
             // Prune the component dir when the last version is gone and no
-            // `current` remains. The activation projection (#2254) is not an
-            // installed version: drop it too so a reinstall starts from
-            // `installed`.
+            // `current` remains. Activation records and stale writer temps
+            // are not installed versions: sweep both so a removed component
+            // cannot linger as "(missing version dir)".
             prune_component_dir(&component_dir);
             Ok(format!("removed component '{name}' version {version}"))
         }
@@ -2491,8 +2532,11 @@ fn op_remove(
 
 /// Drop the component directory once no version directory remains.
 ///
-/// The activation record (`activation`) is a runtime projection, not an
-/// installed version, so it must not keep a removed component visible.
+/// Activation records and `activation.tmp-*` leftovers are runtime
+/// projections, not installed versions, so they must not keep a removed
+/// component visible as a versionless name. New records live in the state
+/// directory; the install-tree sweep covers legacy records and crashed
+/// writers from older builds.
 fn prune_component_dir(component_dir: &Path) {
     let has_versions = std::fs::read_dir(component_dir)
         .map(|entries| entries.flatten().any(|entry| entry.path().is_dir()))
@@ -2500,7 +2544,7 @@ fn prune_component_dir(component_dir: &Path) {
     if has_versions {
         return;
     }
-    let _ = std::fs::remove_file(activation_path(component_dir));
+    remove_activation_artifacts(component_dir);
     if let Ok(mut entries) = std::fs::read_dir(component_dir) {
         if entries.next().is_none() {
             let _ = std::fs::remove_dir(component_dir);
@@ -2861,15 +2905,22 @@ mod tests {
     fn context_for(user: &Path, system: &Path) -> (ComponentContext<'static>, String, String) {
         // Leak the path strings so the context can borrow them with a
         // `'static` lifetime in tests (freed at process exit).
+        let state_path = user
+            .parent()
+            .map_or_else(|| user.to_path_buf(), |base| base.join("state"));
         let user: &'static str = Box::leak(user.to_string_lossy().into_owned().into_boxed_str());
         let system: &'static str =
             Box::leak(system.to_string_lossy().into_owned().into_boxed_str());
+        let state: &'static str =
+            Box::leak(state_path.to_string_lossy().into_owned().into_boxed_str());
         (
             ComponentContext {
                 xdg_data_home: None,
                 home: None,
                 components_dir: Some(user),
                 system_components_dir: Some(system),
+                xdg_state_home: None,
+                component_state_dir: Some(state),
                 wsl_distro_env: None,
                 pre_format: None,
                 pre_no_color: false,
@@ -3374,6 +3425,8 @@ mod tests {
             home: None,
             components_dir: Some(user),
             system_components_dir: Some(system),
+            xdg_state_home: None,
+            component_state_dir: None,
             wsl_distro_env: Some("Ubuntu"),
             pre_format: None,
             pre_no_color: false,
@@ -3502,6 +3555,130 @@ mod tests {
         let (code, stdout) = run_with(&context, &["remove", "net", "0.0.1"]);
         assert_eq!(code, EXIT_OK, "{stdout}");
         assert!(!user_root.join("net").join("0.0.1").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_prints_activation_once_on_the_active_version_row() {
+        let base = scratch("activation-per-version");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        for version in ["0.0.1", "0.0.2"] {
+            let source = write_source_dir(
+                &base.join(format!("source-{version}")),
+                "net",
+                version,
+                "[1, 1]",
+            );
+            let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+            assert_eq!(code, EXIT_OK, "{stdout}");
+        }
+        // The record is name-scoped; it belongs to the active version only.
+        let state_dir = base.join("state").join("net");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(state_dir.join("activation"), "v1 active\n").expect("record");
+
+        let (code, stdout) = run_with(&context, &["list"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        let rows: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.starts_with("net "))
+            .collect();
+        assert_eq!(rows.len(), 2, "{stdout}");
+        let row = |version: &str| {
+            rows.iter()
+                .find(|line| line.split_whitespace().nth(1) == Some(version))
+                .copied()
+                .unwrap_or_else(|| panic!("missing row {version}: {stdout}"))
+        };
+        assert_ne!(
+            row("0.0.1").split_whitespace().nth(5),
+            Some("active"),
+            "superseded version must not repeat the name-scoped label: {stdout}"
+        );
+        assert_eq!(
+            row("0.0.2").split_whitespace().nth(5),
+            Some("active"),
+            "active version must carry the label: {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_reads_state_record_for_a_system_only_install() {
+        let base = scratch("activation-system");
+        let user = base.join("user");
+        let system = base.join("system");
+        write_source_dir(&system.join("net").join("0.0.1"), "net", "0.0.1", "[1, 1]");
+        std::fs::write(system.join("net").join("current"), "0.0.1\n").expect("current");
+        let (context, _, _) = context_for(&user, &system);
+        // The read-only system install still reports the shared state record.
+        let state_dir = base.join("state").join("net");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(state_dir.join("activation"), "v1 active\n").expect("record");
+
+        let (code, stdout) = run_with(&context, &["list"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        let row = stdout
+            .lines()
+            .find(|line| line.starts_with("net "))
+            .expect("system row");
+        assert!(row.contains(" system "), "{stdout}");
+        assert_eq!(
+            row.split_whitespace().nth(5),
+            Some("active"),
+            "system-only install must report the state record: {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_labels_activation_as_last_recorded_not_liveness() {
+        let help = component_help_text();
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("last activation transition"),
+            "help must describe the recorded transition: {help}"
+        );
+        assert!(
+            normalized.contains("not a liveness probe"),
+            "help must deny liveness semantics: {help}"
+        );
+        assert!(
+            normalized.contains("active means a spawn was recorded"),
+            "help must define active as a recorded spawn: {help}"
+        );
+        assert!(
+            !normalized.contains("activation state"),
+            "help must not call the projection a live state: {help}"
+        );
+        let header = format_list_table(&[], false);
+        assert!(header.contains("LAST ACTIVATION"), "{header}");
+    }
+
+    #[test]
+    fn last_version_removal_sweeps_stale_activation_temps() {
+        let base = scratch("activation-temp-prune");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let source = write_source_dir(&base.join("source"), "net", "0.0.1", "[1, 1]");
+        let (code, stdout) = run_with(&context, &["add", &source.display().to_string()]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        let component_dir = Path::new(context.components_dir.expect("user")).join("net");
+        // Simulate a writer killed between temp creation and rename.
+        std::fs::write(
+            component_dir.join("activation.tmp-999-0"),
+            b"partial-record",
+        )
+        .expect("stale temp");
+
+        let (code, stdout) = run_with(&context, &["remove", "net", "0.0.1"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert!(
+            !component_dir.exists(),
+            "stale activation temp must not keep the removed component visible"
+        );
+        let (code, stdout) = run_with(&context, &["list"]);
+        assert_eq!(code, EXIT_OK, "{stdout}");
+        assert!(!stdout.contains("net"), "{stdout}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

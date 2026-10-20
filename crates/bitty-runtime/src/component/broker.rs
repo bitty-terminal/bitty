@@ -23,7 +23,7 @@ use bitty_network_wire::{
     MAX_REQUEST_BODY_BYTES, Message, Method, PROTOCOL_VERSION, WireError, encode_frame,
 };
 
-use super::activation::{ActivationState, write_activation};
+use super::activation::{ActivationState, read_activation, write_activation};
 use super::descriptor::{ResolveError, validate_component_name};
 use super::env::ComponentEnv;
 use super::grant::PluginGrant;
@@ -120,6 +120,14 @@ pub struct BrokerConfig {
     /// System component root (`system_components_root_for`); `None` disables
     /// the system tier. The user tier wins on collision.
     pub system_root: Option<PathBuf>,
+    /// Component activation state root (`component_state_root_for`).
+    ///
+    /// When set, every activation transition for either install tier is
+    /// recorded under `<state-root>/<name>/activation`, so a read-only system
+    /// install reports activation too and the record survives reinstalls.
+    /// `None` keeps the legacy user-tier record beside `current` (and records
+    /// nothing for a system install).
+    pub activation_root: Option<PathBuf>,
     /// Allowlisted environment forwarded to every component.
     pub env: ComponentEnv,
     /// Core version announced in `Hello`.
@@ -150,6 +158,7 @@ impl BrokerConfig {
         Self {
             root,
             system_root: None,
+            activation_root: None,
             env,
             core_version: env!("CARGO_PKG_VERSION").to_owned(),
             idle_timeout: policy.idle_timeout,
@@ -163,6 +172,13 @@ impl BrokerConfig {
     #[must_use]
     pub fn with_system_root(mut self, system_root: Option<PathBuf>) -> Self {
         self.system_root = system_root;
+        self
+    }
+
+    /// Record activation transitions under the shared state directory.
+    #[must_use]
+    pub fn with_activation_root(mut self, activation_root: Option<PathBuf>) -> Self {
+        self.activation_root = activation_root;
         self
     }
 
@@ -402,11 +418,12 @@ struct Slot {
     stderr: Arc<Mutex<StderrRing>>,
     spawns: u64,
     last_stop: Option<StopOutcome>,
-    /// User-tier component directory this slot records activation into.
+    /// Component record directory this slot writes activation into.
     ///
-    /// `Some` only when the winning tier is the writable user tier (the
-    /// system tier is read-only, so its runtime state cannot be persisted);
-    /// set at the last spawn.
+    /// Normally `<state-root>/<name>` (both tiers); without a configured
+    /// state root it falls back to the writable user-tier directory beside
+    /// `current`, and a system-only install records nothing. Set at the last
+    /// spawn and reused for denials between spawns.
     activation_dir: Option<PathBuf>,
 }
 
@@ -713,34 +730,54 @@ impl ComponentBroker {
     /// caller passes the same [`ActivationState`] the list surface reports;
     /// the broker writes it into the bounded activation projection it also
     /// writes on spawn/crash/stop. An invalid component name touches nothing,
-    /// a system-only install (no writable user directory) is not recorded,
-    /// and a denial never masks a component that is currently running (a
-    /// request refused for one plugin must not hide a live shared
-    /// component). Best effort: I/O failures are dropped, never surfaced as
-    /// request failures.
+    /// an uninstalled name creates no state directory, and a denial never
+    /// masks a component that is currently running or one whose recorded
+    /// crash latch is still `crashed` (a request refused for one plugin must
+    /// not hide a live shared component or rewrite the post-crash latch).
+    /// Best effort: I/O failures are dropped, never surfaced as request
+    /// failures.
     pub fn record_activation(&self, component: &str, state: ActivationState) {
         if validate_component_name(component).is_err() {
             return;
         }
+        let denied = matches!(state, ActivationState::Denied(_));
         let slot = self.slots.get(component);
-        if matches!(state, ActivationState::Denied(_))
-            && slot.is_some_and(|slot| slot.process.is_some())
-        {
+        if denied && slot.is_some_and(|slot| slot.process.is_some()) {
             return;
         }
         let dir = match slot.and_then(|slot| slot.activation_dir.clone()) {
             Some(dir) => dir,
             None => {
-                let Some(root) = self.config.root.as_deref() else {
-                    return;
-                };
-                let candidate = root.join(component);
-                if !candidate.is_dir() {
-                    return;
+                if let Some(root) = self.config.activation_root.as_deref() {
+                    let installed = [
+                        self.config.root.as_deref(),
+                        self.config.system_root.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|root| root.join(component).is_dir());
+                    if !installed {
+                        return;
+                    }
+                    root.join(component)
+                } else {
+                    let Some(root) = self.config.root.as_deref() else {
+                        return;
+                    };
+                    let candidate = root.join(component);
+                    if !candidate.is_dir() {
+                        return;
+                    }
+                    candidate
                 }
-                candidate
             }
         };
+        // The crash latch is the strongest recorded outcome (#2294 F6):
+        // another plugin's denial must not rewrite it until a later spawn
+        // records a new transition.
+        if denied && read_activation(&dir) == ActivationState::Crashed {
+            return;
+        }
         // Diagnostics only: a typed write failure never fails the request.
         let _ = write_activation(&dir, state);
     }
@@ -837,13 +874,18 @@ impl ComponentBroker {
         )?;
         slot.process = Some(process);
         slot.spawns += 1;
-        // Activation projection (#2254): only the writable user tier can be
-        // recorded; the system tier stays read-only.
-        slot.activation_dir = match searched.source {
-            super::inventory::ComponentSource::User => {
-                resolved.version_dir.parent().map(Path::to_path_buf)
-            }
-            super::inventory::ComponentSource::System => None,
+        // Activation projection (#2254, #2294): the shared state directory
+        // covers both tiers and survives reinstalls. Without it, keep the
+        // legacy user-tier record beside `current`; the system tier remains
+        // read-only in that fallback.
+        slot.activation_dir = match self.config.activation_root.as_deref() {
+            Some(root) => Some(root.join(component)),
+            None => match searched.source {
+                super::inventory::ComponentSource::User => {
+                    resolved.version_dir.parent().map(Path::to_path_buf)
+                }
+                super::inventory::ComponentSource::System => None,
+            },
         };
         if let Some(dir) = slot.activation_dir.as_deref() {
             let _ = write_activation(dir, ActivationState::Active);

@@ -770,15 +770,19 @@ fn main() {
             eprintln!("{}", component::component_deprecated_note());
         }
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+        let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
         let home = std::env::var("HOME").ok();
         let components_dir = std::env::var("BITTY_COMPONENTS_DIR").ok();
         let system_components_dir = std::env::var("BITTY_SYSTEM_COMPONENTS_DIR").ok();
+        let component_state_dir = std::env::var("BITTY_COMPONENT_STATE_DIR").ok();
         let wsl_distro_env = std::env::var(bitty_runtime::component::WSL_DISTRO_ENV).ok();
         let context = component::ComponentContext {
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
             components_dir: components_dir.as_deref(),
             system_components_dir: system_components_dir.as_deref(),
+            xdg_state_home: xdg_state_home.as_deref(),
+            component_state_dir: component_state_dir.as_deref(),
             wsl_distro_env: wsl_distro_env.as_deref(),
             pre_format: args.component_format.as_deref(),
             pre_no_color: args.component_no_color,

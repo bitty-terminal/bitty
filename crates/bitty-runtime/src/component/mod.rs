@@ -20,10 +20,12 @@
 //!   without system fallback. [`discover_components`] merges both tiers for
 //!   `bitty extension list`.
 //! - [`read_component_activation`] reads the bounded activation projection
-//!   the broker writes beside `current` on spawn, crash, idle/shutdown stop,
-//!   and fail-closed denial, so `list` reports an activation state
-//!   (`installed`, `active`, `denied:<class>`, `crashed`, `stopped`) without
-//!   starting an instance or executing a component.
+//!   the broker writes under `$XDG_STATE_HOME/bitty/extensions/<name>` on
+//!   spawn, crash, idle/shutdown stop, and fail-closed denial, so `list`
+//!   reports the last recorded transition (`installed`, `active`,
+//!   `denied:<class>`, `crashed`, `stopped`) for either install tier without
+//!   starting an instance or executing a component. The label is
+//!   diagnostics, not a liveness probe.
 //! - [`ComponentDescriptor`] validation checks the name grammar, the semver
 //!   version, the executable name (no path separators), the protocol range,
 //!   and the SHA-256 digest of the executable. Every spawn re-runs the full
@@ -95,8 +97,10 @@ mod wsl;
 use std::time::Duration;
 
 pub use activation::{
-    ActivationDenial, ActivationState, COMPONENT_ACTIVATION_FILE, COMPONENT_ACTIVATION_MAX_BYTES,
-    activation_path, read_activation, read_component_activation,
+    ActivationDenial, ActivationState, COMPONENT_ACTIVATION_DIR_NAME, COMPONENT_ACTIVATION_FILE,
+    COMPONENT_ACTIVATION_MAX_BYTES, COMPONENT_STATE_DIR_ENV, activation_path,
+    component_state_root_for, read_activation, read_component_activation,
+    read_component_activation_with_state, remove_activation_artifacts, state_home_for,
 };
 pub use broker::{
     BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, ComponentBroker, ComponentRequest,

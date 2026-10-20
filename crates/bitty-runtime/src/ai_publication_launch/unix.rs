@@ -156,14 +156,18 @@ impl Handles {
 
     /// Test-only access to the child-side bootstrap read end, so a fixture can
     /// impersonate the helper without spawning one.
-    #[cfg(test)]
+    ///
+    /// Gated on the fixture feature as well as `test`: the fixture modules are
+    /// compiled only with `publication-control-test-support`, so a plain
+    /// `--all-targets` build would otherwise see these accessors as dead code.
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     pub(super) fn take_bootstrap_reader(&mut self) -> Option<OwnedFd> {
         self.bootstrap_reader.take()
     }
 
     /// Test-only access to the child-side control end, so a fixture can
     /// impersonate the helper without spawning one.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "publication-control-test-support"))]
     pub(super) fn take_control_child(&mut self) -> Option<UnixStream> {
         self.control_child.take()
     }

@@ -544,7 +544,11 @@ impl PreparedLaunch {
 
     /// Test-only establishment with an explicitly supplied helper pin, so the
     /// pin-refusal outcome is exercised through the production seam.
-    #[cfg(all(test, unix))]
+    ///
+    /// Gated on the fixture feature, not just `test`: `--all-targets` builds
+    /// the lib test harness without `publication-control-test-support`, where
+    /// the only caller (the fixture module) is compiled out.
+    #[cfg(all(test, unix, feature = "publication-control-test-support"))]
     fn establish_with_expected_pin(
         &mut self,
         deadline: Instant,

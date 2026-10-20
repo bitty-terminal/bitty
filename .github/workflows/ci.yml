@@ -193,6 +193,16 @@ jobs:
         if: matrix.shard == 1
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # CTX-1378 (bitty#2288): `publication-control` is default-off, so the
+      # workspace lint above only ever sees the feature's code as compiled
+      # out. Lint the shipped graph with the feature on, but deliberately
+      # WITHOUT `publication-control-test-support`: that combination is where
+      # the test-only accessors lose their only callers, so this step is the
+      # regression gate for feature-combination dead code.
+      - name: Run Clippy (bitty-runtime publication-control feature)
+        if: matrix.shard == 1
+        run: cargo clippy -p bitty-runtime --features publication-control --all-targets --locked -- -D warnings
+
       # CTX-0922: `bitty dev capture|synthesize|dump|overlay` is compiled only
       # with the opt-in `dev-tools` feature; lint that configuration too.
       # (`bitty dev trace` measurement lives in the external bitty-perf suite
@@ -1044,6 +1054,35 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets --locked
+
+      # CTX-1378 (bitty#2288): `publication-control` is default-off, so the
+      # workspace check above never compiles the non-Unix adapter
+      # (`ai_publication_launch/unsupported.rs`) or the feature-enabled paths
+      # that surround it. Compile the shipped graph (no test-support: the
+      # fixture TLS server is Unix-only) with warnings denied so the
+      # fail-closed Windows arm is type-checked on MSVC.
+      #
+      # aws-lc-sys (through bitty-network-publication) builds its C sources
+      # with CMake, which the image ships, and assembles with NASM, which it
+      # does not. `AWS_LC_SYS_PREBUILT_NASM` selects the crate's bundled
+      # prebuilt object files when NASM is absent and is ignored when it is
+      # present, so this stays valid on either image.
+      - name: Check publication-control feature compilation
+        env:
+          RUSTFLAGS: "-D warnings"
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: cargo check -p bitty-runtime --features publication-control --all-targets --locked
+
+      # The non-Unix fail-closed fixture lives behind the same default-off
+      # feature plus `publication-control-test-support` (the Unix fixture TLS
+      # server), so no other leg compiles or runs it. Build the lib test
+      # harness with both features and run the single refusal test: preparation
+      # must reject the platform before generating material or handles.
+      - name: Run publication-control fail-closed test (Windows)
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: cargo test -p bitty-runtime --features publication-control-test-support --lib --locked preparation_fails_closed_on_non_unix_platforms
 
       # CTX-0847: nextest (isolated processes, bounded timeouts, capped
       # real-process group) replaces the libtest run; doctests and the two

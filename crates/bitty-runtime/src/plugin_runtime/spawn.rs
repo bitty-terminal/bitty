@@ -40,44 +40,48 @@
 //!    from the hash-bound install grant (the user consented to the manifest
 //!    declaring `process.spawn:<tool>`); per-spawn UI prompting that refreshes
 //!    it is sequel work, but the enforcement point is here.
-//! 6. **Outcome**: the resolved spawn runs under [`ExecutionService`] with
-//!    the real-process provider below, so stream budgets, char-boundary
-//!    truncation, the `Unknown` agreement, burst caps (`64` tracked outcomes),
-//!    and trust labeling are inherited, not re-implemented.
+//! 6. **Outcome**: the resolved spawn runs under [`ExecutionService`], whose
+//!    provider delegates to the extracted `bitty-execution` supervisor
+//!    (`crate::execution_jobs`). The registry owns job identity, lifecycle,
+//!    owned-tree kill/reap, bounded output, and the terminal outcome; this
+//!    surface inherits stream budgets, char-boundary truncation, the
+//!    `Unknown` agreement, burst caps (`64` tracked outcomes), and trust
+//!    labeling without a second supervisor.
 //!
 //! # Execution hardening
 //!
-//! - **No shell, ever**: argv arrays go directly to
-//!   [`std::process::Command`]; `sh -c`, `cmd /C`, and friends are never
-//!   constructed on any platform. Metacharacters in args are inert data.
+//! - **No shell, ever**: argv arrays reach the supervisor as separate values;
+//!   `sh -c`, `cmd /C`, and friends are never constructed on any platform.
+//!   Metacharacters in args are inert data.
 //! - **Inherited exec confinement** (CTX-1151): admitted Layer-2 tool
 //!   invocations additionally run under `bitty-sandbox` inherited OS
-//!   confinement — on Linux a Landlock `EXECUTE` ruleset (tool binaries
-//!   plus their loaders) applied in the child via `pre_exec`, so an
-//!   admitted binary cannot exec outside the allowlist from inside.
-//!   Confinement setup failure refuses the spawn fail-closed as
-//!   `Unavailable` with a confinement diagnostic; non-Linux platforms
-//!   refuse admitted spawns the same way until their sequel mechanisms
-//!   (macOS `sandbox-exec`, Windows job-object confinement) land.
-//! - **Closed env**: the child starts from `env_clear()` plus the request's
-//!   explicit vars only; ambient environment never crosses the boundary
-//!   (mirrors [`EnvPolicy`]). Besides determinism (no `GIT_PAGER`/`PATH`
-//!   surprises), this keeps secrets out of the child.
-//! - **Bounded drain, no deadlocks**: stdout/stderr are drained concurrently
-//!   on two reaper threads capped at `effective_budget + 1` bytes each, so a
-//!   child emitting megabytes cannot wedge the pipe buffers while the caller
-//!   polls. The caller enforces `timeout_ms`, kills and reaps on expiry, and
-//!   joins the readers; no zombie and no unbounded allocation on any path.
-//! - **Text-only contract**: byte output is converted lossily (mirroring the
-//!   `bitty-lua` boundary) and NUL-bearing output fails closed downstream via
-//!   the shared validation. Binary-safe transport is sequel work.
-//! - **Timeout is `Unknown`, not failure**: a killed child reports
-//!   `Unknown`/`Unknown` with no exit code and a timeout evidence ref, so
-//!   callers reconcile instead of assuming the effect did (or did not) land.
-//! - **Windows**: only portable [`std::process`] APIs are used (`Command`,
-//!   `try_wait`, `kill`, `wait`); no Unix signals, no shell lookup, no
-//!   platform `cfg`. Verified via the workspace Windows `cargo check` gate
-//!   plus portable tests (the child under test is the test binary itself).
+//!   confinement. The supervisor's host `SpawnPreparer` seam attaches the
+//!   Landlock `EXECUTE` ruleset (tool binaries plus their loaders) in the
+//!   child via `pre_exec`, so an admitted binary cannot exec outside the
+//!   allowlist from inside. Confinement setup failure refuses the spawn
+//!   before registry tracking, fail-closed as `Unavailable` with a
+//!   confinement diagnostic; non-Linux platforms refuse admitted spawns the
+//!   same way until their sequel mechanisms (macOS `sandbox-exec`, Windows
+//!   job-object confinement) land.
+//! - **Closed env**: the registry builds the child with a cleared ambient
+//!   environment plus the request's explicit vars only (mirrors
+//!   [`EnvPolicy`]). Besides determinism (no `GIT_PAGER`/`PATH` surprises),
+//!   this keeps secrets out of the child.
+//! - **Bounded output, no deadlocks**: the supervisor drains stdout/stderr
+//!   concurrently into a bounded newest-wins per-stream store; the
+//!   synchronous bridge reads only the tail it can deliver and maps the
+//!   registry's truncation metadata. No zombie and no unbounded allocation
+//!   on any path.
+//! - **Text-only contract**: retained bytes are decoded lossily (mirroring
+//!   the `bitty-lua` boundary) and NUL-bearing output fails closed downstream
+//!   via the shared validation. Binary-safe transport is sequel work.
+//! - **Timeout is `Unknown`, not failure**: the registry's `TimedOut`
+//!   outcome maps to `Unknown`/`Unknown` with no exit code and a timeout
+//!   evidence ref, so callers reconcile instead of assuming the effect did
+//!   (or did not) land.
+//! - **Cancellation is typed and owned-tree scoped**: a host cancel goes
+//!   through the registry's principal/operation gate and kills the recorded
+//!   job's owned tree; this module never signals or kills a pid.
 //!
 //! # Bounds (accepted contracts only, no invented values)
 //!
@@ -137,15 +141,14 @@
 //! would orphan a registry slot Lua can never reconcile (64 such orphans =
 //! self-DoS via `LimitExceeded`). Every stored outcome is therefore a
 //! delivered outcome; the 64-slot bound covers delivered outcomes only and
-//! stays fail-closed by design. Surfacing `execution_id` to Lua for explicit
-//! reconcile is sequel work; until then the host correlates via
-//! [`SpawnService::reconcile`].
+//! stays fail-closed by design. Surfacing the real registry job id to Lua is
+//! sequel work under an accepted API decision; until then the host correlates
+//! via [`SpawnService::reconcile`].
 //!
 //! The module performs real I/O (it spawns children) and therefore lives in
 //! `bitty-runtime`, not in headless `bitty-ipc`: it reuses the accepted
-//! [`ExecutionService`] as its backend with a real-process provider.
-//! No new dependencies: `std` plus the existing `bitty-ipc`/`bitty-lua`
-//! workspace deps.
+//! [`ExecutionService`] as its synchronous gate and the extracted
+//! `bitty-execution` registry as its supervisor.
 
 #![forbid(unsafe_code)]
 
@@ -165,9 +168,13 @@ use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::tools::{
     ACCEPTED_TOOL_GIT, ToolSpawnLedger, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
-    is_tool_spawn_allowed, is_valid_tool_name,
+    is_valid_tool_name,
 };
 use bitty_pty::TreeBackend;
+
+use crate::execution_jobs::{
+    DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised,
+};
 
 /// Panel-path per-stream output budget (`8 KiB`).
 ///
@@ -208,59 +215,43 @@ const SPAWN_BRIDGE_MESSAGE_BYTES: usize = bitty_ipc::devtools::MAX_ERROR_MESSAGE
 /// Scope guarding every spawn (always separate; requires elevation).
 pub const SPAWN_SCOPE: Scope = Scope::ProcessSpawn;
 
-// ── execution seam (CTX-1182 + CTX-1184, issue #1997) ─────────────────────────
+// ── execution seam (CTX-1182 + CTX-1184, issue #1997; #2249) ─────────────────
 //
 // Core-owned spawn-execution seam: [`SpawnMechanicsPolicy`] adopts the
-// published execution sidecar contract numbers verbatim (supervisor poll,
-// drain chunk, tracked-outcome ceiling, output ceiling, typed-cancel grace),
+// published execution sidecar contract numbers (supervisor poll,
+// tracked-outcome ceiling, output ceiling, typed-cancel grace),
 // [`SpawnKillScope`] mirrors `KillScope::for_backend`, and the
 // [`SpawnGeneration`] / [`SpawnHandle`] / [`SpawnCancelRequest`] /
 // [`SpawnCancelOutcome`] / [`SpawnCancelReceipt`] vocabulary mirrors the
-// generation-fenced typed cancel (`cancel_sidecar_typed`). The small-core
-// graph fence keeps Core from importing the execution crate directly, so
-// this module owns the copy and the parity tests below pin every number and
-// behavior against the contract; the composition root ([`SpawnService`])
-// bridges this seam to live behavior (CTX-1184): it enforces the injected
-// policy, reports the adopted kill scope, mints generation-fenced handles,
-// and resolves cancels against live tracked state.
+// generation-fenced typed cancel (`cancel_sidecar_typed`). Since #2249 the
+// process mechanics are no longer a Core copy: [`spawn_process`] delegates
+// to the extracted `bitty-execution` registry through the Core-owned
+// `execution_jobs` seam, which owns job identity, lifecycle, cancellation,
+// bounded output, and the owned-tree kill.
 //
-// Ownership boundaries (unchanged by this seam):
+// Ownership boundaries:
 // - Shape and allowlist gates ([`SpawnRequest::validate`], [`SpawnAuthorizer`])
 //   stay host-owned and are never re-derived here.
-// - One-shot kills are [`SpawnKillScope::DirectChild`]: no owned-tree backend
-//   is adopted for a synchronous spawn, so a grandchild holding a pipe is met
-//   by the bounded drain detach (partial output preserved), never by a tree
-//   kill. The adopted supervision scope ([`SpawnService::kill_scope`]) still
-//   reports the owned tree where a backend exists; executing tree kills for
-//   live supervision is follow-up work.
-// - A synchronous spawn has no live job to cancel: every cancel resolves on
-//   the spot (unknown id fails closed, stored outcome reports its terminal
-//   state, stale generation answers without touching anything). Executing an
-//   accepted cancel against a running job belongs to the async supervisor
-//   follow-up; the vocabulary below exists so that follow-up needs no new
-//   Core vocabulary.
-// - The drain join stays `1 s` while the long-lived registry supervisor joins
-//   drains under a wider `5 s` bound: a one-shot spawn answers against its
-//   `30 s` ceiling, so the tighter bound keeps it total without changing the
-//   mechanism (concurrent bounded drain, bounded join, detach with partial).
-// - The synchronous provider slot ([`ExecutionService::with_provider`]) takes
-//   a bare `fn` pointer owned by `bitty-ipc`, so it runs [`spawn_process`]
-//   (core defaults); tuned policies flow through [`spawn_process_with_policy`]
-//   and the [`SpawnService`] surface until that seam accepts context.
+// - Kill scope is the registry's owned tree via
+//   [`SpawnKillScope::OwnedTree`] where a backend exists; the synchronous
+//   surface never issues a pid-based kill.
+// - The synchronous dispatch still waits for the terminal outcome (the v1 Lua
+//   surface is unchanged). The real job id and the live supervisor handle are
+//   available to host code for cancellation and diagnostics; exposing the job
+//   surface to Lua is phase 2 under an accepted API decision.
+// - The policy's drain fields are retained for API compatibility and parity
+//   assertions; the registry owns the drain chunk, join bound, and retain cap.
+//   Only `poll_interval` still reaches the supervisor.
 
 /// Bounded spawn-execution numbers the spawn surface enforces.
 ///
 /// Every default is the shared contract number, adopted verbatim from the
 /// published execution sidecar contract where the two sides overlap (poll,
-/// drain chunk, tracked ceiling, output ceiling, cancel grace); the drain
-/// join keeps the one-shot `1 s` bound documented above. A host with an
-/// approved reason tunes one field while keeping the rest: fields are public
-/// for that reason, and the tuned policy flows in through
-/// [`SpawnService::with_policy`], [`spawn_process_with_policy`],
-/// `join_drain_bounded`, `drain_bounded_shared`, and
-/// [`SpawnCancelRequest::new_with_policy`]. Use sites clamp defensively
-/// (`saturating_add` for the overflow spare, `max(1)` for the drain chunk
-/// and tracked cap), mirroring the drain below.
+/// tracked ceiling, output ceiling, cancel grace). The drain fields are
+/// retained for compatibility: the extracted supervisor owns the drain
+/// chunk, join bound, and retain cap, so they no longer tune a Core copy.
+/// A host with an approved reason tunes a field while keeping the rest;
+/// use sites clamp defensively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnMechanicsPolicy {
     /// Supervisor poll interval (`SPAWN_POLL_INTERVAL`, 10 ms).
@@ -967,6 +958,11 @@ impl SpawnAuthorizer for HostToolsAuthorizer {
 pub struct SpawnService {
     authorizer: Box<dyn SpawnAuthorizer>,
     exec: ExecutionService,
+    /// Extracted execution supervisor: the registry owns job identity,
+    /// lifecycle, cancellation, and bounded output for every mediated spawn.
+    supervisor: ToolJobSupervisor,
+    /// Caller execution id -> real registry job id for this service.
+    job_ids: BTreeMap<u64, JobId>,
     policy: SpawnMechanicsPolicy,
     generations: BTreeMap<u64, SpawnGeneration>,
     next_generation: NonZeroU64,
@@ -978,6 +974,7 @@ impl fmt::Debug for SpawnService {
         f.debug_struct("SpawnService")
             .field("authorizer", &self.authorizer)
             .field("tracked", &self.exec.len())
+            .field("supervisor", &self.supervisor)
             .field("policy", &self.policy)
             .field("audit_entries", &self.audit.len())
             .finish()
@@ -998,13 +995,58 @@ impl SpawnService {
     /// The policy governs the service surface: the tracked-outcome ceiling,
     /// cancel grace bounds, and handle generations minted below. The
     /// synchronous provider slot itself runs [`spawn_process`] (core
-    /// defaults) until the `bitty-ipc`-owned provider seam accepts context;
-    /// per-spawn tuning flows through [`spawn_process_with_policy`].
+    /// defaults); drain mechanics are owned by the extracted supervisor, and
+    /// per-spawn poll tuning flows through [`spawn_process_with_policy`].
     #[must_use]
     pub fn with_policy(authorizer: Box<dyn SpawnAuthorizer>, policy: SpawnMechanicsPolicy) -> Self {
         Self {
             authorizer,
             exec: ExecutionService::with_provider(spawn_process),
+            supervisor: ToolJobSupervisor::new(),
+            job_ids: BTreeMap::new(),
+            policy,
+            generations: BTreeMap::new(),
+            next_generation: NonZeroU64::MIN,
+            audit: ToolSpawnLedger::new(),
+        }
+    }
+
+    /// Real registry job id for a successful dispatch, if any.
+    ///
+    /// The synchronous v1 surface still returns the caller's `execution_id`
+    /// for reconcile; this accessor exposes the supervisor identity without
+    /// changing that API.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn job_id_for(&self, execution_id: u64) -> Option<JobId> {
+        self.job_ids.get(&execution_id).copied()
+    }
+
+    /// Cloneable supervisor handle for host cancellation and diagnostics.
+    ///
+    /// A host may hand this clone to another thread while a synchronous
+    /// dispatch waits; cancellation still goes through the registry's
+    /// principal/operation gate and the owned-tree kill, never a pid.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn supervisor(&self) -> ToolJobSupervisor {
+        self.supervisor.clone()
+    }
+
+    /// Test seam: a service over an explicit supervisor (bounded capacity,
+    /// pre-filled registry) so registry rejection is observable without a
+    /// second spawn path.
+    #[cfg(test)]
+    pub(crate) fn with_supervisor(
+        authorizer: Box<dyn SpawnAuthorizer>,
+        policy: SpawnMechanicsPolicy,
+        supervisor: ToolJobSupervisor,
+    ) -> Self {
+        Self {
+            authorizer,
+            exec: ExecutionService::with_provider(spawn_process),
+            supervisor,
+            job_ids: BTreeMap::new(),
             policy,
             generations: BTreeMap::new(),
             next_generation: NonZeroU64::MIN,
@@ -1047,10 +1089,9 @@ impl SpawnService {
     ///
     /// [`SpawnKillScope::OwnedTree`] where the platform backend terminates a
     /// whole owned tree, else [`SpawnKillScope::DirectChild`] with the orphan
-    /// gap surfaced through the bounded drain detach. Mirrors
-    /// `KillScope::for_backend` over the detected backend; one-shot timeout
-    /// kills still terminate the direct child only, and executing tree kills
-    /// for live supervision is follow-up work.
+    /// gap surfaced. Mirrors `KillScope::for_backend` over the detected
+    /// backend; the registry cancels and deadline-kills the recorded job's
+    /// tree, never a pid.
     #[must_use]
     pub fn kill_scope(&self) -> SpawnKillScope {
         SpawnKillScope::for_tree_backend(TreeBackend::detect())
@@ -1102,24 +1143,22 @@ impl SpawnService {
             })
     }
 
-    /// Resolve a typed cancel against live tracked state.
+    /// Resolve a typed cancel against the synchronous outcome registry.
     ///
-    /// Mirrors the execution `cancel_sidecar_typed` contract for a
-    /// synchronous surface (no live job exists, so nothing is ever accepted
-    /// for execution):
+    /// Mirrors the execution `cancel_sidecar_typed` contract at the service
+    /// boundary:
     ///
     /// - unknown id fails closed with `NotFound` (same shape as
     ///   [`SpawnService::reconcile`]);
     /// - a handle whose generation is not the spawn's answers
     ///   [`SpawnCancelOutcome::StaleGeneration`] without touching anything;
-    /// - a current handle answers [`SpawnCancelOutcome::AlreadyExited`]: every
-    ///   stored synchronous outcome is terminal, so the answer is
-    ///   mode-independent.
+    /// - a current handle answers [`SpawnCancelOutcome::AlreadyExited`]: a
+    ///   dispatch only returns after the registry reached a terminal state.
     ///
-    /// Executing an accepted cancel against a running job (the
-    /// [`SpawnCancelReceipt::Accepted`] path) belongs to the async supervisor
-    /// follow-up; this surface exists so that follow-up needs no new Core
-    /// vocabulary.
+    /// A host that must stop a live job while a synchronous dispatch waits
+    /// uses the cloneable supervisor handle and the registry's principal
+    /// gate; the registry kills the recorded owned tree, never a pid. The v1
+    /// Lua surface remains terminal-only until the phase-2 job API decision.
     ///
     /// # Errors
     ///
@@ -1162,11 +1201,14 @@ impl SpawnService {
     /// - `Denied[EffectRequiresExplicitConsent]` when `allow_effects` is unset.
     /// - `Denied[ConsentRequired]` when the ledger lacks an active
     ///   `(client_id, process.spawn)` grant at `now_ms`.
-    /// - `Unavailable` when the child cannot be spawned at all.
+    /// - `Unavailable` when the execution supervisor cannot start the job
+    ///   (confinement refusal, supervisor start failure) or a terminal
+    ///   output read fails closed.
     ///
-    /// A successful dispatch mints a fresh generation-fenced [`SpawnHandle`]
-    /// for `execution_id` (readable via [`SpawnService::handle_for`]); failed
-    /// dispatches mint nothing and leave no partial state.
+    /// A successful dispatch records the real registry job id for
+    /// `execution_id` and mints a fresh generation-fenced [`SpawnHandle`]
+    /// (readable via [`SpawnService::handle_for`]); failed dispatches mint
+    /// nothing and leave no partial state.
     ///
     /// Every dispatch appends exactly one entry to the spawn audit ledger
     /// ([`SpawnService::tool_audit`]): `Allow` when the gates authorize the
@@ -1196,6 +1238,11 @@ impl SpawnService {
                     return Err(error);
                 }
             };
+        // The `bitty-ipc` provider slot is a bare `fn`; carry this dispatch's
+        // authenticated principal and registry through the scoped context so
+        // the provider records the real `JobId` for this caller id.
+        let principal = job_principal(client_id)?;
+        let scope = DispatchScope::enter(self.supervisor.clone(), principal);
         let result = self.exec.dispatch(
             &exec_request,
             granted,
@@ -1203,7 +1250,13 @@ impl SpawnService {
             client_id,
             now_ms,
             execution_id,
-        )?;
+        );
+        let job = scope.job();
+        drop(scope);
+        let result = result?;
+        if let Some(job) = job {
+            self.job_ids.insert(execution_id, job);
+        }
         let generation = SpawnGeneration::from_raw(self.next_generation.get())
             .expect("generation counter never mints zero");
         self.next_generation = self.next_generation.saturating_add(1);
@@ -1348,542 +1401,38 @@ pub(crate) fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError
 
 // ── real-process provider ───────────────────────────────────────────────────
 
-/// Builds the closed-environment pipe command for the CTX-0442 synchronous
-/// provider (W-140 Core side).
+/// Real-process [`ExecutionProvider`](bitty_ipc::ExecutionProvider) backed by
+/// the extracted execution supervisor (issue #2249).
 ///
-/// Argv-only (no shell), ambient environment cleared, explicit variables
-/// only, stdin closed, stdout/stderr piped. Duplicated from the extracted
-/// execution supervisor's constructor so the Core surface keeps its shape
-/// without depending on `bitty-execution`; the unit test below owns the
-/// argv/closed-env drift protection.
-#[must_use]
-fn closed_pipe_command(
-    program: &str,
-    args: &[String],
-    cwd: Option<&str>,
-    env: &EnvPolicy,
-) -> std::process::Command {
-    use std::process::{Command, Stdio};
-
-    let mut command = Command::new(program);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    command.env_clear();
-    if let EnvPolicy::Explicit { vars } = env {
-        for var in vars {
-            command.env(&var.name, &var.value);
-        }
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
-}
-
-/// Real-process [`ExecutionProvider`](bitty_ipc::ExecutionProvider): argv-only
-/// spawn with concurrent bounded drain, timeout kill+reap, and closed env.
+/// The registry owns argv-first pipe spawning, the closed environment, the
+/// owned-tree kill/reap, the bounded newest-wins output store, and the
+/// terminal outcome. This function only bridges the synchronous provider slot
+/// into the registry; it never builds or spawns a `std::process::Command`
+/// itself.
 ///
-/// Never constructs a shell on any platform: `executable` plus `args` go
-/// directly to [`std::process::Command`], stdin is null, and stdout/stderr are
-/// piped to bounded reader threads. On timeout the child is killed and reaped
-/// (no zombie) and the outcome is `Unknown`/`Unknown` with a timeout evidence
-/// ref, so callers reconcile instead of assuming the effect did or did not
-/// land. A child that cannot start at all fails as `Unavailable`.
-///
-/// Runs under the core-default mechanics policy; tuned policies flow through
-/// [`spawn_process_with_policy`]. The bare-`fn` shape is the
-/// `bitty-ipc`-owned provider slot ([`ExecutionService::with_provider`]).
+/// Runs under the core-default mechanics policy; the direct-call policy
+/// variant remains available for tests and host diagnostics.
 pub(crate) fn spawn_process(
     request: &bitty_ipc::execution::ExecutionRequest,
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
     spawn_process_with_policy(request, &SpawnMechanicsPolicy::core_defaults())
 }
 
-/// Real-process provider under an explicit mechanics policy
-/// (composition-root injection, CTX-1184).
+/// Real-process provider under an explicit mechanics policy.
 ///
-/// Poll interval, drain chunk, drain-join budget (including both detach
-/// evidence strings), and the drain retain cap all read `policy`; behavior
-/// is otherwise identical to [`spawn_process`].
+/// Only the poll interval still reaches the supervisor; drain chunk, join
+/// budget, and the retain cap are owned by `bitty-execution` so both
+/// consumers share one bounded-output implementation. The policy fields stay
+/// public for compatibility and parity assertions.
 pub(crate) fn spawn_process_with_policy(
     request: &bitty_ipc::execution::ExecutionRequest,
     policy: &SpawnMechanicsPolicy,
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
-    use bitty_ipc::execution::{EffectState, ExecutionStatus, RawExecutionOutput};
-
-    // CTX-0442 argv-only, closed-environment command construction lives in
-    // the Core-local `closed_pipe_command` above (W-140 duplicate of the
-    // extracted supervisor constructor).
-    let mut command = closed_pipe_command(
-        &request.executable,
-        &request.args,
-        request.cwd.as_deref(),
-        &request.env_policy,
-    );
-    // CTX-1151 (#1984): every *admitted* Layer-2 tool invocation runs
-    // under inherited OS exec confinement (`bitty-sandbox`): on Linux the
-    // child may exec only the allowlisted tool binaries (plus their
-    // loaders), so a GTFOBins-class binary cannot escape to a shell from
-    // inside. The guard must stay alive across `spawn` (it owns the
-    // ruleset fd the child hook captured); any setup failure returns
-    // `Unavailable` *before* any process starts — fail-closed, diagnosed,
-    // never silently unconfined. Non-tool requests carry no allowlist
-    // basis and keep their scope/consent gates unchanged.
-    let _confinement = if is_tool_spawn_allowed(&request.executable, &request.args) {
-        let exec_paths =
-            bitty_sandbox::resolve_tool_execs(&request.executable).map_err(|error| {
-                IpcError::Unavailable {
-                    reason: format!(
-                        "tool spawn confinement refused '{}': {}",
-                        request.executable,
-                        truncate_message(error.to_string(), 96),
-                    ),
-                }
-            })?;
-        Some(
-            bitty_sandbox::confine_command_to_execs(&mut command, &exec_paths).map_err(
-                |error| IpcError::Unavailable {
-                    reason: format!(
-                        "tool spawn confinement refused '{}': {}",
-                        request.executable,
-                        truncate_message(error.to_string(), 96),
-                    ),
-                },
-            )?,
-        )
-    } else {
-        None
-    };
-    let child = command.spawn().map_err(|error| IpcError::Unavailable {
-        reason: if _confinement.is_some() {
-            // The spawn ran with confinement armed (Landlock hook
-            // installed): any failure here — a `pre_exec` refusal on a
-            // locked-down host as well as a genuine exec denial — is a
-            // fail-closed confinement refusal, so the diagnostic names it
-            // instead of passing a bare OS error up.
-            format!(
-                "spawn failed for '{}' under tool confinement (fail-closed): {}",
-                request.executable,
-                truncate_message(error.to_string(), 96),
-            )
-        } else {
-            format!(
-                "spawn failed for '{}': {}",
-                request.executable,
-                truncate_message(error.to_string(), 128)
-            )
-        },
-    })?;
-    // CTX-0526: from this point the child is live, so it is owned by a
-    // cleanup guard. Every early `return`/`?` below must pass through the
-    // guard so the child is killed and reaped (bounded) instead of being
-    // dropped unreaped. Steady-state paths disarm the guard once ownership
-    // moves into explicit kill+wait handling; the `Drop` fallback is the
-    // last-resort path for `?` returns (reaper-thread start, `try_wait`).
-    //
-    // Borrow discipline: `guard.child_mut()` borrows end before any
-    // `guard.abandon`/`reaped` call — setup borrows live in their own
-    // statement scopes, and the supervise loop re-borrows per iteration —
-    // so exactly one mutable borrow of the guard is live at a time.
-    let mut guard = PostSpawnChild::new(child);
-
-    // Concurrent bounded drain: each stream is drained to EOF but retains at
-    // most budget+1 bytes (the spare byte detects overflow so the service
-    // marks `truncated`). Draining past the cap instead of stopping early
-    // keeps the child unblocked on every platform: stopping early EPIPEs short
-    // writes on Unix yet wedges full pipes on Windows. Two threads so a child
-    // filling both pipes can never wedge the supervisor, and retained memory
-    // stays bounded on every path.
-    //
-    // CTX-0476: each drain publishes incrementally into a shared buffer so a
-    // bounded join can still return partial output when a grandchild inherits
-    // the pipe and holds EOF open forever.
-    use std::sync::{Arc, Mutex};
-    let cap = policy.drain_retain_cap(request.effective_stream_budget());
-    let chunk_bytes = policy.drain_chunk_bytes.max(1);
-    let stdout_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let stderr_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout_thread = match guard.child_mut().stdout.take() {
-        Some(mut pipe) => {
-            let shared = Arc::clone(&stdout_shared);
-            let handle = std::thread::Builder::new()
-                .name("bitty-spawn-stdout".into())
-                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared, chunk_bytes))
-                .map_err(|_| IpcError::Internal {
-                    reason: "spawn stdout reaper failed to start".into(),
-                });
-            match handle {
-                // CTX-0526: the guard kills+reaps the live child before the
-                // error propagates, so the reaper-start failure cannot
-                // orphan it.
-                Ok(handle) => Some(handle),
-                Err(error) => return Err(guard.abandon(error)),
-            }
-        }
-        None => None,
-    };
-    let mut stderr_thread = match guard.child_mut().stderr.take() {
-        Some(mut pipe) => {
-            let shared = Arc::clone(&stderr_shared);
-            let handle = std::thread::Builder::new()
-                .name("bitty-spawn-stderr".into())
-                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared, chunk_bytes))
-                .map_err(|_| IpcError::Internal {
-                    reason: "spawn stderr reaper failed to start".into(),
-                });
-            match handle {
-                // CTX-0526: same guard cleanup as the stdout reaper path.
-                Ok(handle) => Some(handle),
-                Err(error) => return Err(guard.abandon(error)),
-            }
-        }
-        None => None,
-    };
-    // Both pipes were requested above; a missing pipe means the stdio handoff
-    // failed. Kill and reap so no zombie or wedged child escapes.
-    //
-    // CTX-0526: reachable again — the reaper-start `?` paths above no longer
-    // skip this cleanup, and a missing pipe still kills+reaps exactly once
-    // through the guard.
-    if stdout_thread.is_none() || stderr_thread.is_none() {
-        return Err(guard.abandon(IpcError::Internal {
-            reason: "spawn stdio pipes were not created".into(),
-        }));
-    }
-
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_millis(request.timeout_ms))
-        .unwrap_or_else(std::time::Instant::now);
-    loop {
-        // CTX-0526: a `try_wait` error must kill+reap before returning —
-        // `abandon` performs the cleanup explicitly (the guard's `Drop` is
-        // the last-resort path for any `?` that bypasses it).
-        let observed = guard
-            .child_mut()
-            .try_wait()
-            .map_err(|error| IpcError::Internal {
-                reason: format!(
-                    "spawn wait failed: {}",
-                    truncate_message(error.to_string(), 128)
-                ),
-            });
-        let observed = match observed {
-            Ok(observed) => observed,
-            Err(error) => return Err(guard.abandon(error)),
-        };
-        match observed {
-            Some(status) => {
-                // Steady state: reap explicitly, then disarm the guard so
-                // its `Drop` does not kill+wait a second time. Exactly-once
-                // ownership: from here the child is reaped and the guard
-                // holds no live process.
-                let child = guard.child_mut();
-                let _ = child.wait();
-                guard.reaped();
-                let (stdout, stdout_detached) = stdout_thread
-                    .take()
-                    .map(|h| join_drain_bounded(h, &stdout_shared, policy))
-                    .unwrap_or_default();
-                let (stderr, stderr_detached) = stderr_thread
-                    .take()
-                    .map(|h| join_drain_bounded(h, &stderr_shared, policy))
-                    .unwrap_or_default();
-                let (status_view, effect, code) = if status.success() {
-                    (
-                        ExecutionStatus::Completed,
-                        EffectState::Completed,
-                        Some(status.code().unwrap_or(0)),
-                    )
-                } else {
-                    (ExecutionStatus::Failed, EffectState::Failed, status.code())
-                };
-                // A grandchild holding the pipe open detaches the drain but
-                // must not lose attribution: surface the stall as evidence so
-                // callers reconcile instead of assuming complete output. The
-                // bound is the enforced policy's, so tuned policies report
-                // the bound they actually waited.
-                let mut evidence_refs = Vec::new();
-                if stdout_detached || stderr_detached {
-                    evidence_refs.push(format!(
-                        "spawn drain detached after {} ms; grandchild may hold pipe; partial output preserved",
-                        policy.drain_join_timeout.as_millis(),
-                    ));
-                }
-                return Ok(RawExecutionOutput {
-                    target_id: request.target.clone(),
-                    status: status_view,
-                    exit_code: code,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    evidence_refs,
-                    effect_state: effect,
-                });
-            }
-            None if std::time::Instant::now() >= deadline => {
-                // Steady state: kill+reap explicitly, then disarm — the
-                // guard must not repeat the cleanup on scope exit.
-                // Exactly-once: this branch owns the kill+wait pair.
-                let child = guard.child_mut();
-                let _ = child.kill();
-                let _ = child.wait();
-                guard.reaped();
-                let (stdout, stdout_detached) = stdout_thread
-                    .take()
-                    .map(|h| join_drain_bounded(h, &stdout_shared, policy))
-                    .unwrap_or_default();
-                let (stderr, stderr_detached) = stderr_thread
-                    .take()
-                    .map(|h| join_drain_bounded(h, &stderr_shared, policy))
-                    .unwrap_or_default();
-                let drain_note = match (stdout_detached, stderr_detached) {
-                    (false, false) => "drain joined".to_owned(),
-                    _ => format!(
-                        "drain detached after {} ms; partial output preserved",
-                        policy.drain_join_timeout.as_millis()
-                    ),
-                };
-                return Ok(RawExecutionOutput {
-                    target_id: request.target.clone(),
-                    status: ExecutionStatus::Unknown,
-                    exit_code: None,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    evidence_refs: vec![format!(
-                        "spawn timeout after {} ms; child killed and reaped; stdout {} bytes, stderr {} bytes preserved; {drain_note}",
-                        request.timeout_ms,
-                        stdout.len(),
-                        stderr.len(),
-                    )],
-                    effect_state: EffectState::Unknown,
-                });
-            }
-            None => std::thread::sleep(policy.poll_interval),
-        }
-    }
-}
-
-/// Owned post-spawn cleanup guard (CTX-0526).
-///
-/// Takes ownership of the live [`std::process::Child`] immediately after
-/// `Command::spawn()` succeeds so every early return kills and reaps the
-/// child (bounded) instead of dropping it unreaped. Steady-state paths call
-/// [`PostSpawnChild::reaped`] after their explicit kill+wait (or `abandon`
-/// on error paths, which performs the cleanup and returns the error), which
-/// disarms the guard; the `Drop` fallback covers `?` returns (reaper-thread
-/// start, `try_wait`) that cannot run explicit cleanup first.
-///
-/// Exactly-once: [`PostSpawnChild::reaped`] and [`PostSpawnChild::abandon`]
-/// are idempotent — whichever runs first performs the single kill+wait pair,
-/// and later calls (including `Drop`) are no-ops.
-#[derive(Debug)]
-struct PostSpawnChild<C: PostSpawnChildOps = std::process::Child> {
-    child: Option<C>,
-}
-
-/// Best-effort kill+reap for one owned child.
-///
-/// `kill` is ignored (the child may already be gone); `wait` reaps the
-/// zombie. Bounded: `wait` blocks only until the killed child exits, which
-/// the OS delivers promptly — this never polls and never touches the
-/// minute-scale drain-join or timeout budgets.
-fn kill_and_reap<C: PostSpawnChildOps>(child: &mut C) {
-    let _ = child.kill_child();
-    let _ = child.wait_child();
-}
-
-/// Minimal kill+wait surface the guard needs.
-///
-/// `std::process::Child` implements this directly; test fakes implement it
-/// with counters so error-path cleanup is observable without spawning a
-/// process tree.
-trait PostSpawnChildOps {
-    /// Best-effort terminate (ignored when the child is already gone).
-    fn kill_child(&mut self) -> std::io::Result<()>;
-    /// Reap the child (blocks only until the killed child exits).
-    fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus>;
-}
-
-impl PostSpawnChildOps for std::process::Child {
-    fn kill_child(&mut self) -> std::io::Result<()> {
-        self.kill()
-    }
-
-    fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.wait()
-    }
-}
-
-impl<C: PostSpawnChildOps> PostSpawnChild<C> {
-    /// Own the live child immediately after `spawn()` succeeds.
-    fn new(child: C) -> Self {
-        Self { child: Some(child) }
-    }
-
-    /// Borrow the live child for setup (`stdout.take`, `try_wait`) while
-    /// the guard retains cleanup ownership.
-    ///
-    /// # Panics
-    ///
-    /// Panics when called after [`PostSpawnChild::reaped`] or
-    /// [`PostSpawnChild::abandon`] disarmed the guard; steady-state code
-    /// only touches the child before disarming.
-    fn child_mut(&mut self) -> &mut C {
-        self.child.as_mut().expect("guard holds the live child")
-    }
-
-    /// Disarm after an explicit kill+reap the caller performed.
-    /// Idempotent: safe to call when already disarmed.
-    fn reaped(&mut self) {
-        self.child.take();
-    }
-
-    /// Kill+reap the live child, disarm, and hand the error back.
-    /// Idempotent: the first call performs the single cleanup pair.
-    fn abandon(&mut self, error: IpcError) -> IpcError {
-        if let Some(child) = self.child.as_mut() {
-            kill_and_reap(child);
-        }
-        self.child.take();
-        error
-    }
-}
-
-impl<C: PostSpawnChildOps> Drop for PostSpawnChild<C> {
-    fn drop(&mut self) {
-        // Last-resort path for `?` returns: kill+reap so a live child is
-        // never dropped unreaped. Steady-state paths disarm first, making
-        // this a no-op there.
-        if let Some(child) = self.child.as_mut() {
-            kill_and_reap(child);
-        }
-    }
-}
-
-/// Post-spawn setup faithfully mirroring [`spawn_process`] above, but over a
-/// caller-supplied child (`C`) and injectable reaper-start / wait steps
-/// (CTX-0526).
-///
-/// The production path cannot fail thread-spawn or `try_wait` on demand, so
-/// its error-path cleanup would otherwise be untestable without a process
-/// tree. This seam runs the exact guard discipline — reaper-start failure,
-/// missing-pipe, and wait-error branches all pass through `abandon`, and
-/// steady-state branches disarm via `reaped` — against a fake child, and
-/// returns the `PostSpawnChild` so tests can assert exactly-once kill+wait
-/// ownership with bounded completion.
-#[cfg(test)]
-fn post_spawn_setup<C: PostSpawnChildOps>(
-    mut guard: PostSpawnChild<C>,
-    mut start_stdout_reaper: impl FnMut() -> Result<(), IpcError>,
-    mut start_stderr_reaper: impl FnMut() -> Result<(), IpcError>,
-    pipes_present: bool,
-    mut wait_step: impl FnMut() -> Result<Option<()>, IpcError>,
-) -> Result<PostSpawnChild<C>, IpcError> {
-    if let Err(error) = start_stdout_reaper() {
-        return Err(guard.abandon(error));
-    }
-    if let Err(error) = start_stderr_reaper() {
-        return Err(guard.abandon(error));
-    }
-    if !pipes_present {
-        return Err(guard.abandon(IpcError::Internal {
-            reason: "spawn stdio pipes were not created".into(),
-        }));
-    }
-    match wait_step() {
-        Ok(Some(())) => {
-            // Steady state mirrors `spawn_process`: the caller reaps
-            // explicitly, then disarms so `Drop` stays a no-op.
-            let child = guard.child_mut();
-            let _ = child.wait_child();
-            guard.reaped();
-            Ok(guard)
-        }
-        Ok(None) => Ok(guard),
-        Err(error) => Err(guard.abandon(error)),
-    }
-}
-
-/// Shared-buffer drain for [`spawn_process`] (CTX-0476, CTX-1184).
-///
-/// Drains `pipe` to EOF while retaining at most `cap + 1` bytes in `shared`
-/// (the spare byte lets the service detect overflow and mark `truncated`).
-/// Bytes past the cap are read and discarded so the child never blocks on a
-/// full pipe, however much it emits. Publishes incrementally into `shared`
-/// so a bounded join can return partial output even when EOF never arrives
-/// (grandchild inherits the pipe). Reads in `chunk_bytes` steps (the enforced
-/// policy's drain chunk; clamped to at least one byte so a zero tune cannot
-/// spin on empty reads); retained memory is bounded by `cap` plus one chunk.
-/// Read errors end the drain early (fail-closed downstream: short output is
-/// still validated and attributed). Time O(n), space O(cap) in the child
-/// output.
-fn drain_bounded_shared(
-    pipe: &mut impl std::io::Read,
-    cap: usize,
-    shared: &std::sync::Mutex<Vec<u8>>,
-    chunk_bytes: usize,
-) {
-    let mut chunk = vec![0u8; chunk_bytes.max(1)];
-    loop {
-        match pipe.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut guard = match shared.lock() {
-                    Ok(guard) => guard,
-                    Err(poison) => poison.into_inner(),
-                };
-                if guard.len() <= cap {
-                    let room = cap.saturating_add(1).saturating_sub(guard.len());
-                    guard.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                // Lock released before the next blocking read.
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Clone a shared drain buffer, tolerating a poisoned mutex.
-///
-/// A panicked drain thread still leaves its partial bytes behind; callers
-/// attribute short output fail-closed downstream rather than dropping it.
-fn clone_shared(shared: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
-    match shared.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poison) => poison.into_inner().clone(),
-    }
-}
-
-/// Bounded join for one drain thread (CTX-0476, CTX-1184).
-///
-/// Polls `is_finished` until the enforced policy's drain-join budget; a
-/// finished thread joins normally (panics degrade to shared partial, never
-/// empty), while a hung thread (grandchild holding the pipe) detaches —
-/// dropping the `JoinHandle` — and the caller keeps the partial bytes
-/// collected so far. Polls on the policy's interval. Returns the bytes plus
-/// whether the thread was detached. Never blocks past the budget, so
-/// `spawn_process` stays total on every path.
-fn join_drain_bounded(
-    handle: std::thread::JoinHandle<()>,
-    shared: &std::sync::Mutex<Vec<u8>>,
-    policy: &SpawnMechanicsPolicy,
-) -> (Vec<u8>, bool) {
-    let deadline = std::time::Instant::now() + policy.drain_join_timeout;
-    loop {
-        if handle.is_finished() {
-            let _ = handle.join();
-            return (clone_shared(shared), false);
-        }
-        if std::time::Instant::now() >= deadline {
-            // Detach: dropping the handle leaves the thread running against
-            // the shared buffer (bounded by cap), while we return partial.
-            drop(handle);
-            return (clone_shared(shared), true);
-        }
-        std::thread::sleep(policy.poll_interval);
-    }
+    let run = spawn_supervised(request, policy.poll_interval)?;
+    // The registry never mints id zero; keep the invariant visible to the
+    // bridge so a future registry regression fails here, not downstream.
+    debug_assert!(run.job.get() > 0, "supervised job ids start at one");
+    Ok(run.raw)
 }
 
 // ── Lua bridge mapping ──────────────────────────────────────────────────────
@@ -2128,6 +1677,11 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::execution_jobs::test_support::{
+        ExecutionOutcome, JobCancel, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
+        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
+    };
+
     // ── portable child helper ──────────────────────────────────────────
     //
     // The child under test is always the test binary itself: hermetic,
@@ -2137,6 +1691,7 @@ mod tests {
 
     const HELPER_ENV: &str = "__BITTY_SPAWN_TEST_HELPER";
     const HELPER_PAYLOAD_ENV: &str = "__BITTY_SPAWN_TEST_PAYLOAD";
+    const HELPER_MARKER_ENV: &str = "__BITTY_SPAWN_TEST_MARKER";
 
     #[test]
     fn __bitty_spawn_helper_entry__() {
@@ -2146,6 +1701,20 @@ mod tests {
             }
             Ok("emit") => {
                 eprint!("{}", "x".repeat(1024 * 1024));
+            }
+            Ok("append") => {
+                // One line per spawned child; the #2249 tests use this to
+                // prove a dispatch crosses the registry exactly once and that
+                // a registry refusal starts nothing.
+                use std::io::Write as _;
+                if let Ok(path) = std::env::var(HELPER_MARKER_ENV) {
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .expect("marker file");
+                    let _ = writeln!(file, "spawn");
+                }
             }
             Ok("sleep") => {
                 std::thread::sleep(Duration::from_secs(30));
@@ -2323,6 +1892,53 @@ mod tests {
             1_000,
             id,
         )
+    }
+
+    /// Unique marker path for the one-spawn and rejection probes.
+    fn unique_marker(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "bitty-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ))
+    }
+
+    /// Waits for a registry snapshot satisfying `predicate`.
+    fn wait_snapshot(
+        registry: &JobRegistry,
+        principal: &JobPrincipal,
+        job: JobId,
+        what: &str,
+        predicate: impl Fn(&JobSnapshot) -> bool,
+    ) -> JobSnapshot {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = registry.get_as(principal, job).expect("job stays tracked");
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job} did not reach {what} in time"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Helper spec for the registry-level cancel tests.
+    fn helper_job_spec(mode: &str) -> JobSpec {
+        JobSpec::new(helper_exe(), helper_args())
+            .with_env(
+                EnvPolicy::explicit(vec![(HELPER_ENV.to_owned(), mode.to_owned())])
+                    .expect("explicit env"),
+            )
+            .with_kind(JobKind::Command)
+            .with_lifetime(JobLifetime::Detached)
+            .with_io(JobIo::Pipes)
+            .with_timeouts(JobTimeouts::default().with_hard(Duration::from_secs(30)))
+            .with_origin(JobOrigin::none())
     }
 
     #[test]
@@ -3134,52 +2750,6 @@ mod tests {
     }
 
     #[test]
-    fn spawn_process_with_policy_reports_the_tuned_drain_bound() {
-        // CTX-1184 injection end to end: a grandchild holding the pipes past
-        // a tuned 100 ms drain-join budget must detach with partial output
-        // preserved and evidence naming the tuned bound — not the 1 s core
-        // default.
-        let mut tuned = SpawnMechanicsPolicy::core_defaults();
-        tuned.drain_join_timeout = Duration::from_millis(100);
-        let request = bitty_ipc::execution::ExecutionRequest::new(helper_exe(), helper_args())
-            .with_env_policy(
-                EnvPolicy::explicit(vec![
-                    (HELPER_ENV.to_owned(), "detach-hold".to_owned()),
-                    (
-                        HELPER_PAYLOAD_ENV.to_owned(),
-                        "detach-partial-1184".to_owned(),
-                    ),
-                ])
-                .expect("explicit env"),
-            )
-            .with_timeout_ms(30_000);
-        let start = std::time::Instant::now();
-        let output = super::spawn_process_with_policy(&request, &tuned).expect("detach serves");
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "tuned detach path hung: {:?}",
-            start.elapsed()
-        );
-        assert_eq!(
-            output.status,
-            bitty_ipc::execution::ExecutionStatus::Completed,
-            "the child exits at once; only the grandchild holds the pipes"
-        );
-        assert!(
-            output.evidence_refs.iter().any(|r| r.contains("100 ms")),
-            "detach evidence must name the tuned bound: {:?}",
-            output.evidence_refs
-        );
-        assert!(
-            output.stdout.contains("detach-partial-1184")
-                || output.stderr.contains("detach-partial-1184"),
-            "detach must preserve partial output: stdout={:?} stderr={:?}",
-            output.stdout,
-            output.stderr
-        );
-    }
-
-    #[test]
     fn spawn_cancel_escalation_ranks_order_the_modes() {
         assert!(SpawnCancelMode::Graceful.rank() < SpawnCancelMode::GracefulThenKill.rank());
         assert!(SpawnCancelMode::GracefulThenKill.rank() < SpawnCancelMode::Immediate.rank());
@@ -3485,527 +3055,238 @@ mod tests {
         );
     }
 
-    #[test]
-    fn drain_join_is_bounded_when_thread_hangs() {
-        // CTX-0476 hostile probe: a drain thread that never finishes
-        // (grandchild inherits the pipe, EOF never arrives) must not hang
-        // `spawn_process` forever. The bounded join detaches within the
-        // enforced policy's drain-join budget plus scheduling slack.
-        use std::sync::{Arc, Mutex};
-        let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"partial".to_vec()));
-        let shared_clone = Arc::clone(&shared);
-        let handle = std::thread::Builder::new()
-            .name("bitty-test-hung-drain".into())
-            .spawn(move || {
-                let _ = &shared_clone;
-                std::thread::sleep(Duration::from_secs(30));
-            })
-            .expect("spawn hung thread");
-        let policy = SpawnMechanicsPolicy::core_defaults();
-        let start = std::time::Instant::now();
-        let (bytes, detached) = super::join_drain_bounded(handle, &shared, &policy);
-        assert!(detached, "hung drain must detach, not join");
-        assert_eq!(bytes, b"partial");
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "bounded join hung: {:?}",
-            start.elapsed()
-        );
-        assert_eq!(super::SPAWN_DRAIN_JOIN_TIMEOUT, Duration::from_secs(1));
-    }
+    // ── registry-backed tool spawns (#2249) ──────────────────────────────
 
     #[test]
-    fn drain_join_honors_a_tuned_policy_budget() {
-        // CTX-1184 injection: the join waits the injected policy's budget,
-        // not the core-default constant. A tuned 50 ms budget detaches a
-        // hung drain quickly.
-        use std::sync::{Arc, Mutex};
-        let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"partial".to_vec()));
-        let shared_clone = Arc::clone(&shared);
-        let handle = std::thread::Builder::new()
-            .name("bitty-test-tuned-drain".into())
-            .spawn(move || {
-                let _ = &shared_clone;
-                std::thread::sleep(Duration::from_secs(30));
-            })
-            .expect("spawn hung thread");
-        let mut policy = SpawnMechanicsPolicy::core_defaults();
-        policy.drain_join_timeout = Duration::from_millis(50);
-        let start = std::time::Instant::now();
-        let (bytes, detached) = super::join_drain_bounded(handle, &shared, &policy);
-        assert!(detached, "hung drain must detach under a tuned budget");
-        assert_eq!(bytes, b"partial");
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "tuned join hung: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn shared_drain_respects_cap_and_reports_partial() {
-        // CTX-0476: the shared drain retains at most cap+1 bytes (overflow
-        // detection spare) while still draining the pipe past the cap so the
-        // child never blocks.
-        struct Flood {
-            remaining: usize,
-        }
-        impl std::io::Read for Flood {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.remaining == 0 {
-                    return Ok(0);
-                }
-                let n = buf.len().min(self.remaining);
-                buf[..n].fill(b'q');
-                self.remaining -= n;
-                Ok(n)
-            }
-        }
-        use std::sync::{Arc, Mutex};
-        let cap = 16usize;
-        let shared = Arc::new(Mutex::new(Vec::new()));
-        let mut flood = Flood {
-            remaining: 64 * 1024,
-        };
-        let policy = SpawnMechanicsPolicy::core_defaults();
-        super::drain_bounded_shared(&mut flood, cap, &shared, policy.drain_chunk_bytes);
-        let retained = super::clone_shared(&shared);
+    fn tool_spawn_gets_real_job_identity_and_lifecycle_events() {
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let result = dispatch_ok(&mut service, &allowed_request("echo"), 700).expect("echo serves");
+        assert_eq!(result.exit_code, Some(0));
+        let job = service.job_id_for(700).expect("a real registry job id");
+        let registry = service.supervisor().registry();
+        let principal = JobPrincipal::new("plugin-test").expect("principal");
+        let snapshot = registry.get_as(&principal, job).expect("tracked job");
         assert_eq!(
-            retained.len(),
-            cap + 1,
-            "must retain cap+1, got {}",
-            retained.len()
+            snapshot.state,
+            JobState::Done(ExecutionOutcome::Success),
+            "the dispatched job is terminal under the registry"
         );
-        assert!(retained.iter().all(|&b| b == b'q'));
-    }
-
-    #[test]
-    fn shared_drain_honors_a_tuned_chunk_and_clamps_zero() {
-        // CTX-1184 injection: a one-byte chunk drains the same retained
-        // bytes as the default chunk (chunk size is pacing, not semantics),
-        // and a zero tune clamps to one byte instead of spinning on empty
-        // reads.
-        struct Flood {
-            remaining: usize,
-        }
-        impl std::io::Read for Flood {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.remaining == 0 || buf.is_empty() {
-                    return Ok(0);
-                }
-                let n = buf.len().min(self.remaining);
-                buf[..n].fill(b'z');
-                self.remaining -= n;
-                Ok(n)
-            }
-        }
-        use std::sync::{Arc, Mutex};
-        for chunk_bytes in [1usize, 8 * 1024, 0] {
-            let shared = Arc::new(Mutex::new(Vec::new()));
-            let mut flood = Flood {
-                remaining: 4 * 1024,
-            };
-            super::drain_bounded_shared(&mut flood, 16, &shared, chunk_bytes);
-            let retained = super::clone_shared(&shared);
-            assert_eq!(
-                retained.len(),
-                17,
-                "chunk {chunk_bytes} must retain cap+1, got {}",
-                retained.len()
-            );
-            assert!(retained.iter().all(|&b| b == b'z'));
-        }
-    }
-
-    // ── CTX-0526 post-spawn cleanup ──────────────────────────────────────
-    //
-    // Fake process backend: a counter child behind the same guard seam the
-    // production path uses, so each post-spawn failure step is observable
-    // without launching a process tree. Every case asserts exactly-once
-    // kill+wait ownership with bounded completion.
-
-    /// Fake live child: counts kill/wait calls instead of touching a
-    /// process. `wait_ok` selects whether `wait_child` reports success;
-    /// counters still advance either way (cleanup was attempted).
-    #[derive(Debug)]
-    struct FakeChild {
-        kills: usize,
-        waits: usize,
-        wait_ok: bool,
-    }
-
-    impl FakeChild {
-        fn live() -> Self {
-            Self {
-                kills: 0,
-                waits: 0,
-                wait_ok: true,
-            }
-        }
-    }
-
-    impl super::PostSpawnChildOps for FakeChild {
-        fn kill_child(&mut self) -> std::io::Result<()> {
-            self.kills = self.kills.saturating_add(1);
-            Ok(())
-        }
-
-        fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
-            self.waits = self.waits.saturating_add(1);
-            if self.wait_ok {
-                // Portable fake exit status: command-line tools conventionally
-                // exit 0 on success on every platform, so `success()` agrees
-                // on Unix and Windows without a platform `cfg`. No real
-                // child is spawned; this only satisfies the `ExitStatus`
-                // return type so the fake stays portable (Windows gate).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt as _;
-                    return Ok(std::process::ExitStatus::from_raw(0));
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::ExitStatusExt as _;
-                    return Ok(std::process::ExitStatus::from_raw(0));
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    return Err(std::io::Error::other("fake wait unsupported"));
-                }
-            }
-            Err(std::io::Error::other("fake wait failed"))
-        }
-    }
-
-    /// Shared wrapper so tests can observe the fake's counters after the
-    /// seam consumes the guard (which disarms it, so `Drop` cannot repeat
-    /// the cleanup). `kill`/`wait` delegate to the shared fake; exactly-once
-    /// is asserted on the shared counters.
-    #[derive(Debug)]
-    struct SharedFake(std::sync::Arc<std::sync::Mutex<FakeChild>>);
-
-    impl super::PostSpawnChildOps for SharedFake {
-        fn kill_child(&mut self) -> std::io::Result<()> {
-            self.0.lock().expect("fake").kill_child()
-        }
-
-        fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
-            self.0.lock().expect("fake").wait_child()
-        }
-    }
-
-    fn reaper_ok() -> Result<(), IpcError> {
-        Ok(())
-    }
-
-    fn reaper_failed(reason: &str) -> Result<(), IpcError> {
-        Err(IpcError::Internal {
-            reason: reason.into(),
-        })
-    }
-
-    fn wait_exited() -> Result<Option<()>, IpcError> {
-        Ok(Some(()))
-    }
-
-    fn wait_running() -> Result<Option<()>, IpcError> {
-        Ok(None)
-    }
-
-    fn wait_failed() -> Result<Option<()>, IpcError> {
-        Err(IpcError::Internal {
-            reason: "spawn wait failed: fake".into(),
-        })
-    }
-
-    #[test]
-    fn post_spawn_stdout_reaper_failure_kills_and_reaps_exactly_once() {
-        // Mirrors the stdout-reaper `?` path: the reaper fails to start
-        // while the child is live. Cleanup ownership is observable through
-        // a shared fake: the seam's `abandon` must perform exactly one
-        // kill+wait pair before the error propagates, and the consumed
-        // guard cannot repeat it on drop.
-        use std::sync::{Arc, Mutex};
-        let start = std::time::Instant::now();
-        let shared = Arc::new(Mutex::new(FakeChild::live()));
-        let probe = Arc::clone(&shared);
-        let error = super::post_spawn_setup(
-            super::PostSpawnChild::new(SharedFake(probe)),
-            || reaper_failed("spawn stdout reaper failed to start"),
-            reaper_ok,
-            true,
-            wait_exited,
-        )
-        .expect_err("stdout reaper failure must propagate");
-        assert!(
-            matches!(error, IpcError::Internal { ref reason, .. } if reason == "spawn stdout reaper failed to start"),
-            "got {error:?}"
-        );
-        let counts = {
-            let fake = shared.lock().expect("fake");
-            (fake.kills, fake.waits)
-        };
-        assert_eq!(
-            counts,
-            (1, 1),
-            "stdout reaper failure must kill+reap exactly once, got {counts:?}"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "cleanup hung: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn post_spawn_reaper_failures_clean_up_with_bounded_completion() {
-        // Each failing setup step (stdout reaper, stderr reaper,
-        // missing-pipe) must kill+reap exactly once and return promptly.
-        // The shared fake records the single kill+wait pair; the seam
-        // consumes the guard so `Drop` cannot repeat it.
-        for (name, stdout_ok, stderr_ok, pipes, reason) in [
-            (
-                "stdout-reaper",
-                false,
-                true,
-                true,
-                "spawn stdout reaper failed to start",
-            ),
-            (
-                "stderr-reaper",
-                true,
-                false,
-                true,
-                "spawn stderr reaper failed to start",
-            ),
-            (
-                "missing-pipe",
-                true,
-                true,
-                false,
-                "spawn stdio pipes were not created",
-            ),
-        ]
-            as [(&str, bool, bool, bool, &str); 3]
-        {
-            let start = std::time::Instant::now();
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-            let probe = std::sync::Arc::clone(&shared);
-            let outcome: Result<super::PostSpawnChild<SharedFake>, IpcError> =
-                super::post_spawn_setup(
-                    super::PostSpawnChild::new(SharedFake(probe)),
-                    || {
-                        if stdout_ok {
-                            reaper_ok()
-                        } else {
-                            reaper_failed(reason)
-                        }
-                    },
-                    || {
-                        if stderr_ok {
-                            reaper_ok()
-                        } else {
-                            reaper_failed(reason)
-                        }
-                    },
-                    // Missing-pipe is reachable with healthy reapers: force
-                    // the pipe branch even when both reapers succeed.
-                    pipes,
-                    wait_exited,
-                );
-            let error = outcome.expect_err("failing setup must propagate");
-            assert!(
-                matches!(error, IpcError::Internal { reason: ref got, .. } if got == reason),
-                "case {name}: got {error:?}, want {reason:?}"
-            );
-            let counts = {
-                let fake = shared.lock().expect("fake");
-                (fake.kills, fake.waits)
-            };
-            assert_eq!(
-                counts,
-                (1, 1),
-                "case {name}: must kill+reap exactly once, got {counts:?}"
-            );
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "case {name} hung: {:?}",
-                start.elapsed()
-            );
-        }
-    }
-
-    #[test]
-    fn post_spawn_wait_error_kills_and_reaps_before_return() {
-        // Mirrors the `try_wait().map_err(?)?` path: a wait error with a
-        // live child must kill+reap exactly once before returning.
-        let start = std::time::Instant::now();
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-        let probe = std::sync::Arc::clone(&shared);
-        let error = super::post_spawn_setup(
-            super::PostSpawnChild::new(SharedFake(probe)),
-            reaper_ok,
-            reaper_ok,
-            true,
-            wait_failed,
-        )
-        .expect_err("wait error must propagate");
-        assert!(
-            matches!(error, IpcError::Internal { ref reason, .. } if reason.contains("spawn wait failed")),
-            "got {error:?}"
-        );
-        let counts = {
-            let fake = shared.lock().expect("fake");
-            (fake.kills, fake.waits)
-        };
-        assert_eq!(
-            counts,
-            (1, 1),
-            "wait error must kill+reap exactly once, got {counts:?}"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "cleanup hung: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn post_spawn_success_disarms_and_missing_pipe_is_reachable() {
-        // Success (`Ok(Some)`) disarms via `reaped`: the fake already saw
-        // its single wait, and dropping the returned guard performs no
-        // second kill+wait. Missing-pipe (`pipes_present = false` with
-        // healthy reapers) is reachable and fails with its own reason —
-        // the branch the old `?` returns used to skip.
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-        let live: super::PostSpawnChild<SharedFake> = super::post_spawn_setup(
-            super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&shared))),
-            reaper_ok,
-            reaper_ok,
-            true,
-            wait_exited,
-        )
-        .expect("success must disarm");
-        drop(live);
-        assert_eq!(
-            {
-                let fake = shared.lock().expect("fake");
-                (fake.kills, fake.waits)
-            },
-            (0, 1),
-            "success path must reap once with no kill and no drop-repeat"
-        );
-        let error = super::post_spawn_setup(
-            super::PostSpawnChild::new(SharedFake(std::sync::Arc::new(std::sync::Mutex::new(
-                FakeChild::live(),
-            )))),
-            reaper_ok,
-            reaper_ok,
-            false,
-            wait_running,
-        )
-        .expect_err("missing pipe must be reachable");
-        assert!(
-            matches!(error, IpcError::Internal { ref reason, .. } if reason == "spawn stdio pipes were not created"),
-            "got {error:?}"
-        );
-    }
-
-    #[test]
-    fn post_spawn_cleanup_is_idempotent_and_drop_is_last_resort() {
-        // `abandon` twice performs one kill+wait pair; `reaped` after
-        // `abandon` is a no-op. A guard dropped without disarm still
-        // cleans up via `Drop` (last-resort `?` path); a disarmed guard
-        // drops silently.
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-        {
-            let mut guard = super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&shared)));
-            let first = guard.abandon(IpcError::Internal {
-                reason: "first".into(),
-            });
-            assert!(matches!(first, IpcError::Internal { .. }));
-            let second = guard.abandon(IpcError::Internal {
-                reason: "second".into(),
-            });
-            assert!(matches!(second, IpcError::Internal { .. }));
-            guard.reaped();
-        }
-        assert_eq!(
-            {
-                let fake = shared.lock().expect("fake");
-                (fake.kills, fake.waits)
-            },
-            (1, 1),
-            "double abandon must clean up exactly once"
-        );
-
-        // Last-resort `Drop`: an armed guard cleans up on scope exit.
-        let armed = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-        {
-            let _armed = super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&armed)));
-        }
-        assert_eq!(
-            {
-                let fake = armed.lock().expect("fake");
-                (fake.kills, fake.waits)
-            },
-            (1, 1),
-            "armed drop must kill+reap exactly once"
-        );
-
-        // Disarmed guard drops silently.
-        let disarmed = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
-        {
-            let mut guard =
-                super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&disarmed)));
-            guard.reaped();
-        }
-        assert_eq!(
-            {
-                let fake = disarmed.lock().expect("fake");
-                (fake.kills, fake.waits)
-            },
-            (0, 0),
-            "disarmed drop must not touch the child"
-        );
-    }
-
-    #[test]
-    fn closed_pipe_command_keeps_argv_and_closed_env_shape() {
-        // W-140 drift protection: the Core-local duplicate of the extracted
-        // supervisor constructor must stay argv-only with a cleared ambient
-        // environment, explicit vars only, and no shell.
-        let env =
-            EnvPolicy::explicit(vec![("SEALED".to_owned(), "1".to_owned())]).expect("explicit env");
-        let command = super::closed_pipe_command(
-            "prog",
-            &["a".to_owned(), "--flag".to_owned()],
-            Some("/tmp"),
-            &env,
-        );
-        assert_eq!(command.get_program(), "prog");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
+        let replay = registry.events_since(0, 32).expect("event replay");
+        let events: Vec<JobEvent> = replay
+            .events
+            .iter()
+            .map(|stored| stored.event())
+            .filter(|event| event.id() == job)
             .collect();
-        assert_eq!(args, vec!["a".to_owned(), "--flag".to_owned()]);
-        assert_eq!(
-            command.get_current_dir(),
-            Some(std::path::Path::new("/tmp"))
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, JobEvent::Queued { .. })),
+            "queued transition missing: {events:?}"
         );
-        let envs: Vec<(String, Option<String>)> = command
-            .get_envs()
-            .map(|(key, value)| {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, JobEvent::Started { .. })),
+            "started transition missing: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                JobEvent::Stopped {
+                    outcome: ExecutionOutcome::Success,
+                    ..
+                }
+            )),
+            "stopped transition missing: {events:?}"
+        );
+    }
+
+    #[test]
+    fn cancellation_kills_only_the_recorded_job() {
+        let supervisor = ToolJobSupervisor::with_capacity(4);
+        let registry = supervisor.registry();
+        let principal = JobPrincipal::new("plugin-test").expect("principal");
+        let first = registry
+            .spawn_as(principal.clone(), helper_job_spec("sleep"))
+            .expect("first job");
+        let second = registry
+            .spawn_as(principal.clone(), helper_job_spec("sleep"))
+            .expect("second job");
+        for job in [first, second] {
+            wait_snapshot(&registry, &principal, job, "running", |snapshot| {
+                snapshot.state == JobState::Running
+            });
+        }
+        assert!(matches!(
+            registry
+                .cancel_as(&principal, first)
+                .expect("cancel accepted"),
+            JobCancel::Requested
+        ));
+        let ended = wait_snapshot(&registry, &principal, first, "terminal", |snapshot| {
+            snapshot.state.is_terminal()
+        });
+        assert!(
+            matches!(ended.state, JobState::Done(ExecutionOutcome::Cancelled(_))),
+            "the recorded job must report its cancel: {:?}",
+            ended.state
+        );
+        let untouched = registry.get_as(&principal, second).expect("second tracked");
+        assert_eq!(
+            untouched.state,
+            JobState::Running,
+            "cancel must not signal or kill another recorded job"
+        );
+        assert!(matches!(
+            registry
+                .cancel_as(&principal, second)
+                .expect("cancel accepted"),
+            JobCancel::Requested
+        ));
+        wait_snapshot(&registry, &principal, second, "terminal", |snapshot| {
+            snapshot.state.is_terminal()
+        });
+    }
+
+    #[test]
+    fn denied_authority_never_registers_a_job() {
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let request = SpawnRequest::new("test", vec!["x".to_owned()]).with_allow_effects(true);
+        let no_scope = service
+            .dispatch(
+                &request,
+                &ScopeSet::new(),
+                &consented(1_000),
+                "plugin-test",
+                1_000,
+                701,
+            )
+            .expect_err("missing process.spawn must deny");
+        assert!(matches!(no_scope, IpcError::ScopeDenied { .. }));
+        let no_consent = service
+            .dispatch(
+                &request,
+                &granted_spawn(),
+                &ConsentLedger::new(),
+                "plugin-test",
+                1_000,
+                702,
+            )
+            .expect_err("missing consent must deny");
+        assert!(matches!(no_consent, IpcError::Denied { .. }));
+        let registry = service.supervisor().registry();
+        assert_eq!(
+            registry.len(),
+            0,
+            "a denied authority must never register a job"
+        );
+        assert!(service.is_empty(), "a denied dispatch stores no outcome");
+    }
+
+    #[test]
+    fn registry_rejection_fails_closed_without_spawning() {
+        // Mutation guard: a bypass that spawned before consulting the
+        // registry would create the marker even though the registry is full.
+        let supervisor = ToolJobSupervisor::with_capacity(1);
+        let registry = supervisor.registry();
+        let principal = JobPrincipal::new("plugin-test").expect("principal");
+        let filler = registry
+            .spawn_as(principal.clone(), helper_job_spec("sleep"))
+            .expect("filler");
+        wait_snapshot(&registry, &principal, filler, "running", |snapshot| {
+            snapshot.state == JobState::Running
+        });
+
+        let marker = unique_marker("registry-full");
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::with_supervisor(
+            Box::new(StubAuthorizer::allowing(seen)),
+            SpawnMechanicsPolicy::core_defaults(),
+            supervisor.clone(),
+        );
+        let request = SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                (HELPER_ENV.to_owned(), "append".to_owned()),
                 (
-                    key.to_string_lossy().into_owned(),
-                    value.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
+                    HELPER_MARKER_ENV.to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+            ])
+            .with_allow_effects(true);
+        let error = dispatch_ok(&mut service, &request, 703).expect_err("registry must reject");
+        assert!(
+            matches!(error, IpcError::LimitExceeded { .. }),
+            "registry rejection must map to a typed limit, got {error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "registry rejection must not start a process: {}",
+            marker.display()
+        );
+
+        let _ = registry.cancel_as(&principal, filler);
+        wait_snapshot(&registry, &principal, filler, "terminal", |snapshot| {
+            snapshot.state.is_terminal()
+        });
+    }
+
+    #[test]
+    fn one_dispatch_spawns_exactly_once() {
+        let marker = unique_marker("one-spawn");
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let request = SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                (HELPER_ENV.to_owned(), "append".to_owned()),
+                (
+                    HELPER_MARKER_ENV.to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+            ])
+            .with_allow_effects(true);
+        dispatch_ok(&mut service, &request, 704).expect("one dispatch serves");
+        let text = std::fs::read_to_string(&marker).expect("child wrote the marker");
         assert_eq!(
-            envs,
-            vec![("SEALED".to_owned(), Some("1".to_owned()))],
-            "ambient environment must be cleared, explicit vars only"
+            text.lines().count(),
+            1,
+            "one dispatch must cross the registry exactly once: {text:?}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn production_spawn_path_has_no_direct_command_or_pid_kill() {
+        // Source-level mutation guard: the production halves must route
+        // through the registry. The test-only helper may spawn its grandchild,
+        // so the scan stops at `#[cfg(test)]`.
+        let spawn_prod = include_str!("spawn.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half");
+        for needle in ["Command::new", ".spawn()", ".kill()", "pkill", "killall"] {
+            assert!(
+                !spawn_prod.contains(needle),
+                "spawn.rs production path still contains `{needle}`"
+            );
+        }
+        // `execution_jobs.rs` has no inline test module; its test-only
+        // constructors are `#[cfg(test)]` methods and contain no spawn/kill
+        // call, so scan the whole module.
+        let jobs_prod = include_str!("../execution_jobs.rs");
+        for needle in [".spawn()", ".kill()", "pkill", "killall", "libc::kill"] {
+            assert!(
+                !jobs_prod.contains(needle),
+                "execution_jobs.rs still contains `{needle}`"
+            );
+        }
+        // The confinement pre-validation may build a probe command; it must
+        // never spawn it.
+        assert!(
+            jobs_prod.contains("confine_command_to_execs"),
+            "the tool confinement seam must stay wired"
         );
     }
 

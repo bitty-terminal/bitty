@@ -206,10 +206,31 @@ source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=8e02ab5#8e02ab5fe
 
 [[package]]
 name = "bitty-config"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "bitty-lua 0.0.21",
+ "bitty-ui 0.0.21",
+]
+
+[[package]]
+name = "bitty-config"
 version = "0.0.24"
 dependencies = [
- "bitty-lua",
- "bitty-ui",
+ "bitty-lua 0.0.24",
+ "bitty-ui 0.0.24",
+]
+
+[[package]]
+name = "bitty-execution"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-execution?rev=57714f7#57714f7df8e4038de54a91989a42c0d1e87c88cc"
+dependencies = [
+ "bitty-ipc",
+ "bitty-plugin-host 0.0.21",
+ "bitty-pty 0.0.21",
+ "nix 0.31.3",
+ "rustix 1.1.5",
 ]
 
 [[package]]
@@ -275,9 +296,17 @@ dependencies = [
 
 [[package]]
 name = "bitty-lua"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "phodopus 0.2.0-alpha.1 (git+https://github.com/bitty-terminal/phodopus?rev=1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0)",
+]
+
+[[package]]
+name = "bitty-lua"
 version = "0.0.24"
 dependencies = [
- "phodopus",
+ "phodopus 0.2.0-alpha.1 (git+https://github.com/bitty-terminal/phodopus?rev=91b8a2c)",
 ]
 
 [[package]]
@@ -302,6 +331,14 @@ source = "git+https://github.com/bitty-terminal/bitty-network?rev=c8710e0#c8710e
 name = "bitty-observability-api"
 version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-observability?rev=f1d08f4#f1d08f4f3c2e95cd52e91796a73fb443657fa46d"
+
+[[package]]
+name = "bitty-package"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "ed25519-dalek",
+]
 
 [[package]]
 name = "bitty-package"
@@ -330,12 +367,33 @@ source = "git+https://github.com/bitty-terminal/bitty-platform-services?rev=7c6b
 
 [[package]]
 name = "bitty-plugin-host"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "bitty-config 0.0.21",
+ "bitty-package 0.0.21",
+ "bitty-term-state 0.0.21",
+]
+
+[[package]]
+name = "bitty-plugin-host"
 version = "0.0.24"
 dependencies = [
- "bitty-config",
- "bitty-package",
- "bitty-term-state",
+ "bitty-config 0.0.24",
+ "bitty-package 0.0.24",
+ "bitty-term-state 0.0.24",
  "ed25519-dalek",
+]
+
+[[package]]
+name = "bitty-pty"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "bitty-winjob 0.0.21",
+ "nix 0.31.3",
+ "portable-pty",
+ "rustix 1.1.5",
 ]
 
 [[package]]
@@ -343,7 +401,7 @@ name = "bitty-pty"
 version = "0.0.24"
 dependencies = [
  "bitty-test-support",
- "bitty-winjob",
+ "bitty-winjob 0.0.24",
  "libc",
  "nix 0.31.3",
  "portable-pty",
@@ -354,10 +412,10 @@ dependencies = [
 name = "bitty-render"
 version = "0.0.24"
 dependencies = [
- "bitty-config",
+ "bitty-config 0.0.24",
  "bitty-platform",
- "bitty-term-state",
- "bitty-vt",
+ "bitty-term-state 0.0.24",
+ "bitty-vt 0.0.24",
  "crossfont",
  "fontdb",
  "harfrust",
@@ -371,10 +429,10 @@ version = "0.0.24"
 dependencies = [
  "bitty-ipc",
  "bitty-platform",
- "bitty-pty",
- "bitty-term-state",
+ "bitty-pty 0.0.24",
+ "bitty-term-state 0.0.24",
  "bitty-test-support",
- "bitty-vt",
+ "bitty-vt 0.0.24",
  "getrandom 0.4.3",
  "image",
  "png",
@@ -384,27 +442,28 @@ dependencies = [
 name = "bitty-runtime"
 version = "0.0.24"
 dependencies = [
- "bitty-config",
+ "bitty-config 0.0.24",
+ "bitty-execution",
  "bitty-ipc",
  "bitty-ipc-api",
- "bitty-lua",
+ "bitty-lua 0.0.24",
  "bitty-network-publication",
  "bitty-network-wire",
- "bitty-package",
+ "bitty-package 0.0.24",
  "bitty-platform",
  "bitty-platform-services",
- "bitty-plugin-host",
- "bitty-pty",
+ "bitty-plugin-host 0.0.24",
+ "bitty-pty 0.0.24",
  "bitty-render",
  "bitty-rich",
  "bitty-sandbox",
- "bitty-term-state",
+ "bitty-term-state 0.0.24",
  "bitty-terminal",
  "bitty-test-support",
- "bitty-ui",
+ "bitty-ui 0.0.24",
  "bitty-url-detector",
- "bitty-vt",
- "bitty-winjob",
+ "bitty-vt 0.0.24",
+ "bitty-winjob 0.0.24",
  "getrandom 0.4.3",
  "libc",
  "nix 0.31.3",
@@ -428,9 +487,17 @@ source = "git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177#7bf517
 
 [[package]]
 name = "bitty-term-state"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "bitty-vt 0.0.21",
+]
+
+[[package]]
+name = "bitty-term-state"
 version = "0.0.24"
 dependencies = [
- "bitty-vt",
+ "bitty-vt 0.0.24",
  "proptest",
 ]
 
@@ -438,20 +505,20 @@ dependencies = [
 name = "bitty-terminal"
 version = "0.0.24"
 dependencies = [
- "bitty-config",
+ "bitty-config 0.0.24",
  "bitty-ipc",
- "bitty-lua",
+ "bitty-lua 0.0.24",
  "bitty-observability-api",
- "bitty-package",
+ "bitty-package 0.0.24",
  "bitty-platform",
- "bitty-plugin-host",
+ "bitty-plugin-host 0.0.24",
  "bitty-render",
  "bitty-rich",
  "bitty-runtime",
  "bitty-storage",
- "bitty-term-state",
+ "bitty-term-state 0.0.24",
  "bitty-test-support",
- "bitty-vt",
+ "bitty-vt 0.0.24",
  "nix 0.31.3",
  "pollster",
 ]
@@ -466,12 +533,20 @@ version = "0.0.24"
 
 [[package]]
 name = "bitty-ui"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "bitty-term-state 0.0.21",
+]
+
+[[package]]
+name = "bitty-ui"
 version = "0.0.24"
 dependencies = [
  "bitty-a11y",
  "bitty-rich",
- "bitty-term-state",
- "bitty-vt",
+ "bitty-term-state 0.0.24",
+ "bitty-vt 0.0.24",
 ]
 
 [[package]]
@@ -481,10 +556,26 @@ source = "git+https://github.com/bitty-terminal/bitty-url-detector?rev=be035a0#b
 
 [[package]]
 name = "bitty-vt"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "vte",
+]
+
+[[package]]
+name = "bitty-vt"
 version = "0.0.24"
 dependencies = [
  "miniz_oxide 0.9.1",
  "vte",
+]
+
+[[package]]
+name = "bitty-winjob"
+version = "0.0.21"
+source = "git+https://github.com/bitty-terminal/bitty?rev=5670d9ae#5670d9ae42a0d014047318a420a71fb1ebc01247"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1157,6 +1248,28 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gc-arena"
+version = "0.5.3"
+source = "git+https://github.com/kyren/gc-arena?rev=5a7534b883b703f23cfb8c3cfdf033460aa77ea9#5a7534b883b703f23cfb8c3cfdf033460aa77ea9"
+dependencies = [
+ "allocator-api2",
+ "gc-arena-derive",
+ "hashbrown 0.14.5",
+ "sptr",
+]
+
+[[package]]
+name = "gc-arena-derive"
+version = "0.5.3"
+source = "git+https://github.com/kyren/gc-arena?rev=5a7534b883b703f23cfb8c3cfdf033460aa77ea9#5a7534b883b703f23cfb8c3cfdf033460aa77ea9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -2145,6 +2258,22 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "phodopus"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/bitty-terminal/phodopus?rev=1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0#1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0"
+dependencies = [
+ "ahash",
+ "allocator-api2",
+ "anyhow",
+ "fhex",
+ "gc-arena",
+ "hashbrown 0.14.5",
+ "lsonar",
+ "rand",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

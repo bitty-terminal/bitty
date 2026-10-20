@@ -19,7 +19,11 @@
 //!   `bitty-terminal` and named only in `storage_backends.rs`.
 //!   `bitty-a11y` is the deliberate accessibility snapshot-model seam
 //!   (CTX-1362 / #2257): linked only by `bitty-ui` and named only in
-//!   `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`). Seam crates
+//!   `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`).
+//!   `bitty-execution` is the Core-runtime execution mechanic seam
+//!   (CTX-1403 / #2249): linked only by `bitty-runtime` and named only in
+//!   `crates/bitty-runtime/src/execution_jobs.rs` (`SOURCE_SEAM_FILES`).
+//!   Seam crates
 //!   (`bitty-ipc`, `bitty-ipc-api`, `bitty-network-wire`,
 //!   `bitty-network-publication`, `bitty-observability-api`,
 //!   `bitty-platform-services`, `bitty-url-detector`) are
@@ -117,6 +121,11 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
     // implementation. Unlike the other seams, source naming is restricted to
     // one file by `SOURCE_SEAM_FILES`.
     ("bitty-a11y", &["bitty-ui"]),
+    // CTX-1403 / #2249: the Core-runtime execution mechanic seam. It is an
+    // implementation crate, not a contract/codec seam, but it has the same
+    // exact-consumer + single-source-file shape: `bitty-runtime` owns the
+    // tool/plugin spawn surface and only `execution_jobs.rs` may name it.
+    ("bitty-execution", &["bitty-runtime"]),
 ];
 
 /// Seam crates whose Core source references are restricted to one file.
@@ -124,8 +133,15 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
 /// `bitty-a11y` is a model seam, not a general-purpose contract Core may name
 /// anywhere: exactly `crates/bitty-ui/src/a11y_host.rs` implements
 /// `SnapshotHost`, and every other source imports the role vocabulary through
-/// that module's re-export.
-const SOURCE_SEAM_FILES: &[(&str, &str)] = &[("bitty-a11y", "crates/bitty-ui/src/a11y_host.rs")];
+/// that module's re-export. `bitty-execution` is likewise confined to the
+/// `bitty-runtime` `execution_jobs.rs` bridge (#2249).
+const SOURCE_SEAM_FILES: &[(&str, &str)] = &[
+    ("bitty-a11y", "crates/bitty-ui/src/a11y_host.rs"),
+    (
+        "bitty-execution",
+        "crates/bitty-runtime/src/execution_jobs.rs",
+    ),
+];
 
 /// Crates published from the bitty-terminal org that are intentionally not
 /// extension crates: `phodopus` is the Lua VM linked by `bitty-lua`, not an
@@ -535,6 +551,12 @@ fn extension_fence_lists_are_consistent() {
             "seam crate `{seam}` must also be listed in EXTENSION_CRATES"
         );
     }
+    for (seam, _) in SOURCE_SEAM_FILES {
+        assert!(
+            EXTENSION_CRATES.contains(seam),
+            "source seam crate `{seam}` must also be listed in EXTENSION_CRATES"
+        );
+    }
 }
 
 #[test]
@@ -712,6 +734,42 @@ fn a11y_source_naming_is_restricted_to_host_seam() {
     );
 }
 
+#[test]
+fn execution_source_naming_is_restricted_to_runtime_seam() {
+    // CTX-1403 / #2249: `bitty-execution` is an implementation mechanic, not
+    // a general-purpose contract Core may name anywhere. The
+    // `bitty-runtime` bridge file is legal; any other Core source naming it
+    // is a violation.
+    let root = write_probe_workspace(
+        "execution-source",
+        &[
+            ("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n"),
+            ("bitty-runtime", "[package]\nname = \"bitty-runtime\"\n"),
+        ],
+        &[
+            (
+                "crates/bitty-runtime/src/execution_jobs.rs",
+                "use bitty_execution::JobRegistry;\n",
+            ),
+            (
+                "crates/bitty-runtime/src/other.rs",
+                "use bitty_execution::JobId;\n",
+            ),
+        ],
+    );
+    let violations = extension_source_violations(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the runtime seam may name the execution supervisor: {violations:#?}"
+    );
+    assert!(
+        violations[0].contains("other.rs") && violations[0].contains("bitty_execution"),
+        "the non-seam source must be the offender: {violations:#?}"
+    );
+}
+
 /// Collect `*.rs` files under `dir` (non-recursive walk, skips `target/`).
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries =
@@ -797,7 +855,9 @@ fn core_library_sources_never_name_extension_impls() {
     // `bitty-url-detector`) are linked contracts Core may name by design. The
     // a11y model seam is source-restricted: only
     // `crates/bitty-ui/src/a11y_host.rs` may name `bitty_a11y`
-    // (`SOURCE_SEAM_FILES`, CTX-1362 / #2257).
+    // (`SOURCE_SEAM_FILES`, CTX-1362 / #2257). The execution mechanic seam is
+    // likewise restricted to `crates/bitty-runtime/src/execution_jobs.rs`
+    // (`SOURCE_SEAM_FILES`, CTX-1403 / #2249).
     let violations = extension_source_violations(&workspace_root());
     assert!(
         violations.is_empty(),

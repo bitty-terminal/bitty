@@ -1,0 +1,574 @@
+//! Tool/plugin spawns supervised by the extracted `bitty-execution` registry
+//! (issue #2249, W-140 integration).
+//!
+//! Core keeps the permission gate and the process-confinement policy; the
+//! extracted supervisor owns job identity, lifecycle, cancellation, and
+//! bounded output. This module is the only Core source that names the
+//! extension implementation (W-147 fence exception), and it exposes only
+//! Core/`bitty-ipc` types to the spawn surface.
+//!
+//! # What a tool spawn gets
+//!
+//! - A real [`JobId`] minted by the registry, never a caller-chosen id.
+//! - The registry lifecycle (`Queued` -> `Running` -> `Done(outcome)`) and
+//!   the bounded critical/observation event log.
+//! - Owned-tree cancellation: a cancel goes through
+//!   [`JobRegistry::cancel_as`] and the supervisor kills the recorded job's
+//!   tree. No code here signals or kills a pid.
+//! - Newest-wins bounded output read through the registry, with the tail and
+//!   truncation flags taken from the registry's metadata.
+//!
+//! # Preserved Core controls
+//!
+//! - The caller still passes `process.spawn:<family>` scope, explicit effect
+//!   opt-in, and the consent ledger before this module is reached; a denial
+//!   never registers a job.
+//! - CTX-1151 Landlock `EXECUTE` confinement is applied by
+//!   [`SandboxPreparer`] to the supervisor-built command. A confinement setup
+//!   failure refuses the spawn before the registry is asked to track it, and
+//!   the preparer re-checks the same tool shape before every pipe spawn.
+//! - The supervisor's own refusal set (`RegistryFull`, `InvalidSpec`,
+//!   `Denied`, `CommandRisk*`, `Unavailable`, ...) is mapped to the existing
+//!   `bitty-ipc` failure set; nothing falls back to a direct
+//!   `std::process::Command`.
+//!
+//! PTY shells are deliberately excluded: interactive PTY ownership stays
+//! with the terminal primitive (DEC-0017), and the preparer is never applied
+//! to a PTY job.
+
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bitty_execution::{
+    ExecutionOutcome, JobError, JobIo, JobKind, JobLifetime, JobOrigin, JobPrincipal, JobRegistry,
+    JobSpec, JobTimeouts, OutputStream, OutputView, ReadOutput, SpawnPreparer,
+};
+use bitty_ipc::IpcError;
+use bitty_ipc::execution::{EffectState, ExecutionRequest, ExecutionStatus, RawExecutionOutput};
+use bitty_plugin_host::tools::is_tool_spawn_allowed;
+
+/// Extra time the synchronous bridge grants the supervisor after the job's
+/// hard deadline so it can kill the owned tree, reap the leader, and join the
+/// bounded drains before the terminal event. Matches the registry's 5 s
+/// drain-join bound plus scheduling slack.
+const JOB_WAIT_GRACE: Duration = Duration::from_secs(6);
+
+/// Extra time granted after a fallback cancel request when the supervisor did
+/// not publish a terminal event within [`JOB_WAIT_GRACE`].
+const JOB_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// Principal used by the direct IPC provider when no plugin dispatch context
+/// is active (the host-bridge path). Plugin dispatches carry their own
+/// authenticated client identity instead.
+const IPC_PRINCIPAL: &str = "ipc-execution";
+
+/// One completed (or terminally failed) supervised tool run.
+/// Re-exported job identity for the Core spawn surface.
+///
+/// The type is upstream, but keeping the import here confines the extension
+/// identifier to this seam module (W-147 source fence).
+pub(crate) use bitty_execution::JobId;
+
+/// Test-only re-exports for the spawn surface's registry assertions.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use bitty_execution::{
+        ExecutionOutcome, JobCancel, JobEvent, JobIo, JobKind, JobLifetime, JobOrigin,
+        JobPrincipal, JobRegistry, JobSnapshot, JobSpec, JobState, JobTimeouts,
+    };
+}
+
+/// Builds the registry principal for one authenticated plugin caller.
+pub(crate) fn job_principal(name: &str) -> Result<JobPrincipal, IpcError> {
+    JobPrincipal::new(name).map_err(map_job_error)
+}
+
+pub(crate) struct JobRun {
+    /// Real registry identity minted for this spawn.
+    pub job: JobId,
+    /// Bounded output and outcome shaped for the existing `bitty-ipc`
+    /// synchronous surface.
+    pub raw: RawExecutionOutput,
+}
+
+/// Core-owned wrapper around the extracted [`JobRegistry`] for tool spawns.
+///
+/// Cheap to clone: clones share the same registry and preparer, so a host can
+/// hand one clone to a cancellation path while the synchronous dispatch waits.
+#[derive(Clone)]
+pub(crate) struct ToolJobSupervisor {
+    registry: JobRegistry,
+}
+
+impl std::fmt::Debug for ToolJobSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolJobSupervisor")
+            .field("capacity", &self.registry.capacity())
+            .field("tracked", &self.registry.len())
+            .finish()
+    }
+}
+
+impl ToolJobSupervisor {
+    /// Registry with the default capacity and the Core confinement preparer.
+    pub(crate) fn new() -> Self {
+        Self {
+            registry: JobRegistry::new().with_spawn_preparer(Arc::new(SandboxPreparer)),
+        }
+    }
+
+    /// Registry with an explicit capacity (tests and bounded hosts).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity == 0`, matching [`JobRegistry::with_capacity`].
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            registry: JobRegistry::with_capacity(capacity)
+                .with_spawn_preparer(Arc::new(SandboxPreparer)),
+        }
+    }
+
+    /// Shared registry clone for tests and cancellation paths.
+    #[cfg(test)]
+    pub(crate) fn registry(&self) -> JobRegistry {
+        self.registry.clone()
+    }
+
+    /// Spawns a job and waits for its terminal state, returning bounded
+    /// output shaped for the synchronous execution service.
+    ///
+    /// `on_spawn` runs exactly once with the real [`JobId`] as soon as the
+    /// registry accepts the job, before the wait. It lets the caller record
+    /// identity even when a later read fails closed.
+    pub(crate) fn spawn_and_wait(
+        &self,
+        request: &ExecutionRequest,
+        principal: &JobPrincipal,
+        poll_interval: Duration,
+        on_spawn: impl FnOnce(JobId),
+    ) -> Result<JobRun, IpcError> {
+        // Preserve CTX-1151 fail-closed behavior for admitted tools: resolve
+        // the executable closure and build the Landlock ruleset once before
+        // anything is tracked. The registry's preparer repeats the setup on
+        // the real command; a repeated failure still fails closed as
+        // `SpawnFailed`.
+        validate_tool_confinement(request)?;
+        let spec = JobSpec::new(request.executable.clone(), request.args.clone())
+            .with_cwd(request.cwd.clone())
+            .with_env(request.env_policy.clone())
+            .with_kind(JobKind::Command)
+            .with_lifetime(JobLifetime::Detached)
+            .with_io(JobIo::Pipes)
+            .with_timeouts(
+                JobTimeouts::default()
+                    .with_hard(Duration::from_millis(request.timeout_ms))
+                    .with_retention(Duration::from_secs(60)),
+            )
+            .with_origin(JobOrigin::none());
+        let job = self
+            .registry
+            .spawn_as(principal.clone(), spec)
+            .map_err(map_job_error)?;
+        on_spawn(job);
+        let snapshot = self.wait_terminal(principal, job, request.timeout_ms, poll_interval)?;
+        let outcome = snapshot.state.outcome().ok_or_else(|| IpcError::Internal {
+            reason: format!("job {job} reported a terminal snapshot without an outcome"),
+        })?;
+        let stdout = self.read_stream(principal, job, OutputStream::Stdout, request)?;
+        let stderr = self.read_stream(principal, job, OutputStream::Stderr, request)?;
+        let (status, effect_state, exit_code, mut evidence) =
+            classify_outcome(job, outcome, request, &stdout, &stderr);
+        if matches!(outcome, ExecutionOutcome::SpawnFailed) {
+            return Err(IpcError::Unavailable {
+                reason: format!("job {job} failed to spawn under the execution supervisor"),
+            });
+        }
+        if stdout.truncated || stderr.truncated {
+            evidence.push(format!(
+                "job {job} output was bounded by the execution supervisor; newest bytes preserved"
+            ));
+        }
+        Ok(JobRun {
+            job,
+            raw: RawExecutionOutput {
+                target_id: request.target.clone(),
+                status,
+                exit_code,
+                stdout: stdout.text,
+                stderr: stderr.text,
+                evidence_refs: evidence,
+                effect_state,
+            },
+        })
+    }
+
+    /// Reads one bounded stream from a terminal job.
+    fn read_stream(
+        &self,
+        principal: &JobPrincipal,
+        job: JobId,
+        stream: OutputStream,
+        request: &ExecutionRequest,
+    ) -> Result<OutputView, IpcError> {
+        // Ask for one byte beyond the synchronous stream budget: the
+        // `ExecutionService` consumes that spare byte as its truncation
+        // signal, exactly as the previous direct provider did.
+        let budget = request.effective_stream_budget().saturating_add(1);
+        let read = ReadOutput::new(stream).with_max_bytes(budget);
+        self.registry
+            .read_output_as(principal, job, read)
+            .map_err(map_job_error)
+    }
+
+    /// Waits for the terminal snapshot without blocking the supervisor.
+    ///
+    /// The registry's own hard deadline ends the job; this wait only bounds
+    /// how long the synchronous caller may block on a wedged supervisor. If
+    /// the grace elapses, a typed cancel is requested through the registry
+    /// (never a pid kill) and the wait continues for the cancel grace.
+    fn wait_terminal(
+        &self,
+        principal: &JobPrincipal,
+        job: JobId,
+        timeout_ms: u64,
+        poll_interval: Duration,
+    ) -> Result<bitty_execution::JobSnapshot, IpcError> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms).saturating_add(JOB_WAIT_GRACE))
+            .unwrap_or_else(Instant::now);
+        loop {
+            let snapshot = self
+                .registry
+                .get_as(principal, job)
+                .map_err(map_job_error)?;
+            if snapshot.state.is_terminal() {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(poll_interval.max(Duration::from_millis(1)));
+        }
+        self.registry
+            .cancel_as(principal, job)
+            .map_err(map_job_error)?;
+        let cancel_deadline = Instant::now()
+            .checked_add(JOB_CANCEL_GRACE)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let snapshot = self
+                .registry
+                .get_as(principal, job)
+                .map_err(map_job_error)?;
+            if snapshot.state.is_terminal() {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= cancel_deadline {
+                return Err(IpcError::Unavailable {
+                    reason: format!(
+                        "job {job} did not reach a terminal state after the supervisor cancel"
+                    ),
+                });
+            }
+            std::thread::sleep(poll_interval.max(Duration::from_millis(1)));
+        }
+    }
+}
+
+/// Maps every registry refusal into the existing synchronous failure set.
+///
+/// There is no catch-all success path: an unrecognized registry error fails
+/// closed as `Unavailable`, and nothing spawns a second time.
+pub(crate) fn map_job_error(error: JobError) -> IpcError {
+    match error {
+        JobError::RegistryFull { limit } => IpcError::LimitExceeded {
+            field: "execution jobs".into(),
+            limit,
+            actual: limit.saturating_add(1),
+        },
+        JobError::InvalidSpec { reason }
+        | JobError::InvalidPrincipal { reason }
+        | JobError::InvalidRead { reason }
+        | JobError::InvalidWrite { reason }
+        | JobError::InvalidCancel { reason }
+        | JobError::InvalidCursor { reason } => IpcError::InvalidRequest { reason },
+        JobError::Denied { operation, reason } => IpcError::Denied {
+            code: format!("ExecutionJobDenied({operation})"),
+            reason,
+        },
+        JobError::CommandRiskDenied { deny, reason } => IpcError::Denied {
+            code: format!("CommandRiskDenied({deny})"),
+            reason,
+        },
+        JobError::CommandRiskNeedsConsent { tier, reason } => IpcError::Denied {
+            code: format!("CommandRiskNeedsConsent({tier})"),
+            reason,
+        },
+        JobError::SecureInputDenied { denial, reason } => IpcError::Denied {
+            code: format!("SecureInputDenied({denial})"),
+            reason,
+        },
+        JobError::UnknownJob(id) => IpcError::NotFound {
+            reason: format!("unknown job {id}"),
+        },
+        JobError::UnknownEvent { seq } => IpcError::NotFound {
+            reason: format!("unknown job event {seq}"),
+        },
+        JobError::Unavailable { reason }
+        | JobError::Unsupported { reason }
+        | JobError::RateLimited { reason, .. }
+        | JobError::SignalRateLimited { reason } => IpcError::Unavailable { reason },
+        JobError::GrantsFull { limit } => IpcError::LimitExceeded {
+            field: "job grants".into(),
+            limit,
+            actual: limit.saturating_add(1),
+        },
+    }
+}
+
+/// Classifies one terminal registry outcome for the synchronous surface.
+///
+/// Timeout stays `Unknown` (reconcile, never a clean failure) exactly like
+/// the previous one-shot provider; a cancel stays `Canceled`; a signal and
+/// OOM evidence stay failures. The registry's job id is always in evidence
+/// so the caller can correlate the real identity.
+fn classify_outcome(
+    job: JobId,
+    outcome: ExecutionOutcome,
+    request: &ExecutionRequest,
+    stdout: &OutputView,
+    stderr: &OutputView,
+) -> (ExecutionStatus, EffectState, Option<i32>, Vec<String>) {
+    match outcome {
+        ExecutionOutcome::Success => (
+            ExecutionStatus::Completed,
+            EffectState::Completed,
+            Some(0),
+            vec![format!("job {job} completed")],
+        ),
+        ExecutionOutcome::ExitCode(code) => (
+            ExecutionStatus::Failed,
+            EffectState::Failed,
+            Some(code),
+            vec![format!("job {job} exited with code {code}")],
+        ),
+        ExecutionOutcome::Signaled(signal) => (
+            ExecutionStatus::Failed,
+            EffectState::Failed,
+            None,
+            vec![format!("job {job} ended by signal {signal}")],
+        ),
+        ExecutionOutcome::Cancelled(effect) => (
+            ExecutionStatus::Canceled,
+            EffectState::Canceled,
+            None,
+            vec![format!("job {job} canceled ({})", effect.as_str())],
+        ),
+        ExecutionOutcome::TimedOut(clock) => (
+            ExecutionStatus::Unknown,
+            EffectState::Unknown,
+            None,
+            vec![format!(
+                "spawn timeout after {} ms; job {job} timed out ({}) and its owned tree was killed and reaped; stdout {} bytes, stderr {} bytes preserved",
+                request.timeout_ms,
+                clock.as_str(),
+                stdout.total_bytes,
+                stderr.total_bytes
+            )],
+        ),
+        ExecutionOutcome::SpawnFailed => (
+            ExecutionStatus::Failed,
+            EffectState::Failed,
+            None,
+            vec![format!("job {job} failed to spawn")],
+        ),
+        ExecutionOutcome::OomKilled => (
+            ExecutionStatus::Failed,
+            EffectState::Failed,
+            None,
+            vec![format!("job {job} was oom-killed")],
+        ),
+        ExecutionOutcome::SupervisorLost => (
+            ExecutionStatus::Unknown,
+            EffectState::Unknown,
+            None,
+            vec![format!("job {job} lost its supervisor")],
+        ),
+        ExecutionOutcome::Unknown => (
+            ExecutionStatus::Unknown,
+            EffectState::Unknown,
+            None,
+            vec![format!("job {job} outcome is unknown")],
+        ),
+    }
+}
+
+/// Host-wide spawn context for one synchronous plugin dispatch.
+///
+/// The `bitty-ipc` provider slot is a bare `fn`, so the authenticated plugin
+/// identity and registry clone for one dispatch travel through a thread-local
+/// scope around [`ExecutionService::dispatch`](bitty_ipc::ExecutionService).
+/// The plugin VM and the provider run on the same thread; a nested dispatch
+/// restores the enclosing scope on drop.
+struct DispatchContext {
+    supervisor: ToolJobSupervisor,
+    principal: JobPrincipal,
+    last_job: Cell<Option<JobId>>,
+}
+
+thread_local! {
+    static ACTIVE_DISPATCH: RefCell<Option<DispatchContext>> = const { RefCell::new(None) };
+    static DEFAULT_SUPERVISOR: RefCell<Option<ToolJobSupervisor>> = const { RefCell::new(None) };
+}
+
+/// Scoped plugin dispatch context; restores the previous scope on drop.
+pub(crate) struct DispatchScope {
+    previous: Option<DispatchContext>,
+}
+
+impl DispatchScope {
+    /// Enters a dispatch scope for `principal` over `supervisor`.
+    pub(crate) fn enter(supervisor: ToolJobSupervisor, principal: JobPrincipal) -> Self {
+        let context = DispatchContext {
+            supervisor,
+            principal,
+            last_job: Cell::new(None),
+        };
+        let previous = ACTIVE_DISPATCH.with(|slot| slot.replace(Some(context)));
+        Self { previous }
+    }
+
+    /// Real job id recorded by the provider for this dispatch, if any.
+    pub(crate) fn job(&self) -> Option<JobId> {
+        ACTIVE_DISPATCH.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|context| context.last_job.get())
+        })
+    }
+}
+
+impl Drop for DispatchScope {
+    fn drop(&mut self) {
+        ACTIVE_DISPATCH.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+/// Returns the active dispatch supervisor/principal pair, if any.
+fn active_dispatch() -> Option<(ToolJobSupervisor, JobPrincipal)> {
+    ACTIVE_DISPATCH.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|context| (context.supervisor.clone(), context.principal.clone()))
+    })
+}
+
+/// Records the real job id into the active dispatch scope.
+fn record_job(job: JobId) {
+    ACTIVE_DISPATCH.with(|slot| {
+        if let Some(context) = slot.borrow().as_ref() {
+            context.last_job.set(Some(job));
+        }
+    });
+}
+
+/// Default supervisor for the direct IPC provider (no plugin scope).
+fn default_supervisor() -> ToolJobSupervisor {
+    DEFAULT_SUPERVISOR.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(ToolJobSupervisor::new)
+            .clone()
+    })
+}
+
+/// Runs one tool spawn through the active plugin supervisor, or the direct
+/// IPC default supervisor when no plugin scope is active.
+pub(crate) fn spawn_supervised(
+    request: &ExecutionRequest,
+    poll_interval: Duration,
+) -> Result<JobRun, IpcError> {
+    let (supervisor, principal) = match active_dispatch() {
+        Some(context) => context,
+        None => (
+            default_supervisor(),
+            JobPrincipal::new(IPC_PRINCIPAL).map_err(map_job_error)?,
+        ),
+    };
+    supervisor.spawn_and_wait(request, &principal, poll_interval, record_job)
+}
+
+/// Fail-closed CTX-1151 confinement pre-validation for admitted tools.
+///
+/// Builds the same ruleset the preparer will attach, then drops it without
+/// spawning anything. This keeps the previous synchronous `Unavailable`
+/// diagnostic for a host that cannot confine an admitted tool (non-Linux,
+/// unresolvable executable closure) instead of hiding it behind a tracked
+/// `SpawnFailed` job.
+fn validate_tool_confinement(request: &ExecutionRequest) -> Result<(), IpcError> {
+    if !is_tool_spawn_allowed(&request.executable, &request.args) {
+        return Ok(());
+    }
+    let exec_paths = bitty_sandbox::resolve_tool_execs(&request.executable).map_err(|error| {
+        IpcError::Unavailable {
+            reason: format!(
+                "tool spawn confinement refused '{}': {}",
+                request.executable,
+                truncate_message(error.to_string(), 96)
+            ),
+        }
+    })?;
+    let mut probe = Command::new(&request.executable);
+    probe.args(&request.args);
+    let guard =
+        bitty_sandbox::confine_command_to_execs(&mut probe, &exec_paths).map_err(|error| {
+            IpcError::Unavailable {
+                reason: format!(
+                    "tool spawn confinement refused '{}': {}",
+                    request.executable,
+                    truncate_message(error.to_string(), 96)
+                ),
+            }
+        })?;
+    drop(guard);
+    Ok(())
+}
+
+/// Host-owned preparer that applies CTX-1151 exec confinement to every
+/// admitted tool command the supervisor builds.
+struct SandboxPreparer;
+
+impl SpawnPreparer for SandboxPreparer {
+    fn prepare(
+        &self,
+        spec: &JobSpec,
+        command: &mut Command,
+    ) -> Result<Box<dyn Any + Send>, String> {
+        if !is_tool_spawn_allowed(&spec.program, &spec.args) {
+            return Ok(Box::new(()));
+        }
+        let exec_paths = bitty_sandbox::resolve_tool_execs(&spec.program)
+            .map_err(|error| truncate_message(error.to_string(), 96))?;
+        let guard = bitty_sandbox::confine_command_to_execs(command, &exec_paths)
+            .map_err(|error| truncate_message(error.to_string(), 96))?;
+        Ok(Box::new(guard))
+    }
+}
+
+/// Bounded diagnostic truncation (char-boundary safe).
+fn truncate_message(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let mut end = limit;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}

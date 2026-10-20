@@ -109,6 +109,13 @@ mod platform;
 #[path = "ai_publication_launch/unsupported.rs"]
 mod platform;
 
+mod control;
+
+pub use control::{
+    AuthenticatedControl, ControlEvent, ControlPhase, ControlRecordIo, LaunchBinding, MetadataView,
+    PublicationControl, PublicationControlError, RevocationReason,
+};
+
 /// Fixed child descriptor number of the one-shot bootstrap read end.
 pub const CHILD_BOOTSTRAP_DESCRIPTOR: u32 = 3;
 
@@ -444,6 +451,16 @@ impl PreparedLaunch {
         self.material
             .as_ref()
             .map(LaunchMaterial::helper_cert_sha256)
+    }
+
+    /// SHA-256 over the complete Core `core-supervisor` leaf certificate DER.
+    ///
+    /// This is the non-secret Core-leaf digest carried by the control
+    /// establishment echo. `None` once [`Self::establish`] has consumed the
+    /// launch material, so callers that need the echo snapshot it first with
+    /// [`LaunchBinding::from_prepared`].
+    pub fn core_cert_sha256(&self) -> Option<[u8; 32]> {
+        self.material.as_ref().map(LaunchMaterial::core_cert_sha256)
     }
 
     /// Fixed child-side descriptor numbers for this launch.

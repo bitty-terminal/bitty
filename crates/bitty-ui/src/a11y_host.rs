@@ -265,9 +265,13 @@ impl UiSnapshotHost {
     /// a just-detached surface). The name is resolved against the finished
     /// snapshot to the first focusable match in tree order; root, chrome, and
     /// scene nodes can never own focus. An unknown label fails closed with
-    /// [`A11yError::UnknownHandle`], never a guessed owner.
+    /// [`A11yError::UnknownHandle`], never a guessed owner. A label longer
+    /// than [`MAX_ACCESSIBLE_NAME_LEN`] is discarded (nothing is focused)
+    /// because it can never match a bounded node.
     pub fn set_focus_label(&mut self, label: Option<&str>) {
-        self.focus_label = label.map(str::to_string);
+        self.focus_label = label
+            .filter(|label| label.chars().count() <= MAX_ACCESSIBLE_NAME_LEN)
+            .map(str::to_string);
     }
 
     /// Queues one notice reported by the next ingest.

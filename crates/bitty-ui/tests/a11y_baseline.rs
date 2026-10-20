@@ -534,6 +534,21 @@ fn host_rejects_overlong_names_at_256_boundary() {
 }
 
 #[test]
+fn overlong_focus_label_is_discarded_without_failing_ingest() {
+    // A focus label above the accessibility ceiling can never match a bounded
+    // node; discard it at the setter instead of failing later with
+    // UnknownHandle.
+    let long = "f".repeat(MAX_ACCESSIBLE_NAME_LEN + 1);
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(Some(&long));
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overlong focus label must not fail the ingest");
+    assert!(adapter.focus().owner().is_none(), "nothing focused");
+}
+
+#[test]
 fn host_rejects_unmapped_scene_kind_fail_closed() {
     let mut host = UiSnapshotHost::new("window", "shell");
     host.push_scene(SceneKind::Text, 1);

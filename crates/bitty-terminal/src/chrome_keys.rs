@@ -7488,6 +7488,17 @@ claims = []
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Issue #2336: activation itself queues no notifications, and the
+        // keybinding command below must stay in-grid only.
+        assert!(
+            app.plugin_runtime
+                .as_mut()
+                .expect("plugin runtime")
+                .drain_notifications()
+                .is_empty(),
+            "activation must not enqueue a plugin notification"
+        );
+        assert_eq!(app.runtime.notifications_os_undelivered(), 0);
         assert_eq!(app.runtime.notification_banner(), None);
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
             "bitty-featured.devtools:plugins".to_string()
@@ -7496,6 +7507,29 @@ claims = []
             app.runtime.notification_banner().as_deref(),
             Some("bitty-featured.devtools:plugins: 2 plugins active"),
             "the keybinding dispatch result must surface on the banner"
+        );
+        // Mutation guard: restoring `admit_plugin_notification` in
+        // `surface_dispatch_result` trips the fail-closed backend and makes
+        // this counter (and the queue check below) fail.
+        assert_eq!(
+            app.runtime.notifications_os_undelivered(),
+            0,
+            "a keybinding command result must not attempt an OS notification"
+        );
+        assert_eq!(app.runtime.notifications_os_delivered(), 0);
+        assert!(
+            app.plugin_runtime
+                .as_mut()
+                .expect("plugin runtime")
+                .drain_notifications()
+                .is_empty(),
+            "a keybinding command result must not enqueue a notification"
+        );
+        let _ = app.drive_tick();
+        assert_eq!(
+            app.runtime.notifications_os_undelivered(),
+            0,
+            "the tick must not drain an implicit notification either"
         );
         // A refused chord admits nothing: the live banner is untouched.
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(

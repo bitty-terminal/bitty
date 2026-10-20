@@ -2833,17 +2833,22 @@ impl Runtime {
     }
 
     /// Admits one grant-gated plugin notification into the bounded banner
-    /// surface (CTX-1033, issue #1827). Returns `true` when the notification
-    /// reached the banner or the bounded queue.
+    /// surface (CTX-1033, issue #1827) **and** hands it to the OS. Returns
+    /// `true` when the notification reached the banner or the bounded queue.
     ///
-    /// The application drains
+    /// This is the explicit `bitty.notify.show` path only: the application
+    /// drains
     /// [`crate::plugin_runtime::PluginRuntime::drain_notifications`] once per
     /// tick and feeds each entry here, so `bitty.notify.show` output (for
     /// example `devtools:plugins`) paints on a real host through the same
-    /// one-banner-at-a-time in-grid surface (plus the bridge-dispatched OS
-    /// hand-off) the terminal-originated notifications use. No consent gate: the
+    /// one-banner-at-a-time in-grid surface plus the bridge-dispatched OS
+    /// hand-off the terminal-originated notifications use. No consent gate: the
     /// `platform.notify` grant was already enforced when the plugin queued
     /// the entry, and safe mode never creates the originating VM.
+    ///
+    /// Host-generated command results must use
+    /// [`Self::admit_plugin_banner_notification`] instead: routine plugin
+    /// use never reaches the desktop (issue #2336).
     ///
     /// Bounded and non-blocking: at most one `RC-8` limiter admission plus
     /// one bounded queue push per call. Over-ceiling calls are dropped and
@@ -2860,6 +2865,41 @@ impl Runtime {
         title: &str,
         body: &str,
         now: std::time::Instant,
+    ) -> bool {
+        self.admit_plugin_notice(title, body, now, true)
+    }
+
+    /// Admits one host-generated plugin notice into the bounded in-grid
+    /// banner surface **without** any OS hand-off (issue #2336).
+    ///
+    /// Command-result surfacing (`TerminalApp::surface_dispatch_result`) uses
+    /// this path: invoking a plugin command is routine use, so its return
+    /// value may paint in the terminal banner but must never raise a desktop
+    /// notification. Only an explicit `bitty.notify.show` (drained through
+    /// [`Self::admit_plugin_notification`]) or a documented failure class may
+    /// reach the OS.
+    ///
+    /// Rate limiting, queueing, sanitization, and drop accounting match
+    /// [`Self::admit_plugin_notification`]; only the platform delivery is
+    /// absent, so no delivered/undelivered counter moves.
+    pub fn admit_plugin_banner_notification(
+        &mut self,
+        title: &str,
+        body: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        self.admit_plugin_notice(title, body, now, false)
+    }
+
+    /// Shared admission for plugin notices: sanitize, rate-limit, and
+    /// paint/queue on the bounded banner, optionally handing the admitted
+    /// notification to the OS.
+    fn admit_plugin_notice(
+        &mut self,
+        title: &str,
+        body: &str,
+        now: std::time::Instant,
+        deliver_os: bool,
     ) -> bool {
         let clean_title = bell::sanitize_notification_text(title);
         let clean_body = bell::sanitize_notification_text(body);
@@ -2889,7 +2929,9 @@ impl Runtime {
             self.notifications.push(notification.clone())
         };
         if admitted {
-            self.deliver_notification_to_os(&notification, now);
+            if deliver_os {
+                self.deliver_notification_to_os(&notification, now);
+            }
         } else {
             self.plugin_notifications_dropped = self.plugin_notifications_dropped.saturating_add(1);
         }

@@ -11259,6 +11259,16 @@ events = []
         Some("bitty-featured.ctx1033wire:report: result-visible-text"),
         "the dispatch result must surface on the banner"
     );
+    // Issue #2336: the command result is routine plugin use, so it must not
+    // be handed to the platform backend. The default backend is fail-closed,
+    // so the old implicit path would count one undelivered OS notification
+    // here even without a display server.
+    assert_eq!(
+        app.runtime.notifications_os_undelivered(),
+        0,
+        "a dispatch result must never attempt an OS notification"
+    );
+    assert_eq!(app.runtime.notifications_os_delivered(), 0);
 
     // Notify-drain half: the tick drains the queued notice into the bounded
     // queue behind the live banner (never blocking the frame).
@@ -11267,6 +11277,14 @@ events = []
         app.runtime.pending_notification_count(),
         1,
         "the drained notice must wait in the bounded queue"
+    );
+    // The explicit `bitty.notify.show` still attempts the OS hand-off: the
+    // fail-closed default backend records exactly that one undelivered
+    // attempt, proving the explicit path was not disabled with the fix.
+    assert_eq!(
+        app.runtime.notifications_os_undelivered(),
+        1,
+        "explicit notify.show must still attempt the OS hand-off"
     );
     assert_eq!(
         app.plugin_runtime

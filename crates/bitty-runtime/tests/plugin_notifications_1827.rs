@@ -161,6 +161,36 @@ fn plugin_notice_reaches_backend_at_admission_time() {
 }
 
 #[test]
+fn plugin_command_result_banner_never_reaches_os() {
+    // Issue #2336: host-generated command-result surfacing is routine plugin
+    // use. It may paint the in-grid banner, but it must never hand the text
+    // to the platform notification backend. This is the mutation guard for
+    // `TerminalApp::surface_dispatch_result`: restoring the old
+    // `admit_plugin_notification` call makes this assertion fail.
+    let mut rt = runtime();
+    let probe = NotificationProbe::default();
+    rt.set_notification_backend(Box::new(probe.clone()));
+    let now = Instant::now();
+    assert!(rt.admit_plugin_banner_notification("git-panel:status", "clean", now));
+    assert_eq!(
+        rt.notification_banner_at(now).as_deref(),
+        Some("git-panel:status: clean"),
+        "the command result still paints in-grid"
+    );
+    assert!(
+        probe.received().is_empty(),
+        "routine plugin use must not raise a desktop notification"
+    );
+    assert_eq!(rt.notifications_os_delivered(), 0);
+    assert_eq!(
+        rt.notifications_os_undelivered(),
+        0,
+        "no delivery attempt means no undelivered count either"
+    );
+    assert_eq!(rt.plugin_notifications_dropped(), 0);
+}
+
+#[test]
 fn plugin_notice_without_backend_still_paints_and_counts_miss() {
     let mut rt = runtime();
     let now = Instant::now();

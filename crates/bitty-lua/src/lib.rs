@@ -1253,6 +1253,8 @@ impl LuaVm {
         stashed: StashedExecutor,
         start: BudgetMark,
     ) -> Result<DriveOutcome, VmError> {
+        // Re-based when a parked host operation is cancelled (see below).
+        let mut start = start;
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
@@ -1418,9 +1420,22 @@ impl LuaVm {
             if done {
                 // A parked host operation reports done without being
                 // finished: route it through the host trampoline and keep
-                // stepping instead of completing. Wall-clock policy stays
-                // host-side — the loop-top checks still bound the resume.
+                // stepping instead of completing.
+                //
+                // A park is host-side state, not plugin wall time, and Bitty
+                // registers no host futures, so every park is cancelled
+                // fail-closed. Cancellation must win deterministically: on a
+                // loaded runner the thread can be descheduled around the park
+                // and the next loop-top wall check would suspend the callback
+                // for scheduler delay before the cancellation unwinds through
+                // `pcall` (measured: 43 instructions, 58 ms elapsed). Restart
+                // the wall window at cancellation so the unwind and any work
+                // after it get a fresh budget; running Lua is still bounded by
+                // the unchanged wall and instruction limits. Lua cannot
+                // trigger this path (host-op sequences are Rust-only), so it
+                // is not a plugin-reachable credit.
                 if self.pump_host_suspended(&stashed)? {
+                    start = BudgetMark::now();
                     continue;
                 }
                 // Step reports the executor finished (Result/Stopped/yielded).
@@ -1984,6 +1999,40 @@ mod vm_unit_tests {
         assert!(
             matches!(outcome, ExecuteOutcome::Completed { .. }),
             "cancelled park must unwind through pcall, got {outcome:?}"
+        );
+        assert!(!vm.is_suspended());
+        assert_eq!(vm.suspension_count(), 0);
+    }
+
+    #[test]
+    fn park_cancelled_after_the_wall_budget_still_unwinds() {
+        // A runner can deschedule the thread around a park: the callback then
+        // resumes with only a few dozen instructions executed but more than the
+        // 50 ms wall budget elapsed. Cancellation is host-side and must win
+        // over that wall check, otherwise the callback suspends for scheduler
+        // delay instead of unwinding through `pcall` (CI failure at 43
+        // instructions / 58 ms, bitty#2285).
+        let mut vm = LuaVm::new("xuepoo.trampoline-slow");
+        vm.lua.enter(|ctx| {
+            let park = phodopus::Callback::from_fn(&ctx, |ctx, _, _| {
+                // Model the deschedule inside the slice that parks.
+                std::thread::sleep(std::time::Duration::from_millis(
+                    RC1_WALL_CLOCK_BUDGET_MS + 10,
+                ));
+                let sequence = phodopus::async_sequence(&ctx, |_, mut seq| async move {
+                    seq.suspend(phodopus::HostOpHandle::from_raw(1)).await?;
+                    Ok(phodopus::SequenceReturn::Return)
+                });
+                Ok(phodopus::CallbackReturn::Sequence(sequence))
+            });
+            ctx.set_global("park_once", park);
+        });
+        let outcome = vm
+            .execute("local ok, err = pcall(park_once) assert(ok == false) assert(err ~= nil)")
+            .unwrap();
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "a cancelled park must unwind through pcall even past the wall budget, got {outcome:?}"
         );
         assert!(!vm.is_suspended());
         assert_eq!(vm.suspension_count(), 0);

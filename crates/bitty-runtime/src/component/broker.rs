@@ -23,6 +23,7 @@ use bitty_network_wire::{
     MAX_REQUEST_BODY_BYTES, Message, Method, PROTOCOL_VERSION, WireError, encode_frame,
 };
 
+use super::activation::{ActivationState, write_activation};
 use super::descriptor::{ResolveError, validate_component_name};
 use super::env::ComponentEnv;
 use super::grant::PluginGrant;
@@ -395,6 +396,12 @@ struct Slot {
     stderr: Arc<Mutex<StderrRing>>,
     spawns: u64,
     last_stop: Option<StopOutcome>,
+    /// User-tier component directory this slot records activation into.
+    ///
+    /// `Some` only when the winning tier is the writable user tier (the
+    /// system tier is read-only, so its runtime state cannot be persisted);
+    /// set at the last spawn.
+    activation_dir: Option<PathBuf>,
 }
 
 enum InboundEvent {
@@ -694,6 +701,43 @@ impl ComponentBroker {
         Some(ring.snapshot())
     }
 
+    /// Record a fail-closed activation outcome for `component` (#2254).
+    ///
+    /// Used for refusals that happen before (or instead of) a spawn. The
+    /// caller passes the same [`ActivationState`] the list surface reports;
+    /// the broker writes it into the bounded activation projection it also
+    /// writes on spawn/crash/stop. An invalid component name touches nothing,
+    /// a system-only install (no writable user directory) is not recorded,
+    /// and a denial never masks a component that is currently running (a
+    /// request refused for one plugin must not hide a live shared
+    /// component). Best effort: I/O failures are dropped, never surfaced as
+    /// request failures.
+    pub fn record_activation(&self, component: &str, state: ActivationState) {
+        if validate_component_name(component).is_err() {
+            return;
+        }
+        let slot = self.slots.get(component);
+        if matches!(state, ActivationState::Denied(_))
+            && slot.is_some_and(|slot| slot.process.is_some())
+        {
+            return;
+        }
+        let dir = match slot.and_then(|slot| slot.activation_dir.clone()) {
+            Some(dir) => dir,
+            None => {
+                let Some(root) = self.config.root.as_deref() else {
+                    return;
+                };
+                let candidate = root.join(component);
+                if !candidate.is_dir() {
+                    return;
+                }
+                candidate
+            }
+        };
+        write_activation(&dir, state);
+    }
+
     fn peek_request_id(&self) -> RequestId {
         // Wrap-around is unreachable in practice (u64), and 0 is reserved.
         RequestId(self.next_request.checked_add(1).unwrap_or(1))
@@ -711,6 +755,7 @@ impl ComponentBroker {
                 stderr: Arc::new(Mutex::new(StderrRing::new(COMPONENT_STDERR_MAX_BYTES))),
                 spawns: 0,
                 last_stop: None,
+                activation_dir: None,
             });
         if let Some(process) = slot.process.as_ref() {
             if process.stop_deadline.is_none() {
@@ -785,6 +830,17 @@ impl ComponentBroker {
         )?;
         slot.process = Some(process);
         slot.spawns += 1;
+        // Activation projection (#2254): only the writable user tier can be
+        // recorded; the system tier stays read-only.
+        slot.activation_dir = match searched.source {
+            super::inventory::ComponentSource::User => {
+                resolved.version_dir.parent().map(Path::to_path_buf)
+            }
+            super::inventory::ComponentSource::System => None,
+        };
+        if let Some(dir) = slot.activation_dir.as_deref() {
+            write_activation(dir, ActivationState::Active);
+        }
         Ok(())
     }
 
@@ -1403,23 +1459,39 @@ fn crash(
 
 /// Forget an already-exited child (reaps it).
 fn reap(slot: &mut Slot, outcome: StopOutcome) {
-    if let Some(mut process) = slot.process.take() {
-        process.stdin = None;
-        let _ = process.child.wait();
-        slot.last_stop = Some(outcome);
-    }
+    let Some(mut process) = slot.process.take() else {
+        return;
+    };
+    process.stdin = None;
+    let _ = process.child.wait();
+    slot.last_stop = Some(outcome);
+    record_stop(slot, outcome);
 }
 
 /// Kill only the child recorded at spawn, then reap it.
 fn kill_and_reap(slot: &mut Slot, outcome: StopOutcome) {
-    if let Some(mut process) = slot.process.take() {
-        process.stdin = None;
-        if matches!(process.child.try_wait(), Ok(None)) {
-            let _ = process.child.kill();
-        }
-        let _ = process.child.wait();
-        slot.last_stop = Some(outcome);
+    let Some(mut process) = slot.process.take() else {
+        return;
+    };
+    process.stdin = None;
+    if matches!(process.child.try_wait(), Ok(None)) {
+        let _ = process.child.kill();
     }
+    let _ = process.child.wait();
+    slot.last_stop = Some(outcome);
+    record_stop(slot, outcome);
+}
+
+/// Persist the stop outcome of one slot (activation projection, #2254).
+fn record_stop(slot: &Slot, outcome: StopOutcome) {
+    let Some(dir) = slot.activation_dir.as_deref() else {
+        return;
+    };
+    let state = match outcome {
+        StopOutcome::Exited | StopOutcome::Killed => ActivationState::Stopped,
+        StopOutcome::Crashed => ActivationState::Crashed,
+    };
+    write_activation(dir, state);
 }
 
 #[cfg(test)]
@@ -1615,6 +1687,7 @@ mod tests {
             stderr: Arc::new(Mutex::new(StderrRing::new(64))),
             spawns: 0,
             last_stop: None,
+            activation_dir: None,
         };
         slot.stderr
             .lock()

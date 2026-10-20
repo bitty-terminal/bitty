@@ -874,3 +874,94 @@ fn extension_show_source_is_visible_in_help() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Activation column of the `net` row in a table render (`None` if absent).
+fn activation_column(text: &str) -> Option<String> {
+    text.lines()
+        .find(|line| line.starts_with("net "))
+        .and_then(|line| line.split_whitespace().nth(5).map(str::to_owned))
+}
+
+#[test]
+fn extension_list_reports_recorded_activation_state() {
+    let home = scratch_dir("activation");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let source = write_source_dir(&home.join("source"), "net", "0.0.1", "[1, 1]");
+    let output = run_in(
+        &home,
+        &system,
+        &["extension", "add", &source.display().to_string()],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let component_dir = user_root(&home).join("net");
+    // Installed through `add`, never activated: `installed`, never `active`.
+    let output = run_in(&home, &system, &["extension", "list"]);
+    let text = stdout(&output);
+    assert!(text.contains("ACTIVATION"), "{text}");
+    assert_eq!(activation_column(&text).as_deref(), Some("installed"));
+    let output = run_in(&home, &system, &["extension", "list", "--format", "json"]);
+    let text = stdout(&output);
+    assert!(text.contains("\"activation\":\"installed\""), "{text}");
+    assert!(text.contains("\"activation_class\":null"), "{text}");
+
+    // Active: exactly what the broker records after a spawn.
+    std::fs::write(component_dir.join("activation"), "v1 active\n").expect("active record");
+    let output = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(
+        activation_column(&stdout(&output)).as_deref(),
+        Some("active")
+    );
+    let output = run_in(&home, &system, &["extension", "list", "--format", "json"]);
+    let text = stdout(&output);
+    assert!(text.contains("\"activation\":\"active\""), "{text}");
+    assert!(text.contains("\"activation_class\":null"), "{text}");
+
+    // Denied: the named error class travels with the label.
+    std::fs::write(
+        component_dir.join("activation"),
+        "v1 denied:capability_denied\n",
+    )
+    .expect("denied record");
+    let output = run_in(&home, &system, &["extension", "list"]);
+    assert_eq!(
+        activation_column(&stdout(&output)).as_deref(),
+        Some("denied:capability_denied")
+    );
+    let output = run_in(&home, &system, &["extension", "list", "--format", "json"]);
+    let text = stdout(&output);
+    assert!(
+        text.contains("\"activation\":\"denied:capability_denied\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"activation_class\":\"capability_denied\""),
+        "{text}"
+    );
+
+    // Crashed and stopped are distinct labels, not a generic "inactive".
+    for (record, label) in [("v1 crashed\n", "crashed"), ("v1 stopped\n", "stopped")] {
+        std::fs::write(component_dir.join("activation"), record).expect("record");
+        let output = run_in(&home, &system, &["extension", "list"]);
+        assert_eq!(activation_column(&stdout(&output)).as_deref(), Some(label));
+    }
+
+    // A corrupt or versionless record never claims an activation.
+    for bad in ["active\n", "", "v1 denied:made_up\n"] {
+        std::fs::write(component_dir.join("activation"), bad).expect("bad record");
+        let output = run_in(&home, &system, &["extension", "list"]);
+        assert_eq!(
+            activation_column(&stdout(&output)).as_deref(),
+            Some("installed"),
+            "{bad:?} must not claim a state"
+        );
+    }
+
+    // Removing the last version drops the projection with the component
+    // (an activation record must not keep a removed install visible).
+    let output = run_in(&home, &system, &["extension", "remove", "net", "0.0.1"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!component_dir.exists(), "component dir must be pruned");
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use bitty_network_wire::ErrorKind;
 
+use super::activation::{ActivationDenial, ActivationState};
 use super::broker::{
     BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, ComponentBroker, ComponentRequest,
     ComponentStatus, RequestId,
@@ -151,6 +152,43 @@ impl From<GrantError> for ComponentHostError {
     }
 }
 
+/// Activation state a fail-closed host failure records for `bitty extension
+/// list` (#2254).
+///
+/// Only refusals that leave the component unserved map to a state: denials
+/// and resolution failures become `denied:<class>`, and the post-crash latch
+/// (`BrokerError::Unavailable`) stays `crashed`. Transient conditions
+/// (`Busy`, `Backoff`, invalid request/body, spawn I/O) record nothing — the
+/// crash path already recorded the underlying outcome, and a transient
+/// refusal must not overwrite a meaningful state.
+fn activation_for_error(error: &ComponentHostError) -> Option<ActivationState> {
+    match error {
+        ComponentHostError::CapabilityDenied { .. } => {
+            Some(ActivationState::Denied(ActivationDenial::CapabilityDenied))
+        }
+        ComponentHostError::PluginNotActive { .. } => {
+            Some(ActivationState::Denied(ActivationDenial::PluginNotActive))
+        }
+        ComponentHostError::Grant(_) => {
+            Some(ActivationState::Denied(ActivationDenial::GrantInvalid))
+        }
+        ComponentHostError::Broker(BrokerError::Resolve(error)) => match error {
+            ResolveError::DigestMismatch { .. }
+            | ResolveError::Descriptor(_)
+            | ResolveError::NotRegular { .. }
+            | ResolveError::NameMismatch { .. } => {
+                Some(ActivationState::Denied(ActivationDenial::Untrusted))
+            }
+            ResolveError::NotInstalled { .. } | ResolveError::NoRoot => {
+                Some(ActivationState::Denied(ActivationDenial::Unavailable))
+            }
+            _ => None,
+        },
+        ComponentHostError::Broker(BrokerError::Unavailable) => Some(ActivationState::Crashed),
+        _ => None,
+    }
+}
+
 /// One Bitty instance's native-component host.
 pub struct ComponentHost {
     broker: ComponentBroker,
@@ -211,7 +249,26 @@ impl ComponentHost {
         grant: &PluginGrant,
         request: ComponentRequest,
     ) -> Result<RequestId, ComponentHostError> {
-        Ok(self.broker.submit(now, component, grant, request)?)
+        match self.broker.submit(now, component, grant, request) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                let error = ComponentHostError::from(error);
+                self.record_denial(component, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Record a fail-closed denial for `component` (best effort, #2254).
+    ///
+    /// The runtime calls this for authorization failures that happen before
+    /// the broker is reached (grant/lifecycle denials), and [`Self::submit`]
+    /// calls it for pre-spawn broker failures, so `bitty extension list`
+    /// reports one `denied:<class>` label for either path.
+    pub fn record_denial(&mut self, component: &str, error: &ComponentHostError) {
+        if let Some(state) = activation_for_error(error) {
+            self.broker.record_activation(component, state);
+        }
     }
 
     /// Submit one request and wait (real time) for its terminal event.

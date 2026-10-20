@@ -25,8 +25,11 @@
 //!   `--format table|json|jsonl` (default table) and `--no-color`.
 //! - `list`: read-only enumeration across both tiers (merged, user shadows
 //!   system on the same version). Shows name, version, active marker, source,
-//!   ABI compat, and path. Empty when nothing is installed; never fails on a
-//!   missing root.
+//!   ABI compat, path, and the activation state the broker last recorded for
+//!   that component (`installed`, `active`, `denied:<class>`, `crashed`,
+//!   `stopped`; `installed` when no record exists). The state is read through
+//!   the runtime's single activation reader, never re-derived here. Empty
+//!   when nothing is installed; never fails on a missing root.
 //! - `add <path> [--version <semver>]`: stage a pre-built binary from a local
 //!   path into the user tier only. A directory must hold a source
 //!   `bitty-component.toml` (name, version, protocol, executable, optional
@@ -106,9 +109,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_runtime::component::{
-    COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
-    component_search_roots_for, data_home_for, discover_components, executable_file_name,
-    incompatible_component_hint, missing_component_hint, validate_component_name,
+    ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
+    ComponentSummary, activation_path, component_search_roots_for, data_home_for,
+    discover_components, executable_file_name, incompatible_component_hint, missing_component_hint,
+    read_component_activation, validate_component_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -812,7 +816,10 @@ pub fn component_help_text() -> String {
      verbs:\n\
      \x20 list                        Show installed components across both tiers:\n\
      \x20                             name, version, active marker, source\n\
-     \x20                             (user|system), ABI compat, and path.\n\
+     \x20                             (user|system), ABI compat, path, and the\n\
+     \x20                             activation state the broker last recorded\n\
+     \x20                             (installed|active|denied:<class>|crashed|\n\
+     \x20                             stopped; installed when never activated).\n\
      \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
      \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
      \x20                             A directory holds bitty-component.toml plus\n\
@@ -1176,13 +1183,14 @@ pub fn run_component_subcommand(
     match request.verb {
         ComponentVerb::List => {
             let summaries = discover_components(user_root.as_deref(), system_root.as_deref());
+            let listed = summarize_list(&summaries, user_root.as_deref(), system_root.as_deref());
             match request.format {
                 ComponentFormat::Table => {
                     let no_color = request.no_color || context.pre_no_color;
-                    let _ = output.write_all(format_list_table(&summaries, no_color).as_bytes());
+                    let _ = output.write_all(format_list_table(&listed, no_color).as_bytes());
                 }
                 ComponentFormat::Json | ComponentFormat::Jsonl => {
-                    let _ = writeln!(output, "{}", format_list_envelope(&summaries));
+                    let _ = writeln!(output, "{}", format_list_envelope(&listed));
                 }
             }
             EXIT_OK
@@ -1278,25 +1286,51 @@ pub fn run_component_subcommand(
 // list rendering
 // ---------------------------------------------------------------------------
 
-fn format_list_table(
-    summaries: &[bitty_runtime::component::ComponentSummary],
-    _no_color: bool,
-) -> String {
+/// One `list` entry: the installed inventory plus the activation state the
+/// broker last recorded for that component name (#2254).
+///
+/// `activation` is read through the runtime's single reader
+/// ([`read_component_activation`]); `list` never derives a state of its own.
+#[derive(Debug, Clone)]
+pub struct ListedComponent {
+    /// Discovered inventory for the component name.
+    pub summary: ComponentSummary,
+    /// Recorded activation (`installed` when nothing was recorded).
+    pub activation: ActivationState,
+}
+
+fn summarize_list(
+    summaries: &[ComponentSummary],
+    user_root: Option<&Path>,
+    system_root: Option<&Path>,
+) -> Vec<ListedComponent> {
+    summaries
+        .iter()
+        .map(|summary| ListedComponent {
+            summary: summary.clone(),
+            activation: read_component_activation(user_root, system_root, &summary.name),
+        })
+        .collect()
+}
+
+fn format_list_table(listed: &[ListedComponent], _no_color: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<16} {:<12} {:<7} {:<8} {:<9}  PATH",
-        "NAME", "VERSION", "ACTIVE", "SOURCE", "ABI"
+        "{:<16} {:<12} {:<7} {:<8} {:<9} {:<30}  PATH",
+        "NAME", "VERSION", "ACTIVE", "SOURCE", "ABI", "ACTIVATION"
     );
     let mut rows = 0usize;
-    for summary in summaries {
+    for entry in listed {
+        let summary = &entry.summary;
+        let activation = entry.activation.label();
         if summary.versions.is_empty() {
             let active = summary.active_version.as_deref().unwrap_or("(none)");
             let source = summary.active_source.map_or("-", |source| source.label());
             let _ = writeln!(
                 out,
-                "{:<16} {:<12} {:<7} {:<8} {:<9}  (missing version dir)",
-                summary.name, active, "*", source, "missing",
+                "{:<16} {:<12} {:<7} {:<8} {:<9} {:<30}  (missing version dir)",
+                summary.name, active, "*", source, "missing", activation,
             );
             rows += 1;
             continue;
@@ -1310,12 +1344,13 @@ fn format_list_table(
             };
             let _ = writeln!(
                 out,
-                "{:<16} {:<12} {:<7} {:<8} {:<9}  {}",
+                "{:<16} {:<12} {:<7} {:<8} {:<9} {:<30}  {}",
                 summary.name,
                 installed.version,
                 if is_active { "*" } else { "-" },
                 installed.source.label(),
                 abi,
+                activation,
                 installed.executable_path.display(),
             );
             rows += 1;
@@ -1351,17 +1386,23 @@ fn json_escape(value: &str) -> String {
 /// verb rename: both spellings share this handler, so stdout stays
 /// byte-identical and machine consumers keep parsing without a flag day.
 /// Only the stderr deprecation note distinguishes the alias.
+///
+/// `activation` / `activation_class` were added for #2254 at the end of each
+/// component object: existing fields keep their order and meaning, and
+/// `activation` is the same `installed|active|denied:<class>|crashed|stopped`
+/// label the table shows.
 #[must_use]
-pub fn format_list_envelope(summaries: &[bitty_runtime::component::ComponentSummary]) -> String {
+pub fn format_list_envelope(listed: &[ListedComponent]) -> String {
     let mut out = String::from(
         "{\"v\":1,\"command\":\"component\",\"ok\":true,\"result\":{\"verb\":\"list\",",
     );
-    let _ = write!(out, "\"count\":{},", summaries.len());
+    let _ = write!(out, "\"count\":{},", listed.len());
     out.push_str("\"components\":[");
-    for (index, summary) in summaries.iter().enumerate() {
+    for (index, entry) in listed.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
+        let summary = &entry.summary;
         let _ = write!(
             out,
             "{{\"name\":\"{}\",\"active_version\":{},\"active_source\":{},\"active_path\":{},\"versions\":[",
@@ -1394,7 +1435,15 @@ pub fn format_list_envelope(summaries: &[bitty_runtime::component::ComponentSumm
                 json_escape(&installed.executable_path.display().to_string()),
             );
         }
-        out.push_str("]}}");
+        let _ = write!(
+            out,
+            "],\"activation\":\"{}\",\"activation_class\":{}}}",
+            json_escape(&entry.activation.label()),
+            match entry.activation.class() {
+                Some(class) => format!("\"{}\"", json_escape(class)),
+                None => "null".to_string(),
+            },
+        );
     }
     out.push_str("]}}");
     out
@@ -2422,12 +2471,10 @@ fn op_remove(
                 }
             }
             // Prune the component dir when the last version is gone and no
-            // `current` remains.
-            if let Ok(mut entries) = std::fs::read_dir(&component_dir) {
-                if entries.next().is_none() {
-                    let _ = std::fs::remove_dir(&component_dir);
-                }
-            }
+            // `current` remains. The activation projection (#2254) is not an
+            // installed version: drop it too so a reinstall starts from
+            // `installed`.
+            prune_component_dir(&component_dir);
             Ok(format!("removed component '{name}' version {version}"))
         }
         None => {
@@ -2442,10 +2489,28 @@ fn op_remove(
     }
 }
 
+/// Drop the component directory once no version directory remains.
+///
+/// The activation record (`activation`) is a runtime projection, not an
+/// installed version, so it must not keep a removed component visible.
+fn prune_component_dir(component_dir: &Path) {
+    let has_versions = std::fs::read_dir(component_dir)
+        .map(|entries| entries.flatten().any(|entry| entry.path().is_dir()))
+        .unwrap_or(true);
+    if has_versions {
+        return;
+    }
+    let _ = std::fs::remove_file(activation_path(component_dir));
+    if let Ok(mut entries) = std::fs::read_dir(component_dir) {
+        if entries.next().is_none() {
+            let _ = std::fs::remove_dir(component_dir);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // show-source (pinned-byte transparency, issue #1986)
 // ---------------------------------------------------------------------------
-
 /// Print the exact pinned bytes of one installed extension (issue #1986).
 ///
 /// Resolution is user-first across both tiers (via `discover_components`):

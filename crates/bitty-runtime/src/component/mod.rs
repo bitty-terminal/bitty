@@ -19,6 +19,11 @@
 //!   user tier wins on collision and a tampered user install fails closed
 //!   without system fallback. [`discover_components`] merges both tiers for
 //!   `bitty extension list`.
+//! - [`read_component_activation`] reads the bounded activation projection
+//!   the broker writes beside `current` on spawn, crash, idle/shutdown stop,
+//!   and fail-closed denial, so `list` reports an activation state
+//!   (`installed`, `active`, `denied:<class>`, `crashed`, `stopped`) without
+//!   starting an instance or executing a component.
 //! - [`ComponentDescriptor`] validation checks the name grammar, the semver
 //!   version, the executable name (no path separators), the protocol range,
 //!   and the SHA-256 digest of the executable. Every spawn re-runs the full
@@ -71,6 +76,7 @@
 //! the application event loop), per-platform process sandboxing, and the
 //! registry install source.
 
+mod activation;
 mod broker;
 mod descriptor;
 mod env;
@@ -83,6 +89,10 @@ mod wsl;
 
 use std::time::Duration;
 
+pub use activation::{
+    ActivationDenial, ActivationState, COMPONENT_ACTIVATION_FILE, COMPONENT_ACTIVATION_MAX_BYTES,
+    activation_path, read_activation, read_component_activation,
+};
 pub use broker::{
     BrokerConfig, BrokerError, BrokerEvent, BrokerEventKind, ComponentBroker, ComponentRequest,
     ComponentState, ComponentStatus, ComponentWarnSink, RequestId, StopOutcome,

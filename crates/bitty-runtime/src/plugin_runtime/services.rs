@@ -5631,14 +5631,24 @@ mod tests {
         services.fs_window_start.get() + Duration::from_millis(1)
     }
 
+    /// Scan budget for tests that assert window accounting, not scan time.
+    ///
+    /// The production direct-call default is the RC-1 50 ms budget. A loaded
+    /// runner can spend that before the first directory entry is read, so a
+    /// rate-window test would abort with `E_TIMEOUT` before reaching the
+    /// denial it asserts. These tests keep the production window semantics
+    /// and only opt out of the scan deadline.
+    const FIXTURE_SCAN_BUDGET: Duration = Duration::from_secs(60);
+
     /// One `fs.list` call at a frozen window instant.
     fn list_at(services: &PluginServices, now: Instant) -> Result<LuaValue, BridgeError> {
-        services.fs_list_at(
-            "~/docs",
-            16,
-            now + Duration::from_millis(bitty_lua::RC1_WALL_CLOCK_BUDGET_MS),
-            now,
-        )
+        services.fs_list_at("~/docs", 16, now + FIXTURE_SCAN_BUDGET, now)
+    }
+
+    /// One `fs.list` call with the production window clock and a fixture scan
+    /// budget, for tests whose subject is neither the window nor the deadline.
+    fn list_with_generous_budget(services: &PluginServices) -> Result<LuaValue, BridgeError> {
+        services.fs_list_with_expiry("~/docs", 16, Instant::now() + FIXTURE_SCAN_BUDGET)
     }
 
     #[test]
@@ -5648,7 +5658,7 @@ mod tests {
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
         services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
 
-        let value = services.fs_list("~/docs", 16).expect("granted listing");
+        let value = list_with_generous_budget(&services).expect("granted listing");
         let LuaValue::Table(entries) = value else {
             panic!("fs.list must return an array");
         };
@@ -5675,15 +5685,11 @@ mod tests {
     fn fs_list_without_backend_or_grant_fails_closed() {
         let home = fs_list_test_home("closed");
         let services = services();
-        let error = services
-            .fs_list("~/docs", 16)
-            .expect_err("no backend must fail");
+        let error = list_with_generous_budget(&services).expect_err("no backend must fail");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
 
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
-        let error = services
-            .fs_list("~/docs", 16)
-            .expect_err("no grant must fail");
+        let error = list_with_generous_budget(&services).expect_err("no grant must fail");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
     }
 

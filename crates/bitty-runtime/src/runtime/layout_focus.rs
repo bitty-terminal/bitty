@@ -622,7 +622,13 @@ impl Runtime {
     #[must_use]
     pub fn paint_frames_at(&self, now: std::time::Instant) -> Vec<PresentFrame> {
         let frames = self.present_frames();
-        self.paint_frames_from(&frames, now).unwrap_or(frames)
+        let mut painted = self.paint_frames_from(&frames, now).unwrap_or(frames);
+        // Issue #2337: the Mod+drag ghost is paint-only and lives on the
+        // same seam as geometry interpolation.
+        if self.tiled_drag_active() {
+            self.apply_tiled_drag_paint(&mut painted);
+        }
+        painted
     }
 
     /// Applies active geometry interpolation to already-computed logical

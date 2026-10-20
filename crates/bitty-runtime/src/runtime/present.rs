@@ -2137,8 +2137,18 @@ impl Runtime {
         }
         // CTX-1335: apply paint-only bounds interpolation. The logical
         // `allocations` below stay final (hit-testing, PTY size, and terminal
-        // truth never observe the animated rectangles).
-        let paint_allocations = self.paint_frames_from(&allocations, now);
+        // truth never observe the animated rectangles). Issue #2337: the
+        // Mod+drag ghost is layered on top as another paint-only transform,
+        // so a drag never changes solver geometry or PTY winsize.
+        let mut paint_allocations = self.paint_frames_from(&allocations, now);
+        if self.tiled_drag_active() {
+            let mut paint = paint_allocations
+                .take()
+                .unwrap_or_else(|| allocations.clone());
+            if self.apply_tiled_drag_paint(&mut paint) {
+                paint_allocations = Some(paint);
+            }
+        }
 
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).

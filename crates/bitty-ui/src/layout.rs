@@ -846,6 +846,53 @@ impl LayoutNode {
         placed
     }
 
+    /// Swaps the panels of two leaves without touching split geometry.
+    ///
+    /// Both [`View`] payloads exchange positions in one deterministic pass:
+    /// ids, pane sessions, presentation mode, pseudo/fixed constraints, and
+    /// scroll offsets follow their panel, while every split axis and ratio
+    /// stays byte-identical. This is the center-drop reflow of the
+    /// Hyprland-style Mod+drag move (issue #2337): a swap is a content
+    /// exchange, never a re-parent, so the resulting tree keeps the original
+    /// arrangement exactly.
+    ///
+    /// Returns `false` with the tree untouched when either id is absent,
+    /// both ids are equal (self-drop no-op), or the tree already contains
+    /// the internal sentinel id (fail-closed; unreachable through the
+    /// monotonic `ViewId` high-water).
+    pub fn swap_leaves(&mut self, a: ViewId, b: ViewId) -> bool {
+        const SENTINEL: ViewId = ViewId::new(u64::MAX);
+        if a == b || self.contains_leaf(SENTINEL) {
+            return false;
+        }
+        if !self.contains_leaf(a) || !self.contains_leaf(b) {
+            return false;
+        }
+        let (Some(view_a), Some(view_b)) = (self.find_leaf(a).cloned(), self.find_leaf(b).cloned())
+        else {
+            return false;
+        };
+        // Park `a` under the sentinel id so the second lookup cannot resolve
+        // the already-swapped copy, then install each payload into the other
+        // slot. Three bounded tree walks, no allocation beyond the two
+        // cloned payloads.
+        let Some(slot_a) = self.find_leaf_mut(a) else {
+            return false;
+        };
+        *slot_a = View::new(SENTINEL, 1, 1);
+        let Some(slot_b) = self.find_leaf_mut(b) else {
+            debug_assert!(false, "swap target vanished after lookup");
+            return false;
+        };
+        *slot_b = view_a;
+        let Some(slot_sentinel) = self.find_leaf_mut(SENTINEL) else {
+            debug_assert!(false, "swap sentinel vanished after parking");
+            return false;
+        };
+        *slot_sentinel = view_b;
+        true
+    }
+
     /// Inserts `dragged` beside the node holding `sibling` (CW-09).
     ///
     /// Splits the node holding `sibling` into `Split { axis, ratio, ... }`
@@ -2895,6 +2942,70 @@ mod tests {
         assert_eq!(alloc[0].1.height as u32 + alloc[1].1.height as u32, 24);
         assert_eq!(alloc[0].0, ViewId::new(2));
         assert_eq!(alloc[1].0, ViewId::new(1));
+    }
+
+    #[test]
+    fn swap_leaves_exchanges_panels_and_keeps_split_geometry() {
+        // Issue #2337: a center drop swaps whole View payloads (panel state
+        // follows its id) while every split axis/ratio stays untouched.
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.3,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.6,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::leaf(view(3, 40, 12)),
+            ),
+        );
+        let before = tree.clone();
+        let root_ratio = tree.split_ratio_at(&[]).expect("root split");
+        let inner_ratio = tree.split_ratio_at(&[1]).expect("inner split");
+        assert!(tree.swap_leaves(ViewId::new(1), ViewId::new(3)));
+        assert_eq!(tree.split_ratio_at(&[]), Some(root_ratio));
+        assert_eq!(tree.split_ratio_at(&[1]), Some(inner_ratio));
+        assert_eq!(tree.leaf_count(), 3);
+        let alloc = tree.layout(Rect::new(0, 0, 80, 24));
+        let before_alloc = before.layout(Rect::new(0, 0, 80, 24));
+        assert_eq!(alloc[0].0, ViewId::new(3), "leaf 3 took the swap slot");
+        assert_eq!(alloc[2].0, ViewId::new(1), "leaf 1 took the inner slot");
+        assert_eq!(alloc[0].1, before_alloc[0].1);
+        assert_eq!(alloc[2].1, before_alloc[2].1);
+        // Self and unknown ids are fail-soft no-ops.
+        let stable = tree.clone();
+        assert!(!tree.swap_leaves(ViewId::new(1), ViewId::new(1)));
+        assert!(!tree.swap_leaves(ViewId::new(1), ViewId::new(404)));
+        assert!(!tree.swap_leaves(ViewId::new(404), ViewId::new(1)));
+        assert_eq!(tree, stable);
+    }
+
+    #[test]
+    fn swap_leaves_carries_scroll_and_presentation_with_the_panel() {
+        // Swap exchanges the View payload, not just the id: scroll offset and
+        // presentation mode stay attached to the panel that owns them.
+        let mut first = view(1, 40, 24);
+        first.set_scroll_offset(7, 100);
+        first.set_presentation(crate::presentation::PresentationMode::Floating);
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(first),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert!(tree.swap_leaves(ViewId::new(1), ViewId::new(2)));
+        let one = tree.find_leaf(ViewId::new(1)).expect("leaf 1");
+        let two = tree.find_leaf(ViewId::new(2)).expect("leaf 2");
+        assert_eq!(one.scroll_offset(), 7);
+        assert_eq!(
+            one.presentation(),
+            crate::presentation::PresentationMode::Floating
+        );
+        assert_eq!(two.scroll_offset(), 0);
+        assert_eq!(
+            two.presentation(),
+            crate::presentation::PresentationMode::Tiled
+        );
     }
 
     #[test]

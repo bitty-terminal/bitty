@@ -2,25 +2,24 @@
 //!
 //! Headless pins: Mod(Alt/Super)+press on a tiled leaf grabs it (no
 //! selection starts, focus follows the dragged pane), motion tracks the
-//! advisory preview target live without mutating the tree, release
-//! re-parents with position-based sizing (nearest-edge docking, ratio from
-//! the drop position), and the release never desyncs into a selection
-//! commit. Shift still forces selection; floating leaves stay on the
-//! Alt+drag path; single-leaf trees fail soft to block selection.
+//! advisory preview target live without mutating the tree, release commits
+//! exactly one reflow (center swap, edge insert at a balanced split), and
+//! the release never desyncs into a selection commit. Shift still forces
+//! selection; floating leaves stay on the Alt+drag path; single-leaf trees
+//! fail soft to block selection.
 //!
-//! Issue #1811 (CTX-1070): the drag shows continuous feedback (ghost
-//! outline on the dragged frame plus drop-target highlight under the
-//! cursor, both via the Core-owned chrome-ring drag transition), corner
-//! drops resolve through the accepted #1804 balanced policy at `0.5`, a
-//! committed drop settles via the move transition, and `Esc` cancels
-//! mid-drag restoring the pre-drag layout byte-identically.
+//! Issue #2337: pointer-down arms a bounded present-only ghost that follows
+//! the pointer one-to-one from the grab point and highlights the candidate
+//! tile. Solver geometry, leaf grids, and PTY winsizes stay untouched until
+//! the release commits one swap/insert; `Esc`, pointer leave, and window
+//! focus loss cancel and restore the original layout byte-identically.
 //!
 //! Issue #1981 (CTX-1167): motion holds the drag arms so ring progress
 //! accumulates toward full visibility; repeat motion never restarts the
 //! transition (which had pinned the ghost near-invisible).
 use bitty_platform::{CursorPosition, MouseButton, NamedKey, PressState};
 use bitty_runtime::{
-    AnimationKind, AnimationPolicy, DropSpec, LayoutNode, ReducedMotionMode, Runtime,
+    AnimationKind, AnimationPolicy, DropPlan, DropSpec, LayoutNode, ReducedMotionMode, Runtime,
     RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
 
@@ -52,7 +51,7 @@ fn release(button: MouseButton) -> bitty_platform::MouseEvent {
 /// decoration outer inset at scale 1). Matches the
 /// `cursor_to_leaf_cell` / `cursor_to_layout_point` origin (padding plus
 /// decoration outer, CTX-1168 issue 1983) so drop positions map to exact
-/// cells for position-based sizing.
+/// cells for drop-zone classification.
 fn cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
         x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
@@ -155,7 +154,11 @@ fn motion_tracks_preview_live_without_mutating() {
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.tiled_drag_active());
-    assert_eq!(rt.tiled_drag_preview(), None, "no hover recorded yet");
+    assert_eq!(
+        rt.tiled_drag_preview(),
+        Some(ViewId::new(1)),
+        "pointer-down records the source under the press"
+    );
     // Hover the right pane: preview tracks it, tree untouched.
     rt.handle_cursor_moved(cell_pixels(60, 12));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
@@ -169,18 +172,27 @@ fn motion_tracks_preview_live_without_mutating() {
 }
 
 #[test]
-fn release_commits_position_based_reparent_without_selection() {
+fn release_commits_edge_insert_at_balanced_ratio_without_selection() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane());
     rt.handle_cursor_moved(cell_pixels(10, 12));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.tiled_drag_active());
-    // Drop near the right edge of the right pane (col 70 in an 80-col
-    // container; right pane spans 40..80): docks after with ratio 0.75,
-    // so the dragged pane lands small (25%).
-    rt.handle_cursor_moved(cell_pixels(70, 12));
+    // Drop on the right edge of the right pane (col 78 in an 80-col
+    // container; right pane spans 40..80): inserts after the target at a
+    // balanced half, never a position-sized sliver.
+    rt.handle_cursor_moved(cell_pixels(78, 12));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    assert_eq!(
+        rt.tiled_drag_drop_plan(),
+        Some(DropPlan::Insert(DropSpec::new(
+            ViewId::new(2),
+            SplitAxis::Horizontal,
+            0.5,
+            true
+        )))
+    );
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.tiled_drag_active(), "release must end the drag");
     assert!(
@@ -189,13 +201,15 @@ fn release_commits_position_based_reparent_without_selection() {
     );
     // Source re-parented beside the target; focus stayed on the dragged pane.
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
-    let ids = rt.layout().leaf_ids();
-    assert_eq!(ids.len(), 2);
-    assert!(ids.contains(&ViewId::new(1)) && ids.contains(&ViewId::new(2)));
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(2), ViewId::new(1)],
+        "right-edge insert lands after the target"
+    );
     let ratio = rt.layout().split_ratio_at(&[]).expect("root split");
     assert!(
-        (ratio - 0.75).abs() < 1e-6,
-        "position-based sizing: drop x 70 -> ratio 0.75, got {ratio}"
+        (ratio - 0.5).abs() < 1e-6,
+        "edge insert is balanced, got {ratio}"
     );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
@@ -292,7 +306,7 @@ fn cursor_left_cancels_without_committing() {
     };
 }
 
-// -- Issue #1811 (CTX-1070) live preview, balanced corners, Esc cancel --
+// -- Issue #1811 (CTX-1070) live preview and Esc cancel ------------------
 
 #[test]
 fn drag_arms_live_preview_and_drop_settles() {
@@ -355,12 +369,9 @@ fn drag_arms_live_preview_and_drop_settles() {
         (0.0..1.0).contains(&q2),
         "highlight must be visibly climbing, got {q2}"
     );
-    // The live plan tracks the hovered edge: the center tie docks left at
-    // half, matching the position-based placement a release would commit.
-    assert_eq!(
-        rt.tiled_drag_drop_spec(),
-        Some(DropSpec::new(target, SplitAxis::Horizontal, 0.5, false))
-    );
+    // The live plan tracks the hovered center: release would swap the two
+    // panels in place, exactly the single mutation the commit performs.
+    assert_eq!(rt.tiled_drag_drop_plan(), Some(DropPlan::Swap { target }));
     // Mid-transition the preview is still live.
     let mid = t0 + Duration::from_millis(75);
     assert!(
@@ -503,22 +514,23 @@ fn corner_drop_inserts_balanced_cell() {
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.tiled_drag_active());
-    // Top-right corner of the right pane (col 76, row 2): the physically
-    // tall target stacks the dragged pane above it at a balanced half
-    // instead of a position-sized sliver.
+    // Near the top-right corner of the right pane (col 76, row 2): the
+    // normalized vertical distance is smaller than the horizontal one, so
+    // the nearest-edge rule stacks the dragged pane above it at a balanced
+    // half instead of a position-sized sliver.
     rt.handle_cursor_moved(cell_pixels(76, 2));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
     let spec = rt
         .tiled_drag_drop_spec()
-        .expect("corner hover must plan a drop");
+        .expect("edge hover must plan an insert");
     assert_eq!(spec.target, ViewId::new(2));
     assert_eq!(spec.axis, SplitAxis::Vertical);
     assert!(
         (spec.ratio - 0.5).abs() < 1e-6,
-        "corner drops split balanced, got {}",
+        "edge inserts split balanced, got {}",
         spec.ratio
     );
-    assert!(!spec.after, "top corner docks before");
+    assert!(!spec.after, "top edge docks before");
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.tiled_drag_active());
     assert!(!rt.has_selection());
@@ -530,7 +542,7 @@ fn corner_drop_inserts_balanced_cell() {
     assert_eq!(rt.layout().split_axis_at(&[]), Some(SplitAxis::Vertical));
     assert!(
         (rt.layout().split_ratio_at(&[]).expect("root split") - 0.5).abs() < 1e-6,
-        "corner drop must land balanced"
+        "edge insert must land balanced"
     );
     assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
@@ -549,7 +561,7 @@ fn esc_cancels_mid_drag_byte_identical_without_selection() {
     // untouched.
     rt.handle_cursor_moved(cell_pixels(60, 12));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
-    assert!(rt.tiled_drag_drop_spec().is_some());
+    assert!(rt.tiled_drag_drop_plan().is_some());
     assert_eq!(*rt.layout(), before);
     // Esc cancels the gesture and is consumed (never reaches the shell).
     let delivered = rt.handle_key_event(named_key(NamedKey::Escape, PressState::Pressed));
@@ -560,7 +572,7 @@ fn esc_cancels_mid_drag_byte_identical_without_selection() {
     );
     assert!(!rt.tiled_drag_active(), "Esc must end the drag");
     assert_eq!(rt.tiled_drag_preview(), None);
-    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    assert_eq!(rt.tiled_drag_drop_plan(), None);
     assert_eq!(
         *rt.layout(),
         before,
@@ -599,14 +611,14 @@ fn cursor_left_cancel_clears_preview_and_repaints() {
     rt.handle_mouse_input(press(MouseButton::Left));
     rt.handle_cursor_moved(cell_pixels(60, 12));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
-    assert!(rt.tiled_drag_drop_spec().is_some());
+    assert!(rt.tiled_drag_drop_plan().is_some());
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
         kind: WindowEventKind::CursorLeft,
     });
     assert!(!rt.tiled_drag_active(), "leave must cancel the drag");
     assert_eq!(rt.tiled_drag_preview(), None);
-    assert_eq!(rt.tiled_drag_drop_spec(), None);
+    assert_eq!(rt.tiled_drag_drop_plan(), None);
     assert_eq!(*rt.layout(), before, "cancel must not mutate the tree");
     assert!(
         rt.tick_at(Instant::now()).is_some(),
@@ -677,7 +689,7 @@ fn mod_press_under_capture_starts_tiled_drag() {
         rt.pending_input().is_empty(),
         "grabbing press must not report to the app"
     );
-    rt.handle_cursor_moved(cell_pixels(70, 12));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
     assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.tiled_drag_active());
@@ -686,10 +698,15 @@ fn mod_press_under_capture_starts_tiled_drag() {
         "release must commit, not report (the app never saw the press)"
     );
     assert!(!rt.has_selection());
-    let ratio = rt.layout().split_ratio_at(&[]).expect("root split");
-    assert!(
-        (ratio - 0.75).abs() < 1e-6,
-        "drop must commit position-based sizing, got {ratio}"
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(2), ViewId::new(1)],
+        "center drop swaps the panels"
+    );
+    assert_eq!(
+        rt.layout().split_ratio_at(&[]),
+        Some(0.5),
+        "swap keeps the split geometry"
     );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
@@ -820,8 +837,8 @@ fn outer_gaps_drop_selects_correct_target() {
     assert!(rt.tiled_drag_active());
     assert_eq!(rt.tiled_drag_source(), Some(ViewId::new(1)));
     // Container 80x24 with outer 2: left (2,2,38,20), right (40,2,38,20).
-    // Col 41 is the second col of the right pane.
-    rt.handle_cursor_moved(cell_pixels(41, 12));
+    // Col 77 is the last painted col of the right pane (40..78).
+    rt.handle_cursor_moved(cell_pixels(77, 12));
     assert_eq!(
         rt.tiled_drag_preview(),
         Some(ViewId::new(2)),
@@ -830,12 +847,15 @@ fn outer_gaps_drop_selects_correct_target() {
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.tiled_drag_active());
     assert!(!rt.has_selection());
-    let ids = rt.layout().leaf_ids();
-    assert!(ids.contains(&ViewId::new(1)) && ids.contains(&ViewId::new(2)));
-    assert_ne!(
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(2), ViewId::new(1)],
+        "right-edge insert must move the dragged pane after the target"
+    );
+    assert_eq!(
         rt.layout().split_ratio_at(&[]),
         Some(0.5),
-        "drop beside the target must re-parent with position sizing"
+        "edge insert is balanced"
     );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
@@ -1028,5 +1048,295 @@ fn deco_outer_band_press_grabs_no_tile_and_headed_origin_grabs() {
         "headed origin must grab the left pane"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+// -- Issue #2337 ghost preview, bounded motion, and Hyprland reflow ------
+
+#[test]
+fn press_arms_ghost_without_layout_or_pty_geometry_mutation() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let before_layout = rt.layout().clone();
+    let before_frames = rt.present_frames();
+    let source = ViewId::new(1);
+    let source_frame = before_frames
+        .iter()
+        .find(|frame| frame.view == source)
+        .copied()
+        .expect("source frame");
+    let pos = cell_pixels(10, 12);
+    rt.handle_cursor_moved(pos);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active(), "press must arm the gesture");
+    assert_eq!(
+        rt.tiled_drag_ghost_offset(),
+        Some((0, 0)),
+        "ghost starts exactly over the committed source frame"
+    );
+    let preview = rt.tiled_drag_preview_frame().expect("ghost frame");
+    assert_eq!(preview.frame, source_frame.frame);
+    assert_eq!(preview.content, source_frame.content);
+    assert_eq!(
+        *rt.layout(),
+        before_layout,
+        "press must not commit or reflow the tree"
+    );
+    assert_eq!(
+        rt.present_frames(),
+        before_frames,
+        "press must not move solver frames or PTY geometry"
+    );
+    assert_eq!(
+        rt.tiled_drag_preview(),
+        Some(source),
+        "pointer-down records the candidate under the cursor"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Move, Some(source), std::time::Instant::now())
+            .is_none(),
+        "press must not settle a committed move"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn motion_moves_ghost_without_mutating_layout_or_frames() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let before_layout = rt.layout().clone();
+    let before_frames = rt.present_frames();
+    let source = ViewId::new(1);
+    let source_frame = before_frames
+        .iter()
+        .find(|frame| frame.view == source)
+        .copied()
+        .expect("source frame");
+    let press_pos = cell_pixels(10, 12);
+    let move_pos = cell_pixels(30, 12);
+    rt.handle_cursor_moved(press_pos);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(move_pos);
+    let expected = (
+        (move_pos.x.round() as i32) - (press_pos.x.round() as i32),
+        (move_pos.y.round() as i32) - (press_pos.y.round() as i32),
+    );
+    assert_eq!(
+        rt.tiled_drag_ghost_offset(),
+        Some(expected),
+        "ghost must follow pointer motion one-to-one (ignoring motion mutation fails)"
+    );
+    let preview = rt.tiled_drag_preview_frame().expect("ghost frame");
+    assert_eq!(preview.frame.x, source_frame.frame.x + expected.0);
+    assert_eq!(preview.content.x, source_frame.content.x + expected.0);
+    assert_eq!(
+        preview.frame.width, source_frame.frame.width,
+        "the ghost translates; it never resizes the panel"
+    );
+    assert_eq!(
+        *rt.layout(),
+        before_layout,
+        "motion must not mutate the solver tree"
+    );
+    assert_eq!(
+        rt.present_frames(),
+        before_frames,
+        "motion must not reflow solver frames (PTY size follows only commit)"
+    );
+    let painted = rt.paint_frames_at(std::time::Instant::now());
+    let ghost = painted
+        .iter()
+        .find(|frame| frame.view == source)
+        .expect("painted ghost");
+    assert_eq!(ghost.frame.x, source_frame.frame.x + expected.0);
+    assert_eq!(
+        ghost.tier,
+        Some(bitty_runtime::OverlayTier::Float),
+        "the ghost paints above the untouched tiled layout"
+    );
+    assert_eq!(
+        painted.last().map(|frame| frame.view),
+        Some(source),
+        "the ghost is the last painted frame"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn ghost_is_bounded_inside_the_container() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let press_pos = cell_pixels(10, 12);
+    rt.handle_cursor_moved(press_pos);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Far outside the window: the ghost clamps instead of leaving the
+    // container or growing unbounded.
+    rt.handle_cursor_moved(CursorPosition {
+        x: 5000.0,
+        y: 5000.0,
+    });
+    let (dx, dy) = rt.tiled_drag_ghost_offset().expect("ghost offset");
+    let raw_dx = 5000 - press_pos.x.round() as i32;
+    assert!(dx < raw_dx, "ghost translation must clamp, got dx {dx}");
+    assert!(dy > 0);
+    let preview = rt.tiled_drag_preview_frame().expect("ghost frame");
+    // Default headless container: 80x24 cells at 9x19 px.
+    let right = 80 * 9;
+    let bottom = 24 * 19;
+    assert!(
+        preview.frame.x + preview.frame.width as i32 <= right,
+        "ghost must stay inside the container"
+    );
+    assert!(
+        preview.frame.y + preview.frame.height as i32 <= bottom,
+        "ghost must stay inside the container"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn center_release_swaps_exactly_once_and_keeps_geometry() {
+    let mut rt = make_runtime();
+    let layout = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.3,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    );
+    rt.set_layout(layout);
+    let before = rt.present_frames();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Center of the right pane (24..80, so x = 52): a swap, not an insert.
+    rt.handle_cursor_moved(cell_pixels(52, 12));
+    assert_eq!(
+        rt.tiled_drag_drop_plan(),
+        Some(DropPlan::Swap {
+            target: ViewId::new(2)
+        })
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert_eq!(
+        rt.layout().split_ratio_at(&[]),
+        Some(0.3),
+        "swap keeps the split ratio byte-identical"
+    );
+    let after = rt.present_frames();
+    let before_one = before.iter().find(|f| f.view == ViewId::new(1)).unwrap();
+    let before_two = before.iter().find(|f| f.view == ViewId::new(2)).unwrap();
+    let after_one = after.iter().find(|f| f.view == ViewId::new(1)).unwrap();
+    let after_two = after.iter().find(|f| f.view == ViewId::new(2)).unwrap();
+    assert_eq!(after_one.frame, before_two.frame, "panel 1 took slot 2");
+    assert_eq!(after_two.frame, before_one.frame, "panel 2 took slot 1");
+    assert_eq!(
+        after_one.cols, before_two.cols,
+        "swapped pane grid follows its new slot exactly once"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn focus_loss_cancels_ghost_and_restores_layout() {
+    use bitty_platform::{PlatformEvent, WindowEventKind, WindowId};
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    let before = rt.layout().clone();
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert!(rt.tiled_drag_active());
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::Focused(false),
+    });
+    assert!(!rt.tiled_drag_active(), "focus loss must cancel the drag");
+    assert_eq!(rt.tiled_drag_ghost_offset(), None);
+    assert_eq!(*rt.layout(), before, "cancel must not commit a swap");
+    assert!(!rt.has_selection());
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(*rt.layout(), before, "stale release must not commit");
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_never_resizes_pty_and_commit_resizes_once() {
+    let mut rt = make_runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.3,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt.tick().expect("first full redraw");
+    rt.spawn_shell("/bin/sh").expect("primary shell");
+    let pane = ViewId::new(2);
+    let pane_frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == pane)
+        .expect("pane frame");
+    rt.spawn_shell_for_view(pane, "/bin/sh", &[], pane_frame.cols, pane_frame.rows)
+        .expect("pane shell");
+    let primary_before = rt.pty_size().expect("primary size");
+    let pane_before = rt.pane_pty_size(&pane).expect("pane size");
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Cross into the center of the right pane (24..80, so x = 52) without
+    // releasing: the ghost moves, PTYs do not, and the plan is a real swap.
+    rt.handle_cursor_moved(cell_pixels(52, 12));
+    assert_eq!(
+        rt.tiled_drag_drop_plan(),
+        Some(DropPlan::Swap {
+            target: ViewId::new(2)
+        }),
+        "the PTY test must exercise a center swap, not an edge insert"
+    );
+    assert_eq!(
+        rt.pty_size(),
+        Some(primary_before),
+        "preview must never resize the primary PTY"
+    );
+    assert_eq!(
+        rt.pane_pty_size(&pane),
+        Some(pane_before),
+        "preview must never resize a pane PTY"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    let after_pane = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == pane)
+        .expect("pane frame after swap");
+    let after_primary = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == ViewId::new(1))
+        .expect("primary frame after swap");
+    assert_eq!(
+        rt.pane_pty_size(&pane),
+        Some((after_pane.cols, after_pane.rows)),
+        "committed swap must resize the pane PTY exactly once"
+    );
+    assert_eq!(
+        rt.pty_size(),
+        Some((after_primary.cols, after_primary.rows)),
+        "committed swap must resize the primary PTY to its new slot"
+    );
+    assert_ne!(
+        (after_pane.cols, after_pane.rows),
+        pane_before,
+        "the uneven split must make the swap measurable"
+    );
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }

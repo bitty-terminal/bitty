@@ -2695,11 +2695,17 @@ impl PluginServices {
                 },
             )
             .collect();
-        let height = points
+        let height = specs
             .iter()
-            .map(|point| point.y)
+            .map(|spec| spec.rect.bottom())
+            .chain(
+                points
+                    .iter()
+                    .map(|point| u32::from(point.y).saturating_add(1)),
+            )
             .max()
-            .map_or(1, |y| y.saturating_add(1));
+            .unwrap_or(1)
+            .min(u32::from(u16::MAX)) as u16;
         let layer = HintAnnotationLayer::build_anchored(
             &specs,
             &labels,
@@ -8678,6 +8684,10 @@ mod tests {
         assert_eq!(panel.kind, bitty_ui::TargetKind::Panel);
         assert_eq!(panel.workspace, Some(WorkspaceId::new(7)));
         assert_eq!(panel.rect, Rect::new(1, 2, 20, 10));
+        // The viewport covers the full anchored target, not just the label
+        // anchor row, so pointer hits below the label still resolve.
+        assert!(layer.viewport().height >= 12);
+        assert!(layer.viewport().contains_point(Point::new(5, 5)));
         // The label anchor follows the live Core rectangle, not the
         // caller-supplied (0, 0) placeholder.
         assert_eq!(panel.anchor, Point::new(1, 2));

@@ -234,7 +234,7 @@ impl WorkspaceSource for LiveWorkspaces {
 /// runtime's plain-data [`TargetAnchorSummary`] rows once per tick, and a
 /// cold-path targeting session reads the last committed copy. Plugin calls
 /// never reach the live runtime and never see terminal content. Rows are
-/// already bounded by Core (`bitty_ui::MAX_TARGET_ANCHORS`).
+/// already bounded by Core (`bitty_ui::MAX_HINT_ANNOTATIONS`).
 #[derive(Default)]
 pub(crate) struct LiveTargets {
     rows: RefCell<Vec<TargetAnchorSummary>>,

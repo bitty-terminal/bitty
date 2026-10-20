@@ -332,8 +332,9 @@ impl Runtime {
     /// Visible panels come from one present-frame solve (the same geometry the
     /// compositor paints) converted to window cell coordinates; every
     /// workspace carries its stable id, and only the active workspace has a
-    /// visible rectangle. Panel identity is the hosted leaf id, stable across
-    /// moves and rebalances. Bounded by
+    /// visible rectangle. Panel identity is an issued `PanelId` keyed to the
+    /// hosted leaf, stable across moves and rebalances; the raw compositor
+    /// `ViewId` never leaves as a target. Bounded by
     /// [`bitty_ui::MAX_HINT_ANNOTATIONS`]; deterministic order.
     ///
     /// Time O(f + w) over present frames and workspaces; space O(f + w).
@@ -343,10 +344,20 @@ impl Runtime {
         let live = self.live_cell_metrics();
         let cw = live.width;
         let ch = live.height;
-        let active_seq = self
-            .workspaces
-            .get(self.active_workspace)
-            .map(|slot| slot.seq);
+        // Owning workspace per visible panel: layout leaves first, then
+        // workspace-local detached floats. Window-global pins have no single
+        // owning workspace and stay `None`.
+        let mut panel_workspace: BTreeMap<u64, u64> = BTreeMap::new();
+        for workspace in self.workspace_summaries() {
+            for panel in workspace.panel_ids {
+                panel_workspace.insert(panel, workspace.seq);
+            }
+        }
+        for workspace in &self.workspaces {
+            for view in workspace.floats.paint_ids() {
+                panel_workspace.insert(view.0, workspace.seq);
+            }
+        }
         let mut out = Vec::new();
         // Workspaces first: their container rectangle overlaps every panel, so
         // panels must be painted later for hit testing to prefer the panel.
@@ -383,7 +394,7 @@ impl Runtime {
                 out.push(TargetAnchorSummary {
                     kind: "panel".to_string(),
                     id: self.panel_target_id(frame.view).get(),
-                    workspace: active_seq,
+                    workspace: panel_workspace.get(&frame.view.0).copied(),
                     rect: Some((
                         x.min(u32::from(u16::MAX)) as u16,
                         y.min(u32::from(u16::MAX)) as u16,

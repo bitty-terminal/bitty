@@ -38,25 +38,6 @@ fn gate_vm(id: impl Into<String>) -> LuaVm {
     build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
 }
 
-/// Wall budget for fixtures that deliberately block past a 1-5 ms bridge
-/// deadline. The production 50 ms contract is covered by `measurement_lua`
-/// and `host_budget_accounting`; on loaded runners a 30 ms sleep can overshoot
-/// past 50 ms, and the completion check would then replace the expected
-/// `E_TIMEOUT` mirror with `WallClockExceeded`.
-const TIMEOUT_FIXTURE_WALL_BUDGET_MS: u64 = 60_000;
-
-/// Build a VM with a wide wall budget for timeout fixtures.
-fn timeout_vm(id: impl Into<String>) -> LuaVm {
-    build_plugin_vm(
-        id,
-        Some(VmBudgets {
-            wall_budget_ms: TIMEOUT_FIXTURE_WALL_BUDGET_MS,
-            ..VmBudgets::default()
-        }),
-    )
-    .expect("timeout fixture budgets are valid")
-}
-
 /// Build a VM with explicit budgets through the fail-closed gate.
 fn gate_vm_with(
     id: impl Into<String>,
@@ -492,7 +473,7 @@ fn cancellation_surfaces_catchable_timeout_and_keeps_vm_usable() {
         settings_delay_ms: 30,
         ..MirrorServices::default()
     });
-    let mut vm = timeout_vm("mirror.cancel");
+    let mut vm = gate_vm("mirror.cancel");
     install(&mut vm, services.clone(), 1);
 
     let outcome = vm

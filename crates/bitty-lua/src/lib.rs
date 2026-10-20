@@ -28,7 +28,7 @@
 //! | ID  | Dimension                         | Default                              | Enforcement point |
 //! |-----|-----------------------------------|--------------------------------------|---------------------|
 //! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
-//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | charged `Instant` deadline checked after every slice and again at callback completion; exceed => suspend |
+//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
 //! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
@@ -152,11 +152,10 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 /// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
 /// - Enforcement point: when charged time reaches the budget, the callback
 ///   suspends with [`SuspendReason::WallClockExceeded`] at the next slice
-///   boundary or at callback completion, whichever comes first. A callback
-///   that already finished its Lua body is still reported as suspended and the
-///   VM stays fail-closed. A write that already committed stays committed and
-///   is reported as committed. A write that never returns blocks the owning
-///   thread; the synchronous commit contract cannot preempt it.
+///   boundary; a callback that completes first is not suspended. A write
+///   that already committed stays committed and is reported as committed.
+///   A write that never returns blocks the owning thread; the synchronous
+///   commit contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 
 /// RC-1 host-call I/O credit cap (`5 s` = the bridge's supervised-call
@@ -193,33 +192,22 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 ///   wait made while that callback runs, capped at this value. Spawn-wait time
 ///   past the cap is charged like any other time, so a callback whose spawn
 ///   waits exceed the supervised budget (including one that raised its spawn
-///   deadline above it) suspends fail-closed at the next slice boundary or at
-///   completion.
+///   deadline above it) suspends fail-closed at the next slice boundary.
 /// - Not credited: Lua execution, chunk compilation, marshalling outside the
 ///   call, and any time the host does not spend inside the bridge call.
 /// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
 ///
 /// This credit composes with [`STORE_COMMIT_CREDIT_MAX_MS`] because they cover
 /// disjoint spans (store commit time is subtracted from the spawn-wait
-/// window). The budget values are unchanged. The wall limit is enforced on
-/// charged time at every slice boundary **and again at callback completion**,
-/// so a callback that finishes inside one stepped slice can no longer report
-/// success past the limit (bitty #2314). The maximum wall time a callback can
-/// consume and still report `Completed` is therefore bounded by the sum
+/// window). The budget values are unchanged; the credit caps are per-callback
+/// **credit bounds, not a proven hard wall ceiling**: the wall limit is
+/// checked at slice boundaries, and a callback that completes without
+/// crossing one is not suspended (completion-point enforcement is tracked in
+/// bitty#2314). The credit bound is the sum
 /// `RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS +
-/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 ms = 5250 ms).
-///
-/// Exhausting a credit bound is not itself a suspension signal: once the
-/// host-call credit stops accruing, later host time is charged against the
-/// wall budget, and the callback suspends only when charged time (Lua work
-/// plus host time past a credit cap) reaches `RC1_WALL_CLOCK_BUDGET_MS`.
-/// [`SuspendReason::WallClockExceeded`] reports that charged time, not raw wall
-/// time; raw time remains in `wall_elapsed_ms`. The completion check runs after
-/// the callback body, so effects that landed before completion are not rolled
-/// back; the caller still never receives a successful result past the bound.
-///
-/// Every credited span must be measured by the host, never chosen by the
-/// plugin. The policy is documented in the isolation RFC (RC-1 row and
+/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 ms), and every credited span must
+/// be measured by the host, never chosen by the plugin. The policy is
+/// documented in the isolation RFC (RC-1 row and
 /// `R-RC1-HOST-CALL-CREDIT`, bitty-plugins-docs#169).
 pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
 
@@ -461,19 +449,6 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Wall suspension when charged time reaches `budget_ms`.
-///
-/// Shared by the slice-boundary check and the callback-completion check so a
-/// callback that finishes inside one stepped slice reports the identical
-/// typed reason instead of completing. Reaching the budget is fail-closed
-/// (`>=`), matching the documented RC-1 hard limit.
-fn wall_suspension(charged_ms: u64, budget_ms: u64) -> Option<SuspendReason> {
-    (charged_ms >= budget_ms).then_some(SuspendReason::WallClockExceeded {
-        elapsed_ms: charged_ms,
-        budget_ms,
-    })
-}
-
 // ── errors ───────────────────────────────────────────────────────────────────
 
 /// VM execution error (fail-closed).
@@ -518,14 +493,9 @@ pub enum SuspendReason {
         /// Budget.
         budget: u64,
     },
-    /// Wall-clock deadline exceeded on charged time.
-    ///
-    /// `elapsed_ms` is raw wall time minus the capped store-commit and
-    /// supervised spawn-wait credits: the same value the slice-boundary and
-    /// completion checks compare. Raw wall time is reported separately in
-    /// `wall_elapsed_ms`.
+    /// Wall-clock deadline exceeded.
     WallClockExceeded {
-        /// Charged elapsed ms compared with the budget.
+        /// Elapsed ms.
         elapsed_ms: u64,
         /// Budget ms.
         budget_ms: u64,
@@ -1282,13 +1252,9 @@ impl LuaVm {
     ///
     /// The hard wall limit uses charged time from [`BudgetMark::read`]:
     /// durable commit I/O of committed disk-backed `bitty.store.set` writes
-    /// (this VM's own or a nested cross-VM provider's) and supervised
-    /// `process.spawn` waits are not charged, each up to its per-callback cap
-    /// ([`STORE_COMMIT_CREDIT_MAX_MS`], [`HOST_CALL_CREDIT_MAX_MS`]). The
-    /// warning threshold and the reported `wall_elapsed_ms` use raw wall-clock
-    /// time (bitty #1518). The limit is checked after every slice and again
-    /// when the executor finishes, so a callback cannot complete past it
-    /// (bitty #2314).
+    /// (this VM's own or a nested cross-VM provider's) is not charged, up to
+    /// [`STORE_COMMIT_CREDIT_MAX_MS`] per callback. The warning threshold and
+    /// the reported `wall_elapsed_ms` use raw wall-clock time (bitty #1518).
     pub(crate) fn drive_stashed(
         &mut self,
         stashed: StashedExecutor,
@@ -1365,7 +1331,11 @@ impl LuaVm {
             // Wall hard limit on charged time (raw minus the capped store
             // commit and supervised spawn-wait credits); the reason reports
             // the charged time it compares.
-            if let Some(reason) = wall_suspension(charged_ms, self.wall_budget_ms) {
+            if charged_ms >= self.wall_budget_ms {
+                let reason = SuspendReason::WallClockExceeded {
+                    elapsed_ms: charged_ms,
+                    budget_ms: self.wall_budget_ms,
+                };
                 self.status = VmStatus::Suspended(reason.clone());
                 self.suspension_count = self.suspension_count.wrapping_add(1);
                 self.instructions_used = total_used;
@@ -1510,7 +1480,6 @@ impl LuaVm {
         // Completed without budget exceed.
         self.instructions_used = total_used;
         let reading = start.read();
-        let charged_ms = duration_ms(reading.charged);
         self.wall_elapsed_ms = duration_ms(reading.raw);
         self.store_commit_credit_ms = duration_ms(reading.credit);
         self.host_call_credit_ms = duration_ms(reading.host_call_credit);
@@ -1520,23 +1489,6 @@ impl LuaVm {
         if self.wall_elapsed_ms >= self.warning_ms && !self.warning_triggered {
             self.warning_triggered = true;
             self.warning_count = self.warning_count.wrapping_add(1);
-        }
-
-        // Final wall check: the executor can finish inside one stepped slice
-        // after a long credited host call, so the loop-top check may never see
-        // the charged time that accumulated during that slice. Completion is
-        // the last enforcement point; a callback that reaches the wall budget
-        // here returns the same typed suspension as a slice-boundary exceed,
-        // never `Ready` (bitty #2314).
-        if let Some(reason) = wall_suspension(charged_ms, self.wall_budget_ms) {
-            self.status = VmStatus::Suspended(reason.clone());
-            self.suspension_count = self.suspension_count.wrapping_add(1);
-            return Ok(DriveOutcome::Suspended {
-                reason,
-                instructions_used: self.instructions_used,
-                wall_elapsed_ms: self.wall_elapsed_ms,
-                memory_used: self.memory_used,
-            });
         }
 
         // Final memory check after completion (in case last allocation pushed over).
@@ -1773,20 +1725,6 @@ mod vm_unit_tests {
         assert_eq!(
             (both.credit, both.host_call_credit, both.charged),
             (ms(30), ms(70), ms(0))
-        );
-    }
-
-    #[test]
-    fn wall_suspension_is_inclusive_at_the_budget() {
-        // The completion check shares this threshold: 49 ms charged is still
-        // inside a 50 ms budget, 50 ms is fail-closed.
-        assert_eq!(wall_suspension(49, 50), None);
-        assert_eq!(
-            wall_suspension(50, 50),
-            Some(SuspendReason::WallClockExceeded {
-                elapsed_ms: 50,
-                budget_ms: 50,
-            })
         );
     }
 

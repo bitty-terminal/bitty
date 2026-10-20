@@ -1835,7 +1835,7 @@ fn renderer_adopts_metric_baseline_and_keeps_legacy_fallback() {
 }
 
 #[test]
-fn metric_baseline_fits_measured_tall_glyphs_with_zero_overhang() {
+fn metric_baseline_places_block_cell_box_at_cell_origin() {
     // Full block U+2588 is cell-box rasterized (issue #2307): dest lands
     // exactly on the cell origin and the mask spans exactly the cell — no
     // overhang for neighbor repaints to erase (the CTX-0237 clip mechanism).

@@ -3966,16 +3966,22 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             // Resolve the run fg for this run (runs group identical
             // style, so the first covered cell names it).
             let fg = self.shaped_run_fg(snapshot, row, cols, run);
-            // Issue #2307: a single block scalar never needs the shaped
-            // cluster path. Emit it through the shared cell-box block
-            // emitter so the opt-in shaped path tiles identically to the
-            // default unshaped path. Multi-scalar clusters fall through.
+            // Issue #2307/#2315: a cluster whose only spacing scalar is a
+            // block element never needs the shaped font outline. Emit the
+            // shared cell-box mask so the opt-in shaped path tiles exactly
+            // like the default unshaped path. A block base with trailing
+            // zero-width scalars keeps the same box and paints the marks
+            // through the per-cell path: the font's block edge must never
+            // come back from the shaped multi-glyph group.
             if count == 1 {
-                let mut chars = slice.chars();
-                if let (Some(block), None) = (chars.next(), chars.next()) {
-                    if crate::fallback::is_block_element(block)
-                        && self.emit_glyph(block, row, abs_start, count, fg, list).0
-                    {
+                if let Some(block) = cluster_block_base(slice) {
+                    if slice.chars().count() == 1 {
+                        if self.emit_glyph(block, row, abs_start, count, fg, list).0 {
+                            idx = group_end;
+                            continue;
+                        }
+                    } else {
+                        self.emit_unshaped_slice(slice, row, abs_start, fg, list);
                         idx = group_end;
                         continue;
                     }
@@ -4264,6 +4270,23 @@ fn cluster_base_scalar_count(text: &str) -> usize {
     text.chars()
         .filter(|ch| bitty_term_state::char_cell_width(*ch) > 0)
         .count()
+}
+
+/// Returns the block scalar owning a one-cell cluster, if any (issue #2315).
+///
+/// A cluster qualifies when it has exactly one spacing scalar and that
+/// scalar is a block element; trailing zero-width scalars (combining marks,
+/// join controls, variation selectors) do not disqualify it. Ligatures and
+/// other multi-base clusters return `None` and keep shaping, so block
+/// coverage never changes a ligature run.
+fn cluster_block_base(text: &str) -> Option<char> {
+    let mut bases = text
+        .chars()
+        .filter(|ch| bitty_term_state::char_cell_width(*ch) > 0);
+    match (bases.next(), bases.next()) {
+        (Some(base), None) if crate::fallback::is_block_element(base) => Some(base),
+        _ => None,
+    }
 }
 
 /// End byte of the cluster group starting at `idx`: the next *distinct*

@@ -66,7 +66,7 @@ bitty-sandbox = { version = "0.0.24", path = "../bitty-sandbox" }
 # `version` below is required for `cargo publish` (lockfile pins 0.0.1 for
 # each); the git rev stays the build source until each crate lands on
 # crates.io (see CTX-1172 publish order notes).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c" }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
 bitty-package = { version = "0.0.24", path = "../bitty-package" }
@@ -78,7 +78,7 @@ bitty-rich = { version = "0.0.24", path = "../bitty-rich" }
 # protocol v1 to out-of-process components (first: `bitty-net`). On this path
 # Core links only the dependency-free codec crate, never a general network
 # implementation crate; same exact-rev pin pattern as `bitty-ipc`.
-bitty-network-wire = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-network", rev = "c69fe57" }
+bitty-network-wire = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-network", rev = "c8710e0" }
 # CTX-1373 (bitty#2199): launch-scoped mutual-certificate provider-publication
 # control transport (launch material, bounded bootstrap manifest, TLS 1.3
 # client). Opt-in behind `publication-control`; same exact-rev pin pattern as
@@ -99,7 +99,7 @@ rustls = { version = "=0.23.46", default-features = false, features = ["std", "a
 # `std` only) into the same `ValidatedUrl` + `ActivationGesture` pipeline as
 # OSC 8. No crates.io release yet, so the same git-rev pin convention as
 # `bitty-ipc` / `bitty-network-wire` applies (7-char short SHA).
-bitty-url-detector = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "d211490" }
+bitty-url-detector = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-url-detector", rev = "be035a0" }
 # CTX-1008 (#1763, OQ-076) plus CTX-1178 (#1998): Core consumes the
 # platform notification bridge as its single OS-notification dispatch path.
 # Same exact-rev pin pattern as `bitty-ipc` / `bitty-network-wire`: the
@@ -107,7 +107,7 @@ bitty-url-detector = { version = "0.0.1", git = "https://github.com/bitty-termin
 # defensive second rate cap, and delivers through the real per-platform
 # backend (`LinuxDbusBackend` / `MacosBackend`, fail-closed elsewhere).
 # Pinned to the real-backends commit; the bootstrap rev carried stubs only.
-bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "3a8a7ed" }
+bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-platform-services", rev = "7c6b84b" }
 
 # CORE-RUN-003 (#1526): the supervisor claim lock is an OS-held `flock`.
 # Same workspace pins and platform split as `bitty-ipc` (no new crates).
@@ -134,7 +134,7 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d", features = ["test-support"] }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
 # CTX-1361: the production component-host slice drives the real
 # `bitty extension add` implementation through the composition-root library

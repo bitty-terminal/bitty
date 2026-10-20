@@ -69,6 +69,31 @@ just markdownlint       # markdownlint-cli2 over the repository Markdown
 Run `just check` before requesting review. Formatting, lints, tests, and
 workflow validation must pass without warnings.
 
+### Extracted-extension pins
+
+Core links the extracted extensions (`bitty-ipc`, `bitty-network`,
+`bitty-storage`, `bitty-observability`, `bitty-url-detector`,
+`bitty-platform-services`) as git dependencies pinned to an exact abbreviated
+SHA in `crates/*/Cargo.toml`. Pins move only in a dedicated pin-bump task,
+never silently inside an unrelated change:
+
+```bash
+just pins        # pinned vs upstream main table; fails on an unreachable pin
+just pins-test   # hermetic fixture test for the gate
+```
+
+`just pins` fails when a pinned revision is not reachable from upstream `main`,
+annotates a warning when a pin is more than `PIN_DRIFT_WARN` commits behind
+(default 10), and skips with a clear message when the network is unavailable
+(`--strict` and `--require-network` turn those into failures). CI runs the same
+gate in the `Extension pin drift` job.
+
+To bump: fetch `origin/main` in each affected upstream checkout, record the
+commit delta and whether it touches the pinned crate, update every occurrence
+(`rg 'rev = "<old>"' crates`), refresh `Cargo.lock` with `cargo fetch`, and run
+the gates above. A pin that cannot move because upstream broke the pinned
+surface stays at its current revision and is recorded in the owning Issue.
+
 ## Delivery lifecycle
 
 Changes follow the standard lifecycle: GitHub Issue, CarryCtx task, branch or

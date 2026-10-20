@@ -85,7 +85,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
-# bitty-network is pinned for two crates: `bitty-network-wire` at c69fe57
+# bitty-network is pinned for two crates: `bitty-network-wire` at c8710e0
 # (CTX-0906, DIR-030), the dependency-free native-component wire protocol v1
 # codec the component broker speaks to out-of-process components, and
 # `bitty-network-publication` at c8710e0 (CTX-1373), the launch-scoped
@@ -96,7 +96,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # removed.
 # bitty-ipc is a first-party extraction target (CTX-1585, bitty#1585) and
 # stays linked as Core's inbound socket mechanism (DIR-030): pulled from the
-# independent bitty-terminal/bitty-ipc repository at an exact rev (aa7259d) by
+# independent bitty-terminal/bitty-ipc repository at an exact rev (e6a2c0c) by
 # bitty-runtime/bitty-terminal/bitty-rich, following the same
 # adopted-as-git-dependency pattern as bitty-network (CTX-0917). bitty-agent
 # is no longer linked by Core (CTX-0918); it lives in its own repository.
@@ -106,7 +106,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # bitty-storage is a first-party extraction target (W-146, CTX-0939, bitty
 # #1622): the bounded isolated storage mechanics behind the Core-owned
 # durable-commit seam. Linked ONLY by the application wiring crate
-# (bitty-terminal) at an exact rev (5e720b4, post-merge main: session codec,
+# (bitty-terminal) at an exact rev (7bf5177, post-merge main: session codec,
 # atomic IO, KV backend); no Core library crate links it (Core consumes
 # persistence exclusively through Core-owned traits). std-only API (no
 # database, serialization, PTY, or Core dependency). The approving boundary
@@ -117,7 +117,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # bitty #1649): the canonical zero-dependency observation-seam contract
 # (record bounds, default-deny gate, fail-closed version range) behind the
 # Core-owned verification in `bitty-terminal`. Linked ONLY by the
-# application wiring crate (bitty-terminal) at an exact rev (7b3bb74,
+# application wiring crate (bitty-terminal) at an exact rev (f1d08f4,
 # post-merge main: W-110 contract alignment); no Core library crate links
 # it, and default builds link no exporters, metrics pipeline, or tracing
 # runtime (API crate has zero dependencies, no network, no filesystem).
@@ -128,7 +128,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # bitty-url-detector is a first-party extraction target (CTX-1009, bitty
 # #1760): the dependency-free plaintext URL matcher behind the Core-owned
 # `ValidatedUrl` + `ActivationGesture` pipeline (same consumer as OSC 8).
-# Linked ONLY by the runtime crate (bitty-runtime) at an exact rev (5c65773,
+# Linked ONLY by the runtime crate (bitty-runtime) at an exact rev (be035a0,
 # v0.0.1, `forbid(unsafe)`, std-only, MIT); no network, filesystem, or Core
 # dependency. Recorded 2026-10-07; a dated ADR-0004/ADR-0012 revision
 # recording this source is tracked as a CTX-1009 follow-up. Falls under the
@@ -136,7 +136,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # bitty-platform-services is a first-party extraction target (CTX-1008, bitty
 # #1763, OQ-076): the platform notification bridge behind the defensive
 # second rate cap. Linked ONLY by the runtime crate (bitty-runtime) at an
-# exact rev (2fc794a, v0.0.1, `forbid(unsafe)`, MIT); receives an
+# exact rev (7c6b84b, v0.0.1, `forbid(unsafe)`, MIT); receives an
 # already-gated title/body pair and re-caps over-ceiling callers
 # fail-closed. Recorded 2026-10-07; a dated ADR-0004/ADR-0012 revision
 # recording this source is tracked as a CTX-1008 follow-up. Falls under the

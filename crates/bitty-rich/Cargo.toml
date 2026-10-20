@@ -26,7 +26,7 @@ bitty-pty = { version = "0.0.24", path = "../bitty-pty" }
 # DTOs; workspace-internal edge, no new supply-chain surface.
 # `version` is required for `cargo publish` (lockfile pins 0.0.1); the git
 # rev stays the build source until bitty-ipc lands on crates.io.
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "aa7259d" }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c" }
 # 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
 # 0.4.x line; no other RNG is used so token entropy is auditable in one place.
 getrandom = "0.4"

@@ -1112,6 +1112,14 @@ mod tests {
             "ping result: {}",
             outcome.result_json
         );
+        // Issue #2243: the inspection surface is reachable over the same
+        // pipe and stays behind its debug scope. No elevation is configured
+        // here, so `debug.inspect` is denied with a typed error.
+        let denied = crate::ctl::ctl_roundtrip(&pipe, "bitty.debug/getGridText", None, 0)
+            .expect("inspection round-trip over the named pipe");
+        assert!(!denied.ok, "ungranted inspection must be denied");
+        assert_eq!(denied.category, "scope");
+        assert_eq!(denied.code, "ScopeDenied");
         drop(guard);
         // No orphan pipe after shutdown: the kernel removes the last handle.
         let err = bitty_ipc::winpipe::connect(&pipe, std::time::Duration::from_millis(200))

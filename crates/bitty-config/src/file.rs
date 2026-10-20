@@ -42,8 +42,9 @@
 //!     -- top-right | left | right | bottom-left | bottom | bottom-right
 //!     -- (observed only by fit/center letterbox). The image must live
 //!     -- under `decoration.background_image_roots` (deny-by-default) and
-//!     -- missing/unreadable files fail closed. Blur stays a no-op stub
-//!     -- (OQ-038): never parsed, always 0.
+//!     -- missing/unreadable files fail closed. `blur_radius` is recognized
+//!     -- only as 0 (OQ-038: background blur has no accepted design); a
+//!     -- positive value fails closed instead of being a silent no-op.
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
@@ -132,7 +133,8 @@
 //!   tables keep working; CTX-1076 `background_image`/`background_fit`/
 //!   `background_opacity`/`background_position` are optional extras with the
 //!   same absent-means-silent contract — omitted keys keep the lower-layer
-//!   value, present values validate fail-closed with the field path),
+//!   value, present values validate fail-closed with the field path;
+//!   `blur_radius` is schema-present but OQ-038 accepts only 0),
 //!   `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch`, `cursor_style`, `bell` optional, defaulting to
@@ -1569,7 +1571,22 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 // nothing" so existing `{ opacity, padding }` tables keep
                 // working. Present values are parsed fail-closed here and
                 // again by `WindowConfig::validate` via `plan.validate()`.
-                // Blur stays a no-op stub (OQ-038): never parsed, always 0.
+                // OQ-038: `blur_radius` is recognized only so a non-zero
+                // value fails closed with an explicit unsupported-feature
+                // diagnostic instead of an unknown-key error (or, worse, a
+                // silent no-op). `0` is the only accepted value today.
+                let blur_radius = match w.blur_radius {
+                    None | Some(0) => 0,
+                    Some(v) => {
+                        return Err(ConfigError::validation(
+                            "window.blur_radius",
+                            format!(
+                                "background blur is not supported (OQ-038): only 0 is accepted \
+                                 (found {v})"
+                            ),
+                        ));
+                    }
+                };
                 let background_fit = match w.background_fit.as_deref() {
                     None => None,
                     Some(raw) => match BackgroundFit::parse(raw.trim()) {
@@ -1615,7 +1632,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     opacity: opacity as f32,
                     padding: padding as u32,
                     radius_px,
-                    blur_radius: 0,
+                    blur_radius,
                     background_image: w.background_image,
                     background_fit,
                     background_opacity,
@@ -4173,6 +4190,32 @@ mod tests {
             assert!(
                 err.to_string().contains("window.radius_px"),
                 "must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_window_blur_radius_is_explicitly_unsupported_above_zero() {
+        // OQ-038: `0` is the only accepted blur value. A positive/negative
+        // value must name `window.blur_radius` and say the feature is
+        // unsupported, never look like an unknown key or a silent no-op.
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8, blur_radius = 0 } }"#,
+            &test_source(),
+        )
+        .expect("zero blur parses");
+        assert_eq!(plan.window.as_ref().unwrap().blur_radius, 0);
+        plan.validate().expect("zero blur validates");
+        for bad in [
+            r#"return { window = { opacity = 1.0, padding = 8, blur_radius = 4 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, blur_radius = 128 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, blur_radius = -1 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            assert_eq!(err.field(), Some("window.blur_radius"), "{err}");
+            assert!(
+                err.to_string().contains("OQ-038"),
+                "must explain the unsupported contract: {err}"
             );
         }
     }

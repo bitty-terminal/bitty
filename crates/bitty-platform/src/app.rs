@@ -512,9 +512,10 @@ impl WindowConfig {
 
     /// Sets the background blur radius (CTX-0832 `window.blur_radius`).
     ///
-    /// Clamped to `0..=128` logical pixels. Platform support varies:
+    /// Clamped to `0..=128` logical pixels. OQ-038 has no accepted blur
+    /// contract, so `bitty-config` accepts only `0` today and this seam is
+    /// reserved for a future implementation. Platform support varies:
     /// Wayland (KDE/Hyprland via blur protocol), macOS (NSVisualEffectView).
-    /// Unsupported platforms silently ignore the value.
     pub fn with_blur_radius(mut self, radius: u32) -> Self {
         self.blur_radius = radius.min(128);
         self

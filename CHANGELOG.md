@@ -23,6 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `command:<owner:command>`, `toggle_palette`, and `open_composer` no longer
   lose real commands such as `bar:audio-toggle` (68 ms) and `composer:open`
   (212 ms).
+- **Window background adapts to the live window (CTX-1396, #2332):** the
+  window tier (`window.background_image`) is sized from the live surface
+  extent, so it is stable across splits and pane moves and re-derived on
+  window resize and DPI changes; the default `fill` is uniform cover (no edge
+  gaps, no distortion). The per-view tier
+  (`decoration.background_image` / `views.<selector>.background_image`)
+  tracks each leaf's content frame and re-fits on split, divider move, pane
+  move, and resize. `fit` letterboxes the full image with
+  `background_position` honored; `center`/`tile` keep native DPI-scaled
+  pixels; `stretch` is the documented non-uniform mode. The fit matrix
+  (16:9/4:3/1:1 source x window), the resize/split destination updates, and
+  the `background_opacity` versus `window.opacity` composition are pinned by
+  headless tests.
+
+### Changed
+
+- **`window.blur_radius` rejects non-zero values (OQ-038):** the key is now
+  recognized by the Lua loader so a non-zero value fails closed with a typed
+  `window.blur_radius` diagnostic ("background blur is not supported
+  (OQ-038): only 0 is accepted") instead of an unknown-key error or a silent
+  no-op. `0` remains accepted; the platform blur seam stays reserved for a
+  future bounded contract.
 
 ## [0.0.24] - unreleased
 

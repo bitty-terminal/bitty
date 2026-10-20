@@ -131,11 +131,10 @@ pub(crate) struct WindowState {
     /// output so the value has a visible effect. Platforms without
     /// premultiplied compositing stay opaque with a loud warning.
     pub(crate) opacity: f32,
-    /// Background blur radius from the effective config (CTX-0832
-    /// `window.blur_radius`; default `0` = no blur). Applied to the platform
-    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation.
-    /// Platform-specific: supported on macOS, some Wayland compositors,
-    /// and Windows 10+. Ignored where unsupported.
+    /// Background blur radius from the effective config (CTX-0832/OQ-038
+    /// `window.blur_radius`). The config layer accepts only `0` (no blur)
+    /// until a blur contract lands, so startup always observes `0`; the
+    /// platform seam stays in place for that future contract.
     pub(crate) blur_radius: u32,
     pub(crate) handle: Option<WindowHandle>,
     pub(crate) id: Option<WindowId>,
@@ -838,9 +837,9 @@ impl TerminalApp {
     }
 
     /// Sets the background blur radius applied at window creation (CTX-0832).
-    /// Call once at startup from the effective config; platform-specific
-    /// support varies (macOS, some Wayland compositors, Windows 10+).
-    /// Unsupported platforms silently ignore the request.
+    /// Call once at startup from the effective config. OQ-038 accepts only
+    /// `0` today, so the shipped config never requests blur; this seam is
+    /// retained for a future platform-blur contract.
     pub(crate) fn with_blur_radius(mut self, blur_radius: u32) -> Self {
         self.window.blur_radius = blur_radius;
         self

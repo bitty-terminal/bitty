@@ -2360,6 +2360,176 @@ mod tests {
         assert_eq!(stretch.src, [0.0, 0.0, 20.0, 20.0]);
     }
 
+    /// Expected contain (`fit`) rectangle for one image/dest pair, using the
+    /// same independent-axis rounding as [`fit_plan`].
+    fn expected_contain(image: (u32, u32), dest: RectPx) -> RectPx {
+        let (iw, ih) = (f64::from(image.0), f64::from(image.1));
+        let (dw, dh) = (f64::from(dest.width), f64::from(dest.height));
+        let factor = (dw / iw).min(dh / ih);
+        let out_w = (iw * factor).round().clamp(1.0, dw);
+        let out_h = (ih * factor).round().clamp(1.0, dh);
+        RectPx::new(
+            dest.x + ((dw - out_w) * 0.5).round() as i32,
+            dest.y + ((dh - out_h) * 0.5).round() as i32,
+            out_w as u32,
+            out_h as u32,
+        )
+    }
+
+    #[test]
+    fn fit_plan_matrix_covers_contain_and_anchors_every_aspect() {
+        // CTX-1396 (#2332): the full 16:9 / 4:3 / 1:1 source x window matrix.
+        // Cover must fill the whole destination with no distortion and keep
+        // its source window inside the image (no clamp smear at the edges);
+        // contain must letterbox the full image; center/tile keep native
+        // pixels; stretch maps the full image onto the full rect.
+        let images = [(160_u32, 90_u32, "16:9"), (120, 90, "4:3"), (90, 90, "1:1")];
+        let windows = [
+            (800_u32, 450_u32, "16:9"),
+            (640, 480, "4:3"),
+            (500, 500, "1:1"),
+        ];
+        for (iw, ih, image_label) in images {
+            for (dw, dh, window_label) in windows {
+                let dest = RectPx::new(17, 23, dw, dh);
+                let label = format!("{image_label} image in {window_label} window");
+
+                let fill = fit_plan(BackgroundFit::Fill, (iw, ih), dest, 1.0)
+                    .unwrap_or_else(|| panic!("cover plan for {label}"));
+                assert_eq!(fill.dest, dest, "cover fills the rect for {label}");
+                let [sx, sy, sw, sh] = fill.src;
+                assert!(
+                    sx >= -1e-9 && sy >= -1e-9,
+                    "cover source stays inside the image for {label}: {fill:?}"
+                );
+                assert!(
+                    sw <= f64::from(iw) + 1e-9 && sh <= f64::from(ih) + 1e-9,
+                    "cover source stays inside the image for {label}: {fill:?}"
+                );
+                let source_aspect = sw / sh;
+                let dest_aspect = f64::from(dw) / f64::from(dh);
+                assert!(
+                    (source_aspect - dest_aspect).abs() < 1e-9,
+                    "cover is undistorted for {label}: {fill:?}"
+                );
+                assert!(
+                    (sx - (f64::from(iw) - sw) * 0.5).abs() < 1e-9
+                        && (sy - (f64::from(ih) - sh) * 0.5).abs() < 1e-9,
+                    "cover crops evenly for {label}: {fill:?}"
+                );
+                // Cover is scale invariant: the DPI factor cancels.
+                let fill_hidpi = fit_plan(BackgroundFit::Fill, (iw, ih), dest, 1.6)
+                    .unwrap_or_else(|| panic!("cover hidpi plan for {label}"));
+                assert_eq!(fill_hidpi, fill, "cover ignores DPI for {label}");
+
+                let fit = fit_plan(BackgroundFit::Fit, (iw, ih), dest, 1.0)
+                    .unwrap_or_else(|| panic!("contain plan for {label}"));
+                assert_eq!(
+                    fit.dest,
+                    expected_contain((iw, ih), dest),
+                    "contain letterboxes for {label}"
+                );
+                assert_eq!(
+                    fit.src,
+                    [0.0, 0.0, f64::from(iw), f64::from(ih)],
+                    "contain samples the full image for {label}"
+                );
+
+                let stretch = fit_plan(BackgroundFit::Stretch, (iw, ih), dest, 1.0)
+                    .unwrap_or_else(|| panic!("stretch plan for {label}"));
+                assert_eq!(stretch.dest, dest, "stretch fills the rect for {label}");
+                assert_eq!(
+                    stretch.src,
+                    [0.0, 0.0, f64::from(iw), f64::from(ih)],
+                    "stretch samples the full image for {label}"
+                );
+
+                // Center keeps native pixels at dpi 1, cropped to the rect.
+                let center = fit_plan(BackgroundFit::Center, (iw, ih), dest, 1.0)
+                    .unwrap_or_else(|| panic!("center plan for {label}"));
+                let center_w = iw.min(dw);
+                let center_h = ih.min(dh);
+                assert_eq!(
+                    center.dest,
+                    RectPx::new(
+                        dest.x + ((dw - center_w) as f64 * 0.5).round() as i32,
+                        dest.y + ((dh - center_h) as f64 * 0.5).round() as i32,
+                        center_w,
+                        center_h,
+                    ),
+                    "center keeps native size and centers for {label}"
+                );
+                assert_eq!(
+                    center.src,
+                    [
+                        (f64::from(iw) - f64::from(center_w)) * 0.5,
+                        (f64::from(ih) - f64::from(center_h)) * 0.5,
+                        f64::from(center_w),
+                        f64::from(center_h),
+                    ],
+                    "center crops symmetrically for {label}"
+                );
+
+                // Tile repeats native (DPI-scaled) pixels from the top-left.
+                let tile = fit_plan(BackgroundFit::Tile, (iw, ih), dest, 1.0)
+                    .unwrap_or_else(|| panic!("tile plan for {label}"));
+                assert_eq!(tile.dest, dest, "tile fills the rect for {label}");
+                assert!(tile.tile, "tile flag for {label}");
+                assert_eq!(
+                    (tile.tile_w, tile.tile_h),
+                    (iw, ih),
+                    "native tile for {label}"
+                );
+                let tile_hidpi = fit_plan(BackgroundFit::Tile, (iw, ih), dest, 2.0)
+                    .unwrap_or_else(|| panic!("tile hidpi plan for {label}"));
+                assert_eq!(
+                    (tile_hidpi.tile_w, tile_hidpi.tile_h),
+                    (iw * 2, ih * 2),
+                    "tile scales native pixels by DPI for {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_plan_move_translates_destination_without_changing_source() {
+        // CTX-1396 (#2332): a pane move changes only the content-frame origin.
+        // The fit plan must translate the destination and keep the source
+        // window identical, so the raster cache re-keys on `dest` and repaints
+        // the same crop at the new origin.
+        let image = (160, 90);
+        let before = RectPx::new(10, 20, 300, 200);
+        let after = RectPx::new(110, 70, 300, 200);
+        for fit in [
+            BackgroundFit::Fill,
+            BackgroundFit::Fit,
+            BackgroundFit::Center,
+            BackgroundFit::Tile,
+            BackgroundFit::Stretch,
+        ] {
+            let a = fit_plan(fit, image, before, 1.0).expect("before plan");
+            let b = fit_plan(fit, image, after, 1.0).expect("after plan");
+            assert_eq!(
+                (b.dest.x - a.dest.x, b.dest.y - a.dest.y),
+                (100, 50),
+                "{} destination follows the content frame",
+                fit.as_str()
+            );
+            assert_eq!(
+                (b.dest.width, b.dest.height),
+                (a.dest.width, a.dest.height),
+                "{} keeps the size for a pure move",
+                fit.as_str()
+            );
+            assert_eq!(
+                b.src,
+                a.src,
+                "{} keeps the crop for a pure move",
+                fit.as_str()
+            );
+        }
+    }
+
     #[test]
     fn fit_plan_fill_covers_within_image_bounds_at_any_dpi() {
         // Regression (#2278): the 0.0.24 matrix host renders a 3840x2160

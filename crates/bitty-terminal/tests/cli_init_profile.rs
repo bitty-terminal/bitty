@@ -394,6 +394,59 @@ fn invalid_profile_name_and_bitty_profile_never_target_output() {
 }
 
 #[test]
+fn env_profile_overrides_selector_and_invalid_env_fails_closed() {
+    let root = scratch_root("env-override");
+    assert_ok(&run_bitty(&root, &["init", "--yes"]), "fresh init");
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "work"]),
+        "work profile",
+    );
+    std::fs::write(
+        profile_path(&root, "work"),
+        "return { font = { family = \"Fira Code\", size = 14 } }\n",
+    )
+    .expect("work body");
+
+    let env_check = |profile: &str| {
+        Command::new(BITTY_BIN)
+            .args(["config", "check"])
+            .env("XDG_CONFIG_HOME", &root)
+            .env("HOME", &root)
+            .env("BITTY_PROFILE", profile)
+            .env("NO_COLOR", "1")
+            .env_remove("BITTY_CONFIG")
+            .output()
+            .expect("spawn config check")
+    };
+
+    let selected = env_check("work");
+    assert_ok(&selected, "BITTY_PROFILE override");
+    let text = stdout(&selected);
+    assert!(
+        row(&text, "profile").starts_with("\"work\" (profile: "),
+        "environment selection wins over the selector, output:\n{text}"
+    );
+    assert!(
+        row(&text, "font.family").starts_with("\"Fira Code\""),
+        "{text}"
+    );
+
+    let invalid = env_check("../escape");
+    assert_eq!(
+        invalid.status.code(),
+        Some(2),
+        "invalid BITTY_PROFILE fails closed rather than falling back to the selector"
+    );
+    assert!(
+        stderr(&invalid).contains("BITTY_PROFILE"),
+        "diagnostic names the environment source, stderr={:?}",
+        stderr(&invalid)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn explicit_config_selector_resolves_sibling_profile() {
     let root = scratch_root("explicit");
     let custom_dir = root.join("custom-config");

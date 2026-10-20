@@ -194,13 +194,21 @@ fn core_package_crates_link_no_network_implementation_crate() {
         "`{cargo} fetch --locked` failed: {}",
         String::from_utf8_lossy(&fetch.stderr)
     );
+    // #2249 links the extracted execution supervisor, whose own old Core pin
+    // can introduce a second `bitty-package` package into the resolved graph.
+    // Select the workspace package explicitly by version so the boundary
+    // check still names the package under test instead of failing on Cargo's
+    // ambiguous short name.
+    let version = env!("CARGO_PKG_VERSION");
+    let package_spec = format!("bitty-package@{version}");
+    let host_spec = format!("bitty-plugin-host@{version}");
     let output = std::process::Command::new(&cargo)
         .args([
             "tree",
             "-p",
-            "bitty-package",
+            &package_spec,
             "-p",
-            "bitty-plugin-host",
+            &host_spec,
             "-p",
             "bitty-runtime",
             "--edges",

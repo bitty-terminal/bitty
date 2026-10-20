@@ -65,7 +65,6 @@ const JOB_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// authenticated client identity instead.
 const IPC_PRINCIPAL: &str = "ipc-execution";
 
-/// One completed (or terminally failed) supervised tool run.
 /// Re-exported job identity for the Core spawn surface.
 ///
 /// The type is upstream, but keeping the import here confines the extension
@@ -86,6 +85,7 @@ pub(crate) fn job_principal(name: &str) -> Result<JobPrincipal, IpcError> {
     JobPrincipal::new(name).map_err(map_job_error)
 }
 
+/// One completed (or terminally failed) supervised tool run.
 pub(crate) struct JobRun {
     /// Real registry identity minted for this spawn.
     pub job: JobId,

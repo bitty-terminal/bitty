@@ -3276,26 +3276,55 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn admitted_git_spawn_runs_under_inherited_confinement() {
-        // CTX-1151 wiring proof: an admitted `git status` flows through
-        // `spawn_process` into `bitty-sandbox` confinement. The spawn
-        // itself is the proof — under enforcement the OS allows the exec
-        // (the exit code is git's business: outside a repository it fails
-        // non-zero but still spawns). Where the host cannot enforce
-        // (pre-Landlock kernel, missing `git`, or a container policy that
-        // forbids unprivileged `restrict_self`), the fail-closed
-        // `Unavailable` carrying a confinement diagnostic is the accepted
-        // outcome instead: either way no admitted spawn runs unconfined.
-        let request = bitty_ipc::execution::ExecutionRequest::new("git", vec!["status".to_owned()]);
-        match spawn_process(&request) {
-            Ok(_) => {}
-            Err(error) => {
-                let text = error.to_string();
-                assert!(
-                    matches!(error, IpcError::Unavailable { .. }) && text.contains("confinement"),
-                    "admitted spawn must either run confined or refuse fail-closed with a confinement diagnostic, got {error:?}"
-                );
-            }
-        }
+        // CTX-1151 wiring proof, hardened by CTX-1376: an admitted
+        // `git status` flows through `spawn_process` into `bitty-sandbox`
+        // confinement and must actually start. Before CTX-1376 the child
+        // hook called `restrict_self` without `no_new_privs`, so the spawn
+        // failed with `EPERM` on every unprivileged host; this test
+        // accepted that fail-closed `Unavailable` as an alternative
+        // outcome, which is how the defect survived. It is now a hard
+        // expectation: the repository exists, `git` is on `PATH`, and the
+        // spawn is allowlisted, so a refusal is a regression, not policy.
+        let git =
+            bitty_sandbox::resolve_tool_execs("git").expect("PATH must resolve git on Linux CI");
+        let root = std::env::temp_dir().join(format!(
+            "bitty-admitted-git-{}-{}",
+            std::process::id(),
+            "confinement"
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp repo dir must build");
+        let init = std::process::Command::new(&git[0])
+            .arg("init")
+            .arg("--quiet")
+            .arg(&root)
+            .status()
+            .expect("test fixture git init must start");
+        assert!(init.success(), "test fixture git init must succeed");
+
+        let request = bitty_ipc::execution::ExecutionRequest::new(
+            "git",
+            vec!["status".to_owned(), "--porcelain".to_owned()],
+        )
+        .with_cwd(Some(root.to_string_lossy().into_owned()));
+        let output = match spawn_process(&request) {
+            Ok(output) => output,
+            Err(error) => panic!("admitted git spawn must run confined, got {error:?}"),
+        };
+        assert_eq!(
+            output.status,
+            bitty_ipc::execution::ExecutionStatus::Completed,
+            "allowlisted git status must complete: exit={:?} stderr={:?}",
+            output.exit_code,
+            output.stderr
+        );
+        assert_eq!(output.exit_code, Some(0), "git status must exit 0");
+        assert_eq!(
+            output.stdout.trim(),
+            "",
+            "a fresh repository has no status entries"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

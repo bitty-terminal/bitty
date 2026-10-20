@@ -19,9 +19,12 @@
 //! of the dragged panel that follows the pointer one-to-one from the grab
 //! point, plus the candidate-tile highlight. Solver geometry, leaf grids,
 //! and PTYs are untouched until release; the committed layout is the only
-//! place PTY sizes change. `Esc`, pointer leave, and window focus loss
-//! cancel without residue. The bounded subset and its Hyprland deviations
-//! are documented in the workspace-compositor specification.
+//! place PTY sizes change. `Esc`, pointer leave, and window focus loss cancel
+//! without residue; a mid-drag layout install (close, zoom, workspace switch)
+//! abandons the drop while keeping that install's own layout change, so a
+//! stale release can never commit against the new tree. The bounded subset
+//! and its Hyprland deviations are documented in the workspace-compositor
+//! specification.
 //!
 //! Issue #1811 (CTX-1070): the tiled move shows continuous feedback — the
 //! grab arms the drag transition on the dragged frame and the first hover
@@ -1065,7 +1068,8 @@ impl Runtime {
     /// The chosen mutation runs once through [`Runtime::set_layout`], so leaf
     /// Views, pane sessions, PTYs, and the primary grid reflow exactly like a
     /// keyboard move. Self-drops, background drops, unmappable releases, and
-    /// mid-drag closes end the gesture with the tree untouched. Always
+    /// releases after a mid-drag layout install end the gesture without a
+    /// drop (the install's own tree remains). Always
     /// returns `true` when a drag was active (caller skips the
     /// selection-release commit/copy: the grabbing press never started a
     /// selection, so there is nothing to commit and stale highlights must
@@ -1119,11 +1123,13 @@ impl Runtime {
     }
 
     /// Cancels the active Mod+drag without committing (cursor left the
-    /// window, or `Esc` cancelled mid-drag). The preview never mutates the
-    /// tree, so cancel restores the pre-drag layout byte-identically: no
-    /// re-parent, no selection, no residue. Arms a repaint when a drag was
-    /// active so the ghost outline and drop-target highlight clear on the
-    /// next frame. Returns `true` when a drag was active.
+    /// window, `Esc` cancelled mid-drag, or a layout install replaced the
+    /// tree). The preview never mutates the tree, so cancel restores the
+    /// pre-drag layout byte-identically for pointer/Esc cancellation; a
+    /// layout install keeps its own new tree (for example a close) and only
+    /// the drop is abandoned. No re-parent, no selection, no residue. Arms a
+    /// repaint when a drag was active so the ghost and drop-target highlight
+    /// clear on the next frame. Returns `true` when a drag was active.
     pub fn cancel_tiled_drag(&mut self) -> bool {
         if self.tiled_drag.is_none() {
             return false;

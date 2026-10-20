@@ -2367,6 +2367,13 @@ impl Runtime {
     }
 
     fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>, sync_geometry: bool) {
+        // Issue #2337: any layout install abandons an in-flight Mod+drag. A
+        // close changes the tree under the drag pointer whether or not it
+        // removed the dragged source; the ghost and candidate preview must
+        // clear now, and a later release must never commit a drop against
+        // the new tree. The close's own layout change remains; only the drop
+        // is abandoned.
+        self.cancel_tiled_drag();
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();

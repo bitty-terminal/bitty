@@ -1098,6 +1098,21 @@ fn press_arms_ghost_without_layout_or_pty_geometry_mutation() {
             .is_none(),
         "press must not settle a committed move"
     );
+    // Require a real present: the ghost must reach the paint path, not just
+    // the state seam. `tick` is the same present entry point the headed loop
+    // uses, and the ghost must be the last painted frame at zero offset.
+    assert!(rt.tick().is_some(), "press must present a frame");
+    let painted = rt.paint_frames_at(std::time::Instant::now());
+    let ghost = painted
+        .iter()
+        .find(|frame| frame.view == source)
+        .expect("painted ghost");
+    assert_eq!(ghost.frame, source_frame.frame);
+    assert_eq!(
+        painted.last().map(|frame| frame.view),
+        Some(source),
+        "ghost must paint last after a real present"
+    );
     rt.handle_mouse_input(release(MouseButton::Left));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
@@ -1338,5 +1353,79 @@ fn preview_never_resizes_pty_and_commit_resizes_once() {
         pane_before,
         "the uneven split must make the swap measurable"
     );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn closing_the_dragged_source_cancels_the_drop_before_release() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert!(rt.tiled_drag_active());
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    // Closing the dragged leaf installs the survivor tree. The close is the
+    // layout change; the drag must be abandoned, not left with a ghost or a
+    // release that can act on the new tree.
+    let survivor = LayoutNode::leaf(View::new(ViewId::new(2), 80, 24));
+    rt.set_layout_closing(survivor.clone(), ViewId::new(1));
+    assert!(!rt.tiled_drag_active(), "source close must cancel the drag");
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_ghost_offset(), None);
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(2)],
+        "the close's own layout remains"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(2)],
+        "stale release after source close must not commit a drop"
+    );
+    assert!(!rt.has_selection());
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}
+
+#[test]
+fn closing_a_non_source_leaf_cancels_the_drag_without_an_extra_swap() {
+    let mut rt = make_runtime();
+    rt.set_layout(three_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Hover v2 (40..60): a release would swap v1 and v2.
+    rt.handle_cursor_moved(cell_pixels(50, 12));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(2)));
+    // Close v3, a non-source leaf. The tree becomes [v1, v2]; the stale
+    // release must not swap the two survivors.
+    let closed = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    );
+    rt.set_layout_closing(closed.clone(), ViewId::new(3));
+    assert!(
+        !rt.tiled_drag_active(),
+        "non-source close must cancel the drag too"
+    );
+    assert_eq!(rt.tiled_drag_preview(), None);
+    assert_eq!(rt.tiled_drag_ghost_offset(), None);
+    assert_eq!(
+        rt.layout().split_ratio_at(&[]),
+        Some(0.5),
+        "the close's survivor split remains"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![ViewId::new(1), ViewId::new(2)],
+        "stale release must not commit an extra swap"
+    );
+    assert_eq!(rt.layout().split_ratio_at(&[]), Some(0.5));
+    assert!(!rt.has_selection());
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }

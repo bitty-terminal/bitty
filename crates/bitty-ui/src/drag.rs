@@ -1340,7 +1340,8 @@ mod tests {
                 false
             )))
         );
-        // Just outside the top edge band (fy = 0.25 is center).
+        // Point (60, 5) is at fy = 5/24 ~= 0.208, just below the center
+        // band's 0.25 boundary, so the nearest edge is the top edge.
         assert_eq!(
             drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(60, 5)),
             Some(DropPlan::Insert(DropSpec::new(
@@ -1349,6 +1350,30 @@ mod tests {
                 DROP_INSERT_RATIO,
                 false
             )))
+        );
+    }
+
+    #[test]
+    fn drop_plan_exact_diagonal_tie_prefers_horizontal() {
+        // A 24x24 target with equal normalized x/y offsets: the `min_h <=
+        // min_v` tie-break must choose the horizontal edge (left) and must
+        // not silently flip to vertical.
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 24, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 24, 24)),
+        );
+        let bounds = Rect::new(0, 0, 48, 24);
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(26, 2)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(2),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                false
+            ))),
+            "exact diagonal tie must prefer the horizontal edge"
         );
     }
 

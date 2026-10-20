@@ -18,6 +18,14 @@
 //!   runs (a dead-VM fixture proves no call was attempted);
 //! - raising, result-violating, and re-entrant (self-invoking) callees are
 //!   contained with codes — the host never panics and serves the next call.
+//!
+//! Budget discipline: every fixture here drives the real host-mediated
+//! cross-VM path, so one dispatch spans two VM entries inside a single RC-1
+//! wall window. The harness therefore widens only the wall dimension
+//! ([`HARNESS_WALL_BUDGET_MS`]), which production never sets; the production
+//! budget stays pinned by `bitty-lua/tests/measurement_lua.rs` and
+//! `load_gate.rs`, and `runaway_callee_is_contained_and_the_host_serves_on`
+//! proves dispatch is still bounded at the unchanged instruction budget.
 
 mod common;
 
@@ -25,7 +33,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
@@ -55,6 +63,29 @@ impl SnapshotSource for StaticSnapshot {
     }
 }
 
+/// Test-harness wall-clock headroom for host-mediated command dispatch
+/// (bitty#2259).
+///
+/// Each test here drives the real cross-VM path inside one RC-1
+/// `call_function` window: the caller chunk runs, the host mediates
+/// `bitty.commands.invoke`, the callee chunk runs in a second VM, and the
+/// result is schema-validated and marshalled back. Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS` (50 ms); this harness reused it and suspended at
+/// 80 ms on a shared macOS ARM64 runner (`WallClockExceeded`), and a Linux
+/// shard surfaced the same suspension as `err:E_TIMEOUT` on an otherwise green
+/// commit. One dispatch costs tens of microseconds when idle, so those
+/// failures are scheduler stalls, not product work: wall time is
+/// load-sensitive under sharded CI, correctness is not.
+///
+/// Decision: widen only the harness (bitty#1727 / bitty#1744 treatment), never
+/// the production budget. A fixed 10x headroom (500 ms) keeps every test
+/// bounded — the unchanged RC-1 instruction budget still suspends runaway Lua —
+/// while absorbing descheduling. Budget enforcement stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs` (`execute_with_elapsed` at exactly
+/// 50 ms) and `load_gate.rs`; `runaway_callee_is_contained_and_the_host_serves_on`
+/// below proves the dispatch path itself is still bounded.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir =
         std::env::temp_dir().join(format!("bitty-command-invoke-{tag}-{}", std::process::id()));
@@ -76,6 +107,10 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
             ("zones", LuaValue::array(vec![])),
         ]))),
     });
+    // Load headroom only: instruction and memory stay at RC defaults so the
+    // fixtures still run under production-adjacent budgets. Wall is the sole
+    // load-sensitive dimension (bitty#2259, same as bitty#1727/bitty#1744).
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     // W-146: disk-backed stores commit through an injected backend.
     common::install_stub_backend(&mut rt);
     rt
@@ -127,7 +162,7 @@ const CALLER_ID: &str = "bitty-terminal.palette";
 /// Devtools-shaped owner: empty-args string-result commands plus one
 /// chrome-fitting notice per successful command (the devtools#10 consumer
 /// contract), a filtered command with an optional string arg, a raising
-/// command, and a result-schema violator.
+/// command, a result-schema violator, and a budget burner (`runaway`).
 const OWNER_SRC: &str = r#"
 local EMPTY = { type = "object", properties = {}, additionalProperties = false }
 local STRING_RESULT = { type = "string" }
@@ -175,6 +210,17 @@ bitty.commands.register({
   result_schema = STRING_RESULT,
   run = function(_args)
     error("boom went off")
+  end,
+})
+
+bitty.commands.register({
+  id = "runaway",
+  title = "DevTools: runaway",
+  description = "Never returns, to prove dispatch stops at the RC-1 budget.",
+  args_schema = EMPTY,
+  result_schema = STRING_RESULT,
+  run = function(_args)
+    while true do end
   end,
 })
 
@@ -256,7 +302,14 @@ impl World {
             &root,
             OWNER_ID,
             &["platform.notify"],
-            &["plugins", "trace-start", "boom", "bad-result", "plain"],
+            &[
+                "plugins",
+                "trace-start",
+                "boom",
+                "bad-result",
+                "plain",
+                "runaway",
+            ],
             OWNER_SRC,
         );
         write_plugin(&root, CALLER_ID, &[], &["go", "ls"], CALLER_SRC);
@@ -369,6 +422,7 @@ fn list_commands_catalog_serves_active_commands_sorted() {
             "bitty-featured.devtools:boom",
             "bitty-featured.devtools:plain",
             "bitty-featured.devtools:plugins",
+            "bitty-featured.devtools:runaway",
             "bitty-featured.devtools:trace-start",
             "bitty-terminal.palette:go",
             "bitty-terminal.palette:ls",
@@ -381,7 +435,7 @@ fn list_commands_catalog_serves_active_commands_sorted() {
         .expect("caller ls must dispatch");
     assert_eq!(
         result,
-        LuaValue::String("7:bitty-featured.devtools:bad-result".to_string())
+        LuaValue::String("8:bitty-featured.devtools:bad-result".to_string())
     );
     // Suspended generations contribute nothing: the catalog never names a
     // command that would not serve.
@@ -399,7 +453,7 @@ fn list_commands_catalog_serves_active_commands_sorted() {
         vec!["bitty-terminal.palette:go", "bitty-terminal.palette:ls"]
     );
     world.runtime.resume(&world.owner.clone()).expect("resume");
-    assert_eq!(world.runtime.list_commands().len(), 7);
+    assert_eq!(world.runtime.list_commands().len(), 8);
     // Disposed generations are revoked outright.
     world
         .runtime
@@ -518,6 +572,44 @@ fn multi_positional_args_are_refused_while_a_schema_is_declared() {
         "got {error}"
     );
     assert!(world.runtime.drain_notifications().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Budget: dispatch is bounded and serves on after a suspension
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runaway_callee_is_contained_and_the_host_serves_on() {
+    // Containment on the dispatch path, pinned by the unchanged RC-1
+    // instruction budget: `while true do end` burns 10M instructions on any
+    // runner, so the outcome does not depend on scheduling (asserting the wall
+    // value itself needs a synthetic clock and lives in
+    // `bitty-lua/tests/measurement_lua.rs`). This keeps the whole file free of
+    // load-sensitive assertions while still proving a real overrun is stopped
+    // here rather than only during activation.
+    let mut world = World::activate("budget-runaway");
+    let error = world
+        .runtime
+        .invoke_command("bitty-featured.devtools:runaway", &empty_args())
+        .expect_err("a runaway callee must be suspended");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("InstructionBudgetExceeded") || rendered.contains("WallClockExceeded"),
+        "got {rendered}"
+    );
+    // Fail-closed: the suspended VM refuses the next call instead of running
+    // on with a stale clock, and the refusal stays contained.
+    let again = world.go_no_payload("bitty-featured.devtools:runaway");
+    assert!(again.starts_with("err:"), "got {again}");
+    // The host and the caller survive: an unrelated command still serves.
+    let listed = world
+        .runtime
+        .dispatch_command(&world.caller.clone(), "ls", &[])
+        .expect("caller ls must dispatch after a callee suspension");
+    assert_eq!(
+        listed,
+        LuaValue::String("8:bitty-featured.devtools:bad-result".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------

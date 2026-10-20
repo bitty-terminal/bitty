@@ -385,10 +385,11 @@ impl Runtime {
                 if out.len() >= bitty_ui::MAX_HINT_ANNOTATIONS {
                     break;
                 }
-                let x = u32::from(self.container.x)
-                    .saturating_add(u32::try_from(frame.frame.x.max(0)).unwrap_or(0) / cell_w);
-                let y = u32::from(self.container.y)
-                    .saturating_add(u32::try_from(frame.frame.y.max(0)).unwrap_or(0) / cell_h);
+                // `PresentFrame` geometry is already window-absolute physical
+                // pixels (the present solve receives the container-scaled
+                // area), so no container offset is added here.
+                let x = u32::try_from(frame.frame.x.max(0)).unwrap_or(0) / cell_w;
+                let y = u32::try_from(frame.frame.y.max(0)).unwrap_or(0) / cell_h;
                 let width = frame.frame.width.div_ceil(cell_w).max(1);
                 let height = frame.frame.height.div_ceil(cell_h).max(1);
                 out.push(TargetAnchorSummary {
@@ -2691,6 +2692,43 @@ mod tests {
         assert!(rect.2 > 0 && rect.3 > 0);
         // Same state -> same rows: no wall-clock or iteration-order input.
         assert_eq!(summaries, rt.target_anchor_summaries());
+    }
+
+    #[test]
+    fn panel_anchor_row_matches_present_frame_with_top_band() {
+        use bitty_lua::ui::UiSlot;
+        let mut rt = fresh();
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![BandContent {
+                plugin_id: "review".to_string(),
+                slot: UiSlot::Top,
+                root: bitty_lua::ui::UiNode::text("band"),
+                version: 1,
+            }],
+            ..ChromeBands::default()
+        });
+        rt.tick().expect("band frame presents");
+        let container = rt.container();
+        assert!(container.y >= 1, "top band reserves a row");
+        let focused = rt.focused_view().expect("focused view");
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == focused)
+            .expect("focused frame");
+        let cell_h = i32::try_from(rt.live_cell_metrics().height).expect("cell height");
+        assert!(cell_h > 0);
+        let expected_row = frame.frame.y / cell_h;
+        let panel = rt
+            .target_anchor_summaries()
+            .into_iter()
+            .find(|summary| summary.kind == "panel")
+            .expect("panel anchor");
+        assert_eq!(
+            i32::from(panel.rect.expect("visible panel rect").1),
+            expected_row,
+            "panel anchor row must match the painted frame row"
+        );
     }
 
     #[test]

@@ -31,8 +31,11 @@ optdepends=('noto-fonts: fallback font')
 provides=('bitty')
 conflicts=('bitty' 'bitty-nightly' 'bitty-git')
 _bitty_asset="bitty-x86_64-unknown-linux-gnu"
+# Version the local cached filename so package managers cannot reuse a
+# previous release's download when the published asset name is stable.
+_bitty_src="bitty-${pkgver}-x86_64-unknown-linux-gnu"
 source_x86_64=(
-  "${_bitty_asset}::https://github.com/bitty-terminal/bitty/releases/download/v${pkgver}/${_bitty_asset}"
+  "${_bitty_src}::https://github.com/bitty-terminal/bitty/releases/download/v${pkgver}/${_bitty_asset}"
   "bitty-${pkgver}.tar.gz::https://github.com/bitty-terminal/bitty/archive/refs/tags/v${pkgver}.tar.gz"
 )
 sha256sums_x86_64=(
@@ -41,7 +44,7 @@ sha256sums_x86_64=(
 )
 
 package() {
-  install -Dm755 "${srcdir}/${_bitty_asset}" "${pkgdir}/usr/bin/bitty"
+  install -Dm755 "${srcdir}/${_bitty_src}" "${pkgdir}/usr/bin/bitty"
   cd "${srcdir}/bitty-${pkgver}"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"

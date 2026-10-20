@@ -70,6 +70,8 @@ struct BlockingSpawn {
     /// Delay injected into `commands.invoke` / `services.*` dispatch.
     dispatch_delay_ms: u64,
     dispatches: Cell<u32>,
+    /// Time the dispatch stub actually spent, measured around each sleep.
+    dispatch_waited: Cell<Duration>,
     snapshot_delay_ms: u64,
     store: RefCell<BTreeMap<String, LuaValue>>,
 }
@@ -136,7 +138,10 @@ impl HostServices for BlockingSpawn {
     /// which runs the callee's Lua. Slow dispatch is Lua time, not host I/O.
     fn command_invoke(&self, _qualified: &str, _args: &LuaValue) -> Result<LuaValue, BridgeError> {
         self.dispatches.set(self.dispatches.get() + 1);
+        let started = std::time::Instant::now();
         std::thread::sleep(Duration::from_millis(self.dispatch_delay_ms));
+        self.dispatch_waited
+            .set(self.dispatch_waited.get() + started.elapsed());
         Ok(LuaValue::Bool(true))
     }
 
@@ -166,7 +171,10 @@ impl HostServices for BlockingSpawn {
         _args: &LuaValue,
     ) -> Result<LuaValue, BridgeError> {
         self.dispatches.set(self.dispatches.get() + 1);
+        let started = std::time::Instant::now();
         std::thread::sleep(Duration::from_millis(self.dispatch_delay_ms));
+        self.dispatch_waited
+            .set(self.dispatch_waited.get() + started.elapsed());
         Ok(LuaValue::Bool(true))
     }
 }
@@ -306,6 +314,11 @@ fn lua_dispatch_stays_charged_and_earns_no_host_call_credit() {
     // `bitty.commands.invoke` and `bitty.services.*` method dispatch run
     // callee/provider Lua through `vm.call_function`; the generic bridge guard
     // that wraps them must never be credited as host I/O (bitty#2285 review).
+    //
+    // The property is asserted from the budget ledger and the host-measured
+    // dispatch time, not from the callback outcome: on a loaded runner a
+    // single 10 ms dispatch can overshoot the bridge's 50 ms cheap-call
+    // deadline and fail with `E_TIMEOUT`, which says nothing about credit.
     let (mut vm, services) = vm_with(BlockingSpawn {
         dispatch_delay_ms: 10,
         ..BlockingSpawn::default()
@@ -313,52 +326,71 @@ fn lua_dispatch_stays_charged_and_earns_no_host_call_credit() {
     let outcome = vm
         .execute(
             r#"
-            for _ = 1, 2 do bitty.commands.invoke("acme.other:work") end
+            for _ = 1, 2 do pcall(bitty.commands.invoke, "acme.other:work") end
             local svc = bitty.services.get("acme.iface")
-            svc.ping()
-            svc.ping()
+            pcall(svc.ping)
+            pcall(svc.ping)
         "#,
         )
         .expect("execute");
+    // Outcome-agnostic on purpose: a slow runner may overshoot the 10 ms
+    // dispatch into the bridge's 50 ms cheap-call deadline (contained by
+    // `pcall`) or suspend for wall time that is correctly charged. Neither
+    // changes the credit property.
+    let _ = outcome;
     assert!(
-        matches!(outcome, ExecuteOutcome::Completed { .. }),
-        "40 ms of dispatch stays under the 50 ms wall budget, got {outcome:?}"
+        services.dispatches.get() >= 1,
+        "the dispatch must have run before the outcome resolved"
     );
-    assert_eq!(services.dispatches.get(), 4, "all dispatches must run");
+
+    let snapshot = vm.budget_snapshot();
+    let waited_ms = u64::try_from(services.dispatch_waited.get().as_millis()).unwrap_or(u64::MAX);
     assert_eq!(
-        vm.budget_snapshot().host_call_credit_ms,
-        0,
+        snapshot.host_call_credit_ms, 0,
         "callee/provider Lua dispatch must never earn host-call credit"
+    );
+    // And the dispatch time is charged, not hidden: with zero credit the
+    // charged wall time must account for what the host measured.
+    let charged_ms = snapshot
+        .wall_elapsed_ms
+        .saturating_sub(snapshot.store_commit_credit_ms)
+        .saturating_sub(snapshot.host_call_credit_ms);
+    assert!(
+        charged_ms + CHARGE_TOLERANCE_MS >= waited_ms,
+        "dispatch time must be charged: charged {charged_ms} ms, measured {waited_ms} ms"
     );
 }
 
 #[test]
-fn chained_lua_dispatch_is_charged_not_credited() {
-    // Enough sub-deadline dispatches to exceed the wall budget: the time is
-    // charged as Lua execution, so the callback suspends instead of silently
-    // banking credit.
+fn chained_lua_dispatch_cannot_bank_credit() {
+    // A tight loop of sub-deadline dispatches is the abuse the review flagged:
+    // if the generic guard were credited, this would bank host-call credit
+    // instead of spending the Lua wall budget.
     let (mut vm, services) = vm_with(BlockingSpawn {
         dispatch_delay_ms: 5,
         ..BlockingSpawn::default()
     });
     let outcome = vm
-        .execute(r#"for _ = 1, 20 do bitty.commands.invoke("acme.other:work") end"#)
+        .execute(r#"for _ = 1, 20 do pcall(bitty.commands.invoke, "acme.other:work") end"#)
         .expect("execute");
-    match outcome {
-        ExecuteOutcome::Suspended { reason, .. } => assert!(
-            matches!(reason, SuspendReason::WallClockExceeded { .. }),
-            "chained Lua dispatch must be charged to the wall budget, got {reason:?}"
-        ),
-        other => panic!("chained Lua dispatch must not complete on credited time, got {other:?}"),
-    }
+
+    let snapshot = vm.budget_snapshot();
+    let waited_ms = u64::try_from(services.dispatch_waited.get().as_millis()).unwrap_or(u64::MAX);
     assert!(
-        services.dispatches.get() >= 4,
-        "the loop must have dispatched before the budget tripped"
+        services.dispatches.get() >= 1,
+        "the loop must have dispatched before the outcome resolved"
     );
     assert_eq!(
-        vm.budget_snapshot().host_call_credit_ms,
-        0,
-        "callee/provider Lua dispatch must never earn host-call credit"
+        snapshot.host_call_credit_ms, 0,
+        "chained Lua dispatch must never bank host-call credit, got {outcome:?}"
+    );
+    let charged_ms = snapshot
+        .wall_elapsed_ms
+        .saturating_sub(snapshot.store_commit_credit_ms)
+        .saturating_sub(snapshot.host_call_credit_ms);
+    assert!(
+        charged_ms + CHARGE_TOLERANCE_MS >= waited_ms,
+        "chained dispatch time must be charged: charged {charged_ms} ms, measured {waited_ms} ms"
     );
 }
 

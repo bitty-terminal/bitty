@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.24] - unreleased
 
-Prepared from `v0.0.23..origin/main` (audited through `af59f71d`) but not
-published. Release metadata and this entry are merged; the tag, GitHub
-release, and artifact upload stay on hold until the owner authorizes
-publication. Nothing below claims a frozen candidate SHA, a runtime matrix,
-or a published artifact.
+Prepared from `v0.0.23..origin/main` (audited through `60c3d544`). The owner
+authorized publication on 2026-10-20; the tag, GitHub release, and artifact
+upload happen only after the frozen-candidate runtime matrix and artifact
+verification recorded under `recording/release-0.0.24-integration/`. Nothing
+below claims a published artifact.
 
 ### Added
 
@@ -191,6 +191,18 @@ or a published artifact.
 
 ### Fixed
 
+- **Seamless terminal block elements (CTX-1387, #2307):** block elements
+  `U+2580`-`U+259F` now rasterize on the cell box instead of the font bitmap's
+  side bearings, so adjacent block cells share an exact edge at fractional DPI
+  scale. figlet/lolcat-style art no longer shows a one-pixel grid between
+  cells; partial blocks and quadrants keep their documented fractions, shades
+  keep their 25/50/75% coverage, and box drawing, braille, CJK wide cells,
+  terminal truth, selection, copy, and accessibility text are unchanged.
+- **New panels start at row zero (CTX-1386, #2145):** creating a panel
+  (`Mod+N`/`Mod+T`), splitting, or moving a panel now allocates it against the
+  presented content frame, so the first row holds the prompt instead of a
+  blank line that needed `clear`. Existing panels and cursor/selection
+  coordinates are unaffected.
 - **RC-1 accounting across host calls (CTX-1379, #2285):** the wall-clock
   budget now bounds Lua execution instead of raw elapsed time for supervised
   `process.spawn` waits, which no longer suspend a bounded plugin command. Only
@@ -317,6 +329,10 @@ or a published artifact.
 
 ### Security
 
+- **Component response headers bounded (CTX-1385, #2301):** delivery now
+  enforces the documented 16-header, 1 KiB-per-name/value response bound with a
+  typed fail-closed error, matching the request path; oversize names, values,
+  and a 17th header are refused instead of truncated.
 - **Bounded native clipboard acquisition (CTX-1366, #2206, #2273, path B):**
   Linux and Windows acquisition is bounded before allocation and delivery —
   one absolute deadline threaded through the X11 packet-read loop, selection

@@ -23,6 +23,25 @@ fn gate_vm(id: impl Into<String>) -> LuaVm {
     build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
 }
 
+/// Wall budget for the expired-mount fixture, which deliberately blocks past
+/// its 5 ms bridge deadline. The production 50 ms contract is covered by
+/// `measurement_lua` and `host_budget_accounting`; on loaded runners a 30 ms
+/// sleep can overshoot past 50 ms, and the completion check would then replace
+/// the expected `E_TIMEOUT` with `WallClockExceeded`.
+const TIMEOUT_FIXTURE_WALL_BUDGET_MS: u64 = 60_000;
+
+/// Gate-built VM with a wide wall budget for the timeout fixture.
+fn timeout_vm(id: impl Into<String>) -> LuaVm {
+    build_plugin_vm(
+        id,
+        Some(VmBudgets {
+            wall_budget_ms: TIMEOUT_FIXTURE_WALL_BUDGET_MS,
+            ..VmBudgets::default()
+        }),
+    )
+    .expect("timeout fixture budgets are valid")
+}
+
 #[derive(Default)]
 struct UiServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
@@ -622,7 +641,7 @@ fn expired_mount_returns_timeout_without_commit() {
         slow_ms: 30,
         ..UiServices::default()
     });
-    let mut vm = gate_vm("expired");
+    let mut vm = timeout_vm("expired");
     install(&mut vm, services.clone(), 5);
     run(
         &mut vm,

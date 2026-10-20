@@ -1617,6 +1617,12 @@ impl TerminalApp {
     /// diagnostic at the call site and never reach the banner. `pub(crate)`
     /// for the keybinding dispatch arm (CTX-1125), which surfaces like the
     /// band-click and composer-verb call sites.
+    ///
+    /// Issue #2336: routine command use is in-grid only. The banner paints
+    /// on the terminal, but the host never hands the result to the OS;
+    /// only an explicit `bitty.notify.show` (drained through
+    /// [`Self::drain_plugin_notifications`]) may raise a desktop
+    /// notification.
     pub(crate) fn surface_dispatch_result(
         &mut self,
         plugin_id: &str,
@@ -1634,7 +1640,7 @@ impl TerminalApp {
         let now = std::time::Instant::now();
         let _ = self
             .runtime
-            .admit_plugin_notification(&title, &summary, now);
+            .admit_plugin_banner_notification(&title, &summary, now);
     }
 
     /// Reads mounted UiBlocks from plugin runtime and updates Runtime chrome

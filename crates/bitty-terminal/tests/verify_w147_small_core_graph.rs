@@ -81,6 +81,7 @@ const EXTENSION_CRATES: &[&str] = &[
     "bitty-network",
     "bitty-net",
     "bitty-ipc",
+    "bitty-ipc-api",
     "bitty-network-wire",
     "bitty-network-publication",
     "bitty-observability-api",
@@ -98,6 +99,9 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
         &["bitty-rich", "bitty-runtime", "bitty-terminal"],
     ),
     ("bitty-network-wire", &["bitty-runtime"]),
+    // Feature-gated provider-publication control-record contract (CTX-1390,
+    // bitty#2322): intentionally linked by the runtime, default-off.
+    ("bitty-ipc-api", &["bitty-runtime"]),
     // Feature-gated publication-control transport (CTX-1373, bitty#2199):
     // intentionally linked by the runtime, default-off.
     ("bitty-network-publication", &["bitty-runtime"]),

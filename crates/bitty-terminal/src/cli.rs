@@ -291,6 +291,12 @@ pub(crate) struct Args {
     pub(crate) component_format: Option<String>,
     /// `--no-color` for component table output (global or post-word).
     pub(crate) component_no_color: bool,
+    /// `bitty +show-font` resolved-font probe (CTX-1370, issue #2263).
+    /// True once the `+show-font` token is seen; a program literally named
+    /// `+show-font` needs `bitty -- +show-font`. Read-only: loads the merged
+    /// config and prints the resolved family/size/fallbacks, never starts a
+    /// runtime or a shell.
+    pub(crate) show_font: bool,
     /// `bitty version` version and build metadata (#1375, CTX-0763).
     /// True once the first positional `version` word is seen; a program
     /// literally named `version` needs `bitty run -- version ...` or the
@@ -489,6 +495,7 @@ impl Args {
             component_no_color: false,
             version_word: false,
             version_raw: Vec::new(),
+            show_font: false,
             completion_word: false,
             completion_spelling: String::from("completion"),
             completion_raw: Vec::new(),
@@ -1619,6 +1626,17 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     continue;
                 }
 
+                // `bitty +show-font` resolved-font probe (first positional
+                // only; CTX-1370, issue #2263). The leading `+` keeps it
+                // disjoint from every subcommand word; a program literally
+                // named `+show-font` needs `bitty -- +show-font`. Flags
+                // (`--config`, `--profile`, `--safe`) compose around it.
+                if !program_set && token == "+show-font" {
+                    out.show_font = true;
+                    i += 1;
+                    continue;
+                }
+
                 // `bitty init` opt-in setup wizard (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `init` needs `bitty -- init`.
@@ -2138,6 +2156,11 @@ pub(crate) fn help_text() -> String {
                              `bitty <semver> (<channel> <commit>)` on stdout\n  \
                              (same fields in `--format json`; `-V`/`--version`\n  \
                              alias; local, no instance)\n  \
+            +show-font [--config PATH] [--profile NAME] [--safe]  Resolved font\n  \
+                             probe for terminal-font detectors: prints\n  \
+                             `font_family:`/`font_size:`/`font_fallback:`\n  \
+                             lines from the merged config and exits (exit 3\n  \
+                             when no usable identity; read-only, no runtime)\n  \
              help [cmd]       Show the compact overview, or per-command help\n  \
                               (`bitty help plugin` == `bitty plugin --help`;\n  \
                               unknown names fail closed naming valid commands;\n  \
@@ -2279,6 +2302,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             completion <shell>      Emit shell completion script (alias comp)\n  \
             shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
             version                 Version and build metadata\n  \
+            +show-font              Print resolved font family and size (read-only probe)\n  \
             help [cmd]              Show this help, or per-command help (alias for --help)\n\
           \n\
           {arguments}\n  \

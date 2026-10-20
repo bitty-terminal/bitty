@@ -22,6 +22,7 @@
 use crate::action::TerminalAction;
 use crate::diag::{RejectLog, warn_rejection};
 use crate::kitty_apc::{KITTY_APC_MAX_CONTROL_BYTES, KittyApcAssembler, KittyFeedOutcome};
+use crate::kitty_font_query::{KITTY_FONT_QUERY_WIRE_MAX_BYTES, parse_kitty_font_query};
 use vte::Params;
 
 mod dispatch;
@@ -67,11 +68,34 @@ impl std::fmt::Debug for Parser {
 
 /// Marker for a device-control string opened by `hook` and closed by
 /// `unhook`, so unmapped strings can be reported once, deterministically.
-#[derive(Debug, Default)]
+///
+/// DCS `ESC P +q ... ST` is also the kitty font-query envelope (CTX-1370),
+/// so the hook records that header and `put` captures a fixed-cap payload
+/// for classification at `unhook`. Every other DCS keeps its payload inert
+/// and is reported as [`UnrecognizedSequence`] exactly as before.
+#[derive(Debug)]
 struct PendingDcs {
     active: bool,
     final_byte: u8,
     intermediates: [u8; 2],
+    font_query: bool,
+    font_payload: [u8; KITTY_FONT_QUERY_WIRE_MAX_BYTES],
+    font_len: usize,
+    font_overflow: bool,
+}
+
+impl Default for PendingDcs {
+    fn default() -> Self {
+        Self {
+            active: false,
+            final_byte: 0,
+            intermediates: [0; 2],
+            font_query: false,
+            font_payload: [0; KITTY_FONT_QUERY_WIRE_MAX_BYTES],
+            font_len: 0,
+            font_overflow: false,
+        }
+    }
 }
 
 impl Parser {
@@ -305,7 +329,7 @@ impl Parser {
                         *apc_discarding = true;
                     }
                     i += 1;
-                } else if b == b';' {
+                } else if b == b';' && !apc_buf.starts_with(b"+q") {
                     match kitty.begin_control(apc_buf) {
                         Ok(()) => {
                             *apc_payload = true;
@@ -397,6 +421,18 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
         *apc_payload = false;
         clear_apc_header(kitty, apc_buf);
         return;
+    }
+    // Kitty font queries (`APC +q ... ST`, CTX-1370) are not graphics
+    // transmissions: classify the bounded payload and emit one inert action.
+    // Font values are configuration-owned, so the runtime synthesizes the
+    // reply through the existing bounded `Reply` channel.
+    if !*apc_payload {
+        if let Some(query) = parse_kitty_font_query(apc_buf) {
+            clear_apc_header(kitty, apc_buf);
+            *in_apc = false;
+            bridge.emit(TerminalAction::KittyFontQuery { query });
+            return;
+        }
     }
     let outcome = if *apc_payload {
         Some(kitty.finish())

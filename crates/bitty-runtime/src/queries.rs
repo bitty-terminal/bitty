@@ -73,7 +73,10 @@
 #![forbid(unsafe_code)]
 
 use bitty_term_state::State;
-use bitty_vt::UnrecognizedSequence;
+use bitty_vt::{
+    KittyFontQuery, UnrecognizedSequence,
+    kitty_font_query::{DcsQueryClass, classify_dcs_query_body},
+};
 
 /// Bytes of PTY history retained across [`Runtime::handle_pty_bytes`](crate::Runtime::handle_pty_bytes)
 /// calls so a query split over two PTY reads is still recognized.
@@ -414,7 +417,14 @@ pub(crate) fn find_xtgettcap(combined: &[u8], new_start: usize) -> Vec<Xtgettcap
             j += 1;
         }
         if let Some((term_start, term_end)) = end {
-            if term_end > new_start {
+            // `+q` is shared with the kitty font protocol (CTX-1370). Use
+            // the parser's single classification contract (review F1), not a
+            // leading-hex-prefix check: a mixed payload containing any known
+            // font key is answered as a font query and must never also be
+            // queued as an XTGETTCAP capability, or a following capability
+            // would consume the wrong queue entry.
+            let class = classify_dcs_query_body(&combined[payload_start..term_start]);
+            if term_end > new_start && matches!(class, DcsQueryClass::Xtgettcap) {
                 out.push(XtgettcapQuery {
                     payload: combined[payload_start..term_start].to_vec(),
                 });
@@ -722,6 +732,94 @@ pub(crate) fn kitty_status_enoent_reply(
     reply
 }
 
+/// Resolved font identity reported to kitty font-query detectors.
+///
+/// Borrowed from the live [`RuntimeConfig`](crate::RuntimeConfig) so a query
+/// always reflects the active configuration (including a live reload).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FontIdentity<'a> {
+    /// Resolved family (`appearance.font.family` / effective `font.family`).
+    pub family: &'a str,
+    /// Resolved point size (`font.size`).
+    pub size: f32,
+}
+
+/// Combined byte cap for one font-query answer (both keys).
+///
+/// Each APC answer is bounded by [`KITTY_QUERY_REPLY_MAX_BYTES`]; two
+/// answers plus the family cap fit comfortably, and the state reply queue
+/// still enforces its own 4 KiB total.
+pub(crate) const KITTY_FONT_REPLY_MAX_BYTES: usize = 2 * KITTY_QUERY_REPLY_MAX_BYTES;
+
+/// Lowercase hex encoding for kitty font-query values.
+///
+/// The detector example and kitty's own examples use lowercase; fastfetch
+/// accepts either, but the emitted shape stays byte-stable and matches the
+/// documented example.
+fn encode_hex_lower(bytes: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0F) as usize]);
+    }
+    out
+}
+
+/// Appends one `ESC P 1+r <key>=<hex-value> ESC \` answer.
+fn append_font_reply(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    out.extend_from_slice(b"\x1bP1+r");
+    out.extend_from_slice(key);
+    out.push(b'=');
+    out.extend_from_slice(&encode_hex_lower(value));
+    out.extend_from_slice(b"\x1b\\");
+}
+
+/// Replies for a kitty font query (`DCS +q ...`, CTX-1370).
+///
+/// Emits one `ESC P 1+r kitty-query-font_family=<hex> ESC \` and/or
+/// `ESC P 1+r kitty-query-font_size=<hex> ESC \`, in the order the keys were
+/// requested (fastfetch expects family then size). Values are hex-encoded
+/// configuration bytes — the raw query is never echoed. `None` (no host font
+/// information) or an empty/invalid value answers nothing; the caller queues
+/// the result through the existing bounded `Reply` channel.
+#[must_use]
+pub(crate) fn kitty_font_replies(
+    query: KittyFontQuery,
+    font: Option<&FontIdentity<'_>>,
+) -> Vec<Vec<u8>> {
+    let Some(font) = font else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if query.family {
+        let family = font.family.trim();
+        if !family.is_empty() && family.len() <= bitty_config::types::MAX_FONT_FAMILY_LEN {
+            let mut reply = Vec::new();
+            append_font_reply(
+                &mut reply,
+                bitty_vt::kitty_font_query::KITTY_FONT_QUERY_FAMILY,
+                family.as_bytes(),
+            );
+            out.push(reply);
+        }
+    }
+    if query.size && font.size.is_finite() && font.size > 0.0 {
+        let size = format!("{}", font.size);
+        let mut reply = Vec::new();
+        append_font_reply(
+            &mut reply,
+            bitty_vt::kitty_font_query::KITTY_FONT_QUERY_SIZE,
+            size.as_bytes(),
+        );
+        out.push(reply);
+    }
+    if out.iter().map(Vec::len).sum::<usize>() > KITTY_FONT_REPLY_MAX_BYTES {
+        return Vec::new();
+    }
+    out
+}
+
 // Precise [`UnrecognizedSequence`] triggers (kind/final/intermediates).
 // The parser maps every query below to `Unknown` today; matching the full
 // triple keeps unrelated sequences silent.
@@ -945,6 +1043,98 @@ mod tests {
     }
 
     #[test]
+    fn kitty_font_replies_exact_bytes_for_family_and_size() {
+        let font = FontIdentity {
+            family: "JetBrainsMono Nerd Font",
+            size: 12.0,
+        };
+        let replies = kitty_font_replies(
+            KittyFontQuery {
+                family: true,
+                size: true,
+            },
+            Some(&font),
+        );
+        assert_eq!(replies.len(), 2, "one answer per requested key");
+        assert_eq!(
+            replies[0],
+            b"\x1bP1+rkitty-query-font_family=4a6574427261696e734d6f6e6f204e65726420466f6e74\x1b\\"
+        );
+        assert_eq!(replies[1], b"\x1bP1+rkitty-query-font_size=3132\x1b\\");
+        assert!(replies.iter().map(Vec::len).sum::<usize>() <= KITTY_FONT_REPLY_MAX_BYTES);
+    }
+
+    #[test]
+    fn kitty_font_replies_only_answer_known_requested_keys() {
+        let font = FontIdentity {
+            family: "Maple Mono",
+            size: 13.5,
+        };
+        let mut size_only = kitty_font_replies(
+            KittyFontQuery {
+                family: false,
+                size: true,
+            },
+            Some(&font),
+        );
+        assert_eq!(size_only.len(), 1);
+        assert_eq!(
+            size_only.remove(0),
+            b"\x1bP1+rkitty-query-font_size=31332e35\x1b\\"
+        );
+        let mut family_only = kitty_font_replies(
+            KittyFontQuery {
+                family: true,
+                size: false,
+            },
+            Some(&font),
+        );
+        assert_eq!(family_only.len(), 1);
+        assert_eq!(
+            family_only.remove(0),
+            b"\x1bP1+rkitty-query-font_family=4d61706c65204d6f6e6f\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_font_replies_none_without_host_font_info() {
+        let query = KittyFontQuery {
+            family: true,
+            size: true,
+        };
+        assert!(kitty_font_replies(query, None).is_empty());
+        let empty = FontIdentity {
+            family: "",
+            size: f32::NAN,
+        };
+        assert!(kitty_font_replies(query, Some(&empty)).is_empty());
+    }
+
+    #[test]
+    fn kitty_font_replies_never_echo_query_bytes() {
+        let font = FontIdentity {
+            family: "Mono",
+            size: 12.0,
+        };
+        let replies = kitty_font_replies(
+            KittyFontQuery {
+                family: true,
+                size: true,
+            },
+            Some(&font),
+        );
+        let reply = replies.concat();
+        assert!(!reply.windows(3).any(|window| window == b"+q"));
+        assert!(reply.starts_with(b"\x1bP1+rkitty-query-font_family="));
+        assert!(reply.ends_with(b"\x1b\\"));
+        assert_eq!(
+            reply.iter().filter(|byte| **byte == 0x1b).count(),
+            4,
+            "one APC introducer and one ST per answer"
+        );
+    }
+
+    #[test]
     fn xtgettcap_multi_name_replies_all_valid() {
         // TN;Co in one query.
         let reply = xtgettcap_reply(b"544E;436F");
@@ -964,6 +1154,19 @@ mod tests {
         assert!(find_xtgettcap(bytes, bytes.len()).is_empty());
         // Unterminated DCS fails closed.
         assert!(find_xtgettcap(b"\x1bP+q544E", 0).is_empty());
+    }
+
+    #[test]
+    fn find_xtgettcap_skips_a_mixed_font_payload_and_keeps_alignment() {
+        // Review F1: the mixed payload is classified as a font query by the
+        // shared contract, so it must not occupy an XTGETTCAP queue slot; the
+        // following Co query is the only capability returned.
+        let mut bytes = b"\x1bP+q544E;".to_vec();
+        bytes.extend_from_slice(b"6b697474792d71756572792d666f6e745f73697a65");
+        bytes.extend_from_slice(b"\x1b\\\x1bP+q436F\x1b\\");
+        let found = find_xtgettcap(&bytes, 0);
+        assert_eq!(found.len(), 1, "the mixed font payload must be skipped");
+        assert_eq!(found[0].payload, b"436F");
     }
 
     #[test]

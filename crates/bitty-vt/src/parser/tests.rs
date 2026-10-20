@@ -2765,3 +2765,166 @@ fn apc_discarding_held_esc_then_esc_backslash_terminates() {
         .collect();
     assert_eq!(printed, "ok");
 }
+
+// ---------------------------------------------------------------------------
+// CTX-1370: kitty font queries (`APC +q ... ST`)
+// ---------------------------------------------------------------------------
+
+/// Lowercase hex for the font-query test fixtures.
+fn font_query_hex(bytes: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize]);
+        out.push(DIGITS[(byte & 0x0f) as usize]);
+    }
+    out
+}
+
+/// fastfetch `detectKitty` query bytes, verbatim.
+fn fastfetch_font_query() -> Vec<u8> {
+    let mut wire = b"\x1bP+q".to_vec();
+    wire.extend_from_slice(&font_query_hex(b"kitty-query-font_family"));
+    wire.push(b';');
+    wire.extend_from_slice(&font_query_hex(b"kitty-query-font_size"));
+    wire.extend_from_slice(b"\x1b\\");
+    wire
+}
+
+fn kitty_font_queries(actions: &[TerminalAction]) -> Vec<crate::kitty_font_query::KittyFontQuery> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            TerminalAction::KittyFontQuery { query } => Some(*query),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn kitty_font_query_emits_one_action_for_both_keys() {
+    let wire = fastfetch_font_query();
+    let actions = parse(&wire);
+    assert_eq!(
+        kitty_font_queries(&actions),
+        vec![crate::kitty_font_query::KittyFontQuery {
+            family: true,
+            size: true
+        }],
+        "fastfetch query must emit exactly one classified action"
+    );
+    // The classified action carries flags only; the raw query never rides
+    // the action stream.
+    assert_eq!(actions.len(), 1);
+}
+
+#[test]
+fn kitty_font_query_is_chunk_invariant() {
+    let wire = fastfetch_font_query();
+    for chunk in [1, 2, 3, 7, 16, 64] {
+        assert_eq!(
+            kitty_font_queries(&parse_split(&wire, chunk)),
+            kitty_font_queries(&parse(&wire)),
+            "chunk {chunk} diverged"
+        );
+    }
+}
+
+#[test]
+fn kitty_font_query_unknown_key_is_ignored_silently() {
+    let mut wire = b"\x1bP+q".to_vec();
+    wire.extend_from_slice(&font_query_hex(b"kitty-query-nope"));
+    wire.extend_from_slice(b"\x1b\\");
+    assert!(parse(&wire).is_empty(), "unknown key must emit nothing");
+
+    // Mixed query answers only the known key.
+    let mut mixed = b"\x1bP+q".to_vec();
+    mixed.extend_from_slice(&font_query_hex(b"kitty-query-nope"));
+    mixed.push(b';');
+    mixed.extend_from_slice(&font_query_hex(b"kitty-query-font_size"));
+    mixed.extend_from_slice(b"\x1b\\");
+    assert_eq!(
+        kitty_font_queries(&parse(&mixed)),
+        vec![crate::kitty_font_query::KittyFontQuery {
+            family: false,
+            size: true
+        }]
+    );
+}
+
+#[test]
+fn kitty_font_query_malformed_hex_and_empty_are_inert() {
+    for wire in [
+        b"\x1bP+q\x1b\\".as_slice(),
+        b"\x1bP+q6b697474792d71756572792d\x1b\\".as_slice(),
+        b"\x1bP+q6b697474792d71756572792dzz\x1b\\".as_slice(),
+    ] {
+        assert!(
+            parse(wire).is_empty(),
+            "malformed/empty query must emit nothing for {wire:?}"
+        );
+        // No poisoned stream: the next query still routes.
+        let mut stream = wire.to_vec();
+        stream.extend_from_slice(&fastfetch_font_query());
+        assert_eq!(
+            kitty_font_queries(&parse(&stream)),
+            vec![crate::kitty_font_query::KittyFontQuery {
+                family: true,
+                size: true
+            }],
+            "parser must stay healthy after {wire:?}"
+        );
+    }
+}
+
+#[test]
+fn kitty_font_query_oversized_payload_is_inert() {
+    // Reserved `kitty-query-` prefix, then far past the wire cap.
+    let mut wire = b"\x1bP+q6b697474792d71756572792d".to_vec();
+    wire.extend(std::iter::repeat_n(
+        b'a',
+        crate::kitty_font_query::KITTY_FONT_QUERY_WIRE_MAX_BYTES + 1,
+    ));
+    wire.extend_from_slice(b"\x1b\\");
+    assert!(parse(&wire).is_empty());
+}
+
+#[test]
+fn kitty_font_query_decoded_cap_is_inert_and_stream_recovers() {
+    // 300 hex characters decode to 150 bytes: inside the 512-byte wire cap
+    // but above the 128-byte decoded cap. This is the case that would write
+    // past the fixed stack buffer if the decoded bound were removed (review
+    // F2). The parser must stay silent and the next query must still route.
+    let mut wire = b"\x1bP+q".to_vec();
+    wire.extend(std::iter::repeat_n(b'a', 300));
+    wire.extend_from_slice(b"\x1b\\");
+    assert!(
+        kitty_font_queries(&parse(&wire)).is_empty(),
+        "an over-decoded-cap payload must emit no font action"
+    );
+    let mut stream = wire;
+    stream.extend_from_slice(&fastfetch_font_query());
+    assert_eq!(
+        kitty_font_queries(&parse(&stream)),
+        vec![crate::kitty_font_query::KittyFontQuery {
+            family: true,
+            size: true
+        }],
+        "the stream must recover after an oversized decoded payload"
+    );
+}
+
+#[test]
+fn kitty_font_query_apc_bel_terminator_is_accepted() {
+    let st = fastfetch_font_query();
+    let mut bel = b"\x1b_".to_vec();
+    bel.extend_from_slice(&st[2..st.len() - 2]);
+    bel.push(0x07);
+    assert_eq!(
+        kitty_font_queries(&parse(&bel)),
+        vec![crate::kitty_font_query::KittyFontQuery {
+            family: true,
+            size: true
+        }]
+    );
+}

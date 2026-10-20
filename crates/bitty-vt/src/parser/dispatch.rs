@@ -16,6 +16,9 @@ use crate::action::{
     UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
+use crate::kitty_font_query::{
+    DcsQueryClass, classify_dcs_query_body, looks_like_kitty_font_query,
+};
 use vte::{Params, Perform};
 
 impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
@@ -1227,6 +1230,9 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             // mapped string. Report the unknown sequence immediately and
             // leave the payload inert; `unhook` stays silent for it.
             self.dcs.active = false;
+            self.dcs.font_query = false;
+            self.dcs.font_len = 0;
+            self.dcs.font_overflow = false;
             self.emit(TerminalAction::Unknown(UnrecognizedSequence {
                 kind: SequenceKind::Dcs,
                 final_byte,
@@ -1238,11 +1244,65 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         capture.active = true;
         capture.final_byte = final_byte;
         capture.intermediates = packed;
+        // Kitty font queries share the XTGETTCAP envelope `ESC P +q ... ST`.
+        // Capture that payload under a fixed cap so `unhook` can classify it
+        // without a raw stream scan.
+        capture.font_query = intermediates == b"+" && final_byte == b'q';
+        capture.font_len = 0;
+        capture.font_overflow = false;
+    }
+
+    fn put(&mut self, byte: u8) {
+        let capture = &mut self.dcs;
+        if !capture.active || !capture.font_query {
+            return;
+        }
+        if capture.font_len < capture.font_payload.len() {
+            capture.font_payload[capture.font_len] = byte;
+            capture.font_len += 1;
+        } else {
+            capture.font_overflow = true;
+        }
     }
 
     fn unhook(&mut self) {
         if !self.dcs.active {
             return;
+        }
+        if self.dcs.font_query {
+            let overflow = self.dcs.font_overflow;
+            let len = self.dcs.font_len;
+            // One classification contract shared with the runtime XTGETTCAP
+            // pre-scan (CTX-1370 review F1). An overflowed capture cannot be
+            // decoded truthfully, so it keeps the reserved-family decision
+            // from the captured prefix and never emits a partial font answer.
+            let classification = if overflow {
+                if len == 0 || looks_like_kitty_font_query(&self.dcs.font_payload[..len]) {
+                    DcsQueryClass::ReservedFont
+                } else {
+                    DcsQueryClass::Xtgettcap
+                }
+            } else {
+                classify_dcs_query_body(&self.dcs.font_payload[..len])
+            };
+            self.dcs.font_query = false;
+            self.dcs.font_len = 0;
+            self.dcs.font_overflow = false;
+            match classification {
+                DcsQueryClass::Font(query) => {
+                    self.dcs.active = false;
+                    self.emit(TerminalAction::KittyFontQuery { query });
+                    return;
+                }
+                DcsQueryClass::ReservedFont => {
+                    // A malformed, empty, or unknown-key font query still
+                    // belongs to the reserved family: answer nothing rather
+                    // than falling through to the XTGETTCAP negative reply.
+                    self.dcs.active = false;
+                    return;
+                }
+                DcsQueryClass::Xtgettcap => {}
+            }
         }
         let reported = UnrecognizedSequence {
             kind: SequenceKind::Dcs,

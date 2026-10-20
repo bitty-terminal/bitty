@@ -950,6 +950,28 @@ impl Runtime {
                     }
                 }
             }
+            // Kitty font queries (CTX-1370, issue #2263): the parser already
+            // classified and bounded the DCS (`ESC P +q ... ST`, also accepted
+            // in the APC spelling) payload to the answerable keys.
+            // Values come from the live resolved config (so reloads and CLI
+            // appearance overrides are reflected) and ride the same bounded
+            // `Reply` channel as every other host answer — no second PTY
+            // path, no echo of the query bytes. A separate `bitty +show-font`
+            // process reads the config file instead, so after a live zoom the
+            // two paths can differ until the file catches up (CTX-1370 review
+            // F4); the live value is what this terminal is actually using.
+            if let TerminalAction::KittyFontQuery { query } = &action {
+                let font = crate::queries::FontIdentity {
+                    family: &self.config.font_family,
+                    size: self.config.font_size,
+                };
+                let replies = crate::queries::kitty_font_replies(*query, Some(&font));
+                for reply in replies {
+                    self.state.apply(&TerminalAction::Reply {
+                        bytes: reply.into_boxed_slice(),
+                    });
+                }
+            }
             // Kitty graphics (CTX-0256, CTX-0904): the parser already
             // base64-unwrapped and reassembled `m=` chunks under the ledger
             // cap, so `payload` is decoded bytes ready for the existing intake

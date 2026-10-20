@@ -55,6 +55,7 @@ mod action;
 mod bounded;
 mod diag;
 pub mod kitty_apc;
+pub mod kitty_font_query;
 mod parser;
 
 pub use action::{
@@ -73,4 +74,5 @@ pub use kitty_apc::{
     KITTY_APC_STALL_MAX_BYTES, KITTY_APC_TMP_NAME_MARKER, KittyApcAssembler, KittyApcParams,
     KittyApcReject, KittyCompleted, KittyControlKeys, KittyFeedOutcome, KittyMedium,
 };
+pub use kitty_font_query::{KittyFontQuery, parse_kitty_font_query};
 pub use parser::Parser;

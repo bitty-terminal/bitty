@@ -1514,6 +1514,10 @@ impl State {
             // and the gated set path; terminal state stays inert by contract
             // (malformed sequences never reach this arm).
             TerminalAction::OscPalette { .. } => {}
+            // Kitty font queries (CTX-1370): grid truth is untouched. The
+            // runtime resolves the configured family/size and answers through
+            // the bounded `Reply` channel; terminal state stays inert.
+            TerminalAction::KittyFontQuery { .. } => {}
             TerminalAction::OscClipboard { .. } => {
                 // Semantically inert here by contract (RFC replay guarantee
                 // 6): clipboard effects enter state only through recorded

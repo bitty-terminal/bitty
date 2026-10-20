@@ -194,6 +194,27 @@ fn xtgettcap_multi_name_query_replies_in_order() {
 }
 
 #[test]
+fn mixed_font_and_capability_query_keeps_the_xtgettcap_queue_aligned() {
+    // Review F1: a DCS payload mixing a capability name (TN) with a kitty
+    // font key is a font query under the shared classification. The following
+    // Co query must still consume its own queue slot and answer Co, not TN.
+    let mut stream = b"\x1bP+q544E;".to_vec();
+    stream.extend_from_slice(b"6b697474792d71756572792d666f6e745f73697a65");
+    stream.extend_from_slice(b"\x1b\\");
+    stream.extend_from_slice(b"\x1bP+q436F\x1b\\");
+    let mut rt = Runtime::with_defaults().expect("build");
+    rt.handle_pty_bytes(&stream);
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![
+            b"\x1bP1+rkitty-query-font_size=3132\x1b\\".to_vec(),
+            b"\x1bP1+r436F=323536\x1b\\".to_vec(),
+        ],
+        "font size first, then Co; the mixed payload must not answer TN or steal Co's slot"
+    );
+}
+
+#[test]
 fn vttest_style_mixed_stream_keeps_grid_and_reply_order() {
     // vttest-shaped stream: cursor addressing, DSR, printable text, mode
     // set, then a private query. Grid effects and replies stay ordered and

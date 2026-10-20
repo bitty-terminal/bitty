@@ -256,6 +256,7 @@ mod list;
 mod plugin;
 mod run;
 mod shell_init;
+mod show_font;
 mod spawn;
 mod terminal_app;
 mod test_mode;
@@ -595,6 +596,11 @@ fn main() {
             },
         }
     }
+    // `bitty +show-font --help` prints the probe usage (local, no config).
+    if args.help && args.show_font {
+        print!("{}", show_font::show_font_usage());
+        std::process::exit(0);
+    }
     // Bare `--help` prints the compact overview (CTX-1060, issue #1808);
     // `--help -v` / `--help --verbose` prints the full flag detail.
     // Per-command `bitty <command> --help` branches above are unchanged.
@@ -628,6 +634,13 @@ fn main() {
     if let Some(err) = args.cli_value_error.as_deref() {
         eprintln!("bitty: {err}\n{}", help_text());
         std::process::exit(2);
+    }
+
+    // `bitty +show-font` resolved-font probe (CTX-1370, issue #2263).
+    // Read-only and local: loads the merged config, prints stable text, and
+    // exits. No runtime, PTY, window, IPC, or plugin VM is created.
+    if args.show_font {
+        std::process::exit(show_font::run_cli(&args));
     }
 
     // `bitty run -- COMMAND...` explicit child launch (CTX-0170, local

@@ -3786,12 +3786,21 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         // run with programming ligatures zeroed (second cache entry) and
         // emit the unshaped variant instead. Both variants are served
         // from the run-shape cache (key includes features-hash).
+        //
+        // `shape_run` reports run-relative cluster columns (`col_base = 0`),
+        // so map the absolute cursor column into the run before testing
+        // overlap (issue #2316), and only for a cursor at/after the run
+        // start: a cursor on leading blanks belongs to no run and must not
+        // un-shape a ligature that starts later on the row.
         let unshaped: Vec<ShapedCluster>;
         let clusters_ref: &[ShapedCluster] = match policy {
             LigaturePolicy::Cursor => {
                 if let Some((cursor_row, cursor_col)) = cursor_cell {
+                    let run_cursor_col =
+                        cursor_col.checked_sub(run.start_col).unwrap_or(usize::MAX);
                     if cursor_row == row
-                        && SwashSingle::cursor_intersects_ligature(&clusters, cursor_col).is_some()
+                        && SwashSingle::cursor_intersects_ligature(&clusters, run_cursor_col)
+                            .is_some()
                     {
                         let mut zeroed = effective.to_vec();
                         for tag in crate::shaped::PROGRAMMING_LIGATURE_TAGS {

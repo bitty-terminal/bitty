@@ -172,11 +172,94 @@ pub fn default_to_lua(default: &SettingDefault) -> LuaValue {
 // Resolution (pure: no I/O)
 // ---------------------------------------------------------------------------
 
+/// Which settings layer served one effective value.
+///
+/// Lowest to highest: manifest shipped default < shared host source <
+/// selected user file. `bitty plugin config show` attributes every declared
+/// key to one of these layers; the runtime itself only serves values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SettingLayer {
+    /// The manifest's shipped `[settings]` default.
+    ManifestDefault,
+    /// The shared host source (the application's old settings home).
+    Host,
+    /// The selected per-plugin user file (canonical Lua, alias, or legacy
+    /// TOML; see [`PluginConfigKind`]).
+    UserFile,
+}
+
+impl SettingLayer {
+    /// Stable lowercase spelling for CLI output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManifestDefault => "manifest-default",
+            Self::Host => "host",
+            Self::UserFile => "user-file",
+        }
+    }
+}
+
+/// Which user-file surface was selected for one plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginConfigKind {
+    /// Canonical owner-qualified Lua settings file.
+    CanonicalLua,
+    /// Short-name Lua compatibility alias (only when unambiguous).
+    AliasLua,
+    /// Legacy data-only TOML fallback.
+    LegacyToml,
+}
+
+impl PluginConfigKind {
+    /// Stable lowercase spelling for CLI output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalLua => "lua-canonical",
+            Self::AliasLua => "lua-alias",
+            Self::LegacyToml => "toml-legacy",
+        }
+    }
+
+    /// Whether this surface is the canonical Lua settings file.
+    #[must_use]
+    pub fn is_canonical_lua(self) -> bool {
+        matches!(self, Self::CanonicalLua)
+    }
+}
+
+/// One selected user-file read for settings resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPluginFile {
+    /// Absolute (or caller-rooted) path that was read.
+    pub path: std::path::PathBuf,
+    /// Which surface the path belongs to.
+    pub kind: PluginConfigKind,
+}
+
+/// Candidate user-file paths for one plugin (display and scaffolding).
+///
+/// `canonical_lua` is always present; `alias_lua` exists only when a complete
+/// discovered-id set proves exactly one plugin owns the short name; the
+/// legacy TOML path is always named but is only read when no Lua file exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigPaths {
+    /// `<config-dir>/plugins/<owner>.<name>.lua` (canonical settings file).
+    pub canonical_lua: std::path::PathBuf,
+    /// `<config-dir>/plugins/<short-name>.lua` when unambiguous.
+    pub alias_lua: Option<std::path::PathBuf>,
+    /// `<config-dir>/plugins/<owner>.<name>.toml` (legacy fallback).
+    pub legacy_toml: std::path::PathBuf,
+}
+
 /// Resolved settings for one plugin generation (plain data).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedPluginSettings {
     /// Effective value per declared key (total: every declared key serves).
     pub values: BTreeMap<String, LuaValue>,
+    /// Layer that served each effective value (same key set as `values`).
+    pub layers: BTreeMap<String, SettingLayer>,
     /// File keys that changed nothing, sorted: undeclared keys, wrong-typed
     /// values for declared keys, and parser-skipped keys.
     pub dropped: Vec<String>,
@@ -196,6 +279,7 @@ pub fn resolve_plugin_settings(
     base: Option<&dyn SettingsSource>,
 ) -> ResolvedPluginSettings {
     let mut values = BTreeMap::new();
+    let mut layers = BTreeMap::new();
     let mut dropped = BTreeSet::new();
     // Parser-skipped keys are dropped whatever they name.
     if let Some(parsed) = file {
@@ -203,10 +287,12 @@ pub fn resolve_plugin_settings(
     }
     for decl in declared {
         let mut value = default_to_lua(&decl.default);
+        let mut layer = SettingLayer::ManifestDefault;
         if let Some(source) = base {
             if let Some(candidate) = source.get(&decl.key) {
                 if lua_value_matches_kind(&candidate, decl.kind) {
                     value = candidate;
+                    layer = SettingLayer::Host;
                 }
             }
         }
@@ -214,6 +300,7 @@ pub fn resolve_plugin_settings(
             match parsed.values.get(&decl.key) {
                 Some(candidate) if file_value_matches_kind(candidate, decl.kind) => {
                     value = file_value_to_lua(candidate);
+                    layer = SettingLayer::UserFile;
                 }
                 Some(_) => {
                     dropped.insert(decl.key.clone());
@@ -222,6 +309,7 @@ pub fn resolve_plugin_settings(
             }
         }
         values.insert(decl.key.clone(), value);
+        layers.insert(decl.key.clone(), layer);
     }
     // Declared keys consumed above; every remaining file key is undeclared.
     if let Some(parsed) = file {
@@ -233,6 +321,7 @@ pub fn resolve_plugin_settings(
     }
     ResolvedPluginSettings {
         values,
+        layers,
         dropped: dropped.into_iter().collect(),
     }
 }
@@ -289,12 +378,17 @@ impl SettingsSource for PluginSettingsSource {
 pub struct LoadedPluginSettings {
     /// Per-generation source for the activation.
     pub source: PluginSettingsSource,
+    /// Layer that served each effective value.
+    pub layers: BTreeMap<String, SettingLayer>,
     /// Merge diagnostics (see [`ResolvedPluginSettings::dropped`]).
     pub dropped: Vec<String>,
     /// Whole-file failure, if any: malformed, oversize, non-UTF-8, or
     /// unreadable. `None` when the file applied (or was absent, which is not
     /// an error). Bounded; carries key names at most, never file bytes.
     pub file_error: Option<String>,
+    /// The user file that was selected (and read), when one existed. A
+    /// rejected file still reports its path and kind.
+    pub selected_file: Option<SelectedPluginFile>,
 }
 
 /// Non-sensitive settings diagnostic surfaced by the activation report.
@@ -363,6 +457,7 @@ fn diagnostics_for_loaded(
 fn loaded_settings(
     resolved: ResolvedPluginSettings,
     file_error: Option<String>,
+    selected_file: Option<SelectedPluginFile>,
     diagnostics: Vec<PluginSettingsDiagnostic>,
 ) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
     let dropped = resolved.dropped;
@@ -370,8 +465,10 @@ fn loaded_settings(
     (
         LoadedPluginSettings {
             source: PluginSettingsSource::new(resolved.values),
+            layers: resolved.layers,
             dropped,
             file_error,
+            selected_file,
         },
         diagnostics,
     )
@@ -427,13 +524,16 @@ fn merge_lua_settings(
     base: Option<&dyn SettingsSource>,
 ) -> ResolvedPluginSettings {
     let mut values = BTreeMap::new();
+    let mut layers = BTreeMap::new();
     let mut dropped = BTreeSet::new();
     for decl in declared {
         let mut value = default_to_lua(&decl.default);
+        let mut layer = SettingLayer::ManifestDefault;
         if let Some(source) = base {
             if let Some(candidate) = source.get(&decl.key) {
                 if lua_value_matches_kind(&candidate, decl.kind) {
                     value = candidate;
+                    layer = SettingLayer::Host;
                 }
             }
         }
@@ -441,6 +541,7 @@ fn merge_lua_settings(
             match source.get(&decl.key) {
                 Some(candidate) if lua_value_matches_kind(candidate, decl.kind) => {
                     value = candidate.clone();
+                    layer = SettingLayer::UserFile;
                 }
                 Some(_) => {
                     dropped.insert(decl.key.clone());
@@ -449,6 +550,7 @@ fn merge_lua_settings(
             }
         }
         values.insert(decl.key.clone(), value);
+        layers.insert(decl.key.clone(), layer);
     }
     if let Some(source) = lua {
         for key in source.keys() {
@@ -459,19 +561,27 @@ fn merge_lua_settings(
     }
     ResolvedPluginSettings {
         values,
+        layers,
         dropped: dropped.into_iter().collect(),
     }
 }
 
-fn lua_config_paths(
+/// Public candidate paths for one plugin, without host diagnostics.
+#[must_use]
+pub fn plugin_config_paths(
     config_dir: &Path,
     plugin_id: &str,
     discovered_ids: Option<&[String]>,
-) -> Option<(
-    std::path::PathBuf,
-    Option<std::path::PathBuf>,
-    Vec<PluginSettingsDiagnostic>,
-)> {
+) -> Option<PluginConfigPaths> {
+    plugin_config_paths_with_diagnostics(config_dir, plugin_id, discovered_ids)
+        .map(|(paths, _diagnostics)| paths)
+}
+
+fn plugin_config_paths_with_diagnostics(
+    config_dir: &Path,
+    plugin_id: &str,
+    discovered_ids: Option<&[String]>,
+) -> Option<(PluginConfigPaths, Vec<PluginSettingsDiagnostic>)> {
     if !plugin_file::valid_plugin_file_id(plugin_id) {
         return None;
     }
@@ -508,7 +618,17 @@ fn lua_config_paths(
             None
         }
     });
-    Some((canonical, alias, diagnostics))
+    Some((
+        PluginConfigPaths {
+            canonical_lua: canonical,
+            alias_lua: alias,
+            legacy_toml: plugins.join(format!(
+                "{plugin_id}.{}",
+                plugin_file::PLUGIN_FILE_EXTENSION
+            )),
+        },
+        diagnostics,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -739,21 +859,29 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
     base: Option<&dyn SettingsSource>,
     discovered_ids: Option<&[String]>,
 ) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
-    let path = match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
-        // Validated ids match `owner.name` with no separators, so joining
-        // the file name cannot escape the `plugins/` directory (fail-closed
-        // `None` otherwise).
-        (Some(dir), true) => lua_config_paths(dir, plugin_id, discovered_ids),
-        _ => None,
-    };
-    let mut path_diagnostics = Vec::new();
+    let (paths, mut path_diagnostics) =
+        match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
+            // Validated ids match `owner.name` with no separators, so joining
+            // the file name cannot escape the `plugins/` directory (fail-closed
+            // `None` otherwise).
+            (Some(dir), true) => {
+                match plugin_config_paths_with_diagnostics(dir, plugin_id, discovered_ids) {
+                    Some((paths, diagnostics)) => (Some(paths), diagnostics),
+                    None => (None, Vec::new()),
+                }
+            }
+            _ => (None, Vec::new()),
+        };
     let mut canonical_shadow_alias = None;
-    let lua_bytes = match path {
-        Some((canonical_path, alias_path, diagnostics)) => {
-            path_diagnostics = diagnostics;
-            match read_bounded_regular_file(&canonical_path) {
+    let (lua_bytes, selected_file) = match &paths {
+        Some(paths) => {
+            let canonical = SelectedPluginFile {
+                path: paths.canonical_lua.clone(),
+                kind: PluginConfigKind::CanonicalLua,
+            };
+            match read_bounded_regular_file(&paths.canonical_lua) {
                 Ok(bytes) => {
-                    if let Some(alias_path) = alias_path.as_deref() {
+                    if let Some(alias_path) = paths.alias_lua.as_deref() {
                         if std::fs::symlink_metadata(alias_path).is_ok() {
                             let alias = alias_path
                                 .file_stem()
@@ -764,32 +892,40 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
                             }
                         }
                     }
-                    Some(bytes)
+                    (Some(bytes), Some(canonical))
                 }
-                Err(ConfigReadError::NotFound) => match alias_path {
-                    Some(alias_path) => match read_bounded_regular_file(&alias_path) {
-                        Ok(bytes) => Some(bytes),
-                        Err(ConfigReadError::NotFound) => None,
+                Err(ConfigReadError::NotFound) => match &paths.alias_lua {
+                    Some(alias_path) => match read_bounded_regular_file(alias_path) {
+                        Ok(bytes) => (
+                            Some(bytes),
+                            Some(SelectedPluginFile {
+                                path: alias_path.clone(),
+                                kind: PluginConfigKind::AliasLua,
+                            }),
+                        ),
+                        Err(ConfigReadError::NotFound) => (None, None),
                         Err(ConfigReadError::Rejected(error)) => {
                             return loaded_settings(
                                 merge_lua_settings(declared, None, base),
                                 Some(error),
+                                None,
                                 path_diagnostics,
                             );
                         }
                     },
-                    None => None,
+                    None => (None, None),
                 },
                 Err(ConfigReadError::Rejected(error)) => {
                     return loaded_settings(
                         merge_lua_settings(declared, None, base),
                         Some(error),
+                        Some(canonical),
                         path_diagnostics,
                     );
                 }
             }
         }
-        None => None,
+        None => (None, None),
     };
     if let Some(bytes) = lua_bytes {
         let limits = PlainConfigLimits {
@@ -818,9 +954,11 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
                 return loaded_settings(
                     ResolvedPluginSettings {
                         values: resolved.values,
+                        layers: resolved.layers,
                         dropped,
                     },
                     None,
+                    selected_file,
                     path_diagnostics,
                 );
             }
@@ -828,42 +966,45 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
                 return loaded_settings(
                     merge_lua_settings(declared, None, base),
                     Some(format!("plugin Lua config rejected: {error}")),
+                    selected_file,
                     path_diagnostics,
                 );
             }
         }
     }
 
-    let toml_path = match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
-        (Some(dir), true) => Some(
-            dir.join(plugin_file::PLUGINS_DIR_NAME)
-                .join(format!("{plugin_id}.toml")),
-        ),
-        _ => None,
-    };
-    let Some(path) = toml_path else {
+    let Some(paths) = paths else {
         let resolved = resolve_plugin_settings(declared, None, base);
-        return loaded_settings(resolved, None, path_diagnostics);
+        return loaded_settings(resolved, None, None, path_diagnostics);
     };
-    let bytes = match read_bounded_regular_file(&path) {
+    let legacy = SelectedPluginFile {
+        path: paths.legacy_toml.clone(),
+        kind: PluginConfigKind::LegacyToml,
+    };
+    let bytes = match read_bounded_regular_file(&paths.legacy_toml) {
         Ok(bytes) => bytes,
         Err(ConfigReadError::NotFound) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            return loaded_settings(resolved, None, path_diagnostics);
+            return loaded_settings(resolved, None, None, path_diagnostics);
         }
         Err(ConfigReadError::Rejected(error)) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            return loaded_settings(resolved, Some(error), path_diagnostics);
+            return loaded_settings(resolved, Some(error), None, path_diagnostics);
         }
     };
     match plugin_file::parse_plugin_file(&bytes) {
         Ok(parsed) => {
             let resolved = resolve_plugin_settings(declared, Some(&parsed), base);
-            loaded_settings(resolved, None, path_diagnostics)
+            loaded_settings(resolved, None, Some(legacy), path_diagnostics)
         }
         Err(error) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            loaded_settings(resolved, Some(error.to_string()), path_diagnostics)
+            loaded_settings(
+                resolved,
+                Some(error.to_string()),
+                Some(legacy),
+                path_diagnostics,
+            )
         }
     }
 }
@@ -1072,6 +1213,112 @@ mod tests {
             &LuaValue::array(vec![LuaValue::String("a".to_string())]),
             SettingKind::StringArray
         ));
+    }
+
+    #[test]
+    fn layers_attribute_each_key_to_its_serving_layer() {
+        let resolved = resolve_plugin_settings(&bar_decls(), None, None);
+        for decl in bar_decls() {
+            assert_eq!(
+                resolved.layers.get(&decl.key),
+                Some(&SettingLayer::ManifestDefault)
+            );
+        }
+        let file = parse_body("show = false\n");
+        let resolved = resolve_plugin_settings(&bar_decls(), Some(&file), None);
+        assert_eq!(resolved.layers.get("show"), Some(&SettingLayer::UserFile));
+        assert_eq!(
+            resolved.layers.get("edge"),
+            Some(&SettingLayer::ManifestDefault)
+        );
+    }
+
+    #[test]
+    fn selected_file_distinguishes_canonical_alias_and_legacy() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-settings-selected-{}",
+            std::process::id()
+        ));
+        let plugins = dir.join("plugins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        let ids = vec!["xuepoo.bar".to_string()];
+
+        std::fs::write(plugins.join("xuepoo.bar.lua"), b"return { show = false }\n")
+            .expect("canonical");
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&ids),
+        );
+        assert_eq!(
+            loaded.selected_file.as_ref().map(|file| file.kind),
+            Some(PluginConfigKind::CanonicalLua)
+        );
+        assert_eq!(loaded.layers.get("show"), Some(&SettingLayer::UserFile));
+
+        std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove canonical");
+        std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&ids),
+        );
+        assert_eq!(
+            loaded.selected_file.as_ref().map(|file| file.kind),
+            Some(PluginConfigKind::AliasLua)
+        );
+
+        std::fs::remove_file(plugins.join("bar.lua")).expect("remove alias");
+        std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = false\n").expect("legacy");
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&ids),
+        );
+        assert_eq!(
+            loaded.selected_file.as_ref().map(|file| file.kind),
+            Some(PluginConfigKind::LegacyToml)
+        );
+        assert_eq!(loaded.layers.get("show"), Some(&SettingLayer::UserFile));
+
+        std::fs::remove_file(plugins.join("xuepoo.bar.toml")).expect("remove legacy");
+        let loaded = load_plugin_settings_with_plugins(
+            Some(&dir),
+            "xuepoo.bar",
+            &bar_decls(),
+            None,
+            Some(&ids),
+        );
+        assert!(loaded.selected_file.is_none());
+        assert_eq!(
+            loaded.layers.get("show"),
+            Some(&SettingLayer::ManifestDefault)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_paths_fail_closed_for_unsafe_ids_and_alias_collisions() {
+        let dir = Path::new("/tmp/config");
+        assert!(plugin_config_paths(dir, "../escape", None).is_none());
+        let paths = plugin_config_paths(dir, "xuepoo.bar", Some(&["other.bar".to_string()]))
+            .expect("valid id");
+        assert!(paths.alias_lua.is_none());
+        assert_eq!(
+            paths.canonical_lua,
+            dir.join("plugins").join("xuepoo.bar.lua")
+        );
+        assert_eq!(
+            paths.legacy_toml,
+            dir.join("plugins").join("xuepoo.bar.toml")
+        );
     }
 
     #[test]

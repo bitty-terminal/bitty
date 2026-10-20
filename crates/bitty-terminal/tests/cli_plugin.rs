@@ -1166,3 +1166,333 @@ fn plugin_store_display_rejects_escaped_record_root() {
     assert!(text.contains("xuepoo.external"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// `bitty plugin config show|scaffold` (#2246)
+// ---------------------------------------------------------------------------
+
+/// External fixture with declared `[settings]` (issue #2246).
+fn write_config_fixture(home: &Path) -> PathBuf {
+    let dir = home.join("source-config");
+    std::fs::create_dir_all(dir.join("lua")).expect("fixture lua dir");
+    let manifest = "[plugin]\n\
+         id = \"xuepoo.cfg\"\n\
+         name = \"Config Fixture\"\n\
+         version = \"1.0.0\"\n\
+         description = \"per-plugin settings fixture\"\n\n\
+         [compat]\n\
+         bitty = \">=0.0.1,<1.0\"\n\
+         plugin-api = \"^1.0\"\n\n\
+         [capabilities]\n\
+         platform.notify = true\n\n\
+         [lazy]\n\
+         commands = [\"xuepoo.cfg:greet\"]\n\
+         events = []\n\n\
+         [settings]\n\
+         show = { type = \"bool\", default = true }\n\
+         edge = { type = \"string\", default = \"bottom\" }\n\
+         limit = { type = \"int\", default = 8 }\n\
+         modules = { type = \"string-array\", default = [\"workspaces\", \"clock\"] }\n";
+    std::fs::write(dir.join("bitty-plugin.toml"), manifest).expect("fixture manifest");
+    std::fs::write(
+        dir.join("lua/init.lua"),
+        "bitty.commands.register({\n  id = \"greet\",\n  title = \"Greet\",\n  \
+         run = function() return \"hi\" end,\n})\nreturn {}\n",
+    )
+    .expect("fixture init");
+    dir
+}
+
+fn install_config_fixture(home: &Path) {
+    let source = write_config_fixture(home);
+    let output = run_in(
+        home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+fn config_dir(home: &Path) -> PathBuf {
+    home.join("bitty").join("plugins")
+}
+
+#[test]
+fn plugin_config_show_reports_schema_and_source_layers() {
+    let home = scratch_dir("config-show");
+    install_config_fixture(&home);
+
+    // Manifest defaults: every key resolves to the default layer.
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    for needle in [
+        "show",
+        "bool",
+        "true",
+        "manifest-default",
+        "edge",
+        "\"bottom\"",
+        "limit",
+        "int",
+        "8",
+        "modules",
+        "string-array",
+        "selected:       - (manifest defaults only)",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+
+    // JSON is a versioned envelope with the same attribution.
+    let output = run_in(
+        &home,
+        &["plugin", "config", "show", "xuepoo.cfg", "--json"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let json = stdout(&output);
+    assert!(json.contains("\"v\":1"), "{json}");
+    assert!(json.contains("\"verb\":\"config\""), "{json}");
+    assert!(json.contains("\"action\":\"show\""), "{json}");
+    assert!(json.contains("\"source\":\"manifest-default\""), "{json}");
+    assert!(json.contains("\"description\":null"), "{json}");
+    assert!(json.contains("\"selected\":null"), "{json}");
+
+    // Canonical Lua wins and every overridden key attributes to user-file.
+    std::fs::create_dir_all(config_dir(&home)).expect("plugins dir");
+    std::fs::write(
+        config_dir(&home).join("xuepoo.cfg.lua"),
+        "return { show = false, modules = { \"clock\" } }\n",
+    )
+    .expect("canonical lua");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("lua-canonical"), "{text}");
+    assert!(text.contains("user-file"), "{text}");
+    assert!(text.contains("false"), "{text}");
+    assert!(text.contains("[\"clock\"]"), "{text}");
+    // `edge` and `limit` were untouched: the manifest default still serves.
+    let edge_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("edge"))
+        .expect("edge row");
+    assert!(edge_line.contains("manifest-default"), "{edge_line}");
+
+    // Legacy TOML is disclosed as the active source when it is selected.
+    std::fs::remove_file(config_dir(&home).join("xuepoo.cfg.lua")).expect("remove lua");
+    std::fs::write(config_dir(&home).join("xuepoo.cfg.toml"), "show = false\n")
+        .expect("legacy toml");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("toml-legacy"), "{text}");
+    assert!(text.contains("legacy TOML is the active source"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_config_show_fails_closed_on_unknown_and_undeclared_keys() {
+    let home = scratch_dir("config-show-errors");
+    install_config_fixture(&home);
+
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.missing"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unknown plugin"),
+        "{}",
+        stderr(&output)
+    );
+
+    std::fs::create_dir_all(config_dir(&home)).expect("plugins dir");
+    std::fs::write(
+        config_dir(&home).join("xuepoo.cfg.lua"),
+        "return { show = false, frobnicate = 7 }\n",
+    )
+    .expect("undeclared key");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    // The report still prints the effective values, then fails closed.
+    assert!(
+        stdout(&output).contains("frobnicate"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("UndeclaredKey"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A malformed settings file is a typed rejection, never a silent default.
+    std::fs::write(
+        config_dir(&home).join("xuepoo.cfg.lua"),
+        "return io.open('/etc/passwd')\n",
+    )
+    .expect("hostile settings");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("ConfigRejected"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("manifest-default"),
+        "{}",
+        stdout(&output)
+    );
+
+    // An unreadable stored manifest is a schema error, not an unknown plugin.
+    let manifest = data_store(&home).join("packages/xuepoo.cfg/1.0.0/bitty-plugin.toml");
+    std::fs::write(&manifest, "not a manifest\n").expect("corrupt manifest");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("settings schema") || stderr(&output).contains("unreadable"),
+        "{}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_config_scaffold_round_trips_and_refuses_overwrite() {
+    let home = scratch_dir("config-scaffold");
+    install_config_fixture(&home);
+    let target = config_dir(&home).join("xuepoo.cfg.lua");
+
+    let output = run_in(&home, &["plugin", "config", "scaffold", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(target.is_file(), "scaffold must create the canonical path");
+    let body = std::fs::read_to_string(&target).expect("scaffold body");
+    assert!(body.contains("return {"), "{body}");
+    assert!(body.contains("show = true,"), "{body}");
+    assert!(
+        body.contains("modules = { \"workspaces\", \"clock\" },"),
+        "{body}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "scaffold must be owner-only");
+    }
+    // No temp file survives a successful commit.
+    let leftovers: Vec<_> = std::fs::read_dir(config_dir(&home))
+        .expect("plugins dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".bitty-plugin-config-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // Round-trip: scaffold -> show parses the generated file and attributes
+    // every declared key to the user file.
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("lua-canonical"), "{text}");
+    assert!(!text.contains("manifest-default"), "{text}");
+
+    // Refuse to overwrite without --force, and leave the bytes untouched.
+    std::fs::write(&target, "return { show = false }\n").expect("user edit");
+    let output = run_in(&home, &["plugin", "config", "scaffold", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("AlreadyExists"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("unchanged"),
+        "return { show = false }\n"
+    );
+
+    // --force restores the template.
+    let output = run_in(
+        &home,
+        &["plugin", "config", "scaffold", "xuepoo.cfg", "--force"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        std::fs::read_to_string(&target)
+            .expect("rewritten")
+            .contains("show = true,")
+    );
+
+    // The issue shape remains an alias: `config <id> --init`.
+    let output = run_in(
+        &home,
+        &["plugin", "config", "xuepoo.cfg", "--init", "--force"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // A plugin without declarations has nothing to scaffold.
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "config",
+            "scaffold",
+            "bitty-terminal.shell-integration",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("NoSettings"),
+        "{}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_config_scaffold_refuses_symlinked_target() {
+    let home = scratch_dir("config-scaffold-symlink");
+    install_config_fixture(&home);
+    let target = config_dir(&home).join("xuepoo.cfg.lua");
+    let outside = home.join("outside.lua");
+    std::fs::write(&outside, "return { show = false }\n").expect("outside target");
+    std::os::unix::fs::symlink(&outside, &target).expect("symlink target");
+
+    let output = run_in(
+        &home,
+        &["plugin", "config", "scaffold", "xuepoo.cfg", "--force"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("SymlinkTarget"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("outside unchanged"),
+        "return { show = false }\n"
+    );
+    // A symlinked target is also a hard error for inspection.
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("ConfigRejected"),
+        "{}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

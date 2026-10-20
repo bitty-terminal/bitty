@@ -158,6 +158,15 @@ impl HintAnnotationLayer {
         anchors: &[Point],
         viewport: Rect,
     ) -> Result<Self, AnnotationLayerError> {
+        // Validate the caller's original lengths before zipping: `zip` stops
+        // at the shorter slice and would silently drop surplus targets.
+        if targets.len() != labels.len() || targets.len() != anchors.len() {
+            return Err(AnnotationLayerError::LengthMismatch {
+                targets: targets.len(),
+                labels: labels.len(),
+                anchors: anchors.len(),
+            });
+        }
         let specs: Vec<HintAnnotationSpec> = targets
             .iter()
             .zip(anchors.iter())
@@ -417,6 +426,21 @@ mod tests {
         let err = HintAnnotationLayer::build(&targets[..2], &labels, &anchors, Rect::zero())
             .expect_err("mismatch must fail");
         assert!(matches!(err, AnnotationLayerError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn shorter_anchor_slice_never_silently_drops_targets() {
+        let (targets, labels, anchors) = session(3);
+        let err = HintAnnotationLayer::build(&targets, &labels[..2], &anchors[..2], Rect::zero())
+            .expect_err("surplus targets must fail closed");
+        assert_eq!(
+            err,
+            AnnotationLayerError::LengthMismatch {
+                targets: 3,
+                labels: 2,
+                anchors: 2,
+            }
+        );
     }
 
     #[test]

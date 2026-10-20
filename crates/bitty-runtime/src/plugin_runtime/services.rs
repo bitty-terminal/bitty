@@ -1750,6 +1750,10 @@ pub struct PluginServices {
     /// `None` leaves the channel unwired; session start then fails closed with
     /// `E_UI_UNAVAILABLE` rather than presenting an unowned batch.
     target_annotations: RefCell<Option<SharedTargetAnnotations>>,
+    /// Whether this generation published the layer currently in the shared
+    /// annotation channel. Only the publisher may clear it, so another
+    /// generation's suspend/dispose cannot erase a live session's labels.
+    target_annotations_owner: Cell<bool>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
     /// Safe-mode flag for this generation (CTX-0941, W-28 host API).
@@ -1916,6 +1920,7 @@ impl PluginServices {
             target_session_overlay: RefCell::new(None),
             target_source: RefCell::new(None),
             target_annotations: RefCell::new(None),
+            target_annotations_owner: Cell::new(false),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
             safe_mode: Cell::new(false),
@@ -2443,6 +2448,7 @@ impl PluginServices {
         *self.target_lenses.borrow_mut() = Some(lenses);
         *self.label_allocator.borrow_mut() = Some(allocator);
         *self.target_annotations.borrow_mut() = Some(annotations);
+        self.target_annotations_owner.set(false);
     }
 
     /// The `bitty.ui.targets`/`bitty.ui.labels` capability gate (W-29).
@@ -2501,10 +2507,13 @@ impl PluginServices {
     /// lenses, and allocator are untouched (revocation of lenses is owned by
     /// [`Self::revoke_targeting_lenses`]).
     pub fn clear_targeting_session(&self) {
+        let owned_annotations = self.target_annotations_owner.replace(false);
         *self.target_dispatcher.borrow_mut() = TargetDispatcher::new();
         *self.target_session_overlay.borrow_mut() = None;
-        if let Some(annotations) = self.target_annotations.borrow().clone() {
-            *annotations.borrow_mut() = None;
+        if owned_annotations {
+            if let Some(annotations) = self.target_annotations.borrow().clone() {
+                *annotations.borrow_mut() = None;
+            }
         }
     }
 
@@ -2735,6 +2744,7 @@ impl PluginServices {
             .map_err(map_targets_dispatch_error)?;
         let annotations = self.require_target_annotations()?;
         *annotations.borrow_mut() = Some(Rc::new(layer));
+        self.target_annotations_owner.set(true);
         *self.target_dispatcher.borrow_mut() = dispatcher;
         Ok(labels)
     }
@@ -8781,6 +8791,42 @@ mod tests {
                 .code,
             E_UI_NOT_OWNER
         );
+    }
+
+    #[test]
+    fn targeting_foreign_generation_dispose_keeps_active_annotations() {
+        let registry = Rc::new(RefCell::new(TargetRegistry::new()));
+        let lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>> = Rc::new(RefCell::new(Vec::new()));
+        let allocator = Rc::new(RefCell::new(LabelAllocator::default()));
+        let annotations: SharedTargetAnnotations = Rc::new(RefCell::new(None));
+        let capture = Rc::new(RefCell::new(OverlayCapture::new()));
+        let owner = generation_services("owner.plugin", 1, &capture);
+        let foreign = generation_services("foreign.plugin", 2, &capture);
+        owner.set_targeting_state(
+            Rc::clone(&registry),
+            Rc::clone(&lenses),
+            Rc::clone(&allocator),
+            Rc::clone(&annotations),
+        );
+        foreign.set_targeting_state(registry, lenses, allocator, Rc::clone(&annotations));
+        owner
+            .ui_targets_register("owner.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        let handle = owner
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        let labels = owner
+            .ui_targets_session_start(handle, 80, &targeting_anchors(1), &targeting_commands(1))
+            .expect("start");
+        assert!(annotations.borrow().is_some());
+        // The foreign generation has no session; its suspend/dispose cleanup
+        // must not erase the owner's live annotation layer.
+        assert!(!foreign.revoke_targeting_lenses());
+        assert!(
+            annotations.borrow().is_some(),
+            "foreign lifecycle cleanup must not clear the active layer"
+        );
+        assert!(owner.ui_targets_dispatch(&labels[0]).is_ok());
     }
 
     #[test]

@@ -1016,9 +1016,21 @@ impl SpawnService {
     /// The synchronous v1 surface still returns the caller's `execution_id`
     /// for reconcile; this accessor exposes the supervisor identity without
     /// changing that API.
+    /// Real registry job id for a successful dispatch, as a raw `u64`.
+    ///
+    /// The v1 Lua surface still returns the caller's `execution_id` for
+    /// reconcile; this accessor lets the host correlate that id with the
+    /// supervisor identity without exposing an upstream type in a public
+    /// signature. The plugin-facing job surface is phase 2.
+    #[must_use]
+    pub fn job_id_for(&self, execution_id: u64) -> Option<u64> {
+        self.job_ids.get(&execution_id).map(|job| job.get())
+    }
+
+    /// Test-only typed handle for registry assertions.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn job_id_for(&self, execution_id: u64) -> Option<JobId> {
+    pub(crate) fn job_handle_for(&self, execution_id: u64) -> Option<JobId> {
         self.job_ids.get(&execution_id).copied()
     }
 
@@ -3063,7 +3075,13 @@ mod tests {
         let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
         let result = dispatch_ok(&mut service, &allowed_request("echo"), 700).expect("echo serves");
         assert_eq!(result.exit_code, Some(0));
-        let job = service.job_id_for(700).expect("a real registry job id");
+        let raw_job = service.job_id_for(700).expect("a real registry job id");
+        let job = JobId::from_raw(raw_job).expect("job ids are non-zero");
+        assert_eq!(
+            service.job_handle_for(700),
+            Some(job),
+            "the public raw id and the registry handle agree"
+        );
         let registry = service.supervisor().registry();
         let principal = JobPrincipal::new("plugin-test").expect("principal");
         let snapshot = registry.get_as(&principal, job).expect("tracked job");

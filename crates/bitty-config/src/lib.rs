@@ -118,6 +118,7 @@ pub use panel_rules::{
 };
 pub use plan::{
     ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+    ProfileSelector,
 };
 pub use project_schema::{
     MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,

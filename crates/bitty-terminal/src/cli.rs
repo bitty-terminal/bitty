@@ -88,6 +88,11 @@ pub(crate) struct Args {
     /// CTX-0180: keep this + `config_path`/`theme`/appearance resolution in
     /// [`crate::config_cli::load_merged_config`] (one `Cli` plan for every present CLI field).
     pub(crate) profile: Option<String>,
+    /// True when `--profile` / `--profile=` was present without a value.
+    /// The launch resolver keeps its warn-and-ignore compatibility contract;
+    /// mutating init dispatch rejects this instead of silently treating the
+    /// command as a bare init (CTX-1404, issue #2187).
+    pub(crate) profile_value_missing: bool,
     /// CLI theme override (from `--theme`). Wins over the config file and the
     /// named profile, which win over defaults
     /// (`CLI > file > profile > defaults` via `bitty-config` merge;
@@ -125,6 +130,10 @@ pub(crate) struct Args {
     pub(crate) init_yes: bool,
     /// `--force`: wizard overwrites an existing config (with `.bak` backup).
     pub(crate) init_force: bool,
+    /// `--migrate`: explicit legacy `init.lua` migration to the
+    /// profile-backed layout (CTX-1404 / issue #2187). Never implied by
+    /// `--force`.
+    pub(crate) init_migrate: bool,
     /// `--scrollback LINES`: init-only explicit answer (raw text, validated
     /// fail-closed by the init dispatch; missing value fails closed there).
     pub(crate) init_scrollback: Option<String>,
@@ -387,6 +396,9 @@ pub(crate) enum ConfigCommand {
     Check,
     /// Open the file in `$VISUAL`/`$EDITOR` (never overwrites existing).
     Edit,
+    /// Named-profile management (`list`, `show`, `use`, `path`). The
+    /// sub-verb and optional name follow in `config_args`.
+    Profile,
 }
 
 impl ConfigCommand {
@@ -396,6 +408,7 @@ impl ConfigCommand {
             "path" => Some(Self::Path),
             "check" => Some(Self::Check),
             "edit" => Some(Self::Edit),
+            "profile" => Some(Self::Profile),
             _ => None,
         }
     }
@@ -406,6 +419,7 @@ impl ConfigCommand {
             Self::Path => "path",
             Self::Check => "check",
             Self::Edit => "edit",
+            Self::Profile => "profile",
         }
     }
 }
@@ -431,6 +445,7 @@ impl Args {
             focus: None,
             config_path: None,
             profile: None,
+            profile_value_missing: false,
             theme: None,
             font_family: None,
             font_size: None,
@@ -442,6 +457,7 @@ impl Args {
             init_word: false,
             init_yes: false,
             init_force: false,
+            init_migrate: false,
             init_scrollback: None,
             init_close_confirm: None,
             init_gaps_in: None,
@@ -911,6 +927,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
         if token.starts_with("--profile=") {
             let val = token.trim_start_matches("--profile=");
             if val.trim().is_empty() {
+                out.profile_value_missing = true;
                 eprintln!("warning: --profile needs a profile name — ignoring");
             } else {
                 out.profile = Some(val.to_string());
@@ -1050,6 +1067,12 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // `bitty init --force`: overwrite an existing config file
                 // (with a `.bak` backup). Ignored elsewhere.
                 out.init_force = true;
+                i += 1;
+            }
+            "--migrate" => {
+                // `bitty init --migrate`: explicit legacy init.lua migration
+                // to the profile-backed layout. Never implied by `--force`.
+                out.init_migrate = true;
                 i += 1;
             }
             "--scrollback" => {
@@ -1386,6 +1409,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.profile = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
+                    out.profile_value_missing = true;
                     eprintln!("warning: --profile needs a profile name — ignoring");
                     i += 1;
                 }

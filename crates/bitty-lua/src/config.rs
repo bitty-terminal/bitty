@@ -713,6 +713,15 @@ pub struct ConfigData {
     /// `bitty-config`: charset/length per `validate_profile_name`, honored
     /// only in `LayerKind::Profile` layers).
     pub extends: Option<String>,
+    /// Top-level `format` scalar (CTX-1404 profile selector envelope;
+    /// raw discriminator, honored fail-closed downstream only in
+    /// `LayerKind::User` layers). Its presence marks new-format intent so a
+    /// legacy `init.lua` is never reinterpreted as a selector.
+    pub format: Option<String>,
+    /// Top-level `profile` scalar (CTX-1404 selector target; raw profile
+    /// name, validated fail-closed downstream by `validate_profile_name`
+    /// and rejected unless `format` selects the accepted envelope).
+    pub profile: Option<String>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// `plugins` array (each entry `{ id, enabled? }`; absent means "this
@@ -761,6 +770,8 @@ impl ConfigData {
             && self.session.is_none()
             && self.close_confirm.is_none()
             && self.extends.is_none()
+            && self.format.is_none()
+            && self.profile.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
             && self.panel_rules.is_none()
@@ -2245,6 +2256,11 @@ impl ConfigData {
                 // downstream in `bitty-config`). Non-strings fail closed
                 // here with the `extends` path, like every other scalar.
                 "extends" => out.extends = Some(expect_string(key, val)?),
+                // CTX-1404: top-level selector envelope scalars. Extraction
+                // stays raw; `bitty-config` accepts the discriminator only in
+                // the User layer and validates the profile name fail-closed.
+                "format" => out.format = Some(expect_string(key, val)?),
+                "profile" => out.profile = Some(expect_string(key, val)?),
                 _ => out.undeclared.push(key.clone()),
             }
         }
@@ -3933,6 +3949,29 @@ mod tests {
         let message = eval_err(r#"return { extends = 42 }"#);
         assert!(message.contains("extends"), "{message}");
         assert!(!message.contains("42"), "must not echo value: {message}");
+    }
+
+    #[test]
+    fn profile_selector_scalars_extract_as_declared() {
+        // CTX-1404: the versioned selector envelope extracts raw; layer
+        // gating, discriminator matching, and name validation live in
+        // `bitty-config`.
+        let data = eval_ok(
+            r#"return { format = "bitty-profile-v1", profile = "default", theme = "dark" }"#,
+        );
+        assert_eq!(data.format.as_deref(), Some("bitty-profile-v1"));
+        assert_eq!(data.profile.as_deref(), Some("default"));
+        assert_eq!(data.theme.as_deref(), Some("dark"));
+        assert!(data.undeclared.is_empty());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn profile_selector_wrong_type_fails_closed_with_path() {
+        let message = eval_err(r#"return { format = 42 }"#);
+        assert!(message.contains("format"), "{message}");
+        let message = eval_err(r#"return { profile = true }"#);
+        assert!(message.contains("profile"), "{message}");
     }
 
     #[test]

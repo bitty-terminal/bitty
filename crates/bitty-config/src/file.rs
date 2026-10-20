@@ -187,6 +187,12 @@
 //!   CTX-0759): a single-parent profile name validated fail-closed and
 //!   resolved by [`load_profile_chain`]. In every other layer it is
 //!   rejected as undeclared here.
+//! - A User-layer selector envelope is accepted only with the exact
+//!   `format = "bitty-profile-v1"` discriminator (CTX-1404): `profile`
+//!   names the persisted selection, and every other declared key in the
+//!   same table is a User override. Unmarked `profile`/`format` keys stay
+//!   undeclared, so legacy files are never reinterpreted. `extends` is not
+//!   allowed in the selector; it remains a profile-layer key.
 //! - Empty chunk / no return / `return nil` means "no user overrides".
 //!
 //! # Bounds and failure posture (threat T-01)
@@ -202,9 +208,10 @@
 //! # Precedence
 //!
 //! `CLI > file > profile > defaults`: the file yields a [`LayerKind::User`]
-//! plan, the named profile (`--profile` / `BITTY_PROFILE`, CTX-0169) yields a
-//! [`LayerKind::Profile`] plan UNDER the file (`init.lua` still wins over
-//! it), explicit CLI appearance flags (`--theme`, `--font-family`,
+//! plan, the selected profile (`--profile` / `BITTY_PROFILE`, else the
+//! persisted User selector, CTX-0169/CTX-1404) yields a [`LayerKind::Profile`]
+//! plan UNDER the file (`init.lua` still wins over it), explicit CLI
+//! appearance flags (`--theme`, `--font-family`,
 //! `--font-size`, `--opacity`, CTX-0180) yield one [`LayerKind::Cli`] plan,
 //! and [`merge_layers`](crate::merge_layers) sorts by precedence so the CLI wins.
 //! `BITTY_CONFIG` (path) and `BITTY_PROFILE` (name) env overrides sit between
@@ -222,6 +229,7 @@ use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{
     ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
+    ProfileSelector,
 };
 use crate::types::{
     AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
@@ -244,6 +252,14 @@ pub const FALLBACK_LUA_NAME: &str = "config.lua";
 /// Directory under the config root holding named profiles
 /// (`$XDG_CONFIG_HOME/bitty/profiles/<name>.lua`, CTX-0169 / #271).
 pub const PROFILES_DIR_NAME: &str = "profiles";
+
+/// Versioned User-layer selector discriminator (CTX-1404 / issue #2187).
+///
+/// A User file is treated as a profile selector only when its top-level
+/// `format` equals this exact value. The discriminator keeps every legacy
+/// `init.lua` on the plain-configuration path: an unmarked `profile` key is
+/// rejected as undeclared instead of being reinterpreted as activation.
+pub const PROFILE_SELECTOR_FORMAT: &str = "bitty-profile-v1";
 
 /// Maximum profile name length (fail-closed; keeps paths bounded).
 pub const MAX_PROFILE_NAME_LEN: usize = 64;
@@ -943,12 +959,27 @@ pub fn profile_file_path_with_platform_env(
     localappdata: Option<&str>,
 ) -> Result<PathBuf, ConfigError> {
     let valid = validate_profile_name(name)?;
+    let dir = profile_dir_with_platform_env(xdg_config_home, home, appdata, localappdata)?;
+    Ok(dir.join(format!("{valid}.lua")))
+}
+
+/// Platform-aware user profile directory (`<config-dir>/profiles`).
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidInput`] when no platform config root is usable.
+pub fn profile_dir_with_platform_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
     let dir = config_dir_with_platform_env(xdg_config_home, home, appdata, localappdata)
         .ok_or_else(|| ConfigError::InvalidInput {
             message: "no config root ($XDG_CONFIG_HOME, %APPDATA%, $HOME, or %LOCALAPPDATA% unset)"
                 .to_string(),
         })?;
-    Ok(dir.join(PROFILES_DIR_NAME).join(format!("{valid}.lua")))
+    Ok(dir.join(PROFILES_DIR_NAME))
 }
 
 /// Reads the live environment (`$XDG_CONFIG_HOME`, `$HOME`) for the profile
@@ -1180,22 +1211,80 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         });
     }
 
-    // CTX-0759 (#1366): top-level `extends` is a profile-layer-only key.
-    // Profile layers carry it as the single-parent chain link (validated
-    // fail-closed by `plan.validate()` below and resolved by
-    // `load_profile_chain`); every other layer rejects it as undeclared,
-    // preserving the pre-extends behavior for `init.lua`.
-    let extends = match data.extends {
-        None => None,
-        Some(raw) => {
-            if source.layer != LayerKind::Profile {
-                return Err(ConfigError::UndeclaredField {
-                    field: "extends".to_string(),
-                    source: Some(src_desc),
-                });
+    // CTX-1404: a User-layer selector envelope is recognized only by the
+    // exact versioned `format` discriminator. Unmarked `profile`/`extends`
+    // keys stay undeclared in a User file, so a legacy `init.lua` is never
+    // reinterpreted as persisted activation.
+    //
+    // CTX-0759 (#1366): `extends` remains a profile-layer-only key in every
+    // other layer (single-parent chain link validated by `plan.validate()`
+    // and resolved by `load_profile_chain`).
+    let (extends, selector) = if source.layer == LayerKind::User {
+        match data.format.as_deref() {
+            None => {
+                if data.profile.is_some() {
+                    return Err(ConfigError::UndeclaredField {
+                        field: "profile".to_string(),
+                        source: Some(src_desc),
+                    });
+                }
+                if data.extends.is_some() {
+                    return Err(ConfigError::UndeclaredField {
+                        field: "extends".to_string(),
+                        source: Some(src_desc),
+                    });
+                }
+                (None, None)
             }
-            Some(raw)
+            Some(format) => {
+                if format != PROFILE_SELECTOR_FORMAT {
+                    return Err(ConfigError::validation(
+                        "format",
+                        format!(
+                            "unsupported profile selector format '{format}' (expected \"{PROFILE_SELECTOR_FORMAT}\")"
+                        ),
+                    ));
+                }
+                if data.extends.is_some() {
+                    return Err(ConfigError::validation(
+                        "extends",
+                        "a profile selector cannot declare extends; declare it in the selected profile",
+                    ));
+                }
+                let raw = data.profile.ok_or_else(|| {
+                    ConfigError::validation("profile", "profile selector requires a profile name")
+                })?;
+                let profile = validate_profile_name(&raw)
+                    .map_err(|err| ConfigError::validation("profile", err.to_string()))?;
+                (None, Some(ProfileSelector { profile }))
+            }
         }
+    } else {
+        if data.format.is_some() {
+            return Err(ConfigError::UndeclaredField {
+                field: "format".to_string(),
+                source: Some(src_desc),
+            });
+        }
+        if data.profile.is_some() {
+            return Err(ConfigError::UndeclaredField {
+                field: "profile".to_string(),
+                source: Some(src_desc),
+            });
+        }
+        let extends = match data.extends {
+            None => None,
+            Some(raw) => {
+                if source.layer != LayerKind::Profile {
+                    return Err(ConfigError::UndeclaredField {
+                        field: "extends".to_string(),
+                        source: Some(src_desc),
+                    });
+                }
+                Some(raw)
+            }
+        };
+        (extends, None)
     };
 
     // Table-wins for the theme alias.
@@ -2514,6 +2603,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         panel_rules,
         profile_name: None,
         extends,
+        selector,
         undeclared_fields: Vec::new(),
     };
     plan.validate()?;
@@ -2766,6 +2856,21 @@ pub fn load_profile_chain_with_env(
     appdata: Option<&str>,
     localappdata: Option<&str>,
 ) -> Result<Vec<LayeredPlan>, ConfigError> {
+    let dir = profile_dir_with_platform_env(xdg_config_home, home, appdata, localappdata)?;
+    load_profile_chain_in_dir(name, &dir)
+}
+
+/// Loads one named profile plus its single-parent `extends` ancestors from
+/// an explicit profile directory (CTX-1404).
+///
+/// This is the directory form behind [`load_profile_chain_with_env`], reused
+/// by local configuration management so an explicit `--config` root and the
+/// startup resolver agree on where profiles live.
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain_with_env`].
+pub fn load_profile_chain_in_dir(name: &str, dir: &Path) -> Result<Vec<LayeredPlan>, ConfigError> {
     let mut chain: Vec<LayeredPlan> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut current = validate_profile_name(name)?;
@@ -2781,13 +2886,7 @@ pub fn load_profile_chain_with_env(
             ));
         }
         visited.push(current.clone());
-        let path = profile_file_path_with_platform_env(
-            &current,
-            xdg_config_home,
-            home,
-            appdata,
-            localappdata,
-        )?;
+        let path = dir.join(format!("{current}.lua"));
         let is_parent_hop = !chain.is_empty();
         if is_parent_hop && !path.exists() {
             return Err(ConfigError::validation(
@@ -4767,6 +4866,88 @@ mod tests {
         let err = parse_lua_config(r#"return { extends = "base" }"#, &user_src)
             .expect_err("user rejects");
         assert_eq!(err.field(), Some("extends"));
+    }
+
+    #[test]
+    fn parse_profile_selector_requires_exact_versioned_format() {
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(
+            r#"return { format = "bitty-profile-v1", profile = "default", window = { opacity = 0.9, padding = 8 } }"#,
+            &user_src,
+        )
+        .expect("selector parses");
+        assert_eq!(
+            plan.selector.as_ref().map(|s| s.profile.as_str()),
+            Some("default")
+        );
+        assert!(
+            plan.window.is_some(),
+            "user overrides stay in the User plan"
+        );
+
+        // An unmarked `profile` key is not a legacy reinterpretation.
+        let err = parse_lua_config(r#"return { profile = "default" }"#, &user_src)
+            .expect_err("unmarked profile rejected");
+        assert_eq!(err.field(), Some("profile"));
+
+        let err = parse_lua_config(
+            r#"return { format = "bitty-profile-v2", profile = "default" }"#,
+            &user_src,
+        )
+        .expect_err("unknown format rejected");
+        assert_eq!(err.field(), Some("format"));
+    }
+
+    #[test]
+    fn parse_profile_selector_validates_name_and_layer() {
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let err = parse_lua_config(
+            r#"return { format = "bitty-profile-v1", profile = "../escape" }"#,
+            &user_src,
+        )
+        .expect_err("traversal name rejected");
+        assert_eq!(err.field(), Some("profile"));
+
+        let profile_src = ConfigSource::new(LayerKind::Profile, Some("profiles/work.lua"));
+        let err = parse_lua_config(
+            r#"return { format = "bitty-profile-v1", profile = "default" }"#,
+            &profile_src,
+        )
+        .expect_err("selector keys are User-only");
+        assert_eq!(err.field(), Some("format"));
+    }
+
+    #[test]
+    fn profile_selector_merges_user_over_profile() {
+        let root = profiles_scratch("selector-merge");
+        write_profile(
+            &root,
+            "default",
+            r#"return { font = { family = "Maple Mono", size = 14 }, window = { opacity = 1.0, padding = 4 } }"#,
+        );
+        let root_s = root.display().to_string();
+        let profile_layers =
+            load_profile_chain_with_env("default", Some(&root_s), None, None, None).expect("chain");
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let user_plan = parse_lua_config(
+            r#"return { format = "bitty-profile-v1", profile = "default", window = { opacity = 0.9, padding = 8 } }"#,
+            &user_src,
+        )
+        .expect("selector");
+        let merged = resolve_effective_with_profiles(
+            Some(LayeredPlan::new(user_src, user_plan)),
+            profile_layers,
+            &CliOverrides::default(),
+        )
+        .expect("merge");
+        assert_eq!(merged.effective.font.family, "Maple Mono");
+        assert!((merged.effective.window.opacity - 0.9).abs() < f32::EPSILON);
+        assert_eq!(merged.effective.window.padding, 8);
+        assert_eq!(
+            merged.source_of("window.opacity").unwrap().layer,
+            LayerKind::User
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Isolated `$XDG_CONFIG_HOME`-style root with a `bitty/profiles/`

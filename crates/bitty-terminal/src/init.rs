@@ -1,6 +1,8 @@
 //! `bitty init` opt-in setup wizard (#243, CTX-0149).
 
 use std::io::IsTerminal as _;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
@@ -8,6 +10,18 @@ use crate::spawn::FALLBACK_SHELL;
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
 /// garbage or a stuck key can never spin the wizard forever.
 pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
+
+/// Default generated profile name (CTX-1404 / issue #2187).
+pub(crate) const DEFAULT_PROFILE_NAME: &str = "default";
+
+/// Bounded collision search for a recoverable `.bak` sibling.
+const INIT_MAX_BACKUP_ATTEMPTS: u32 = 100;
+
+/// Bounded collision search for an exclusive temporary sibling.
+const INIT_MAX_TEMP_ATTEMPTS: u32 = 16;
+
+/// Process-local suffix source for atomic temporary siblings.
+static INIT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum accepted stdin line length in bytes (mirrors the config
 /// `MAX_LINE_BYTES` posture: overlong lines are truncated, never unbounded).
@@ -652,7 +666,9 @@ pub(crate) fn init_render_vim_keymaps() -> String {
 /// only for the vim preset.
 pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     let mut out = String::from(
-        "-- bitty user configuration (Lua, wezterm-style), written by `bitty init`.\n\
+        "-- bitty profile defaults (Lua, wezterm-style), written by `bitty init`.\n\
+         -- This file is a profile, not the active selector; override values in\n\
+         -- init.lua or extend this profile from another named profile.\n\
          -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
          -- Unknown keys fail closed; validate with `bitty config check`.\n\
          return {\n",
@@ -707,6 +723,31 @@ pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// Renders the thin User-layer selector (`init.lua`) for a profile
+/// (CTX-1404 / issue #2187).
+///
+/// The versioned `format` discriminator is the only marker that makes the
+/// file a selector; an unmarked file keeps the legacy plain-configuration
+/// path. User overrides belong beside the selector keys in this same return
+/// table and win over the selected profile (`file > profile`).
+pub(crate) fn render_selector_lua(profile: &str) -> String {
+    format!(
+        "-- bitty user configuration selector, written by `bitty init`.\n\
+         -- The selected profile holds the generated defaults; add your overrides\n\
+         -- here (for example: window = {{ opacity = 0.95, padding = 8 }}).\n\
+         -- Switch profiles explicitly with `bitty config profile use NAME`.\n\
+         -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
+         -- Unknown keys fail closed; validate with `bitty config check`.\n\
+         return {{\n\
+         \x20   format = \"{}\",\n\
+         \x20   profile = \"{}\",\n\
+         \x20   -- overrides go here\n\
+         }}\n",
+        bitty_config::file::PROFILE_SELECTOR_FORMAT,
+        init_lua_escape(profile),
+    )
 }
 
 /// Wizard line-editing escape outcome: one parsed `ESC`-led sequence mapped
@@ -3114,7 +3155,31 @@ pub(crate) fn write_init_config(
             ))
         })?;
     }
-    if target.exists() && !force {
+    let existing = match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: refusing to write through symlink '{}'",
+                    target.display()
+                )));
+            }
+            if !meta.is_file() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: '{}' is not a regular file; refusing to replace it",
+                    target.display()
+                )));
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(InitWriteError::Io(format!(
+                "bitty init: cannot inspect '{}': {err}",
+                target.display()
+            )));
+        }
+    };
+    if existing && !force {
         return Err(InitWriteError::Refused(format!(
             "bitty init: '{}' already exists (re-run with --force to overwrite; a .bak backup is kept)",
             target.display()
@@ -3130,53 +3195,369 @@ pub(crate) fn write_init_config(
             })?;
         }
     }
-    let mut backup = None;
-    let mut updated = false;
-    if target.exists() {
-        let backup_path = target.with_extension("lua.bak");
-        let previous = std::fs::read(target).map_err(|err| {
-            InitWriteError::Io(format!(
-                "bitty init: cannot read '{}': {err}",
-                target.display()
-            ))
-        })?;
-        std::fs::write(&backup_path, previous).map_err(|err| {
-            InitWriteError::Io(format!(
-                "bitty init: cannot write backup '{}': {err}",
-                backup_path.display()
-            ))
-        })?;
-        backup = Some(backup_path);
-        updated = true;
+    let backup = if existing {
+        Some(write_recoverable_backup(target)?)
+    } else {
+        None
+    };
+    if existing {
+        replace_atomically(target, content)?;
+    } else {
+        create_new_exclusively(target, content)?;
     }
-    std::fs::write(target, content).map_err(|err| {
-        InitWriteError::Io(format!(
-            "bitty init: cannot write '{}': {err}",
-            target.display()
-        ))
-    })?;
     Ok(InitWriteOutcome {
         path: target.to_path_buf(),
         backup,
-        updated,
+        updated: existing,
     })
+}
+
+/// Copies the current bytes to a collision-free `<name>.bak[.N]` sibling
+/// using `create_new` so the sole recovery copy is never overwritten.
+fn write_recoverable_backup(
+    target: &std::path::Path,
+) -> Result<std::path::PathBuf, InitWriteError> {
+    let meta = std::fs::metadata(target).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot inspect '{}': {err}",
+            target.display()
+        ))
+    })?;
+    if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(InitWriteError::Refused(format!(
+            "bitty init: '{}' exceeds {} bytes; refusing to back up and replace it",
+            target.display(),
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        )));
+    }
+    let previous = std::fs::read(target).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot read '{}': {err}",
+            target.display()
+        ))
+    })?;
+    let name = target.file_name().map_or_else(
+        || "config.lua".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    for attempt in 0..=INIT_MAX_BACKUP_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            target.with_file_name(format!("{name}.bak"))
+        } else {
+            target.with_file_name(format!("{name}.bak.{attempt}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(&previous).map_err(|err| {
+                    InitWriteError::Io(format!(
+                        "bitty init: cannot write backup '{}': {err}",
+                        candidate.display()
+                    ))
+                })?;
+                file.sync_all().map_err(|err| {
+                    InitWriteError::Io(format!(
+                        "bitty init: cannot sync backup '{}': {err}",
+                        candidate.display()
+                    ))
+                })?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(InitWriteError::Io(format!(
+                    "bitty init: cannot create backup '{}': {err}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Err(InitWriteError::Io(format!(
+        "bitty init: exhausted {INIT_MAX_BACKUP_ATTEMPTS} backup names beside '{}'; remove an old .bak file",
+        target.display()
+    )))
+}
+
+/// Creates a brand-new file with `create_new` (never overwrites), writes and
+/// syncs it. A partial file from a failed write is removed.
+fn create_new_exclusively(target: &std::path::Path, content: &str) -> Result<(), InitWriteError> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot create '{}': {err}",
+                target.display()
+            ))
+        })?;
+    let result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    if let Err(err) = result {
+        drop(file);
+        let _ = std::fs::remove_file(target);
+        return Err(InitWriteError::Io(format!(
+            "bitty init: cannot write '{}': {err}",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Replaces an existing file atomically: write a unique sibling temp,
+/// sync it, then rename over the target (the rename is the commit point).
+fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), InitWriteError> {
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = target.file_name().map_or_else(
+        || "config.lua".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let previous_permissions = std::fs::metadata(target)
+        .ok()
+        .map(|meta| meta.permissions());
+    let mut temp = None;
+    for _ in 0..INIT_MAX_TEMP_ATTEMPTS {
+        let counter = INIT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.tmp-{}-{counter}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(InitWriteError::Io(format!(
+                    "bitty init: cannot create temporary file beside '{}': {err}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    let Some((temp_path, mut file)) = temp else {
+        return Err(InitWriteError::Io(format!(
+            "bitty init: exhausted temporary file names beside '{}'",
+            target.display()
+        )));
+    };
+    let write_result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(InitWriteError::Io(format!(
+            "bitty init: cannot write temporary file for '{}': {err}",
+            target.display()
+        )));
+    }
+    if let Some(permissions) = previous_permissions {
+        let _ = std::fs::set_permissions(&temp_path, permissions);
+    }
+    if let Err(err) = std::fs::rename(&temp_path, target) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(InitWriteError::Io(format!(
+            "bitty init: cannot replace '{}': {err}",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Explicit legacy migration (`bitty init --migrate`, CTX-1404).
+///
+/// Copies the complete legacy `init.lua` bytes into `profiles/default.lua`
+/// without reserializing them, validates the profile, proves the effective
+/// values are unchanged, then replaces the legacy file with the thin
+/// selector. The original bytes are preserved in the selector write's
+/// collision-free backup. Nothing is written on any validation failure.
+fn run_init_migrate(target: &std::path::Path) -> i32 {
+    if !target.exists() {
+        eprintln!(
+            "bitty init: --migrate needs an existing legacy config at '{}'",
+            target.display()
+        );
+        return 2;
+    }
+    let original = match std::fs::read_to_string(target) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!(
+                "bitty init: cannot read legacy config '{}': {err}",
+                target.display()
+            );
+            return 1;
+        }
+    };
+    let legacy_layer = match bitty_config::file::load_user_layer(target) {
+        Ok(layer) => layer,
+        Err(err) => {
+            eprintln!("bitty init: cannot migrate '{}': {err}", target.display());
+            return 2;
+        }
+    };
+    if legacy_layer.plan.selector.is_some() {
+        eprintln!(
+            "bitty init: '{}' is already a profile selector; nothing to migrate",
+            target.display()
+        );
+        return 2;
+    }
+    let profile_dir = target
+        .parent()
+        .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME))
+        .unwrap_or_else(|| std::path::PathBuf::from(bitty_config::file::PROFILES_DIR_NAME));
+    let profile_path = profile_dir.join(format!("{DEFAULT_PROFILE_NAME}.lua"));
+    if profile_path.exists() {
+        eprintln!(
+            "bitty init: migration destination '{}' already exists; refusing to overwrite it",
+            profile_path.display()
+        );
+        return 2;
+    }
+    let empty_cli = bitty_config::file::CliOverrides::default();
+    let legacy_effective = match bitty_config::file::resolve_effective_with_profiles(
+        Some(legacy_layer),
+        Vec::new(),
+        &empty_cli,
+    ) {
+        Ok(merged) => merged.effective,
+        Err(err) => {
+            eprintln!("bitty init: cannot resolve legacy config: {err}");
+            return 2;
+        }
+    };
+    let profile_source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::Profile,
+        Some(profile_path.display().to_string()),
+    );
+    let profile_plan = match bitty_config::file::parse_lua_config(&original, &profile_source) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("bitty init: legacy config is not valid as a profile: {err}");
+            return 2;
+        }
+    };
+    let profile_plan = match bitty_config::migration::migrate(profile_plan) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("bitty init: legacy config cannot be migrated: {err}");
+            return 2;
+        }
+    };
+    let profile_layer = bitty_config::LayeredPlan::new(profile_source, profile_plan);
+    let selector_content = render_selector_lua(DEFAULT_PROFILE_NAME);
+    let selector_source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::User,
+        Some(target.display().to_string()),
+    );
+    let selector_plan =
+        match bitty_config::file::parse_lua_config(&selector_content, &selector_source) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!("bitty init: generated selector is invalid: {err}");
+                return 1;
+            }
+        };
+    let selector_layer = bitty_config::LayeredPlan::new(selector_source, selector_plan);
+    let migrated_effective = match bitty_config::file::resolve_effective_with_profiles(
+        Some(selector_layer),
+        vec![profile_layer],
+        &empty_cli,
+    ) {
+        Ok(merged) => merged.effective,
+        Err(err) => {
+            eprintln!("bitty init: migrated configuration does not validate: {err}");
+            return 2;
+        }
+    };
+    if migrated_effective != legacy_effective {
+        eprintln!(
+            "bitty init: migration would change effective values; refusing to rewrite '{}'. Keep the legacy file or migrate manually.",
+            target.display()
+        );
+        return 2;
+    }
+    println!(
+        "bitty init: migrating legacy '{}' to profile '{}'",
+        target.display(),
+        profile_path.display()
+    );
+    let profile_outcome = match write_init_config(&profile_path, &original, false) {
+        Ok(outcome) => outcome,
+        Err(InitWriteError::Refused(message)) => {
+            eprintln!("{message}");
+            return 2;
+        }
+        Err(InitWriteError::Io(message)) => {
+            eprintln!("{message}");
+            return 1;
+        }
+    };
+    match write_init_config(target, &selector_content, true) {
+        Ok(selector_outcome) => {
+            if let Some(backup) = &selector_outcome.backup {
+                println!(
+                    "bitty init: preserved legacy bytes in '{}'",
+                    backup.display()
+                );
+            }
+            println!(
+                "bitty init: migrated to '{}' + selector '{}'",
+                profile_outcome.path.display(),
+                selector_outcome.path.display()
+            );
+            println!("bitty init: validate any time with `bitty config check`");
+            0
+        }
+        Err(InitWriteError::Refused(message)) => {
+            eprintln!("{message}");
+            eprintln!(
+                "bitty init: migrated profile '{}' is not active; fix the selector, then run `bitty config profile use {DEFAULT_PROFILE_NAME}`",
+                profile_outcome.path.display()
+            );
+            2
+        }
+        Err(InitWriteError::Io(message)) => {
+            eprintln!("{message}");
+            eprintln!(
+                "bitty init: migrated profile '{}' is not active; fix the selector, then run `bitty config profile use {DEFAULT_PROFILE_NAME}`",
+                profile_outcome.path.display()
+            );
+            1
+        }
+    }
 }
 
 /// Short usage for `bitty init` (stdout on `--help`-style flows, stderr on
 /// fail-closed exit 2).
 pub(crate) fn init_usage() -> String {
-    "usage: bitty init [--yes] [--force] [VALUE FLAGS] [--config PATH]\n\
+    "usage: bitty init [--yes] [--force] [--profile NAME] [--migrate] [VALUE FLAGS] [--config PATH]\n\
      \n\
      Opt-in setup wizard (never auto-runs): shell /\n\
      theme / font family+size / decoration (gaps_in, gaps_out, border,\n\
      radius) / scrollback / close_confirm / keybinding-preset picks, then\n\
-     writes the config file with shipped keys only (no secrets, no network).\n\
+     writes profile defaults with shipped keys only (no secrets, no network).\n\
+     Bare init writes profiles/default.lua plus a thin init.lua selector;\n\
+     --profile NAME writes only profiles/NAME.lua and never activates it.\n\
      \n\
      flags:\n\
      \x20 --yes     skip prompts; write sane defaults ($SHELL when clean, dark\n\
      \x20           theme, shipped font/decoration/scrollback/close_confirm,\n\
      \x20           shipped keymap defaults)\n\
-     \x20 --force   overwrite an existing file (backs it up to init.lua.bak)\n\
+     \x20 --force   overwrite existing generated files (collision-free .bak backups)\n\
+     \x20 --profile NAME  create/refresh only profiles/NAME.lua; no selector\n\
+     \x20           change, no plugin/component/shell follow-up\n\
+     \x20 --migrate move an existing legacy init.lua to profiles/default.lua\n\
+     \x20           and replace init.lua with the thin selector (explicit only;\n\
+     \x20           --force never migrates a legacy file implicitly)\n\
      \n\
      value flags (answer one step, skip its prompt; validated fail-closed):\n\
      \x20 --theme NAME         preset name or alias (e.g. dark, tokyo-night)\n\
@@ -3196,13 +3577,14 @@ pub(crate) fn init_usage() -> String {
      \x20 --print-shell-init / --no-print-shell-init  print the shell-init handoff line\n\
      \n\
      target: --config PATH wins, else BITTY_CONFIG, else\n\
-     $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua).\n\
+     $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua);\n\
+     profiles live beside it under profiles/<name>.lua.\n\
      Shell integration (Tab completion + OSC 7/133 prompt hooks) is separate:\n\
      after init, run `bitty shell-init --help` and eval the line for your shell.\n\
      Without --force an existing file is never overwritten (exit 2).\n\
      Without a TTY on stdin, prompts are skipped only with --yes (exit 2\n\
      otherwise, never a hang). Re-runs are idempotent: same answers write\n\
-     the same file. Validate any file any time with `bitty config check`."
+     the same files. Validate any file any time with `bitty config check`."
         .to_string()
 }
 
@@ -3334,17 +3716,35 @@ pub(crate) fn init_preview_baseline(
     if file_broken {
         return bitty_config::fallback_builtin();
     }
-    let profile_request =
+    let selector_request = file_layer
+        .as_ref()
+        .and_then(|layer| layer.plan.selector.as_ref())
+        .map(|selector| selector.profile.clone());
+    let cli_profile_request =
         bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.bitty_profile);
+    let profile_from_selector = cli_profile_request.is_none() && selector_request.is_some();
+    let selector_dir = if profile_from_selector {
+        probed
+            .as_ref()
+            .and_then(|found| found.path.parent())
+            .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME))
+    } else {
+        None
+    };
+    let profile_request = cli_profile_request.or(selector_request);
     let mut profile_layers = Vec::new();
     if let Some(requested) = profile_request {
-        match bitty_config::file::load_profile_chain_with_env(
-            &requested,
-            env.xdg_config_home,
-            env.home,
-            None,
-            None,
-        ) {
+        let chain = match &selector_dir {
+            Some(dir) => bitty_config::file::load_profile_chain_in_dir(&requested, dir),
+            None => bitty_config::file::load_profile_chain_with_env(
+                &requested,
+                env.xdg_config_home,
+                env.home,
+                None,
+                None,
+            ),
+        };
+        match chain {
             Ok(layers) => profile_layers = layers,
             Err(_) => return bitty_config::fallback_builtin(),
         }
@@ -3424,6 +3824,15 @@ pub(crate) fn run_init_subcommand_with_io(
         );
         return 2;
     }
+    // A mutating command never inherits the launch resolver's
+    // warn-and-ignore treatment of an empty `--profile` (CTX-1404).
+    if args.profile_value_missing {
+        eprintln!(
+            "bitty init: --profile needs a profile name\n{}",
+            init_usage()
+        );
+        return 2;
+    }
     // Validate every explicit value flag before touching the filesystem or
     // prompting: an invalid flag is a usage error, never a silent default.
     let overrides = match init_overrides_from_args(args) {
@@ -3433,6 +3842,70 @@ pub(crate) fn run_init_subcommand_with_io(
             return 2;
         }
     };
+    // CTX-1404 init output mode. `--profile NAME` creates or refreshes one
+    // named profile only and never touches the active selector; a bare init
+    // writes the default profile plus the thin selector. `BITTY_PROFILE` is
+    // a one-launch input and is deliberately NOT an output target.
+    let init_profile = match args.profile.as_deref() {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                // Preserve the launch parser's "empty means absent" rule.
+                None
+            } else {
+                match bitty_config::file::validate_profile_name(trimmed) {
+                    Ok(name) => Some(name),
+                    Err(err) => {
+                        eprintln!("bitty init: {err}\n{}", init_usage());
+                        return 2;
+                    }
+                }
+            }
+        }
+    };
+    let plugin_flags_present =
+        args.init_plugins.is_some() || args.init_no_plugins || args.init_with_components.is_some();
+    if args.init_migrate {
+        if init_profile.is_some() {
+            eprintln!(
+                "bitty init: --migrate and --profile cannot be combined\n{}",
+                init_usage()
+            );
+            return 2;
+        }
+        if plugin_flags_present {
+            eprintln!(
+                "bitty init: --migrate does not run plugin or component follow-ups\n{}",
+                init_usage()
+            );
+            return 2;
+        }
+    }
+    if init_profile.is_some() {
+        // A custom selector path would put the profile directory somewhere
+        // other than the user config root; keep named-profile writes
+        // unambiguous and fail closed.
+        if args
+            .config_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+            || env.bitty_config.is_some_and(|p| !p.trim().is_empty())
+        {
+            eprintln!(
+                "bitty init: --profile with --config/BITTY_CONFIG is ambiguous; choose one target\n{}",
+                init_usage()
+            );
+            return 2;
+        }
+        if plugin_flags_present {
+            eprintln!(
+                "bitty init: --profile does not run plugin or component follow-ups\n{}",
+                init_usage()
+            );
+            return 2;
+        }
+    }
     // BITTY_CONFIG env participates exactly like --config (CLI wins), same
     // as the `config` subcommand and startup.
     let explicit =
@@ -3449,6 +3922,19 @@ pub(crate) fn run_init_subcommand_with_io(
             return 2;
         }
     };
+    if args.init_migrate {
+        return run_init_migrate(&target);
+    }
+    let profile_dir = target
+        .parent()
+        .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME))
+        .unwrap_or_else(|| std::path::PathBuf::from(bitty_config::file::PROFILES_DIR_NAME));
+    let default_profile = profile_dir.join(format!("{DEFAULT_PROFILE_NAME}.lua"));
+    let profile_target = match &init_profile {
+        Some(name) => profile_dir.join(format!("{name}.lua")),
+        None => default_profile.clone(),
+    };
+    let profile_mode = init_profile.is_some();
     let answers = if args.init_yes {
         let mut answers = init_yes_defaults(env.shell);
         init_apply_overrides(&mut answers, &overrides);
@@ -3527,8 +4013,13 @@ pub(crate) fn run_init_subcommand_with_io(
     // Prompts fail closed (EOF/cancel/too many invalid -> exit 1, nothing
     // written); `--yes` takes flag values or offline-safe defaults without
     // prompting. Offline contract: no network/secrets here, only decisions.
+    // A named-profile write is configuration-only: no plugin selection,
+    // fetch consent, component install, or shell-init handoff.
+    let followups_allowed = !profile_mode;
     let mut followup_history: Vec<String> = Vec::new();
-    let plugin_ids: Vec<String> = if let Some(list) = overrides.plugins.clone() {
+    let plugin_ids: Vec<String> = if !followups_allowed {
+        Vec::new()
+    } else if let Some(list) = overrides.plugins.clone() {
         list
     } else if args.init_yes {
         Vec::new()
@@ -3580,168 +4071,270 @@ pub(crate) fn run_init_subcommand_with_io(
             }
         }
     };
-    let print_shell_init: bool = overrides.print_shell_init.unwrap_or(true);
-    let content = render_init_lua(&answers);
-    // Visible preview: show the exact pending config before write.
-    // Print-only (no confirm prompt); abort paths return above, so this
-    // runs only on the commit path. Plain header (no color): the wizard
-    // `color` only styles option lists, and plain keeps piped output
-    // greppable. Skipped when the write below will refuse (existing file
-    // without --force) so the recap never reads as a write promise.
-    if !(target.exists() && !args.init_force) {
-        let _ = writeln!(output, "\n  (pending init.lua — about to be written)");
-        let _ = write!(output, "{content}");
-        let _ = output.flush();
+    let print_shell_init: bool = followups_allowed && overrides.print_shell_init.unwrap_or(true);
+    let profile_content = render_init_lua(&answers);
+    let selector_content = render_selector_lua(DEFAULT_PROFILE_NAME);
+    // Preflight before preview or mutation. A complete legacy `init.lua` is
+    // never silently overwritten or reinterpreted, even with `--force`;
+    // migration is the explicit path. Existing profile-backed files still
+    // obey the ordinary `--force` overwrite rule.
+    if !profile_mode && target.exists() {
+        let is_selector = match bitty_config::file::load_user_layer(&target) {
+            Ok(layer) => layer.plan.selector.is_some(),
+            Err(_) => false,
+        };
+        if !is_selector {
+            eprintln!(
+                "bitty init: '{}' exists and is not a profile selector; a legacy configuration is never replaced implicitly. Run `bitty init --migrate` to migrate it explicitly, or `bitty init --profile NAME` to create a named profile without activation.",
+                target.display()
+            );
+            return 2;
+        }
     }
-    match write_init_config(&target, &content, args.init_force) {
-        Ok(outcome) => {
-            if outcome.updated {
-                match &outcome.backup {
-                    Some(backup) => println!(
-                        "bitty init: backed up existing config to '{}'",
-                        backup.display()
-                    ),
-                    None => println!("bitty init: replaced existing config"),
-                }
+    let selector_exists = !profile_mode && target.exists();
+    let profile_exists = profile_target.exists();
+    if !args.init_force && (selector_exists || profile_exists) {
+        let existing = if selector_exists {
+            &target
+        } else {
+            &profile_target
+        };
+        eprintln!(
+            "bitty init: '{}' already exists (re-run with --force to overwrite; a .bak backup is kept)",
+            existing.display()
+        );
+        return 2;
+    }
+    // Visible preview: show the exact pending files before write.
+    // Print-only (no confirm prompt); abort/refusal paths return above, so
+    // this runs only on the commit path. Plain header (no color): the wizard
+    // `color` only styles option lists, and plain keeps piped output
+    // greppable. The selector is printed last so the recap still ends with
+    // the entry file the user edits.
+    let _ = writeln!(
+        output,
+        "\n  (pending {} — about to be written)",
+        profile_target.display()
+    );
+    let _ = write!(output, "{profile_content}");
+    if !profile_mode {
+        let _ = writeln!(output, "\n  (pending init.lua — about to be written)");
+        let _ = write!(output, "{selector_content}");
+    }
+    let _ = output.flush();
+    let profile_outcome =
+        match write_init_config(&profile_target, &profile_content, args.init_force) {
+            Ok(outcome) => outcome,
+            Err(InitWriteError::Refused(message)) => {
+                eprintln!("{message}");
+                return 2;
             }
-            let shell = answers
-                .shell
-                .as_deref()
-                .map_or("(default)".to_string(), |s| format!("\"{s}\""));
-            let keymaps = match answers.key_preset {
-                InitKeyPreset::Default => "default (shipped)".to_string(),
-                InitKeyPreset::Vim => format!(
-                    "vim ({} explicit entries)",
-                    bitty_config::keymap::DEFAULT_KEYMAPS.len()
-                ),
-            };
-            println!(
-                "bitty init: wrote '{}' (theme=\"{}\", shell={shell}, font={} {}pt, \
-                 scrollback={}, close_confirm={}, keymaps={keymaps})",
-                outcome.path.display(),
+            Err(InitWriteError::Io(message)) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        };
+    if profile_outcome.updated {
+        match &profile_outcome.backup {
+            Some(backup) => println!(
+                "bitty init: backed up existing profile to '{}'",
+                backup.display()
+            ),
+            None => println!("bitty init: replaced existing profile"),
+        }
+    }
+    let selector_outcome = if profile_mode {
+        None
+    } else {
+        match write_init_config(&target, &selector_content, args.init_force) {
+            Ok(outcome) => {
+                if outcome.updated {
+                    match &outcome.backup {
+                        Some(backup) => println!(
+                            "bitty init: backed up existing config to '{}'",
+                            backup.display()
+                        ),
+                        None => println!("bitty init: replaced existing config"),
+                    }
+                }
+                Some(outcome)
+            }
+            Err(InitWriteError::Refused(message)) => {
+                eprintln!("{message}");
+                eprintln!(
+                    "bitty init: profile '{}' was written; run `bitty config profile use {DEFAULT_PROFILE_NAME}` after resolving the selector",
+                    profile_outcome.path.display()
+                );
+                return 2;
+            }
+            Err(InitWriteError::Io(message)) => {
+                eprintln!("{message}");
+                eprintln!(
+                    "bitty init: profile '{}' was written but is not active; resolve the selector, then run `bitty config profile use {DEFAULT_PROFILE_NAME}`",
+                    profile_outcome.path.display()
+                );
+                return 1;
+            }
+        }
+    };
+    {
+        let shell = answers
+            .shell
+            .as_deref()
+            .map_or("(default)".to_string(), |s| format!("\"{s}\""));
+        let keymaps = match answers.key_preset {
+            InitKeyPreset::Default => "default (shipped)".to_string(),
+            InitKeyPreset::Vim => format!(
+                "vim ({} explicit entries)",
+                bitty_config::keymap::DEFAULT_KEYMAPS.len()
+            ),
+        };
+        match &selector_outcome {
+            Some(selector) => println!(
+                "bitty init: wrote profile '{}' and selector '{}' (theme=\"{}\", shell={shell}, font={} {}pt, \
+                     scrollback={}, close_confirm={}, keymaps={keymaps})",
+                profile_outcome.path.display(),
+                selector.path.display(),
                 answers.theme,
                 answers.font_family,
                 answers.font_size,
                 answers.scrollback,
                 answers.close_confirm.as_str(),
+            ),
+            None => println!(
+                "bitty init: wrote profile '{}/{}.lua' (theme=\"{}\", shell={shell}, font={} {}pt, \
+                     scrollback={}, close_confirm={}, keymaps={keymaps}); the active selector was not changed",
+                profile_outcome.path.parent().map_or_else(
+                    || "(config root)".to_string(),
+                    |parent| parent.display().to_string()
+                ),
+                init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME),
+                answers.theme,
+                answers.font_family,
+                answers.font_size,
+                answers.scrollback,
+                answers.close_confirm.as_str(),
+            ),
+        }
+        if profile_mode {
+            println!(
+                "bitty init: activate explicitly with `bitty config profile use {}`",
+                init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME)
             );
-            println!("bitty init: validate any time with `bitty config check`");
-            // CTX-1132 (#1913) follow-up commits (after the config write, so a
-            // config refusal writes nothing at all, preserving --yes
-            // idempotence). All offline-safe: plugin records without fetching,
-            // per-plugin consent only on explicit opt-in, component hints
-            // only (never silent fetch), shell-init printed (never evaled).
-            if !plugin_ids.is_empty() {
-                let state_path = match crate::plugin::init_plugin_state_path(
-                    args.config_path.as_deref(),
-                    env.bitty_config,
-                    env.xdg_config_home,
-                    env.home,
-                ) {
-                    Ok(path) => Some(path),
-                    Err(message) => {
-                        eprintln!(
-                            "bitty init: {message} (plugin queue skipped; re-run `bitty plugin install <id>` later)"
-                        );
-                        None
-                    }
-                };
-                if let Some(state_path) = state_path {
-                    match crate::plugin::init_record_bundled_offline(&state_path, &plugin_ids) {
-                        Ok(recorded) => {
-                            if recorded > 0 {
-                                let _ = writeln!(
-                                    output,
-                                    "bitty init: recorded {} plugin{} offline (disabled, no fetch)",
-                                    recorded,
-                                    if recorded == 1 { "" } else { "s" },
-                                );
-                            } else {
-                                let _ = writeln!(
-                                    output,
-                                    "bitty init: plugins already recorded (nothing new)"
-                                );
-                            }
-                            let _ = output.flush();
-                        }
-                        Err(message) => {
-                            eprintln!(
-                                "bitty init: {message} (re-run `bitty plugin install <id>` later)"
+        } else {
+            println!(
+                "bitty init: defaults live in the profile; add overrides to '{}'",
+                target.display()
+            );
+        }
+        println!("bitty init: validate any time with `bitty config check`");
+        // CTX-1132 (#1913) follow-up commits (after the config write, so a
+        // config refusal writes nothing at all, preserving --yes
+        // idempotence). All offline-safe: plugin records without fetching,
+        // per-plugin consent only on explicit opt-in, component hints
+        // only (never silent fetch), shell-init printed (never evaled).
+        if !plugin_ids.is_empty() {
+            let state_path = match crate::plugin::init_plugin_state_path(
+                args.config_path.as_deref(),
+                env.bitty_config,
+                env.xdg_config_home,
+                env.home,
+            ) {
+                Ok(path) => Some(path),
+                Err(message) => {
+                    eprintln!(
+                        "bitty init: {message} (plugin queue skipped; re-run `bitty plugin install <id>` later)"
+                    );
+                    None
+                }
+            };
+            if let Some(state_path) = state_path {
+                match crate::plugin::init_record_bundled_offline(&state_path, &plugin_ids) {
+                    Ok(recorded) => {
+                        if recorded > 0 {
+                            let _ = writeln!(
+                                output,
+                                "bitty init: recorded {} plugin{} offline (disabled, no fetch)",
+                                recorded,
+                                if recorded == 1 { "" } else { "s" },
+                            );
+                        } else {
+                            let _ = writeln!(
+                                output,
+                                "bitty init: plugins already recorded (nothing new)"
                             );
                         }
-                    }
-                    if fetch_approved {
-                        for id in &plugin_ids {
-                            match crate::plugin::init_install_bundled_with_consent(
-                                &state_path,
-                                id,
-                                args.init_yes,
-                                input,
-                                output,
-                            ) {
-                                Ok(summary) => {
-                                    let _ = writeln!(output, "bitty init: {summary}");
-                                    let _ = output.flush();
-                                }
-                                Err(message) => {
-                                    let _ = writeln!(
-                                        output,
-                                        "bitty init: {message} (kept offline record; re-run `bitty plugin install {id}` later)"
-                                    );
-                                    let _ = output.flush();
-                                }
-                            }
-                        }
-                    } else {
-                        let _ = writeln!(
-                            output,
-                            "bitty init: skipped fetching (offline record kept; re-run `bitty plugin install <id>` to grant)"
-                        );
                         let _ = output.flush();
                     }
-                }
-            }
-            if with_components && !plugin_ids.is_empty() {
-                let mut declared: Vec<String> = Vec::new();
-                for id in &plugin_ids {
-                    for component in init_bundled_plugin_components(id) {
-                        if !declared.iter().any(|seen| seen == &component) {
-                            declared.push(component);
-                        }
-                    }
-                }
-                if declared.is_empty() {
-                    let _ = writeln!(
-                        output,
-                        "bitty init: no selected plugin declares native components; nothing to install"
-                    );
-                } else {
-                    for component in &declared {
-                        let _ = writeln!(
-                            output,
-                            "bitty init: component '{component}' is missing; re-run `bitty component install {component} --version <X.Y.Z>` (offline, nothing fetched; or stage via `bitty component add <path>`)"
+                    Err(message) => {
+                        eprintln!(
+                            "bitty init: {message} (re-run `bitty plugin install <id>` later)"
                         );
                     }
                 }
-                let _ = output.flush();
+                if fetch_approved {
+                    for id in &plugin_ids {
+                        match crate::plugin::init_install_bundled_with_consent(
+                            &state_path,
+                            id,
+                            args.init_yes,
+                            input,
+                            output,
+                        ) {
+                            Ok(summary) => {
+                                let _ = writeln!(output, "bitty init: {summary}");
+                                let _ = output.flush();
+                            }
+                            Err(message) => {
+                                let _ = writeln!(
+                                    output,
+                                    "bitty init: {message} (kept offline record; re-run `bitty plugin install {id}` later)"
+                                );
+                                let _ = output.flush();
+                            }
+                        }
+                    }
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "bitty init: skipped fetching (offline record kept; re-run `bitty plugin install <id>` to grant)"
+                    );
+                    let _ = output.flush();
+                }
             }
-            if print_shell_init {
-                let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
-                let line = init_shell_init_line(&detected);
-                let source_hint = init_shell_source_hint(&detected);
-                println!(
-                    "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+        }
+        if with_components && !plugin_ids.is_empty() {
+            let mut declared: Vec<String> = Vec::new();
+            for id in &plugin_ids {
+                for component in init_bundled_plugin_components(id) {
+                    if !declared.iter().any(|seen| seen == &component) {
+                        declared.push(component);
+                    }
+                }
+            }
+            if declared.is_empty() {
+                let _ = writeln!(
+                    output,
+                    "bitty init: no selected plugin declares native components; nothing to install"
                 );
+            } else {
+                for component in &declared {
+                    let _ = writeln!(
+                        output,
+                        "bitty init: component '{component}' is missing; re-run `bitty component install {component} --version <X.Y.Z>` (offline, nothing fetched; or stage via `bitty component add <path>`)"
+                    );
+                }
             }
-            0
+            let _ = output.flush();
         }
-        Err(InitWriteError::Refused(message)) => {
-            eprintln!("{message}");
-            2
+        if print_shell_init {
+            let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
+            let line = init_shell_init_line(&detected);
+            let source_hint = init_shell_source_hint(&detected);
+            println!(
+                "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+            );
         }
-        Err(InitWriteError::Io(message)) => {
-            eprintln!("{message}");
-            1
-        }
+        0
     }
 }

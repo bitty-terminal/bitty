@@ -265,20 +265,53 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
     }
     // Named profile (fail-closed): validate, resolve under the user-level
     // XDG root (XDG_CONFIG_DIRS never consulted), load as Profile layer.
-    let profile_request = bitty_config::file::resolve_profile_request(
+    //
+    // CTX-1404 selection order: `--profile` (C) > `BITTY_PROFILE` (E) >
+    // persisted User selector (S). An explicit one-launch selection always
+    // wins and never rewrites the selector; a persisted selector is used
+    // only when neither C nor E is present. A broken selected chain fails
+    // closed instead of falling back to the other source.
+    let cli_profile_request = bitty_config::file::resolve_profile_request(
         args.profile.as_deref(),
         bitty_profile_env.as_deref(),
     );
+    let selector_request = file_layer
+        .as_ref()
+        .and_then(|layer| layer.plan.selector.as_ref())
+        .map(|selector| selector.profile.clone());
+    let profile_from_selector = cli_profile_request.is_none() && selector_request.is_some();
+    let profile_request = cli_profile_request.or(selector_request);
     let profile_from_cli = args
         .profile
         .as_deref()
         .is_some_and(|p| !p.trim().is_empty());
+    // A persisted selector resolves beside the user file that carries it:
+    // the default root yields `<config>/bitty/profiles`, while an explicit
+    // `--config /custom/init.lua` yields `/custom/profiles` (matching
+    // `bitty init`, which writes profiles beside the explicit selector).
+    // One-launch `--profile`/`BITTY_PROFILE` keep the user-root resolver.
+    let selector_profile_dir = used_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME));
     let mut profile_layers: Vec<bitty_config::LayeredPlan> = Vec::new();
     let mut profile_path: Option<std::path::PathBuf> = None;
     if let Some(requested) = profile_request.clone() {
-        let resolved = bitty_config::file::profile_file_path(&requested).map_err(|err| {
+        let resolved = if profile_from_selector {
+            match &selector_profile_dir {
+                Some(dir) => Ok(dir.join(format!("{requested}.lua"))),
+                None => bitty_config::file::profile_file_path(&requested),
+            }
+        } else {
+            bitty_config::file::profile_file_path(&requested)
+        }
+        .map_err(|err| {
             if profile_from_cli {
                 LoadFailure::fatal(format!("bitty: invalid --profile '{requested}': {err}"))
+            } else if profile_from_selector {
+                LoadFailure::fatal(format!(
+                    "bitty: invalid selected profile '{requested}': {err}"
+                ))
             } else {
                 LoadFailure::fatal(format!("bitty: invalid BITTY_PROFILE '{requested}': {err}"))
             }
@@ -287,6 +320,12 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
             if profile_from_cli {
                 return Err(LoadFailure::fatal(format!(
                     "bitty: --profile '{requested}' not found ('{}')",
+                    resolved.display()
+                )));
+            }
+            if profile_from_selector {
+                return Err(LoadFailure::fatal(format!(
+                    "bitty: selected profile '{requested}' not found ('{}')",
                     resolved.display()
                 )));
             }
@@ -299,7 +338,11 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
         // (base-first `Profile` layers); the child overrides the base per
         // field. Chain failures (cycle, missing parent, invalid name) fail
         // closed with the `extends` field path.
-        match bitty_config::file::load_profile_chain(&requested) {
+        let chain = match (&selector_profile_dir, profile_from_selector) {
+            (Some(dir), true) => bitty_config::file::load_profile_chain_in_dir(&requested, dir),
+            _ => bitty_config::file::load_profile_chain(&requested),
+        };
+        match chain {
             Ok(layers) => {
                 profile_path = Some(resolved.clone());
                 profile_layers = layers;
@@ -314,7 +357,10 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
         // `--config` + `--profile` together: both layers stay loaded; the
         // explicit file wins over the profile (init.lua semantics). Warn so
         // the composition is never silent.
-        if used_path.is_some() && probed.as_ref().is_some_and(|p| p.explicit) {
+        if !profile_from_selector
+            && used_path.is_some()
+            && probed.as_ref().is_some_and(|p| p.explicit)
+        {
             let name = profile_request.as_deref().unwrap_or_default();
             eprintln!(
                 "bitty: warning: --config with --profile '{name}': profile layers under the explicit file (explicit file wins)"
@@ -561,12 +607,13 @@ fn builtin_app_config() -> Result<AppConfig, String> {
 
 /// Short usage for `bitty config` (stderr, fail-closed exit 2).
 pub(crate) fn config_usage() -> String {
-    "usage: bitty config <path|check|edit> [--config PATH] [--profile NAME]\n\
+    "usage: bitty config <path|check|edit|profile> [--config PATH] [--profile NAME]\n\
      \n\
      verbs:\n\
-     \x20 path   print the resolved config file path\n\
-     \x20 check  load + validate; print per-key sources (cli/file/profile/default)\n\
-     \x20 edit   open the file in $VISUAL/$EDITOR (vi fallback)\n\
+     \x20 path     print the resolved config file path\n\
+     \x20 check    load + validate; print per-key sources (cli/file/profile/default)\n\
+     \x20 edit     open the file in $VISUAL/$EDITOR (vi fallback)\n\
+     \x20 profile  manage named profiles (list|show|use|path NAME)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
      profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua (--profile, else BITTY_PROFILE)\n\
@@ -754,6 +801,9 @@ pub(crate) fn layer_source_label(
 /// - `edit`: mkdir parents + starter-when-missing, open `$VISUAL`/`$EDITOR`
 ///   (0 on editor success; 1 on spawn failure; editor non-zero propagates).
 pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
+    if cmd == ConfigCommand::Profile {
+        return crate::profile::run_profile_subcommand(args);
+    }
     if !args.config_args.is_empty() {
         eprintln!(
             "bitty config {}: unexpected argument '{}'\n{}",
@@ -1386,6 +1436,8 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 2
             }
         },
+        // Handled before the positional rejection above; kept exhaustive.
+        ConfigCommand::Profile => crate::profile::run_profile_subcommand(args),
         ConfigCommand::Edit => {
             let probed = bitty_config::file::probe_config_path(explicit.as_deref());
             let target = match probed {

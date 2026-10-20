@@ -132,11 +132,11 @@ pub use reload::{
     ReloadReport, VIEWS_FIELD_PREFIX, classify_field, diff, fallback_builtin, reconcile_live,
 };
 pub use theme::{
-    ALL_PRESETS, BITTY_DARK, CUSTOM_PALETTE_ANSI_COUNT, CustomPalette, DARK_THEME_ALIAS,
-    DEFAULT_THEME_NAME, Theme, ThemeCategory, ThemeResolution, ThemeSelection, ThemeSelectionError,
-    default_theme, is_known_theme_name, list_presets, normalize_theme_name, parse_theme_selection,
-    resolve_selection, resolve_selection_with_status, resolve_theme, resolve_theme_with_status,
-    unknown_theme_diagnostic,
+    ALL_PRESETS, BITTY_DARK, CUSTOM_PALETTE_ANSI_COUNT, CustomPalette, CustomPaletteError,
+    DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeCategory, ThemeResolution, ThemeSelection,
+    ThemeSelectionError, default_theme, is_known_theme_name, list_presets, normalize_theme_name,
+    parse_theme_selection, resolve_selection, resolve_selection_with_status, resolve_theme,
+    resolve_theme_with_status, unknown_theme_diagnostic,
 };
 pub use trust::{
     TrustDecision, TrustRecord, TrustStore, admit_project_layer, check_trust, validate_project_plan,

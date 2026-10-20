@@ -3427,7 +3427,7 @@ impl Runtime {
                             preedit_width,
                             live.height.max(1),
                         ),
-                        color: [0x33, 0x33, 0x33, 0xCC],
+                        color: bitty_render::grid::ime_preedit_bg_in(&self.config.theme),
                     });
                     layers.combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
@@ -3436,7 +3436,7 @@ impl Runtime {
                             preedit_width,
                             2,
                         ),
-                        color: [0xFF, 0xFF, 0x00, 0xFF],
+                        color: bitty_render::grid::ime_preedit_underline_in(&self.config.theme),
                     });
                     layers.combined_glyphs.extend(glyphs);
                     // Composition caret: static bar at the IME cursor cell
@@ -3502,13 +3502,13 @@ impl Runtime {
         );
         layers.combined_overlay.push(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(origin_px_x, banner_y, pill_w, live.height),
-            color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
+            color: bitty_render::grid::banner_fill_in(&self.config.theme),
         });
         let glyphs = self.renderer.overlay_text_glyphs(
             banner,
             (origin_px_x, banner_y),
             max_cells,
-            bitty_render::grid::PENDING_PASTE_BANNER_FG,
+            bitty_render::grid::banner_text_in(&self.config.theme),
         );
         layers.combined_glyphs.extend(glyphs);
         layers.any_needs_draw = true;

@@ -1017,22 +1017,47 @@ mod tests {
         ));
         assert_eq!(runtime.config().theme.background, expected.background);
         assert_eq!(runtime.active_background(), expected.background);
+        let outline_before_focused = runtime.config().outline_focused;
+        let outline_before_idle = runtime.config().outline_idle;
 
         let mut custom = light.clone();
         let preset = bitty_config::theme::resolve_theme(None);
+        let mut ansi = preset.ansi;
+        for (index, entry) in ansi.iter_mut().enumerate() {
+            *entry = [0x10 + index as u8, 0x40, 0x80];
+        }
         let palette = bitty_config::theme::CustomPalette {
             background: [0x10, 0x20, 0x30],
-            foreground: preset.foreground,
-            cursor: preset.cursor,
-            selection: preset.selection,
-            ansi: preset.ansi,
+            foreground: [0xE0, 0xE0, 0xE0],
+            cursor: [0xFF, 0x2E, 0x88],
+            selection: [0x24, 0x30, 0x4A],
+            ansi,
         };
         custom.appearance.colors = Some(palette);
         apply_live(&mut runtime, &custom).expect("adopt colors");
         assert_eq!(
+            runtime.config().theme,
+            bitty_runtime::ThemePalette::from_custom(&palette),
+            "every custom role reaches the live renderer palette"
+        );
+        assert_eq!(
             runtime.active_background(),
             [0x10, 0x20, 0x30, 0xFF],
             "appearance.colors replaces the preset palette"
+        );
+        // Custom palettes own only the terminal roles; the outline pair keeps
+        // whatever the selected configuration resolved (documented
+        // derivation), so a custom table cannot silently rewrite chrome
+        // tokens it does not declare.
+        assert_eq!(
+            runtime.config().outline_focused,
+            outline_before_focused,
+            "custom colors must not change the focused outline"
+        );
+        assert_eq!(
+            runtime.config().outline_idle,
+            outline_before_idle,
+            "custom colors must not change the idle outline"
         );
         let _ = take_app_adoption();
     }

@@ -324,24 +324,127 @@ impl Default for ThemePalette {
         Self::bitty_dark()
     }
 }
-/// Pending-paste banner background: opaque dark amber, distinct from the
-/// grid background, selection, and cursor so the confirmation prompt reads
-/// as a warning overlay (CTX-0186 presentation-only dialog).
+/// Bitty Dark reference background for the pending-paste banner.
+///
+/// Kept as the documented default value; production paint uses
+/// [`banner_fill_in`] so every preset, custom palette, and live OSC 4 remap
+/// recolors the banner (CTX-1395).
 pub const PENDING_PASTE_BANNER_BG: Rgba8 = [0x5A, 0x4A, 0x00, 0xFF];
-/// Pending-paste banner text: opaque light amber on [`PENDING_PASTE_BANNER_BG`].
+/// Bitty Dark reference text for [`PENDING_PASTE_BANNER_BG`]; production uses
+/// [`banner_text_in`] (contrast-derived black/white).
 pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
-/// Help popup panel background (CTX-0265): opaque dark indigo, one step
-/// above [`DEFAULT_BG`] so the floating panel reads above the grid while
-/// staying inside the Bitty Dark family.
+/// Bitty Dark reference background for the help popup (CTX-0265); production
+/// uses [`help_panel_bg_in`] (theme selection ground).
 pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
-/// Help popup panel border (CTX-0265): opaque lavender, mirroring the
-/// Bitty Dark accent so the 1-cell outline reads as chrome, not content.
+/// Bitty Dark reference accent for the help popup ring (CTX-0265); production
+/// uses [`help_panel_border_in`] (theme ANSI 12 accent).
 pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
-/// Help popup panel text (CTX-0265): opaque Bitty Dark foreground on
-/// [`HELP_PANEL_BG`].
+/// Bitty Dark reference text for [`HELP_PANEL_BG`]; production uses
+/// [`help_panel_fg_in`] (theme foreground).
 pub const HELP_PANEL_FG: Rgba8 = [0xCD, 0xD6, 0xF4, 0xFF];
 /// Foreground alpha substituted for faint (`SGR 2`) text.
 pub const FAINT_ALPHA: u8 = 0x7F;
+
+/// ANSI index carrying the pending-banner warning ground (CTX-1395).
+///
+/// The pending-paste/close-confirm pill is a warning surface, so its
+/// background follows the theme's ANSI 3 (yellow) entry, including any live
+/// OSC 4 override. Text stays readable through
+/// [`readable_foreground_on`] instead of a second hardcoded role.
+pub const BANNER_ANSI_INDEX: u8 = 3;
+
+/// ANSI index carrying the help-panel accent ring (CTX-1395).
+///
+/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue): a
+/// theme-owned chrome accent that a custom palette or OSC 4 remap moves with
+/// the rest of the terminal.
+pub const HELP_PANEL_ACCENT_ANSI_INDEX: u8 = 12;
+
+/// WCAG relative luminance of an sRGB triplet (0.0..=1.0).
+///
+/// Used only to pick a legible default foreground for a themed warning
+/// ground; the value is derived, never configured.
+#[must_use]
+pub fn relative_luminance(rgb: [u8; 3]) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let c = f32::from(value) / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+}
+
+/// Black or white, whichever is more legible on `background`.
+///
+/// The pending banner's ground is a theme role (ANSI 3), but its text role is
+/// derived: a fixed black or white would fail on half the catalog (pastel
+/// yellow on dark themes, dark amber on light themes). The choice follows the
+/// WCAG contrast ratio against both endpoints and is deterministic per
+/// palette.
+#[must_use]
+pub fn readable_foreground_on(background: [u8; 3]) -> Rgba8 {
+    let l = relative_luminance(background);
+    let against_white = 1.05 / (l + 0.05);
+    let against_black = (l + 0.05) / 0.05;
+    if against_black >= against_white {
+        [0x00, 0x00, 0x00, 0xFF]
+    } else {
+        [0xFF, 0xFF, 0xFF, 0xFF]
+    }
+}
+
+/// Theme-aware pending-banner background (CTX-1395): ANSI 3.
+#[must_use]
+pub fn banner_fill_in(palette: &ThemePalette) -> Rgba8 {
+    let rgb = palette.active_index(BANNER_ANSI_INDEX);
+    [rgb[0], rgb[1], rgb[2], 0xFF]
+}
+
+/// Theme-aware pending-banner text (CTX-1395): derived from
+/// [`banner_fill_in`].
+#[must_use]
+pub fn banner_text_in(palette: &ThemePalette) -> Rgba8 {
+    let rgb = palette.active_index(BANNER_ANSI_INDEX);
+    readable_foreground_on(rgb)
+}
+
+/// Theme-aware help-panel background (CTX-1395): the theme selection ground.
+///
+/// The selection pair is the one surface the theme guarantees legible with the
+/// default foreground, so a floating help panel reuses it instead of a
+/// hardcoded indigo.
+#[must_use]
+pub const fn help_panel_bg_in(palette: &ThemePalette) -> Rgba8 {
+    palette.selection
+}
+
+/// Theme-aware help-panel accent ring (CTX-1395): ANSI 12.
+#[must_use]
+pub fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
+    let rgb = palette.active_index(HELP_PANEL_ACCENT_ANSI_INDEX);
+    [rgb[0], rgb[1], rgb[2], 0xFF]
+}
+
+/// Theme-aware help-panel text (CTX-1395): the default foreground.
+#[must_use]
+pub const fn help_panel_fg_in(palette: &ThemePalette) -> Rgba8 {
+    palette.foreground
+}
+
+/// Theme-aware IME preedit ground (CTX-1395): the selection fill.
+#[must_use]
+pub const fn ime_preedit_bg_in(palette: &ThemePalette) -> Rgba8 {
+    palette.selection
+}
+
+/// Theme-aware IME preedit underline (CTX-1395): the cursor accent.
+#[must_use]
+pub const fn ime_preedit_underline_in(palette: &ThemePalette) -> Rgba8 {
+    palette.cursor
+}
 
 /// Numerator of the fixed baseline rule: the pen baseline sits at
 /// `row_top + cell_height * BASELINE_NUMERATOR / 4`. Metric-aware baselines

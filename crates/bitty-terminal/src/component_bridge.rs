@@ -10,6 +10,9 @@
 //!   that host, and before this mirror it was empty in production, so every
 //!   request would deny as "plugin is not registered". Nothing is granted
 //!   here: the mirror reproduces the activated generation's existing grant.
+//!   A hot reload with a new manifest hash replaces the mirrored predecessor,
+//!   so the policy host follows the live generation rather than the startup
+//!   snapshot.
 //! - [`pump_component_requests`] (re-exported from `bitty-runtime`) is the
 //!   per-tick bridge between queued `bitty.component.request` submissions and
 //!   the existing [`ComponentBroker`](bitty_runtime::component::ComponentBroker).
@@ -30,11 +33,15 @@ use bitty_runtime::plugin_runtime::{LifecycleState, PluginRuntime, broker_reques
 /// Mirror every active plugin generation's manifest and grant into the
 /// runtime's policy host.
 ///
-/// Returns the number of generations mirrored. Idempotent: an already
-/// registered id is skipped, and a grant already bound to the same manifest
-/// generation is left as is. A plugin the runtime refuses is reported through
-/// `warn` and stays unmirrored, so its component requests fail closed instead
-/// of inheriting another generation's authority.
+/// Returns the number of generations mirrored. Idempotent for the current
+/// generation: a registered id whose manifest hash already matches the
+/// plugin runtime's active package is left as is. When the hash changed (a
+/// hot reload, `PluginRuntime::reload`), the predecessor is removed and the
+/// new generation is registered from scratch, so component requests carry
+/// the new manifest hash instead of being denied against a stale mirror. A
+/// plugin the runtime refuses is reported through `warn` and stays
+/// unmirrored (or loses its predecessor), so its component requests fail
+/// closed instead of inheriting another generation's authority.
 pub fn mirror_plugin_authority(
     runtime: &mut Runtime,
     plugins: &PluginRuntime,
@@ -52,11 +59,16 @@ pub fn mirror_plugin_authority(
         let Some(package) = plugins.discovered_package(&id) else {
             continue;
         };
-        if runtime.plugin_host().registry().get(&id).is_some() {
-            continue;
-        }
         let manifest = package.manifest.clone();
         let hash = manifest.manifest_hash();
+        let registered = runtime
+            .plugin_host()
+            .registry()
+            .get(&id)
+            .map(|entry| entry.manifest.manifest_hash());
+        if registered.as_deref() == Some(hash.as_str()) {
+            continue;
+        }
         let granted: BTreeSet<CapabilityId> = match package.granted.as_ref() {
             Some(granted) => granted
                 .iter()
@@ -70,11 +82,26 @@ pub fn mirror_plugin_authority(
                 }
             },
         };
-        pending.push((id, manifest, hash, granted));
+        pending.push((id, manifest, hash, granted, registered.is_some()));
     }
 
-    let mut registered = Vec::with_capacity(pending.len());
-    for (id, manifest, hash, granted) in pending {
+    // A reloaded generation replaces its predecessor's identity. `remove`
+    // (rather than `dispose`) purges the id so the new manifest can be
+    // declared; a removal failure leaves the plugin unmirrored and therefore
+    // fail-closed.
+    let mut replacements = Vec::with_capacity(pending.len());
+    for (id, manifest, hash, granted, stale) in pending {
+        if stale {
+            if let Err(error) = runtime.plugin_host_mut().remove(&id) {
+                warn(id.as_str(), &error.to_string());
+                continue;
+            }
+        }
+        replacements.push((id, manifest, hash, granted));
+    }
+
+    let mut registered = Vec::with_capacity(replacements.len());
+    for (id, manifest, hash, granted) in replacements {
         match runtime.register_plugin(manifest) {
             Ok(()) => registered.push((id, hash, granted)),
             Err(error) => warn(id.as_str(), &error.to_string()),

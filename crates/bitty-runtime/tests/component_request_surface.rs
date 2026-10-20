@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bitty_lua::LuaValue;
-use bitty_plugin_host::{GrantRecord, PluginId};
+use bitty_plugin_host::{GrantRecord, PluginId, PluginState};
 use bitty_runtime::Runtime;
-use bitty_runtime::component::{ComponentWarnSink, executable_file_name};
+use bitty_runtime::component::{ComponentHostError, ComponentWarnSink, executable_file_name};
+use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir};
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
@@ -117,6 +118,18 @@ fn install_via_add(root: &Path, name: &str, executable: &Path, mode: &str) {
 
 /// One dev plugin whose Lua exposes `go` (queue a request) and `poll`.
 fn write_plugin(root: &Path, id: &str, lua: &str, capability: Option<&str>, egress: Option<&str>) {
+    write_versioned_plugin(root, id, "0.1.0", lua, capability, egress);
+}
+
+/// One plugin source at an explicit version, used by the reload regression.
+fn write_versioned_plugin(
+    root: &Path,
+    id: &str,
+    version: &str,
+    lua: &str,
+    capability: Option<&str>,
+    egress: Option<&str>,
+) {
     let plugin = root.join(id);
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
     let capabilities = capability
@@ -131,7 +144,7 @@ fn write_plugin(root: &Path, id: &str, lua: &str, capability: Option<&str>, egre
             r#"[plugin]
 id = "{id}"
 name = "Component Surface Test"
-version = "0.1.0"
+version = "{version}"
 description = "production component request surface"
 
 [compat]
@@ -460,6 +473,183 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     let queue = plugins.component_request_queue().borrow();
     assert_eq!(queue.in_flight(), 0);
     assert_eq!(plugins.component_requests_dropped(), 0);
+}
+
+/// Install one local source into the store with its declared set approved.
+fn install_approved(store: &Path, source: &Path) {
+    install_local_dir(store, source, &LocalInstallOptions::default(), &mut |_| {
+        Ok(true)
+    })
+    .expect("install")
+    .expect("approved");
+}
+
+/// Production contract for a hot reload (bitty#2302): the mirror is keyed by
+/// the generation hash, so re-running it after `PluginRuntime::reload`
+/// authorizes the new manifest while the predecessor's hash and tickets stay
+/// refused.
+#[test]
+fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
+    const PLUGIN: &str = "acme.reload";
+    const V2_URL: &str = "http://api.example.com/v2/reloaded";
+
+    let scratch = Scratch::new("reload");
+    let components = scratch.path().join("extensions");
+    std::fs::create_dir_all(&components).expect("component root");
+    install_via_add(&components, ECHO, Path::new(FIXTURE), "echo");
+
+    let store = scratch.path().join("store");
+    let source_v1 = scratch.path().join("source-v1");
+    let source_v2 = scratch.path().join("source-v2");
+    write_versioned_plugin(
+        &source_v1,
+        PLUGIN,
+        "0.1.0",
+        &surface_lua(ECHO, URL, 5_000),
+        Some(CAPABILITY),
+        Some(EGRESS_HOST),
+    );
+    write_versioned_plugin(
+        &source_v2,
+        PLUGIN,
+        "0.2.0",
+        &surface_lua(ECHO, V2_URL, 5_000),
+        Some(CAPABILITY),
+        Some(EGRESS_HOST),
+    );
+    install_approved(&store, &source_v1.join(PLUGIN));
+
+    let mut runtime =
+        Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig::default())
+            .expect("runtime");
+    assert!(install_with_roots(
+        &mut runtime,
+        Some(components.clone()),
+        None,
+        SilentWarn
+    ));
+
+    let mut plugins = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(scratch.path().join("plugins-state")),
+        store_root: Some(store.clone()),
+        bundled_roots: Vec::new(),
+        third_party_roots: Vec::new(),
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(EmptySnapshot),
+    });
+    assert_eq!(plugins.discover().len(), 1, "one store plugin discovered");
+    let id = PluginId::new(PLUGIN).expect("plugin id");
+    let report = plugins.activate(&id).expect("activate v1");
+    assert_eq!(report.state, LifecycleState::Active);
+
+    let v1_hash = plugins
+        .discovered_package(&id)
+        .expect("v1 package")
+        .manifest
+        .manifest_hash();
+    assert_eq!(
+        mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        1,
+        "the v1 generation is mirrored"
+    );
+    let ticket = queue_request(&mut plugins, PLUGIN);
+    assert_eq!(
+        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
+        format!("ok:200:{URL}"),
+        "the v1 generation serves through the mirrored authority"
+    );
+
+    // A ticket queued by v1 is purged by the reload, not delivered to v2.
+    let stale_ticket = queue_request(&mut plugins, PLUGIN);
+    install_approved(&store, &source_v2.join(PLUGIN));
+    let report = plugins.reload(&id).expect("reload v2");
+    assert_eq!(report.state, LifecycleState::Active);
+    let v2_hash = plugins
+        .discovered_package(&id)
+        .expect("v2 package")
+        .manifest
+        .manifest_hash();
+    assert_ne!(v1_hash, v2_hash, "reload must move to a new manifest hash");
+    let stale = LuaValue::table([(
+        "ticket",
+        LuaValue::Integer(stale_ticket.parse().expect("stale ticket integer")),
+    )]);
+    assert_eq!(
+        plugins
+            .invoke_command(&format!("{PLUGIN}:poll"), &stale)
+            .expect("poll stale ticket"),
+        LuaValue::String("err:E_COMPONENT_TICKET".to_string()),
+        "the predecessor's ticket is purged by the reload"
+    );
+
+    // Regression: the un-refreshed mirror still holds v1's hash, so v2 is
+    // denied until the composition root mirrors the reloaded generation.
+    let ticket = queue_request(&mut plugins, PLUGIN);
+    assert_eq!(
+        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
+        "err:E_COMPONENT_CAPABILITY_DENIED",
+        "a stale mirror must fail closed for the reloaded generation"
+    );
+
+    assert_eq!(
+        mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        1,
+        "the reloaded generation is mirrored once"
+    );
+    let registered = runtime
+        .plugin_host()
+        .registry()
+        .get(&id)
+        .expect("reloaded generation registered");
+    assert_eq!(registered.state, PluginState::Activated);
+    assert_eq!(
+        registered.manifest.manifest_hash(),
+        v2_hash,
+        "the policy host now holds the reloaded manifest"
+    );
+    assert_eq!(
+        mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        0,
+        "the same generation is already mirrored and is not churned"
+    );
+
+    let ticket = queue_request(&mut plugins, PLUGIN);
+    assert_eq!(
+        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
+        format!("ok:200:{V2_URL}"),
+        "the reloaded generation serves with its own code and hash"
+    );
+
+    // The predecessor's hash no longer authorizes anything.
+    match runtime.component_grant(PLUGIN, &v1_hash) {
+        Err(ComponentHostError::CapabilityDenied { reason, .. }) => assert!(
+            reason.contains("manifest hash is not the registered generation"),
+            "unexpected denial reason: {reason}"
+        ),
+        other => panic!("the predecessor generation must be refused, got {other:?}"),
+    }
+    assert!(
+        !runtime
+            .component_grant(PLUGIN, &v2_hash)
+            .expect("reloaded generation authorized")
+            .is_offline(),
+        "the reloaded generation keeps its granted network authority"
+    );
+
+    let queue = plugins.component_request_queue().borrow();
+    assert_eq!(queue.pending(), 0, "no submission survives the reload");
+    assert_eq!(
+        queue.in_flight(),
+        0,
+        "no broker request survives the reload"
+    );
 }
 
 /// Manifest-shaped types are not needed by the surface test except through

@@ -191,6 +191,13 @@ or a published artifact.
 
 ### Fixed
 
+- **Reloaded plugin component authority (CTX-1383, #2302):** the runtime policy
+  host mirror is keyed by the activation manifest hash, so re-running it after
+  a successful `PluginRuntime::reload` replaces the predecessor generation
+  instead of leaving its stale grant. Component requests from the reloaded
+  generation are authorized with the new hash, the predecessor's hash is
+  refused, and the predecessor's tickets stay purged. Included in the 0.0.24
+  release.
 - **Copy keeps combining marks and joiners (CTX-1367, #2260, #2266):** text
   extraction pushed only `Cell::glyph` and dropped `Cell::zerowidth`, so a
   decomposed `é` (`e` + U+0301) copied as `e` and a ZWJ family emoji copied

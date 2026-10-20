@@ -3093,14 +3093,16 @@ impl BridgeState {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        // Host work is not Lua work: the call's own duration is credited
-        // against the enclosing callback's RC-1 wall budget (bitty #2285),
-        // capped per callback. The cheap-call policy below is unchanged: it
-        // still measures real time minus store commit credit, so a slow read
-        // keeps failing closed with `E_TIMEOUT`.
-        let window = crate::HostCallWindow::at(mark.start());
+        // No host-call credit here: this guard also wraps `commands.invoke`
+        // and `services.*` method dispatch, which execute callee/provider Lua
+        // through `vm.call_function`. Crediting it would credit Lua execution
+        // and let a caller loop sub-deadline dispatches to accumulate credit
+        // (bitty #2285 review). Only supervised `process.spawn` waits are
+        // credited, in `bounded_spawn`.
+        //
+        // The cheap-call deadline is measured in raw time minus store commit
+        // credit only, so an enclosing host-call credit can never relax it.
         let out = f(expiry);
-        window.close();
         let reading = mark.read();
         let charged = reading.raw.saturating_sub(reading.credit);
         if charged > deadline {

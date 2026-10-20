@@ -191,14 +191,16 @@ or a published artifact.
 
 ### Fixed
 - **RC-1 accounting across host calls (CTX-1379, #2285):** the wall-clock
-  budget now bounds Lua execution instead of raw elapsed time, so blocking
-  host calls (`process.spawn` waits and other bounded bridge calls) no longer
-  suspend a bounded plugin command; the credit is capped per callback and the
-  cheap-call and spawn deadlines still fail closed in raw time. Pattern
-  iteration (phodopus `string.gmatch`/`gsub`) now charges each scan position
-  once, so parsing a capped 8 KiB tool output no longer burns the full
-  instruction budget. The git-panel `open` command completes with a branch
-  list again.
+  budget now bounds Lua execution instead of raw elapsed time for supervised
+  `process.spawn` waits, which no longer suspend a bounded plugin command. Only
+  that wait is credited; `commands.invoke`/`services.*` Lua dispatch, snapshot
+  and filesystem reads, and every other bridge call stay charged, and the
+  cheap-call and spawn deadlines still fail closed in raw time. The credit is
+  capped per callback at the spawn deadline; the amendment and its risk entry
+  live in the isolation RFC (`bitty-plugins-docs#169`). Pattern iteration
+  (phodopus `string.gmatch`/`gsub`) now charges each scan position once, so
+  parsing a capped 8 KiB tool output no longer burns the full instruction
+  budget. The git-panel `open` command completes with a branch list again.
 
 - **Reloaded plugin component authority (CTX-1383, #2302):** the runtime policy
   host mirror is keyed by the activation manifest hash, so re-running it after

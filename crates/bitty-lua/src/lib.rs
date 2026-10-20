@@ -31,7 +31,7 @@
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
-//! | RC-1 | bounded host-call credit        | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a bounded host bridge call (spawn wait, snapshot/read services) is excluded from the hard wall limit, capped per callback at the supervised-call deadline; the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
+//! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
@@ -176,8 +176,14 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 /// by its own raw deadline, which the host enforces whether or not the credit
 /// covers it.
 ///
-/// - Credited: wall time spent inside a bounded host call, minus any store
-///   commit I/O already credited for the same span (no double credit). The
+/// - Credited: wall time spent inside a supervised `process.spawn` call, minus
+///   any store commit I/O already credited for the same span (no double
+///   credit). **Nothing else is credited**: the generic read-only bridge guard
+///   also wraps `bitty.commands.invoke` and `bitty.services.*` dispatch, and
+///   those execute callee/provider Lua, so crediting them would credit Lua
+///   execution and let a caller loop sub-deadline dispatches to accumulate
+///   credit. Snapshot reads, filesystem reads, and every other cheap call stay
+///   charged (they are bounded by the 50 ms cheap-call deadline). The
 ///   cheap-call deadline and the spawn deadline are unaffected: they are
 ///   checked in raw time by the bridge, and a call that misses its own
 ///   deadline still fails closed as before.
@@ -1313,8 +1319,9 @@ impl LuaVm {
                 self.warning_count = self.warning_count.wrapping_add(1);
             }
 
-            // Wall hard limit on charged time (raw minus capped store commit
-            // I/O credit); the reason reports the charged time it compares.
+            // Wall hard limit on charged time (raw minus the capped store
+            // commit and supervised spawn-wait credits); the reason reports
+            // the charged time it compares.
             if charged_ms >= self.wall_budget_ms {
                 let reason = SuspendReason::WallClockExceeded {
                     elapsed_ms: charged_ms,

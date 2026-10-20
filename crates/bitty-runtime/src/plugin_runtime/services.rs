@@ -1930,11 +1930,6 @@ impl PluginServices {
     }
 
     /// Reset the per-plugin `fs.list` window once the accepted window elapsed.
-    fn refresh_fs_window(&self) {
-        self.refresh_fs_window_at(Instant::now());
-    }
-
-    /// [`Self::refresh_fs_window`] at an explicit instant.
     ///
     /// The explicit clock keeps the window boundary testable without a
     /// wall-clock sleep; production always passes [`Instant::now`].
@@ -1948,9 +1943,12 @@ impl PluginServices {
     /// Admit one `bitty.fs.list` call before any directory I/O.
     ///
     /// Charges one operation against the per-plugin window and fails with
-    /// `E_FS_OVER_BOUND` once the window is exhausted.
-    fn admit_fs_list(&self) -> Result<(), BridgeError> {
-        self.refresh_fs_window();
+    /// `E_FS_OVER_BOUND` once the window is exhausted. The explicit clock is
+    /// the same instant used by [`Self::refresh_fs_window_at`]: production
+    /// passes [`Instant::now`], tests freeze it so a long call loop cannot
+    /// straddle the accepted window.
+    fn admit_fs_list_at(&self, now: Instant) -> Result<(), BridgeError> {
+        self.refresh_fs_window_at(now);
         self.fs_gate
             .borrow_mut()
             .admit_listing(&self.plugin_id)
@@ -1963,6 +1961,53 @@ impl PluginServices {
             .borrow_mut()
             .charge_listing_bytes(&self.plugin_id, bytes)
             .map_err(fs_gate_error)
+    }
+
+    /// [`HostServices::fs_list_with_expiry`] at an explicit window instant.
+    ///
+    /// The explicit clock keeps the per-plugin rate window testable without
+    /// sleeping a full window; production always passes [`Instant::now`].
+    /// Authorization, caps, and the scan expiry are unchanged.
+    fn fs_list_at(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        expiry: Instant,
+        now: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        // CTX-1348: the backend resolves only paths covered by this
+        // generation's own `fs.read:` grants. It reads the activation
+        // snapshot directly, so a revoked generation cannot list through a
+        // stale service handle. Without a wired backend the verb keeps its
+        // historical fail-closed behavior.
+        let granted = self.granted_capabilities.borrow().clone();
+        let backend = self
+            .fs_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.fs.list"))?;
+        // Per-plugin window (P0-AC-014): the operation is admitted before
+        // any directory I/O, so an exhausted plugin cannot keep scanning.
+        self.admit_fs_list_at(now)?;
+        let entries: Vec<FsListEntry> =
+            backend.list_with_expiry(&granted, prefix, max_entries, expiry)?;
+        let bytes = entries
+            .iter()
+            .map(|entry| entry.name.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        self.charge_fs_list_bytes(bytes)?;
+        Ok(LuaValue::array(
+            entries
+                .into_iter()
+                .map(|entry| {
+                    LuaValue::table([
+                        ("name", LuaValue::String(entry.name)),
+                        ("kind", LuaValue::String(entry.kind.to_string())),
+                        ("untrusted", LuaValue::Bool(true)),
+                    ])
+                })
+                .collect(),
+        ))
     }
 
     /// Grant `panel.create` and/or `panel.focus` from the activation snapshot
@@ -2926,39 +2971,7 @@ impl HostServices for PluginServices {
         max_entries: usize,
         expiry: Instant,
     ) -> Result<LuaValue, BridgeError> {
-        // CTX-1348: the backend resolves only paths covered by this
-        // generation's own `fs.read:` grants. It reads the activation
-        // snapshot directly, so a revoked generation cannot list through a
-        // stale service handle. Without a wired backend the verb keeps its
-        // historical fail-closed behavior.
-        let granted = self.granted_capabilities.borrow().clone();
-        let backend = self
-            .fs_backend
-            .borrow()
-            .clone()
-            .ok_or_else(|| BridgeError::not_implemented("bitty.fs.list"))?;
-        // Per-plugin window (P0-AC-014): the operation is admitted before
-        // any directory I/O, so an exhausted plugin cannot keep scanning.
-        self.admit_fs_list()?;
-        let entries: Vec<FsListEntry> =
-            backend.list_with_expiry(&granted, prefix, max_entries, expiry)?;
-        let bytes = entries
-            .iter()
-            .map(|entry| entry.name.len() as u64)
-            .fold(0u64, u64::saturating_add);
-        self.charge_fs_list_bytes(bytes)?;
-        Ok(LuaValue::array(
-            entries
-                .into_iter()
-                .map(|entry| {
-                    LuaValue::table([
-                        ("name", LuaValue::String(entry.name)),
-                        ("kind", LuaValue::String(entry.kind.to_string())),
-                        ("untrusted", LuaValue::Bool(true)),
-                    ])
-                })
-                .collect(),
-        ))
+        self.fs_list_at(prefix, max_entries, expiry, Instant::now())
     }
 
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
@@ -5532,8 +5545,9 @@ mod tests {
     #[test]
     fn debug_trace_expired_call_never_opens_a_trace() {
         let services = debug_services(false, true);
-        let past = Instant::now();
-        std::thread::sleep(Duration::from_millis(2));
+        // An explicit instant in the past: no sleep needed for the deadline
+        // to have passed.
+        let past = Instant::now() - Duration::from_millis(1);
         let error = services
             .debug_trace_with_expiry(&LuaValue::Nil, past)
             .expect_err("expired");
@@ -5607,6 +5621,36 @@ mod tests {
         dir
     }
 
+    /// Window instant used by the rate-window tests.
+    ///
+    /// The returned instant is a fixed offset from the services' window start,
+    /// not [`Instant::now`]: every call in a test therefore charges the same
+    /// window, so a slow runner cannot advance the window mid-loop and hand a
+    /// plugin fresh capacity it did not earn.
+    fn frozen_window(services: &PluginServices) -> Instant {
+        services.fs_window_start.get() + Duration::from_millis(1)
+    }
+
+    /// Scan budget for tests that assert window accounting, not scan time.
+    ///
+    /// The production direct-call default is the RC-1 50 ms budget. A loaded
+    /// runner can spend that before the first directory entry is read, so a
+    /// rate-window test would abort with `E_TIMEOUT` before reaching the
+    /// denial it asserts. These tests keep the production window semantics
+    /// and only opt out of the scan deadline.
+    const FIXTURE_SCAN_BUDGET: Duration = Duration::from_secs(60);
+
+    /// One `fs.list` call at a frozen window instant.
+    fn list_at(services: &PluginServices, now: Instant) -> Result<LuaValue, BridgeError> {
+        services.fs_list_at("~/docs", 16, now + FIXTURE_SCAN_BUDGET, now)
+    }
+
+    /// One `fs.list` call with the production window clock and a fixture scan
+    /// budget, for tests whose subject is neither the window nor the deadline.
+    fn list_with_generous_budget(services: &PluginServices) -> Result<LuaValue, BridgeError> {
+        services.fs_list_with_expiry("~/docs", 16, Instant::now() + FIXTURE_SCAN_BUDGET)
+    }
+
     #[test]
     fn fs_list_serves_granted_entries_with_untrusted_shape() {
         let home = fs_list_test_home("granted");
@@ -5614,7 +5658,7 @@ mod tests {
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
         services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
 
-        let value = services.fs_list("~/docs", 16).expect("granted listing");
+        let value = list_with_generous_budget(&services).expect("granted listing");
         let LuaValue::Table(entries) = value else {
             panic!("fs.list must return an array");
         };
@@ -5641,15 +5685,11 @@ mod tests {
     fn fs_list_without_backend_or_grant_fails_closed() {
         let home = fs_list_test_home("closed");
         let services = services();
-        let error = services
-            .fs_list("~/docs", 16)
-            .expect_err("no backend must fail");
+        let error = list_with_generous_budget(&services).expect_err("no backend must fail");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
 
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
-        let error = services
-            .fs_list("~/docs", 16)
-            .expect_err("no grant must fail");
+        let error = list_with_generous_budget(&services).expect_err("no grant must fail");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
     }
 
@@ -5660,9 +5700,12 @@ mod tests {
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
         services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
 
+        // Frozen window instant: the denial must come from the charges, not
+        // from wall time elapsing mid-loop (CTX-1375 follow-up).
+        let now = frozen_window(&services);
         let mut denial = None;
         for call in 1..=(FS_LIST_MAX_ENTRIES + 1) {
-            match services.fs_list("~/docs", 16) {
+            match list_at(&services, now) {
                 Ok(_) => {}
                 Err(error) => {
                     denial = Some((call, error));
@@ -5695,9 +5738,12 @@ mod tests {
         services.set_fs_backend(Some(Rc::new(FsListBackend::new(&home))));
         services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
 
+        // Frozen window instant: 1025 real calls must not be able to outlive
+        // the accepted window on a loaded runner.
+        let now = frozen_window(&services);
         let mut denial = None;
         for call in 1..=(FS_LIST_MAX_ENTRIES + 1) {
-            match services.fs_list("~/docs", 16) {
+            match list_at(&services, now) {
                 Ok(value) => {
                     let LuaValue::Table(entries) = value else {
                         panic!("fs.list must return an array");
@@ -5718,8 +5764,10 @@ mod tests {
     #[test]
     fn fs_list_window_reopens_after_the_accepted_window() {
         // A plugin that exhausts the op window must regain capacity once the
-        // accepted window elapses. Drive the boundary through the explicit
-        // clock instead of sleeping, so the test is deterministic and fast.
+        // accepted window elapses. Every call takes an explicit window
+        // instant, so the boundary is exact and the test never sleeps: a
+        // loaded runner cannot reset the window underneath the 1024-call
+        // exhaustion loop.
         let home = fs_list_test_home("window-reset");
         for name in ["a.txt", "b.txt"] {
             std::fs::remove_file(home.join("docs").join(name)).expect("clear fixture");
@@ -5729,28 +5777,23 @@ mod tests {
         services.set_granted_capabilities(vec!["fs.read:~/docs/**".to_string()]);
 
         // Empty pages return no bytes, so the op window is what runs out.
+        let start = services.fs_window_start.get();
+        let inside = start + Duration::from_millis(1);
         for _ in 0..FS_LIST_MAX_ENTRIES {
-            services.fs_list("~/docs", 16).expect("window has capacity");
+            list_at(&services, inside).expect("window has capacity");
         }
-        let error = services
-            .fs_list("~/docs", 16)
-            .expect_err("exhausted window must deny");
+        let error = list_at(&services, inside).expect_err("exhausted window must deny");
         assert_eq!(error.code, "E_FS_OVER_BOUND");
 
         // Still inside the same window: the usage is not cleared.
-        services.refresh_fs_window_at(
-            services.fs_window_start.get() + (FS_LIST_WINDOW - Duration::from_millis(1)),
-        );
-        let error = services
-            .fs_list("~/docs", 16)
+        let nearly_elapsed = start + (FS_LIST_WINDOW - Duration::from_millis(1));
+        let error = list_at(&services, nearly_elapsed)
             .expect_err("usage must survive until the window elapses");
         assert_eq!(error.code, "E_FS_OVER_BOUND");
 
         // One full window later the usage clears and listing resumes.
-        services.refresh_fs_window_at(services.fs_window_start.get() + FS_LIST_WINDOW);
-        services
-            .fs_list("~/docs", 16)
-            .expect("elapsed window must restore capacity");
+        let reopened = start + FS_LIST_WINDOW;
+        list_at(&services, reopened).expect("elapsed window must restore capacity");
     }
 
     fn env_services(grants: &[&str], values: &[(&str, &str)]) -> PluginServices {

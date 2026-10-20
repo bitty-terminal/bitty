@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.24] - unreleased
 
-Prepared from `v0.0.23..origin/main` (head `470c20ab`) but not published.
-Release metadata and this entry are merged; the tag, GitHub release, and
-artifact upload stay on hold until the owner authorizes publication. Nothing
-below claims a frozen candidate SHA, a runtime matrix, or a published
-artifact.
+Prepared from `v0.0.23..origin/main` (audited through `af59f71d`) but not
+published. Release metadata and this entry are merged; the tag, GitHub
+release, and artifact upload stay on hold until the owner authorizes
+publication. Nothing below claims a frozen candidate SHA, a runtime matrix,
+or a published artifact.
 
 ### Added
 
@@ -28,6 +28,24 @@ artifact.
   projected from the broker's own transition points through a single runtime
   reader; a missing, oversize, symlinked, or malformed record reads as
   `installed`, never as `active`.
+- **Component request surface from Lua (CTX-1380, #2296):**
+  `bitty.component.request { id, method, url, headers?, body?, timeout_ms? }`
+  validates and enqueues one submission and returns a ticket without
+  spawning, sending, or waiting, so no Lua callback can hold the owner thread
+  for a component deadline; `bitty.component.poll(ticket)` returns `nil` while
+  in flight, a bounded `{ status, headers, body, bytes, untrusted }` table on
+  success, or the stable typed class on failure. Bounds are explicit: 8 KiB
+  request and response payloads, 16 headers of 1 KiB, 32 queued submissions
+  with 4 held per plugin, and a 5 s default deadline with a 30 s ceiling;
+  deadlines cancel, and a suspended, reloaded, or disposed generation has its
+  tickets purged and in-flight requests cancelled. Authorization is
+  unchanged (an `Activated` plugin, the activation-time manifest generation, a
+  non-denied grant bound to that hash, and the `GrantStore` /
+  `[[network.egress]]` intersection), re-checked by the runtime on submission
+  and by the broker at spawn; the startup registry mirror only supplies the
+  policy host that was empty in production and grants nothing. This closes
+  #2254, with a headed run against the real `bitty-net` reporting
+  `status=200 body=hello`.
 - **`bitty.history` Lua surface (CTX-1352, #2268):** the placeholder provider
   is replaced by a bounded terminal transcript source (`transcript`, sampled
   from completed scrollback into a bounded ring), so the `history`, `search`,
@@ -95,6 +113,19 @@ artifact.
   kitty graphics is pinned as the default image path with yazi-exact
   detection and display/erase regressions; and the graphics seam parity check
   covers the extension taxonomy.
+- **Per-plugin settings inspection and scaffolding (CTX-2246, #2299):**
+  `bitty plugin config show <id>` prints the declared `[settings]` schema, the
+  canonical, alias, and legacy candidate paths, the selected file, and every
+  effective value with its serving layer (`manifest-default`, `host`,
+  `user-file`), resolving the file exactly as activation does without creating
+  or executing the plugin VM. `bitty plugin config scaffold <id>` writes a
+  commented canonical Lua template from manifest defaults only: it refuses to
+  overwrite without `--force`, refuses symlinked targets and symlinked
+  `plugins/` directories, stays inside the environment-derived config root,
+  and commits atomically with mode 0600. Both support a JSON envelope and
+  return typed non-zero failures (`UnknownPlugin`, `SchemaUnreadable`,
+  `ConfigRejected`, `UndeclaredKey`, `NoSettings`, `AlreadyExists`,
+  `SymlinkTarget`, `InvalidTarget`, `UnsafePath`, `IoError`).
 - **Core metadata snapshots for `ai.*` (CTX-1274, #2184):** a bounded,
   credential-free snapshot producer with monotonic mutation versions and
   explicit invalidation injects exactly one Core-owned `snapshot_version`
@@ -134,6 +165,16 @@ artifact.
   scenarios are refused rather than reported as passed. Float-exit reaping
   (#2175) and typed exit through a focused float (#2181) gain regression
   matrices.
+- **Extension pins and drift gate (CTX-1363, #2291):** all six extracted
+  extension pins move to their upstream `main` heads (still exact abbreviated
+  SHAs at `0.0.1`, edition 2024, MSRV 1.85), and
+  `scripts/check-extension-pins.sh` with `just pins` fails a pin unreachable
+  from upstream `main`, warns past `PIN_DRIFT_WARN` commits behind, and skips
+  with a clear message when the network is absent.
+- **`command_invoke` budget flake (CTX-1381, #2298):** the cross-VM command
+  test no longer measures runner scheduling against the 50 ms production RC-1
+  wall budget; the production budget and its containment assertions are
+  unchanged.
 - **Release packaging (CTX-1270, #2156):** the release workflow guards
   immutable R2 objects against overwrite on re-runs.
 
@@ -243,6 +284,17 @@ artifact.
   Together with band delivery (#2213, #2236) and its headless regression lock
   (#2213, #2215), the accepted input hot path takes no owning-plugin-VM
   entries; the release-owner disposition of #2213 remains open.
+- **Activation record hardening (CTX-1361, #2295):** the activation
+  projection is written through an `O_CREAT|O_EXCL` temp file (mode 0600 on
+  Unix) that refuses an existing entry instead of truncating it, retried on
+  name collision, flushed with `sync_all`, renamed into place with a directory
+  flush, and reported through a typed `ActivationWriteError`
+  (`RecordNotRegular`, `RecordOversize`, `TempNameExhausted`, `TempCreate`,
+  `TempWrite`, `Rename`, `SyncDir`) that the broker drops because activation
+  is diagnostics and never a request or stop gate. The read path no longer
+  takes its size from `symlink_metadata` while re-resolving a path a same-user
+  process can swap, so a planted symlink can neither redirect the write nor
+  force an unbounded read.
 - **Landlock exec confinement (CTX-1376, #2282, #2284):**
   `landlock_restrict_self` now runs after `PR_SET_NO_NEW_PRIVS`, the
   prerequisite for unprivileged callers. Without it every admitted Layer-2
@@ -268,9 +320,11 @@ artifact.
   stream, one-shot zeroized bootstrap writes, and a TLS 1.3 client handshake
   with typed outcomes and an absolute deadline, with non-Unix `prepare`
   failing closed. The feature graph is checked by `cargo deny` and the
-  supply-chain gate. It does not yet spawn `ai_helper`: the helper does not
-  ingest inherited handles, there is no control-record state machine, and no
-  strict enablement.
+  supply-chain gate, and #2293 compiles the feature on Windows CI (check plus
+  the non-Unix fail-closed test) and gates feature-combination dead code
+  without adding `allow(dead_code)`. It does not yet spawn `ai_helper`: the
+  helper does not ingest inherited handles, there is no control-record state
+  machine, and no strict enablement.
 
 ### Documentation
 
@@ -283,12 +337,16 @@ artifact.
 
 ### Known issues
 
-- **Component request surface (#2254) is partial.** The broker, installed
-  store, grants, lifecycle, activation reporting, and a real `bitty-net`
-  HTTP 200 through the production host are in place, but no non-test code
-  submits a request and no Lua or IPC verb exists, so an installed component
-  is not reachable from a user action. The synchronous request path can block
-  up to 310 s and must stay off the UI thread.
+- **Component request surface limits (#2254, #2296).** The Lua producer is
+  merged and #2254 is closed, but there is no IPC verb (that would need a
+  user-level authority the accepted model does not define), no streaming,
+  watch, subscription, or retained handle (one request, one bounded
+  response), and response bodies cross as lossy UTF-8 with a real byte count,
+  so binary payloads are not a supported Lua shape. A plugin suspended only in
+  the plugin runtime after startup keeps its mirrored grant until the next
+  start; its component requests then fail closed on the parked command path.
+  The synchronous `ComponentRequest` path can still block up to 310 s and must
+  stay off the UI thread.
 - **Residual input-to-VM paths (#2213).** Band delivery and keybinding
   commands are deferred to the cold phase, but the issue's release-owner and
   security disposition remains open.

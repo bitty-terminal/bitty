@@ -5,136 +5,322 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.0.24] - 2026-10-17
+## [0.0.24] - unreleased
+
+Prepared from `v0.0.23..origin/main` (head `470c20ab`) but not published.
+Release metadata and this entry are merged; the tag, GitHub release, and
+artifact upload stay on hold until the owner authorizes publication. Nothing
+below claims a frozen candidate SHA, a runtime matrix, or a published
+artifact.
 
 ### Added
 
-- **Resident AI helper spawn path (CTX-1253, #2123):** Core-side resolution,
-  digest verification, stdio framing, and bounded restart supervision for the
-  native `ai` component.
-- **Kitty graphics support (CTX-1272, #2131):** bounded capability detection,
-  image retention across alt-screen cycles, and related terminal-state and
-  rendering coverage.
+- **Component broker at the production composition root (CTX-1361, #2267,
+  #2276):** one `ComponentHost`-owned broker is installed on both the primary
+  and headless-fallback startup paths. Components resolve only from the
+  installed store under `$XDG_DATA_HOME/bitty/extensions` (`PATH` is never
+  consulted), and every spawn re-runs resolution and descriptor digest
+  verification. A request needs an `Activated` plugin, the caller's matching
+  manifest hash, a non-denied grant record, and every capability to pass the
+  canonical `GrantStore::is_granted`. `bitty extension list` adds a bounded
+  `ACTIVATION` column and `activation`/`activation_class` JSON fields that
+  report `installed`, `active`, `denied:<class>`, `crashed`, or `stopped`,
+  projected from the broker's own transition points through a single runtime
+  reader; a missing, oversize, symlinked, or malformed record reads as
+  `installed`, never as `active`.
+- **`bitty.history` Lua surface (CTX-1352, #2268):** the placeholder provider
+  is replaced by a bounded terminal transcript source (`transcript`, sampled
+  from completed scrollback into a bounded ring), so the `history`, `search`,
+  and `copy-mode` plugins no longer nil-index. `commands` and `kv` answer the
+  typed `E_HISTORY_UNAVAILABLE`. Capture is opt-in and defaults to off;
+  `history.capture.transcript` records the preference, a disabled capture is
+  denied with `E_HISTORY_CAPTURE_DISABLED`, and safe mode forces both off.
+- **Bounded `bitty.fs.list` backend (CTX-1348, #2271, #2281):** the file
+  manager can browse at runtime instead of every call failing closed with
+  `E_NOT_IMPLEMENTED`. Listing accepts only the activation snapshot's own
+  `fs.read:` patterns (`fs.write:` never authorizes listing), canonicalizes
+  the request or its nearest existing ancestor against the grant root before
+  any not-found decision, rejects `..`, absolute paths, `~user`, and `./~`
+  before I/O, and runs the default-deny sensitive-name filter over resolved
+  components and entry names. Results are capped at `FS_LIST_MAX_ENTRIES`
+  (1024) and `FS_LIST_MAX_BYTES` (8192) in deterministic name order, charged
+  against the per-plugin RC-8 window, and the walk aborts `E_TIMEOUT` on the
+  RC-1 deadline. #2281 deflakes the cap tests against wall-clock expiry
+  without loosening the production budget.
+- **Resolved terminal font advertisement (CTX-1370, #2277):** the parser
+  classifies the kitty font query (`ESC P +q <hex-key>[;<hex-key>] ST`, also
+  APC) and the runtime answers `font_family`/`font_size` from the live
+  resolved configuration over the existing bounded reply channel, echoing
+  nothing. `bitty +show-font` prints `font_family:`, `font_size:`, and
+  optional `font_fallback:` lines from the same merged configuration, is
+  read-only and headless, and creates no runtime, window, PTY, IPC, or plugin
+  VM. This is the Bitty side of `fastfetch-cli/fastfetch#2660`, which queries
+  the DCS and falls back to `+show-font` off Windows.
+- **Enter confirms a pending paste (CTX-1372, #2269):** `Enter` confirms
+  through the same `confirm_pending_paste(true)` seam as repeating the paste
+  gesture, and the press is consumed so its CR never reaches the PTY behind
+  the gate. Modifiers do not change the outcome; with no pending paste the key
+  keeps its normal binding. `Esc` still cancels, paste-again still confirms,
+  and the banner and collapsed flash now read
+  `(Enter to confirm, Esc to cancel)`. Trigger classes and the
+  no-silent-delivery invariant are unchanged.
 - **Restricted Lua plugin settings (CTX-1294, #2192):** per-plugin settings
-  files use declared keys and strict types, with bounded reads and fail-closed
-  fallback; short-name aliases require complete discovery.
-- **Panel geometry interpolation (CTX-1335, #2113):** split, move, and resize
-  transitions interpolate painted bounds, with instant, reduced-motion, safe,
-  and zero-duration paths that paint the committed end bounds on the first
-  frame. Float detach/restore fails closed to instant bounds, and a tier or
-  capacity change cancels the stale tween before the next present. Layout,
-  hit-testing, PTY size, and terminal truth keep reading the committed frames.
-
-### Fixed
-
-- **Workspace and floating-panel lifecycle (CTX-1264, CTX-1271, CTX-1278,
-  CTX-1285):** stale float/pin cleanup, detached-view scrolling and chrome
-  occlusion, workspace-switch animation behavior, child-exit cleanup, and
-  overlay indicator preservation.
-- **Last tiled-panel close (CTX-1297, CTX-1302, #2194, #2195):** closing a
-  workspace's last tiled panel prunes that workspace when another workspace
-  exists and it has no local floating panels; focus follows the surviving
-  workspace. A workspace with floating panels, or the sole workspace beside
-  a pinned panel, stays present while the closed tiled panel's shell is torn
-  down. Pruning honors busy-job confirmation, and closing a zoomed panel
-  preserves its tiled siblings.
-- **Focus after tiled-panel close (CTX-1300, #2196):** focus moves to the
-  previous panel in stable layout order, wrapping to the last survivor when
-  the first panel closes.
-- **PTY and input behavior (CTX-1254, CTX-1255, CTX-1267):** bounded
-  FreeBSD flood respawn handling, fail-closed drain behavior, and fcitx5
-  Shift-toggle input handling.
-- **Plugin command acknowledgements (CTX-1293, #2193):** boolean results from
-  presentation commands no longer create notification banners.
-- **Host-owned settings diagnostics (CTX-1303, #2198):** bounded diagnostics
-  on plugin entries report ambiguous or shadowed aliases, ignored entries,
-  and rejected settings files through host warning logs. Summaries omit
-  setting names and values and preserve the existing activation-report and
-  loaded-settings layouts and capability checks.
-- **Float teardown and workspace focus (CTX-1336, CTX-1337, #2221, #2222):**
-  a closed float no longer leaves a ghost host leaf, a workspace emptied by
-  its last float is pruned instead of showing a blank slot, focus moves to a
-  surviving pinned view when the last tiled panel closes, and cross-workspace
-  focus and pin-only survivors are fenced.
-- **`new_panel` over an emptied workspace (CTX-1338, CTX-1347, #2223,
-  #2240):** `new_panel` materializes a tiled base when the workspace has none
-  (or refuses loudly), and the fresh shell inherits the working directory from
-  the surviving float or pin instead of its own allocation target.
-- **Pin-only session capture (CTX-1342, #2230):** a pin-only empty tiled base
-  is refused with the typed `SessionError::PinOnlyEmptyBase` diagnostic
-  instead of being reported as file corruption; capture writes no file and
-  leaves the existing session untouched. Pinless empty workspaces remain
-  `Corrupt`; persisting the pin-only state needs a storage codec change.
-- **Plugin UI retained strings (CTX-1340, #2229):** retained text, theme
-  tokens, command identifiers, argument keys, and string argument values are
-  charged against the existing 2 MiB SCN-4 aggregate, and argument keys are
-  capped at the existing 64-byte command-identifier bound. The 320 KiB
-  envelope, aggregate, and `E_UI_BLOCK_BUDGET` class are unchanged.
-- **Animation budget (CTX-1335, #2232):** a gesture re-arming its ring carries
-  the painted frame forward, and only bounds-only tweens are evicted at the
-  shared budget; a budget full of ring entries refuses the trigger.
-- **Lua error diagnostics (CTX-1346, #2237):** table-shaped bridge errors
-  decode to `<code>: <message>` instead of `<table 0x...>`; plain strings,
-  numbers, userdata, and opaque tables keep their existing rendering.
-- **Clipboard live-test isolation (CTX-1316, #2205):** guard only: native
-  scenarios are refused, not accepted. Live validation requires a disposable
-  display and fails closed when isolation evidence is unbound; acquisition
-  behavior itself is unchanged.
+  files use declared keys and strict types with bounded reads and fail-closed
+  fallback; over-bound configuration fails closed as `Limit`, and short-name
+  aliases require complete discovery. #2193 stops boolean presentation
+  acknowledgements from raising notification banners, and #2198 keeps
+  settings diagnostics host-internal: ambiguous or shadowed aliases, ignored
+  entries, and rejected files surface through host warning logs that omit
+  setting names and values.
+- **Post-install next steps (CTX-1268, #2154):** `bitty plugin install` and
+  `bitty plugin enable` print the enable command, install location, the
+  per-plugin config path with a manifest-derived snippet, manifest-declared
+  `[hints] next_steps` (bounded to 8 lines of 512 bytes, validated
+  fail-closed, excluded from the grant-binding manifest hash), and a
+  `bitty plugin info <id>` pointer. `bitty plugin --help` gains a `wiring`
+  section. Snippet defaults are TOML-escaped, so hostile manifest bytes
+  cannot inject terminal escapes.
+- **Panel geometry interpolation (CTX-1335, #2231, #2232):** split, move, and
+  resize transitions interpolate painted bounds with instant,
+  reduced-motion, safe, and zero-duration paths that paint the committed end
+  bounds on the first frame. A float detach/restore fails closed to instant
+  bounds, and a tier or capacity change cancels the stale tween before the
+  next present. A re-armed gesture carries the painted frame forward, and a
+  full ring refuses the trigger instead of evicting an entry that hosts
+  bounds. Layout, hit-testing, PTY size, and terminal truth keep reading the
+  committed logical frames.
+- **Graphics query and image path (CTX-1264, CTX-1272, CTX-1277, #2148,
+  #2165, #2166):** `XTWINOPS 16t` now answers the live cell metrics
+  (`CSI 6 ; height ; width t`), so cell-size probers stop seeing a zero cell;
+  kitty graphics is pinned as the default image path with yazi-exact
+  detection and display/erase regressions; and the graphics seam parity check
+  covers the extension taxonomy.
+- **Core metadata snapshots for `ai.*` (CTX-1274, #2184):** a bounded,
+  credential-free snapshot producer with monotonic mutation versions and
+  explicit invalidation injects exactly one Core-owned `snapshot_version`
+  into all 13 supported outbound `ai.*` request methods, with strict bounded
+  JSON, duplicate-key rejection, Unicode validation, credential-shaped value
+  rejection, and fail-closed publication acknowledgement. Event-loop,
+  Lua/IPC caller wiring, and helper receipts remain explicit follow-up
+  seams.
 
 ### Changed
 
-- **Release and installation tooling:** hardened Windows installer checks,
-  immutable R2 rerun protection, and plugin-install next steps.
-- **Plugin install staging (CTX-1313, #2204):** fresh CLI installs stay
-  staged-disabled until explicit enable; update installs keep their desired
-  state and the existing package security gates.
-- **Startup configuration fallback (CTX-1339, #2225):** on first start, a
-  present user config file that cannot be loaded or merged falls back to the
-  built-in defaults with diagnostics; a missing explicit `--config` or
-  `BITTY_CONFIG` path, an invalid profile, a CLI usage error, and an invalid
-  built-in plan stay fail-closed. Merge errors name the offending layer, and
-  `--theme` is validated with the other CLI appearance overrides before any
-  layer merge.
-- **Band input delivery (CTX-1332, #2213):** partial: band delivery moved to
-  the AboutToWait cold phase; remaining `drive_tick` VM pumps are not covered
-  and P0-AC-015 remains unverified.
-- **Input-to-VM regression lock (CTX-1327, #2215):** a headless proof through
-  `AppHandler::handle_event` shows the accepted input path taking no
-  owning-plugin-VM entries and delivering exactly once on the later cold pump.
-- **Band slot placement (CTX-1341, #2234):** left and right band slots fail
-  closed at mount with an unsupported-placement refusal instead of returning a
-  handle that no renderer paints, reserves, or hit-tests.
-- **Terminal docs pin (CTX-1318, #2214):** the `docs` gitlink advances to
-  Terminal Docs `2b027ccd`, which carries the `interfaces/provider-contracts.md`
+- **Fresh CLI plugin installs stay disabled (CTX-1313, #2204, #2212):**
+  local, git, and archive CLI installs are staged until an explicit enable,
+  while update installs keep their desired state and the existing package
+  security gates.
+- **First-start configuration fallback (CTX-1339, #2225, #2228):** a present
+  user config that cannot be loaded or merged falls back to built-in defaults
+  with diagnostics, and merge errors name the offending layer. A missing
+  explicit `--config`/`BITTY_CONFIG` path, an invalid profile, a CLI usage
+  error, and an invalid built-in plan stay fail-closed.
+- **Float drag is Alt-only (CTX-1271, #2140, #2161):** `Super`-drag stays with
+  the compositor, so Hyprland move/resize keeps working while Bitty handles
+  the Alt chord.
+- **Renderer and terminal memory diagnostics (CTX-1269, #2183):** renderer
+  glyph retention is bounded with packed grayscale storage, retained-byte
+  quotas, malformed-dimension checks, and transient oversized-glyph
+  retention; permissioned terminal and retained-workspace memory diagnostics
+  report truthful truncation and child lifecycle metadata.
+- **Removed the mascot splash (CTX-1265, CTX-1301, #2135, #2157, #2197):** the
+  ASCII mascot banner, its first-run marker-file writes, `bitty --mascot`, and
+  `--no-splash` are gone from parsing, help, and shell completions.
+- **Gate and test tooling (CTX-1308, CTX-1316, #2205, #2209, #2211):** local
+  `Quality gates` shards run against a bounded disk sccache with serialized
+  bind-mounted matrix checkouts, and exact WSL parent help bytes are
+  preserved. Destructive live clipboard validation now requires a disposable
+  display and fails closed when isolation evidence is unbound; native
+  scenarios are refused rather than reported as passed. Float-exit reaping
+  (#2175) and typed exit through a focused float (#2181) gain regression
+  matrices.
+- **Release packaging (CTX-1270, #2156):** the release workflow guards
+  immutable R2 objects against overwrite on re-runs.
+
+### Fixed
+
+- **Copy keeps combining marks and joiners (CTX-1367, #2260, #2266):** text
+  extraction pushed only `Cell::glyph` and dropped `Cell::zerowidth`, so a
+  decomposed `é` (`e` + U+0301) copied as `e` and a ZWJ family emoji copied
+  as separate people. `Cell::push_text_into` now emits the base glyph followed
+  by every retained zero-width scalar in arrival order, and selection, block
+  selection, persistent selection, accessibility runs, inspection grid text,
+  visible-view text, session scrollback capture, and URL detection all route
+  through it. Cell storage, the five-scalar mark bound, spacer semantics, and
+  rendering are unchanged.
+- **Multi-line paste duplication and the Ctrl+C ghost (CTX-1368, #2261,
+  #2272):** paste bytes were delivered exactly once; the damage was
+  frame/cursor damage. `CUF`/`CUB` counted a wide pair's trailing spacer as an
+  extra column, so fish's two-pass bracketed-paste repaint landed four
+  columns off, appended `abc` past the first paint, and left the original
+  cell behind. Cursor moves are now O(1) `col ± n` with a lead snap when the
+  destination is a spacer, and the requested column count is never inflated.
+  Paste inspection also treats ZWJ/ZWNJ as cluster joiners rather than bidi
+  controls, while real bidi controls and zero-width characters still gate.
+- **Combining marks paint (CTX-1371, #2264, #2279):** the unshaped per-cell
+  paint path emitted only the base glyph, so `e` + U+0301 painted a bare `e`
+  while copy returned `é`. Each visible mark is now emitted at the font pen
+  origin (`col * cell_width + base_advance + mark.left`) through the shared
+  atlas/inline path, matching the accent the font already paints for
+  precomposed U+00E9. Join controls, variation selectors, and tag scalars are
+  skipped so they cannot paint tofu, and a mark with no drawable glyph is
+  dropped instead of promoted to a box. Terminal truth and cell storage are
+  untouched; the `wide_combining` present golden is re-recorded for the
+  intentional paint change.
+- **`fill` background cover on HiDPI (CTX-1374, #2278, #2283):** `fill`
+  double-counted the window DPI factor, so the cover window ran past the
+  image and the rasterizer's clamp turned the overshoot into smear bands,
+  shrinking the visible image to `1/dpi` of the width. Cover is
+  scale-invariant and now scores against the raw image size; `center` and
+  `tile` keep their DPI scaling.
+- **Alternate screen and image retention (CTX-1264, CTX-1272, #2132, #2133,
+  #2152, #2159):** scrolled-off alternate-screen rows are discarded instead
+  of captured into main scrollback (a `btop` run no longer leaks its UI and
+  padding rows into primary history), and kitty image placements are retained
+  across the alt-screen session so pre-existing images survive a TUI exit.
+- **Workspace, float, and focus lifecycle (CTX-1264, CTX-1266, CTX-1271,
+  CTX-1278, CTX-1280, CTX-1285, CTX-1287, CTX-1288, CTX-1289, CTX-1297,
+  CTX-1300, CTX-1302, CTX-1336, CTX-1337, CTX-1341, #2134, #2141, #2149, #2150,
+  #2151, #2155, #2158, #2160, #2170, #2174, #2176, #2179, #2182, #2185,
+  #2186, #2194, #2195, #2196, #2222, #2224, #2233, #2234):** stashed and
+  scratchpad panels are released on child exit (including while zoomed)
+  instead of stranding a session-less ghost tile; a closed float or pin no
+  longer leaves a ghost host leaf; an emptied workspace is pruned while the
+  sole workspace beside a pinned panel and workspaces holding floats stay
+  present; focus moves to the previous panel in stable layout order after a
+  close and to a surviving pinned view when the last tiled panel goes; the
+  overlay window-ID indicator survives workspace create and a refused move
+  and is released only after a real move lands; numbered moves reuse an
+  existing workspace; detached floats occlude
+  lower chrome and hide background tiled chrome while tiled text stays live;
+  float scroll reaches detached and pinned views; and unwired vertical band
+  slots fail closed at mount instead of returning a handle nothing paints.
+- **Panel creation over an emptied workspace (CTX-1338, CTX-1347, #2223,
+  #2240, #2238, #2242):** `new_panel` materializes a tiled base when the
+  workspace has none or refuses loudly, and the fresh shell inherits the
+  working directory of the surviving float or pin.
+- **Pin-only session capture (CTX-1342, #2230, #2235):** a pin-only empty
+  tiled base is a valid live state and is now refused with the typed
+  `SessionError::PinOnlyEmptyBase` diagnostic instead of being reported as
+  file corruption; capture writes no file and leaves the existing session
+  untouched. Pinless empty workspaces remain `Corrupt`; persisting the
+  pin-only state needs a storage codec change.
+- **Input and IME (CTX-1265, CTX-1267, #2136, #2142, #2147, #2153):** Shift
+  alone never produces PTY bytes, so the fcitx5 Shift toggle reaches the IME
+  under kitty report-all; composed commits trim exactly one trailing commit
+  space while unsolicited commits stay verbatim; bare Delete releases no
+  longer report `CSI` under report-events, so one tap deletes once. The
+  `bitty init` wizard pickers navigate on a single keypress over live TTYs
+  (`j`/`k`, arrows, in-place repaint) and keep the line loop for piped runs,
+  raw-setup failure, and non-Unix.
+- **Diagnostics and budgets (CTX-1296, CTX-1340, CTX-1346, #2189, #2190,
+  #2229, #2237, #2241):** child exit during launch-time process identity
+  capture is rechecked and skipped only when the child is confirmed absent or
+  a zombie,
+  with surviving or indeterminate identity failures still fail-closed; Lua
+  table-shaped bridge errors decode to `<code>: <message>` instead of
+  `<table 0x...>`; and retained plugin UI text, theme tokens, command
+  identifiers, argument keys, and string argument values are charged against
+  the existing 2 MiB SCN-4 aggregate with argument keys capped at 64 bytes.
+
+### Security
+
+- **Bounded native clipboard acquisition (CTX-1366, #2206, #2273, path B):**
+  Linux and Windows acquisition is bounded before allocation and delivery —
+  one absolute deadline threaded through the X11 packet-read loop, selection
+  and INCR waits, shared INCR classification, payload and decoded-memory caps
+  enforced before allocation with typed `OverLimit`, and the same
+  `AcquisitionLimits` on Wayland and Windows. Over-limit X11/Windows payloads
+  refuse rather than truncate. The macOS read path keeps its typed refusal,
+  so acquisition is bounded or explicitly refused everywhere.
+- **Keybinding commands leave the input path (CTX-1324, #2275):** input-
+  originated `command:<owner:command>`, `toggle_palette`, and `open_composer`
+  actions go through a bounded eight-entry app queue drained by the existing
+  exclusive `AboutToWait` cold phase, so registration, lifecycle, schema,
+  origin, and capability gates are evaluated at delivery. Oversize `command:`
+  targets are refused before queueing and overflow drops the newest request
+  with an attributed warning and counter; no allow-all fallback exists.
+  Together with band delivery (#2213, #2236) and its headless regression lock
+  (#2213, #2215), the accepted input hot path takes no owning-plugin-VM
+  entries; the release-owner disposition of #2213 remains open.
+- **Landlock exec confinement (CTX-1376, #2282, #2284):**
+  `landlock_restrict_self` now runs after `PR_SET_NO_NEW_PRIVS`, the
+  prerequisite for unprivileged callers. Without it every admitted Layer-2
+  tool spawn was refused `EPERM` and surfaced as a fail-closed confinement
+  error, which the runtime matrix saw through `git-panel`.
+- **Spawn descriptor reservation (CTX-1377, #2287, #2289):** the launch seam
+  fills its whole `0..=4` placement range with CLOEXEC placeholder pipes
+  before `Command::spawn`, so std's exec-error channel is allocated above the
+  dup2 targets and a failed exec can no longer be reported as a successful
+  spawn. The reservation is released on success, failure, abort, and drop,
+  never crosses exec, and adds no production `unsafe`.
+- **Plugin-controlled spawn directory rejected (CTX-1345, #2251):**
+  `process.spawn { cwd }` is rejected with typed `E_DEF_INVALID` rather than
+  honored, and `SpawnRequest::validate` refuses any `Some(cwd)` before
+  routing, authorization, scope, consent, or process contact. Honoring a
+  plugin string let `Command::current_dir` follow symlinks outside the
+  plugin's `fs.read` grant and reopened the `[tools.*]` `-C` repository escape;
+  the removal of the `*_with_cwd` host APIs also lands the `panel.create`
+  backend wiring.
+- **Feature-gated publication-control launch seam (CTX-1373, #2274, #2286):**
+  a `publication-control` cargo feature (default off) adds nonce generation,
+  bounded manifest preparation, an anonymous bootstrap pipe, a duplex control
+  stream, one-shot zeroized bootstrap writes, and a TLS 1.3 client handshake
+  with typed outcomes and an absolute deadline, with non-Unix `prepare`
+  failing closed. The feature graph is checked by `cargo deny` and the
+  supply-chain gate. It does not yet spawn `ai_helper`: the helper does not
+  ingest inherited handles, there is no control-record state machine, and no
+  strict enablement.
+
+### Documentation
+
+- **Terminal docs pin (CTX-1318, #2207, #2214):** the `docs` gitlink advances
+  to Terminal Docs `2b027ccd`, carrying the `interfaces/provider-contracts.md`
   specification-spine repair; the re-audited pin range returns `CLEAN`.
-
-### Removed
-
-- **Obsolete mascot splash (CTX-1301, #2197):** removed the first-run splash,
-  its marker-file writes, and the `--no-splash` flag from CLI parsing, help,
-  and shell completions.
+- **Lua-canonical plugin settings (CTX-1294, #2250, #2252):** configuration
+  documentation describes the Lua-canonical settings model, and the `docs`
+  gitlink advances to the merged settings sync so Core consumes it.
 
 ### Known issues
 
-- Native clipboard acquisition (#2206) remains open at P0: acquisition is
-  still unbounded before allocation and delivery.
-- Residual input-to-VM paths (#2213) remain open: `drive_tick` VM pumps are
-  uncovered and P0-AC-015 is unverified.
-- The stray blank first row on a new panel (#2145) is unreproduced and moved
-  to 0.0.25 as a P2 follow-up.
+- **Component request surface (#2254) is partial.** The broker, installed
+  store, grants, lifecycle, activation reporting, and a real `bitty-net`
+  HTTP 200 through the production host are in place, but no non-test code
+  submits a request and no Lua or IPC verb exists, so an installed component
+  is not reachable from a user action. The synchronous request path can block
+  up to 310 s and must stay off the UI thread.
+- **Residual input-to-VM paths (#2213).** Band delivery and keybinding
+  commands are deferred to the cold phase, but the issue's release-owner and
+  security disposition remains open.
+- **Native clipboard read on macOS stays refused.** Path B bounds Linux and
+  Windows acquisition; macOS returns the typed refusal, so no unbounded read
+  exists there either.
+- **`bitty.history` source coverage.** `transcript` is real; `commands` and
+  `kv` answer `E_HISTORY_UNAVAILABLE`, and capture is off by default.
+- **Publication-control is not wired.** `#2286` is feature-gated and default
+  off; nothing in this release spawns `ai_helper` through it.
+- **Lua RC-1 fuel accounting for host calls (#2285) is not included.** PR
+  #2292 is open and unmerged at this entry's head, so no bound is claimed for
+  it.
 
 ### Follow-ups (not in this release)
 
 - Native `net` and `graphics` extensions remain deferred; this Core changelog
-  does not claim an extension publication or installable native extension.
+  does not claim an extension publication or an installable native extension.
+- Upstream detector recognition (a chafa Bitty rule, a yazi Bitty brand) and
+  `fastfetch-cli/fastfetch#2660` remain external follow-ups.
 
 ### Release engineering
 
-- Workspace version bumped `0.0.23 -> 0.0.24`, applied to `Cargo.toml`,
-  `Cargo.lock`, internal `path` dependency pins, `packaging/PKGBUILD*`
-  `pkgver`, `nfpm.yaml`, the `flake.nix` fallback, and the `README.md`
-  release line. `scripts/check-release-version.sh --tag v0.0.24` keeps
-  `bitty --version`, packaging metadata, and the release tag in agreement.
+- Workspace version bumped `0.0.23 -> 0.0.24` (CTX-1290, #2180), applied to
+  `Cargo.toml`, `Cargo.lock`, internal `path` dependency pins,
+  `packaging/PKGBUILD*` `pkgver`, `nfpm.yaml`, the `flake.nix` fallback, and
+  the `README.md` release line. `scripts/check-release-version.sh --tag
+  v0.0.24` keeps `bitty --version`, packaging metadata, and the release
+  tag in agreement.
+- Earlier partial 0.0.24 entries (#2210, #2245) are superseded by this
+  complete pass over `v0.0.23..origin/main`; no tag or publication is
+  claimed here.
 
 ## [0.0.23] - 2026-10-15
 

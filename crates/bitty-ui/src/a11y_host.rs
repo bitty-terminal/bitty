@@ -49,7 +49,8 @@
 
 use bitty_a11y::{
     A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
-    InteractivePurpose, SceneKind, Snapshot, SnapshotBuilder, SnapshotHost, TextRun,
+    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, SceneKind, Snapshot, SnapshotBuilder,
+    SnapshotHost, TextRun,
 };
 
 use crate::motion::MotionSpec;
@@ -75,6 +76,16 @@ pub use bitty_a11y::Role;
 /// mistakes partial exposure for a missing feature.
 pub const FIDELITY_BOUNDARY: &str = "terminal exposure covers readable text runs and cursor position only; \
 absolute cursor addressing, SGR styling as semantic structure, graphics protocols, and images are not represented";
+
+/// Core-owned accessible name used when an untrusted PTY title is overlong.
+///
+/// The OSC title is bounded by the parser at 4096 bytes but the accessibility
+/// name ceiling is 256 characters. Passing an overlong title to the extension
+/// would fail every ingest until the PTY changes it, leaving assistive
+/// technology with a stale or absent tree. Core therefore substitutes this
+/// fixed name for both the window root and the terminal region; the overlong
+/// title itself is never truncated or exposed.
+pub const FALLBACK_ACCESSIBLE_NAME: &str = "terminal";
 
 // ---------------------------------------------------------------------------
 // Accessibility mapping for retained primitives
@@ -195,8 +206,13 @@ impl UiSnapshotHost {
     /// only borrowed and is not retained.
     #[must_use]
     pub fn from_terminal(snapshot: &bitty_term_state::Snapshot) -> Self {
-        let title = snapshot.title.as_str().to_string();
-        let mut host = Self::new(&title, &title);
+        let title = snapshot.title.as_str();
+        let title = if title.chars().count() > MAX_ACCESSIBLE_NAME_LEN {
+            FALLBACK_ACCESSIBLE_NAME
+        } else {
+            title
+        };
+        let mut host = Self::new(title, title);
         host.rows = terminal_runs(snapshot)
             .into_iter()
             .map(|run| (run.row, run.text))

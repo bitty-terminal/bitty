@@ -20,7 +20,8 @@ use bitty_a11y::{
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::UiNodeKind;
 use bitty_ui::a11y_host::{
-    A11ySettings, FIDELITY_BOUNDARY, UiSnapshotHost, a11y_role_of, terminal_runs,
+    A11ySettings, FALLBACK_ACCESSIBLE_NAME, FIDELITY_BOUNDARY, UiSnapshotHost, a11y_role_of,
+    terminal_runs,
 };
 use bitty_vt::{ControlChar, GraphemeCell};
 
@@ -261,6 +262,30 @@ fn terminal_runs_keep_zero_width_scalars() {
     let snapshot = state.snapshot();
     let runs = terminal_runs(&snapshot);
     assert_eq!(runs[0].text, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+}
+
+#[test]
+fn overlong_pty_title_uses_core_fallback_and_ingests() {
+    // A PTY can set a 4096-byte OSC title while the accessibility ceiling is
+    // 256 characters. The host substitutes a fixed Core-owned name for both
+    // the root and the terminal region instead of failing every ingest.
+    let mut state = State::new();
+    let long = "t".repeat(MAX_ACCESSIBLE_NAME_LEN + 1);
+    state.apply(&TerminalAction::OscTitle {
+        text: long.clone().into(),
+    });
+    prints(&mut state, "body");
+    let terminal = state.snapshot();
+    assert_eq!(terminal.title.as_str(), long);
+    let host = UiSnapshotHost::from_terminal(&terminal);
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overlong PTY title must not fail the ingest");
+    let live = adapter.snapshot().expect("live snapshot");
+    assert!(live.lookup_label(FALLBACK_ACCESSIBLE_NAME).is_some());
+    assert!(live.lookup_label(&long).is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["body"]);
 }
 
 #[test]

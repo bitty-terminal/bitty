@@ -821,7 +821,9 @@ pub fn band_scroll_args_table(
 ) -> LuaValue {
     let mut table: Vec<(LuaValue, LuaValue)> = args
         .iter()
-        .filter(|(key, _)| key != UI_SCROLL_DELTA_ARG && key != UI_REGION_ARG)
+        // `delta` is always host-owned. `region` is host-owned only when the
+        // binding declared one; a legacy span keeps its own `region` arg.
+        .filter(|(key, _)| key != UI_SCROLL_DELTA_ARG && (region.is_none() || key != UI_REGION_ARG))
         .map(|(key, value)| (LuaValue::String(key.clone()), click_arg_value(value)))
         .collect();
     if let Some(region) = region {
@@ -2440,6 +2442,31 @@ mod tests {
             (
                 LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
                 LuaValue::Number(-2.0)
+            )
+        );
+
+        // A legacy scroll binding without a declared region keeps its own
+        // `region` argument; the host only owns it for region-aware spans.
+        let legacy = [
+            ("region".to_string(), ClickArg::String("keep".to_string())),
+            ("id".to_string(), ClickArg::Number(1.0)),
+        ];
+        let LuaValue::Table(pairs) = band_scroll_args_table(&legacy, -1, None) else {
+            panic!("scroll args must encode as one table");
+        };
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            pairs[0],
+            (
+                LuaValue::String("region".to_string()),
+                LuaValue::String("keep".to_string())
+            )
+        );
+        assert_eq!(
+            pairs[2],
+            (
+                LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
+                LuaValue::Number(-1.0)
             )
         );
     }

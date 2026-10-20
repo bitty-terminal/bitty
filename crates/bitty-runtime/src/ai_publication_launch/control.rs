@@ -1298,7 +1298,10 @@ impl<T: ControlRecordIo> PublicationControl<T> {
             lifetime_id: previous,
             feed_revision: previous_revision,
         });
-        self.retirement_crossed = false;
+        // Carry the once-only crossed-invalidation allowance into the retired
+        // window. If it was already consumed while waiting for this lifetime,
+        // replaying the predecessor after the rotation must still be refused.
+        self.retirement_crossed = wait.crossed_consumed;
         self.lifetime = Some(lifetime_id);
         self.feed_revision = Some(feed_revision);
         self.clear_publication();

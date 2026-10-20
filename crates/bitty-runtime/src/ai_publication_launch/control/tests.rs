@@ -896,6 +896,57 @@ fn core_invalidation_rotates_and_republishes() {
     let tuple = control.send_publish().expect("republish");
     assert_eq!(tuple.publication_id.version(), 2);
     assert_eq!(tuple.snapshot_version, 2);
+
+    // The rotation and republish completed with the one crossed
+    // invalidation already consumed. Replaying the same predecessor now must
+    // be refused instead of granting a second correlation window.
+    script.push(invalidate(lifetime_id, 1, Reason::Reset));
+    let error = control
+        .receive()
+        .expect_err("replayed crossed predecessor after rotation");
+    assert!(matches!(error, PublicationControlError::StaleAuthority));
+    assert!(control.is_closed());
+}
+
+#[test]
+fn duplicate_crossed_invalidation_after_lifetime_is_refused() {
+    let mut script = Script::new();
+    let (mut control, lifetime_id, _) = drive_to_bound(&mut script);
+
+    control
+        .invalidate(Reason::SourceMutation)
+        .expect("local invalidation");
+    script.push(invalidate(lifetime_id, 1, Reason::Reset));
+    assert_eq!(
+        control.receive().expect("crossed invalidate"),
+        ControlEvent::Invalidated {
+            lifetime_id,
+            feed_revision: 1,
+            reason: Reason::Reset,
+            correlation_only: true,
+        }
+    );
+
+    script.push(lifetime_record(second_lifetime(), 1));
+    assert_eq!(
+        control.receive().expect("lifetime"),
+        ControlEvent::LifetimeRotated {
+            previous: lifetime_id,
+            lifetime_id: second_lifetime(),
+            feed_revision: 1,
+        }
+    );
+    assert_eq!(control.phase(), ControlPhase::AwaitProjection);
+
+    // The crossed invalidation was already consumed before Lifetime. The
+    // retired predecessor window carries that fact, so a replay after the
+    // rotation is refused even before the replacement Projection arrives.
+    script.push(invalidate(lifetime_id, 1, Reason::Reset));
+    let error = control
+        .receive()
+        .expect_err("duplicate crossed predecessor after lifetime");
+    assert!(matches!(error, PublicationControlError::StaleAuthority));
+    assert!(control.is_closed());
 }
 
 #[test]

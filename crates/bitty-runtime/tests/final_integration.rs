@@ -23,12 +23,12 @@
 //!   `DrawList + Atlas` onto an in-memory RGBA buffer instead. Real present is
 //!   behind `BITTY_RENDER_GPU_TESTS=1` in `bitty-render` and is not exercised on CI.
 //! - **Real MCP/ IPC transport:** `bitty-ipc` only owns bounded framing +
-//!   `StdioTransportStub` / `McpClientStub` (no Unix socket `XDG_RUNTIME_DIR` /
-//!   Windows named pipe, no peer-credential check, no process spawn). A real
-//!   endpoint with perm `0600` / current-user ACL and per-action auth follows the
-//!   accepted IPC and Agent RFC that closed (`OQ-018`) on 2026-08-29 (frontmatter
-//!   `status: accepted`; bitty-docs open-questions register) and remains an env-gated
-//!   gap in this headless seam.
+//!   `StdioTransportStub` / `McpClientStub` at this seam (no Unix socket
+//!   `XDG_RUNTIME_DIR` / Windows named pipe, no peer-credential check, no
+//!   process spawn). The real endpoint with perm `0600` / current-user pipe
+//!   ACL and per-action auth is covered by the `bitty-terminal` servo and
+//!   `bitty-ipc` transport tests (CTX-1405, issues #2244/#2243) and remains
+//!   an env-gated gap in this headless seam.
 //! - **Real PTY spawn:** `Runtime::spawn_shell` is not invoked here; this test
 //!   feeds synthetic bytes via `handle_pty_bytes` so it stays deterministic and
 //!   portable (Windows ConPTY remains `Unsupported` before its slice).

@@ -72,13 +72,13 @@ bitty-sandbox = { version = "0.0.24", path = "../bitty-sandbox" }
 # `version` below is required for `cargo publish` (lockfile pins 0.0.1 for
 # each); the git rev stays the build source until each crate lands on
 # crates.io (see CTX-1172 publish order notes).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c" }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of
 # defining a second wire format. Same git source and rev as the `bitty-ipc`
 # pin above, so Cargo resolves one `bitty-ipc-api` package.
-bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c", optional = true }
+bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", optional = true }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
 bitty-package = { version = "0.0.24", path = "../bitty-package" }
@@ -146,7 +146,7 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c", features = ["test-support"] }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
 # CTX-1361: the production component-host slice drives the real
 # `bitty extension add` implementation through the composition-root library

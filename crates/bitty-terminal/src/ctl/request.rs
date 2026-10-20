@@ -46,8 +46,8 @@ pub struct CtlTargeting {
 ///
 /// The servo registers it additively on its owned `Dispatcher`, and the
 /// drain authorizes it as `view.inspect` (same as `view list`); the
-/// `bitty-ipc` pin maps the same scope for enqueue and drain. Unix only;
-/// Windows stays fail-closed via the existing `ctl_roundtrip` stub.
+/// `bitty-ipc` pin maps the same scope for enqueue and drain. Both Unix
+/// sockets and Windows instance pipes serve it (same dispatcher).
 pub const METHOD_LIST_PANELS: &str = "bitty.debug/listPanels";
 
 /// One validated `bitty ctl` operation.
@@ -282,11 +282,11 @@ pub fn ctl_help_text() -> String {
             --format SHAPE   Output shape: table|json|jsonl (default table)\n  \
             -h, --help       Print this help and exit (never needs an instance)\n\
           \n\
-          Platform (issue #1800): IPC verbs need a live instance with IPC\n  \
-            serving (Unix only; Windows serving is unavailable until a\n  \
-            named-pipe transport lands. With an explicit target, verbs\n  \
-            report unavailable with exit 6; without a target, they report\n  \
-            no live instance. `instance list` stays local discovery only).\n\
+          Platform: IPC verbs need a live instance with IPC serving.\n  \
+            Unix uses the instance socket; Windows uses the instance-derived\n  \
+            named pipe (same bounded protocol, current-user ACL plus SID\n  \
+            check). Without a target, verbs report no live instance (exit 6).\n  \
+            `instance list` stays local discovery only.\n\
           \n\
           Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
             instance list                 Local discovery (no IPC; same-UID sockets only)\n  \

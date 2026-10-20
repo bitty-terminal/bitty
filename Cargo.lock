@@ -1142,28 +1142,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gc-arena"
-version = "0.5.3"
-source = "git+https://github.com/kyren/gc-arena?rev=5a7534b883b703f23cfb8c3cfdf033460aa77ea9#5a7534b883b703f23cfb8c3cfdf033460aa77ea9"
-dependencies = [
- "allocator-api2",
- "gc-arena-derive",
- "hashbrown 0.14.5",
- "sptr",
-]
-
-[[package]]
-name = "gc-arena-derive"
-version = "0.5.3"
-source = "git+https://github.com/kyren/gc-arena?rev=5a7534b883b703f23cfb8c3cfdf033460aa77ea9#5a7534b883b703f23cfb8c3cfdf033460aa77ea9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "synstructure 0.13.2",
-]
-
-[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2154,17 +2132,39 @@ dependencies = [
 [[package]]
 name = "phodopus"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/bitty-terminal/phodopus?rev=f6aa59a#f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344"
+source = "git+https://github.com/bitty-terminal/phodopus?rev=91b8a2c#91b8a2ceb77994aeaf3f8485862a400671bbed5e"
 dependencies = [
  "ahash",
  "allocator-api2",
  "anyhow",
  "fhex",
- "gc-arena",
  "hashbrown 0.14.5",
  "lsonar",
+ "phodopus-gc-arena",
  "rand",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "phodopus-gc-arena"
+version = "0.5.3"
+source = "git+https://github.com/bitty-terminal/phodopus?rev=91b8a2c#91b8a2ceb77994aeaf3f8485862a400671bbed5e"
+dependencies = [
+ "allocator-api2",
+ "hashbrown 0.14.5",
+ "phodopus-gc-arena-derive",
+ "sptr",
+]
+
+[[package]]
+name = "phodopus-gc-arena-derive"
+version = "0.5.3"
+source = "git+https://github.com/bitty-terminal/phodopus?rev=91b8a2c#91b8a2ceb77994aeaf3f8485862a400671bbed5e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
 ]
 
 [[package]]

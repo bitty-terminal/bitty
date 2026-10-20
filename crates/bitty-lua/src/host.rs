@@ -3093,11 +3093,20 @@ impl BridgeState {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        let out = f(expiry)?;
-        if mark.read().charged > deadline {
+        // Host work is not Lua work: the call's own duration is credited
+        // against the enclosing callback's RC-1 wall budget (bitty #2285),
+        // capped per callback. The cheap-call policy below is unchanged: it
+        // still measures real time minus store commit credit, so a slow read
+        // keeps failing closed with `E_TIMEOUT`.
+        let window = crate::HostCallWindow::at(mark.start());
+        let out = f(expiry);
+        window.close();
+        let reading = mark.read();
+        let charged = reading.raw.saturating_sub(reading.credit);
+        if charged > deadline {
             return Err(BridgeError::timeout());
         }
-        Ok(out)
+        out
     }
 
     /// [`Self::bounded_mutation`] for the plugin store write
@@ -3181,7 +3190,14 @@ impl BridgeState {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        let out = f(expiry)?;
+        // A supervised spawn carries its own deadline; the wait for the child
+        // is host time, not Lua work, so it is credited against the enclosing
+        // callback's RC-1 wall budget (bitty #2285) instead of suspending a
+        // plugin for time the host spent outside the VM.
+        let window = crate::HostCallWindow::at(start);
+        let out = f(expiry);
+        window.close();
+        let out = out?;
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }

@@ -1124,10 +1124,19 @@ mod tests {
             assert_eq!(denied.code, "ScopeDenied");
         }
         drop(guard);
-        // No orphan pipe after shutdown: the kernel removes the last handle.
+        // No listening orphan after shutdown. The name disappears once the
+        // last handle closes (NotFound); a worker still winding down leaves a
+        // connected instance that cannot accept (busy/TimedOut). Either way a
+        // new client must not connect to a fresh listener.
         let err = bitty_ipc::winpipe::connect(&pipe, std::time::Duration::from_millis(200))
-            .expect_err("pipe must be gone after guard drop");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            .expect_err("no listener may remain after guard drop");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected post-shutdown connect error: {err:?}"
+        );
     }
 
     #[cfg(any(

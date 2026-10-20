@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
-    BridgeError, ExecuteOutcome, HostServices, LuaValue, LuaVm, MarshallingLimits, SuspendReason,
+    BridgeError, ExecuteOutcome, HOST_CALL_CREDIT_MAX_MS, HostServices, LuaValue, LuaVm,
+    MarshallingLimits, SuspendReason,
 };
 
 /// One real `git` invocation measured ~35 ms on the reporting host.
@@ -36,6 +37,9 @@ const SPAWN_WAIT_MS: u64 = 35;
 
 /// Capped tool output the git panel parses (`MAX_SPAWN_OUTPUT_BYTES`).
 const TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// Scheduling slack between the measured host call and the budget reading.
+const CHARGE_TOLERANCE_MS: u64 = 5;
 
 /// Fuel ceiling for the bounded spawn-bearing workload. The measured cost is
 /// well under 1M; the ceiling catches a return of the ~10M quadratic charge
@@ -46,6 +50,8 @@ const BOUNDED_WORKLOAD_FUEL_CEILING: u64 = 1_000_000;
 #[derive(Default)]
 struct BlockingSpawn {
     waits: Cell<u32>,
+    /// Time the stub actually spent blocked, measured around each sleep.
+    waited: Cell<Duration>,
     snapshot_delay_ms: u64,
     store: RefCell<BTreeMap<String, LuaValue>>,
 }
@@ -94,7 +100,9 @@ impl HostServices for BlockingSpawn {
 
     fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
         self.waits.set(self.waits.get() + 1);
+        let started = std::time::Instant::now();
         std::thread::sleep(Duration::from_millis(SPAWN_WAIT_MS));
+        self.waited.set(self.waited.get() + started.elapsed());
         let output = tool_output(&args.join(" "));
         Ok(LuaValue::table([
             ("output", LuaValue::String(output)),
@@ -173,18 +181,38 @@ fn blocking_spawn_wait_does_not_consume_the_wall_budget() {
     );
 
     let snapshot = vm.budget_snapshot();
-    assert!(
-        snapshot.host_call_credit_ms >= 2 * SPAWN_WAIT_MS,
-        "host-call credit must cover both waits, got {} ms",
-        snapshot.host_call_credit_ms
-    );
+    // Assert the accounting contract against the wait the host *actually*
+    // spent, not the requested 35 ms: runner sleeps overshoot (the macOS
+    // runner turned two 35 ms waits into ~300 ms). What matters is that every
+    // bounded wait is credited up to the cap, so only Lua time is charged.
+    let waited_ms = u64::try_from(services.waited.get().as_millis()).unwrap_or(u64::MAX);
+    let credited_ms = snapshot.host_call_credit_ms;
     let charged_lua_ms = snapshot
         .wall_elapsed_ms
         .saturating_sub(snapshot.store_commit_credit_ms)
-        .saturating_sub(snapshot.host_call_credit_ms);
+        .saturating_sub(credited_ms);
+    let over_cap_ms = waited_ms.saturating_sub(HOST_CALL_CREDIT_MAX_MS);
+
+    assert!(waited_ms >= 2 * SPAWN_WAIT_MS, "both waits must block");
+    assert!(
+        credited_ms + CHARGE_TOLERANCE_MS >= waited_ms.min(HOST_CALL_CREDIT_MAX_MS),
+        "host-call credit {credited_ms} ms must cover the measured {waited_ms} ms wait \
+         up to the {HOST_CALL_CREDIT_MAX_MS} ms cap"
+    );
+    assert!(
+        charged_lua_ms <= over_cap_ms + CHARGE_TOLERANCE_MS,
+        "only host time past the credit cap may be charged: charged {charged_lua_ms} ms, \
+         measured {waited_ms} ms, cap {HOST_CALL_CREDIT_MAX_MS} ms"
+    );
+    // Two bounded spawn waits are far below the supervised-call deadline, so
+    // they must never consume the Lua wall budget. This is the assertion that
+    // caught the old 200 ms cap on a loaded macOS runner (two 35 ms waits took
+    // ~300 ms and left 102 ms charged).
     assert!(
         charged_lua_ms < snapshot.wall_budget_ms,
-        "charged Lua time must stay under the wall budget, got {charged_lua_ms} ms"
+        "bounded spawn waits must not consume the wall budget, got {charged_lua_ms} ms \
+         (raw {} ms, credit {credited_ms} ms, measured wait {waited_ms} ms)",
+        snapshot.wall_elapsed_ms
     );
 }
 

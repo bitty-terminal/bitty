@@ -31,7 +31,7 @@
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
-//! | RC-1 | bounded host-call credit        | `HOST_CALL_CREDIT_MAX_MS = 200 ms`   | time spent inside a bounded host bridge call (spawn wait, snapshot/read services) is excluded from the hard wall limit, capped per callback; the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
+//! | RC-1 | bounded host-call credit        | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a bounded host bridge call (spawn wait, snapshot/read services) is excluded from the hard wall limit, capped per callback at the supervised-call deadline; the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
@@ -157,7 +157,8 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 ///   commit contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 
-/// RC-1 host-call I/O credit cap (`200 ms` = `4 * RC1_WALL_CLOCK_BUDGET_MS`).
+/// RC-1 host-call I/O credit cap (`5 s` = the bridge's supervised-call
+/// deadline, [`crate::host::SPAWN_TIMEOUT_MS`]).
 ///
 /// Supervised host calls (`process.spawn` and the other bridge calls that are
 /// allowed to block) are host work, not Lua work: their wait time must not
@@ -166,10 +167,14 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 /// `git` invocations measured ~70 ms for a callback that used ~140k
 /// instructions).
 ///
-/// The time is measured around the bridge call itself and subtracted from the
-/// charged wall time, so only Lua execution counts toward the hard limit. The
-/// credit stays bounded so chained host calls cannot stretch one callback
-/// without limit:
+/// The cap matches the deadline the bridge itself grants a supervised call. A
+/// smaller fixed cap (the first revision used `200 ms`) charged a callback for
+/// waits the bridge had legally allowed: on a loaded macOS runner two 35 ms
+/// spawns took ~300 ms, so 102 ms of forced wait became "charged Lua time"
+/// and would have suspended a plugin for something it did not do. The cap is a
+/// policy bound on *chaining*, not on one call — the call is already bounded
+/// by its own raw deadline, which the host enforces whether or not the credit
+/// covers it.
 ///
 /// - Credited: wall time spent inside a bounded host call, minus any store
 ///   commit I/O already credited for the same span (no double credit). The
@@ -178,7 +183,9 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 ///   deadline still fails closed as before.
 /// - Scope: per callback, cumulative across every host call made while that
 ///   callback runs, capped at this value. Host time past the cap is charged
-///   like any other time.
+///   like any other time, so a callback whose host calls exceed the supervised
+///   budget (including one that raised its spawn deadline above it) suspends
+///   fail-closed at the next slice boundary.
 /// - Not credited: Lua execution, chunk compilation, marshalling outside the
 ///   call, and any time the host does not spend inside the bridge call.
 /// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
@@ -187,9 +194,9 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 /// disjoint spans (store commit time is subtracted from the host-call window).
 /// A callback's effective wall ceiling is therefore
 /// `RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS +
-/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 200 = 450 ms), and every credited span
-/// must be reported by the host, not chosen by the plugin.
-pub const HOST_CALL_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
+/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 = 5250 ms), and every credited
+/// span must be measured by the host, not chosen by the plugin.
+pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
 
 /// RC-1 warning threshold (candidate): `8 ms` — sets `warning_triggered` but
 /// does not suspend.
@@ -1673,10 +1680,17 @@ mod vm_unit_tests {
             ),
             (ms(70), ms(0), ms(70))
         );
+        // A bounded spawn wait longer than the old fixed 200 ms cap is fully
+        // credited: the cap now matches the supervised-call deadline.
+        let slow_wait = BudgetReading::new(ms(300), Duration::ZERO, ms(300));
+        assert_eq!(
+            (slow_wait.host_call_credit, slow_wait.charged),
+            (ms(300), ms(0))
+        );
         // Host time past the cap is charged like any other time.
         let cap = Duration::from_millis(HOST_CALL_CREDIT_MAX_MS);
-        let over = BudgetReading::new(ms(500), Duration::ZERO, ms(500));
-        assert_eq!((over.host_call_credit, over.charged), (cap, ms(500) - cap));
+        let over = BudgetReading::new(cap + ms(80), Duration::ZERO, cap + ms(80));
+        assert_eq!((over.host_call_credit, over.charged), (cap, ms(80)));
         // Both credits compose without double counting or exceeding raw.
         let both = BudgetReading::new(ms(100), ms(30), ms(90));
         assert_eq!(

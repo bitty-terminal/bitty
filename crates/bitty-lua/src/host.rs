@@ -252,6 +252,66 @@ pub const THEME_ANSI_COUNT: usize = 16;
 /// Maximum bytes of one source module file accepted by `require`.
 pub const MODULE_FILE_MAX_BYTES: usize = 1024 * 1024;
 
+// ── `bitty.component.*` request surface (CTX-2254, bitty#2254) ────────────
+//
+// DIR-030 leaves the broker to Core; this bridge is the plugin-facing
+// producer. It is a two-call surface on purpose: `request` only validates and
+// enqueues a bounded submission, and `poll` reads a completed result. Neither
+// call spawns, waits, or blocks on the component, so a Lua callback can never
+// hold the owner thread for the component's request deadline.
+
+/// Maximum bytes one `bitty.component.request` may carry across the bridge:
+/// the component id, URL, header names/values, and body together.
+///
+/// Reuses the accepted `8 KiB` plugin-payload ceiling
+/// ([`DEFAULT_MAX_VALUE_BYTES`], [`FS_CONTENT_MAX_BYTES`]). Over-bound requests
+/// fail closed with `E_COMPONENT_PAYLOAD_TOO_LARGE` before any enqueue, so
+/// oversize input never reaches the broker.
+pub const COMPONENT_REQUEST_MAX_BYTES: usize = 8 * 1024;
+
+/// Response body bytes one `bitty.component.poll` result may carry.
+///
+/// Core does not truncate component bytes: a response that exceeds this cap
+/// fails with the typed `budget` class instead, so a plugin never mistakes a
+/// partial body for the whole answer.
+pub const COMPONENT_RESPONSE_MAX_BYTES: usize = 8 * 1024;
+
+/// Maximum headers accepted on one request and retained from one response.
+pub const COMPONENT_HEADERS_MAX: usize = 16;
+
+/// Maximum bytes of one request/response header name or value.
+pub const COMPONENT_HEADER_MAX_BYTES: usize = 1024;
+
+/// Deadline used when a request omits `timeout_ms`.
+pub const COMPONENT_TIMEOUT_DEFAULT_MS: u32 = 5_000;
+
+/// Deadline ceiling for one request; larger requests fail closed with
+/// `E_DEF_LIMIT` instead of being silently clamped, so the plugin observes the
+/// bound it will actually get.
+pub const COMPONENT_TIMEOUT_MAX_MS: u32 = 30_000;
+
+/// Component id bytes (`[a-z][a-z0-9-]{0,31}`, native-component wire v1
+/// grammar).
+pub const COMPONENT_ID_MAX_BYTES: usize = 32;
+
+/// URL bytes accepted for one request.
+pub const COMPONENT_URL_MAX_BYTES: usize = 2_048;
+
+/// Stable error class: the accepted capability model does not authorize the
+/// request (matches the activation denial label from `bitty extension list`).
+pub const COMPONENT_CLASS_CAPABILITY_DENIED: &str = "capability_denied";
+
+/// Stable error class: the requesting plugin is not in the `Activated`
+/// lifecycle state, so it holds no request authority.
+pub const COMPONENT_CLASS_PLUGIN_NOT_ACTIVE: &str = "plugin_not_active";
+
+/// Stable error class: a bounded resource (queue, in-flight window, response
+/// budget, completion window) refused the request or its result.
+pub const COMPONENT_CLASS_BUDGET: &str = "budget";
+
+/// Stable error class: the component did not finish before the Core deadline.
+pub const COMPONENT_CLASS_TIMEOUT: &str = "timeout";
+
 /// Maximum commands captured from one `init.lua` (HOST-002 admission bound).
 ///
 /// Matches the policy-layer manifest ceiling
@@ -634,6 +694,185 @@ pub struct HistoryQueryRequest {
 /// `MAX_NEEDLE_BYTES`); longer input is a typed over-bound denial before any
 /// host call.
 pub const HISTORY_NEEDLE_MAX_BYTES: usize = 256;
+
+/// HTTP method a plugin may name for `bitty.component.request`.
+///
+/// Closed set: the native-component wire v1 method table. There is no
+/// arbitrary verb passthrough, so a plugin can never encode a method the
+/// component did not agree to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentMethod {
+    /// `GET`.
+    Get,
+    /// `HEAD`.
+    Head,
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+    /// `PATCH`.
+    Patch,
+    /// `DELETE`.
+    Delete,
+    /// `OPTIONS`.
+    Options,
+}
+
+impl ComponentMethod {
+    /// Every accepted spelling, in wire code order.
+    pub const ALL: [Self; 7] = [
+        Self::Get,
+        Self::Post,
+        Self::Put,
+        Self::Delete,
+        Self::Head,
+        Self::Options,
+        Self::Patch,
+    ];
+
+    /// Uppercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Options => "OPTIONS",
+        }
+    }
+
+    /// Parse an exact uppercase wire spelling; anything else is `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|method| method.as_str() == text)
+    }
+}
+
+/// One bounded, validated component request crossing the host-service
+/// boundary (`bitty.component.request`).
+///
+/// The bridge owns shape validation and the payload ceiling; the runtime owns
+/// authorization (plugin lifecycle, manifest generation, capability grant),
+/// resolution, and the broker deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentBridgeRequest {
+    /// Installed component name (`net`, `graphics`, ...).
+    pub component: String,
+    /// Wire method.
+    pub method: ComponentMethod,
+    /// Absolute `http`/`https` URL.
+    pub url: String,
+    /// Request headers in caller order.
+    pub headers: Vec<(String, String)>,
+    /// Optional request body.
+    pub body: Option<String>,
+    /// Requested deadline in milliseconds (already defaulted and bounded).
+    pub timeout_ms: u32,
+}
+
+impl ComponentBridgeRequest {
+    /// Bytes this request carries across the bridge (id, URL, headers, body).
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        let headers: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        self.component.len() + self.url.len() + headers + self.body.as_ref().map_or(0, String::len)
+    }
+}
+
+/// Terminal outcome of one `bitty.component.request` ticket.
+///
+/// The runtime owns the outcome; the bridge owns its Lua rendering so the
+/// success shape and the failure class table live in one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentBridgeOutcome {
+    /// A complete, bounded response.
+    Response {
+        /// HTTP status from the component.
+        status: u16,
+        /// Response headers (bounded by [`COMPONENT_HEADERS_MAX`]).
+        headers: Vec<(String, String)>,
+        /// Response body (bounded by [`COMPONENT_RESPONSE_MAX_BYTES`]).
+        body: Vec<u8>,
+    },
+    /// Terminal failure carrying a stable class from the table below.
+    Failed {
+        /// Stable class (`capability_denied`, `plugin_not_active`, `budget`, ...).
+        class: String,
+        /// Bounded host-authored detail.
+        message: String,
+    },
+}
+
+/// Bridge error for one component request failure class.
+///
+/// Single mapping table shared by the runtime (which classifies failures) and
+/// the docs: the class strings are the accepted `bitty extension list` denial
+/// labels, while the `E_COMPONENT_*` codes are the stable Lua-visible codes.
+#[must_use]
+pub fn component_bridge_error(class: &str, message: &str) -> BridgeError {
+    let (bridge_class, code) = match class {
+        COMPONENT_CLASS_CAPABILITY_DENIED => ("runtime", "E_COMPONENT_CAPABILITY_DENIED"),
+        COMPONENT_CLASS_PLUGIN_NOT_ACTIVE => ("runtime", "E_COMPONENT_NOT_ACTIVE"),
+        COMPONENT_CLASS_BUDGET => ("budget", "E_COMPONENT_BUDGET"),
+        COMPONENT_CLASS_TIMEOUT => ("budget", "E_COMPONENT_TIMEOUT"),
+        "component_grant_invalid" => ("runtime", "E_COMPONENT_GRANT_INVALID"),
+        "component_untrusted" => ("resolution", "E_COMPONENT_UNTRUSTED"),
+        "component_unavailable" => ("resolution", "E_COMPONENT_UNAVAILABLE"),
+        "component_invalid" => ("validation", "E_COMPONENT_INVALID"),
+        "component_busy" => ("runtime", "E_COMPONENT_BUSY"),
+        "component_backoff" => ("runtime", "E_COMPONENT_BACKOFF"),
+        "component_spawn_failed" => ("runtime", "E_COMPONENT_SPAWN_FAILED"),
+        "component_invalid_request" => ("validation", "E_COMPONENT_INVALID_REQUEST"),
+        "component_request_failed" => ("runtime", "E_COMPONENT_REQUEST_FAILED"),
+        _ => ("runtime", "E_COMPONENT_FAILED"),
+    };
+    BridgeError::new(bridge_class, code, message)
+}
+
+/// Lua table shape of one successful `bitty.component.poll` result.
+///
+/// `untrusted = true` labels component bytes as observation data, never
+/// instructions (same rule as `process.spawn` output). `body` is decoded
+/// lossily because the Lua value space is UTF-8; `bytes` carries the real
+/// byte count so a binary body is never silently mistaken for text.
+#[must_use]
+pub fn component_response_value(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> LuaValue {
+    let headers = LuaValue::array(
+        headers
+            .iter()
+            .map(|(name, value)| {
+                LuaValue::table([
+                    ("name", LuaValue::String(name.clone())),
+                    ("value", LuaValue::String(value.clone())),
+                ])
+            })
+            .collect(),
+    );
+    LuaValue::table([
+        ("status", LuaValue::Integer(i64::from(status))),
+        ("headers", headers),
+        (
+            "body",
+            LuaValue::String(String::from_utf8_lossy(body).into_owned()),
+        ),
+        (
+            "bytes",
+            LuaValue::Integer(i64::try_from(body.len()).unwrap_or(i64::MAX)),
+        ),
+        ("untrusted", LuaValue::Bool(true)),
+    ])
+}
 
 struct MarshalBudget {
     nodes: usize,
@@ -1065,6 +1304,52 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.fs_list(prefix, max_entries)
+    }
+    /// Enqueue one bounded native-component request for `bitty.component.request`
+    /// (CTX-2254, bitty#2254).
+    ///
+    /// Returns an opaque ticket for [`HostServices::component_poll`]. The call
+    /// never spawns, sends, or waits: it authorizes against the calling
+    /// generation's own grants and enqueues a bounded intent that the
+    /// application drains once per tick into the existing
+    /// [`ComponentBroker`](crate) path. Spawn stays host-side and is reachable
+    /// only through the runtime, so this surface exposes no raw spawn.
+    ///
+    /// Denials are typed and oracle-tight (`component_bridge_error`): the
+    /// accepted capability model decides, so there is no allow-all path. The
+    /// default implementation fails closed with `E_NOT_IMPLEMENTED`, so a host
+    /// without a component surface can never gain ambient requests from the
+    /// always-present `bitty.component` namespace.
+    fn component_request(&self, request: &ComponentBridgeRequest) -> Result<u64, BridgeError> {
+        let _ = request;
+        Err(BridgeError::not_implemented("bitty.component.request"))
+    }
+    /// Expiry-aware [`HostServices::component_request`] for the bridge deadline.
+    ///
+    /// Same contract as [`HostServices::store_set_with_expiry`]: check expiry
+    /// before enqueueing and fail closed with [`BridgeError::timeout`] without
+    /// a queued intent when the callback budget already elapsed.
+    fn component_request_with_expiry(
+        &self,
+        request: &ComponentBridgeRequest,
+        expiry: Instant,
+    ) -> Result<u64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.component_request(request)
+    }
+    /// Read one completed [`HostServices::component_request`] result.
+    ///
+    /// `Ok(None)` means the request is still in flight. `Ok(Some(value))` is
+    /// the bounded [`component_response_value`] table. A terminal failure
+    /// raises the typed class from [`component_bridge_error`] instead of a
+    /// fabricated empty response, and ticket reuse, an unknown ticket, or a
+    /// ticket whose completion window closed are typed refusals — never a
+    /// silent `nil`.
+    fn component_poll(&self, ticket: u64) -> Result<Option<LuaValue>, BridgeError> {
+        let _ = ticket;
+        Err(BridgeError::not_implemented("bitty.component.poll"))
     }
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
@@ -3059,6 +3344,259 @@ impl LuaVm {
 /// runtime gate, so the bridge never clamps a request silently. A missing or
 /// malformed field fails closed with `E_DEF_INVALID`; an over-long search
 /// needle is the gate's typed `E_HISTORY_OVER_BOUND`, not a shape error.
+/// Parse and validate one `bitty.component.request` table (CTX-2254).
+///
+/// Shape and ceilings are enforced here, before the runtime sees the request:
+/// the component id grammar, the closed method set, the URL scheme/length, the
+/// header table, the body string, and the aggregate
+/// [`COMPONENT_REQUEST_MAX_BYTES`] payload ceiling. The runtime keeps the
+/// authoritative authorization and broker checks.
+fn parse_component_request(opts: &LuaValue) -> Result<ComponentBridgeRequest, BridgeError> {
+    if !matches!(opts, LuaValue::Table(_)) {
+        return Err(component_validation(
+            "E_DEF_INVALID",
+            "component.request expects one spec table: { id, method, url, headers?, body?, timeout_ms? }",
+        ));
+    }
+    let component = component_text_field(opts, "id", COMPONENT_ID_MAX_BYTES, true)?;
+    if !component_id_shape_ok(&component) {
+        return Err(component_validation(
+            "E_DEF_INVALID",
+            "component.request id must match [a-z][a-z0-9-]{0,31}",
+        ));
+    }
+    let method_text = component_text_field(opts, "method", 16, true)?;
+    let method = ComponentMethod::parse(&method_text).ok_or_else(|| {
+        component_validation(
+            "E_DEF_INVALID",
+            "component.request method must be one of GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        )
+    })?;
+    let url = component_text_field(opts, "url", COMPONENT_URL_MAX_BYTES, true)?;
+    if !component_url_shape_ok(&url) {
+        return Err(component_validation(
+            "E_DEF_INVALID",
+            "component.request url must be an absolute http:// or https:// URL without whitespace or control bytes",
+        ));
+    }
+    let headers = match opts.get("headers") {
+        None | Some(LuaValue::Nil) => Vec::new(),
+        Some(LuaValue::Table(pairs)) => {
+            if pairs.len() > COMPONENT_HEADERS_MAX {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_LIMIT",
+                    format!("component.request accepts at most {COMPONENT_HEADERS_MAX} headers"),
+                ));
+            }
+            let mut headers = Vec::with_capacity(pairs.len());
+            for (name, value) in pairs {
+                let LuaValue::String(name) = name else {
+                    return Err(component_validation(
+                        "E_DEF_INVALID",
+                        "component.request header names must be strings",
+                    ));
+                };
+                let LuaValue::String(value) = value else {
+                    return Err(component_validation(
+                        "E_DEF_INVALID",
+                        "component.request header values must be strings",
+                    ));
+                };
+                if !component_header_shape_ok(name) {
+                    return Err(component_validation(
+                        "E_DEF_INVALID",
+                        "component.request header names must be HTTP token bytes",
+                    ));
+                }
+                if name.len() > COMPONENT_HEADER_MAX_BYTES
+                    || value.len() > COMPONENT_HEADER_MAX_BYTES
+                {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_LIMIT",
+                        format!(
+                            "component.request header name/value must not exceed {COMPONENT_HEADER_MAX_BYTES} bytes"
+                        ),
+                    ));
+                }
+                if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+                    return Err(component_validation(
+                        "E_DEF_INVALID",
+                        "component.request header values must not contain CR or LF",
+                    ));
+                }
+                headers.push((name.clone(), value.clone()));
+            }
+            headers
+        }
+        Some(_) => {
+            return Err(component_validation(
+                "E_DEF_INVALID",
+                "component.request headers must be a string-keyed table",
+            ));
+        }
+    };
+    let body = match opts.get("body") {
+        None | Some(LuaValue::Nil) => None,
+        Some(LuaValue::String(body)) => Some(body.clone()),
+        Some(_) => {
+            return Err(component_validation(
+                "E_DEF_INVALID",
+                "component.request body must be a string",
+            ));
+        }
+    };
+    let timeout_ms = match opts.get("timeout_ms") {
+        None | Some(LuaValue::Nil) => COMPONENT_TIMEOUT_DEFAULT_MS,
+        Some(LuaValue::Integer(value)) if *value >= 1 => u32::try_from(*value).map_err(|_| {
+            BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                format!("component.request timeout_ms must not exceed {COMPONENT_TIMEOUT_MAX_MS}"),
+            )
+        })?,
+        Some(_) => {
+            return Err(component_validation(
+                "E_DEF_INVALID",
+                "component.request timeout_ms must be a positive integer",
+            ));
+        }
+    };
+    if timeout_ms > COMPONENT_TIMEOUT_MAX_MS {
+        return Err(BridgeError::new(
+            "validation",
+            "E_DEF_LIMIT",
+            format!("component.request timeout_ms must not exceed {COMPONENT_TIMEOUT_MAX_MS}"),
+        ));
+    }
+    let request = ComponentBridgeRequest {
+        component,
+        method,
+        url,
+        headers,
+        body,
+        timeout_ms,
+    };
+    if request.payload_bytes() > COMPONENT_REQUEST_MAX_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_COMPONENT_PAYLOAD_TOO_LARGE",
+            format!("component.request payload exceeds {COMPONENT_REQUEST_MAX_BYTES} bytes"),
+        ));
+    }
+    Ok(request)
+}
+
+/// One required/optional string field of a `bitty.component.request` table.
+fn component_text_field(
+    opts: &LuaValue,
+    key: &str,
+    max_bytes: usize,
+    required: bool,
+) -> Result<String, BridgeError> {
+    match opts.get(key) {
+        Some(LuaValue::String(value)) => {
+            if value.is_empty() {
+                return Err(component_validation(
+                    "E_DEF_INVALID",
+                    "component.request string fields must not be empty",
+                ));
+            }
+            if value.len() > max_bytes {
+                return Err(BridgeError::new(
+                    "validation",
+                    "E_DEF_LIMIT",
+                    format!("component.request {key} must not exceed {max_bytes} bytes"),
+                ));
+            }
+            if value
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+            {
+                return Err(component_validation(
+                    "E_DEF_INVALID",
+                    "component.request string fields must not contain control bytes",
+                ));
+            }
+            Ok(value.clone())
+        }
+        None | Some(LuaValue::Nil) if !required => Ok(String::new()),
+        _ => Err(component_validation(
+            "E_DEF_INVALID",
+            "component.request id, method, and url must be strings",
+        )),
+    }
+}
+
+/// Native-component wire v1 id grammar: `[a-z][a-z0-9-]{0,31}`.
+fn component_id_shape_ok(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    matches!(bytes.first(), Some(byte) if byte.is_ascii_lowercase())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && !id.ends_with('-')
+        && id.len() <= COMPONENT_ID_MAX_BYTES
+}
+
+/// `http://` or `https://` absolute URL shape, no userinfo, no fragments.
+fn component_url_shape_ok(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('/')
+        && !rest.contains('@')
+        && !rest.contains('#')
+        && !url
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+/// RFC 7230 token bytes for one header name.
+fn component_header_shape_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Positive ticket id from a `bitty.component.poll` argument.
+fn component_ticket(value: Value<'_>) -> Result<u64, BridgeError> {
+    match value {
+        Value::Integer(ticket) if ticket >= 1 => Ok(ticket as u64),
+        _ => Err(component_validation(
+            "E_DEF_INVALID",
+            "component.poll expects the positive ticket integer returned by component.request",
+        )),
+    }
+}
+
+fn component_validation(code: &'static str, message: &str) -> BridgeError {
+    BridgeError::new("validation", code, message)
+}
+
 fn parse_history_query(
     source: HistoryQuerySource,
     opts: &LuaValue,
@@ -4381,6 +4919,82 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     )
     .expect("fs table accepts 'list'");
 
+    // CTX-2254 (bitty#2254, DIR-030 follow-up): `bitty.component.*` is the
+    // production producer for installed native components. Two calls, never a
+    // blocking one: `request` validates bounds and enqueues a submission,
+    // `poll` reads a completed result. The generation's own
+    // `network.connect:*` grant and the runtime's canonical
+    // registry/grant/lifecycle check decide every request, and the runtime
+    // resolves + digest-verifies the installed component before any spawn.
+    // There is no raw spawn, no component path, and no allow-all path here.
+    let component = Table::new(&ctx);
+    component
+        .set(
+            ctx,
+            "request",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    // The marshalling ceiling is the same `8 KiB` plugin-payload
+                    // budget, so an over-bound table is reported with the
+                    // surface's own code instead of the generic value error:
+                    // the plugin sees one stable refusal for an oversized
+                    // request, before any enqueue.
+                    let opts = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| {
+                            if matches!(error.code, "E_VALUE_BYTES" | "E_VALUE_NODES") {
+                                BridgeError::new(
+                                    "validation",
+                                    "E_COMPONENT_PAYLOAD_TOO_LARGE",
+                                    format!(
+                                        "component.request payload exceeds {COMPONENT_REQUEST_MAX_BYTES} bytes"
+                                    ),
+                                )
+                            } else {
+                                error
+                            }
+                            .to_error(ctx)
+                        })?;
+                    let request =
+                        parse_component_request(&opts).map_err(|error| error.to_error(ctx))?;
+                    let ticket = state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .component_request_with_expiry(&request, expiry)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, Value::Integer(i64::try_from(ticket).unwrap_or(i64::MAX)));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("component table accepts 'request'");
+    component
+        .set(
+            ctx,
+            "poll",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let ticket =
+                        component_ticket(stack.get(0)).map_err(|error| error.to_error(ctx))?;
+                    let result = state
+                        .bounded(|_expiry| state.services.component_poll(ticket))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        match result {
+                            Some(value) => value.to_lua(ctx),
+                            None => Value::Nil,
+                        },
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("component table accepts 'poll'");
+
     // CTX-0894/CTX-0897: `bitty.debug.*` namespace for devtools plugins.
     // Default host implementations return E_NOT_IMPLEMENTED; the runtime
     // gates each entry point on its own grant: `debug.inspect` (read-only
@@ -5637,6 +6251,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts workspace");
     root.set(ctx, "history", readonly_table(ctx, history))
         .expect("root accepts history");
+    root.set(ctx, "component", readonly_table(ctx, component))
+        .expect("root accepts component");
     Value::Table(readonly_table(ctx, root))
 }
 

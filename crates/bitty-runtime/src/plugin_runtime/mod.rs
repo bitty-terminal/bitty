@@ -22,6 +22,7 @@
 //! The numeric bounds below are the RFC's ratified defaults.
 
 pub mod audio;
+pub mod component_requests;
 pub mod debug;
 pub mod device_providers;
 pub mod fs;
@@ -62,6 +63,11 @@ pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPuls
 pub use bitty_lua::{
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
+};
+pub use component_requests::{
+    COMPONENT_COMPLETION_CAPACITY, COMPONENT_IN_FLIGHT_PER_PLUGIN,
+    COMPONENT_REQUEST_QUEUE_CAPACITY, ComponentPollOutcome, ComponentRequestQueue,
+    QueuedComponentRequest, broker_request, outcome_value,
 };
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
@@ -700,6 +706,16 @@ pub struct PluginRuntime {
     /// (`Runtime::push_input_bytes`); authorization (grant, cap, budget,
     /// framing) ran at enqueue time, so the drain is mechanical.
     submit_requests: Rc<RefCell<TerminalSubmitQueue>>,
+    /// CTX-2254 (bitty#2254): bounded plugin-facing component request surface.
+    ///
+    /// Enqueued inside the VM callback and drained by the composition root
+    /// (`bitty_terminal::component_bridge::pump_component_requests`) once per
+    /// application tick, which authorizes each submission through the runtime
+    /// and submits it to the existing component broker. Results return to the
+    /// plugin through
+    /// `bitty.component.poll`. Holds no authority: the runtime re-checks the
+    /// lifecycle, manifest generation, and grant record for every request.
+    component_requests: Rc<RefCell<ComponentRequestQueue>>,
     /// CTX-1169: durable-commit backend behind confirmed colorschemes.
     ///
     /// `None` by default (no persist configured): confirms drain to a
@@ -860,6 +876,7 @@ impl PluginRuntime {
             submit_requests: Rc::new(RefCell::new(TerminalSubmitQueue::new(
                 TERMINAL_SUBMIT_QUEUE_CAPACITY,
             ))),
+            component_requests: Rc::new(RefCell::new(ComponentRequestQueue::new())),
             theme_persist_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
@@ -1315,6 +1332,72 @@ impl PluginRuntime {
     #[must_use]
     pub fn submit_requests_dropped(&self) -> u64 {
         self.submit_requests.borrow().dropped()
+    }
+
+    /// Runtime-shared component request surface (CTX-2254, bitty#2254).
+    #[must_use]
+    pub fn component_request_queue(&self) -> &Rc<RefCell<ComponentRequestQueue>> {
+        &self.component_requests
+    }
+
+    /// Take the component submissions enqueued since the last tick.
+    ///
+    /// Drained by the composition-root pump, which authorizes and submits each
+    /// one through the runtime's component broker.
+    pub fn drain_component_requests(&mut self) -> Vec<QueuedComponentRequest> {
+        self.component_requests.borrow_mut().take_submissions()
+    }
+
+    /// Bind one accepted submission to its broker request id.
+    pub fn bind_component_request(
+        &mut self,
+        ticket: u64,
+        plugin_id: &str,
+        id: crate::component::RequestId,
+        deadline: Instant,
+    ) {
+        self.component_requests
+            .borrow_mut()
+            .bind(ticket, plugin_id, id, deadline);
+    }
+
+    /// Complete one submission with a typed pre-broker failure.
+    pub fn fail_component_request(
+        &mut self,
+        ticket: u64,
+        plugin_id: &str,
+        class: &str,
+        message: &str,
+    ) {
+        self.component_requests
+            .borrow_mut()
+            .fail(ticket, plugin_id, class, message);
+    }
+
+    /// Deliver broker events into the request surface.
+    pub fn deliver_component_events(&mut self, events: &[crate::component::BrokerEvent]) {
+        let mut queue = self.component_requests.borrow_mut();
+        for event in events {
+            queue.deliver(event);
+        }
+    }
+
+    /// Fail in-flight requests past their deadline; returns broker ids to
+    /// cancel.
+    pub fn expire_component_requests(&mut self, now: Instant) -> Vec<crate::component::RequestId> {
+        self.component_requests.borrow_mut().expire(now)
+    }
+
+    /// Broker ids completed by a bridge-side bound (response budget) that the
+    /// caller must cancel.
+    pub fn take_cancelled_component_requests(&mut self) -> Vec<crate::component::RequestId> {
+        self.component_requests.borrow_mut().take_cancelled()
+    }
+
+    /// Component submissions dropped for lack of queue room.
+    #[must_use]
+    pub fn component_requests_dropped(&self) -> u64 {
+        self.component_requests.borrow().dropped()
     }
 
     /// Runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -2017,8 +2100,12 @@ impl PluginRuntime {
             self.host.declare(manifest.clone())?;
             self.host.resolve(id)?;
             self.host.register(id)?;
-            self.host
-                .insert_grant(GrantRecord::granted(id.clone(), hash, granted.clone(), 0));
+            self.host.insert_grant(GrantRecord::granted(
+                id.clone(),
+                hash.clone(),
+                granted.clone(),
+                0,
+            ));
             self.host.activate(id)?;
             Ok(())
         })();
@@ -2288,6 +2375,13 @@ impl PluginRuntime {
                 .map(|capability| capability.as_str().to_string())
                 .collect(),
         );
+        // CTX-2254 (bitty#2254): the production component request surface.
+        // The queue is shared with every generation (it carries no authority);
+        // the manifest generation is pinned host-side so a request from a
+        // stale generation is refused by the runtime instead of served under
+        // the new one.
+        plugin_services.set_component_queue(Some(self.component_requests.clone()));
+        plugin_services.set_component_manifest_hash(Some(hash.clone()));
         plugin_services.set_declared_events(manifest.lazy.events.iter().cloned().collect());
         plugin_services.set_debug_view(self.debug_view.clone());
         plugin_services.set_trace_hub(self.trace_hub.clone());
@@ -2533,6 +2627,12 @@ impl PluginRuntime {
         self.command_directory
             .borrow_mut()
             .suspend_owner(id.as_str());
+        // CTX-2254: a parked generation may not receive component results it
+        // can no longer poll under its authority; every held ticket fails
+        // closed with the typed `plugin_not_active` class.
+        self.component_requests
+            .borrow_mut()
+            .drop_plugin(id.as_str());
         let _ = self.host.suspend(id);
         Ok(())
     }
@@ -2627,6 +2727,11 @@ impl PluginRuntime {
             .borrow_mut()
             .revoke_owner(id.as_str());
         let _ = self.host.remove(id);
+        // CTX-2254: a disposed generation holds no request authority; every
+        // ticket still open for it fails closed with `plugin_not_active`.
+        self.component_requests
+            .borrow_mut()
+            .drop_plugin(id.as_str());
         // CTX-1244: a disposed generation's timers are dead; drop deadlines
         // and fired rows so a stale handle can never fire or wake.
         self.clear_plugin_timers(id);

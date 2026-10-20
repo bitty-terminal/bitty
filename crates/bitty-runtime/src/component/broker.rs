@@ -46,6 +46,12 @@ impl RequestId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// Construct a raw id for crate-internal tests.
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 impl fmt::Display for RequestId {

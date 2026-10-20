@@ -77,8 +77,13 @@ pub use config::{
 };
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, COMMAND_LIST_MAX_ENTRIES,
-    COMMAND_QUALIFIED_MAX_BYTES, CommandCatalogEntry, CommandRegistration, E_UI_ALREADY_CAPTURED,
-    E_UI_NOT_OWNER, E_UI_UNAVAILABLE, ENV_KEY_MAX_BYTES, EventSubscription, FS_CONTENT_MAX_BYTES,
+    COMMAND_QUALIFIED_MAX_BYTES, COMPONENT_CLASS_BUDGET, COMPONENT_CLASS_CAPABILITY_DENIED,
+    COMPONENT_CLASS_PLUGIN_NOT_ACTIVE, COMPONENT_CLASS_TIMEOUT, COMPONENT_HEADER_MAX_BYTES,
+    COMPONENT_HEADERS_MAX, COMPONENT_ID_MAX_BYTES, COMPONENT_REQUEST_MAX_BYTES,
+    COMPONENT_RESPONSE_MAX_BYTES, COMPONENT_TIMEOUT_DEFAULT_MS, COMPONENT_TIMEOUT_MAX_MS,
+    COMPONENT_URL_MAX_BYTES, CommandCatalogEntry, CommandRegistration, ComponentBridgeOutcome,
+    ComponentBridgeRequest, ComponentMethod, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER,
+    E_UI_UNAVAILABLE, ENV_KEY_MAX_BYTES, EventSubscription, FS_CONTENT_MAX_BYTES,
     FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES, FS_PATH_MAX_BYTES, HISTORY_NEEDLE_MAX_BYTES,
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, IMAGE_PATH_MAX_BYTES,
     KeymapSuggestion, LuaValue, MarshallingLimits, OVERLAY_CALL_MAX_BYTES,
@@ -94,9 +99,10 @@ pub use host::{
     SPAWN_TIMEOUT_MS, ServiceMethod, ServiceProvision, ServiceRoute, StashedFunction,
     THEME_ANSI_COUNT, THEME_COLOR_MAX_BYTES, TaskRegistration, ThemeTable, TimerRegistration,
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_RENAME_MAX_BYTES,
-    WorkspaceAttention, WorkspaceInfo, WorkspaceRequest, env_grant_authorizes, env_grant_shape_ok,
-    env_key_shape_ok, parse_fs_write_append, parse_theme_table, validate_env_key,
-    validate_fs_content, validate_fs_list_max, validate_fs_path, validate_image_path,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceRequest, component_bridge_error,
+    component_response_value, env_grant_authorizes, env_grant_shape_ok, env_key_shape_ok,
+    parse_fs_write_append, parse_theme_table, validate_env_key, validate_fs_content,
+    validate_fs_list_max, validate_fs_path, validate_image_path,
 };
 pub use plain_config::{ConfigLuaVm, PlainConfigError, PlainConfigLimits, PlainConfigValue};
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};

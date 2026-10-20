@@ -71,10 +71,15 @@
 //! (`now: Instant`) so idle, handshake, and backoff policy are deterministic
 //! under test.
 //!
-//! Not in this slice (DIR-030 follow-ups): the Lua-facing request surface
-//! (a non-blocking request handle plus a response event, which depends on
-//! the application event loop), per-platform process sandboxing, and the
-//! registry install source.
+//! The plugin-facing producer is `bitty.component.request` / `bitty.component
+//! .poll` (CTX-2254, bitty#2254): a plugin enqueues a bounded request and reads
+//! the result on a later tick, so no Lua callback blocks on a component and
+//! the broker stays owned by the runtime thread. Authorization, the installed
+//! store, and the 8 KiB bridge bounds live in
+//! [`plugin_runtime::component_requests`](crate::plugin_runtime::component_requests).
+//!
+//! Not in this slice (DIR-030 follow-ups): per-platform process sandboxing and
+//! the registry install source.
 
 mod activation;
 mod broker;

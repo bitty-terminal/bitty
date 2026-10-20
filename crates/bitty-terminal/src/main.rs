@@ -231,6 +231,7 @@ mod cmd;
 mod color;
 mod completion;
 mod component;
+mod component_bridge;
 mod component_host;
 mod component_seed;
 mod composer_owner;
@@ -1065,6 +1066,34 @@ fn main() {
         .as_ref()
         .map(|session| Rc::clone(&session.history));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
+
+    // CTX-2254 (bitty#2254): mirror the activated plugin policy state into the
+    // runtime's own policy host so the component broker's capability gate sees
+    // the same plugins the plugin runtime activated. This grants nothing new:
+    // it copies each `Active` generation's manifest and already-decided grant
+    // record, and a refused mirror leaves that plugin's component requests
+    // failing closed (`capability_denied`), never inheriting another
+    // generation's authority.
+    if let Some(plugins) = plugin_runtime_handle.as_ref() {
+        let mirrored = component_bridge::mirror_plugin_authority(
+            &mut runtime,
+            plugins,
+            |plugin, reason| {
+                logging::warn(|| {
+                    format!(
+                        "bitty: plugin '{plugin}' not mirrored into the runtime policy host ({reason}); component requests stay denied"
+                    )
+                });
+            },
+        );
+        if mirrored > 0 {
+            logging::info(|| {
+                format!(
+                    "bitty: {mirrored} plugin generation(s) mirrored into the runtime policy host for component requests"
+                )
+            });
+        }
+    }
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);

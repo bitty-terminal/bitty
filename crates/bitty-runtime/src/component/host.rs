@@ -367,6 +367,16 @@ impl ComponentHost {
     pub fn shutdown(&mut self) -> Vec<BrokerEvent> {
         self.broker.shutdown()
     }
+
+    /// Cancel one in-flight request (CTX-2254).
+    ///
+    /// Used by the plugin-facing request surface when its deadline or response
+    /// budget closes before the component answered: the broker sends `Cancel`
+    /// and discards late frames, so no unbounded work survives an abandoned
+    /// ticket.
+    pub fn cancel(&mut self, id: RequestId) {
+        self.broker.cancel(id);
+    }
 }
 
 #[cfg(test)]

@@ -8,9 +8,11 @@
 //! component before every spawn.
 //!
 //! Authorization inputs (`plugin_id`, `manifest_hash`) are caller-supplied and
-//! acceptable only because every caller is Core-internal today. A future
-//! Lua/IPC verb must derive both from the VM/registry, never from
-//! plugin-supplied strings.
+//! acceptable only because every caller is Core-internal today. The plugin
+//! request surface (`bitty.component.*`, CTX-2254) derives both host-side from
+//! the generation's `PluginServices` (plugin id and activation-time manifest
+//! hash), never from plugin-supplied strings, and submits through
+//! [`Runtime::submit_component_request`].
 
 use std::time::Instant;
 
@@ -150,8 +152,10 @@ impl Runtime {
     /// capability authorization.
     ///
     /// This blocks and must never run on the runtime owner/UI thread. It is
-    /// the only supported request shape today; an asynchronous delivery
-    /// surface is a blocking prerequisite for the future Lua/IPC verb.
+    /// kept for headless callers and tests; the production plugin surface
+    /// (`bitty.component.request` + `poll`, CTX-2254) uses
+    /// [`Self::submit_component_request`] and delivers responses on a later
+    /// tick instead.
     #[doc(hidden)]
     pub fn component_request(
         &mut self,
@@ -236,5 +240,17 @@ impl Runtime {
         self.component_host
             .as_ref()
             .and_then(|host| host.status(component))
+    }
+
+    /// Cancel one in-flight component request (CTX-2254, bitty#2254).
+    ///
+    /// The plugin-facing request surface calls this when a ticket's deadline
+    /// or response budget closed first, so the broker sends `Cancel` and drops
+    /// late frames instead of accumulating work nobody will read.
+    #[doc(hidden)]
+    pub fn cancel_component_request(&mut self, id: RequestId) {
+        if let Some(host) = self.component_host.as_mut() {
+            host.cancel(id);
+        }
     }
 }

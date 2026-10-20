@@ -1312,6 +1312,13 @@ impl TerminalApp {
         // frames through the single input router before present, so a
         // granted submit lands in the focused PTY on this tick.
         self.apply_plugin_submit_requests();
+        // CTX-2254 (bitty#2254): authorize and submit queued
+        // `bitty.component.request` submissions to the existing component
+        // broker and deliver its responses back to the requesting plugin.
+        // Cold tick only: the Lua side never waits on a component, so this
+        // path does bounded bookkeeping (one broker poll per tick) and no VM
+        // work on the input hot path.
+        self.pump_component_requests();
         // CTX-1244 (issue #2107): fire due one-shot plugin timers before
         // present, so a timer callback's `bitty.ui.update` lands in
         // `update_chrome_bands` on this same tick and presents while idle.
@@ -2638,6 +2645,37 @@ impl TerminalApp {
                     )
                 });
             }
+        }
+    }
+
+    /// Authorize and submit queued `bitty.component.request` submissions and
+    /// deliver broker responses back to the requesting plugin (CTX-2254,
+    /// bitty#2254).
+    ///
+    /// Bounded by the plugin runtime's component queue and one broker poll per
+    /// tick. Every submission was validated by the Lua bridge (payload,
+    /// method, URL, timeout) and is re-authorized here by
+    /// `Runtime::submit_component_request` (lifecycle, manifest generation,
+    /// grant record) before the existing broker resolves and digest-verifies
+    /// the installed component. Fail-closed rules:
+    /// - a denied submission completes its ticket with the typed class
+    ///   (`capability_denied`, `plugin_not_active`, `budget`, ...), so the
+    ///   plugin's next `bitty.component.poll` raises it instead of hanging;
+    /// - a ticket past its deadline fails `timeout` and the broker request is
+    ///   cancelled, so no abandoned work keeps running.
+    pub(crate) fn pump_component_requests(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let submitted = crate::component_bridge::pump_component_requests(
+            &mut self.runtime,
+            plugin_runtime,
+            std::time::Instant::now(),
+        );
+        if submitted > 0 {
+            crate::logging::info(|| {
+                format!("bitty: {submitted} component request(s) submitted to the broker")
+            });
         }
     }
 

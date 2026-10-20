@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bitty_lua::LuaValue;
+use bitty_lua::{LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::{CapabilityId, GrantRecord, PluginId, PluginState};
 use bitty_runtime::Runtime;
 use bitty_runtime::component::{
@@ -44,6 +44,15 @@ const CAPABILITY: &str = "network.connect:api.example.com:443";
 const SECOND_CAPABILITY: &str = "terminal.semantic-read";
 const POLL_BUDGET: Duration = Duration::from_millis(10);
 const POLL_ATTEMPTS: usize = 400;
+/// Test-harness wall-clock headroom for command dispatch.
+///
+/// One dispatch spans the Lua command entry plus the component-request host
+/// call inside a single RC-1 window. Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS` (50 ms); a shared macOS ARM64 runner suspended
+/// the `big` fixture at 130 ms on an otherwise green commit (the same
+/// scheduler-stall shape as bitty#2259 / #1727 / #1744). Widen only the
+/// harness wall dimension; instruction and memory stay at RC defaults.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 const RELOAD_PLUGIN: &str = "acme.reload";
 const RELOAD_V2_URL: &str = "https://api.example.com/v2/reloaded";
 
@@ -363,6 +372,7 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
         settings: std::rc::Rc::new(EmptySettings),
         snapshot: std::rc::Rc::new(EmptySnapshot),
     });
+    plugins.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     let discovered = plugins.discover();
     for (id, result) in &discovered {
         if let Err(error) = result {

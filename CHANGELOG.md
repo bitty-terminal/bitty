@@ -15,6 +15,17 @@ or a published artifact.
 
 ### Added
 
+- **Grapheme-cluster shaping across wide-character spacers (CTX-1369,
+  #2262):** the opt-in shaped renderer now keeps a wide lead's trailing
+  spacer inside its shaping run, so a contiguous ZWJ emoji sequence reaches
+  HarfBuzz as one grapheme cluster and paints one ligated glyph when the font
+  supplies it. The cell grid keeps logical order and per-cell
+  glyph-plus-zerowidth storage, so selection, copy, search, and accessibility
+  text stay byte-exact; spacers never emit glyphs and base advances stay
+  grid-true. When no face ligates the cluster, the deterministic per-cell
+  fallback paints each base on its own column (join controls and selectors
+  stay zero-width) instead of stacking or doubling tofu. CJK wide cells, box
+  drawing, and programming ligatures keep their previous output.
 - **Component broker at the production composition root (CTX-1361, #2267,
   #2276):** one `ComponentHost`-owned broker is installed on both the primary
   and headless-fallback startup paths. Components resolve only from the
@@ -374,7 +385,7 @@ or a published artifact.
   `Cargo.toml`, `Cargo.lock`, internal `path` dependency pins,
   `packaging/PKGBUILD*` `pkgver`, `nfpm.yaml`, the `flake.nix` fallback, and
   the `README.md` release line. `scripts/check-release-version.sh --tag
-  v0.0.24` keeps `bitty --version`, packaging metadata, and the release
+v0.0.24` keeps `bitty --version`, packaging metadata, and the release
   tag in agreement.
 - Earlier partial 0.0.24 entries (#2210, #2245) are superseded by this
   complete pass over `v0.0.23..origin/main`; no tag or publication is

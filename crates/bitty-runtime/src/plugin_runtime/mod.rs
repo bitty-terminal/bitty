@@ -49,7 +49,10 @@ use std::time::{Duration, Instant};
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::ui::UiNode;
-use bitty_lua::{CommandRegistration, HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
+use bitty_lua::{
+    CommandRegistration, HostServices, InvocationOutcome, LuaVm, MarshallingLimits,
+    RegistrationCapture,
+};
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::grant::GrantRecord;
@@ -435,6 +438,20 @@ pub enum PluginRuntimeError {
         /// Bounded detail.
         detail: String,
     },
+    /// An app-dispatched command reached the RC-1 wall budget and is parked
+    /// for the next cold tick (bitty #2314).
+    ///
+    /// This is **not** a terminal refusal: the owning VM keeps the executor
+    /// and resumes it through [`PluginRuntime::pump_parked_commands`] until it
+    /// completes or reaches the callback ceiling. Callers on the app cold path
+    /// treat it as accepted work; nested `bitty.commands.invoke` dispatch never
+    /// returns it (a sync caller cannot resume).
+    Parked {
+        /// Plugin id.
+        plugin: String,
+        /// Bounded detail.
+        detail: String,
+    },
     /// A hard count/size limit was exceeded.
     LimitExceeded {
         /// Plugin id or path identifier.
@@ -468,8 +485,16 @@ impl PluginRuntimeError {
             Self::Capture { .. } => "E_CAPTURE",
             Self::Budget { .. } => "E_BUDGET_EXCEEDED",
             Self::Timeout { .. } => "E_TIMEOUT",
+            Self::Parked { .. } => "E_TIMEOUT",
             Self::LimitExceeded { .. } => "E_DEF_LIMIT",
         }
+    }
+
+    /// Whether this "error" is a non-terminal park for the next cold tick
+    /// (bitty #2314).
+    #[must_use]
+    pub fn is_parked(&self) -> bool {
+        matches!(self, Self::Parked { .. })
     }
 
     /// Diagnostic class for this failure (CTX-0330 taxonomy).
@@ -484,7 +509,7 @@ impl PluginRuntimeError {
             | Self::ModuleTree { .. }
             | Self::LimitExceeded { .. }
             | Self::Incompatible { .. } => "validation",
-            Self::Budget { .. } | Self::Timeout { .. } => "budget",
+            Self::Budget { .. } | Self::Timeout { .. } | Self::Parked { .. } => "budget",
             Self::Io(_)
             | Self::NotFound { .. }
             | Self::Integrity { .. }
@@ -535,6 +560,9 @@ impl std::fmt::Display for PluginRuntimeError {
             Self::Timeout { plugin, detail } => {
                 write!(f, "plugin '{plugin}' timed out: {detail}")
             }
+            Self::Parked { plugin, detail } => {
+                write!(f, "plugin '{plugin}' invocation parked: {detail}")
+            }
             Self::LimitExceeded {
                 plugin,
                 field,
@@ -566,6 +594,28 @@ struct PluginEntry {
     services: Option<Rc<PluginServices>>,
     registrations: RegistrationCapture,
     settings_diagnostics: Vec<plugin_settings::PluginSettingsDiagnostic>,
+}
+
+/// One app-dispatched command parked at the RC-1 wall budget (bitty #2314).
+///
+/// The VM owns the executor/fuel/clock; this record only keeps the command
+/// identity and result schema needed to validate the eventual result. At most
+/// one record exists per plugin, so the parked-work set is bounded by the
+/// active plugin count rather than by input rate.
+struct ParkedCommand {
+    command: String,
+    result_schema: Option<String>,
+}
+
+/// Result of resuming one parked command on the cold tick.
+#[derive(Debug)]
+pub struct ParkedCommandCompletion {
+    /// Owning plugin.
+    pub plugin: PluginId,
+    /// Command id (unqualified).
+    pub command: String,
+    /// Completed result or the terminal error that ended the park.
+    pub outcome: Result<LuaValue, PluginRuntimeError>,
 }
 
 type DiscoveryResults = Vec<(PluginId, Result<(), PluginRuntimeError>)>;
@@ -783,6 +833,15 @@ pub struct PluginRuntime {
     /// integration tests (bitty#1744, same treatment as bitty#1727);
     /// production code never sets this.
     vm_wall_budget_ms: Option<u64>,
+    /// App-dispatched commands parked at the RC-1 wall budget (bitty #2314).
+    ///
+    /// At most one parked command per plugin and none per non-command
+    /// callback: the VM holds exactly one executor, and this map only carries
+    /// the command identity/result schema needed to validate the eventual
+    /// result. Bounded by the active plugin count, never by input rate.
+    /// Cancellation on suspend/dispose/reload removes the entry and drops the
+    /// VM's parked executor.
+    parked_commands: BTreeMap<PluginId, ParkedCommand>,
     /// CTX-1244 (issue #2107): host-owned one-shot timer deadlines.
     ///
     /// Keyed by `(plugin, handle)`; the value is the absolute firing
@@ -888,6 +947,7 @@ impl PluginRuntime {
             device_host,
             audio_host,
             vm_wall_budget_ms: None,
+            parked_commands: BTreeMap::new(),
             timer_deadlines: BTreeMap::new(),
             timer_fired: BTreeSet::new(),
         }
@@ -2065,6 +2125,11 @@ impl PluginRuntime {
                 entry.package.source_class,
             )
         };
+        // bitty #2314: a previous generation's park can never survive into a
+        // fresh activation (defensive; dispose/reload already cancel it). The
+        // state validation above refused a still-active generation before
+        // this point, so an active plugin's park is never disturbed here.
+        self.cancel_parked_command(id);
         // CTX-0416 host-upgrade re-check at activation: the closed compat
         // grammar is evaluated against the running host before any policy or
         // VM work. Bundled packages skip (their `>=0.1` floor stays and the
@@ -2594,6 +2659,10 @@ impl PluginRuntime {
     }
 
     fn suspend_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        // bitty #2314: a suspended generation must not keep a parked executor
+        // or resume it after the lifecycle transition. Drop the park first;
+        // the callback body is never restarted.
+        self.cancel_parked_command(id);
         let entry = self
             .entries
             .get_mut(id)
@@ -2692,6 +2761,9 @@ impl PluginRuntime {
     }
 
     fn dispose_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+        // bitty #2314: teardown cancels any parked command before the VM is
+        // dropped, so no resume can observe a half-disposed generation.
+        self.cancel_parked_command(id);
         let entry = self
             .entries
             .get_mut(id)
@@ -2827,7 +2899,8 @@ impl PluginRuntime {
     /// [`PluginRuntimeError::Capture`] when the command is unknown or an
     /// args/result schema is violated;
     /// [`PluginRuntimeError::Vm`] when the callback fails, suspends, or is
-    /// re-entered while busy.
+    /// re-entered while busy; [`PluginRuntimeError::Parked`] when it reached
+    /// the RC-1 wall budget and is resumable on the next cold tick.
     pub fn dispatch_command(
         &mut self,
         id: &PluginId,
@@ -2844,6 +2917,14 @@ impl PluginRuntime {
                 LifecycleState::Active | LifecycleState::Suspended
             ) {
                 return Err(lifecycle_error(id, "plugin is not active"));
+            }
+            if self.parked_commands.contains_key(id) {
+                // One parked executor per plugin: a second invocation cannot
+                // start while the first is suspended mid-body.
+                return Err(PluginRuntimeError::Vm(format!(
+                    "command '{command_id}' owner '{}' has a parked invocation",
+                    id.as_str()
+                )));
             }
             let qualified = format!("{}:{}", id.as_str(), command_id);
             let registration = entry
@@ -2899,15 +2980,36 @@ impl PluginRuntime {
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
         let result = match vm.try_borrow_mut() {
-            Ok(mut vm) => vm.call_function(&run, args),
+            Ok(mut vm) => vm.call_function_resumable(&run, args),
             Err(_) => {
                 return Err(PluginRuntimeError::Vm(format!(
                     "command '{command_id}' owner '{}' is busy",
                     id.as_str()
                 )));
             }
-        }
-        .map_err(|error| PluginRuntimeError::Vm(error.to_string()))?;
+        };
+        let result = match result {
+            Ok(InvocationOutcome::Completed(value)) => value,
+            Ok(InvocationOutcome::Parked) => {
+                // Keep the owning generation alive and the command identity
+                // needed to validate the result. The next cold tick resumes
+                // the same executor; the body is never restarted.
+                self.parked_commands.insert(
+                    id.clone(),
+                    ParkedCommand {
+                        command: command_id.to_string(),
+                        result_schema: result_schema.clone(),
+                    },
+                );
+                return Err(PluginRuntimeError::Parked {
+                    plugin: id.to_string(),
+                    detail: format!(
+                        "command '{command_id}' parked at the RC-1 wall budget; resumes on the next cold tick"
+                    ),
+                });
+            }
+            Err(error) => return Err(PluginRuntimeError::Vm(error.to_string())),
+        };
         // The effective result schema is re-checked before the result
         // returns, so a misbehaving callee is contained to this invocation.
         if let Some(schema) = result_schema.as_deref() {
@@ -3094,6 +3196,121 @@ impl PluginRuntime {
             _ => &positional,
         };
         self.dispatch_command(&id, command, slice)
+    }
+
+    /// Resume every parked command once on the cold tick (bitty #2314).
+    ///
+    /// Called by the application's exclusive cold phase, never by input,
+    /// redraw, PTY, or event delivery. Each call advances at most one RC-1
+    /// wall window per parked plugin; a callback that still needs work stays
+    /// parked for the next tick, and cumulative active wall time is bounded by
+    /// the VM's callback ceiling. Completed results (and terminal failures)
+    /// are returned so the caller can surface them exactly once.
+    ///
+    /// Cancelled or no-longer-active generations never resume: their parks are
+    /// removed and the executor is dropped.
+    pub fn pump_parked_commands(&mut self) -> Vec<ParkedCommandCompletion> {
+        let ids: Vec<PluginId> = self.parked_commands.keys().cloned().collect();
+        let mut completed = Vec::new();
+        for id in ids {
+            let Some(parked) = self.parked_commands.remove(&id) else {
+                continue;
+            };
+            if !self
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.state == LifecycleState::Active)
+            {
+                if !self.clear_vm_park(&id) {
+                    // Keep the record if the VM borrow contends; the next
+                    // cold tick retries the cancellation. Never resume an
+                    // inactive generation.
+                    self.parked_commands.insert(id, parked);
+                }
+                continue;
+            }
+            let Some(vm) = self.entries.get(&id).and_then(|entry| entry.vm.clone()) else {
+                continue;
+            };
+            let outcome = match vm.try_borrow_mut() {
+                Ok(mut vm) => vm.resume_parked_call(),
+                Err(_) => {
+                    // A live borrow is unexpected on the cold path; keep the
+                    // park for the next tick instead of guessing.
+                    self.parked_commands.insert(id, parked);
+                    continue;
+                }
+            };
+            match outcome {
+                Ok(InvocationOutcome::Parked) => {
+                    self.parked_commands.insert(id, parked);
+                }
+                Ok(InvocationOutcome::Completed(value)) => {
+                    let outcome = match parked.result_schema.as_deref() {
+                        Some(schema) => {
+                            let json = store::encode_json(&value);
+                            if value_satisfies_schema(schema, &json) {
+                                Ok(value)
+                            } else {
+                                Err(PluginRuntimeError::Capture {
+                                    plugin: id.to_string(),
+                                    detail: format!(
+                                        "command '{}' result does not satisfy the command schema",
+                                        parked.command
+                                    ),
+                                })
+                            }
+                        }
+                        None => Ok(value),
+                    };
+                    completed.push(ParkedCommandCompletion {
+                        plugin: id,
+                        command: parked.command,
+                        outcome,
+                    });
+                }
+                Err(error) => {
+                    completed.push(ParkedCommandCompletion {
+                        plugin: id,
+                        command: parked.command,
+                        outcome: Err(PluginRuntimeError::Vm(error.to_string())),
+                    });
+                }
+            }
+        }
+        completed
+    }
+
+    /// Number of commands currently parked for the next cold tick.
+    ///
+    /// Bounded by the active plugin count (one per plugin); exposed for the
+    /// cold-path diagnostics and cancellation tests.
+    #[must_use]
+    pub fn parked_command_count(&self) -> usize {
+        self.parked_commands.len()
+    }
+
+    /// Drop one plugin's parked invocation without running its body.
+    fn cancel_parked_command(&mut self, id: &PluginId) {
+        if self.clear_vm_park(id) {
+            self.parked_commands.remove(id);
+        }
+    }
+
+    /// Drop the VM's parked executor. Returns `false` only when a live borrow
+    /// prevents the cancellation; the caller then keeps the durable record so
+    /// the next cold tick can retry.
+    fn clear_vm_park(&self, id: &PluginId) -> bool {
+        match self.entries.get(id).and_then(|entry| entry.vm.clone()) {
+            Some(vm) => match vm.try_borrow_mut() {
+                Ok(mut vm) => {
+                    vm.cancel_parked_call();
+                    true
+                }
+                Err(_) => false,
+            },
+            None => true,
+        }
     }
 
     /// List the active command catalog in (`plugin`, `id`) order (CTX-1035).

@@ -28,7 +28,7 @@
 //! | ID  | Dimension                         | Default                              | Enforcement point |
 //! |-----|-----------------------------------|--------------------------------------|---------------------|
 //! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
-//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
+//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | charged `Instant` deadline checked after every slice; resumable command callbacks park at the limit and resume on a later cold tick, and every callback is bounded at completion by `RC1_CALLBACK_CEILING_MS` (5250 ms) |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
 //! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
@@ -152,10 +152,14 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 /// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
 /// - Enforcement point: when charged time reaches the budget, the callback
 ///   suspends with [`SuspendReason::WallClockExceeded`] at the next slice
-///   boundary; a callback that completes first is not suspended. A write
-///   that already committed stays committed and is reported as committed.
-///   A write that never returns blocks the owning thread; the synchronous
-///   commit contract cannot preempt it.
+///   boundary for non-resumable callbacks, or parks for a later cold tick when
+///   it is an app-dispatched command (bitty #2314). At completion every
+///   callback is also bounded by [`RC1_CALLBACK_CEILING_MS`]; a slice-only
+///   callback that completed past it is suspended fail-closed, and a resumable
+///   command that exhausted it is suspended instead of parked. A write that
+///   already committed stays committed and is reported as committed. A write
+///   that never returns blocks the owning thread; the synchronous commit
+///   contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 
 /// RC-1 host-call I/O credit cap (`5 s` = the bridge's supervised-call
@@ -199,17 +203,36 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 ///
 /// This credit composes with [`STORE_COMMIT_CREDIT_MAX_MS`] because they cover
 /// disjoint spans (store commit time is subtracted from the spawn-wait
-/// window). The budget values are unchanged; the credit caps are per-callback
-/// **credit bounds, not a proven hard wall ceiling**: the wall limit is
-/// checked at slice boundaries, and a callback that completes without
-/// crossing one is not suspended (completion-point enforcement is tracked in
-/// bitty#2314). The credit bound is the sum
+/// window). The budget values are unchanged; app-level command dispatch parks
+/// a callback that reaches the per-tick wall budget and resumes it on a later
+/// cold tick, while [`RC1_CALLBACK_CEILING_MS`] bounds the cumulative active
+/// wall time across those ticks. Slice-only callbacks that complete past the
+/// same ceiling are suspended fail-closed at completion (bitty #2314). The
+/// ceiling is
 /// `RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS +
 /// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 ms), and every credited span must
 /// be measured by the host, never chosen by the plugin. The policy is
 /// documented in the isolation RFC (RC-1 row and
 /// `R-RC1-HOST-CALL-CREDIT`, bitty-plugins-docs#169).
 pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
+
+/// Maximum raw wall time one callback may consume and still complete under the
+/// default RC-1 budgets: `5250 ms` = 50 ms wall + 200 ms store-commit credit +
+/// 5000 ms supervised spawn-wait credit.
+///
+/// The ceiling is enforced on every callback at completion (bitty #2314).
+/// App-dispatched commands are resumable: a callback that exceeds the 50 ms
+/// per-tick wall budget parks and resumes on later cold ticks, and reaching
+/// this cumulative active-wall limit suspends it fail-closed. Slice-only
+/// callbacks (init/config/event/timer and synchronous nested dispatch) cannot
+/// resume, so a callback that completes past the limit is refused fail-closed
+/// instead of being reported as completed. Reaching it suspends with
+/// [`SuspendReason::WallClockExceeded`]; the caller never observes a successful
+/// result past the ceiling. `RC1_WALL_CLOCK_BUDGET_MS` remains the per-tick
+/// budget, and a VM whose wall budget is tuned widens the ceiling by the same
+/// delta (see [`LuaVm::callback_ceiling_ms`]).
+pub const RC1_CALLBACK_CEILING_MS: u64 =
+    RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS + HOST_CALL_CREDIT_MAX_MS;
 
 /// RC-1 warning threshold (candidate): `8 ms` — sets `warning_triggered` but
 /// does not suspend.
@@ -494,8 +517,14 @@ pub enum SuspendReason {
         budget: u64,
     },
     /// Wall-clock deadline exceeded.
+    ///
+    /// At a slice boundary `elapsed_ms` is charged time against the per-tick
+    /// `budget_ms` ([`RC1_WALL_CLOCK_BUDGET_MS`]). For a resumable command
+    /// callback that exhausts the cumulative envelope, `elapsed_ms` is the
+    /// callback's active wall time and `budget_ms` is
+    /// [`RC1_CALLBACK_CEILING_MS`] (bitty #2314).
     WallClockExceeded {
-        /// Elapsed ms.
+        /// Elapsed ms compared with the budget.
         elapsed_ms: u64,
         /// Budget ms.
         budget_ms: u64,
@@ -565,8 +594,11 @@ pub struct VmBudgetSnapshot {
     pub memory_limit: usize,
     /// Approx instructions consumed in last execute (or current).
     pub instructions_used: u64,
-    /// Raw wall-clock elapsed ms of last execute (store commit credit is not
-    /// subtracted; see `store_commit_credit_ms`).
+    /// Active raw wall-clock elapsed ms of the last callback (store commit
+    /// credit is not subtracted; see `store_commit_credit_ms`). For a
+    /// resumable command this is cumulative across cold ticks with parked gaps
+    /// excluded; for a slice-only callback it is the one callback's raw wall
+    /// time.
     pub wall_elapsed_ms: u64,
     /// Store commit I/O credit (ms) applied to the RC-1 hard wall limit in
     /// the last execute, capped at [`STORE_COMMIT_CREDIT_MAX_MS`].
@@ -580,6 +612,9 @@ pub struct VmBudgetSnapshot {
     pub warning_triggered: bool,
     /// Whether VM is suspended.
     pub suspended: bool,
+    /// Whether an app-dispatched command callback is parked for the next cold
+    /// tick (`is_parked`; not a suspension).
+    pub parked: bool,
     /// Suspend reason if suspended.
     pub suspend_reason: Option<SuspendReason>,
     /// Total suspensions since creation or last reset.
@@ -634,6 +669,80 @@ pub(crate) enum DriveOutcome {
     },
 }
 
+/// Outcome of one resumable invocation step (bitty #2314).
+///
+/// App-level command dispatch enters a plugin callback through
+/// [`LuaVm::call_function_resumable`]. When the callback reaches the RC-1 wall
+/// budget, the executor is parked with its fuel and cumulative clock intact
+/// and [`LuaVm::resume_parked_call`] continues it on a later cold tick. The
+/// parked body is never restarted, so host calls that already returned do not
+/// run twice.
+#[derive(Debug)]
+pub enum InvocationOutcome {
+    /// The callback completed and produced its result value.
+    Completed(LuaValue),
+    /// The callback is parked until the next cold tick.
+    Parked,
+}
+
+/// One callback's preserved execution state across cold ticks.
+#[derive(Debug)]
+pub(crate) struct DriveState {
+    stashed: StashedExecutor,
+    fuel: Fuel,
+    total_used: u64,
+    /// Cumulative active wall time across completed segments (parked gaps are
+    /// excluded).
+    elapsed: Duration,
+    /// Cumulative applied store-commit credit, capped per callback.
+    store_credit: Duration,
+    /// Cumulative applied supervised-spawn-wait credit, capped per callback.
+    host_credit: Duration,
+    warning_triggered: bool,
+}
+
+impl DriveState {
+    fn new(stashed: StashedExecutor, instruction_budget: u64) -> Self {
+        Self {
+            stashed,
+            fuel: Fuel::with(initial_grant(instruction_budget, 0)),
+            total_used: 0,
+            elapsed: Duration::ZERO,
+            store_credit: Duration::ZERO,
+            host_credit: Duration::ZERO,
+            warning_triggered: false,
+        }
+    }
+}
+
+/// One segment's RC-1 reading with the callback's remaining credit capacity
+/// applied. `charged` is this segment's Lua/host time; `total_elapsed` is the
+/// cumulative active wall time including prior segments.
+#[derive(Debug, Clone, Copy)]
+struct SegmentReading {
+    charged: Duration,
+    store_credit: Duration,
+    host_credit: Duration,
+    total_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WallPolicy {
+    /// Legacy behavior for init/event/timer/config callbacks: the wall limit
+    /// is checked at slice boundaries only.
+    SliceOnly,
+    /// App-dispatched command callbacks: park at the per-tick wall budget and
+    /// resume later, bounded by [`RC1_CALLBACK_CEILING_MS`].
+    Resumable,
+}
+
+#[derive(Debug)]
+enum DriveTerminal {
+    Suspended(SuspendReason),
+    Ready,
+    Parked,
+}
+
 // ── VM ───────────────────────────────────────────────────────────────────────
 
 /// Deterministic, bounded phodopus VM for one plugin identity+generation.
@@ -678,6 +787,10 @@ pub struct LuaVm {
     /// `BridgeState` via `Rc` so `set_spawn_deadline_ms` updates live
     /// callbacks. Defaults to [`host::SPAWN_TIMEOUT_MS`].
     pub(crate) spawn_deadline_ms: Rc<Cell<u64>>,
+    /// One app-dispatched command callback parked at the RC-1 wall budget
+    /// (bitty #2314). At most one per VM; other callbacks are refused while it
+    /// is present, and the executor is dropped on cancellation.
+    parked: Option<DriveState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,6 +915,7 @@ impl LuaVm {
             marshalling_limits: host::MarshallingLimits::default(),
             host_deadline_ms: host::DEFAULT_HOST_DEADLINE_MS,
             spawn_deadline_ms: Rc::new(Cell::new(host::SPAWN_TIMEOUT_MS)),
+            parked: None,
         }
     }
 
@@ -871,6 +985,25 @@ impl LuaVm {
         matches!(self.status, VmStatus::Suspended(_))
     }
 
+    /// Whether an app-dispatched command callback is parked for the next cold
+    /// tick (bitty #2314).
+    ///
+    /// A parked VM is not suspended and not usable for another callback; the
+    /// owner resumes or cancels the park before any other execution.
+    #[must_use]
+    pub fn is_parked(&self) -> bool {
+        self.parked.is_some()
+    }
+
+    /// Cumulative active wall-time ceiling for one callback
+    /// ([`RC1_CALLBACK_CEILING_MS`], widened by any wall-budget tuning).
+    #[must_use]
+    pub fn callback_ceiling_ms(&self) -> u64 {
+        self.wall_budget_ms
+            .saturating_add(STORE_COMMIT_CREDIT_MAX_MS)
+            .saturating_add(HOST_CALL_CREDIT_MAX_MS)
+    }
+
     /// Suspend reason if suspended.
     #[must_use]
     pub fn suspend_reason(&self) -> Option<&SuspendReason> {
@@ -904,7 +1037,11 @@ impl LuaVm {
         self.instructions_used
     }
 
-    /// Wall elapsed ms of last execution.
+    /// Active raw wall elapsed ms of the last callback.
+    ///
+    /// For a resumable command this is cumulative across cold ticks (parked
+    /// idle gaps are excluded); for a slice-only callback it is that
+    /// callback's raw wall time.
     #[must_use]
     pub fn wall_elapsed_ms(&self) -> u64 {
         self.wall_elapsed_ms
@@ -991,6 +1128,7 @@ impl LuaVm {
     /// FS-5 — caller should drop and recreate for generation N+1).
     pub fn reset(&mut self) {
         self.status = VmStatus::Ready;
+        self.parked = None;
         self.warning_triggered = false;
         // Keep suspension_count for attribution, but clear per-execution metrics.
         self.instructions_used = 0;
@@ -1085,6 +1223,7 @@ impl LuaVm {
             memory_used: self.memory_used,
             warning_triggered: self.warning_triggered,
             suspended,
+            parked: self.parked.is_some(),
             suspend_reason,
             suspension_count: self.suspension_count,
             warning_count: self.warning_count,
@@ -1117,6 +1256,11 @@ impl LuaVm {
     /// wall-clock starts before `Closure::load` so compile work counts toward
     /// the RC-1 budget (slow compiles suspend without executing).
     pub(crate) fn drive_chunk(&mut self, code: &str) -> Result<DriveOutcome, VmError> {
+        if self.parked.is_some() {
+            return Err(VmError::Runtime(
+                "vm holds a parked invocation; resume or cancel it before executing".to_string(),
+            ));
+        }
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
@@ -1244,30 +1388,52 @@ impl LuaVm {
 
     /// Shared budget-enforced stepping loop over an already-loaded executor.
     ///
-    /// Used by [`LuaVm::drive_chunk`] and by host-bridge invocation
-    /// ([`LuaVm::call_function`](crate::LuaVm::call_function)); RC-1/RC-2
+    /// Used by [`LuaVm::drive_chunk`] and host-bridge invocation; RC-1/RC-2
     /// enforcement is identical in both paths. `start` is the wall-clock
     /// origin: for `drive_chunk` it predates `Closure::load` (compile counts),
-    /// for `call_function` it is the invocation entry (no compile).
+    /// for a callback it is the invocation entry (no compile).
     ///
     /// The hard wall limit uses charged time from [`BudgetMark::read`]:
     /// durable commit I/O of committed disk-backed `bitty.store.set` writes
-    /// (this VM's own or a nested cross-VM provider's) is not charged, up to
-    /// [`STORE_COMMIT_CREDIT_MAX_MS`] per callback. The warning threshold and
-    /// the reported `wall_elapsed_ms` use raw wall-clock time (bitty #1518).
+    /// (this VM's own or a nested cross-VM provider's) and supervised
+    /// `process.spawn` waits are not charged, each up to its per-callback cap
+    /// ([`STORE_COMMIT_CREDIT_MAX_MS`], [`HOST_CALL_CREDIT_MAX_MS`]). The
+    /// warning threshold and the reported `wall_elapsed_ms` use raw wall-clock
+    /// time (bitty #1518).
+    ///
+    /// This entry keeps the legacy slice-only policy: init, event, timer, and
+    /// config callbacks suspend fail-closed at a slice boundary and are never
+    /// parked. They are still bounded at completion by
+    /// [`RC1_CALLBACK_CEILING_MS`]. Resumable app-dispatched commands go
+    /// through [`LuaVm::call_function_resumable`] instead (bitty #2314).
     pub(crate) fn drive_stashed(
         &mut self,
         stashed: StashedExecutor,
         start: BudgetMark,
     ) -> Result<DriveOutcome, VmError> {
-        // Re-based when a parked host operation is cancelled (see below).
-        let mut start = start;
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
             });
         }
+        self.begin_invocation();
+        let mut state = DriveState::new(stashed, self.instruction_budget);
+        let terminal = self.drive_state(&mut state, start, WallPolicy::SliceOnly)?;
+        match terminal {
+            DriveTerminal::Suspended(reason) => Ok(DriveOutcome::Suspended {
+                reason,
+                instructions_used: self.instructions_used,
+                wall_elapsed_ms: self.wall_elapsed_ms,
+                memory_used: self.memory_used,
+            }),
+            DriveTerminal::Ready => Ok(DriveOutcome::Ready {
+                stashed: state.stashed,
+            }),
+            DriveTerminal::Parked => unreachable!("slice-only drives never park"),
+        }
+    }
 
+    fn begin_invocation(&mut self) {
         self.total_executions = self.total_executions.wrapping_add(1);
         self.warning_triggered = false;
         self.instructions_used = 0;
@@ -1275,265 +1441,396 @@ impl LuaVm {
         self.store_commit_credit_ms = 0;
         self.host_call_credit_ms = 0;
         self.memory_used = self.lua.total_memory();
+    }
 
-        // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
-        // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
-        // instructions instead of once per whole budget. `total_used` tracks
-        // the true cumulative consumption across slices; fuel is only topped
-        // up between `step` calls (never during), per phodopus's contract.
-        let mut total_used: u64 = 0;
-        let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
+    /// One segment reading with the callback's remaining credit capacity
+    /// applied. The segment clock is fresh per cold tick; cumulative credit
+    /// caps are shared across ticks through `state`.
+    fn segment_reading(&self, state: &DriveState, start: BudgetMark) -> SegmentReading {
+        let reading = start.read();
+        let store_remaining =
+            Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS).saturating_sub(state.store_credit);
+        let host_remaining =
+            Duration::from_millis(HOST_CALL_CREDIT_MAX_MS).saturating_sub(state.host_credit);
+        let store_credit = reading.credit.min(store_remaining);
+        let host_credit = reading.host_call_credit.min(host_remaining);
+        SegmentReading {
+            charged: reading
+                .raw
+                .saturating_sub(store_credit)
+                .saturating_sub(host_credit),
+            store_credit,
+            host_credit,
+            total_elapsed: state.elapsed.saturating_add(reading.raw),
+        }
+    }
 
-        // CTX-0464: `start` predates `Closure::load` for `drive_chunk`
-        // (compile counts toward the RC-1 wall budget; the chunk cap bounds
-        // how much compile work can hide here), and marks invocation entry
-        // for `call_function` (no compile). The previous after-load origin
-        // let unbounded compile hide outside the budget; the cap plus this
-        // origin keeps trivial-config CI flakes bounded (compile of at most
-        // 1 MiB cannot deschedule a whole 50 ms budget on its own, and any
-        // excess suspends fail-closed here or in `drive_chunk`).
+    fn apply_metrics(&mut self, state: &mut DriveState, reading: SegmentReading) {
+        self.instructions_used = state.total_used;
+        self.wall_elapsed_ms = duration_ms(reading.total_elapsed);
+        self.store_commit_credit_ms =
+            duration_ms(state.store_credit.saturating_add(reading.store_credit));
+        self.host_call_credit_ms =
+            duration_ms(state.host_credit.saturating_add(reading.host_credit));
+        self.memory_used = self.lua.total_memory();
+        if reading.total_elapsed >= Duration::from_millis(self.warning_ms)
+            && !state.warning_triggered
+        {
+            state.warning_triggered = true;
+            self.warning_count = self.warning_count.wrapping_add(1);
+        }
+        self.warning_triggered = state.warning_triggered;
+    }
+
+    /// Apply the current segment's metrics and fold it into the cumulative
+    /// callback clock before a park or a terminal result.
+    fn finish_segment(&mut self, state: &mut DriveState, reading: SegmentReading) {
+        self.apply_metrics(state, reading);
+        state.elapsed = reading.total_elapsed;
+        state.store_credit = state.store_credit.saturating_add(reading.store_credit);
+        state.host_credit = state.host_credit.saturating_add(reading.host_credit);
+        self.warning_triggered = state.warning_triggered;
+    }
+
+    fn wall_reason(&self, charged_ms: u64, budget_ms: u64) -> SuspendReason {
+        SuspendReason::WallClockExceeded {
+            elapsed_ms: charged_ms,
+            budget_ms,
+        }
+    }
+
+    fn suspend_invocation(
+        &mut self,
+        state: &mut DriveState,
+        reading: SegmentReading,
+        reason: SuspendReason,
+    ) -> DriveTerminal {
+        self.apply_metrics(state, reading);
+        self.status = VmStatus::Suspended(reason.clone());
+        self.suspension_count = self.suspension_count.wrapping_add(1);
+        self.instructions_used = state.total_used;
+        self.memory_used = self.lua.total_memory();
+        DriveTerminal::Suspended(reason)
+    }
+
+    fn drive_state(
+        &mut self,
+        state: &mut DriveState,
+        start: BudgetMark,
+        policy: WallPolicy,
+    ) -> Result<DriveTerminal, VmError> {
+        let mut start = start;
+        if let VmStatus::Suspended(reason) = &self.status {
+            return Err(VmError::Suspended {
+                reason: reason.clone(),
+            });
+        }
 
         // Pre-check memory before stepping (fail-closed per FS-7).
         let mem_before = self.lua.total_memory();
+        self.memory_used = mem_before;
         if mem_before > self.memory_limit {
+            let reading = self.segment_reading(state, start);
             let reason = SuspendReason::MemoryExceeded {
                 used: mem_before,
                 limit: self.memory_limit,
             };
-            self.status = VmStatus::Suspended(reason.clone());
-            self.suspension_count = self.suspension_count.wrapping_add(1);
-            self.memory_used = mem_before;
-            self.instructions_used = 0;
-            self.wall_elapsed_ms = duration_ms(start.read().raw);
-            return Ok(DriveOutcome::Suspended {
-                reason,
-                instructions_used: 0,
-                wall_elapsed_ms: self.wall_elapsed_ms,
-                memory_used: mem_before,
-            });
+            return Ok(self.suspend_invocation(state, reading, reason));
         }
 
-        // Stepping loop with budget checks at slice boundaries.
-        loop {
-            let reading = start.read();
-            let elapsed_ms = duration_ms(reading.raw);
-            let charged_ms = duration_ms(reading.charged);
-            self.wall_elapsed_ms = elapsed_ms;
-            self.store_commit_credit_ms = duration_ms(reading.credit);
-            self.host_call_credit_ms = duration_ms(reading.host_call_credit);
-
-            // Warning threshold — counted, not suspending.
-            if elapsed_ms >= self.warning_ms && !self.warning_triggered {
-                self.warning_triggered = true;
-                self.warning_count = self.warning_count.wrapping_add(1);
-            }
-
-            // Wall hard limit on charged time (raw minus the capped store
-            // commit and supervised spawn-wait credits); the reason reports
-            // the charged time it compares.
-            if charged_ms >= self.wall_budget_ms {
-                let reason = SuspendReason::WallClockExceeded {
-                    elapsed_ms: charged_ms,
-                    budget_ms: self.wall_budget_ms,
-                };
-                self.status = VmStatus::Suspended(reason.clone());
-                self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = total_used;
-                self.memory_used = self.lua.total_memory();
-                return Ok(DriveOutcome::Suspended {
-                    reason,
-                    instructions_used: self.instructions_used,
-                    wall_elapsed_ms: elapsed_ms,
-                    memory_used: self.memory_used,
-                });
-            }
-
-            // Memory check before next slice.
-            let mem = self.lua.total_memory();
-            self.memory_used = mem;
-            if mem > self.memory_limit {
-                let reason = SuspendReason::MemoryExceeded {
-                    used: mem,
-                    limit: self.memory_limit,
-                };
-                self.status = VmStatus::Suspended(reason.clone());
-                self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = total_used;
-                return Ok(DriveOutcome::Suspended {
-                    reason,
-                    instructions_used: self.instructions_used,
-                    wall_elapsed_ms: elapsed_ms,
-                    memory_used: mem,
-                });
-            }
-
-            // Instruction budget via cumulative fuel consumption.
-            if total_used >= self.instruction_budget {
-                let still_normal = self.lua.enter(|ctx| {
-                    let exec = ctx.fetch(&stashed);
-                    exec.mode() == ExecutorMode::Normal
-                });
-                if still_normal {
-                    let reason = SuspendReason::InstructionBudgetExceeded {
-                        used: total_used,
-                        budget: self.instruction_budget,
-                    };
-                    self.status = VmStatus::Suspended(reason.clone());
-                    self.suspension_count = self.suspension_count.wrapping_add(1);
-                    self.instructions_used = total_used;
-                    self.memory_used = self.lua.total_memory();
-                    return Ok(DriveOutcome::Suspended {
-                        reason,
-                        instructions_used: total_used,
-                        wall_elapsed_ms: elapsed_ms,
-                        memory_used: self.memory_used,
-                    });
+        // A parked callback that already completed its Lua body inside the
+        // previous tick's final slice has no execution left: the resume only
+        // extracts the result. Do not charge it another per-tick window or
+        // park it again. Host-suspended parks still go through the trampoline.
+        let initial_mode = self.lua.enter(|ctx| ctx.fetch(&state.stashed).mode());
+        let resumed_ready = match initial_mode {
+            ExecutorMode::Normal => false,
+            ExecutorMode::HostSuspended => {
+                if self.pump_host_suspended(&state.stashed)? {
+                    start = BudgetMark::now();
+                    false
+                } else {
+                    return Err(VmError::Runtime(
+                        "executor reports HostSuspended with no pending host operation".to_string(),
+                    ));
                 }
-                // Executor is done (Result/Stopped) but budget exhausted —
-                // still done; the strict final check below suspends if the
-                // completed run itself reached the budget.
-                break;
             }
+            _ => true,
+        };
 
-            // Top up the slice grant (capped at the remaining budget). The
-            // previous slice always exhausts its grant before `step` reports
-            // more work, so this only fires on slice boundaries; the guard
-            // keeps any leftover when phodopus returns early with fuel spare.
-            if fuel.remaining() <= 0 {
-                fuel.set_remaining(initial_grant(self.instruction_budget, total_used));
-            }
-
-            // Step one capped slice. Phodopus runs at most ~`SLICE_FUEL` worth
-            // (64-instruction `run_vm` batches) before returning, so wall and
-            // memory are re-checked promptly after this returns.
-            let fuel_before = fuel.remaining();
-            let step_done = self.lua.enter(|ctx| {
-                let exec = ctx.fetch(&stashed);
-                exec.step(ctx, &mut fuel)
-            });
-            let done = match step_done {
-                Ok(done) => done,
-                Err(error) => {
-                    return Err(VmError::Runtime(format!(
-                        "executor step refused: {error:?}"
-                    )));
-                }
-            };
-            let consumed = (fuel_before as i64 - fuel.remaining() as i64).max(0) as u64;
-            total_used = total_used.saturating_add(consumed);
-
-            // If done, break to mode inspection by the caller (`execute` vs
-            // `eval_config`); the strict final checks below still apply.
-            if done {
-                // A parked host operation reports done without being
-                // finished: route it through the host trampoline and keep
-                // stepping instead of completing.
-                //
-                // A park is host-side state, not plugin wall time, and Bitty
-                // registers no host futures, so every park is cancelled
-                // fail-closed. Cancellation must win deterministically: on a
-                // loaded runner the thread can be descheduled around the park
-                // and the next loop-top wall check would suspend the callback
-                // for scheduler delay before the cancellation unwinds through
-                // `pcall` (measured: 43 instructions, 58 ms elapsed). Restart
-                // the wall window at cancellation so the unwind and any work
-                // after it get a fresh budget; running Lua is still bounded by
-                // the unchanged wall and instruction limits. Lua cannot
-                // trigger this path (host-op sequences are Rust-only), so it
-                // is not a plugin-reachable credit.
-                if self.pump_host_suspended(&stashed)? {
+        if !resumed_ready {
+            loop {
+                let mode = self.lua.enter(|ctx| ctx.fetch(&state.stashed).mode());
+                if mode == ExecutorMode::HostSuspended
+                    && self.pump_host_suspended(&state.stashed)?
+                {
+                    // Cancellation is host-side state, not plugin wall time;
+                    // restart the segment window after it unwinds.
                     start = BudgetMark::now();
                     continue;
                 }
-                // Step reports the executor finished (Result/Stopped/yielded).
-                // Mode inspection and result extraction belong to the caller
-                // (`execute` vs `eval_config`), which run after the shared
-                // final completion checks below.
-                break;
-            }
+                if mode != ExecutorMode::Normal {
+                    break;
+                }
 
-            // Each non-done slice makes minimal positive progress per
-            // phodopus's contract and strictly grows `total_used`, so the
-            // instruction pre-check above guarantees termination. The net
-            // below only guards pathological fuel handling.
+                let reading = self.segment_reading(state, start);
+                self.apply_metrics(state, reading);
 
-            // Safety: if total elapsed exceeds wall budget *2, break to avoid
-            // infinite loop on pathological fuel handling.
-            if charged_ms > self.wall_budget_ms.saturating_mul(2) {
-                let reason = SuspendReason::WallClockExceeded {
-                    elapsed_ms: charged_ms,
-                    budget_ms: self.wall_budget_ms,
-                };
-                self.status = VmStatus::Suspended(reason.clone());
-                self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = total_used;
-                self.memory_used = self.lua.total_memory();
-                return Ok(DriveOutcome::Suspended {
-                    reason,
-                    instructions_used: self.instructions_used,
-                    wall_elapsed_ms: elapsed_ms,
-                    memory_used: self.memory_used,
+                if policy == WallPolicy::Resumable {
+                    if duration_ms(reading.total_elapsed) >= self.callback_ceiling_ms() {
+                        let reason = self.wall_reason(
+                            duration_ms(reading.total_elapsed),
+                            self.callback_ceiling_ms(),
+                        );
+                        return Ok(self.suspend_invocation(state, reading, reason));
+                    }
+                } else if duration_ms(reading.charged) >= self.wall_budget_ms {
+                    let reason =
+                        self.wall_reason(duration_ms(reading.charged), self.wall_budget_ms);
+                    return Ok(self.suspend_invocation(state, reading, reason));
+                }
+
+                let mem = self.lua.total_memory();
+                self.memory_used = mem;
+                if mem > self.memory_limit {
+                    let reason = SuspendReason::MemoryExceeded {
+                        used: mem,
+                        limit: self.memory_limit,
+                    };
+                    return Ok(self.suspend_invocation(state, reading, reason));
+                }
+
+                if state.total_used >= self.instruction_budget {
+                    let reason = SuspendReason::InstructionBudgetExceeded {
+                        used: state.total_used,
+                        budget: self.instruction_budget,
+                    };
+                    return Ok(self.suspend_invocation(state, reading, reason));
+                }
+
+                // Terminal dimensions win over a park: a callback that is also
+                // over its instruction or memory limit must suspend fail-closed,
+                // not defer that decision to another tick.
+                if policy == WallPolicy::Resumable
+                    && duration_ms(reading.charged) >= self.wall_budget_ms
+                {
+                    self.finish_segment(state, reading);
+                    return Ok(DriveTerminal::Parked);
+                }
+
+                // Top up the slice grant (capped at the remaining budget). The
+                // previous slice always exhausts its grant before `step` reports
+                // more work, so this only fires on slice boundaries; the guard
+                // keeps any leftover when phodopus returns early with fuel spare.
+                if state.fuel.remaining() <= 0 {
+                    state
+                        .fuel
+                        .set_remaining(initial_grant(self.instruction_budget, state.total_used));
+                }
+
+                let fuel_before = state.fuel.remaining();
+                let step_done = self.lua.enter(|ctx| {
+                    let exec = ctx.fetch(&state.stashed);
+                    exec.step(ctx, &mut state.fuel)
                 });
+                let done = match step_done {
+                    Ok(done) => done,
+                    Err(error) => {
+                        return Err(VmError::Runtime(format!(
+                            "executor step refused: {error:?}"
+                        )));
+                    }
+                };
+                let consumed = (fuel_before as i64 - state.fuel.remaining() as i64).max(0) as u64;
+                state.total_used = state.total_used.saturating_add(consumed);
+
+                if done {
+                    // A parked host operation reports done without being
+                    // finished: route it through the host trampoline and keep
+                    // stepping instead of completing. Cancellation is host-side
+                    // state, not plugin wall time, so restart the window.
+                    if self.pump_host_suspended(&state.stashed)? {
+                        start = BudgetMark::now();
+                        continue;
+                    }
+                    break;
+                }
+
+                // Safety net for pathological fuel handling, preserved for the
+                // legacy slice-only path. A resumable callback parks at the wall
+                // budget above instead of being suspended here.
+                if policy == WallPolicy::SliceOnly
+                    && duration_ms(reading.charged) > self.wall_budget_ms.saturating_mul(2)
+                {
+                    let reason =
+                        self.wall_reason(duration_ms(reading.charged), self.wall_budget_ms);
+                    return Ok(self.suspend_invocation(state, reading, reason));
+                }
             }
         }
 
         // Completed without budget exceed.
-        self.instructions_used = total_used;
-        let reading = start.read();
-        self.wall_elapsed_ms = duration_ms(reading.raw);
-        self.store_commit_credit_ms = duration_ms(reading.credit);
-        self.host_call_credit_ms = duration_ms(reading.host_call_credit);
-        self.memory_used = self.lua.total_memory();
+        self.instructions_used = state.total_used;
+        let reading = self.segment_reading(state, start);
+        self.apply_metrics(state, reading);
 
-        // Final wall warning check (if warning threshold hit during successful run).
-        if self.wall_elapsed_ms >= self.warning_ms && !self.warning_triggered {
-            self.warning_triggered = true;
-            self.warning_count = self.warning_count.wrapping_add(1);
+        // Cumulative active wall ceiling: applies to every callback. Slice-only
+        // callbacks cannot resume, so a callback that ran past the envelope is
+        // refused fail-closed at completion; resumable commands were parked at
+        // the per-tick budget and are refused here only when their cumulative
+        // active work exhausted the envelope (bitty #2314).
+        if duration_ms(reading.total_elapsed) >= self.callback_ceiling_ms() {
+            let reason = self.wall_reason(
+                duration_ms(reading.total_elapsed),
+                self.callback_ceiling_ms(),
+            );
+            return Ok(self.suspend_invocation(state, reading, reason));
         }
 
         // Final memory check after completion (in case last allocation pushed over).
+        self.memory_used = self.lua.total_memory();
         if self.memory_used > self.memory_limit {
             let reason = SuspendReason::MemoryExceeded {
                 used: self.memory_used,
                 limit: self.memory_limit,
             };
-            self.status = VmStatus::Suspended(reason.clone());
-            self.suspension_count = self.suspension_count.wrapping_add(1);
-            return Ok(DriveOutcome::Suspended {
-                reason,
-                instructions_used: self.instructions_used,
-                wall_elapsed_ms: self.wall_elapsed_ms,
-                memory_used: self.memory_used,
-            });
+            return Ok(self.suspend_invocation(state, reading, reason));
         }
 
-        // Final instruction check: if we consumed >= budget but still completed
-        // exactly at budget, treat as suspended per strict fail-closed (RC-1 is
-        // hard limit). However if we completed and used < budget, success.
+        // Final instruction check: a callback that consumed the full budget
+        // still suspends fail-closed per RC-1.
         if self.instructions_used >= self.instruction_budget {
             let reason = SuspendReason::InstructionBudgetExceeded {
                 used: self.instructions_used,
                 budget: self.instruction_budget,
             };
-            // Only suspend if we actually hit the budget; completed work that
-            // exactly used the budget is still considered budget exceed per
-            // RC-1 (fail-closed). This makes harness deterministic.
-            // But if code completed with used < budget, we already returned success.
-            // Here used >= budget implies we exhausted budget even though executor
-            // reported done — still suspend to be strict.
-            // To avoid false positive on tiny scripts that use << budget, we already
-            // checked < budget case earlier, so this is genuine exceed.
-            self.status = VmStatus::Suspended(reason.clone());
-            self.suspension_count = self.suspension_count.wrapping_add(1);
-            return Ok(DriveOutcome::Suspended {
-                reason,
-                instructions_used: self.instructions_used,
-                wall_elapsed_ms: self.wall_elapsed_ms,
-                memory_used: self.memory_used,
-            });
+            return Ok(self.suspend_invocation(state, reading, reason));
         }
 
-        Ok(DriveOutcome::Ready { stashed })
+        if policy == WallPolicy::Resumable
+            && !resumed_ready
+            && duration_ms(reading.charged) >= self.wall_budget_ms
+        {
+            // The first tick that finishes the body parks instead of
+            // completing, so a real input-path command is never refused for
+            // 50-212 ms of work. The next cold tick sees `resumed_ready` and
+            // extracts the result without charging another window.
+            self.finish_segment(state, reading);
+            return Ok(DriveTerminal::Parked);
+        }
+
+        Ok(DriveTerminal::Ready)
+    }
+
+    /// Extract a callback's result value from a finished executor.
+    fn take_call_result(&mut self, stashed: &StashedExecutor) -> Result<host::LuaValue, VmError> {
+        let limits = self.marshalling_limits;
+        if self.lua.enter(|ctx| ctx.fetch(stashed).mode()) == ExecutorMode::HostSuspended {
+            return Err(VmError::Runtime(
+                "executor parked on a host operation after drive".to_string(),
+            ));
+        }
+        let outcome = self.lua.enter(|ctx| {
+            let exec = ctx.fetch(stashed);
+            match exec.take_result::<Value>(ctx) {
+                Ok(Ok(value)) => host::LuaValue::from_lua(value, limits).map_err(|e| e.to_string()),
+                Ok(Err(err)) => Err(crate::error::format_lua_error(ctx, &err)),
+                Err(err) => Err(format!("{err:?}")),
+            }
+        });
+        outcome.map_err(VmError::Runtime)
+    }
+
+    /// Invoke a command callback under the resumable RC-1 wall policy.
+    ///
+    /// Unlike [`LuaVm::call_function`], a callback that reaches the per-tick
+    /// wall budget parks with its executor, fuel, and cumulative clock intact
+    /// and returns [`InvocationOutcome::Parked`]; the owner resumes it on a
+    /// later cold tick with [`LuaVm::resume_parked_call`]. The callback body is
+    /// never restarted, so host calls that already returned are not repeated.
+    /// Cumulative active wall time is bounded by
+    /// [`LuaVm::callback_ceiling_ms`]; reaching it suspends the VM fail-closed
+    /// with [`SuspendReason::WallClockExceeded`].
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Runtime`] when the VM already holds a parked invocation,
+    /// [`VmError::Suspended`] when the VM is suspended, and runtime/load
+    /// errors from the callback itself.
+    pub fn call_function_resumable(
+        &mut self,
+        function: &host::StashedFunction,
+        args: &[host::LuaValue],
+    ) -> Result<InvocationOutcome, VmError> {
+        if self.parked.is_some() {
+            return Err(VmError::Runtime(
+                "vm already holds a parked invocation".to_string(),
+            ));
+        }
+        if let VmStatus::Suspended(reason) = &self.status {
+            return Err(VmError::Suspended {
+                reason: reason.clone(),
+            });
+        }
+        let stashed = self.lua.enter(|ctx| {
+            let func: phodopus::Function = ctx.fetch(function);
+            let argv: Vec<Value> = args.iter().map(|value| value.to_lua(ctx)).collect();
+            ctx.stash(Executor::start(ctx, func, Variadic(argv)))
+        });
+        self.begin_invocation();
+        let mut state = DriveState::new(stashed, self.instruction_budget);
+        match self.drive_state(&mut state, BudgetMark::now(), WallPolicy::Resumable)? {
+            DriveTerminal::Ready => {
+                let value = self.take_call_result(&state.stashed)?;
+                Ok(InvocationOutcome::Completed(value))
+            }
+            DriveTerminal::Parked => {
+                self.parked = Some(state);
+                Ok(InvocationOutcome::Parked)
+            }
+            DriveTerminal::Suspended(reason) => Err(VmError::Suspended { reason }),
+        }
+    }
+
+    /// Resume the parked callback on this cold tick.
+    ///
+    /// Returns [`InvocationOutcome::Parked`] when the callback used this
+    /// tick's wall window without finishing, and
+    /// [`InvocationOutcome::Completed`] once its result is available. The
+    /// executor is never restarted, so a completed host call never runs twice.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Runtime`] when no invocation is parked, plus the same
+    /// runtime/suspension errors as [`LuaVm::call_function_resumable`].
+    pub fn resume_parked_call(&mut self) -> Result<InvocationOutcome, VmError> {
+        let Some(mut state) = self.parked.take() else {
+            return Err(VmError::Runtime("no parked invocation".to_string()));
+        };
+        if let VmStatus::Suspended(reason) = &self.status {
+            return Err(VmError::Suspended {
+                reason: reason.clone(),
+            });
+        }
+        match self.drive_state(&mut state, BudgetMark::now(), WallPolicy::Resumable)? {
+            DriveTerminal::Ready => {
+                let value = self.take_call_result(&state.stashed)?;
+                Ok(InvocationOutcome::Completed(value))
+            }
+            DriveTerminal::Parked => {
+                self.parked = Some(state);
+                Ok(InvocationOutcome::Parked)
+            }
+            DriveTerminal::Suspended(reason) => Err(VmError::Suspended { reason }),
+        }
+    }
+
+    /// Drop one parked invocation (reload/dispose/suspend cancellation).
+    ///
+    /// Returns whether a park was present. The executor is released and the VM
+    /// stays usable; no callback body runs during cancellation.
+    pub fn cancel_parked_call(&mut self) -> bool {
+        self.parked.take().is_some()
     }
 
     /// Execute Lua source `code` with RC-1/RC-2 enforcement.
@@ -1612,6 +1909,11 @@ impl LuaVm {
         code: &str,
         synthetic_elapsed: Duration,
     ) -> Result<ExecuteOutcome, VmError> {
+        if self.parked.is_some() {
+            return Err(VmError::Runtime(
+                "vm holds a parked invocation; resume or cancel it before executing".to_string(),
+            ));
+        }
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),

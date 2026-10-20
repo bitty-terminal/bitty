@@ -976,6 +976,10 @@ impl TerminalApp {
                 self.surface_dispatch_result(COMPOSER_PLUGIN_ID, verb, &result);
                 Ok(())
             }
+            // bitty #2314: a command that reached the RC-1 wall budget is
+            // parked, not refused; the cold pump resumes it and surfaces its
+            // result on a later tick.
+            Err(error) if error.is_parked() => Ok(()),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -1778,6 +1782,20 @@ impl TerminalApp {
             .and_then(|runtime| runtime.timer_deadline())
     }
 
+    /// Immediate cold-tick wake while a command is parked at the RC-1 wall
+    /// budget (bitty #2314).
+    ///
+    /// A park must continue on a later `AboutToWait`; under `ControlFlow::Wait`
+    /// no further event may arrive, so joining `now` into the wake-min makes
+    /// the next loop iteration deliver the resume window. `None` when nothing
+    /// is parked, so idle wakeups are unchanged.
+    fn parked_command_deadline(&self) -> Option<std::time::Instant> {
+        self.plugin_runtime
+            .as_ref()
+            .filter(|runtime| runtime.parked_command_count() > 0)
+            .map(|_| std::time::Instant::now())
+    }
+
     /// Fire due one-shot plugin timers (CTX-1244).
     ///
     /// Cold-tick pump only (called from `drive_tick` before present, never
@@ -1998,6 +2016,9 @@ impl TerminalApp {
             Ok(result) => {
                 self.surface_dispatch_result(&click.plugin_id, &click.command, &result);
             }
+            // bitty #2314: parked work is accepted; the cold pump resumes it
+            // and surfaces the result exactly once.
+            Err(error) if error.is_parked() => {}
             Err(error) => {
                 crate::logging::warn(|| {
                     format!(
@@ -2043,6 +2064,7 @@ impl TerminalApp {
             Ok(result) => {
                 self.surface_dispatch_result(&click.plugin_id, &click.command, &result);
             }
+            Err(error) if error.is_parked() => {}
             Err(error) => {
                 crate::logging::warn(|| {
                     format!(
@@ -2114,6 +2136,7 @@ impl TerminalApp {
             Ok(result) => {
                 self.surface_dispatch_result(&scroll.plugin_id, &scroll.command, &result);
             }
+            Err(error) if error.is_parked() => {}
             Err(error) => {
                 crate::logging::warn(|| {
                     format!(
@@ -2157,6 +2180,7 @@ impl TerminalApp {
             Ok(result) => {
                 self.surface_dispatch_result(&scroll.plugin_id, &scroll.command, &result);
             }
+            Err(error) if error.is_parked() => {}
             Err(error) => {
                 crate::logging::warn(|| {
                     format!(
@@ -2208,6 +2232,41 @@ impl TerminalApp {
         self.pending_input_commands.push_back(action);
     }
 
+    /// Resumes commands parked at the RC-1 wall budget on the cold phase
+    /// (bitty #2314).
+    ///
+    /// Results and terminal failures are surfaced exactly once through the
+    /// same banner path as an immediate dispatch. Returns the number of
+    /// completed parked invocations that reached the surface.
+    fn pump_parked_plugin_commands(&mut self) -> usize {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return 0;
+        };
+        let completions = plugin_runtime.pump_parked_commands();
+        let completed = completions.len();
+        for completion in completions {
+            match completion.outcome {
+                Ok(result) => {
+                    self.surface_dispatch_result(
+                        completion.plugin.as_str(),
+                        &completion.command,
+                        &result,
+                    );
+                }
+                Err(error) => {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: parked command '{}:{}' refused ({error})",
+                            completion.plugin.as_str(),
+                            completion.command
+                        )
+                    });
+                }
+            }
+        }
+        completed
+    }
+
     /// Runs the exclusive cold delivery phase (CTX-1332, C-D1/C-D4/C-D5).
     ///
     /// Called from exactly one place: the `AboutToWait` arm, after
@@ -2223,13 +2282,19 @@ impl TerminalApp {
     /// stays queued. Each selected request is re-validated against the live
     /// presented origin before the VM borrow. Static keybinding command
     /// invocations queued by the input intercept (CTX-1324) drain on the same
-    /// phase, bounded by [`INPUT_COMMAND_QUEUE_CAPACITY`]. Returns the number
-    /// of attempts that reached dispatch (including refusals).
+    /// phase, bounded by [`INPUT_COMMAND_QUEUE_CAPACITY`]. Commands parked at
+    /// the RC-1 wall budget are resumed once per cold tick (bitty #2314);
+    /// still-parked work counts as an attempt, while a completed resume counts
+    /// as one delivered result. Returns attempts plus completed resumed parks.
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
+        // bitty #2314: resume commands parked by the previous cold tick
+        // before admitting new work. A resume advances at most one RC-1 wall
+        // window per plugin; a command that still needs work stays parked for
+        // the next tick. New parks created below wait until the next tick.
+        let mut attempted = self.pump_parked_plugin_commands();
         let admissions = self
             .runtime
             .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);
-        let mut attempted = 0usize;
         // Defense-in-depth: every `drive_tick` calls
         // `set_chrome_bands_with_mounts`, which eagerly retains only live
         // origins, so a surviving admission normally passes this check. It
@@ -2330,9 +2395,15 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return Err(String::from("plugin runtime is gone"));
         };
-        plugin_runtime
-            .invoke_command(qualified, args)
-            .map_err(|error| error.to_string())
+        match plugin_runtime.invoke_command(qualified, args) {
+            Ok(value) => Ok(value),
+            // bitty #2314: parked work is accepted, not refused. The cold pump
+            // resumes it and surfaces the eventual result; the boolean
+            // acknowledgement keeps the immediate banner path quiet so an
+            // empty nil result cannot surface before the command finishes.
+            Err(error) if error.is_parked() => Ok(LuaValue::Bool(false)),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Route post-intercept fall-through input into the capture queue
@@ -3507,6 +3578,10 @@ impl AppHandler for TerminalApp {
                 // `None` when no timers are armed, so unarmed idle stays
                 // on `set_wait` (zero-submit preserved).
                 let timers = self.plugin_timer_deadline();
+                // bitty #2314: a command parked at the RC-1 wall budget must
+                // resume on the next cold tick; arm an immediate wake so an
+                // otherwise idle window still delivers that tick.
+                let parked = self.parked_command_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -3515,6 +3590,7 @@ impl AppHandler for TerminalApp {
                     kitty_local,
                     coalesced,
                     timers,
+                    parked,
                 ]
                 .into_iter()
                 .flatten()

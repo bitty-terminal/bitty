@@ -333,37 +333,52 @@ pub fn band_regions_for(
 ) -> Result<Vec<BandItemRegion>, BandRegionError> {
     let (_, runs) = flatten_band_runs(&band.root);
     let mut regions: Vec<BandItemRegion> = Vec::new();
+    let mut count = 0usize;
+    // Identity and end column of the trailing distinct region, used both for
+    // adjacent-merge detection and to keep counting past the cap.
+    let mut trailing: Option<(UiRegion, usize)> = None;
     for run in runs {
         let Some(region) = run.region else {
+            trailing = None;
             continue;
         };
         let start = run.start_col.min(window_width);
         let end = run.end_col.min(window_width);
         if start >= end {
-            // Entirely clipped past the painted bounds.
+            // Entirely clipped past the painted bounds; it breaks adjacency.
+            trailing = None;
             continue;
         }
-        if let Some(back) = regions.last_mut() {
-            if back.region == region && back.end_col == start {
-                back.end_col = end;
+        if let Some((previous, previous_end)) = &trailing {
+            if previous == &region && *previous_end == start {
+                if let Some(back) = regions.last_mut() {
+                    if back.region == region {
+                        back.end_col = end;
+                    }
+                }
+                trailing = Some((region, end));
                 continue;
             }
         }
-        if regions.len() >= BAND_MAX_REGIONS {
-            return Err(BandRegionError::Overflow {
-                count: regions.len().saturating_add(1),
-                max: BAND_MAX_REGIONS,
+        count = count.saturating_add(1);
+        if regions.len() < BAND_MAX_REGIONS {
+            regions.push(BandItemRegion {
+                plugin_id: band.plugin_id.clone(),
+                edge,
+                visible_index,
+                row,
+                region: region.clone(),
+                start_col: start,
+                end_col: end,
+                version: band.version,
             });
         }
-        regions.push(BandItemRegion {
-            plugin_id: band.plugin_id.clone(),
-            edge,
-            visible_index,
-            row,
-            region,
-            start_col: start,
-            end_col: end,
-            version: band.version,
+        trailing = Some((region, end));
+    }
+    if count > BAND_MAX_REGIONS {
+        return Err(BandRegionError::Overflow {
+            count,
+            max: BAND_MAX_REGIONS,
         });
     }
     Ok(regions)
@@ -663,17 +678,17 @@ pub enum BandColumnOutcome {
 
 /// Resolves a flattened-text column into its click outcome (CTX-0946 C1).
 ///
-/// Pure over one band: finds the run owning `char_idx` (display-cell
-/// column) and splits its command against `owner`. Pure for headless tests;
-/// geometry (which band owns the row) lives on [`Runtime::plugin_band_hit`].
+/// Pure over one band: finds the run owning `col` (display-cell column) and
+/// splits its command against `owner`. Pure for headless tests; geometry
+/// (which band owns the row) lives on [`Runtime::plugin_band_hit`].
 #[must_use]
 pub fn resolve_click_in_band(
     owner: &str,
     runs: &[BandRun],
-    char_idx: usize,
+    col: usize,
     button: BandButton,
 ) -> BandColumnOutcome {
-    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
+    let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
         return BandColumnOutcome::NoClaim;
     };
     let Some(click) = run.on_click.as_ref() else {
@@ -707,9 +722,9 @@ pub fn resolve_click_in_band(
 /// identity instead (issue #2248), so a merged multi-leaf region is one
 /// item.
 #[must_use]
-pub fn find_run_index(runs: &[BandRun], char_idx: usize) -> Option<usize> {
+pub fn find_run_index(runs: &[BandRun], col: usize) -> Option<usize> {
     runs.iter()
-        .position(|run| char_idx >= run.start_col && char_idx < run.end_col)
+        .position(|run| col >= run.start_col && col < run.end_col)
 }
 
 /// Resolves a click on one declared region (issue #2248).
@@ -722,11 +737,11 @@ fn resolve_click_for_region(
     owner: &str,
     runs: &[BandRun],
     region: &UiRegion,
-    char_idx: usize,
+    col: usize,
     button: BandButton,
 ) -> BandColumnOutcome {
     let Some(run) = runs.iter().find(|run| {
-        char_idx >= run.start_col && char_idx < run.end_col && run.region.as_ref() == Some(region)
+        col >= run.start_col && col < run.end_col && run.region.as_ref() == Some(region)
     }) else {
         return BandColumnOutcome::NoClaim;
     };
@@ -752,10 +767,10 @@ fn resolve_scroll_for_region(
     owner: &str,
     runs: &[BandRun],
     region: &UiRegion,
-    char_idx: usize,
+    col: usize,
 ) -> BandScrollOutcome {
     let Some(run) = runs.iter().find(|run| {
-        char_idx >= run.start_col && char_idx < run.end_col && run.region.as_ref() == Some(region)
+        col >= run.start_col && col < run.end_col && run.region.as_ref() == Some(region)
     }) else {
         return BandScrollOutcome::NoClaim;
     };
@@ -871,14 +886,14 @@ pub struct BandScrollTarget {
 
 /// Resolves a flattened-text column into its scroll outcome (CTX-1190).
 ///
-/// Pure over one band: finds the run owning `char_idx` (display-cell
-/// column) and splits its `on_scroll` command against `owner`, mirroring
+/// Pure over one band: finds the run owning `col` (display-cell column) and
+/// splits its `on_scroll` command against `owner`, mirroring
 /// [`resolve_click_in_band`]. Geometry (which band owns the row) lives on
 /// [`Runtime::plugin_band_hit`]; the wheel step joins in
 /// [`Runtime::band_scroll`].
 #[must_use]
-pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> BandScrollOutcome {
-    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
+pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], col: usize) -> BandScrollOutcome {
+    let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
         return BandScrollOutcome::NoClaim;
     };
     let Some(scroll) = run.on_scroll.as_ref() else {
@@ -1012,10 +1027,10 @@ pub struct BandHit {
     pub visible_index: usize,
     /// Window row the band paints (window cells).
     pub row: u16,
-    /// Display-cell column into the flattened band text.
-    pub char_idx: usize,
-    /// Display-cell column inside the band row (the region rect unit,
-    /// issue #2248).
+    /// Display-cell column inside the band row, measured with the same
+    /// [`char_cell_width`](bitty_term_state::char_cell_width) rules as
+    /// [`BandRun::start_col`]/[`BandRun::end_col`]. This is the unit every
+    /// hit-test consumer uses, including region rects (issue #2248).
     pub col: usize,
 }
 
@@ -1260,12 +1275,10 @@ impl Runtime {
             return None;
         }
         let col = usize::try_from(cell_col).unwrap_or(usize::MAX);
-        let char_idx = cell_col_to_char_idx(&text, col);
         Some(BandHit {
             edge: row_hit.edge,
             visible_index: row_hit.visible_index,
             row: row_hit.row,
-            char_idx,
             col,
         })
     }
@@ -1367,9 +1380,8 @@ impl Runtime {
     ///
     /// Shared by [`Self::band_press`] and [`Self::band_release`] so both
     /// sides classify identically: past-text is `NoClaim` (the width guard
-    /// in [`Self::plugin_band_hit`], never the saturating tail of
-    /// [`cell_col_to_char_idx`]). A declared region resolves to that item;
-    /// a bare interactive span keeps the legacy span target.
+    /// in [`Self::plugin_band_hit`]). A declared region resolves to that
+    /// item; a bare interactive span keeps the legacy span target.
     fn band_target_at(
         &self,
         pos: CursorPosition,
@@ -1398,15 +1410,15 @@ impl Runtime {
         };
         let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
         let outcome = match declared.as_ref() {
-            Some(region) => resolve_click_for_region(&owner, &runs, region, hit.char_idx, button),
-            None => resolve_click_in_band(&owner, &runs, hit.char_idx, button),
+            Some(region) => resolve_click_for_region(&owner, &runs, region, hit.col, button),
+            None => resolve_click_in_band(&owner, &runs, hit.col, button),
         };
         match outcome {
             BandColumnOutcome::Hit(request) => {
                 let key = match request.region.clone() {
                     Some(region) => BandTargetKey::Region(region),
                     None => {
-                        let Some(run) = find_run_index(&runs, hit.char_idx) else {
+                        let Some(run) = find_run_index(&runs, hit.col) else {
                             // Unreachable (a Hit always owns a run); fail closed.
                             return PressedBandTarget::NoClaim;
                         };
@@ -1883,8 +1895,8 @@ impl Runtime {
         };
         let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
         let outcome = match declared.as_ref() {
-            Some(region) => resolve_scroll_for_region(&owner, &runs, region, hit.char_idx),
-            None => resolve_scroll_in_band(&owner, &runs, hit.char_idx),
+            Some(region) => resolve_scroll_for_region(&owner, &runs, region, hit.col),
+            None => resolve_scroll_in_band(&owner, &runs, hit.col),
         };
         match outcome {
             BandScrollOutcome::Hit(mut target) => {
@@ -1977,23 +1989,6 @@ impl Runtime {
     pub fn band_host_stats(&self) -> BandHostStats {
         self.band_stats
     }
-}
-
-/// Maps a display-cell column to a char index in `text` (CTX-0946 C1).
-///
-/// Walks with [`char_cell_width`](bitty_term_state::char_cell_width) — the
-/// same widths the paint path lays out — so a pointer column and its glyph
-/// agree. Saturates at the last char for out-of-range columns.
-fn cell_col_to_char_idx(text: &str, cell_col: usize) -> usize {
-    let mut cells = 0usize;
-    for (idx, ch) in text.chars().enumerate() {
-        let width = usize::from(bitty_term_state::char_cell_width(ch));
-        if cell_col < cells.saturating_add(width) {
-            return idx;
-        }
-        cells = cells.saturating_add(width);
-    }
-    text.chars().count().saturating_sub(1)
 }
 
 #[cfg(test)]

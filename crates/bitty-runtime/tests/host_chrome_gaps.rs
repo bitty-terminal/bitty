@@ -1016,6 +1016,26 @@ fn region_scroll_text(text: &str, id: &str) -> UiNode {
     }
 }
 
+fn region_both_text(text: &str, id: &str, kind: UiRegionKind) -> UiNode {
+    let declared = region(id, kind);
+    UiNode::Text {
+        text: text.to_string(),
+        fg: None,
+        bg: None,
+        bold: None,
+        on_click: Some(ClickCommand {
+            command: "test-bar:open".to_string(),
+            args: vec![("shared".to_string(), ClickArg::Number(7.0))],
+            region: Some(declared.clone()),
+        }),
+        on_scroll: Some(ClickCommand {
+            command: "test-bar:step".to_string(),
+            args: vec![("shared".to_string(), ClickArg::Number(7.0))],
+            region: Some(declared),
+        }),
+    }
+}
+
 fn click_button_at(rt: &mut Runtime, row: u16, col: u16, button: MouseButton) {
     rt.handle_cursor_moved(cell_pixels(rt, row, col));
     rt.handle_mouse_input(bitty_platform::MouseEvent::new(button, PressState::Pressed));
@@ -1321,9 +1341,119 @@ fn ignoring_regions_would_misroute_adjacent_items() {
 }
 
 #[test]
+fn wide_prefix_click_and_scroll_resolve_by_display_column() {
+    // Display-cell columns are authoritative for run lookup. A wide prefix
+    // (`你` = 2 cells, 1 char) shifts char indices behind display columns;
+    // resolving with the char index would miss the `BC` run entirely.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            plain("你A"),
+            region_both_text("BC", "wide", UiRegionKind::Item),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+
+    // `B` is display column 3; the old char-index path would use 2 and hit
+    // the unbound prefix.
+    click_at(&mut rt, row, 3);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1, "wide prefix click must route the BC item");
+    assert_eq!(clicks[0].command, "open");
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("wide")
+    );
+
+    // `C` is display column 4: the wheel must resolve the same run.
+    wheel_at(&mut rt, row, 4, 1.0);
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1, "wide prefix wheel must route the BC item");
+    assert_eq!(scrolls[0].command, "step");
+    assert_eq!(
+        scrolls[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("wide")
+    );
+
+    // The wide prefix itself remains unclaimed.
+    click_at(&mut rt, row, 1);
+    assert!(rt.drain_band_clicks().is_empty());
+}
+
+#[test]
+fn combining_prefix_click_and_scroll_resolve_by_display_column() {
+    // A combining mark adds chars without adding cells; the display column
+    // still owns the run.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            plain("e\u{301}"),
+            region_both_text("BC", "combining", UiRegionKind::Item),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    click_at(&mut rt, row, 1);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("combining")
+    );
+    wheel_at(&mut rt, row, 2, 1.0);
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1);
+    assert_eq!(
+        scrolls[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("combining")
+    );
+}
+
+#[test]
+fn merged_region_press_and_release_on_different_leaves_routes_once() {
+    // Mutation guard for the region table: two adjacent leaves share one
+    // region identity and one command. Pressing the first and releasing on
+    // the second is one item, so the region table is what makes it dispatch.
+    // If hit-testing ignored regions, press/release would pair by run index
+    // and route nothing.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            region_text("AB", "group", UiRegionKind::Module, "test-bar:open"),
+            region_text("CD", "group", UiRegionKind::Module, "test-bar:open"),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 0));
+    rt.handle_mouse_input(press());
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 3));
+    rt.handle_mouse_input(release());
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(
+        clicks.len(),
+        1,
+        "one merged item routes exactly once across its leaves"
+    );
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("group")
+    );
+    assert_eq!(rt.band_host_stats().clicks_routed, 1);
+    assert_eq!(rt.band_host_stats().clicks_unclaimed, 0);
+}
+
+#[test]
 fn region_overflow_fails_closed_with_the_cap() {
     let mut rt = minimal_runtime();
-    let items: Vec<UiNode> = (0..=BAND_MAX_REGIONS)
+    // Ten items past the cap: the diagnostic must report the true distinct
+    // count, not `max + 1`.
+    let count = BAND_MAX_REGIONS + 10;
+    let items: Vec<UiNode> = (0..count)
         .map(|index| {
             region_text(
                 "x",
@@ -1338,7 +1468,7 @@ fn region_overflow_fails_closed_with_the_cap() {
     assert_eq!(
         rt.band_item_regions(BandEdge::Bottom, 0),
         Err(BandRegionError::Overflow {
-            count: BAND_MAX_REGIONS + 1,
+            count,
             max: BAND_MAX_REGIONS,
         })
     );

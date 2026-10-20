@@ -31,9 +31,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use bitty_lua::{
-    BridgeError, COMPONENT_CLASS_BUDGET, COMPONENT_CLASS_TIMEOUT, COMPONENT_HEADERS_MAX,
-    COMPONENT_REQUEST_MAX_BYTES, COMPONENT_RESPONSE_MAX_BYTES, ComponentBridgeOutcome,
-    ComponentBridgeRequest, ComponentMethod, component_bridge_error, component_response_value,
+    BridgeError, COMPONENT_CLASS_BUDGET, COMPONENT_CLASS_TIMEOUT, COMPONENT_HEADER_MAX_BYTES,
+    COMPONENT_HEADERS_MAX, COMPONENT_REQUEST_MAX_BYTES, COMPONENT_RESPONSE_MAX_BYTES,
+    ComponentBridgeOutcome, ComponentBridgeRequest, ComponentMethod, component_bridge_error,
+    component_response_value,
 };
 
 use crate::component::{
@@ -214,14 +215,47 @@ impl ComponentRequestQueue {
         let ticket = in_flight.ticket;
         match &event.kind {
             BrokerEventKind::Head { status, headers } => {
+                // The request path rejects a header above the same documented
+                // bound. Fail the response closed instead of truncating, so a
+                // plugin never mistakes a partial header set for the answer.
+                let retained = self
+                    .partial
+                    .get(&event.id)
+                    .map_or(0, |partial| partial.headers.len());
+                if retained.saturating_add(headers.len()) > COMPONENT_HEADERS_MAX {
+                    self.finish_failure(
+                        event.id,
+                        &plugin_id,
+                        ticket,
+                        COMPONENT_CLASS_BUDGET,
+                        &format!(
+                            "component response exceeds the {COMPONENT_HEADERS_MAX}-header bridge budget"
+                        ),
+                    );
+                    return;
+                }
+                if headers.iter().any(|(name, value)| {
+                    name.len() > COMPONENT_HEADER_MAX_BYTES
+                        || value.len() > COMPONENT_HEADER_MAX_BYTES
+                }) {
+                    self.finish_failure(
+                        event.id,
+                        &plugin_id,
+                        ticket,
+                        COMPONENT_CLASS_BUDGET,
+                        &format!(
+                            "component response header name/value exceeds the {COMPONENT_HEADER_MAX_BYTES}-byte bridge budget"
+                        ),
+                    );
+                    return;
+                }
                 let partial = self.partial.entry(event.id).or_default();
                 partial.status = *status;
-                for (name, value) in headers {
-                    if partial.headers.len() >= COMPONENT_HEADERS_MAX {
-                        break;
-                    }
-                    partial.headers.push((name.clone(), value.clone()));
-                }
+                partial.headers.extend(
+                    headers
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
             }
             BrokerEventKind::Body { data, last } => {
                 let exceeds = self.partial.get(&event.id).is_none_or(|partial| {
@@ -547,6 +581,121 @@ mod tests {
                 assert_eq!(class, COMPONENT_CLASS_BUDGET);
             }
             other => panic!("expected a budget failure, got {other:?}"),
+        }
+    }
+
+    /// Queue and bind one ticket to broker request `id`.
+    fn bound_queue(id: u64) -> (ComponentRequestQueue, u64) {
+        let mut queue = ComponentRequestQueue::new();
+        let now = Instant::now();
+        let ticket = queue
+            .enqueue(PLUGIN, HASH, request(None), now)
+            .expect("enqueue");
+        queue.bind(
+            ticket,
+            PLUGIN,
+            RequestId::for_test(id),
+            now + Duration::from_secs(1),
+        );
+        (queue, ticket)
+    }
+
+    fn assert_header_budget_failure(
+        mut queue: ComponentRequestQueue,
+        ticket: u64,
+        id: u64,
+        expected_message: &str,
+    ) {
+        assert_eq!(queue.take_cancelled(), vec![RequestId::for_test(id)]);
+        assert_eq!(queue.in_flight(), 0, "the refused request is cancelled");
+        match queue.poll(PLUGIN, ticket).expect("poll") {
+            ComponentPollOutcome::Ready(ComponentBridgeOutcome::Failed { class, message }) => {
+                assert_eq!(class, COMPONENT_CLASS_BUDGET);
+                assert!(
+                    message.contains(expected_message),
+                    "unexpected failure message: {message}"
+                );
+            }
+            other => panic!("expected a budget failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_header_name_over_the_bridge_budget_fails_and_cancels() {
+        let id = 21;
+        let (mut queue, ticket) = bound_queue(id);
+        queue.deliver(&event(
+            id,
+            BrokerEventKind::Head {
+                status: 200,
+                headers: vec![("n".repeat(COMPONENT_HEADER_MAX_BYTES + 1), "v".to_string())],
+            },
+        ));
+        assert_header_budget_failure(queue, ticket, id, "header name/value exceeds");
+    }
+
+    #[test]
+    fn response_header_value_over_the_bridge_budget_fails_and_cancels() {
+        let id = 22;
+        let (mut queue, ticket) = bound_queue(id);
+        queue.deliver(&event(
+            id,
+            BrokerEventKind::Head {
+                status: 200,
+                headers: vec![("x".to_string(), "v".repeat(COMPONENT_HEADER_MAX_BYTES + 1))],
+            },
+        ));
+        assert_header_budget_failure(queue, ticket, id, "header name/value exceeds");
+    }
+
+    #[test]
+    fn response_header_count_over_the_bridge_budget_fails_and_cancels() {
+        let id = 23;
+        let (mut queue, ticket) = bound_queue(id);
+        let headers = (0..=COMPONENT_HEADERS_MAX)
+            .map(|index| (format!("x-{index}"), "v".to_string()))
+            .collect();
+        queue.deliver(&event(
+            id,
+            BrokerEventKind::Head {
+                status: 200,
+                headers,
+            },
+        ));
+        assert_header_budget_failure(queue, ticket, id, "16-header bridge budget");
+    }
+
+    #[test]
+    fn response_headers_at_the_bridge_budget_complete() {
+        let id = 24;
+        let (mut queue, ticket) = bound_queue(id);
+        let headers: Vec<_> = (0..COMPONENT_HEADERS_MAX)
+            .map(|index| (format!("x-{index}"), "v".repeat(COMPONENT_HEADER_MAX_BYTES)))
+            .collect();
+        queue.deliver(&event(
+            id,
+            BrokerEventKind::Head {
+                status: 200,
+                headers,
+            },
+        ));
+        queue.deliver(&event(
+            id,
+            BrokerEventKind::Body {
+                data: b"hello".to_vec(),
+                last: true,
+            },
+        ));
+        match queue.poll(PLUGIN, ticket).expect("poll") {
+            ComponentPollOutcome::Ready(ComponentBridgeOutcome::Response { headers, .. }) => {
+                assert_eq!(headers.len(), COMPONENT_HEADERS_MAX);
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(_, value)| value.len() == COMPONENT_HEADER_MAX_BYTES)
+                );
+            }
+            other => panic!("expected a bounded response, got {other:?}"),
         }
     }
 

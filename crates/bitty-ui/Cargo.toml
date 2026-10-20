@@ -15,6 +15,14 @@ workspace = true
 
 [dependencies]
 bitty-term-state = { version = "0.0.24", path = "../bitty-term-state" }
+# CTX-1362 / #2257: the accepted W-134 snapshot-model seam. The extension
+# owns `Role`/`SceneKind`/`SnapshotBuilder`/`Adapter` and the bounded host
+# contract; Core implements `SnapshotHost` over its terminal projection and
+# keeps derivation, focus association, and validation. This is the only
+# Core library edge to `bitty-a11y`; the W-147 fence records it deliberately
+# (`SEAM_CRATES` plus the `SOURCE_SEAM_FILES` restriction in
+# verify_w147_small_core_graph.rs).
+bitty-a11y = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-a11y", rev = "8e02ab5" }
 
 
 [dev-dependencies]

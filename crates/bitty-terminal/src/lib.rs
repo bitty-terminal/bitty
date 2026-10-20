@@ -14,6 +14,7 @@
 #![cfg(not(test))]
 
 pub mod component;
+pub mod component_bridge;
 #[doc(hidden)]
 pub mod component_host;
 mod component_seed;

@@ -16,12 +16,13 @@ use bitty_config::theme::CustomPalette;
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
-    BridgeError, CommandCatalogEntry, E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES,
-    FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES, HistoryQueryOp, HistoryQueryRequest,
-    HistoryQuerySource, HostServices, LuaValue, LuaVm, OVERLAY_CALL_MAX_BYTES,
-    OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES, OverlayInput, OverlayPoll,
-    SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, ThemeTable, WORKSPACE_LIST_MAX_ITEMS,
-    WorkspaceInfo, WorkspaceRequest, env_grant_shape_ok, validate_env_key,
+    BridgeError, COMPONENT_CLASS_CAPABILITY_DENIED, CommandCatalogEntry, ComponentBridgeRequest,
+    E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
+    HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm,
+    OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
+    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction, ThemeTable,
+    WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest, component_bridge_error,
+    env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_rich::{
@@ -50,6 +51,7 @@ use super::history::{
     history_error, history_page_value, history_source, history_unavailable,
 };
 
+use super::component_requests::{ComponentPollOutcome, ComponentRequestQueue, outcome_value};
 use super::debug::{self, DebugView, TraceHub, TraceRequest};
 use super::fs_list::{FsListBackend, FsListEntry};
 use super::overlay::{
@@ -1770,6 +1772,20 @@ pub struct PluginServices {
     fs_gate: RefCell<FsGate>,
     /// Start of the current `fs.list` rate window.
     fs_window_start: Cell<Instant>,
+    /// Runtime-shared bounded component request surface (CTX-2254,
+    /// bitty#2254).
+    ///
+    /// Shared with every generation; authorization stays with the runtime and
+    /// the per-generation capability snapshot below, so the queue carries no
+    /// authority. `None` leaves `bitty.component.*` failing closed with
+    /// `E_NOT_IMPLEMENTED`.
+    component_queue: RefCell<Option<Rc<RefCell<ComponentRequestQueue>>>>,
+    /// Manifest generation this services object belongs to (CTX-2254).
+    ///
+    /// Set once at activation from the parsed manifest; component requests
+    /// carry it so the runtime can refuse a stale generation instead of
+    /// serving it under the new one.
+    component_manifest_hash: RefCell<Option<String>>,
 }
 
 impl PluginServices {
@@ -1847,6 +1863,8 @@ impl PluginServices {
             fs_backend: RefCell::new(None),
             fs_gate: RefCell::new(FsGate::new(fs_list_caps())),
             fs_window_start: Cell::new(Instant::now()),
+            component_queue: RefCell::new(None),
+            component_manifest_hash: RefCell::new(None),
         }
     }
 
@@ -1888,6 +1906,27 @@ impl PluginServices {
     /// it the verb keeps failing closed with `E_NOT_IMPLEMENTED`.
     pub fn set_fs_backend(&self, backend: Option<Rc<FsListBackend>>) {
         *self.fs_backend.borrow_mut() = backend;
+    }
+
+    /// Share the runtime's bounded component request queue (CTX-2254).
+    ///
+    /// Shared with every generation; the call-time gate in
+    /// [`HostServices::component_request`] reads this generation's own granted
+    /// capabilities and manifest generation, so the queue itself carries no
+    /// authority. `None` leaves the verb failing closed with
+    /// `E_NOT_IMPLEMENTED`.
+    pub fn set_component_queue(&self, queue: Option<Rc<RefCell<ComponentRequestQueue>>>) {
+        *self.component_queue.borrow_mut() = queue;
+    }
+
+    /// Bind this generation's manifest hash for component attribution
+    /// (CTX-2254).
+    ///
+    /// Set once at activation from the parsed manifest, never from Lua: the
+    /// runtime compares it against the registered generation and refuses a
+    /// request from a stale generation.
+    pub fn set_component_manifest_hash(&self, hash: Option<String>) {
+        *self.component_manifest_hash.borrow_mut() = hash;
     }
 
     /// Reset the per-plugin `fs.list` window once the accepted window elapsed.
@@ -2828,6 +2867,57 @@ impl HostServices for PluginServices {
             max_entries,
             Instant::now() + super::fs_list::LIST_SCAN_BUDGET,
         )
+    }
+
+    /// Enqueue one bounded native-component request (CTX-2254, bitty#2254).
+    ///
+    /// Enqueue-time gate only: the generation must hold a granted
+    /// `network.connect` capability and carry its manifest generation, and the
+    /// queue must have room. The runtime re-authorizes canonically
+    /// (`Runtime::submit_component_request`) before anything reaches the
+    /// broker, so this check can never widen authority; it only keeps a
+    /// generation that could never be authorized from consuming the queue.
+    fn component_request(&self, request: &ComponentBridgeRequest) -> Result<u64, BridgeError> {
+        let queue = self
+            .component_queue
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.component.request"))?;
+        let granted = self.granted_capabilities.borrow();
+        if !granted
+            .iter()
+            .any(|capability| capability.starts_with("network.connect"))
+        {
+            return Err(component_bridge_error(
+                COMPONENT_CLASS_CAPABILITY_DENIED,
+                "the plugin generation holds no granted network.connect capability",
+            ));
+        }
+        drop(granted);
+        let manifest_hash = self
+            .component_manifest_hash
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.component.request"))?;
+        queue.borrow_mut().enqueue(
+            &self.plugin_id,
+            &manifest_hash,
+            request.clone(),
+            Instant::now(),
+        )
+    }
+
+    /// Read one completed component request (CTX-2254, bitty#2254).
+    fn component_poll(&self, ticket: u64) -> Result<Option<LuaValue>, BridgeError> {
+        let queue = self
+            .component_queue
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.component.poll"))?;
+        match queue.borrow_mut().poll(&self.plugin_id, ticket)? {
+            ComponentPollOutcome::Pending => Ok(None),
+            ComponentPollOutcome::Ready(outcome) => outcome_value(&outcome).map(Some),
+        }
     }
 
     fn fs_list_with_expiry(

@@ -19,10 +19,11 @@
 //! layer's move over [`Runtime::drain_band_clicks`](bitty_runtime::Runtime);
 //! the queue contents pinned here are its contract.
 
-use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiSlot};
+use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiRegion, UiRegionKind, UiSlot};
 use bitty_platform::{CursorPosition, MouseButton, PressState};
 use bitty_runtime::{
-    BandContent, BandEdge, BandMount, ChromeBands, Runtime, UiRect, band_click_args_table,
+    BAND_MAX_REGIONS, BandButton, BandContent, BandEdge, BandItemRegion, BandMount,
+    BandRegionError, ChromeBands, Runtime, UiRect, band_click_args_table, resolve_item_region,
 };
 
 fn minimal_runtime() -> Runtime {
@@ -58,6 +59,7 @@ fn pill(text: &str, id: f64) -> UiNode {
         on_click: Some(ClickCommand {
             command: "test-bar:focus".to_string(),
             args: vec![("id".to_string(), ClickArg::Number(id))],
+            region: None,
         }),
         on_scroll: None,
     }
@@ -215,6 +217,7 @@ fn overlapping_foreign_claim_is_denied_never_routed() {
             on_click: Some(ClickCommand {
                 command: "other-plugin:focus".to_string(),
                 args: Vec::new(),
+                region: None,
             }),
             on_scroll: None,
         }]),
@@ -417,14 +420,22 @@ fn press_drag_across_bands_fires_nothing() {
 
 #[test]
 fn click_args_encode_as_one_named_table() {
-    let table = band_click_args_table(&[
-        ("id".to_string(), ClickArg::Number(2.0)),
-        ("name".to_string(), ClickArg::String("ws".to_string())),
-    ]);
+    let table = band_click_args_table(
+        &[
+            ("id".to_string(), ClickArg::Number(2.0)),
+            ("name".to_string(), ClickArg::String("ws".to_string())),
+        ],
+        None,
+        bitty_runtime::BandButton::Left,
+    );
     let bitty_lua::host::LuaValue::Table(pairs) = table else {
         panic!("click args must encode as one table");
     };
-    assert_eq!(pairs.len(), 2);
+    assert_eq!(
+        pairs.len(),
+        2,
+        "a legacy region-less click keeps its pre-2248 payload"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +685,7 @@ fn scroll_pill(text: &str) -> UiNode {
         on_scroll: Some(ClickCommand {
             command: "test-bar:scroll".to_string(),
             args: vec![("step".to_string(), ClickArg::Number(2.0))],
+            region: None,
         }),
     }
 }
@@ -776,6 +788,7 @@ fn band_scroll_with_foreign_command_is_denied() {
             on_scroll: Some(ClickCommand {
                 command: "other-plugin:scroll".to_string(),
                 args: Vec::new(),
+                region: None,
             }),
         }]),
     );
@@ -960,4 +973,457 @@ fn cancellation_drops_queued_admissions_and_keeps_the_release_swallow() {
         !rt.band_release_armed(),
         "the invalidated action consumes its release"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2248: per-item hit regions (click/scroll per module)
+// ---------------------------------------------------------------------------
+
+fn region(id: &str, kind: UiRegionKind) -> UiRegion {
+    UiRegion {
+        id: id.to_string(),
+        kind,
+    }
+}
+
+fn region_text(text: &str, id: &str, kind: UiRegionKind, command: &str) -> UiNode {
+    UiNode::Text {
+        text: text.to_string(),
+        fg: None,
+        bg: None,
+        bold: None,
+        on_click: Some(ClickCommand {
+            command: command.to_string(),
+            args: vec![("shared".to_string(), ClickArg::Number(7.0))],
+            region: Some(region(id, kind)),
+        }),
+        on_scroll: None,
+    }
+}
+
+fn region_scroll_text(text: &str, id: &str) -> UiNode {
+    UiNode::Text {
+        text: text.to_string(),
+        fg: None,
+        bg: None,
+        bold: None,
+        on_click: None,
+        on_scroll: Some(ClickCommand {
+            command: "test-bar:step".to_string(),
+            args: vec![("shared".to_string(), ClickArg::Number(7.0))],
+            region: Some(region(id, UiRegionKind::Module)),
+        }),
+    }
+}
+
+fn click_button_at(rt: &mut Runtime, row: u16, col: u16, button: MouseButton) {
+    rt.handle_cursor_moved(cell_pixels(rt, row, col));
+    rt.handle_mouse_input(bitty_platform::MouseEvent::new(button, PressState::Pressed));
+    rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+        button,
+        PressState::Released,
+    ));
+}
+
+#[test]
+fn band_regions_round_trip_with_kind_and_clipped_rects() {
+    // Region identity survives the Lua→Core data path, and Core derives the
+    // rect from the same painted spans: no plugin-supplied coordinates.
+    let mut rt = minimal_runtime();
+    let long = "x".repeat(120);
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            region_text("ws1", "ws:1", UiRegionKind::Item, "test-bar:focus"),
+            plain(" "),
+            region_text(&long, "clock", UiRegionKind::Module, "test-bar:clock"),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    let regions = rt
+        .band_item_regions(BandEdge::Bottom, 0)
+        .expect("regions emit");
+    assert_eq!(regions.len(), 2);
+    assert_eq!(regions[0].plugin_id, "test-bar");
+    assert_eq!(regions[0].region.id, "ws:1");
+    assert_eq!(regions[0].region.kind, UiRegionKind::Item);
+    assert_eq!((regions[0].start_col, regions[0].end_col), (0, 3));
+    assert_eq!(regions[0].row, row);
+    assert_eq!(regions[0].version, 1);
+    assert_eq!(regions[1].region.id, "clock");
+    assert_eq!(regions[1].region.kind, UiRegionKind::Module);
+    assert_eq!(regions[1].start_col, 4);
+    assert_eq!(
+        regions[1].end_col,
+        usize::from(rt.window_cells().width),
+        "a region is clipped to the painted window bounds"
+    );
+    assert_eq!(
+        rt.band_item_regions(BandEdge::Top, 0),
+        Err(BandRegionError::MissingBand)
+    );
+}
+
+#[test]
+fn adjacent_spans_with_one_identity_merge_into_one_item() {
+    // A module composed of several leaves (icon + label) is one item, not
+    // one item per leaf.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            region_text("ab", "group", UiRegionKind::Module, "test-bar:go"),
+            region_text("cd", "group", UiRegionKind::Module, "test-bar:go"),
+        ]),
+    );
+    rt.tick();
+    let regions = rt
+        .band_item_regions(BandEdge::Bottom, 0)
+        .expect("regions emit");
+    assert_eq!(regions.len(), 1);
+    assert_eq!((regions[0].start_col, regions[0].end_col), (0, 4));
+}
+
+#[test]
+fn overlapping_regions_tie_break_last_registered() {
+    // Emitted tables are disjoint; the resolver still documents a
+    // deterministic rule for any future overlapping source.
+    let item = |id: &str, start_col: usize, end_col: usize| BandItemRegion {
+        plugin_id: "test-bar".to_string(),
+        edge: BandEdge::Bottom,
+        visible_index: 0,
+        row: 10,
+        region: region(id, UiRegionKind::Item),
+        start_col,
+        end_col,
+        version: 1,
+    };
+    let regions = vec![item("a", 0, 4), item("b", 2, 6)];
+    assert_eq!(resolve_item_region(&regions, 1).expect("a").region.id, "a");
+    assert_eq!(
+        resolve_item_region(&regions, 3)
+            .expect("last registered wins")
+            .region
+            .id,
+        "b"
+    );
+    assert_eq!(resolve_item_region(&regions, 5).expect("b").region.id, "b");
+    assert!(resolve_item_region(&regions, 6).is_none());
+}
+
+#[test]
+fn adjacent_regions_dispatch_to_their_own_item() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            region_text("CLOCK", "clock", UiRegionKind::Module, "test-bar:open"),
+            region_text("VOL", "volume", UiRegionKind::Module, "test-bar:step"),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    click_at(&mut rt, row, 1);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].command, "open");
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("clock")
+    );
+    assert_eq!(clicks[0].button, BandButton::Left);
+
+    click_at(&mut rt, row, 6);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].command, "step");
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("volume")
+    );
+}
+
+#[test]
+fn right_and_middle_band_clicks_route_buttons_without_clipboard_authority() {
+    let mut rt = minimal_runtime();
+    rt.force_headless_clipboard();
+    rt.clipboard_mut()
+        .set_text("secret".to_string())
+        .expect("headless set");
+    rt.set_primary_text("primary-secret".to_string());
+    rt.drain_pending_input();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![region_text(
+            "clock",
+            "clock",
+            UiRegionKind::Module,
+            "test-bar:open",
+        )]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+
+    click_button_at(&mut rt, row, 1, MouseButton::Right);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].button, BandButton::Right);
+    assert!(
+        rt.pending_input().is_empty(),
+        "right click on chrome never pastes the clipboard"
+    );
+    assert!(!rt.has_pending_paste());
+
+    click_button_at(&mut rt, row, 1, MouseButton::Middle);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].button, BandButton::Middle);
+    assert!(
+        rt.pending_input().is_empty(),
+        "middle click on chrome never pastes the primary selection"
+    );
+
+    // Unbound chrome areas consume the buttons too: no dispatch, no paste.
+    click_button_at(&mut rt, row, 40, MouseButton::Right);
+    assert!(rt.drain_band_clicks().is_empty());
+    assert!(rt.pending_input().is_empty());
+}
+
+#[test]
+fn second_button_during_a_band_press_is_consumed_without_mispairing() {
+    let mut rt = minimal_runtime();
+    rt.force_headless_clipboard();
+    rt.clipboard_mut()
+        .set_text("secret".to_string())
+        .expect("headless set");
+    rt.drain_pending_input();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![region_text(
+            "clock",
+            "clock",
+            UiRegionKind::Module,
+            "test-bar:open",
+        )]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 1));
+    rt.handle_mouse_input(press()); // left arms
+    rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+        MouseButton::Right,
+        PressState::Pressed,
+    ));
+    rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+        MouseButton::Right,
+        PressState::Released,
+    ));
+    assert!(
+        rt.pending_input().is_empty(),
+        "the second button never pastes"
+    );
+    rt.handle_mouse_input(release()); // left resolves exactly once
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].button, BandButton::Left);
+}
+
+#[test]
+fn legacy_span_routes_left_only_and_never_pastes_on_right() {
+    // Backward compatibility: a span without a region keeps the pre-2248
+    // args payload and its primary-button-only contract. Right and middle
+    // are still chrome (no clipboard paste), but dispatch nothing.
+    let mut rt = minimal_runtime();
+    rt.force_headless_clipboard();
+    rt.clipboard_mut()
+        .set_text("secret".to_string())
+        .expect("headless set");
+    rt.drain_pending_input();
+    mount_bottom_bar(&mut rt, UiNode::row(vec![pill("2:ws2", 2.0)]));
+    rt.tick();
+    let row = bar_row(&rt);
+    click_at(&mut rt, row, 1);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].button, BandButton::Left);
+    assert!(clicks[0].region.is_none());
+
+    click_button_at(&mut rt, row, 1, MouseButton::Right);
+    assert!(rt.drain_band_clicks().is_empty());
+    assert!(rt.pending_input().is_empty(), "no clipboard paste");
+    assert_eq!(rt.band_host_stats().clicks_unclaimed, 1);
+}
+
+#[test]
+fn band_scroll_routes_the_region_with_the_host_delta() {
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            plain("vol "),
+            region_scroll_text("vol+", "volume"),
+            region_scroll_text("vol-", "volume-down"),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    wheel_at(&mut rt, row, 5, 1.0);
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1);
+    assert_eq!(scrolls[0].command, "step");
+    assert_eq!(
+        scrolls[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("volume")
+    );
+    assert_eq!(scrolls[0].delta, 3);
+
+    // Adjacent scroll regions are distinct items even when command and
+    // declared args are identical (the region is the discriminator).
+    wheel_at(&mut rt, row, 9, 1.0);
+    let scrolls = rt.drain_band_scrolls();
+    assert_eq!(scrolls.len(), 1);
+    assert_eq!(
+        scrolls[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("volume-down")
+    );
+}
+
+#[test]
+fn ignoring_regions_would_misroute_adjacent_items() {
+    // Mutation guard: the two items share command and declared args, so a
+    // hit-test that ignored regions would still route, but could only ever
+    // report `region = None`. The region id is the only discriminator.
+    let mut rt = minimal_runtime();
+    mount_bottom_bar(
+        &mut rt,
+        UiNode::row(vec![
+            region_text("AA", "left-item", UiRegionKind::Item, "test-bar:pick"),
+            region_text("BB", "right-item", UiRegionKind::Item, "test-bar:pick"),
+        ]),
+    );
+    rt.tick();
+    let row = bar_row(&rt);
+    click_at(&mut rt, row, 0);
+    click_at(&mut rt, row, 2);
+    let clicks = rt.drain_band_clicks();
+    assert_eq!(clicks.len(), 2);
+    assert_eq!(
+        clicks[0].region.as_ref().map(|region| region.id.as_str()),
+        Some("left-item")
+    );
+    assert_eq!(
+        clicks[1].region.as_ref().map(|region| region.id.as_str()),
+        Some("right-item")
+    );
+    assert_eq!(clicks[0].command, clicks[1].command);
+    assert_eq!(clicks[0].args, clicks[1].args);
+}
+
+#[test]
+fn region_overflow_fails_closed_with_the_cap() {
+    let mut rt = minimal_runtime();
+    let items: Vec<UiNode> = (0..=BAND_MAX_REGIONS)
+        .map(|index| {
+            region_text(
+                "x",
+                &format!("item-{index}"),
+                UiRegionKind::Item,
+                "test-bar:pick",
+            )
+        })
+        .collect();
+    mount_bottom_bar(&mut rt, UiNode::row(items));
+    rt.tick();
+    assert_eq!(
+        rt.band_item_regions(BandEdge::Bottom, 0),
+        Err(BandRegionError::Overflow {
+            count: BAND_MAX_REGIONS + 1,
+            max: BAND_MAX_REGIONS,
+        })
+    );
+    let row = bar_row(&rt);
+    click_at(&mut rt, row, 0);
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "an over-cap band routes no click"
+    );
+    assert_eq!(rt.band_host_stats().region_overflows, 1);
+    wheel_at(&mut rt, row, 0, 1.0);
+    assert!(
+        rt.drain_band_scrolls().is_empty(),
+        "an over-cap band routes no wheel"
+    );
+    assert_eq!(rt.band_host_stats().region_overflows, 2);
+    assert_eq!(rt.band_host_stats().clicks_denied, 1);
+    assert_eq!(rt.band_host_stats().scrolls_denied, 1);
+}
+
+#[test]
+fn stale_region_gesture_is_refused_after_a_version_bump() {
+    let mut rt = minimal_runtime();
+    let root = || {
+        UiNode::row(vec![region_text(
+            "clock",
+            "clock",
+            UiRegionKind::Module,
+            "test-bar:open",
+        )])
+    };
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            bottom: vec![BandContent {
+                plugin_id: "test-bar".to_string(),
+                slot: UiSlot::Bottom,
+                root: root(),
+                version: 1,
+            }],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Bottom,
+            version: 1,
+            generation: 7,
+            handle: 42,
+        }],
+    );
+    assert!(rt.tick().is_some());
+    let row = bar_row(&rt);
+    let first = rt
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("first origin");
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 0));
+    rt.handle_mouse_input(press());
+    assert!(rt.band_release_armed());
+
+    // Content update: the same region id at a new version. The armed press
+    // must not fire against the replacement tree.
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            bottom: vec![BandContent {
+                plugin_id: "test-bar".to_string(),
+                slot: UiSlot::Bottom,
+                root: root(),
+                version: 2,
+            }],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Bottom,
+            version: 2,
+            generation: 7,
+            handle: 43,
+        }],
+    );
+    assert!(!rt.band_origin_is_current(&first), "stale origin refused");
+    rt.handle_mouse_input(release());
+    assert!(
+        rt.drain_band_clicks().is_empty(),
+        "a region resolved under a superseded version never routes"
+    );
+    assert_eq!(rt.band_host_stats().clicks_unclaimed, 1);
 }

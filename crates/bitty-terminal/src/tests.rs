@@ -11597,6 +11597,8 @@ events = []
         plugin_id: id.to_string(),
         command: "report".to_string(),
         args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+        region: None,
+        button: bitty_runtime::BandButton::Left,
         origin: None,
         admission_seq: 0,
     });
@@ -11758,6 +11760,8 @@ events = []
         plugin_id: id.to_string(),
         command: "focus".to_string(),
         args: Vec::<(String, bitty_lua::ui::ClickArg)>::new(),
+        region: None,
+        button: bitty_runtime::BandButton::Left,
         origin: None,
         admission_seq: 0,
     });
@@ -11878,6 +11882,7 @@ events = []
         plugin_id: id.to_string(),
         command: "scroll".to_string(),
         args: vec![("step".to_string(), bitty_lua::ui::ClickArg::Number(2.0))],
+        region: None,
         delta: 3,
         origin: None,
         admission_seq: 0,

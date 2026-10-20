@@ -941,6 +941,13 @@ pub struct Runtime {
     /// routes only onto the same band run). `None` when no band press owns
     /// its release; cleared with the release swallow.
     band_press_target: Option<band_host::PressedBandTarget>,
+    /// Button that armed the current band press (issue #2248). Only the
+    /// matching release resolves the gesture.
+    band_press_button: Option<band_host::BandButton>,
+    /// Second button pressed on the same band row while the first gesture is
+    /// armed (issue #2248). Its paired release is consumed so chrome keeps
+    /// clipboard and capture authority even for multi-button gestures.
+    band_extra_press: Option<band_host::BandButton>,
     /// Headless host statistics for band routing and paint (CTX-0946).
     band_stats: band_host::BandHostStats,
     search_state: SearchState,
@@ -1763,6 +1770,8 @@ impl Runtime {
             pending_band_origins: Vec::new(),
             published_band_origins: Vec::new(),
             band_press_target: None,
+            band_press_button: None,
+            band_extra_press: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
@@ -2035,6 +2044,8 @@ impl Runtime {
             pending_band_origins: Vec::new(),
             published_band_origins: Vec::new(),
             band_press_target: None,
+            band_press_button: None,
+            band_extra_press: None,
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,

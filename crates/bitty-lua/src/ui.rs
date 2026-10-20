@@ -174,6 +174,35 @@ pub const UI_CLICK_MAX_ARG_KEY_BYTES: usize = UI_CLICK_MAX_COMMAND_BYTES;
 /// Maximum theme token name length (CTX-0890).
 pub const UI_MAX_THEME_TOKEN_BYTES: usize = 32;
 
+/// Maximum declared hit-region id length (issue #2248).
+///
+/// Region ids are identifiers on the same command surface as command
+/// identifiers and argument keys, so they reuse
+/// [`UI_CLICK_MAX_COMMAND_BYTES`] instead of introducing a new ceiling. The
+/// id feeds the existing per-generation aggregate through
+/// [`ClickCommand::retained_string_bytes`].
+pub const UI_MAX_REGION_ID_BYTES: usize = UI_CLICK_MAX_COMMAND_BYTES;
+
+/// Argument name the host injects for a declared hit region (issue #2248).
+///
+/// A click or scroll on a span carrying `region = { id, kind }` dispatches
+/// the declared command with the region id under this name. A declared entry
+/// of the same name is overwritten, never duplicated.
+pub const UI_REGION_ARG: &str = "region";
+
+/// Argument name the host injects for a band click button (issue #2248).
+///
+/// One of [`UI_BUTTON_LEFT`], [`UI_BUTTON_RIGHT`], or [`UI_BUTTON_MIDDLE`].
+/// A declared entry of the same name is overwritten, never duplicated.
+pub const UI_BUTTON_ARG: &str = "button";
+
+/// Left mouse button spelling carried under [`UI_BUTTON_ARG`].
+pub const UI_BUTTON_LEFT: &str = "left";
+/// Right mouse button spelling carried under [`UI_BUTTON_ARG`].
+pub const UI_BUTTON_RIGHT: &str = "right";
+/// Middle mouse button spelling carried under [`UI_BUTTON_ARG`].
+pub const UI_BUTTON_MIDDLE: &str = "middle";
+
 /// Argument name the host injects beside the declared scroll args at
 /// dispatch (CTX-1190, issue #2008).
 ///
@@ -201,6 +230,61 @@ pub(crate) const UI_MARSHAL_LIMITS: MarshallingLimits = MarshallingLimits {
     max_bytes: UI_MAX_TEXT_BYTES + 64 * 1024,
 };
 
+/// Kind of a declared per-item hit region (issue #2248).
+///
+/// `Module` covers a whole status module (clock, volume, a window item);
+/// `Item` covers one item inside a module (one workspace capsule). The kind
+/// is presentation metadata carried back with the dispatch; it grants no
+/// authority and selects no code path in Core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UiRegionKind {
+    /// A whole module row or capsule strip entry.
+    Module,
+    /// One item inside a module.
+    Item,
+}
+
+impl UiRegionKind {
+    /// Every accepted kind, in canonical declaration order.
+    pub const ALL: [Self; 2] = [Self::Module, Self::Item];
+
+    /// Lua spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Item => "item",
+        }
+    }
+
+    /// Parse the closed kind set; `None` for any other string.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for UiRegionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Declared identity of one per-item hit region (issue #2248).
+///
+/// A region is declared beside a click or scroll binding:
+/// `on_click = { command = "...", region = { id = "clock", kind = "module" } }`.
+/// Core owns the rectangle: the host derives it from the painted spans, so a
+/// plugin never supplies coordinates. The id is bounded and stable for one
+/// band version; the kind labels what the item represents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiRegion {
+    /// Bounded region identifier (1..=[`UI_MAX_REGION_ID_BYTES`] bytes).
+    pub id: String,
+    /// Region kind (`module` or `item`).
+    pub kind: UiRegionKind,
+}
+
 /// Click command binding for interactive UiNode elements (CTX-0890).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickCommand {
@@ -208,6 +292,13 @@ pub struct ClickCommand {
     pub command: String,
     /// Command arguments (max 8 args, each max 256 bytes; only scalar values).
     pub args: Vec<(String, ClickArg)>,
+    /// Optional per-item hit region this binding belongs to (issue #2248).
+    ///
+    /// A span with a region is an explicit item in the band's emitted region
+    /// set; dispatch carries the region id under [`UI_REGION_ARG`]. `None`
+    /// keeps the pre-2248 span behaviour (the span is clickable, but no
+    /// region identity is published).
+    pub region: Option<UiRegion>,
 }
 
 /// Click command argument value (CTX-0890).
@@ -229,6 +320,7 @@ impl ClickCommand {
     /// bytes, but their keys are still charged.
     fn retained_string_bytes(&self) -> usize {
         self.command.len()
+            + self.region.as_ref().map_or(0, |region| region.id.len())
             + self
                 .args
                 .iter()
@@ -524,6 +616,17 @@ impl UiNode {
         let bold = extract_bool_opt(value, "bold")?;
         let on_click = extract_click_command(value)?;
         let on_scroll = extract_scroll_command(value)?;
+        // Issue #2248: one span has one region identity. Both bindings may
+        // name it (a clickable scroll item), but they must agree; a mismatch
+        // fails closed instead of choosing one silently.
+        if let (Some(click), Some(scroll)) = (on_click.as_ref(), on_scroll.as_ref()) {
+            if (click.region.is_some() || scroll.region.is_some()) && click.region != scroll.region
+            {
+                return Err(component_invalid(
+                    "on_click.region and on_scroll.region must declare the same region",
+                ));
+            }
+        }
 
         match kind {
             "Text" => match value.get("text") {
@@ -683,29 +786,35 @@ fn extract_bool_opt(value: &LuaValue, key: &str) -> Result<Option<bool>, BridgeE
 
 /// Extract optional click command from a Lua table (CTX-0890).
 fn extract_click_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
-    extract_command_binding(value, "on_click", false)
+    extract_command_binding(value, "on_click", &[], true)
 }
 
 /// Extract optional scroll command from a Lua table (CTX-1190, issue #2008).
 ///
 /// Same [`ClickCommand`] shape as `on_click`. The declared args reserve one
-/// slot for the host-computed [`UI_SCROLL_DELTA_ARG`] merged at dispatch:
-/// a table that is already full without naming `delta` fails closed here so
-/// dispatch can never exceed [`UI_CLICK_MAX_ARGS`].
+/// slot for the host-computed [`UI_SCROLL_DELTA_ARG`] and, when a region is
+/// declared, one more for [`UI_REGION_ARG`]. A table that is already full
+/// without naming them fails closed here so dispatch can never exceed
+/// [`UI_CLICK_MAX_ARGS`].
 fn extract_scroll_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
-    extract_command_binding(value, "on_scroll", true)
+    extract_command_binding(value, "on_scroll", &[UI_SCROLL_DELTA_ARG], false)
 }
 
-/// Extract an optional `{ command, args }` command binding under `key`.
+/// Extract an optional `{ command, args, region? }` command binding under
+/// `key`.
 ///
-/// `reserve_delta_slot` caps the declared args one below
-/// [`UI_CLICK_MAX_ARGS`] unless the table already names
-/// [`UI_SCROLL_DELTA_ARG`] (overwritten at dispatch, so no extra slot is
-/// needed). Malformed bindings fail closed with `E_UI_COMPONENT_INVALID`.
+/// `base_host_args` names arguments the host always injects at dispatch;
+/// `region_click` adds a `button` slot on top of [`UI_REGION_ARG`] when the
+/// binding declares a region (region-less bindings keep their pre-2248 arg
+/// budget exactly). The declared table reserves one slot per host argument
+/// it does not already name (a declared entry is overwritten, so it needs
+/// no extra slot). Malformed bindings fail closed with
+/// `E_UI_COMPONENT_INVALID`.
 fn extract_command_binding(
     value: &LuaValue,
     key: &str,
-    reserve_delta_slot: bool,
+    base_host_args: &[&str],
+    region_click: bool,
 ) -> Result<Option<ClickCommand>, BridgeError> {
     let Some(binding) = value.get(key) else {
         return Ok(None);
@@ -727,16 +836,29 @@ fn extract_command_binding(
         None => return Err(component_invalid(format!("{key}.command is required"))),
     };
 
+    let region = extract_region(binding, key)?;
+    // The host injects the region and button arguments only when the
+    // binding declares a region; legacy bindings keep their pre-2248 arg
+    // budget and payload exactly.
+    let mut host_args = base_host_args.to_vec();
+    if region.is_some() {
+        host_args.push(UI_REGION_ARG);
+        if region_click {
+            host_args.push(UI_BUTTON_ARG);
+        }
+    }
+
     let args = match binding.get("args") {
         Some(LuaValue::Table(pairs)) => {
-            let max_args = if reserve_delta_slot
-                && !pairs.iter().any(|(arg_key, _)| {
-                    matches!(arg_key, LuaValue::String(name) if name == UI_SCROLL_DELTA_ARG)
-                }) {
-                UI_CLICK_MAX_ARGS - 1
-            } else {
-                UI_CLICK_MAX_ARGS
-            };
+            let undeclared_host_args = host_args
+                .iter()
+                .filter(|injected| {
+                    !pairs.iter().any(|(arg_key, _)| {
+                        matches!(arg_key, LuaValue::String(name) if name == *injected)
+                    })
+                })
+                .count();
+            let max_args = UI_CLICK_MAX_ARGS.saturating_sub(undeclared_host_args);
             if pairs.len() > max_args {
                 return Err(component_invalid(format!(
                     "{key}.args must have at most {max_args} entries",
@@ -785,7 +907,74 @@ fn extract_command_binding(
         None => Vec::new(),
     };
 
-    Ok(Some(ClickCommand { command, args }))
+    Ok(Some(ClickCommand {
+        command,
+        args,
+        region,
+    }))
+}
+
+/// Extract the optional `region = { id, kind? }` identity from one binding
+/// (issue #2248).
+///
+/// `id` is required when the table is present, is bounded by
+/// [`UI_MAX_REGION_ID_BYTES`], and uses the lowercase identifier alphabet
+/// `[a-z0-9._:-]`. `kind` is optional and defaults to
+/// [`UiRegionKind::Module`]; an unknown kind fails closed.
+fn extract_region(binding: &LuaValue, key: &str) -> Result<Option<UiRegion>, BridgeError> {
+    let Some(region) = binding.get(UI_REGION_ARG) else {
+        return Ok(None);
+    };
+    let LuaValue::Table(_) = region else {
+        return Err(component_invalid(format!(
+            "{key}.{UI_REGION_ARG} must be a table"
+        )));
+    };
+    let id = match region.get("id") {
+        Some(LuaValue::String(id)) if is_valid_region_id(id) => id.clone(),
+        Some(LuaValue::String(id)) => {
+            return Err(component_invalid(format!(
+                "invalid region id '{id}': must be 1-{UI_MAX_REGION_ID_BYTES} bytes of [a-z0-9._:-]"
+            )));
+        }
+        Some(_) => {
+            return Err(component_invalid(format!(
+                "{key}.{UI_REGION_ARG}.id must be a string"
+            )));
+        }
+        None => {
+            return Err(component_invalid(format!(
+                "{key}.{UI_REGION_ARG}.id is required"
+            )));
+        }
+    };
+    let kind = match region.get("kind") {
+        Some(LuaValue::String(kind)) => UiRegionKind::parse(kind).ok_or_else(|| {
+            component_invalid(format!(
+                "{key}.{UI_REGION_ARG}.kind must be 'module' or 'item'"
+            ))
+        })?,
+        Some(_) => {
+            return Err(component_invalid(format!(
+                "{key}.{UI_REGION_ARG}.kind must be a string"
+            )));
+        }
+        None => UiRegionKind::Module,
+    };
+    Ok(Some(UiRegion { id, kind }))
+}
+
+/// Whether `id` is a valid bounded region identifier (issue #2248).
+///
+/// Lowercase ASCII alphanumerics plus `.`, `_`, `:`, and `-`, so ids can
+/// name a module (`clock`) or a namespaced item (`ws:2`).
+#[must_use]
+pub fn is_valid_region_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= UI_MAX_REGION_ID_BYTES
+        && id.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | ':' | '-')
+        })
 }
 
 /// Typed `E_UI_COMPONENT_INVALID` diagnostic (accepted ui.mount/update code).
@@ -1135,6 +1324,229 @@ mod tests {
             }
             _ => panic!("expected Text node"),
         }
+    }
+
+    fn region_table(id: &str, kind: Option<&str>) -> LuaValue {
+        let mut pairs = vec![(
+            LuaValue::String("id".to_string()),
+            LuaValue::String(id.to_string()),
+        )];
+        if let Some(kind) = kind {
+            pairs.push((
+                LuaValue::String("kind".to_string()),
+                LuaValue::String(kind.to_string()),
+            ));
+        }
+        LuaValue::Table(pairs)
+    }
+
+    fn click_with_region(region: LuaValue) -> LuaValue {
+        LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("clock".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("clock.open".to_string())),
+                    ("region", region),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn region_round_trips_from_binding() {
+        // Issue #2248: a binding may declare one bounded region identity;
+        // the parser retains it verbatim for Core geometry emission.
+        let node =
+            UiNode::from_lua_value(&click_with_region(region_table("clock", Some("module"))))
+                .expect("region parses");
+        let UiNode::Text { on_click, .. } = node else {
+            panic!("expected Text node");
+        };
+        assert_eq!(
+            on_click.expect("binding").region,
+            Some(UiRegion {
+                id: "clock".to_string(),
+                kind: UiRegionKind::Module,
+            })
+        );
+
+        // The kind is optional and defaults to `module`.
+        let node = UiNode::from_lua_value(&click_with_region(region_table("ws:2", None)))
+            .expect("region without kind parses");
+        let UiNode::Text { on_click, .. } = node else {
+            panic!("expected Text node");
+        };
+        assert_eq!(
+            on_click.expect("binding").region,
+            Some(UiRegion {
+                id: "ws:2".to_string(),
+                kind: UiRegionKind::Module,
+            })
+        );
+
+        // An explicit `item` kind survives the round trip.
+        let node = UiNode::from_lua_value(&click_with_region(region_table("ws:2", Some("item"))))
+            .expect("item kind parses");
+        let UiNode::Text { on_click, .. } = node else {
+            panic!("expected Text node");
+        };
+        assert_eq!(
+            on_click.expect("binding").region.expect("region").kind,
+            UiRegionKind::Item
+        );
+    }
+
+    #[test]
+    fn region_validation_fails_closed() {
+        let too_long = "a".repeat(UI_MAX_REGION_ID_BYTES + 1);
+        let bad_ids = ["", "Clock", "with space", "bang!", too_long.as_str()];
+        for bad in bad_ids {
+            let error = UiNode::from_lua_value(&click_with_region(region_table(bad, None)))
+                .expect_err("invalid region id must fail");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID", "id {bad:?}");
+        }
+        // Unknown kind fails; missing id fails.
+        assert_eq!(
+            UiNode::from_lua_value(&click_with_region(region_table("clock", Some("pixel"))))
+                .expect_err("unknown kind")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        assert_eq!(
+            UiNode::from_lua_value(&click_with_region(LuaValue::table([(
+                "kind",
+                LuaValue::String("module".to_string()),
+            )])))
+            .expect_err("missing id")
+            .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+    }
+
+    #[test]
+    fn click_and_scroll_regions_must_agree() {
+        // One span has one item identity: mismatched declarations reject the
+        // mount instead of silently choosing a binding's region.
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("volume".to_string())),
+            (
+                "on_click",
+                LuaValue::table([
+                    ("command", LuaValue::String("volume.open".to_string())),
+                    ("region", region_table("volume", Some("module"))),
+                ]),
+            ),
+            (
+                "on_scroll",
+                LuaValue::table([
+                    ("command", LuaValue::String("volume.step".to_string())),
+                    ("region", region_table("speaker", Some("module"))),
+                ]),
+            ),
+        ]);
+        let error = UiNode::from_lua_value(&value).expect_err("mismatched regions");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("same region"));
+
+        // Identical regions are accepted.
+        let mut value = value;
+        if let LuaValue::Table(pairs) = &mut value {
+            for (key, binding) in pairs.iter_mut() {
+                if matches!(key, LuaValue::String(name) if name == "on_scroll") {
+                    if let LuaValue::Table(binding_pairs) = binding {
+                        for (binding_key, region) in binding_pairs.iter_mut() {
+                            if matches!(binding_key, LuaValue::String(name) if name == "region") {
+                                *region = region_table("volume", Some("module"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        UiNode::from_lua_value(&value).expect("matching regions parse");
+    }
+
+    #[test]
+    fn click_args_reserve_region_and_button_slots() {
+        let args = |count: usize| {
+            LuaValue::Table(
+                (0..count)
+                    .map(|index| {
+                        (
+                            LuaValue::String(format!("arg{index}")),
+                            LuaValue::String("v".to_string()),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let value = |args: LuaValue, region: Option<LuaValue>| {
+            let mut binding = vec![
+                (
+                    LuaValue::String("command".to_string()),
+                    LuaValue::String("cmd".to_string()),
+                ),
+                (LuaValue::String("args".to_string()), args),
+            ];
+            if let Some(region) = region {
+                binding.push((LuaValue::String(UI_REGION_ARG.to_string()), region));
+            }
+            LuaValue::table([
+                ("kind", LuaValue::String("Text".to_string())),
+                ("text", LuaValue::String("t".to_string())),
+                ("on_click", LuaValue::Table(binding)),
+            ])
+        };
+        // No region: no host args are injected, so the pre-2248 budget of
+        // 16 declared args is unchanged.
+        UiNode::from_lua_value(&value(args(UI_CLICK_MAX_ARGS), None))
+            .expect("16 declared args fit without a region");
+        assert_eq!(
+            UiNode::from_lua_value(&value(args(UI_CLICK_MAX_ARGS + 1), None))
+                .expect_err("17 declared args exceed the dispatch bound")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // With a region: `region` and `button` are injected, so 14 fit.
+        UiNode::from_lua_value(&value(
+            args(UI_CLICK_MAX_ARGS - 2),
+            Some(region_table("clock", None)),
+        ))
+        .expect("14 declared args fit with a region");
+        assert_eq!(
+            UiNode::from_lua_value(&value(
+                args(UI_CLICK_MAX_ARGS - 1),
+                Some(region_table("clock", None)),
+            ))
+            .expect_err("15 declared args exceed the dispatch bound with a region")
+            .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        // Declaring the host names reserves no extra slot (overwritten).
+        let mut declared = vec![
+            (
+                LuaValue::String(UI_REGION_ARG.to_string()),
+                LuaValue::String("r".to_string()),
+            ),
+            (
+                LuaValue::String(UI_BUTTON_ARG.to_string()),
+                LuaValue::String("left".to_string()),
+            ),
+        ];
+        declared.extend((0..(UI_CLICK_MAX_ARGS - 2)).map(|index| {
+            (
+                LuaValue::String(format!("arg{index}")),
+                LuaValue::String("v".to_string()),
+            )
+        }));
+        UiNode::from_lua_value(&value(
+            LuaValue::Table(declared),
+            Some(region_table("clock", None)),
+        ))
+        .expect("declared host names reuse their slots");
     }
 
     #[test]

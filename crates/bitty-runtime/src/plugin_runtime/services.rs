@@ -6761,10 +6761,12 @@ mod tests {
                     ("id".to_string(), ClickArg::String("dev".to_string())),
                     ("focus".to_string(), ClickArg::Bool(true)),
                 ],
+                region: None,
             }),
             on_scroll: Some(ClickCommand {
                 command: "bar.scroll".to_string(),
                 args: vec![("step".to_string(), ClickArg::Number(1.0))],
+                region: None,
             }),
         }
     }
@@ -6823,6 +6825,7 @@ mod tests {
             on_click: Some(ClickCommand {
                 command: "c".to_string(),
                 args,
+                region: None,
             }),
             on_scroll: None,
         };

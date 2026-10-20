@@ -190,6 +190,7 @@ or a published artifact.
   immutable R2 objects against overwrite on re-runs.
 
 ### Fixed
+
 - **RC-1 accounting across host calls (CTX-1379, #2285):** the wall-clock
   budget now bounds Lua execution instead of raw elapsed time for supervised
   `process.spawn` waits, which no longer suspend a bounded plugin command. Only
@@ -201,6 +202,15 @@ or a published artifact.
   (phodopus `string.gmatch`/`gsub`) now charges each scan position once, so
   parsing a capped 8 KiB tool output no longer burns the full instruction
   budget. The git-panel `open` command completes with a branch list again.
+- **RC-1 wall at callback completion (CTX-1391, #2314):** the completed path
+  now re-checks charged wall time before reporting success, so a callback that
+  chains bounded supervised spawns past the 5000 ms per-callback credit cap
+  suspends with the same `WallClockExceeded` outcome used at slice boundaries
+  instead of returning `Completed` at ~6 s against a 50 ms budget. Exhausting a
+  credit bound alone is not a suspension: later host time is charged, and the
+  callback suspends only when charged time reaches the wall budget. A callback
+  that reports `Completed` is therefore bounded by the 50 + 200 + 5000 ms
+  credit envelope.
 
 - **Reloaded plugin component authority (CTX-1383, #2302):** the runtime policy
   host mirror is keyed by the activation manifest hash, so re-running it after

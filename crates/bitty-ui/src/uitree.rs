@@ -24,8 +24,8 @@
 //!   bumps only on structural change, and the report carries the
 //!   invalidation set ([`UiChange`]) for layout, hit-test, and paint.
 //! - [`a11y_role_of`] — the accessibility mapping for every primitive,
-//!   reusing the crate [`A11yRole`](crate::a11y::A11yRole) vocabulary so no
-//!   second role table is introduced.
+//!   returning the extension [`Role`](crate::a11y_host::Role) vocabulary so
+//!   no second role table is introduced.
 //!
 //! Relationship to the accepted Rich `Scene`/`SceneNode` model: this tree
 //! composes **beside** it and subsumes nothing. The [`UiNodeKind::Terminal`]
@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::a11y::A11yRole;
+use crate::a11y_host::Role;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -642,20 +642,20 @@ impl UiTree {
 
 /// Maps a primitive to its accessible role.
 ///
-/// Total: every [`UiNodeKind`] maps, reusing the crate [`A11yRole`]
+/// Total: every [`UiNodeKind`] maps, reusing the extension [`Role`]
 /// vocabulary. Interactive semantics stay disciplined — `TextInput`
 /// exposes `input`; no primitive guesses a button role. Visual styling is
 /// free; this mapping is the fixed semantic half.
 #[must_use]
-pub fn a11y_role_of(kind: &UiNodeKind) -> A11yRole {
+pub fn a11y_role_of(kind: &UiNodeKind) -> Role {
     match kind {
         UiNodeKind::Box | UiNodeKind::ScrollView | UiNodeKind::Canvas | UiNodeKind::Overlay => {
-            A11yRole::Group
+            Role::Group
         }
-        UiNodeKind::Text(_) | UiNodeKind::Terminal => A11yRole::Text,
-        UiNodeKind::Image => A11yRole::Image,
-        UiNodeKind::VirtualList => A11yRole::List,
-        UiNodeKind::TextInput { .. } => A11yRole::Input,
+        UiNodeKind::Text(_) | UiNodeKind::Terminal => Role::Text,
+        UiNodeKind::Image => Role::Image,
+        UiNodeKind::VirtualList => Role::List,
+        UiNodeKind::TextInput { .. } => Role::Input,
     }
 }
 
@@ -830,15 +830,15 @@ mod tests {
         for kind in &kinds {
             let _ = a11y_role_of(kind);
         }
-        assert_eq!(a11y_role_of(&UiNodeKind::Terminal), A11yRole::Text);
+        assert_eq!(a11y_role_of(&UiNodeKind::Terminal), Role::Text);
         assert_eq!(
             a11y_role_of(&UiNodeKind::TextInput {
                 value: String::new(),
                 placeholder: String::new(),
             }),
-            A11yRole::Input
+            Role::Input
         );
-        assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), A11yRole::List);
+        assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), Role::List);
     }
 
     #[test]

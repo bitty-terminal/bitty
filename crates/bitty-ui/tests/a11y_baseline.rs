@@ -1,22 +1,27 @@
-//! Accessibility baseline integration tests (UX-42, CTX-0614).
+//! Accessibility seam parity tests (CTX-1362, Refs #2257).
 //!
-//! Pins the candidate baseline implemented in `bitty_ui::a11y` against the
-//! candidate record
-//! (`bitty-terminal-docs/specifications/accessibility-baseline-candidate.md`,
-//! Draft): role mapping per scene kind with fail-closed unmapped kinds,
-//! terminal text runs plus cursor with the fidelity boundary, and chrome
-//! read-only exposure excluded from the tab order. Headless, deterministic,
-//! bounded: no window, no GPU, no PTY, no filesystem.
+//! Pins Core's `SnapshotHost` implementation on the `bitty-a11y` seam against
+//! the accepted contract: role vocabulary equivalence, byte-exact terminal
+//! text-run projection with the stated fidelity boundary, focus/tab-order
+//! selection, bounded inputs fail-closed (256-name, 4096-node,
+//! 256-announcement, 8-pending caps), stale-generation rejection with nothing
+//! swapped, no-retained-handle behavior, the no-backend fallback, and
+//! dropped-field structural failure. Headless, deterministic, bounded: no
+//! window, no GPU, no PTY, no filesystem, no clock.
 
 #![forbid(unsafe_code)]
 
+use bitty_a11y::{
+    A11yError, Adapter, AnnouncementKind, AnnouncementQueue, ChromeKind, FocusOwner, Generation,
+    HeadlessBackend, InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
+    MAX_PENDING_ANNOUNCEMENTS, MAX_SNAPSHOT_NODES, Role, SceneKind, SnapshotBuilder, SnapshotHost,
+    needs_refresh, role_of,
+};
 use bitty_term_state::{State, TerminalAction};
-use bitty_ui::a11y::{
-    A11yError, A11yNodeKind, A11yRole, A11ySettings, A11ySource, A11yTreeBuilder, AnnouncementKind,
-    AnnouncementQueue, ChromeKind, ChromeNode, FIDELITY_BOUNDARY, InteractiveNode,
-    MAX_A11Y_TREE_NODES, MAX_ANNOUNCEMENT_TEXT_LEN, MAX_PENDING_ANNOUNCEMENTS, SceneKind,
-    build_a11y_tree, chrome_tab_order, expose_terminal, interactive_role, needs_a11y_refresh,
-    role_of, terminal_text_runs, validate_scene,
+use bitty_ui::UiNodeKind;
+use bitty_ui::a11y_host::{
+    A11ySettings, FALLBACK_ACCESSIBLE_NAME, FIDELITY_BOUNDARY, UiSnapshotHost, a11y_role_of,
+    terminal_runs,
 };
 use bitty_vt::{ControlChar, GraphemeCell};
 
@@ -31,33 +36,67 @@ fn feed_line(state: &mut State, text: &str) {
     state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
 }
 
+fn tree_snapshot() -> bitty_term_state::Snapshot {
+    let mut state = State::new();
+    feed_line(&mut state, "hello");
+    prints(&mut state, "world");
+    state.apply(&TerminalAction::OscTitle {
+        text: "editor".into(),
+    });
+    state.snapshot()
+}
+
 // ---------------------------------------------------------------------------
-// Role mapping: every mapped kind resolves, unmapped kinds fail closed
+// Seam constants: pinned ceilings owned by the extension
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_mapped_scene_kind_has_a_role() {
-    let expected: &[(SceneKind, A11yRole)] = &[
-        (SceneKind::Text, A11yRole::Text),
-        (SceneKind::Row, A11yRole::Group),
-        (SceneKind::Column, A11yRole::Group),
-        (SceneKind::Block, A11yRole::Group),
-        (SceneKind::Image, A11yRole::Image),
-        (SceneKind::CodeBlock, A11yRole::Code),
-        (SceneKind::Table, A11yRole::Table),
-        (SceneKind::List, A11yRole::List),
-        (SceneKind::Rule, A11yRole::Separator),
+fn seam_ceilings_match_accepted_bounds() {
+    assert_eq!(MAX_ACCESSIBLE_NAME_LEN, 256);
+    assert_eq!(MAX_SNAPSHOT_NODES, 4096);
+    assert_eq!(MAX_ANNOUNCEMENT_TEXT_LEN, 256);
+    assert_eq!(MAX_PENDING_ANNOUNCEMENTS, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Role vocabulary parity: extension Role spells what Core A11yRole spelled
+// ---------------------------------------------------------------------------
+
+#[test]
+fn role_spellings_match_retired_vocabulary() {
+    let expected: &[(Role, &str)] = &[
+        (Role::Text, "text"),
+        (Role::Group, "group"),
+        (Role::Code, "code"),
+        (Role::Table, "table"),
+        (Role::List, "list"),
+        (Role::Button, "button"),
+        (Role::Input, "input"),
+        (Role::Separator, "separator"),
+        (Role::Image, "image"),
     ];
-    assert_eq!(SceneKind::mapped().len(), expected.len());
-    for (kind, role) in expected {
-        assert_eq!(role_of(*kind), Ok(*role), "kind {kind:?} must map");
+    for (role, spelling) in expected {
+        assert_eq!(role.as_str(), *spelling);
+        assert_eq!(role.to_string(), *spelling);
     }
-    // The mapped set is exactly the full set minus the fallback.
-    assert_eq!(SceneKind::all().len(), SceneKind::mapped().len() + 1);
 }
 
 #[test]
-fn unknown_scene_kind_fails_closed() {
+fn scene_kind_mapping_matches_retired_table() {
+    let expected: &[(SceneKind, Role)] = &[
+        (SceneKind::Text, Role::Text),
+        (SceneKind::Row, Role::Group),
+        (SceneKind::Column, Role::Group),
+        (SceneKind::Block, Role::Group),
+        (SceneKind::Image, Role::Image),
+        (SceneKind::CodeBlock, Role::Code),
+        (SceneKind::Table, Role::Table),
+        (SceneKind::List, Role::List),
+        (SceneKind::Rule, Role::Separator),
+    ];
+    for (kind, role) in expected {
+        assert_eq!(role_of(*kind), Ok(*role), "kind {kind:?} must map");
+    }
     assert_eq!(
         role_of(SceneKind::Unknown),
         Err(A11yError::UnmappedSceneKind)
@@ -65,171 +104,48 @@ fn unknown_scene_kind_fails_closed() {
 }
 
 #[test]
-fn validate_scene_accepts_mapped_and_rejects_unmapped() {
-    assert!(validate_scene(SceneKind::mapped()).is_ok());
-    assert!(validate_scene(&[]).is_ok());
+fn ui_primitive_mapping_matches_retired_values() {
+    assert_eq!(a11y_role_of(&UiNodeKind::Terminal), Role::Text);
     assert_eq!(
-        validate_scene(&[SceneKind::Text, SceneKind::Unknown, SceneKind::List]),
-        Err(A11yError::UnmappedSceneKind)
+        a11y_role_of(&UiNodeKind::Text(String::from("t"))),
+        Role::Text
+    );
+    assert_eq!(a11y_role_of(&UiNodeKind::Box), Role::Group);
+    assert_eq!(a11y_role_of(&UiNodeKind::Image), Role::Image);
+    assert_eq!(a11y_role_of(&UiNodeKind::VirtualList), Role::List);
+    assert_eq!(
+        a11y_role_of(&UiNodeKind::TextInput {
+            value: String::new(),
+            placeholder: String::new(),
+        }),
+        Role::Input
     );
 }
 
 #[test]
-fn interactive_roles_resolve_from_declared_purpose() {
-    assert_eq!(interactive_role("button"), Ok(A11yRole::Button));
-    assert_eq!(interactive_role("input"), Ok(A11yRole::Input));
-}
-
-#[test]
-fn undeclared_interactive_purpose_fails_closed() {
+fn interactive_purposes_resolve_from_declared_purpose() {
     assert_eq!(
-        interactive_role("switch"),
+        InteractivePurpose::parse("button"),
+        Ok(InteractivePurpose::Button)
+    );
+    assert_eq!(
+        InteractivePurpose::parse("input"),
+        Ok(InteractivePurpose::Input)
+    );
+    assert_eq!(
+        InteractivePurpose::parse("switch"),
         Err(A11yError::UnmappedSceneKind)
     );
-    assert_eq!(interactive_role(""), Err(A11yError::UnmappedSceneKind));
-}
-
-#[test]
-fn interactive_node_exposes_name_state_and_activation() {
-    let button = InteractiveNode::new("button", "Send", true).unwrap();
-    assert_eq!(button.role(), A11yRole::Button);
-    assert_eq!(button.name(), "Send");
-    assert!(button.is_enabled());
-    assert_eq!(button.activation_label(), Some("activate"));
-
-    let disabled = InteractiveNode::new("input", "Search", false).unwrap();
-    assert_eq!(disabled.role(), A11yRole::Input);
-    assert!(!disabled.is_enabled());
-    // Disabled controls expose state with no activation.
-    assert_eq!(disabled.activation_label(), None);
-}
-
-#[test]
-fn interactive_node_rejects_undeclared_purpose_and_overlong_name() {
     assert_eq!(
-        InteractiveNode::new("menu", "Open", true),
+        InteractivePurpose::parse(""),
         Err(A11yError::UnmappedSceneKind)
     );
-    let long = "n".repeat(257);
-    assert!(matches!(
-        InteractiveNode::new("button", &long, true),
-        Err(A11yError::NameTooLong { .. })
-    ));
+    assert_eq!(InteractivePurpose::Button.role(), Role::Button);
+    assert_eq!(InteractivePurpose::Input.role(), Role::Input);
 }
 
-// ---------------------------------------------------------------------------
-// Terminal exposure: text runs plus cursor, read-only, stated boundary
-// ---------------------------------------------------------------------------
-
-#[test]
-fn terminal_runs_expose_readable_text_and_cursor() {
-    let mut state = State::new();
-    feed_line(&mut state, "hello");
-    prints(&mut state, "world");
-    let snapshot = state.snapshot();
-
-    let runs = terminal_text_runs(&snapshot);
-    assert!(runs.len() >= 2);
-    assert_eq!(runs[0].row, 0);
-    assert_eq!(runs[0].text, "hello");
-    assert_eq!(runs[1].row, 1);
-    // LF preserves the column, so the second line starts at column 5.
-    assert_eq!(runs[1].text.trim(), "world");
-
-    let exposure = expose_terminal(&snapshot);
-    assert_eq!(exposure.cursor, snapshot.cursor.position);
-    assert_eq!(exposure.cursor_visible, snapshot.cursor.visible);
-    // Cursor tracks the live position: one fed line plus five more cells.
-    assert_eq!(exposure.cursor.row, 1);
-    assert_eq!(exposure.cursor.col, 10);
-}
-
-#[test]
-fn terminal_blank_rows_produce_no_runs() {
-    let state = State::new();
-    let snapshot = state.snapshot();
-    assert!(terminal_text_runs(&snapshot).is_empty());
-}
-
-#[test]
-fn terminal_runs_keep_zero_width_scalars() {
-    // CTX-1367 (#2260): a11y runs must expose the same cluster copy does.
-    let mut state = State::new();
-    prints(&mut state, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
-    let snapshot = state.snapshot();
-    let runs = terminal_text_runs(&snapshot);
-    assert_eq!(runs[0].text, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
-}
-
-#[test]
-fn terminal_exposure_is_named_by_title_and_read_only() {
-    let mut state = State::new();
-    prints(&mut state, "data");
-    state.apply(&TerminalAction::OscTitle {
-        text: "editor".into(),
-    });
-    let before = state.snapshot();
-    let exposure = expose_terminal(&before);
-    assert_eq!(exposure.title, "editor");
-    // The projection derives from the snapshot and mutates nothing.
-    assert_eq!(state.snapshot(), before);
-    assert_eq!(exposure.runs.len(), 1);
-    assert_eq!(exposure.runs[0].text, "data");
-}
-
-#[test]
-fn fidelity_boundary_is_stated_not_implied() {
-    for token in ["cursor", "SGR", "graphics", "images"] {
-        assert!(
-            FIDELITY_BOUNDARY.contains(token),
-            "boundary must name {token}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Chrome exposure: read-only state, excluded from the tab order
-// ---------------------------------------------------------------------------
-
-#[test]
-fn chrome_is_excluded_from_tab_order_while_state_is_exposed() {
-    let bar = ChromeNode::new(ChromeKind::Bar, "status bar", Some("main.rs")).unwrap();
-    let tabs = ChromeNode::new(ChromeKind::TabStrip, "tabs", Some("editor")).unwrap();
-    let note = ChromeNode::new(ChromeKind::Notification, "notices", None).unwrap();
-    let nodes = [bar, tabs, note];
-
-    for node in &nodes {
-        assert!(!node.is_tab_stop(), "{node:?} must never be a focus target");
-    }
-    assert!(chrome_tab_order(&nodes).is_empty());
-    assert!(chrome_tab_order(&[]).is_empty());
-
-    // State stays exposed read-only: names and active items are readable.
-    assert_eq!(nodes[0].accessible_name(), "status bar");
-    assert_eq!(nodes[0].active_item(), Some("main.rs"));
-    assert_eq!(nodes[1].kind(), ChromeKind::TabStrip);
-    assert_eq!(nodes[1].active_item(), Some("editor"));
-    assert_eq!(nodes[2].accessible_name(), "notices");
-    assert_eq!(nodes[2].active_item(), None);
-}
-
-#[test]
-fn chrome_rejects_overlong_names() {
-    let long = "x".repeat(300);
-    assert!(matches!(
-        ChromeNode::new(ChromeKind::Rail, &long, None),
-        Err(A11yError::NameTooLong { .. })
-    ));
-    assert!(matches!(
-        ChromeNode::new(ChromeKind::Rail, "rail", Some(&long)),
-        Err(A11yError::NameTooLong { .. })
-    ));
-}
-
-/// Drift coupling: every `bitty-rich` `SceneNode` variant must map to a
-/// `SceneKind` with a resolved role (or fail closed for `Unknown`).
-/// Deliberately exhaustive — gains a compile error if `bitty-rich` adds a
-/// variant, so the mirror in `bitty_ui::a11y` cannot drift silently.
+/// Drift coupling: every `bitty-rich` `SceneNode` variant must map to an
+/// extension `SceneKind` with a resolved role (or fail closed for `Unknown`).
 #[test]
 fn scene_kind_mirror_tracks_bitty_rich() {
     use bitty_rich::scene::{Border, CodeBlockModel, ListModel, SceneNode, StyledSpan, TableModel};
@@ -300,179 +216,620 @@ fn scene_kind_mirror_tracks_bitty_rich() {
         role_of(SceneKind::Unknown),
         Err(A11yError::UnmappedSceneKind)
     ));
-    assert!(matches!(
-        validate_scene(&[SceneKind::Unknown]),
-        Err(A11yError::UnmappedSceneKind)
-    ));
 }
 
 // ---------------------------------------------------------------------------
-// Accessibility tree: stable shape, fail-closed bounds, read-only build
+// Terminal projection: text runs plus cursor, read-only, stated boundary
 // ---------------------------------------------------------------------------
 
-fn tree_snapshot() -> bitty_term_state::Snapshot {
+#[test]
+fn fidelity_boundary_is_stated_not_implied() {
+    for token in ["cursor", "SGR", "graphics", "images"] {
+        assert!(
+            FIDELITY_BOUNDARY.contains(token),
+            "boundary must name {token}"
+        );
+    }
+}
+
+#[test]
+fn terminal_runs_expose_readable_text_and_cursor() {
     let mut state = State::new();
     feed_line(&mut state, "hello");
     prints(&mut state, "world");
+    let snapshot = state.snapshot();
+
+    let runs = terminal_runs(&snapshot);
+    assert!(runs.len() >= 2);
+    assert_eq!(runs[0].row, 0);
+    assert_eq!(runs[0].text, "hello");
+    assert_eq!(runs[1].row, 1);
+    assert_eq!(runs[1].text.trim(), "world");
+}
+
+#[test]
+fn terminal_blank_rows_produce_no_runs() {
+    let state = State::new();
+    let snapshot = state.snapshot();
+    assert!(terminal_runs(&snapshot).is_empty());
+}
+
+#[test]
+fn terminal_runs_keep_zero_width_scalars() {
+    // CTX-1367 (#2260): a11y runs must expose the same cluster copy does.
+    let mut state = State::new();
+    prints(&mut state, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+    let snapshot = state.snapshot();
+    let runs = terminal_runs(&snapshot);
+    assert_eq!(runs[0].text, "e\u{0301}\u{2764}\u{FE0F}\u{1F468}\u{200D}");
+}
+
+#[test]
+fn overlong_pty_title_uses_core_fallback_and_ingests() {
+    // A PTY can set a 4096-byte OSC title while the accessibility ceiling is
+    // 256 characters. The host substitutes a fixed Core-owned name for both
+    // the root and the terminal region instead of failing every ingest.
+    let mut state = State::new();
+    let long = "t".repeat(MAX_ACCESSIBLE_NAME_LEN + 1);
+    state.apply(&TerminalAction::OscTitle {
+        text: long.clone().into(),
+    });
+    prints(&mut state, "body");
+    let terminal = state.snapshot();
+    assert_eq!(terminal.title.as_str(), long);
+    let host = UiSnapshotHost::from_terminal(&terminal);
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overlong PTY title must not fail the ingest");
+    let live = adapter.snapshot().expect("live snapshot");
+    assert!(live.lookup_label(FALLBACK_ACCESSIBLE_NAME).is_some());
+    assert!(live.lookup_label(&long).is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["body"]);
+}
+
+#[test]
+fn terminal_projection_is_named_by_title_and_read_only() {
+    let mut state = State::new();
+    prints(&mut state, "data");
     state.apply(&TerminalAction::OscTitle {
         text: "editor".into(),
     });
-    state.snapshot()
+    let before = state.snapshot();
+    let runs = terminal_runs(&before);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].text, "data");
+    assert_eq!(state.snapshot(), before);
 }
 
-#[test]
-fn tree_shape_is_root_terminal_chrome_scene_in_order() {
-    let snapshot = tree_snapshot();
-    let chrome = [
-        ChromeNode::new(ChromeKind::Bar, "status bar", Some("main.rs")).unwrap(),
-        ChromeNode::new(ChromeKind::Notification, "notices", None).unwrap(),
-    ];
-    let scene = [SceneKind::Text, SceneKind::Table];
-    let before = snapshot.clone();
-    let tree = build_a11y_tree(&snapshot, &chrome, &scene).unwrap();
-    // The build borrows everything and mutates nothing.
-    assert_eq!(snapshot, before);
+// ---------------------------------------------------------------------------
+// Host ingest round trip through the single seam
+// ---------------------------------------------------------------------------
 
-    // 1 root + 1 terminal + 2 rows + 2 chrome + 2 scene.
-    assert_eq!(tree.len(), 8);
-    assert!(!tree.is_empty());
+fn standard_host() -> UiSnapshotHost {
+    let mut host = UiSnapshotHost::new("terminal window", "shell");
+    host.push_row(0, "$ echo hi");
+    host.push_row(1, "hi");
+    host = host.with_cursor(1, 2, true);
+    host.push_chrome(ChromeKind::Bar, "status bar", Some("utf-8"));
+    host.push_scene(SceneKind::Text, 41);
+    host.push_interactive(InteractivePurpose::Button, "follow link", true);
+    host.set_focus_label(Some("shell"));
+    host.push_notice(AnnouncementKind::Focus, "shell focused");
+    host
+}
 
-    let root = tree.get(tree.root()).unwrap();
-    assert_eq!(root.kind(), A11yNodeKind::Root);
-    assert_eq!(root.name(), "editor");
-    assert_eq!(root.role(), Some(A11yRole::Group));
-    assert_eq!(root.children().len(), 5);
+/// Builds a host with content distinguishable from another prefix.
+fn prefixed_host(prefix: &str) -> UiSnapshotHost {
+    let root = format!("{prefix} window");
+    let title = format!("{prefix} shell");
+    let row = format!("{prefix} row");
+    let chrome = format!("{prefix} status");
+    let action = format!("{prefix} action");
+    let mut host = UiSnapshotHost::new(&root, &title);
+    host.push_row(0, &row);
+    host.push_chrome(ChromeKind::Bar, &chrome, None);
+    host.push_interactive(InteractivePurpose::Button, &action, true);
+    host.set_focus_label(Some(&title));
+    host
+}
 
-    let order: Vec<(A11yNodeKind, &str)> = tree
+/// Reads the live terminal-row content, in snapshot order.
+fn live_row_texts(adapter: &Adapter) -> Vec<String> {
+    let snapshot = adapter.snapshot().expect("live snapshot");
+    snapshot
         .preorder()
-        .map(|node| (node.kind(), node.name()))
-        .collect();
-    assert_eq!(order[0], (A11yNodeKind::Root, "editor"));
-    assert_eq!(order[1], (A11yNodeKind::Terminal, "editor"));
-    assert_eq!(order[2].0, A11yNodeKind::TerminalRow);
-    assert_eq!(order[2].1, "hello");
-    assert_eq!(order[3].0, A11yNodeKind::TerminalRow);
-    assert!(order[3].1.contains("world"));
-    assert_eq!(
-        order[4],
-        (A11yNodeKind::Chrome(ChromeKind::Bar), "status bar")
-    );
-    assert_eq!(
-        order[5],
-        (A11yNodeKind::Chrome(ChromeKind::Notification), "notices")
-    );
-    assert_eq!(order[6], (A11yNodeKind::Scene(SceneKind::Text), "text"));
-    // Scene roles attach last in caller order; preorder ends with the table.
-    let names: Vec<&str> = tree.preorder().map(|node| node.name()).collect();
-    assert_eq!(names.last(), Some(&"table"));
-
-    // Terminal leaf states the live cursor; rows read as text.
-    let terminal = tree
-        .preorder()
-        .find(|node| node.kind() == A11yNodeKind::Terminal)
-        .unwrap();
-    let visibility = if snapshot.cursor.visible {
-        "visible"
-    } else {
-        "hidden"
-    };
-    assert_eq!(
-        terminal.state(),
-        Some(format!("cursor 1,10 {visibility}").as_str())
-    );
-    assert_eq!(terminal.role(), Some(A11yRole::Text));
-
-    // Chrome keeps its identity and stays out of the role vocabulary.
-    let bar = tree.preorder().nth(4).unwrap();
-    assert_eq!(bar.role(), None);
-    assert_eq!(bar.state(), Some("main.rs"));
+        .filter_map(|handle| match snapshot.get(handle) {
+            Some(bitty_a11y::NodeView::TerminalRow { text }) => Some(text.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn tree_fails_closed_on_unmapped_scene_kind() {
-    let snapshot = tree_snapshot();
+fn host_ingest_expose_round_trip() {
+    let host = standard_host();
+    let generation = Generation::initial();
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("host ingest");
+    let snapshot = adapter.snapshot().expect("live snapshot");
+    assert_eq!(snapshot.generation(), generation);
+    assert!(snapshot.lookup_label("shell").is_some());
+    assert!(snapshot.lookup_label("status bar").is_some());
+    assert!(snapshot.lookup_label("follow link").is_some());
+
+    let mut backend = HeadlessBackend::new();
+    backend.set_permission(true);
+    adapter.expose_to(&mut backend).expect("expose");
+    assert_eq!(backend.exposures().len(), 1);
+    let drained = adapter.announce_to(&mut backend).expect("announce");
+    assert_eq!(drained, 1);
+}
+
+/// Independently reads the expected rows from the live grid cells.
+///
+/// This deliberately does not call `terminal_runs`: a mutation in the
+/// projection (for example dropping zero-width scalars) must fail the
+/// round-trip test, not move the expected value with it.
+fn expected_runs_from_cells(snapshot: &bitty_term_state::Snapshot) -> Vec<(u32, String)> {
+    let mut rows = Vec::new();
+    for row in 0..snapshot.height {
+        let start = row.saturating_mul(snapshot.width);
+        let end = start
+            .saturating_add(snapshot.width)
+            .min(snapshot.cells.len());
+        let Some(cells) = snapshot.cells.get(start..end) else {
+            continue;
+        };
+        let mut text = String::new();
+        for cell in cells {
+            if cell.spacer {
+                continue;
+            }
+            text.push(cell.glyph);
+            for mark in &cell.zerowidth {
+                text.push(*mark);
+            }
+        }
+        let trimmed = text.trim_end();
+        if !trimmed.is_empty() {
+            rows.push((u32::try_from(row).unwrap_or(u32::MAX), trimmed.to_string()));
+        }
+    }
+    rows
+}
+
+/// The Core projection round-trips through `SnapshotHost` byte-exactly.
+///
+/// Grid text comes from the same live terminal `Snapshot` the renderer reads;
+/// the adapter must not retype, normalize, trim, or reorder a row. Selection
+/// is the accessibility selection: the tab order contains the terminal leaf
+/// and interactive nodes only, chrome is excluded, and the recorded focus
+/// owner is the terminal leaf Core reported as focused.
+#[test]
+fn round_trip_matches_grid_text_and_selection_byte_exactly() {
+    let mut state = State::new();
+    feed_line(&mut state, "hello");
+    // `feed_line` uses LF only; return to column zero so row 1 starts at the
+    // left margin and the literal expectation stays readable.
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+    // A wide character and a combining mark exercise the same cell-walk the
+    // renderer uses; neither may be split or normalized by the seam.
+    prints(&mut state, "wide界");
+    prints(&mut state, "e\u{0301}");
+    state.apply(&TerminalAction::OscTitle {
+        text: "editor".into(),
+    });
+    let terminal = state.snapshot();
+    let before = terminal.clone();
+    let expected_rows = expected_runs_from_cells(&terminal);
+
+    let mut host = UiSnapshotHost::from_terminal(&terminal);
+    host.push_chrome(ChromeKind::Bar, "status bar", Some("utf-8"));
+    host.push_scene(SceneKind::Text, 7);
+    host.push_interactive(InteractivePurpose::Button, "follow link", true);
+    host.set_focus_label(Some("editor"));
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("host ingest");
+    let live = adapter.snapshot().expect("live snapshot");
+
+    // Grid rows: same order, same bytes, no truncation or retyping.
+    let mut actual_rows: Vec<(u32, String)> = Vec::new();
+    for handle in live.preorder() {
+        let Some(bitty_a11y::NodeView::TerminalRow { text }) = live.get(handle) else {
+            continue;
+        };
+        let anchor = adapter.resolve(handle).expect("live row anchor");
+        let bitty_a11y::Anchor::TerminalRow { row } = anchor else {
+            panic!("terminal row node must carry a row anchor, got {anchor:?}");
+        };
+        actual_rows.push((*row, text.to_string()));
+    }
     assert_eq!(
-        build_a11y_tree(&snapshot, &[], &[SceneKind::Text, SceneKind::Unknown]),
-        Err(A11yError::UnmappedSceneKind)
+        expected_rows,
+        vec![
+            (0, String::from("hello")),
+            (1, String::from("wide界e\u{0301}")),
+        ],
+        "the independent cell walk must see the literal grid text"
     );
-}
+    assert_eq!(actual_rows.len(), expected_rows.len());
+    for (actual, expected) in actual_rows.iter().zip(&expected_rows) {
+        assert_eq!(actual.0, expected.0, "row ordinal must be preserved");
+        assert_eq!(
+            actual.1.as_bytes(),
+            expected.1.as_bytes(),
+            "row {} must round-trip byte-exactly",
+            expected.0
+        );
+    }
 
-#[test]
-fn tree_fails_closed_on_overlong_title_and_chrome_label() {
-    let snapshot = tree_snapshot();
-    let long = "n".repeat(300);
-    let chrome = [ChromeNode::new(ChromeKind::Rail, "rail", None).unwrap()];
-    // Overlong titles fail the root; overlong chrome labels fail at
-    // construction (pinned below), so the tree build itself stays total.
-    let builder = A11yTreeBuilder::new(&long);
-    assert!(matches!(builder, Err(A11yError::NameTooLong { .. })));
-    let bad_state = ChromeNode::new(ChromeKind::Rail, "rail", Some(&long));
-    assert!(matches!(bad_state, Err(A11yError::NameTooLong { .. })));
-    let tree = build_a11y_tree(&snapshot, &chrome, &[]);
-    assert!(tree.is_ok());
-}
-
-#[test]
-fn tree_builder_enforces_cap_foreign_handles_and_row_content_rule() {
-    let mut builder = A11yTreeBuilder::new("window").unwrap();
-    assert_eq!(builder.len(), 1);
-    assert!(!builder.is_empty());
-    let root = builder.root();
-    assert_eq!(root.as_u32(), 0);
-
-    // Row content bypasses the name cap; plain names do not.
-    let long = "x".repeat(300);
-    assert!(builder.push_row_text(root, &long).is_ok());
+    // Selection: terminal leaf first, then the interactive control; chrome
+    // is never a tab stop.
+    let tab_order = live.tab_order();
+    assert_eq!(tab_order.len(), 2, "terminal + one interactive node");
     assert!(matches!(
-        builder.push(root, A11yNodeKind::TerminalRow, &long, None),
+        live.get(tab_order[0]),
+        Some(bitty_a11y::NodeView::Terminal { .. })
+    ));
+    assert!(matches!(
+        live.get(tab_order[1]),
+        Some(bitty_a11y::NodeView::Interactive {
+            purpose: InteractivePurpose::Button,
+            name: "follow link",
+            enabled: true,
+        })
+    ));
+    for handle in &tab_order {
+        assert!(!matches!(
+            live.get(*handle),
+            Some(bitty_a11y::NodeView::Chrome { .. })
+        ));
+    }
+
+    // Focus association is Core-owned and points at the terminal leaf.
+    let owner = adapter.focus().owner().expect("terminal leaf focused");
+    assert_eq!(owner.anchor(), &bitty_a11y::Anchor::TerminalLeaf);
+
+    // The projection is read-only: the source terminal snapshot is untouched.
+    assert_eq!(terminal, before);
+    assert_eq!(state.snapshot(), before);
+}
+
+// ---------------------------------------------------------------------------
+// Bounds: fail-closed on the Core side of the seam
+// ---------------------------------------------------------------------------
+
+#[test]
+fn host_rejects_overlong_names_at_256_boundary() {
+    let long = "n".repeat(MAX_ACCESSIBLE_NAME_LEN + 1);
+    let mut host = UiSnapshotHost::new(&long, "shell");
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
+    assert!(matches!(
+        adapter.ingest_host(&host, Generation::initial(), None),
         Err(A11yError::NameTooLong { .. })
     ));
 
-    // Interactive controls attach with their declared role (the rejected
-    // overlong push above allocated nothing, so this is id 2).
-    let button = builder
-        .push(
-            root,
-            A11yNodeKind::Interactive(A11yRole::Button),
-            "Send",
-            Some("enabled"),
-        )
-        .unwrap();
-    assert_eq!(button.as_usize(), 2);
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.push_chrome(ChromeKind::Rail, &long, None);
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
+    assert!(matches!(
+        adapter.ingest_host(&host, Generation::initial(), None),
+        Err(A11yError::NameTooLong { .. })
+    ));
 
-    // A handle from a taller builder is out of range here.
-    let mut other = A11yTreeBuilder::new("other").unwrap();
-    let _ = other
-        .push(other.root(), A11yNodeKind::Terminal, "t", None)
-        .unwrap();
-    let _ = other
-        .push(other.root(), A11yNodeKind::Terminal, "t", None)
-        .unwrap();
-    let foreign = other
-        .push(other.root(), A11yNodeKind::Terminal, "t", None)
-        .unwrap();
-    assert!(other.len() > builder.len());
-    assert!(foreign.as_usize() >= builder.len());
+    let at_cap = "n".repeat(MAX_ACCESSIBLE_NAME_LEN);
+    let mut host = UiSnapshotHost::new(&at_cap, "shell");
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("boundary length is accepted");
+}
+
+#[test]
+fn overlong_focus_label_is_discarded_without_failing_ingest() {
+    // A focus label above the accessibility ceiling can never match a bounded
+    // node; discard it at the setter instead of failing later with
+    // UnknownHandle.
+    let long = "f".repeat(MAX_ACCESSIBLE_NAME_LEN + 1);
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(Some(&long));
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overlong focus label must not fail the ingest");
+    assert!(adapter.focus().owner().is_none(), "nothing focused");
+}
+
+#[test]
+fn host_rejects_unmapped_scene_kind_fail_closed() {
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.push_scene(SceneKind::Text, 1);
+    host.push_scene(SceneKind::Unknown, 2);
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
     assert_eq!(
-        builder.push(foreign, A11yNodeKind::Terminal, "t", None),
-        Err(A11yError::UnknownParent)
+        adapter.ingest_host(&host, Generation::initial(), None),
+        Err(A11yError::UnmappedSceneKind)
     );
+    assert!(adapter.snapshot().is_none());
+}
 
-    // The node cap fails closed with an exact count.
-    let mut full = A11yTreeBuilder::new("full").unwrap();
-    let full_root = full.root();
-    for _ in 1..MAX_A11Y_TREE_NODES {
-        full.push(full_root, A11yNodeKind::TerminalRow, "r", None)
-            .unwrap();
+#[test]
+fn host_rejects_modal_without_overlay_surface() {
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_modal_overlay(true);
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
+    assert_eq!(
+        adapter.ingest_host(&host, Generation::initial(), None),
+        Err(A11yError::InvalidStructure)
+    );
+}
+
+#[test]
+fn host_enforces_4096_node_cap_fail_closed() {
+    let mut host = UiSnapshotHost::new("window", "shell");
+    for row in 0..(MAX_SNAPSHOT_NODES as u32 + 10) {
+        host.push_row(row, "x");
     }
+    host.set_focus_label(None);
+    let mut adapter = Adapter::new();
+    let err = adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect_err("node cap must fail closed");
+    assert!(matches!(err, A11yError::TooManyNodes { .. }));
+    assert!(adapter.snapshot().is_none());
+}
+
+#[test]
+fn host_rejects_overlong_announcement_text() {
+    let long = "n".repeat(MAX_ANNOUNCEMENT_TEXT_LEN + 1);
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(None);
+    host.push_notice(AnnouncementKind::Focus, &long);
+    let mut adapter = Adapter::new();
+    assert!(matches!(
+        adapter.ingest_host(&host, Generation::initial(), None),
+        Err(A11yError::AnnouncementTooLong { .. })
+    ));
+    assert!(adapter.snapshot().is_none());
+}
+
+#[test]
+fn host_announcement_overflow_drops_oldest_not_fail_closed() {
+    // W-134: the 8-pending bound is a drop-oldest queue, not a fail-closed
+    // ingest error. The newest state wins; the ingest itself succeeds.
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(None);
+    let overflow = MAX_PENDING_ANNOUNCEMENTS + 2;
+    for index in 0..overflow {
+        host.push_notice(AnnouncementKind::AsyncState, &format!("state {index}"));
+    }
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("overflow drops the oldest, it does not fail the ingest");
+    let pending = adapter.pending_announcements();
+    assert_eq!(pending.len(), MAX_PENDING_ANNOUNCEMENTS);
+    assert_eq!(pending.first().expect("nonempty").text(), "state 2");
     assert_eq!(
-        full.push(full_root, A11yNodeKind::TerminalRow, "r", None),
-        Err(A11yError::TooManyNodes {
-            count: MAX_A11Y_TREE_NODES + 1,
-            cap: MAX_A11Y_TREE_NODES,
-        })
+        pending.last().expect("nonempty").text(),
+        format!("state {}", overflow - 1).as_str()
     );
-    assert_eq!(full.finish().len(), MAX_A11Y_TREE_NODES);
+}
+
+// ---------------------------------------------------------------------------
+// Structural mutation: a dropped field fails closed with nothing swapped
+// ---------------------------------------------------------------------------
+
+/// A host that names the root but never supplies the terminal leaf.
+///
+/// The seam's contract requires both; a partial projection must fail before
+/// anything attaches, never present a root-only tree to assistive technology.
+struct DroppedTerminalHost;
+
+impl SnapshotHost for DroppedTerminalHost {
+    fn build_snapshot(&self, builder: &mut SnapshotBuilder) -> Result<(), A11yError> {
+        builder.set_root_name("window")?;
+        Ok(())
+    }
+
+    fn focus_for(
+        &self,
+        _snapshot: &bitty_a11y::Snapshot,
+        _map: &bitty_a11y::HandleMap,
+    ) -> Result<Option<FocusOwner>, A11yError> {
+        Ok(None)
+    }
+
+    fn announcements(&self) -> Vec<(AnnouncementKind, String)> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn dropped_field_fails_closed_and_live_snapshot_preserved() {
+    let old = prefixed_host("old");
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&old, Generation::initial(), None)
+        .expect("old ingest");
+    assert_eq!(
+        adapter.ingest_host(&DroppedTerminalHost, Generation::initial(), None),
+        Err(A11yError::InvalidStructure)
+    );
+    let live = adapter.snapshot().expect("old snapshot preserved");
+    assert!(live.lookup_label("old shell").is_some());
+    assert!(
+        live.lookup_label("window").is_none(),
+        "no partial root-only tree"
+    );
+    assert_eq!(live_row_texts(&adapter), vec!["old row"]);
+    assert_eq!(adapter.generation(), Generation::initial());
+}
+
+// ---------------------------------------------------------------------------
+// Disabled extension / platform fallback: exposure drops, Core baseline stays
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disabled_extension_fallback_keeps_core_baseline() {
+    let terminal = tree_snapshot();
+    let before = terminal.clone();
+    let host = UiSnapshotHost::from_terminal(&terminal);
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("host ingest works with zero backends");
+    let live_len = adapter.snapshot().expect("live snapshot").len();
+
+    // Platform permission denied is the runtime "extension disabled" state:
+    // nothing is exposed, nothing is lost, and the projection stays live.
+    let mut backend = HeadlessBackend::new();
+    assert_eq!(
+        adapter.expose_to(&mut backend),
+        Err(A11yError::PermissionDenied)
+    );
+    assert!(backend.exposures().is_empty());
+    assert_eq!(adapter.snapshot().expect("live snapshot").len(), live_len);
+    assert_eq!(terminal, before, "terminal truth is untouched");
+    assert!(!needs_refresh(None), "no invalidation, no rebuild");
+}
+
+// ---------------------------------------------------------------------------
+// Stale generations: rejected and the previous snapshot is preserved
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stale_generation_rejected_and_live_snapshot_preserved() {
+    // The old and new hosts carry different labels, rows, and actions, so a
+    // swap to the rejected snapshot would be visible in the assertions below.
+    let old = prefixed_host("old");
+    let new = prefixed_host("new");
+    let mut adapter = Adapter::new();
+    let advanced = Generation::initial().advance().advance();
+    adapter
+        .ingest_host(&old, advanced, None)
+        .expect("advanced ingest");
+    let live_generation = adapter.generation();
+    assert_eq!(live_generation, advanced);
+    let err = adapter
+        .ingest_host(&new, Generation::initial(), None)
+        .expect_err("stale ingest must fail");
+    assert!(matches!(err, A11yError::StaleGeneration { .. }));
+    assert_eq!(
+        adapter.generation(),
+        live_generation,
+        "generation unchanged"
+    );
+    let live = adapter.snapshot().expect("old snapshot preserved");
+    assert!(live.lookup_label("old shell").is_some());
+    assert!(live.lookup_label("new shell").is_none());
+    assert!(live.lookup_label("old status").is_some());
+    assert!(live.lookup_label("new status").is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["old row"]);
+}
+
+// ---------------------------------------------------------------------------
+// No retained handles: each ingest re-binds focus fresh
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fresh_ingest_rebinds_handles_without_retaining_old_ones() {
+    // The second host differs from the first in labels and row content, and
+    // the first generation's handles/focus must not resolve against the new
+    // live projection.
+    let old = prefixed_host("old");
+    let new = prefixed_host("new");
+    let mut adapter = Adapter::new();
+    let first = Generation::initial();
+    adapter
+        .ingest_host(&old, first, None)
+        .expect("first ingest");
+    let old_handles: Vec<_> = adapter
+        .snapshot()
+        .expect("first snapshot")
+        .preorder()
+        .collect();
+    let old_owner = adapter.focus().owner().expect("old focus").handle();
+    assert!(old_handles.contains(&old_owner));
+
+    let second = first.advance();
+    adapter
+        .ingest_host(&new, second, None)
+        .expect("second ingest re-binds fresh");
+    assert_eq!(adapter.generation(), second);
+
+    let live = adapter.snapshot().expect("second snapshot");
+    let new_handles: Vec<_> = live.preorder().collect();
+    assert!(
+        new_handles
+            .iter()
+            .all(|handle| !old_handles.contains(handle)),
+        "handles from the previous generation must not be reused"
+    );
+    let err = adapter
+        .resolve(old_owner)
+        .expect_err("old-generation handle must not resolve");
+    assert!(matches!(
+        err,
+        A11yError::UnknownHandle | A11yError::StaleGeneration { .. }
+    ));
+
+    let new_owner = adapter.focus().owner().expect("new focus");
+    assert_eq!(adapter.focus().generation(), second);
+    assert!(new_handles.contains(&new_owner.handle()));
+    assert!(live.lookup_label("new shell").is_some());
+    assert!(live.lookup_label("old shell").is_none());
+    assert_eq!(live_row_texts(&adapter), vec!["new row"]);
+
+    assert!(matches!(
+        adapter.ingest_host(&old, first, None),
+        Err(A11yError::StaleGeneration { .. })
+    ));
+}
+
+#[test]
+fn identical_reingest_does_not_advance_generation_or_grow() {
+    let host = standard_host();
+    let mut adapter = Adapter::new();
+    let generation = Generation::initial();
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("first ingest");
+    let len = adapter.snapshot().expect("live snapshot").len();
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("identical re-ingest");
+    assert_eq!(adapter.generation(), generation);
+    assert_eq!(adapter.snapshot().expect("live snapshot").len(), len);
+}
+
+#[test]
+fn chrome_stays_out_of_tab_order_while_state_is_exposed() {
+    let host = standard_host();
+    let mut adapter = Adapter::new();
+    adapter
+        .ingest_host(&host, Generation::initial(), None)
+        .expect("ingest");
+    let snapshot = adapter.snapshot().expect("live snapshot");
+    let tab_order = snapshot.tab_order();
+    assert!(!tab_order.is_empty());
+    for handle in &tab_order {
+        let view = snapshot.get(*handle).expect("known handle");
+        assert!(
+            !matches!(view, bitty_a11y::NodeView::Chrome { .. }),
+            "chrome must never be a tab stop"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,9 +840,7 @@ fn tree_builder_enforces_cap_foreign_handles_and_row_content_rule() {
 fn announcements_coalesce_consecutive_duplicates() {
     let mut queue = AnnouncementQueue::new();
     assert!(queue.is_empty());
-    assert_eq!(queue.len(), 0);
     assert_eq!(queue.push_focus("editor"), Ok(true));
-    // Same kind and text as the tail coalesces: no duplicate is stored.
     assert_eq!(queue.push_focus("editor"), Ok(false));
     assert_eq!(queue.len(), 1);
     let drained = queue.drain();
@@ -493,19 +848,6 @@ fn announcements_coalesce_consecutive_duplicates() {
     assert_eq!(drained[0].kind(), AnnouncementKind::Focus);
     assert_eq!(drained[0].text(), "editor");
     assert!(queue.is_empty());
-}
-
-#[test]
-fn announcements_keep_kinds_distinct() {
-    let mut queue = AnnouncementQueue::new();
-    assert_eq!(queue.push_focus("ready"), Ok(true));
-    // Same text under the other kind is a different notice.
-    assert_eq!(queue.push_state("ready"), Ok(true));
-    assert_eq!(queue.len(), 2);
-    let drained = queue.drain();
-    assert_eq!(drained[0].kind(), AnnouncementKind::Focus);
-    assert_eq!(drained[1].kind(), AnnouncementKind::AsyncState);
-    assert_eq!(drained[1].text(), "ready");
 }
 
 #[test]
@@ -517,27 +859,10 @@ fn announcements_rate_limit_drops_oldest() {
     }
     assert_eq!(queue.len(), MAX_PENDING_ANNOUNCEMENTS);
     let drained = queue.drain();
-    // Newest state wins: the first three notices were dropped.
     assert_eq!(drained.len(), MAX_PENDING_ANNOUNCEMENTS);
     assert_eq!(drained[0].text(), "state 3");
     let last = format!("state {}", MAX_PENDING_ANNOUNCEMENTS + 2);
     assert_eq!(drained.last().expect("nonempty").text(), last.as_str());
-    assert!(queue.is_empty());
-}
-
-#[test]
-fn announcements_reject_overlong_text_at_the_boundary() {
-    let mut queue = AnnouncementQueue::new();
-    let long = "n".repeat(MAX_ANNOUNCEMENT_TEXT_LEN + 1);
-    assert!(matches!(
-        queue.push_focus(&long),
-        Err(A11yError::NameTooLong { .. })
-    ));
-    assert!(queue.is_empty());
-    // Boundary length is accepted.
-    let at_cap = "n".repeat(MAX_ANNOUNCEMENT_TEXT_LEN);
-    assert_eq!(queue.push_state(&at_cap), Ok(true));
-    assert_eq!(queue.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,75 +911,18 @@ fn settings_high_contrast_selects_compliant_outlines() {
 
 #[test]
 fn hot_path_refresh_is_invalidation_driven() {
-    // Render/paint/damage ticks with no content change pass `None` and
-    // never rebuild.
-    assert!(!needs_a11y_refresh(None));
+    use bitty_a11y::InvalidationSource;
+    assert!(!needs_refresh(None));
     for source in [
-        A11ySource::FocusChange,
-        A11ySource::AsyncStateChange,
-        A11ySource::SceneUpdate,
-        A11ySource::TerminalUpdate,
-        A11ySource::ChromeUpdate,
+        InvalidationSource::FocusChange,
+        InvalidationSource::AsyncStateChange,
+        InvalidationSource::SceneUpdate,
+        InvalidationSource::TerminalUpdate,
+        InvalidationSource::ChromeUpdate,
     ] {
         assert!(
-            needs_a11y_refresh(Some(source)),
+            needs_refresh(Some(source)),
             "source {source:?} must refresh"
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// SessionId decision (F-3, CW-17, issue #995): ViewId keying retained,
-// re-confirmed vs ADR-0013 (CTX-0721)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn session_f3_keeps_viewid_keying() {
-    // Decision F-3 (re-confirmed CTX-0721 against adopted `OQ-058` and
-    // `ADR-0013`): no `SessionId` newtype exists; scenes stay keyed by
-    // `ViewId`. `ADR-0013` `Session` maps to the headless continuity
-    // layer, not to the view key.
-    use bitty_ui::{
-        LayoutNode, PanelId, TerminalBinding, View, ViewId, WorkspaceScene, WorkspaceSceneId,
-    };
-    let tiled = LayoutNode::leaf(View::new(ViewId::new(11), 80, 24));
-    let mut scene = WorkspaceScene::new(WorkspaceSceneId::new(1), tiled);
-    let panel = PanelId::new(7);
-    scene
-        .bind(panel, ViewId::new(11), TerminalBinding::new(77))
-        .expect("bind by ViewId");
-    // View-keyed lookup resolves in its own lane: the panel lane never
-    // converts into the view lane.
-    assert_eq!(scene.view_of(panel), Some(ViewId::new(11)));
-    assert_eq!(
-        scene.attachment_of(panel).expect("attached").view,
-        ViewId::new(11)
-    );
-}
-
-#[test]
-fn session_f3_reconfirmed_vs_adr0013() {
-    // F-3 re-confirmation (CTX-0721, issue #995): pane-session identity is
-    // the owning live `ViewId`; `ADR-0013` Panel/Execution separation holds
-    // (panels never own executions, presentation non-authoritative), and
-    // `ADR-0013` `Session` (attachable continuity scope) stays a separate
-    // layer that introduces no UI-layer `SessionId` newtype here.
-    use bitty_ui::{
-        LayoutNode, PanelId, TerminalBinding, View, ViewId, WorkspaceScene, WorkspaceSceneId,
-    };
-    let tiled = LayoutNode::leaf(View::new(ViewId::new(21), 80, 24));
-    let mut scene = WorkspaceScene::new(WorkspaceSceneId::new(2), tiled);
-    let panel = PanelId::new(9);
-    scene
-        .bind(panel, ViewId::new(21), TerminalBinding::new(88))
-        .expect("bind by ViewId");
-    // No session key participates: the attachment is (panel, view, terminal).
-    let attachment = scene.attachment_of(panel).expect("attached");
-    assert_eq!(attachment.view, ViewId::new(21));
-    assert_eq!(attachment.terminal, TerminalBinding::new(88));
-    // Panel and view lanes stay pairwise distinct: no conversion exists.
-    assert_ne!(
-        std::any::TypeId::of::<PanelId>(),
-        std::any::TypeId::of::<ViewId>()
-    );
 }

@@ -141,12 +141,20 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # fail-closed. Recorded 2026-10-07; a dated ADR-0004/ADR-0012 revision
 # recording this source is tracked as a CTX-1008 follow-up. Falls under the
 # same 2027-03-31 re-audit bound above.
+# bitty-a11y is the accepted W-134 snapshot-model seam (CTX-1362, bitty
+# #2257): a zero-dependency, `forbid(unsafe)` crate that owns the bounded
+# semantic snapshot vocabulary and the `SnapshotHost`/`Adapter` contract.
+# Core's `bitty-ui` implements the host side over its terminal projection;
+# `bitty-a11y` owns no PTY, GPU, window, or plugin handle. The W-147 fence
+# records `bitty-ui` as the only allowed consumer. Falls under the same
+# 2027-03-31 pin re-audit bound above.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
     "https://github.com/bitty-terminal/bitty-network",
     "https://github.com/bitty-terminal/bitty-ipc",
     "https://github.com/bitty-terminal/bitty-storage",
+    "https://github.com/bitty-terminal/bitty-a11y",
     "https://github.com/bitty-terminal/bitty-observability",
     "https://github.com/bitty-terminal/bitty-url-detector",
     "https://github.com/bitty-terminal/bitty-platform-services",

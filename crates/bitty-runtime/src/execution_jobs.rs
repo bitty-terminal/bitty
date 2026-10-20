@@ -37,7 +37,7 @@
 //! to a PTY job.
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,9 +89,13 @@ pub(crate) fn job_principal(name: &str) -> Result<JobPrincipal, IpcError> {
 pub(crate) struct JobRun {
     /// Real registry identity minted for this spawn.
     pub job: JobId,
-    /// Bounded output and outcome shaped for the existing `bitty-ipc`
-    /// synchronous surface.
+    /// Outcome and retained (not yet caller-budget-truncated) output shaped
+    /// for the existing `bitty-ipc` synchronous surface.
     pub raw: RawExecutionOutput,
+    /// Whether any output byte was lost to the registry store or the caller's
+    /// stream budget. Computed from byte totals, not from the line-joined
+    /// text length, so newline-heavy output still reports truncation.
+    pub truncated: bool,
 }
 
 /// Core-owned wrapper around the extracted [`JobRegistry`] for tool spawns.
@@ -141,16 +145,11 @@ impl ToolJobSupervisor {
 
     /// Spawns a job and waits for its terminal state, returning bounded
     /// output shaped for the synchronous execution service.
-    ///
-    /// `on_spawn` runs exactly once with the real [`JobId`] as soon as the
-    /// registry accepts the job, before the wait. It lets the caller record
-    /// identity even when a later read fails closed.
     pub(crate) fn spawn_and_wait(
         &self,
         request: &ExecutionRequest,
         principal: &JobPrincipal,
         poll_interval: Duration,
-        on_spawn: impl FnOnce(JobId),
     ) -> Result<JobRun, IpcError> {
         // Preserve CTX-1151 fail-closed behavior for admitted tools: resolve
         // the executable closure and build the Landlock ruleset once before
@@ -174,13 +173,12 @@ impl ToolJobSupervisor {
             .registry
             .spawn_as(principal.clone(), spec)
             .map_err(map_job_error)?;
-        on_spawn(job);
         let snapshot = self.wait_terminal(principal, job, request.timeout_ms, poll_interval)?;
         let outcome = snapshot.state.outcome().ok_or_else(|| IpcError::Internal {
             reason: format!("job {job} reported a terminal snapshot without an outcome"),
         })?;
-        let stdout = self.read_stream(principal, job, OutputStream::Stdout, request)?;
-        let stderr = self.read_stream(principal, job, OutputStream::Stderr, request)?;
+        let stdout = self.read_stream(principal, job, OutputStream::Stdout)?;
+        let stderr = self.read_stream(principal, job, OutputStream::Stderr)?;
         let (status, effect_state, exit_code, mut evidence) =
             classify_outcome(job, outcome, request, &stdout, &stderr);
         if matches!(outcome, ExecutionOutcome::SpawnFailed) {
@@ -188,9 +186,14 @@ impl ToolJobSupervisor {
                 reason: format!("job {job} failed to spawn under the execution supervisor"),
             });
         }
-        if stdout.truncated || stderr.truncated {
+        let budget = request.effective_stream_budget() as u64;
+        let truncated = stdout.truncated
+            || stderr.truncated
+            || stdout.total_bytes > budget
+            || stderr.total_bytes > budget;
+        if truncated {
             evidence.push(format!(
-                "job {job} output was bounded by the execution supervisor; newest bytes preserved"
+                "job {job} output was bounded; newest bytes preserved"
             ));
         }
         Ok(JobRun {
@@ -204,6 +207,7 @@ impl ToolJobSupervisor {
                 evidence_refs: evidence,
                 effect_state,
             },
+            truncated,
         })
     }
 
@@ -213,15 +217,14 @@ impl ToolJobSupervisor {
         principal: &JobPrincipal,
         job: JobId,
         stream: OutputStream,
-        request: &ExecutionRequest,
     ) -> Result<OutputView, IpcError> {
-        // Ask for one byte beyond the synchronous stream budget: the
-        // `ExecutionService` consumes that spare byte as its truncation
-        // signal, exactly as the previous direct provider did.
-        let budget = request.effective_stream_budget().saturating_add(1);
-        let read = ReadOutput::new(stream).with_max_bytes(budget);
+        // Read the whole retained tail (bounded by the registry's 256 KiB
+        // per-stream store) and let the synchronous `ExecutionService` apply
+        // the caller's stream budget. Reading only `budget + 1` here would
+        // lose the truncation signal when line-joining shortens the tail
+        // below the budget even though the child emitted more bytes.
         self.registry
-            .read_output_as(principal, job, read)
+            .read_output_as(principal, job, ReadOutput::new(stream))
             .map_err(map_job_error)
     }
 
@@ -418,7 +421,6 @@ fn classify_outcome(
 struct DispatchContext {
     supervisor: ToolJobSupervisor,
     principal: JobPrincipal,
-    last_job: Cell<Option<JobId>>,
 }
 
 thread_local! {
@@ -437,19 +439,9 @@ impl DispatchScope {
         let context = DispatchContext {
             supervisor,
             principal,
-            last_job: Cell::new(None),
         };
         let previous = ACTIVE_DISPATCH.with(|slot| slot.replace(Some(context)));
         Self { previous }
-    }
-
-    /// Real job id recorded by the provider for this dispatch, if any.
-    pub(crate) fn job(&self) -> Option<JobId> {
-        ACTIVE_DISPATCH.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .and_then(|context| context.last_job.get())
-        })
     }
 }
 
@@ -468,15 +460,6 @@ fn active_dispatch() -> Option<(ToolJobSupervisor, JobPrincipal)> {
             .as_ref()
             .map(|context| (context.supervisor.clone(), context.principal.clone()))
     })
-}
-
-/// Records the real job id into the active dispatch scope.
-fn record_job(job: JobId) {
-    ACTIVE_DISPATCH.with(|slot| {
-        if let Some(context) = slot.borrow().as_ref() {
-            context.last_job.set(Some(job));
-        }
-    });
 }
 
 /// Default supervisor for the direct IPC provider (no plugin scope).
@@ -501,7 +484,7 @@ pub(crate) fn spawn_supervised(
             JobPrincipal::new(IPC_PRINCIPAL).map_err(map_job_error)?,
         ),
     };
-    supervisor.spawn_and_wait(request, &principal, poll_interval, record_job)
+    supervisor.spawn_and_wait(request, &principal, poll_interval)
 }
 
 /// Fail-closed CTX-1151 confinement pre-validation for admitted tools.
@@ -559,6 +542,22 @@ impl SpawnPreparer for SandboxPreparer {
             .map_err(|error| truncate_message(error.to_string(), 96))?;
         Ok(Box::new(guard))
     }
+}
+
+/// Truncates `text` to `budget` bytes at a char boundary.
+///
+/// Returns the bounded text and whether any byte was cut. Used by the
+/// synchronous spawn surface so `ExecutionResult` summaries stay within the
+/// accepted per-stream ceiling.
+pub(crate) fn truncate_to_budget(text: &str, budget: usize) -> (String, bool) {
+    if text.len() <= budget {
+        return (text.to_owned(), false);
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
 }
 
 /// Bounded diagnostic truncation (char-boundary safe).

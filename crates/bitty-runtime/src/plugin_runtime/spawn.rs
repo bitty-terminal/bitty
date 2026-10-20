@@ -40,13 +40,14 @@
 //!    from the hash-bound install grant (the user consented to the manifest
 //!    declaring `process.spawn:<tool>`); per-spawn UI prompting that refreshes
 //!    it is sequel work, but the enforcement point is here.
-//! 6. **Outcome**: the resolved spawn runs under [`ExecutionService`], whose
-//!    provider delegates to the extracted `bitty-execution` supervisor
-//!    (`crate::execution_jobs`). The registry owns job identity, lifecycle,
-//!    owned-tree kill/reap, bounded output, and the terminal outcome; this
-//!    surface inherits stream budgets, char-boundary truncation, the
-//!    `Unknown` agreement, burst caps (`64` tracked outcomes), and trust
-//!    labeling without a second supervisor.
+//! 6. **Outcome**: the resolved spawn runs under the extracted
+//!    `bitty-execution` supervisor (`crate::execution_jobs`). The registry
+//!    owns job identity, lifecycle, owned-tree kill/reap, bounded output, and
+//!    the terminal outcome; this surface applies stream budgets, char-boundary
+//!    truncation, the `Unknown` agreement, burst caps (`64` tracked
+//!    outcomes), and trust labeling without a second supervisor. The direct
+//!    IPC provider keeps [`ExecutionService`](bitty_ipc::ExecutionService) as
+//!    its synchronous gate over the same registry-backed provider.
 //!
 //! # Execution hardening
 //!
@@ -146,9 +147,10 @@
 //! via [`SpawnService::reconcile`].
 //!
 //! The module performs real I/O (it spawns children) and therefore lives in
-//! `bitty-runtime`, not in headless `bitty-ipc`: it reuses the accepted
-//! [`ExecutionService`] as its synchronous gate and the extracted
-//! `bitty-execution` registry as its supervisor.
+//! `bitty-runtime`, not in headless `bitty-ipc`: the plugin service applies
+//! the six gates itself, while the direct IPC provider keeps the accepted
+//! [`ExecutionService`](bitty_ipc::ExecutionService) as its synchronous gate
+//! and the extracted `bitty-execution` registry as its supervisor.
 
 #![forbid(unsafe_code)]
 
@@ -157,6 +159,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use bitty_ipc::IpcError;
 use bitty_ipc::execution::{
     DEFAULT_EXEC_TIMEOUT_MS, EnvPolicy, EnvVar, ExecutionRequest, ExecutionResult,
     MAX_EXEC_ARG_BYTES, MAX_EXEC_ARGS, MAX_EXEC_ARGS_TOTAL_BYTES, MAX_EXEC_CLIENT_ID_BYTES,
@@ -164,7 +167,6 @@ use bitty_ipc::execution::{
     MAX_TRACKED_EXECUTIONS,
 };
 use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
-use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::tools::{
     ACCEPTED_TOOL_GIT, ToolSpawnLedger, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
@@ -173,7 +175,7 @@ use bitty_plugin_host::tools::{
 use bitty_pty::TreeBackend;
 
 use crate::execution_jobs::{
-    DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised,
+    DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised, truncate_to_budget,
 };
 
 /// Panel-path per-stream output budget (`8 KiB`).
@@ -938,8 +940,8 @@ impl SpawnAuthorizer for HostToolsAuthorizer {
 
 /// Bounded, consent-gated spawn service: the CTX-0445 execution surface.
 ///
-/// Wraps the accepted [`ExecutionService`] with the real-process provider and
-/// the [`SpawnAuthorizer`] routing step. `SpawnService` owns no socket and
+/// Composes the [`SpawnAuthorizer`] routing step, the six consent gates, and
+/// the extracted execution supervisor. `SpawnService` owns no socket and
 /// spawns nothing until [`SpawnService::dispatch`] passes all six gates.
 ///
 /// Composition-root bridge (CTX-1184, issue #1997): the service enforces one
@@ -957,7 +959,8 @@ impl SpawnAuthorizer for HostToolsAuthorizer {
 /// mirroring the FS audit ledger.
 pub struct SpawnService {
     authorizer: Box<dyn SpawnAuthorizer>,
-    exec: ExecutionService,
+    /// Synchronous outcomes for [`SpawnService::reconcile`].
+    results: BTreeMap<u64, ExecutionResult>,
     /// Extracted execution supervisor: the registry owns job identity,
     /// lifecycle, cancellation, and bounded output for every mediated spawn.
     supervisor: ToolJobSupervisor,
@@ -973,7 +976,7 @@ impl fmt::Debug for SpawnService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpawnService")
             .field("authorizer", &self.authorizer)
-            .field("tracked", &self.exec.len())
+            .field("tracked", &self.results.len())
             .field("supervisor", &self.supervisor)
             .field("policy", &self.policy)
             .field("audit_entries", &self.audit.len())
@@ -1001,7 +1004,7 @@ impl SpawnService {
     pub fn with_policy(authorizer: Box<dyn SpawnAuthorizer>, policy: SpawnMechanicsPolicy) -> Self {
         Self {
             authorizer,
-            exec: ExecutionService::with_provider(spawn_process),
+            results: BTreeMap::new(),
             supervisor: ToolJobSupervisor::new(),
             job_ids: BTreeMap::new(),
             policy,
@@ -1056,7 +1059,7 @@ impl SpawnService {
     ) -> Self {
         Self {
             authorizer,
-            exec: ExecutionService::with_provider(spawn_process),
+            results: BTreeMap::new(),
             supervisor,
             job_ids: BTreeMap::new(),
             policy,
@@ -1089,9 +1092,9 @@ impl SpawnService {
     /// Tracked-outcome ceiling this service enforces.
     ///
     /// The policy's `tracked_cap`, clamped to at least one slot and at most
-    /// the registry ceiling (`MAX_TRACKED_EXECUTIONS`): the inner
-    /// [`ExecutionService`] registry still fails closed at its own ceiling,
-    /// so a tune above it clamps instead of silently never taking effect.
+    /// the supervisor ceiling (`MAX_TRACKED_EXECUTIONS`): the extracted
+    /// `JobRegistry` still fails closed at its own capacity, so a tune above
+    /// it clamps instead of silently never taking effect.
     #[must_use]
     pub fn effective_tracked_cap(&self) -> usize {
         self.policy.tracked_cap.clamp(1, MAX_TRACKED_EXECUTIONS)
@@ -1112,19 +1115,19 @@ impl SpawnService {
     /// Number of stored outcomes (burst accounting).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.exec.len()
+        self.results.len()
     }
 
     /// Whether no outcome is stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.exec.is_empty()
+        self.results.is_empty()
     }
 
     /// Whether `execution_id` has a stored outcome.
     #[must_use]
     pub fn contains(&self, execution_id: u64) -> bool {
-        self.exec.contains(execution_id)
+        self.results.contains_key(&execution_id)
     }
 
     /// Reconcile one tracked spawn: return its latest stored outcome.
@@ -1136,7 +1139,12 @@ impl SpawnService {
     ///
     /// Returns `NotFound` when `execution_id` has no stored outcome.
     pub fn reconcile(&self, execution_id: u64) -> Result<ExecutionResult, IpcError> {
-        self.exec.reconcile(execution_id)
+        self.results
+            .get(&execution_id)
+            .cloned()
+            .ok_or_else(|| IpcError::NotFound {
+                reason: format!("unknown execution id {execution_id}"),
+            })
     }
 
     /// Handle minted for a tracked spawn, if any.
@@ -1250,25 +1258,38 @@ impl SpawnService {
                     return Err(error);
                 }
             };
-        // The `bitty-ipc` provider slot is a bare `fn`; carry this dispatch's
-        // authenticated principal and registry through the scoped context so
-        // the provider records the real `JobId` for this caller id.
+        if self.results.contains_key(&execution_id) {
+            return Err(IpcError::InvalidRequest {
+                reason: format!(
+                    "execution id {execution_id} is already tracked (reconcile, never blind-retry)"
+                ),
+            });
+        }
+        // The supervisor owns the process; the scoped context carries this
+        // dispatch's authenticated principal and registry so the provider
+        // records the real `JobId` for this caller id.
         let principal = job_principal(client_id)?;
         let scope = DispatchScope::enter(self.supervisor.clone(), principal);
-        let result = self.exec.dispatch(
-            &exec_request,
-            granted,
-            consent,
-            client_id,
-            now_ms,
-            execution_id,
-        );
-        let job = scope.job();
+        let run = spawn_supervised(&exec_request, self.policy.poll_interval);
         drop(scope);
-        let result = result?;
-        if let Some(job) = job {
-            self.job_ids.insert(execution_id, job);
-        }
+        let run = run?;
+        let budget = exec_request.effective_stream_budget();
+        let (stdout, stdout_cut) = truncate_to_budget(&run.raw.stdout, budget);
+        let (stderr, stderr_cut) = truncate_to_budget(&run.raw.stderr, budget);
+        let result = ExecutionResult::new(
+            execution_id,
+            client_id.to_owned(),
+            exec_request.target.clone(),
+            run.raw.status,
+            run.raw.exit_code,
+            stdout,
+            stderr,
+            run.truncated || stdout_cut || stderr_cut,
+            run.raw.evidence_refs,
+            run.raw.effect_state,
+        )?;
+        self.job_ids.insert(execution_id, run.job);
+        self.results.insert(execution_id, result.clone());
         let generation = SpawnGeneration::from_raw(self.next_generation.get())
             .expect("generation counter never mints zero");
         self.next_generation = self.next_generation.saturating_add(1);
@@ -1313,11 +1334,11 @@ impl SpawnService {
             });
         }
         let cap = self.effective_tracked_cap();
-        if self.exec.len() >= cap {
+        if self.results.len() >= cap {
             return Err(IpcError::LimitExceeded {
                 field: "spawn tracked outcomes".into(),
                 limit: cap,
-                actual: self.exec.len().saturating_add(1),
+                actual: self.results.len().saturating_add(1),
             });
         }
         let resolved = self.authorizer.authorize(&request.tool, &request.args)?;
@@ -1713,6 +1734,12 @@ mod tests {
             }
             Ok("emit") => {
                 eprint!("{}", "x".repeat(1024 * 1024));
+            }
+            Ok("newlines") => {
+                // Newline-heavy output keeps the retained byte total high
+                // while the line-joined view collapses to nothing; #2249
+                // must still report truncation from the byte totals.
+                eprint!("{}", "\n".repeat(200_000));
             }
             Ok("append") => {
                 // One line per spawned child; the #2249 tests use this to
@@ -2191,6 +2218,28 @@ mod tests {
     }
 
     #[test]
+    fn newline_heavy_output_still_reports_truncation() {
+        // CodeRabbit follow-up: line-joined text can be shorter than the
+        // caller budget even when the child wrote far more. Truncation is
+        // decided from the registry's byte totals, not the joined length.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let request = allowed_request("newlines")
+            .with_timeout_ms(10_000)
+            .with_output_budget(SPAWN_PANEL_OUTPUT_BUDGET);
+        let result = dispatch_ok(&mut service, &request, 52).expect("newlines serve");
+        assert!(
+            result.truncated,
+            "200 KB of newlines must report truncation at the {SPAWN_PANEL_OUTPUT_BUDGET}-byte budget"
+        );
+        assert!(
+            result.stderr_summary.len() <= SPAWN_PANEL_OUTPUT_BUDGET,
+            "the summary must stay within the caller budget, got {} bytes",
+            result.stderr_summary.len()
+        );
+    }
+
+    #[test]
     fn hanging_child_reports_unknown_and_reaps() {
         let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
         let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
@@ -2648,10 +2697,10 @@ mod tests {
 
     #[test]
     fn spawn_service_tracked_cap_clamps_to_the_registry_ceiling() {
-        // CodeRabbit follow-up on CTX-1184: the inner ExecutionService
-        // registry still fails closed at MAX_TRACKED_EXECUTIONS, so a tune
-        // above it must clamp instead of silently never taking effect —
-        // and a zero tune must clamp to one slot.
+        // CodeRabbit follow-up on CTX-1184: the extracted supervisor still
+        // fails closed at MAX_TRACKED_EXECUTIONS, so a tune above it must
+        // clamp instead of silently never taking effect — and a zero tune
+        // must clamp to one slot.
         let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
         let service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
         assert_eq!(service.effective_tracked_cap(), MAX_TRACKED_EXECUTIONS);
@@ -3300,8 +3349,17 @@ mod tests {
                 "execution_jobs.rs still contains `{needle}`"
             );
         }
-        // The confinement pre-validation may build a probe command; it must
+        // The main bridge must still delegate to the registry, and the
+        // confinement pre-validation may build a probe command only; it must
         // never spawn it.
+        assert!(
+            spawn_prod.contains("spawn_supervised"),
+            "spawn_process must delegate to the registry-backed bridge"
+        );
+        assert!(
+            jobs_prod.contains("spawn_as("),
+            "execution_jobs must create jobs through the registry"
+        );
         assert!(
             jobs_prod.contains("confine_command_to_execs"),
             "the tool confinement seam must stay wired"

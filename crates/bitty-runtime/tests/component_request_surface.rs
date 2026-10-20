@@ -38,6 +38,8 @@ const EGRESS_PORT: u16 = 443;
 const CAPABILITY: &str = "network.connect:api.example.com:443";
 const POLL_BUDGET: Duration = Duration::from_millis(10);
 const POLL_ATTEMPTS: usize = 400;
+const RELOAD_PLUGIN: &str = "acme.reload";
+const RELOAD_V2_URL: &str = "https://api.example.com/v2/reloaded";
 
 struct Scratch(PathBuf);
 
@@ -484,16 +486,42 @@ fn install_approved(store: &Path, source: &Path) {
     .expect("approved");
 }
 
-/// Production contract for a hot reload (bitty#2302): the mirror is keyed by
-/// the generation hash, so re-running it after `PluginRuntime::reload`
-/// authorizes the new manifest while the predecessor's hash and tickets stay
-/// refused.
-#[test]
-fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
-    const PLUGIN: &str = "acme.reload";
-    const V2_URL: &str = "http://api.example.com/v2/reloaded";
+/// Store-backed v1 generation mirrored into the policy host, with a v2
+/// source staged for the reload scenarios.
+struct ReloadFixture {
+    runtime: Runtime,
+    plugins: PluginRuntime,
+    id: PluginId,
+    store: PathBuf,
+    source_v2: PathBuf,
+    v1_hash: String,
+    // Kept alive for the fixture's lifetime; dropped last so the runtime and
+    // plugin session tear down before the scratch tree disappears.
+    _scratch: Scratch,
+}
 
-    let scratch = Scratch::new("reload");
+impl ReloadFixture {
+    /// Install v2 over the store and reload the live generation.
+    fn reload_to_v2(&mut self) -> String {
+        install_approved(&self.store, &self.source_v2.join(RELOAD_PLUGIN));
+        let report = self.plugins.reload(&self.id).expect("reload v2");
+        assert_eq!(report.state, LifecycleState::Active);
+        let v2_hash = self
+            .plugins
+            .discovered_package(&self.id)
+            .expect("v2 package")
+            .manifest
+            .manifest_hash();
+        assert_ne!(
+            self.v1_hash, v2_hash,
+            "reload must move to a new manifest hash"
+        );
+        v2_hash
+    }
+}
+
+fn reload_fixture(tag: &str) -> ReloadFixture {
+    let scratch = Scratch::new(tag);
     let components = scratch.path().join("extensions");
     std::fs::create_dir_all(&components).expect("component root");
     install_via_add(&components, ECHO, Path::new(FIXTURE), "echo");
@@ -503,7 +531,7 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
     let source_v2 = scratch.path().join("source-v2");
     write_versioned_plugin(
         &source_v1,
-        PLUGIN,
+        RELOAD_PLUGIN,
         "0.1.0",
         &surface_lua(ECHO, URL, 5_000),
         Some(CAPABILITY),
@@ -511,13 +539,13 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
     );
     write_versioned_plugin(
         &source_v2,
-        PLUGIN,
+        RELOAD_PLUGIN,
         "0.2.0",
-        &surface_lua(ECHO, V2_URL, 5_000),
+        &surface_lua(ECHO, RELOAD_V2_URL, 5_000),
         Some(CAPABILITY),
         Some(EGRESS_HOST),
     );
-    install_approved(&store, &source_v1.join(PLUGIN));
+    install_approved(&store, &source_v1.join(RELOAD_PLUGIN));
 
     let mut runtime =
         Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig::default())
@@ -539,7 +567,7 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
         snapshot: std::rc::Rc::new(EmptySnapshot),
     });
     assert_eq!(plugins.discover().len(), 1, "one store plugin discovered");
-    let id = PluginId::new(PLUGIN).expect("plugin id");
+    let id = PluginId::new(RELOAD_PLUGIN).expect("plugin id");
     let report = plugins.activate(&id).expect("activate v1");
     assert_eq!(report.state, LifecycleState::Active);
 
@@ -555,31 +583,48 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
         1,
         "the v1 generation is mirrored"
     );
-    let ticket = queue_request(&mut plugins, PLUGIN);
+
+    ReloadFixture {
+        _scratch: scratch,
+        runtime,
+        plugins,
+        id,
+        store,
+        source_v2,
+        v1_hash,
+    }
+}
+
+/// Production contract for a hot reload (bitty#2302): the mirror is keyed by
+/// the generation hash, so re-running it after `PluginRuntime::reload`
+/// authorizes the new manifest while the predecessor's hash and tickets stay
+/// refused.
+#[test]
+fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
+    let mut fixture = reload_fixture("reload");
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
     assert_eq!(
-        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
-        format!("ok:200:{URL}"),
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        format!("ok:200:{URL}|grant:{EGRESS_HOST}:{EGRESS_PORT}"),
         "the v1 generation serves through the mirrored authority"
     );
 
     // A ticket queued by v1 is purged by the reload, not delivered to v2.
-    let stale_ticket = queue_request(&mut plugins, PLUGIN);
-    install_approved(&store, &source_v2.join(PLUGIN));
-    let report = plugins.reload(&id).expect("reload v2");
-    assert_eq!(report.state, LifecycleState::Active);
-    let v2_hash = plugins
-        .discovered_package(&id)
-        .expect("v2 package")
-        .manifest
-        .manifest_hash();
-    assert_ne!(v1_hash, v2_hash, "reload must move to a new manifest hash");
+    let stale_ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
+    let v2_hash = fixture.reload_to_v2();
     let stale = LuaValue::table([(
         "ticket",
         LuaValue::Integer(stale_ticket.parse().expect("stale ticket integer")),
     )]);
     assert_eq!(
-        plugins
-            .invoke_command(&format!("{PLUGIN}:poll"), &stale)
+        fixture
+            .plugins
+            .invoke_command(&format!("{RELOAD_PLUGIN}:poll"), &stale)
             .expect("poll stale ticket"),
         LuaValue::String("err:E_COMPONENT_TICKET".to_string()),
         "the predecessor's ticket is purged by the reload"
@@ -587,24 +632,30 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
 
     // Regression: the un-refreshed mirror still holds v1's hash, so v2 is
     // denied until the composition root mirrors the reloaded generation.
-    let ticket = queue_request(&mut plugins, PLUGIN);
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
     assert_eq!(
-        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
         "err:E_COMPONENT_CAPABILITY_DENIED",
         "a stale mirror must fail closed for the reloaded generation"
     );
 
     assert_eq!(
-        mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
             panic!("mirror refused {plugin}: {reason}")
         }),
         1,
         "the reloaded generation is mirrored once"
     );
-    let registered = runtime
+    let registered = fixture
+        .runtime
         .plugin_host()
         .registry()
-        .get(&id)
+        .get(&fixture.id)
         .expect("reloaded generation registered");
     assert_eq!(registered.state, PluginState::Activated);
     assert_eq!(
@@ -613,22 +664,30 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
         "the policy host now holds the reloaded manifest"
     );
     assert_eq!(
-        mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
             panic!("mirror refused {plugin}: {reason}")
         }),
         0,
         "the same generation is already mirrored and is not churned"
     );
 
-    let ticket = queue_request(&mut plugins, PLUGIN);
+    let ticket = queue_request(&mut fixture.plugins, RELOAD_PLUGIN);
     assert_eq!(
-        poll_until_settled(&mut runtime, &mut plugins, PLUGIN, &ticket),
-        format!("ok:200:{V2_URL}"),
+        poll_until_settled(
+            &mut fixture.runtime,
+            &mut fixture.plugins,
+            RELOAD_PLUGIN,
+            &ticket
+        ),
+        format!("ok:200:{RELOAD_V2_URL}|grant:{EGRESS_HOST}:{EGRESS_PORT}"),
         "the reloaded generation serves with its own code and hash"
     );
 
     // The predecessor's hash no longer authorizes anything.
-    match runtime.component_grant(PLUGIN, &v1_hash) {
+    match fixture
+        .runtime
+        .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+    {
         Err(ComponentHostError::CapabilityDenied { reason, .. }) => assert!(
             reason.contains("manifest hash is not the registered generation"),
             "unexpected denial reason: {reason}"
@@ -636,20 +695,96 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
         other => panic!("the predecessor generation must be refused, got {other:?}"),
     }
     assert!(
-        !runtime
-            .component_grant(PLUGIN, &v2_hash)
+        !fixture
+            .runtime
+            .component_grant(RELOAD_PLUGIN, &v2_hash)
             .expect("reloaded generation authorized")
             .is_offline(),
         "the reloaded generation keeps its granted network authority"
     );
 
-    let queue = plugins.component_request_queue().borrow();
+    let queue = fixture.plugins.component_request_queue().borrow();
     assert_eq!(queue.pending(), 0, "no submission survives the reload");
     assert_eq!(
         queue.in_flight(),
         0,
         "no broker request survives the reload"
     );
+}
+
+/// B1 (bitty#2302 review): an explicit plugin-level denial in the policy host
+/// must survive a reload and a mirror refresh; the reloaded generation must be
+/// neither re-granted nor activated.
+#[test]
+fn explicit_denial_survives_reload_and_mirror_refresh() {
+    let mut fixture = reload_fixture("denied-reload");
+    let id = fixture.id.clone();
+    fixture
+        .runtime
+        .insert_grant(GrantRecord::denied(id.clone(), fixture.v1_hash.clone(), 7));
+    let v2_hash = fixture.reload_to_v2();
+
+    let mut warnings = Vec::new();
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            warnings.push(format!("{plugin}: {reason}"));
+        }),
+        0,
+        "a denied predecessor must not be re-granted for the reloaded generation"
+    );
+    assert!(
+        fixture.runtime.plugin_host().grants().is_denied(&id),
+        "the plugin-level denial marker must survive the refresh"
+    );
+    assert!(
+        fixture.runtime.plugin_host().registry().get(&id).is_none(),
+        "a denied generation must not be left activated in the policy host"
+    );
+    match fixture.runtime.component_grant(RELOAD_PLUGIN, &v2_hash) {
+        Err(ComponentHostError::CapabilityDenied { reason, .. }) => assert!(
+            reason.contains("plugin is not registered") || reason.contains("denied"),
+            "unexpected denial reason: {reason}"
+        ),
+        other => panic!("the denied reloaded generation must be refused, got {other:?}"),
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("explicit policy-host denial")),
+        "the refusal must be reported: {warnings:?}"
+    );
+}
+
+/// B2 (bitty#2302 review): a generation that is no longer live loses its
+/// mirrored policy-host authority on the next reconciliation.
+#[test]
+fn disposed_generation_loses_mirrored_authority() {
+    let mut fixture = reload_fixture("disposed-reload");
+    let id = fixture.id.clone();
+    fixture.plugins.dispose(&id).expect("dispose v1");
+    assert_eq!(fixture.plugins.state(&id), Some(&LifecycleState::Disposed));
+
+    assert_eq!(
+        mirror_plugin_authority(&mut fixture.runtime, &fixture.plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}")
+        }),
+        0,
+        "a disposed generation adds no mirrored authority"
+    );
+    assert!(
+        fixture.runtime.plugin_host().registry().get(&id).is_none(),
+        "the disposed id must be removed from the policy host"
+    );
+    match fixture
+        .runtime
+        .component_grant(RELOAD_PLUGIN, &fixture.v1_hash)
+    {
+        Err(ComponentHostError::CapabilityDenied { reason, .. }) => assert!(
+            reason.contains("plugin is not registered"),
+            "unexpected denial reason: {reason}"
+        ),
+        other => panic!("the disposed generation must be refused, got {other:?}"),
+    }
 }
 
 /// Manifest-shaped types are not needed by the surface test except through

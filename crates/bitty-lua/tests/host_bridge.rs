@@ -16,28 +16,6 @@ fn gate_vm(id: impl Into<String>) -> LuaVm {
     build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
 }
 
-/// Wall budget for timeout/commit fixtures that deliberately block past the
-/// bridge's 1-5 ms cheap-call deadline.
-///
-/// These tests assert the typed `E_TIMEOUT` (or committed-mutation) bridge
-/// behavior, not the RC-1 wall. The production 50 ms default is covered by
-/// `measurement_lua` and `host_budget_accounting`; on a loaded runner a 30 ms
-/// sleep can overshoot past 50 ms, so the completion check would otherwise
-/// replace the expected `Completed` result with `WallClockExceeded`.
-const TIMEOUT_FIXTURE_WALL_BUDGET_MS: u64 = 60_000;
-
-/// Gate-built VM with a wide wall budget for timeout/commit fixtures.
-fn timeout_vm(id: impl Into<String>) -> LuaVm {
-    build_plugin_vm(
-        id,
-        Some(VmBudgets {
-            wall_budget_ms: TIMEOUT_FIXTURE_WALL_BUDGET_MS,
-            ..VmBudgets::default()
-        }),
-    )
-    .expect("timeout fixture budgets are valid")
-}
-
 #[derive(Default)]
 struct FakeServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
@@ -258,7 +236,7 @@ fn host_call_deadline_returns_typed_timeout() {
         settings_delay_ms: 30,
         ..FakeServices::default()
     });
-    let mut vm = timeout_vm("t");
+    let mut vm = gate_vm("t");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -793,7 +771,7 @@ fn post_deadline_effects_never_commit() {
     let services = Rc::new(SlowStoreServices {
         store: RefCell::new(BTreeMap::new()),
     });
-    let mut vm = timeout_vm("pre-commit");
+    let mut vm = gate_vm("pre-commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -884,7 +862,7 @@ fn committed_mutation_is_not_reported_as_timeout() {
     let services = Rc::new(SlowCommitServices {
         store: RefCell::new(BTreeMap::new()),
     });
-    let mut vm = timeout_vm("commit");
+    let mut vm = gate_vm("commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");

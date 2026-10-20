@@ -214,15 +214,6 @@ below claims a published artifact.
   (phodopus `string.gmatch`/`gsub`) now charges each scan position once, so
   parsing a capped 8 KiB tool output no longer burns the full instruction
   budget. The git-panel `open` command completes with a branch list again.
-- **RC-1 wall at callback completion (CTX-1391, #2314):** the completed path
-  now re-checks charged wall time before reporting success, so a callback that
-  chains bounded supervised spawns past the 5000 ms per-callback credit cap
-  suspends with the same `WallClockExceeded` outcome used at slice boundaries
-  instead of returning `Completed` at ~6 s against a 50 ms budget. Exhausting a
-  credit bound alone is not a suspension: later host time is charged, and the
-  callback suspends only when charged time reaches the wall budget. A callback
-  that reports `Completed` is therefore bounded by the 50 + 200 + 5000 ms
-  credit envelope.
 
 - **Reloaded plugin component authority (CTX-1383, #2302):** the runtime policy
   host mirror is keyed by the activation manifest hash, so re-running it after
@@ -404,6 +395,13 @@ below claims a published artifact.
 
 ### Known issues
 
+- **RC-1 completion-point ceiling is deferred to 0.0.25 (#2314).** The
+  5250 ms per-callback credit ceiling remains advisory in 0.0.24: the 50 ms
+  charged-time wall still suspends at slice boundaries, but a callback that
+  finishes inside one stepped slice can report `Completed` past the credit
+  cap. Completion-point enforcement was reverted because input-path plugin
+  commands (`bar:audio-toggle`, `composer:open`) are refused when the VM
+  suspends at completion and command dispatch cannot resume it.
 - **Component request surface limits (#2254, #2296).** The Lua producer is
   merged and #2254 is closed, but there is no IPC verb (that would need a
   user-level authority the accepted model does not define), no streaming,

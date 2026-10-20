@@ -21,12 +21,6 @@ use bitty_runtime::plugin_runtime::{
     ThemePersistHandler, write_atomic_durably,
 };
 
-/// Load-sensitive activation harness budget. These tests assert image-root and
-/// theme behavior, not wall enforcement; 60 s keeps a descheduled activation
-/// from tripping the 50 ms production wall. The default contract stays covered
-/// by `measurement_lua` and `host_budget_accounting`.
-const HARNESS_WALL_BUDGET_MS: u64 = 60_000;
-
 struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
@@ -78,7 +72,6 @@ fn runtime_with_roots(root: PathBuf, image_roots: Vec<PathBuf>) -> PluginRuntime
         snapshot: Rc::new(NoSnapshot),
     });
     rt.set_image_roots(image_roots);
-    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     rt
 }
 

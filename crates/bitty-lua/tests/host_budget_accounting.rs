@@ -2,9 +2,8 @@
 
 //! RC-1 accounting across the host boundary (bitty#2285).
 //!
-//! Three independent defects made the bounded git-panel `open` workload
-//! suspend on RC-1 or report success past the budget while it performed almost
-//! no Lua work:
+//! Two independent defects made the bounded git-panel `open` workload suspend
+//! on RC-1 while it performed almost no Lua work:
 //!
 //! 1. **Wall-clock charged host I/O.** The wall budget is a deadline on Lua
 //!    execution, but `BudgetMark` measured raw wall time, so the wait inside a
@@ -19,17 +18,11 @@
 //!    8 KiB-capped `git branch -a` output burned ~10.05M instructions for
 //!    ~40 bytes of work per line. gmatch/gsub now charge each scan position
 //!    once, keeping the scan linear.
-//! 3. **Completion bypass.** The completed path updated the ledger and warning
-//!    flag but never re-checked charged time, so a callback that chained
-//!    bounded spawns past the 5000 ms credit cap returned `Completed` above
-//!    the 50 ms wall budget. The wall is now enforced at slice boundaries and
-//!    again at callback completion (bitty#2314).
 //!
-//! The regressions pin both directions: the bounded workload completes, a
+//! Both directions are pinned here: the bounded workload completes, a
 //! genuinely runaway script still trips the instruction budget fail-closed,
-//! Lua executed through `commands.invoke`/`services.*` dispatch earns no
-//! host-call credit (the guard that wraps those calls must stay uncredited),
-//! and chained spawns past the credit cap suspend instead of completing.
+//! and Lua executed through `commands.invoke`/`services.*` dispatch earns no
+//! host-call credit (the guard that wraps those calls must stay uncredited).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -39,7 +32,7 @@ use std::time::Duration;
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
     BridgeError, ExecuteOutcome, HOST_CALL_CREDIT_MAX_MS, HostServices, LuaValue, LuaVm,
-    MarshallingLimits, RC1_WALL_CLOCK_BUDGET_MS, SLICE_FUEL, ServiceRoute, SuspendReason,
+    MarshallingLimits, ServiceRoute, SuspendReason,
 };
 
 /// One real `git` invocation measured ~35 ms on the reporting host.
@@ -74,8 +67,6 @@ struct BlockingSpawn {
     waits: Cell<u32>,
     /// Time the spawn stub actually spent blocked, measured around each sleep.
     waited: Cell<Duration>,
-    /// Delay injected into `process.spawn`; zero uses the real-git proxy.
-    spawn_delay_ms: u64,
     /// Delay injected into `commands.invoke` / `services.*` dispatch.
     dispatch_delay_ms: u64,
     dispatches: Cell<u32>,
@@ -130,12 +121,7 @@ impl HostServices for BlockingSpawn {
     fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
         self.waits.set(self.waits.get() + 1);
         let started = std::time::Instant::now();
-        let delay_ms = if self.spawn_delay_ms == 0 {
-            SPAWN_WAIT_MS
-        } else {
-            self.spawn_delay_ms
-        };
-        std::thread::sleep(Duration::from_millis(delay_ms));
+        std::thread::sleep(Duration::from_millis(SPAWN_WAIT_MS));
         self.waited.set(self.waited.get() + started.elapsed());
         let output = tool_output(&args.join(" "));
         Ok(LuaValue::table([
@@ -211,11 +197,8 @@ fn tool_output(_argv: &str) -> String {
 }
 
 fn vm_with(services: BlockingSpawn) -> (LuaVm, Rc<BlockingSpawn>) {
-    vm_with_budgets(services, VmBudgets::default())
-}
-
-fn vm_with_budgets(services: BlockingSpawn, budgets: VmBudgets) -> (LuaVm, Rc<BlockingSpawn>) {
-    let mut vm = build_plugin_vm("xuepoo.accounting-2285", Some(budgets)).expect("budgets");
+    let mut vm =
+        build_plugin_vm("xuepoo.accounting-2285", Some(VmBudgets::default())).expect("budgets");
     let services = Rc::new(services);
     let host: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(host, MarshallingLimits::default(), 50)
@@ -323,151 +306,6 @@ fn blocking_spawn_wait_does_not_consume_the_wall_budget() {
         "bounded spawn waits must not consume the wall budget, got {charged_lua_ms} ms \
          (raw {} ms, credit {credited_ms} ms, measured wait {waited_ms} ms)",
         snapshot.wall_elapsed_ms
-    );
-}
-
-#[test]
-fn chained_spawns_past_the_credit_cap_suspend_at_completion() {
-    // Reviewer probe for bitty#2314: three bounded 2 s spawns chained in one
-    // callback. The callback uses ~315 instructions, so all three host calls
-    // fit inside one stepped slice; the slice-boundary check never observes
-    // the charged time. The 5000 ms spawn-wait credit hides the first 5 s and
-    // the remaining ~1 s is charged, so completion must suspend
-    // `WallClockExceeded` instead of returning `Completed`.
-    const SPAWN_DELAY_MS: u64 = 2_000;
-    let (mut vm, services) = vm_with(BlockingSpawn {
-        spawn_delay_ms: SPAWN_DELAY_MS,
-        ..BlockingSpawn::default()
-    });
-
-    let outcome = vm
-        .execute(
-            r#"
-            local first = bitty.process.spawn({ "branch", "-a" })
-            local second = bitty.process.spawn({ "status", "--porcelain" })
-            local third = bitty.process.spawn({ "rev-parse", "HEAD" })
-            bitty.store.set("delivered", #first.output + #second.output + #third.output)
-        "#,
-        )
-        .expect("execute");
-
-    let (instructions_used, wall_elapsed_ms) = match outcome {
-        ExecuteOutcome::Suspended {
-            reason,
-            instructions_used,
-            wall_elapsed_ms,
-            ..
-        } => {
-            match reason {
-                SuspendReason::WallClockExceeded {
-                    elapsed_ms,
-                    budget_ms,
-                } => {
-                    assert_eq!(budget_ms, RC1_WALL_CLOCK_BUDGET_MS);
-                    assert!(
-                        elapsed_ms >= RC1_WALL_CLOCK_BUDGET_MS,
-                        "the reason must report charged time at or past the budget, got {elapsed_ms} ms"
-                    );
-                }
-                other => panic!("completion must suspend WallClockExceeded, got {other:?}"),
-            }
-            (instructions_used, wall_elapsed_ms)
-        }
-        other => panic!("chained spawns must not complete past the credit cap, got {other:?}"),
-    };
-
-    assert_eq!(services.waits.get(), 3, "all three spawns must have run");
-    assert!(
-        wall_elapsed_ms >= 3 * SPAWN_DELAY_MS,
-        "raw wall must include all three waits, got {wall_elapsed_ms} ms"
-    );
-    // Keep the probe shape: if it spread over slices, the loop-top check could
-    // catch it and the test would no longer prove the completion check.
-    assert!(
-        instructions_used < SLICE_FUEL as u64,
-        "the probe must finish inside one slice, used {instructions_used} instructions"
-    );
-
-    let snapshot = vm.budget_snapshot();
-    assert_eq!(
-        snapshot.host_call_credit_ms, HOST_CALL_CREDIT_MAX_MS,
-        "the spawn-wait credit must be capped at {HOST_CALL_CREDIT_MAX_MS} ms"
-    );
-    let charged_ms = snapshot
-        .wall_elapsed_ms
-        .saturating_sub(snapshot.store_commit_credit_ms)
-        .saturating_sub(snapshot.host_call_credit_ms);
-    assert!(
-        charged_ms >= snapshot.wall_budget_ms,
-        "charged {charged_ms} ms must reach the {} ms wall budget",
-        snapshot.wall_budget_ms
-    );
-    assert!(vm.is_suspended(), "the VM must stay suspended fail-closed");
-    assert!(
-        vm.execute("return 1").is_err(),
-        "a suspended VM must refuse further execution"
-    );
-}
-
-#[test]
-fn spawn_wait_just_below_the_credit_cap_still_completes() {
-    // Boundary counterpart to the chained-spawn regression: a fully credited
-    // wait just below the 5000 ms per-callback cap charges no Lua time, so the
-    // completion check must not suspend for raw wall time. Exhausting the
-    // credit bound is not itself a suspension; only charged time past the wall
-    // budget is.
-    //
-    // The wall budget is widened to 2 s here so runner sleep overshoot on the
-    // 4.5 s wait cannot turn this into a different (correct) wall suspension;
-    // the exact 49/50 ms threshold is pinned deterministically by
-    // `wall_suspension_is_inclusive_at_the_budget`.
-    const SPAWN_DELAY_MS: u64 = 4_500;
-    let (mut vm, services) = vm_with_budgets(
-        BlockingSpawn {
-            spawn_delay_ms: SPAWN_DELAY_MS,
-            ..BlockingSpawn::default()
-        },
-        VmBudgets {
-            wall_budget_ms: 2_000,
-            ..VmBudgets::default()
-        },
-    );
-    // Raise the supervised-call deadline so sleep overshoot on a loaded runner
-    // cannot turn the wait into E_TIMEOUT before the credit is closed.
-    vm.set_spawn_deadline_ms(10_000).expect("spawn deadline");
-
-    let outcome = vm
-        .execute(
-            r#"
-            local result = bitty.process.spawn({ "status", "--porcelain" })
-            bitty.store.set("delivered", #result.output)
-        "#,
-        )
-        .expect("execute");
-
-    match outcome {
-        ExecuteOutcome::Completed {
-            wall_elapsed_ms, ..
-        } => {
-            assert!(
-                wall_elapsed_ms >= SPAWN_DELAY_MS,
-                "raw wall must include the credited wait, got {wall_elapsed_ms} ms"
-            );
-        }
-        other => panic!(
-            "a credited wait below the {HOST_CALL_CREDIT_MAX_MS} ms cap must complete, got {other:?}"
-        ),
-    }
-    assert_eq!(services.waits.get(), 1, "the spawn must have run");
-    let snapshot = vm.budget_snapshot();
-    let charged_ms = snapshot
-        .wall_elapsed_ms
-        .saturating_sub(snapshot.store_commit_credit_ms)
-        .saturating_sub(snapshot.host_call_credit_ms);
-    assert!(
-        charged_ms < snapshot.wall_budget_ms,
-        "charged {charged_ms} ms must stay below the {} ms wall budget",
-        snapshot.wall_budget_ms
     );
 }
 
@@ -681,60 +519,13 @@ fn runaway_lua_still_suspends_fail_closed() {
 }
 
 #[test]
-fn charged_host_call_past_the_wall_budget_suspends_at_completion() {
-    // A slow cheap call is charged in full (no host-call credit outside a
-    // supervised spawn). Even when `pcall` contains its `E_TIMEOUT`, the
-    // callback is past the 50 ms wall budget and must not report `Completed`
-    // when it finishes inside the same stepped slice (bitty #2314).
-    let (mut vm, _services) = vm_with(BlockingSpawn {
+fn slow_cheap_host_call_still_fails_closed_with_timeout() {
+    // The spawn credit is not a general relaxation: a read that misses its own
+    // 50 ms cheap-call deadline still reports `E_TIMEOUT` to the plugin.
+    let (mut vm, services) = vm_with(BlockingSpawn {
         snapshot_delay_ms: 80,
         ..BlockingSpawn::default()
     });
-    let outcome = vm
-        .execute(
-            r#"
-            local ok, err = pcall(bitty.terminal.snapshot, { scope = "semantic" })
-            bitty.store.set("ok", ok and 1 or 0)
-            bitty.store.set("code", err and err.code or "NONE")
-        "#,
-        )
-        .expect("execute");
-    match outcome {
-        ExecuteOutcome::Suspended { reason, .. } => {
-            assert!(
-                matches!(
-                    reason,
-                    SuspendReason::WallClockExceeded {
-                        budget_ms: RC1_WALL_CLOCK_BUDGET_MS,
-                        ..
-                    }
-                ),
-                "an 80 ms charged host call must suspend WallClockExceeded, got {reason:?}"
-            );
-        }
-        other => panic!("a charged host call past the wall budget must suspend, got {other:?}"),
-    }
-    assert!(vm.is_suspended(), "the VM must stay suspended fail-closed");
-}
-
-#[test]
-fn slow_cheap_host_call_still_fails_closed_with_timeout() {
-    // The spawn credit is not a general relaxation: a read that misses its own
-    // 50 ms cheap-call deadline still reports `E_TIMEOUT` to the plugin. The
-    // wall budget is raised to 60 s so this test isolates the cheap-call
-    // timeout from the completion wall check: the 80 ms wait is charged in
-    // full, and under the default 50 ms wall it would (correctly) suspend at
-    // completion (`charged_host_call_past_the_wall_budget_suspends_at_completion`).
-    let (mut vm, services) = vm_with_budgets(
-        BlockingSpawn {
-            snapshot_delay_ms: 80,
-            ..BlockingSpawn::default()
-        },
-        VmBudgets {
-            wall_budget_ms: 60_000,
-            ..VmBudgets::default()
-        },
-    );
     let outcome = vm
         .execute(
             r#"

@@ -49,6 +49,16 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 - `src/blocks.rs`, `src/hints.rs`, `src/background.rs` — command blocks, hint
   targets, and background images.
 - `src/host.rs` — external-editor round-trip seam (retained host mechanism).
-- `src/geometry.rs`, `src/loader.rs`, `src/presentation.rs` — rect helpers,
-  loading, and presentation assembly.
+- `src/geometry.rs`, `src/loader.rs` — rect helpers and resource-root
+  loading.
 - `tests/` — headless presentation tests.
+
+## Retired surfaces
+
+- `src/presentation.rs` (`RichPresentation` snapshot aggregation) and
+  `src/projection.rs` (fragment-to-`RichBlock` projection) were removed in
+  CTX-1412 (bitty#2117): no Core path consumed them, and the projection was
+  the only reason this crate carried a production edge to the extracted
+  `bitty-ipc` repository. `crates/bitty-rich/tests/retired_surface_guard.rs`
+  keeps them retired; the scene/image/place/background remainder stays with
+  the graphics/seam extraction (bitty#2163).

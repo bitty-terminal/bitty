@@ -107,8 +107,6 @@ pub mod kitty_raster;
 pub mod kitty_seam;
 pub mod kitty_unicode;
 pub mod loader;
-pub mod presentation;
-pub mod projection;
 pub mod scene;
 pub mod shell;
 pub mod wallpaper_theme;
@@ -179,7 +177,6 @@ pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
-pub use projection::{ProjectedBlock, ProjectionError, project_fragments};
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,

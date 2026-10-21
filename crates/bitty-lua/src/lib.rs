@@ -18,6 +18,10 @@
 //!   maps 1:1 to `bitty-config` plan fields; extraction is bounded and the
 //!   typed schema remains the validation authority. There is no `mlua`
 //!   dependency anywhere, so no `mlua::Lua` / `phodopus::Lua` type conflict.
+//! - **UI node model ([`ui`]) and candidate catalog ([`ui_catalog`]):** the
+//!   accepted v1 `Text`/`Row`/`Column`/`List` bridge types plus the headless
+//!   bitty#2114 component-catalog descriptors. Both are pure bounded data
+//!   handling; the catalog never constructs a VM and is not on a hot path.
 //!
 //! The crate is `std`-only, `#![forbid(unsafe_code)]`, `MSRV 1.85`,
 //! `edition = "2024"`, `publish = false` (workspace), headless and
@@ -70,6 +74,7 @@ pub mod plain_config;
 mod stdlib;
 pub mod store;
 pub mod ui;
+pub mod ui_catalog;
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
@@ -107,6 +112,12 @@ pub use host::{
 };
 pub use plain_config::{ConfigLuaVm, PlainConfigError, PlainConfigLimits, PlainConfigValue};
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};
+pub use ui_catalog::{
+    CATALOG_MAX_DEPTH, CATALOG_MAX_DETAIL_BYTES, CATALOG_MAX_NODES, CATALOG_MAX_PILL_LABEL_BYTES,
+    CATALOG_MAX_PILLS, CATALOG_MAX_ROWS, CATALOG_MAX_SEGMENT_BYTES, CATALOG_MAX_SEGMENTS,
+    CATALOG_MAX_TEXT_BYTES, CatalogBlock, CatalogEntry, CatalogError, DetailFallbackDescriptor,
+    ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor,
+};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 

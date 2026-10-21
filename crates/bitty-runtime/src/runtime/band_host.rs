@@ -49,8 +49,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::band_slots::BandEdge;
 use super::{BandContent, ChromeBands, Runtime};
 use bitty_lua::host::LuaValue;
-use bitty_lua::ui::{ClickArg, ClickCommand, UI_SCROLL_DELTA_ARG, UiNode, UiSlot};
-use bitty_platform::CursorPosition;
+use bitty_lua::ui::{
+    ClickArg, ClickCommand, UI_BUTTON_ARG, UI_BUTTON_LEFT, UI_BUTTON_MIDDLE, UI_BUTTON_RIGHT,
+    UI_REGION_ARG, UI_SCROLL_DELTA_ARG, UiNode, UiRegion, UiSlot,
+};
+use bitty_platform::{CursorPosition, MouseButton};
 use bitty_render::grid::{Rgba8, ThemePalette};
 
 /// Maximum queued band click requests (CTX-0946 C1).
@@ -88,6 +91,19 @@ pub const COLD_ADMISSION_SELECTION_MAX: usize = BAND_CLICK_QUEUE_MAX + BAND_SCRO
 /// surface.
 pub const BAND_ACCENT_ANSI_INDEX: u8 = 12;
 
+/// Maximum per-item hit regions one band may expose (issue #2248).
+///
+/// Regions are user-facing items (status modules, workspace capsules), not
+/// spans: adjacent spans with the same declared identity merge into one
+/// region first, so the count tracks distinct items. A band that declares
+/// more than this fails closed as a whole — no region on it routes a click
+/// or scroll — and counts [`BandHostStats::region_overflows`]. The bound is
+/// a policy constant: 64 items is above any sane bar and far below the
+/// 2048-node scene cap, so a hostile tree cannot mint an unbounded region
+/// table. It does not add a security ceiling; it reuses the existing
+/// fail-closed admission posture.
+pub const BAND_MAX_REGIONS: usize = 64;
+
 /// One flattened run of a band tree: a char-column span sharing style and
 /// click binding (CTX-0946 C1/C2).
 ///
@@ -117,6 +133,12 @@ pub struct BandRun {
     pub on_click: Option<ClickCommand>,
     /// Scroll binding effective for the span, if any (CTX-1190, #2008).
     pub on_scroll: Option<ClickCommand>,
+    /// Per-item hit region effective for the span, if declared (issue #2248).
+    ///
+    /// One identity per span: the click binding's region wins, else the
+    /// scroll binding's. Parser validation guarantees both agree when both
+    /// are present. `None` keeps the legacy span-only click target.
+    pub region: Option<UiRegion>,
 }
 
 /// Flattens a band tree into its full text plus styled runs (CTX-0946).
@@ -129,7 +151,9 @@ pub struct BandRun {
 pub fn flatten_band_runs(root: &UiNode) -> (String, Vec<BandRun>) {
     let mut text = String::new();
     let mut runs = Vec::new();
-    flatten_into(root, &mut text, &mut runs, None, None, None, None, false);
+    flatten_into(
+        root, &mut text, &mut runs, None, None, None, None, None, false,
+    );
     (text, runs)
 }
 
@@ -142,6 +166,7 @@ fn flatten_into(
     bg: Option<String>,
     on_click: Option<ClickCommand>,
     on_scroll: Option<ClickCommand>,
+    region: Option<UiRegion>,
     bold: bool,
 ) {
     match node {
@@ -156,6 +181,13 @@ fn flatten_into(
             let start = display_cells(text);
             let start_char = text.chars().count();
             text.push_str(leaf);
+            let on_click = leaf_click.clone().or(on_click);
+            let on_scroll = leaf_scroll.clone().or(on_scroll);
+            let region = on_click
+                .as_ref()
+                .and_then(|click| click.region.clone())
+                .or_else(|| on_scroll.as_ref().and_then(|scroll| scroll.region.clone()))
+                .or(region);
             runs.push(BandRun {
                 start_col: start,
                 end_col: display_cells(text),
@@ -164,8 +196,9 @@ fn flatten_into(
                 fg: leaf_fg.clone().or(fg),
                 bg: leaf_bg.clone().or(bg),
                 bold: leaf_bold.unwrap_or(bold),
-                on_click: leaf_click.clone().or(on_click),
-                on_scroll: leaf_scroll.clone().or(on_scroll),
+                on_click,
+                on_scroll,
+                region,
             });
         }
         UiNode::Row {
@@ -197,6 +230,11 @@ fn flatten_into(
             let bold = row_bold.unwrap_or(bold);
             let on_click = row_click.clone().or(on_click);
             let on_scroll = row_scroll.clone().or(on_scroll);
+            let region = on_click
+                .as_ref()
+                .and_then(|click| click.region.clone())
+                .or_else(|| on_scroll.as_ref().and_then(|scroll| scroll.region.clone()))
+                .or(region);
             for child in children {
                 flatten_into(
                     child,
@@ -206,6 +244,7 @@ fn flatten_into(
                     bg.clone(),
                     on_click.clone(),
                     on_scroll.clone(),
+                    region.clone(),
                     bold,
                 );
             }
@@ -229,6 +268,173 @@ fn display_cells(text: &str) -> usize {
 pub fn band_is_visible(root: &UiNode) -> bool {
     let (text, _) = flatten_band_runs(root);
     !text.is_empty()
+}
+
+/// One bounded per-item hit region emitted by a band (issue #2248).
+///
+/// The rectangle is one row high and spans display cells `[start_col,
+/// end_col)` inside the band, already clipped to the painted window width.
+/// Core derives it from the same flattened runs the paint path uses, so
+/// there is no second geometry source. The plugin never supplies
+/// coordinates: it declares an identity beside a binding, and the host owns
+/// the rect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandItemRegion {
+    /// Owning plugin id (the band owner).
+    pub plugin_id: String,
+    /// Edge owning the band.
+    pub edge: BandEdge,
+    /// Visible index on the edge (hidden bands take no index).
+    pub visible_index: usize,
+    /// Window row the band paints.
+    pub row: u16,
+    /// Declared region identity (`id` + `kind`).
+    pub region: UiRegion,
+    /// First display-cell column of the region (inclusive, clipped).
+    pub start_col: usize,
+    /// One past the last display-cell column (exclusive, clipped).
+    pub end_col: usize,
+    /// Exact band tree version that produced this rect.
+    pub version: u32,
+}
+
+/// Why region emission refused a band (issue #2248).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandRegionError {
+    /// No visible band at that edge/index.
+    MissingBand,
+    /// The band declared more than [`BAND_MAX_REGIONS`] distinct regions.
+    ///
+    /// Fail-closed: the whole band's region table is refused, so no click or
+    /// scroll on it can route. The frame still paints.
+    Overflow {
+        /// Distinct regions the band declared.
+        count: usize,
+        /// The bound ([`BAND_MAX_REGIONS`]).
+        max: usize,
+    },
+}
+
+/// Derives the bounded region table for one band (issue #2248).
+///
+/// Walks the flattened runs in declaration order, keeps spans that declare a
+/// region, clips them to `window_width` display cells, and merges adjacent
+/// spans with the same identity into one rect (a container region covering
+/// several leaves is one item, not one item per leaf). Adjacent but
+/// *different* regions stay separate. The result is sorted by
+/// `start_col` by construction. More than [`BAND_MAX_REGIONS`] distinct
+/// regions refuse the whole table.
+pub fn band_regions_for(
+    band: &BandContent,
+    edge: BandEdge,
+    visible_index: usize,
+    row: u16,
+    window_width: usize,
+) -> Result<Vec<BandItemRegion>, BandRegionError> {
+    let (_, runs) = flatten_band_runs(&band.root);
+    let mut regions: Vec<BandItemRegion> = Vec::new();
+    let mut count = 0usize;
+    // Identity and end column of the trailing distinct region, used both for
+    // adjacent-merge detection and to keep counting past the cap.
+    let mut trailing: Option<(UiRegion, usize)> = None;
+    for run in runs {
+        let Some(region) = run.region else {
+            trailing = None;
+            continue;
+        };
+        let start = run.start_col.min(window_width);
+        let end = run.end_col.min(window_width);
+        if start >= end {
+            // Entirely clipped past the painted bounds; it breaks adjacency.
+            trailing = None;
+            continue;
+        }
+        if let Some((previous, previous_end)) = &trailing {
+            if previous == &region && *previous_end == start {
+                if let Some(back) = regions.last_mut() {
+                    if back.region == region {
+                        back.end_col = end;
+                    }
+                }
+                trailing = Some((region, end));
+                continue;
+            }
+        }
+        count = count.saturating_add(1);
+        if regions.len() < BAND_MAX_REGIONS {
+            regions.push(BandItemRegion {
+                plugin_id: band.plugin_id.clone(),
+                edge,
+                visible_index,
+                row,
+                region: region.clone(),
+                start_col: start,
+                end_col: end,
+                version: band.version,
+            });
+        }
+        trailing = Some((region, end));
+    }
+    if count > BAND_MAX_REGIONS {
+        return Err(BandRegionError::Overflow {
+            count,
+            max: BAND_MAX_REGIONS,
+        });
+    }
+    Ok(regions)
+}
+
+/// Resolves a display-cell column to exactly one emitted region (issue #2248).
+///
+/// Later registration wins when regions overlap ("topmost/last-registered"):
+/// emitted tables from [`band_regions_for`] are disjoint by construction, so
+/// the tie-break is a documented invariant for any future overlapping
+/// source rather than a silent first-match. A column outside every region
+/// resolves to `None` (unclaimed chrome).
+#[must_use]
+pub fn resolve_item_region(regions: &[BandItemRegion], col: usize) -> Option<&BandItemRegion> {
+    regions
+        .iter()
+        .rev()
+        .find(|region| col >= region.start_col && col < region.end_col)
+}
+
+/// Mouse button a band region routes (issue #2248).
+///
+/// Bands consume left, right, and middle presses so no button can reach a
+/// clipboard paste or capture path behind chrome. Back/forward and other
+/// buttons fall through unchanged (no band action is declared for them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandButton {
+    /// Primary button.
+    Left,
+    /// Secondary button.
+    Right,
+    /// Middle button.
+    Middle,
+}
+
+impl BandButton {
+    /// Maps a platform button to a band-routable button.
+    #[must_use]
+    pub const fn from_mouse(button: MouseButton) -> Option<Self> {
+        match button {
+            MouseButton::Left => Some(Self::Left),
+            MouseButton::Right => Some(Self::Right),
+            MouseButton::Middle => Some(Self::Middle),
+            MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
+        }
+    }
+
+    /// Dispatch spelling carried under `button`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => UI_BUTTON_LEFT,
+            Self::Right => UI_BUTTON_RIGHT,
+            Self::Middle => UI_BUTTON_MIDDLE,
+        }
+    }
 }
 
 /// Minimal host theme-token table for band paint (CTX-0946 C2).
@@ -357,6 +563,18 @@ pub struct BandClickRequest {
     pub command: String,
     /// Declared `on_click.args` in declaration order.
     pub args: Vec<(String, ClickArg)>,
+    /// Declared per-item region, when the hit span declared one (issue #2248).
+    ///
+    /// Dispatch carries the region id under [`UI_REGION_ARG`]. `None` is the
+    /// legacy span-only target; the click still routes, without a region
+    /// identity.
+    pub region: Option<UiRegion>,
+    /// Button that produced this click (issue #2248).
+    ///
+    /// Dispatch carries its spelling under [`UI_BUTTON_ARG`]. Bands never
+    /// consult the button for authority; the plugin decides what each
+    /// button does through its registered command.
+    pub button: BandButton,
     /// Presentation-captured origin (CTX-1332, C-D4).
     ///
     /// Stamped when the gesture is armed from the last eligible presented
@@ -397,21 +615,54 @@ pub fn split_band_command(command: &str, owner: &str) -> Option<String> {
 /// Converts declared click args to the single Lua table arg (CTX-0946 C1).
 ///
 /// `dispatch_command` takes positional args; a click carries one named
-/// table (`run({id = 3})`), preserving declaration order.
+/// table (`run({id = 3})`), preserving declaration order. Issue #2248 adds
+/// the resolved region id under [`UI_REGION_ARG`] and the button spelling
+/// under [`UI_BUTTON_ARG`] only when the hit span declared a region; both
+/// merge last and overwrite declared entries of the same names — never
+/// duplicated and never exceeding `UI_CLICK_MAX_ARGS` (the parser reserves
+/// their slots). A legacy region-less span keeps its pre-2248 payload
+/// byte-for-byte, so strict command schemas stay valid.
 #[must_use]
-pub fn band_click_args_table(args: &[(String, ClickArg)]) -> LuaValue {
+pub fn band_click_args_table(
+    args: &[(String, ClickArg)],
+    region: Option<&UiRegion>,
+    button: BandButton,
+) -> LuaValue {
+    let Some(region) = region else {
+        return band_click_args_table_legacy(args);
+    };
+    let mut table: Vec<(LuaValue, LuaValue)> = args
+        .iter()
+        .filter(|(key, _)| key != UI_BUTTON_ARG && key != UI_REGION_ARG)
+        .map(|(key, value)| (LuaValue::String(key.clone()), click_arg_value(value)))
+        .collect();
+    table.push((
+        LuaValue::String(UI_REGION_ARG.to_string()),
+        LuaValue::String(region.id.clone()),
+    ));
+    table.push((
+        LuaValue::String(UI_BUTTON_ARG.to_string()),
+        LuaValue::String(button.as_str().to_string()),
+    ));
+    LuaValue::Table(table)
+}
+
+/// Pre-2248 click payload: declared args only, no host region/button.
+fn band_click_args_table_legacy(args: &[(String, ClickArg)]) -> LuaValue {
     LuaValue::Table(
         args.iter()
-            .map(|(key, value)| {
-                let value = match value {
-                    ClickArg::String(text) => LuaValue::String(text.clone()),
-                    ClickArg::Number(number) => LuaValue::Number(*number),
-                    ClickArg::Bool(flag) => LuaValue::Bool(*flag),
-                };
-                (LuaValue::String(key.clone()), value)
-            })
+            .map(|(key, value)| (LuaValue::String(key.clone()), click_arg_value(value)))
             .collect(),
     )
+}
+
+/// Marshals one declared arg value.
+fn click_arg_value(value: &ClickArg) -> LuaValue {
+    match value {
+        ClickArg::String(text) => LuaValue::String(text.clone()),
+        ClickArg::Number(number) => LuaValue::Number(*number),
+        ClickArg::Bool(flag) => LuaValue::Bool(*flag),
+    }
 }
 
 /// Outcome of resolving a pointer column inside one band (CTX-0946 C1).
@@ -427,12 +678,71 @@ pub enum BandColumnOutcome {
 
 /// Resolves a flattened-text column into its click outcome (CTX-0946 C1).
 ///
-/// Pure over one band: finds the run owning `char_idx` (display-cell
-/// column) and splits its command against `owner`. Pure for headless tests;
-/// geometry (which band owns the row) lives on [`Runtime::plugin_band_hit`].
+/// Pure over one band: finds the run owning `col` (display-cell column) and
+/// splits its command against `owner`. Pure for headless tests; geometry
+/// (which band owns the row) lives on [`Runtime::plugin_band_hit`].
 #[must_use]
-pub fn resolve_click_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> BandColumnOutcome {
-    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
+pub fn resolve_click_in_band(
+    owner: &str,
+    runs: &[BandRun],
+    col: usize,
+    button: BandButton,
+) -> BandColumnOutcome {
+    let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
+        return BandColumnOutcome::NoClaim;
+    };
+    let Some(click) = run.on_click.as_ref() else {
+        return BandColumnOutcome::NoClaim;
+    };
+    // Pre-2248 spans have no region and no button contract: only the
+    // primary button routes, so an existing strict args schema never sees a
+    // new `button` entry. Region-aware spans route all three buttons.
+    if run.region.is_none() && button != BandButton::Left {
+        return BandColumnOutcome::NoClaim;
+    }
+    let Some(verb) = split_band_command(&click.command, owner) else {
+        return BandColumnOutcome::Denied;
+    };
+    BandColumnOutcome::Hit(BandClickRequest {
+        plugin_id: owner.to_string(),
+        command: verb,
+        args: click.args.clone(),
+        region: run.region.clone(),
+        button,
+        origin: None,
+        admission_seq: 0,
+    })
+}
+
+/// Index of the run owning a display-cell column, if any (CTX-0946 C1).
+///
+/// Pure run identity behind [`resolve_click_in_band`]: press and release
+/// compare run indices (plus band and resolved request) so a press-drag
+/// onto another span can never fire its command. Declared regions pair by
+/// identity instead (issue #2248), so a merged multi-leaf region is one
+/// item.
+#[must_use]
+pub fn find_run_index(runs: &[BandRun], col: usize) -> Option<usize> {
+    runs.iter()
+        .position(|run| col >= run.start_col && col < run.end_col)
+}
+
+/// Resolves a click on one declared region (issue #2248).
+///
+/// Finds the run under the column that carries `region` (the emitted rect
+/// is derived from those runs, so the two geometries agree) and splits its
+/// click command against `owner`. A region declared only on `on_scroll`
+/// yields `NoClaim` for a click; a foreign qualifier yields `Denied`.
+fn resolve_click_for_region(
+    owner: &str,
+    runs: &[BandRun],
+    region: &UiRegion,
+    col: usize,
+    button: BandButton,
+) -> BandColumnOutcome {
+    let Some(run) = runs.iter().find(|run| {
+        col >= run.start_col && col < run.end_col && run.region.as_ref() == Some(region)
+    }) else {
         return BandColumnOutcome::NoClaim;
     };
     let Some(click) = run.on_click.as_ref() else {
@@ -445,20 +755,38 @@ pub fn resolve_click_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> 
         plugin_id: owner.to_string(),
         command: verb,
         args: click.args.clone(),
+        region: Some(region.clone()),
+        button,
         origin: None,
         admission_seq: 0,
     })
 }
 
-/// Index of the run owning a display-cell column, if any (CTX-0946 C1).
-///
-/// Pure run identity behind [`resolve_click_in_band`]: press and release
-/// compare run indices (plus band and resolved request) so a press-drag
-/// onto another span can never fire its command.
-#[must_use]
-pub fn find_run_index(runs: &[BandRun], char_idx: usize) -> Option<usize> {
-    runs.iter()
-        .position(|run| char_idx >= run.start_col && char_idx < run.end_col)
+/// Resolves a wheel on one declared region (issue #2248).
+fn resolve_scroll_for_region(
+    owner: &str,
+    runs: &[BandRun],
+    region: &UiRegion,
+    col: usize,
+) -> BandScrollOutcome {
+    let Some(run) = runs.iter().find(|run| {
+        col >= run.start_col && col < run.end_col && run.region.as_ref() == Some(region)
+    }) else {
+        return BandScrollOutcome::NoClaim;
+    };
+    let Some(scroll) = run.on_scroll.as_ref() else {
+        return BandScrollOutcome::NoClaim;
+    };
+    let Some(verb) = split_band_command(&scroll.command, owner) else {
+        return BandScrollOutcome::Denied;
+    };
+    BandScrollOutcome::Hit(BandScrollTarget {
+        plugin_id: owner.to_string(),
+        command: verb,
+        args: scroll.args.clone(),
+        region: Some(region.clone()),
+        origin: None,
+    })
 }
 
 /// One Core-routed band scroll: owner, verb, declared args, and the
@@ -479,6 +807,9 @@ pub struct BandScrollRequest {
     pub command: String,
     /// Declared `on_scroll.args` in declaration order.
     pub args: Vec<(String, ClickArg)>,
+    /// Declared per-item region, when the wheel span declared one
+    /// (issue #2248). Dispatch carries its id under [`UI_REGION_ARG`].
+    pub region: Option<UiRegion>,
     /// Host-computed signed line step for this request.
     pub delta: i32,
     /// Presentation-captured origin (CTX-1332, C-D4).
@@ -494,22 +825,28 @@ pub struct BandScrollRequest {
 ///
 /// Mirrors [`band_click_args_table`]: `dispatch_command` takes positional
 /// args; a scroll carries one named table (`run({id = 3, delta = 1})`),
-/// preserving declaration order with `delta` merged last. A declared
-/// `delta` entry is overwritten by the host value, never duplicated.
+/// preserving declaration order with the region id (when declared) and
+/// `delta` merged last. Declared `region`/`delta` entries are overwritten by
+/// the host values, never duplicated.
 #[must_use]
-pub fn band_scroll_args_table(args: &[(String, ClickArg)], delta: i32) -> LuaValue {
+pub fn band_scroll_args_table(
+    args: &[(String, ClickArg)],
+    delta: i32,
+    region: Option<&UiRegion>,
+) -> LuaValue {
     let mut table: Vec<(LuaValue, LuaValue)> = args
         .iter()
-        .filter(|(key, _)| key != UI_SCROLL_DELTA_ARG)
-        .map(|(key, value)| {
-            let value = match value {
-                ClickArg::String(text) => LuaValue::String(text.clone()),
-                ClickArg::Number(number) => LuaValue::Number(*number),
-                ClickArg::Bool(flag) => LuaValue::Bool(*flag),
-            };
-            (LuaValue::String(key.clone()), value)
-        })
+        // `delta` is always host-owned. `region` is host-owned only when the
+        // binding declared one; a legacy span keeps its own `region` arg.
+        .filter(|(key, _)| key != UI_SCROLL_DELTA_ARG && (region.is_none() || key != UI_REGION_ARG))
+        .map(|(key, value)| (LuaValue::String(key.clone()), click_arg_value(value)))
         .collect();
+    if let Some(region) = region {
+        table.push((
+            LuaValue::String(UI_REGION_ARG.to_string()),
+            LuaValue::String(region.id.clone()),
+        ));
+    }
     table.push((
         LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
         LuaValue::Number(f64::from(delta)),
@@ -540,6 +877,8 @@ pub struct BandScrollTarget {
     pub command: String,
     /// Declared `on_scroll.args` in declaration order.
     pub args: Vec<(String, ClickArg)>,
+    /// Declared per-item region, if any (issue #2248).
+    pub region: Option<UiRegion>,
     /// Presentation-captured origin (CTX-1332, C-D4).
     #[doc(hidden)]
     pub origin: Option<BandOrigin>,
@@ -547,14 +886,14 @@ pub struct BandScrollTarget {
 
 /// Resolves a flattened-text column into its scroll outcome (CTX-1190).
 ///
-/// Pure over one band: finds the run owning `char_idx` (display-cell
-/// column) and splits its `on_scroll` command against `owner`, mirroring
+/// Pure over one band: finds the run owning `col` (display-cell column) and
+/// splits its `on_scroll` command against `owner`, mirroring
 /// [`resolve_click_in_band`]. Geometry (which band owns the row) lives on
 /// [`Runtime::plugin_band_hit`]; the wheel step joins in
 /// [`Runtime::band_scroll`].
 #[must_use]
-pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) -> BandScrollOutcome {
-    let Some(run) = find_run_index(runs, char_idx).and_then(|index| runs.get(index)) else {
+pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], col: usize) -> BandScrollOutcome {
+    let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
         return BandScrollOutcome::NoClaim;
     };
     let Some(scroll) = run.on_scroll.as_ref() else {
@@ -567,6 +906,7 @@ pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) ->
         plugin_id: owner.to_string(),
         command: verb,
         args: scroll.args.clone(),
+        region: run.region.clone(),
         origin: None,
     })
 }
@@ -580,17 +920,33 @@ pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], char_idx: usize) ->
 /// denied on the same target the press armed).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum PressedBandTarget {
-    /// The press armed a claimed span: band, run index, resolved request.
+    /// The press armed a claimed item: band, item key, resolved request.
     Hit {
         edge: BandEdge,
         visible_index: usize,
-        run: usize,
-        request: BandClickRequest,
+        key: BandTargetKey,
+        button: BandButton,
+        request: Box<BandClickRequest>,
     },
     /// The press landed on an unclaimed span or past the text.
     NoClaim,
-    /// The press landed on an unroutable claim (foreign qualifier, ...).
+    /// The press landed on an unroutable claim (foreign qualifier,
+    /// region overflow, ...).
     Denied,
+}
+
+/// Item identity a band press armed (issue #2248).
+///
+/// A declared region pairs by identity, so a press on one leaf of a merged
+/// region and a release on another leaf of the same region is still the same
+/// item. A legacy span pairs by run index, preserving the pre-2248 rule that
+/// a drag across spans fires nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BandTargetKey {
+    /// Declared per-item region identity.
+    Region(UiRegion),
+    /// Legacy span-only target (run index).
+    Span(usize),
 }
 
 /// Cursor-side band scroll classification behind [`Runtime::band_scroll`]
@@ -609,6 +965,9 @@ enum ScrollTargetOutcome {
     Unclaimed,
     /// On a span with an unroutable scroll binding: fall through, counted.
     Denied,
+    /// The band declared more than [`BAND_MAX_REGIONS`] regions: refuse
+    /// every wheel on it (fail-closed) and count the overflow.
+    Overflow,
 }
 
 /// Whether band rows collide (duplicate rows).
@@ -654,6 +1013,9 @@ pub struct BandHostStats {
     pub scrolls_unclaimed: u64,
     /// Scroll requests dropped on a full drain queue (CTX-1190).
     pub scroll_queue_drops: u64,
+    /// Band gestures refused because the band declared more than
+    /// [`BAND_MAX_REGIONS`] distinct regions (issue #2248).
+    pub region_overflows: u64,
 }
 
 /// A resolved band hit: which visible band, and which text column.
@@ -665,8 +1027,11 @@ pub struct BandHit {
     pub visible_index: usize,
     /// Window row the band paints (window cells).
     pub row: u16,
-    /// Display-cell column into the flattened band text.
-    pub char_idx: usize,
+    /// Display-cell column inside the band row, measured with the same
+    /// [`char_cell_width`](bitty_term_state::char_cell_width) rules as
+    /// [`BandRun::start_col`]/[`BandRun::end_col`]. This is the unit every
+    /// hit-test consumer uses, including region rects (issue #2248).
+    pub col: usize,
 }
 
 /// A resolved band row: which visible band row owns the pointer.
@@ -909,26 +1274,70 @@ impl Runtime {
         if cell_col >= width_cells.min(window_cells) {
             return None;
         }
-        let char_idx = cell_col_to_char_idx(&text, usize::try_from(cell_col).unwrap_or(usize::MAX));
+        let col = usize::try_from(cell_col).unwrap_or(usize::MAX);
         Some(BandHit {
             edge: row_hit.edge,
             visible_index: row_hit.visible_index,
             row: row_hit.row,
-            char_idx,
+            col,
         })
     }
 
-    /// Routes a left press on a plugin band row to chrome (CTX-0946 C1).
+    /// Emits the bounded per-item region table for one visible band
+    /// (issue #2248).
+    ///
+    /// `edge`/`visible_index` address the band in the same stacking order
+    /// paint and hit-test use; `row` comes from [`Self::visible_band_row`].
+    /// Rectangles are display-cell columns clipped to the painted window
+    /// width. Regions are derived on demand from the current tree, so a
+    /// remount or reflow can never expose stale geometry: the next call
+    /// reads the new tree. A band above [`BAND_MAX_REGIONS`] returns
+    /// [`BandRegionError::Overflow`] and routes nothing (fail-closed). No
+    /// plugin VM is entered; this is a pure data walk.
+    ///
+    /// # Errors
+    ///
+    /// [`BandRegionError::MissingBand`] when no visible band occupies the
+    /// index, or [`BandRegionError::Overflow`] for an over-cap band.
+    pub fn band_item_regions(
+        &self,
+        edge: BandEdge,
+        visible_index: usize,
+    ) -> Result<Vec<BandItemRegion>, BandRegionError> {
+        let row = self
+            .visible_band_row(edge, visible_index)
+            .ok_or(BandRegionError::MissingBand)?;
+        let bands = self.visible_edge_bands(edge);
+        let band = bands
+            .get(visible_index)
+            .ok_or(BandRegionError::MissingBand)?;
+        band_regions_for(
+            band,
+            edge,
+            visible_index,
+            row,
+            usize::from(self.window_cells().width),
+        )
+    }
+
+    /// Routes a press on a plugin band row to chrome (CTX-0946 C1,
+    /// issue #2248).
     ///
     /// Returns `true` (consume the press: no focus move, no selection, no
-    /// capture report) when the last-known cursor sits anywhere on a painted
-    /// band row — including the unclaimed trailing region past the text —
-    /// arming the one-shot [`Self::band_release_swallow`] plus the stored
-    /// press target so the paired release routes only onto the same band
-    /// run (standard button semantics). Shift still forces the selection
-    /// path (the CTX-0181 accessibility escape).
-    pub(super) fn band_press(&mut self) -> bool {
-        if self.shift_pressed {
+    /// capture report, and no clipboard paste) when the last-known cursor
+    /// sits anywhere on a painted band row — including the unclaimed
+    /// trailing region past the text — arming the one-shot
+    /// [`Self::band_release_swallow`] plus the stored press target so the
+    /// paired release routes only onto the same item (standard button
+    /// semantics). Left, right, and middle presses are consumed; back,
+    /// forward, and other buttons fall through unchanged. Left with Shift
+    /// still forces the selection path (the CTX-0181 accessibility escape);
+    /// Shift does not re-enable clipboard paste on chrome for other buttons.
+    pub(super) fn band_press(&mut self, mouse_button: MouseButton) -> bool {
+        let Some(button) = BandButton::from_mouse(mouse_button) else {
+            return false;
+        };
+        if self.shift_pressed && button == BandButton::Left {
             return false;
         }
         let Some(pos) = self.last_cursor else {
@@ -937,18 +1346,48 @@ impl Runtime {
         let Some(row_hit) = self.plugin_band_row_hit(pos) else {
             return false;
         };
-        self.band_press_target = Some(self.band_target_at(pos, &row_hit));
+        // A different button while one is armed is still chrome *on a band
+        // row*: consume it without disturbing the armed gesture, and remember
+        // its release so the pair never falls through to clipboard/capture.
+        // A repeated press of the *same* button is a lost-release recovery:
+        // fall through and re-arm instead of wedging the band forever.
+        if let Some(armed) = self.band_press_button {
+            if armed != button {
+                if self.band_extra_press.is_none() {
+                    self.band_extra_press = Some(button);
+                }
+                return true;
+            }
+        }
+        if self.band_region_overflow(row_hit.edge, row_hit.visible_index) {
+            self.band_stats.region_overflows = self.band_stats.region_overflows.saturating_add(1);
+        }
+        self.band_press_target = Some(self.band_target_at(pos, &row_hit, button));
+        self.band_press_button = Some(button);
         self.band_release_swallow = true;
         true
+    }
+
+    /// Whether a band's region table overflowed its bound (issue #2248).
+    fn band_region_overflow(&self, edge: BandEdge, visible_index: usize) -> bool {
+        matches!(
+            self.band_item_regions(edge, visible_index),
+            Err(BandRegionError::Overflow { .. })
+        )
     }
 
     /// Resolves a press or release position into its stored-target form.
     ///
     /// Shared by [`Self::band_press`] and [`Self::band_release`] so both
     /// sides classify identically: past-text is `NoClaim` (the width guard
-    /// in [`Self::plugin_band_hit`], never the saturating tail of
-    /// [`cell_col_to_char_idx`]).
-    fn band_target_at(&self, pos: CursorPosition, row_hit: &BandRowHit) -> PressedBandTarget {
+    /// in [`Self::plugin_band_hit`]). A declared region resolves to that
+    /// item; a bare interactive span keeps the legacy span target.
+    fn band_target_at(
+        &self,
+        pos: CursorPosition,
+        row_hit: &BandRowHit,
+        button: BandButton,
+    ) -> PressedBandTarget {
         let bands = self.visible_edge_bands(row_hit.edge);
         let Some(band) = bands.get(row_hit.visible_index) else {
             return PressedBandTarget::NoClaim;
@@ -962,11 +1401,29 @@ impl Runtime {
             // Unreachable (same geometry walk twice); fail closed.
             return PressedBandTarget::NoClaim;
         }
-        match resolve_click_in_band(&owner, &runs, hit.char_idx) {
+        // Issue #2248: a declared region owns its rect. Overflow refuses the
+        // whole band (fail-closed) rather than routing a partial table.
+        let regions = match self.band_item_regions(row_hit.edge, row_hit.visible_index) {
+            Ok(regions) => regions,
+            Err(BandRegionError::MissingBand) => return PressedBandTarget::NoClaim,
+            Err(BandRegionError::Overflow { .. }) => return PressedBandTarget::Denied,
+        };
+        let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
+        let outcome = match declared.as_ref() {
+            Some(region) => resolve_click_for_region(&owner, &runs, region, hit.col, button),
+            None => resolve_click_in_band(&owner, &runs, hit.col, button),
+        };
+        match outcome {
             BandColumnOutcome::Hit(request) => {
-                let Some(run) = find_run_index(&runs, hit.char_idx) else {
-                    // Unreachable (a Hit always owns a run); fail closed.
-                    return PressedBandTarget::NoClaim;
+                let key = match request.region.clone() {
+                    Some(region) => BandTargetKey::Region(region),
+                    None => {
+                        let Some(run) = find_run_index(&runs, hit.col) else {
+                            // Unreachable (a Hit always owns a run); fail closed.
+                            return PressedBandTarget::NoClaim;
+                        };
+                        BandTargetKey::Span(run)
+                    }
                 };
                 // CTX-1332 C-D4: capture the presentation-published origin now
                 // (the press and release both resolve against the same live
@@ -978,8 +1435,9 @@ impl Runtime {
                 PressedBandTarget::Hit {
                     edge: row_hit.edge,
                     visible_index: row_hit.visible_index,
-                    run,
-                    request,
+                    key,
+                    button,
+                    request: Box::new(request),
                 }
             }
             BandColumnOutcome::Denied => PressedBandTarget::Denied,
@@ -992,6 +1450,8 @@ impl Runtime {
     pub(super) fn clear_band_press(&mut self) {
         self.band_release_swallow = false;
         self.band_press_target = None;
+        self.band_press_button = None;
+        self.band_extra_press = None;
     }
 
     /// Assigns the next monotonic admission sequence, failing closed at
@@ -1241,11 +1701,26 @@ impl Runtime {
     /// the same denied target the press armed counts
     /// [`BandHostStats::clicks_denied`]. A full queue drops fail-closed and
     /// counts [`BandHostStats::queue_drops`].
-    pub(super) fn band_release(&mut self) -> bool {
+    pub(super) fn band_release(&mut self, mouse_button: MouseButton) -> bool {
+        let Some(button) = BandButton::from_mouse(mouse_button) else {
+            return false;
+        };
+        // A second button pressed on the same band row while the first was
+        // armed: consume its release without resolving the main gesture.
+        if self.band_extra_press == Some(button) {
+            self.band_extra_press = None;
+            return true;
+        }
         if !self.band_release_swallow {
             return false;
         }
+        // A release of another button never resolves the armed gesture; it
+        // is still chrome and must not fall through to clipboard/capture.
+        if self.band_press_button != Some(button) {
+            return true;
+        }
         self.band_release_swallow = false;
+        self.band_press_button = None;
         let pressed = self.band_press_target.take();
         let Some(pos) = self.last_cursor else {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
@@ -1255,27 +1730,30 @@ impl Runtime {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
             return true;
         };
-        let released = self.band_target_at(pos, &row_hit);
+        let released = self.band_target_at(pos, &row_hit, button);
         match (pressed, released) {
             (
                 Some(PressedBandTarget::Hit {
                     edge,
                     visible_index,
-                    run,
+                    key,
+                    button,
                     request,
                 }),
                 PressedBandTarget::Hit {
                     edge: release_edge,
                     visible_index: release_visible,
-                    run: release_run,
+                    key: release_key,
+                    button: release_button,
                     request: release_request,
                 },
             ) if edge == release_edge
                 && visible_index == release_visible
-                && run == release_run
+                && key == release_key
+                && button == release_button
                 && request == release_request =>
             {
-                let mut request = request;
+                let mut request = *request;
                 // CTX-1332 C-D4/C-D5: the press-captured origin must still be
                 // the live published origin and the live band identity.
                 if let Some(origin) = request.origin.clone() {
@@ -1359,6 +1837,7 @@ impl Runtime {
                     plugin_id: target.plugin_id,
                     command: target.command,
                     args: target.args,
+                    region: target.region,
                     delta,
                     origin: target.origin,
                     admission_seq: seq,
@@ -1368,6 +1847,14 @@ impl Runtime {
             ScrollTargetOutcome::Denied => {
                 self.band_stats.scrolls_denied = self.band_stats.scrolls_denied.saturating_add(1);
                 false
+            }
+            ScrollTargetOutcome::Overflow => {
+                self.band_stats.region_overflows =
+                    self.band_stats.region_overflows.saturating_add(1);
+                self.band_stats.scrolls_denied = self.band_stats.scrolls_denied.saturating_add(1);
+                // Consume the tick as chrome: an over-cap band refuses the
+                // action but must not leak the wheel to the viewport behind.
+                true
             }
             ScrollTargetOutcome::Unclaimed => {
                 self.band_stats.scrolls_unclaimed =
@@ -1399,7 +1886,19 @@ impl Runtime {
         let Some(hit) = self.plugin_band_hit(pos) else {
             return ScrollTargetOutcome::Unclaimed;
         };
-        match resolve_scroll_in_band(&owner, &runs, hit.char_idx) {
+        // Issue #2248: a declared region owns its rect; an over-cap band
+        // refuses the wheel (fail-closed) instead of routing a partial table.
+        let regions = match self.band_item_regions(row_hit.edge, row_hit.visible_index) {
+            Ok(regions) => regions,
+            Err(BandRegionError::MissingBand) => return ScrollTargetOutcome::Unclaimed,
+            Err(BandRegionError::Overflow { .. }) => return ScrollTargetOutcome::Overflow,
+        };
+        let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
+        let outcome = match declared.as_ref() {
+            Some(region) => resolve_scroll_for_region(&owner, &runs, region, hit.col),
+            None => resolve_scroll_in_band(&owner, &runs, hit.col),
+        };
+        match outcome {
             BandScrollOutcome::Hit(mut target) => {
                 target.origin = self
                     .published_band_origin(row_hit.edge, row_hit.visible_index)
@@ -1427,6 +1926,7 @@ impl Runtime {
             if back.plugin_id == request.plugin_id
                 && back.command == request.command
                 && back.args == request.args
+                && back.region == request.region
                 && back.origin == request.origin
             {
                 back.delta = back.delta.saturating_add(request.delta);
@@ -1491,23 +1991,6 @@ impl Runtime {
     }
 }
 
-/// Maps a display-cell column to a char index in `text` (CTX-0946 C1).
-///
-/// Walks with [`char_cell_width`](bitty_term_state::char_cell_width) — the
-/// same widths the paint path lays out — so a pointer column and its glyph
-/// agree. Saturates at the last char for out-of-range columns.
-fn cell_col_to_char_idx(text: &str, cell_col: usize) -> usize {
-    let mut cells = 0usize;
-    for (idx, ch) in text.chars().enumerate() {
-        let width = usize::from(bitty_term_state::char_cell_width(ch));
-        if cell_col < cells.saturating_add(width) {
-            return idx;
-        }
-        cells = cells.saturating_add(width);
-    }
-    text.chars().count().saturating_sub(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1532,6 +2015,7 @@ mod tests {
             on_click: Some(ClickCommand {
                 command: command.to_string(),
                 args: vec![("id".to_string(), ClickArg::Number(3.0))],
+                region: None,
             }),
             on_scroll: None,
         }
@@ -1547,6 +2031,7 @@ mod tests {
             on_scroll: Some(ClickCommand {
                 command: command.to_string(),
                 args: vec![("step".to_string(), ClickArg::Number(2.0))],
+                region: None,
             }),
         }
     }
@@ -1569,6 +2054,7 @@ mod tests {
         let click = ClickCommand {
             command: "owner:go".to_string(),
             args: Vec::new(),
+            region: None,
         };
         let root = UiNode::Row {
             children: vec![text_node("x")],
@@ -1614,6 +2100,7 @@ mod tests {
         let scroll = ClickCommand {
             command: "owner:scroll".to_string(),
             args: Vec::new(),
+            region: None,
         };
         let root = UiNode::Row {
             children: vec![text_node("x"), scroll_node("y", "owner:leaf")],
@@ -1651,6 +2138,7 @@ mod tests {
                 on_scroll: Some(ClickCommand {
                     command: "other-plugin:scroll".to_string(),
                     args: Vec::new(),
+                    region: None,
                 }),
             },
         ]));
@@ -1689,6 +2177,7 @@ mod tests {
                 ("delta".to_string(), ClickArg::Number(99.0)),
             ],
             -3,
+            None,
         );
         let LuaValue::Table(pairs) = table else {
             panic!("scroll args must marshal as a table");
@@ -1720,6 +2209,7 @@ mod tests {
             plugin_id: "test-bar".to_string(),
             command: "scroll".to_string(),
             args: vec![("step".to_string(), ClickArg::Number(2.0))],
+            region: None,
             delta: 3,
             origin: None,
             admission_seq: 0,
@@ -1832,7 +2322,7 @@ mod tests {
             text_node("1:ws1 "),
             click_node("2:ws2", "owner:focus"),
         ]));
-        match resolve_click_in_band("owner", &runs, 7) {
+        match resolve_click_in_band("owner", &runs, 7, BandButton::Left) {
             BandColumnOutcome::Hit(request) => {
                 assert_eq!(request.plugin_id, "owner");
                 assert_eq!(request.command, "focus");
@@ -1845,18 +2335,18 @@ mod tests {
         }
         // Outside any claim (separator span, padding past the text).
         assert_eq!(
-            resolve_click_in_band("owner", &runs, 2),
+            resolve_click_in_band("owner", &runs, 2, BandButton::Left),
             BandColumnOutcome::NoClaim
         );
         assert_eq!(
-            resolve_click_in_band("owner", &runs, 99),
+            resolve_click_in_band("owner", &runs, 99, BandButton::Left),
             BandColumnOutcome::NoClaim
         );
         // Overlapping claim: a foreign qualifier on the span is denied,
         // never routed to either plugin.
         let (_, runs) = flatten_band_runs(&UiNode::row(vec![click_node("x", "other:focus")]));
         assert_eq!(
-            resolve_click_in_band("owner", &runs, 0),
+            resolve_click_in_band("owner", &runs, 0, BandButton::Left),
             BandColumnOutcome::Denied
         );
     }
@@ -1876,14 +2366,104 @@ mod tests {
             ("name".to_string(), ClickArg::String("ws".to_string())),
             ("flag".to_string(), ClickArg::Bool(true)),
         ];
-        let LuaValue::Table(pairs) = band_click_args_table(&args) else {
+        let LuaValue::Table(pairs) = band_click_args_table(&args, None, BandButton::Left) else {
             panic!("args must encode as one table");
         };
-        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            pairs.len(),
+            3,
+            "a legacy region-less click keeps its pre-2248 payload"
+        );
         assert_eq!(pairs[0].0, LuaValue::String("id".to_string()));
         assert_eq!(pairs[0].1, LuaValue::Number(3.0));
         assert_eq!(pairs[1].1, LuaValue::String("ws".to_string()));
         assert_eq!(pairs[2].1, LuaValue::Bool(true));
+    }
+
+    #[test]
+    fn args_tables_merge_region_and_button_last() {
+        // Issue #2248: region and button are host values, merged last and
+        // overwriting declared entries of the same names (never doubled).
+        let region = UiRegion {
+            id: "clock".to_string(),
+            kind: bitty_lua::ui::UiRegionKind::Module,
+        };
+        let declared = [
+            ("region".to_string(), ClickArg::String("fake".to_string())),
+            ("button".to_string(), ClickArg::String("fake".to_string())),
+            ("id".to_string(), ClickArg::Number(3.0)),
+        ];
+        let LuaValue::Table(pairs) =
+            band_click_args_table(&declared, Some(&region), BandButton::Middle)
+        else {
+            panic!("click args must encode as one table");
+        };
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, LuaValue::String("id".to_string()));
+        assert_eq!(
+            pairs[1],
+            (
+                LuaValue::String(UI_REGION_ARG.to_string()),
+                LuaValue::String("clock".to_string())
+            )
+        );
+        assert_eq!(
+            pairs[2],
+            (
+                LuaValue::String(UI_BUTTON_ARG.to_string()),
+                LuaValue::String(UI_BUTTON_MIDDLE.to_string())
+            )
+        );
+
+        let scroll_declared = [
+            ("region".to_string(), ClickArg::String("fake".to_string())),
+            ("id".to_string(), ClickArg::Number(3.0)),
+        ];
+        let LuaValue::Table(pairs) = band_scroll_args_table(&scroll_declared, -2, Some(&region))
+        else {
+            panic!("scroll args must encode as one table");
+        };
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, LuaValue::String("id".to_string()));
+        assert_eq!(
+            pairs[1],
+            (
+                LuaValue::String(UI_REGION_ARG.to_string()),
+                LuaValue::String("clock".to_string())
+            )
+        );
+        assert_eq!(
+            pairs[2],
+            (
+                LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
+                LuaValue::Number(-2.0)
+            )
+        );
+
+        // A legacy scroll binding without a declared region keeps its own
+        // `region` argument; the host only owns it for region-aware spans.
+        let legacy = [
+            ("region".to_string(), ClickArg::String("keep".to_string())),
+            ("id".to_string(), ClickArg::Number(1.0)),
+        ];
+        let LuaValue::Table(pairs) = band_scroll_args_table(&legacy, -1, None) else {
+            panic!("scroll args must encode as one table");
+        };
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            pairs[0],
+            (
+                LuaValue::String("region".to_string()),
+                LuaValue::String("keep".to_string())
+            )
+        );
+        assert_eq!(
+            pairs[2],
+            (
+                LuaValue::String(UI_SCROLL_DELTA_ARG.to_string()),
+                LuaValue::Number(-1.0)
+            )
+        );
     }
 
     #[test]
@@ -1907,6 +2487,8 @@ mod tests {
                 plugin_id: "test-bar".to_string(),
                 command: format!("click-{seq}"),
                 args: Vec::new(),
+                region: None,
+                button: BandButton::Left,
                 origin: Some(origin.clone()),
                 admission_seq: seq as u64,
             });
@@ -1915,6 +2497,8 @@ mod tests {
             plugin_id: "test-bar".to_string(),
             command: "click-over".to_string(),
             args: Vec::new(),
+            region: None,
+            button: BandButton::Left,
             origin: Some(origin),
             admission_seq: COLD_ADMISSION_SELECTION_MAX as u64,
         });

@@ -2010,7 +2010,24 @@ impl TerminalApp {
             });
             return false;
         };
-        let args = bitty_runtime::band_click_args_table(&click.args);
+        let args =
+            bitty_runtime::band_click_args_table(&click.args, click.region.as_ref(), click.button);
+        // Issue #2248: one cold-phase info line per dispatched band gesture
+        // so headed evidence and operator traces name the resolved item and
+        // button. User-paced, never a hot loop; the region id is declared
+        // presentation metadata, never pointer coordinates.
+        crate::logging::info(|| {
+            format!(
+                "bitty: band click '{}:{}' region={} button={}",
+                click.plugin_id,
+                click.command,
+                click
+                    .region
+                    .as_ref()
+                    .map_or("<none>", |region| region.id.as_str()),
+                click.button.as_str()
+            )
+        });
         let outcome = plugin_runtime.dispatch_ui_command(&id, &click.command, &[args], origin);
         match outcome {
             Ok(result) => {
@@ -2058,7 +2075,8 @@ impl TerminalApp {
             });
             return false;
         };
-        let args = bitty_runtime::band_click_args_table(&click.args);
+        let args =
+            bitty_runtime::band_click_args_table(&click.args, click.region.as_ref(), click.button);
         let outcome = plugin_runtime.dispatch_command(&id, &click.command, &[args]);
         match outcome {
             Ok(result) => {
@@ -2130,7 +2148,23 @@ impl TerminalApp {
             });
             return false;
         };
-        let args = bitty_runtime::band_scroll_args_table(&scroll.args, scroll.delta);
+        let args = bitty_runtime::band_scroll_args_table(
+            &scroll.args,
+            scroll.delta,
+            scroll.region.as_ref(),
+        );
+        crate::logging::info(|| {
+            format!(
+                "bitty: band scroll '{}:{}' region={} delta={}",
+                scroll.plugin_id,
+                scroll.command,
+                scroll
+                    .region
+                    .as_ref()
+                    .map_or("<none>", |region| region.id.as_str()),
+                scroll.delta
+            )
+        });
         let outcome = plugin_runtime.dispatch_ui_command(&id, &scroll.command, &[args], origin);
         match outcome {
             Ok(result) => {
@@ -2174,7 +2208,11 @@ impl TerminalApp {
             });
             return false;
         };
-        let args = bitty_runtime::band_scroll_args_table(&scroll.args, scroll.delta);
+        let args = bitty_runtime::band_scroll_args_table(
+            &scroll.args,
+            scroll.delta,
+            scroll.region.as_ref(),
+        );
         let outcome = plugin_runtime.dispatch_command(&id, &scroll.command, &[args]);
         match outcome {
             Ok(result) => {

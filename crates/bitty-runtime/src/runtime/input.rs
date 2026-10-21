@@ -942,10 +942,10 @@ impl Runtime {
         // press resolves the click into the drain queue (or counts it
         // unclaimed/denied) and never reaches a capturing app as an orphan
         // report.
-        if event.button == MouseButton::Left
-            && event.state == PressState::Released
-            && self.band_release()
-        {
+        // Issue #2248: left, right, and middle releases paired with a
+        // band-consumed press are chrome; the gesture resolves only on the
+        // button that armed it.
+        if event.state == PressState::Released && self.band_release(event.button) {
             return;
         }
         // CTX-0384: copy mode consumes mouse selection while active (the
@@ -964,11 +964,11 @@ impl Runtime {
         // capture decision below so no capturing app ever sees it (the
         // release block above pairs with it) and focus never moves. Shift
         // still forces selection.
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && self.band_press()
-        {
+        // Issue #2248: any band-routable press is consumed before the
+        // focus/capture decision, so a right or middle press on chrome can
+        // never paste the clipboard behind the band. Shift remains the
+        // selection escape for the left button inside `band_press`.
+        if event.state == PressState::Pressed && self.band_press(event.button) {
             return;
         }
         // CTX-0804 (#1477): a left press on another pane is a focus choice

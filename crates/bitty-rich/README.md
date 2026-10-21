@@ -53,12 +53,22 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
   loading.
 - `tests/` — headless presentation tests.
 
-## Retired surfaces
+## Graphics/scene retention and retired surfaces
 
-- `src/presentation.rs` (`RichPresentation` snapshot aggregation) and
-  `src/projection.rs` (fragment-to-`RichBlock` projection) were removed in
-  CTX-1412 (bitty#2117): no Core path consumed them, and the projection was
-  the only reason this crate carried a production edge to the extracted
-  `bitty-ipc` repository. `crates/bitty-rich/tests/retired_surface_guard.rs`
-  keeps them retired; the scene/image/place/background remainder stays with
-  the graphics/seam extraction (bitty#2163).
+The accepted graphics contract (`W-133`, ADR 0016 Boundary 2) keeps the
+graphics trust decision and scene composition in Core: bounded intake,
+`ImageStore`/`ImagePlacement`, the aggregate budget, pre-upload validation,
+and the rich scene model. This crate's `image`, `scene`, `kitty_place`,
+`kitty_unicode`, `background`, `wallpaper_theme`, and `geometry` modules are
+therefore Core-retained implementation, not extraction material; only
+`kitty_decode`/`kitty_raster` are extension-bound, and their Core copies stay
+behind `kitty_seam.rs` until the composition-root binding and worker protocol
+land (W-141).
+
+Two _unwired helpers_ were removed in CTX-1412 (bitty#2117) because no Core
+path consumed them: `src/presentation.rs` (`RichPresentation` snapshot
+aggregation) and `src/projection.rs` (fragment-to-`RichBlock` projection).
+This is not a boundary change — `scene.rs` remains Core-retained with the
+SCN-1..5 limits — and the projection was the only reason this crate carried
+a production edge to the extracted `bitty-ipc` repository.
+`crates/bitty-rich/tests/retired_surface_guard.rs` keeps them retired.

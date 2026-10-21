@@ -1,8 +1,13 @@
-//! Retired rich-presentation surface guard for bitty#2117 (core-split).
+//! Retired rich-presentation helper guard for bitty#2117 (core-split).
 //!
-//! `bitty-rich` is the crate the graphics/scene extraction (bitty#2163)
-//! shrinks. CTX-1412 retired two surfaces ahead of that extraction because
-//! no Core path consumed them:
+//! The accepted graphics contract keeps the trust decision and the scene
+//! composition in Core (`W-133` / ADR 0016 Boundary 2): bounded intake,
+//! `ImageStore`/`ImagePlacement`, the aggregate budget, pre-upload
+//! validation, and the rich scene model are Core-retained implementation,
+//! not extraction material. Only decode/raster are extension-bound.
+//!
+//! CTX-1412 retired two *unwired helpers* that no Core path consumed while
+//! the scene/image/place/background surface stays Core-retained:
 //!
 //! - `src/presentation.rs` - the `RichPresentation` snapshot aggregation
 //!   view (hyperlinks + shell zones + clipboard + command blocks + the
@@ -22,9 +27,10 @@
 //! `bitty-ipc` dependency to `crates/bitty-rich/Cargo.toml` fails a test
 //! here; removing the offending change passes again.
 //!
-//! Scope note: the scene/image/place/background remainder, the legacy
-//! `kitty` placeholder stub, and the decode/raster seam stay untouched -
-//! they are bitty#2163's surface, not this retirement.
+//! Scope note: the retained scene/image/place/background modules, the
+//! legacy `kitty` placeholder stub, and the decode/raster seam copies are
+//! governed by the `W-133` retention decision and their own tracked
+//! follow-ups, not by this retirement.
 
 use std::path::{Path, PathBuf};
 

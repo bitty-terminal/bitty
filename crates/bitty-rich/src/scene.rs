@@ -798,6 +798,14 @@ mod tests {
 
     #[test]
     fn scn3_text_bytes_per_block_enforced() {
+        // Value pin: the SCN-3 budget is 256 KiB and must not drift while the
+        // unwired projection helper that used to exercise it is retired
+        // (CTX-1412 / bitty#2117).
+        assert_eq!(
+            SCENE_MAX_TEXT_BYTES_PER_BLOCK,
+            256 * 1024,
+            "SCN-3 per-block text budget must stay 256 KiB"
+        );
         let large = "a".repeat(SCENE_MAX_TEXT_BYTES_PER_BLOCK + 1);
         let content = tiny_text(&large);
         assert!(content.text_bytes() > SCENE_MAX_TEXT_BYTES_PER_BLOCK);

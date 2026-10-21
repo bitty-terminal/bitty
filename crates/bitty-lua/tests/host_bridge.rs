@@ -2573,3 +2573,161 @@ fn string_lua_error_is_unchanged() {
         BoundedExecution::RuntimeError("lua error: boom".to_string())
     );
 }
+
+/// Stub backend for `bitty.runtime.inspect()` (issue #2396).
+struct RuntimeInspectStub {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    calls: std::cell::Cell<u32>,
+    snapshot: bitty_lua::runtime_inspect::RuntimeInspectSnapshot,
+}
+
+impl HostServices for RuntimeInspectStub {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("terminal.snapshot"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn runtime_inspect(
+        &self,
+    ) -> Result<bitty_lua::runtime_inspect::RuntimeInspectSnapshot, BridgeError> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(self.snapshot.clone())
+    }
+}
+
+fn inspect_snapshot() -> bitty_lua::runtime_inspect::RuntimeInspectSnapshot {
+    use bitty_lua::runtime_inspect::{
+        DecorationGeometry, InspectRows, PluginInspectRow, ProfileSource, RuntimeDiagnostics,
+        RuntimeInspectSnapshot, Section, ThemeSource,
+    };
+    RuntimeInspectSnapshot {
+        diagnostics: Section::available(RuntimeDiagnostics {
+            app_version: "0.0.26".to_string(),
+            config_file: Some("/cfg/init.lua".to_string()),
+            config_dir: Some("/cfg".to_string()),
+            plugin_ledger: Some("/cfg/bitty-plugins.toml".to_string()),
+            plugin_store: Some("/data/plugins".to_string()),
+            extension_user_root: Some("/data/extensions".to_string()),
+            extension_system_root: Some("/usr/lib/bitty/extensions".to_string()),
+            extension_state_root: Some("/state/extensions".to_string()),
+            profile: Some("work".to_string()),
+            profile_source: ProfileSource::Cli,
+            theme: "bitty-dark".to_string(),
+            theme_source: ThemeSource::Default,
+            font_family: "monospace".to_string(),
+            font_size: 12.0,
+            decoration: DecorationGeometry::default(),
+        }),
+        plugins: Section::available(InspectRows::new(vec![PluginInspectRow {
+            id: "owner.plugin".to_string(),
+            name: "Plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry".to_string(),
+            enabled: true,
+            recorded: true,
+        }])),
+        ..RuntimeInspectSnapshot::default()
+    }
+}
+
+#[test]
+fn runtime_inspect_serves_a_snapshot_and_rejects_arguments() {
+    use std::cell::Cell;
+    let services = Rc::new(RuntimeInspectStub {
+        store: RefCell::new(BTreeMap::new()),
+        calls: Cell::new(0),
+        snapshot: inspect_snapshot(),
+    });
+    let mut vm = gate_vm("runtime-inspect");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local snapshot = bitty.runtime.inspect()
+            bitty.store.set("app", snapshot.diagnostics.app_version)
+            bitty.store.set("plugin", snapshot.plugins.rows[1].id)
+            bitty.store.set("unavailable", snapshot.extensions.unavailable or "present")
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    {
+        let store = services.store.borrow();
+        assert_eq!(
+            store.get("app"),
+            Some(&LuaValue::String("0.0.26".to_string()))
+        );
+        assert_eq!(
+            store.get("plugin"),
+            Some(&LuaValue::String("owner.plugin".to_string()))
+        );
+        assert_eq!(
+            store.get("unavailable"),
+            Some(&LuaValue::String("source unavailable".to_string()))
+        );
+    }
+    assert_eq!(services.calls.get(), 1);
+
+    // Any argument is rejected before the host is reached.
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(function() return bitty.runtime.inspect("/etc/passwd") end)
+            bitty.store.set("code", ok and "OK" or err.code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_INVALID".to_string()))
+    );
+    assert_eq!(services.calls.get(), 1, "argument path never reaches host");
+}
+
+#[test]
+fn runtime_inspect_defaults_fail_closed_without_backend() {
+    let services = Rc::new(FakeServices::default());
+    let mut vm = gate_vm("runtime-inspect-default");
+    install(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(function() return bitty.runtime.inspect() end)
+            bitty.store.set("code", ok and "OK" or err.code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_NOT_IMPLEMENTED".to_string()))
+    );
+}

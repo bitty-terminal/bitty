@@ -534,6 +534,10 @@ pub(crate) struct StartupSeed<'a> {
     pub(crate) image_roots: &'a [String],
     /// Effective opt-in history capture switches (CTX-1352).
     pub(crate) history_capture: bitty_config::HistoryCaptureConfig,
+    /// Cold-path inputs for the `bitty.runtime.inspect()` snapshot
+    /// (issue #2396). The snapshot is built only when a discovered package
+    /// declares `runtime.inspect`.
+    pub(crate) inspect: Option<&'a crate::runtime_inspect::RuntimeInspectContext>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -683,6 +687,24 @@ pub(crate) fn discover_with_roots(
         runtime.set_fs_backend(Some(Rc::new(FsListBackend::new(home))));
     }
     let _ = runtime.discover();
+    // Issue #2396: build the read-only dashboard snapshot after discovery
+    // (so only declaring packages trigger the cold-path reads) and before
+    // activation (so every granted generation captures it). The builder
+    // owns all file reads; the Lua call path stays pure.
+    if runtime.declares_capability("runtime.inspect") {
+        if let Some(context) = seed.inspect {
+            // Safe-mode parity is structural: a context built for one mode is
+            // never installed into a runtime running in the other. A mismatch
+            // leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
+            if context.safe_mode == safe_mode {
+                runtime.set_runtime_inspect_snapshot(crate::runtime_inspect::build(context));
+            } else {
+                crate::logging::warn(|| {
+                    "bitty: runtime.inspect snapshot safe-mode mismatch; not installed".to_string()
+                });
+            }
+        }
+    }
     for (id, result) in runtime.activate_discovered() {
         match result {
             Ok(report) if report.skipped_safe_mode => {
@@ -859,6 +881,7 @@ mod tests {
             pinned: &pinned,
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
             .expect("dev root must yield a session");
@@ -870,6 +893,80 @@ mod tests {
         assert_eq!(
             value,
             LuaValue::String("~/docs/a.txt:file:true,~/docs/b.txt:file:true".to_string())
+        );
+    }
+
+    /// Issue #2396 end-to-end: a granted development plugin reads the
+    /// cold-path snapshot through `bitty.runtime.inspect()`; the call path
+    /// takes no arguments and receives the bounded table.
+    #[test]
+    fn discover_serves_runtime_inspect_to_a_granted_plugin() {
+        let root = fs_list_probe_root("inspect");
+        let id = "xuepoo.inspect";
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Inspect\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\nruntime.inspect = true\n\n[lazy]\ncommands = [\"{id}:inspect\"]\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            r#"
+            local function inspect()
+              local snapshot = bitty.runtime.inspect()
+              return snapshot.diagnostics.app_version .. ":" .. type(snapshot.plugins.rows)
+                .. ":" .. tostring(snapshot.plugins.truncated)
+            end
+            bitty.commands.register({ id = "inspect", title = "Inspect", run = inspect })
+            "#,
+        )
+        .expect("init");
+
+        let live = Runtime::with_defaults().expect("defaults");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let context = crate::runtime_inspect::RuntimeInspectContext {
+            app_version: "test-version".to_string(),
+            config_file: None,
+            config_dir: None,
+            plugin_ledger: None,
+            plugin_store: None,
+            extension_user_root: None,
+            extension_system_root: None,
+            extension_state_root: None,
+            profiles_dir: None,
+            profile: None,
+            profile_source: bitty_runtime::plugin_runtime::ProfileSource::None,
+            theme: bitty_config::theme::DEFAULT_THEME_NAME.to_string(),
+            theme_source: bitty_runtime::plugin_runtime::ThemeSource::Default,
+            font_family: "monospace".to_string(),
+            font_size: 12.0,
+            decoration: bitty_runtime::plugin_runtime::DecorationGeometry::default(),
+            safe_mode: false,
+        };
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: Some(&context),
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
+            .expect("dev root must yield a session");
+        let mut runtime = session.runtime;
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        let value = runtime
+            .dispatch_command(&plugin_id, "inspect", &[])
+            .expect("dispatch runtime.inspect command");
+        assert_eq!(
+            value,
+            LuaValue::String("test-version:table:false".to_string())
         );
     }
 
@@ -1034,6 +1131,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             pinned: &pinned,
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1270,6 +1368,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             pinned: &pinned,
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1431,6 +1530,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             pinned: &pinned,
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1571,6 +1671,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             pinned: &pinned,
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
         };
         discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session")

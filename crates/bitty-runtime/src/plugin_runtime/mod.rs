@@ -63,6 +63,14 @@ use bitty_plugin_host::{
 };
 
 pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
+pub use bitty_lua::runtime_inspect::{
+    DecorationGeometry, ExtensionActivation, ExtensionInspectRow, ExtensionTrust, InspectRows,
+    PluginInspectRow, ProfileInspectRow, ProfileSource, RUNTIME_INSPECT_MAX_BYTES,
+    RUNTIME_INSPECT_MAX_EXTENSION_ROWS, RUNTIME_INSPECT_MAX_PATH_BYTES,
+    RUNTIME_INSPECT_MAX_PLUGIN_ROWS, RUNTIME_INSPECT_MAX_PROFILE_ROWS,
+    RUNTIME_INSPECT_MAX_SETTING_ROWS, RUNTIME_INSPECT_MAX_STRING_BYTES, RuntimeDiagnostics,
+    RuntimeInspectSnapshot, Section, SettingInspectRow, SettingSource, ThemeSource,
+};
 pub use bitty_lua::{
     WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS as WORKSPACE_INFO_NAME_MAX_CHARS,
     WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
@@ -687,6 +695,13 @@ pub struct PluginRuntime {
     /// CTX-0897: per-owner event traces for `bitty.debug.trace`, fed by
     /// [`PluginRuntime::deliver_event`].
     trace_hub: Rc<RefCell<debug::TraceHub>>,
+    /// Issue #2396: prebuilt read-only snapshot for `bitty.runtime.inspect`.
+    ///
+    /// The application assembles it on the cold path (after discovery, before
+    /// activation) from already-resolved configuration and recorded state. It
+    /// is cloned into each `runtime.inspect` generation, so the call path
+    /// performs no I/O and can meet its 10 ms budget.
+    runtime_inspect: Option<RuntimeInspectSnapshot>,
     /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
     /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
     workspace_source: Option<Rc<dyn WorkspaceSource>>,
@@ -927,6 +942,7 @@ impl PluginRuntime {
             command_directory: Rc::new(RefCell::new(CommandDirectory::new())),
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
+            runtime_inspect: None,
             workspace_source: None,
             target_source: None,
             history_provider: None,
@@ -1200,6 +1216,36 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Install the prebuilt `bitty.runtime.inspect()` snapshot (issue #2396).
+    ///
+    /// Call after discovery and before activation: generations that hold
+    /// `runtime.inspect` capture a clone when their services are built. The
+    /// snapshot must already satisfy the 64 KiB aggregate bound
+    /// ([`RuntimeInspectSnapshot::enforce_budget`]); the bridge still refuses
+    /// an oversized payload fail-closed. Installing it grants nothing: the
+    /// per-generation `runtime.inspect` capability remains the only switch.
+    pub fn set_runtime_inspect_snapshot(&mut self, snapshot: RuntimeInspectSnapshot) {
+        self.runtime_inspect = Some(snapshot);
+    }
+
+    /// Whether any discovered package declares `capability`.
+    ///
+    /// Used by the cold-path wiring to build the `runtime.inspect` snapshot
+    /// only when a discovered plugin can actually read it. Declaration is not
+    /// authority: activation still intersects the manifest with the recorded
+    /// grant.
+    #[must_use]
+    pub fn declares_capability(&self, capability: &str) -> bool {
+        self.entries.values().any(|entry| {
+            entry
+                .package
+                .manifest
+                .capabilities
+                .all_ids()
+                .is_ok_and(|ids| ids.iter().any(|id| id.as_str() == capability))
+        })
     }
 
     /// Install the live Core target/anchor source for targeting sessions
@@ -2282,6 +2328,13 @@ impl PluginRuntime {
         let debug_trace = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.trace");
+        // Issue #2396: the read-only dashboard head is independent of
+        // `runtime.configure` (read never implies write, write never
+        // implies read). Installation of the snapshot below is gated on
+        // this flag, so an ungranted generation holds no copy.
+        let runtime_inspect = granted
+            .iter()
+            .any(|capability| capability.as_str() == "runtime.inspect");
         let panel_create = granted
             .iter()
             .any(|capability| capability.as_str() == "panel.create");
@@ -2447,6 +2500,13 @@ impl PluginRuntime {
         // the `grants` target serves only this generation's own snapshot.
         plugin_services.set_debug_inspect(debug_inspect);
         plugin_services.set_debug_trace(debug_trace);
+        // Issue #2396: install the prebuilt snapshot only for a granted
+        // generation. A granted generation without a wired snapshot keeps
+        // failing closed with `E_NOT_IMPLEMENTED`.
+        let inspect_snapshot = runtime_inspect
+            .then(|| self.runtime_inspect.clone())
+            .flatten();
+        plugin_services.set_runtime_inspect(runtime_inspect, inspect_snapshot);
         plugin_services.set_panel_access(panel_create, panel_focus);
         // CTX-1099: the `bitty.panel.set_pinned` host backend. Installed
         // only for `panel.focus` generations (no backend without grant);

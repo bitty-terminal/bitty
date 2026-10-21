@@ -1597,6 +1597,12 @@ pub struct PluginRow {
     pub commands: Vec<String>,
     /// Pinned manifest hash when recorded.
     pub manifest_hash: Option<String>,
+    /// Declared settings (issue #2396 read-only inspection only).
+    ///
+    /// Declarations carry their shipped default and kind; values are resolved
+    /// separately from the per-plugin user file. Empty when no manifest body
+    /// is available (a recorded id without a bundled/staged manifest).
+    pub settings: Vec<bitty_plugin_host::manifest::SettingDecl>,
 }
 
 impl PluginRow {
@@ -1706,6 +1712,7 @@ fn rows_from_state(
                 .map(|command| command.id.as_str().to_string())
                 .collect(),
             manifest_hash,
+            settings: manifest.settings.clone(),
         });
     }
 
@@ -1734,6 +1741,7 @@ fn rows_from_state(
             denied: record.denied.clone(),
             commands: Vec::new(),
             manifest_hash: Some(record.manifest_hash.clone()),
+            settings: Vec::new(),
         });
     }
 
@@ -1749,6 +1757,22 @@ fn rows_from_state(
 
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(rows)
+}
+
+/// Load the managed ledger for read-only runtime inspection (issue #2396).
+///
+/// String error keeps the private CLI failure type out of the inspection
+/// module; the message is already host-authored and bounded by the caller.
+pub(crate) fn load_state_for_inspect(path: &Path) -> Result<PluginState, String> {
+    load_state(path).map_err(|failure| failure.message)
+}
+
+/// Build plugin rows for read-only runtime inspection (issue #2396).
+pub(crate) fn rows_for_inspect(
+    state: &PluginState,
+    store_root: Option<&Path>,
+) -> Result<Vec<PluginRow>, String> {
+    rows_from_state(state, store_root).map_err(|failure| failure.message)
 }
 
 /// Read the store index, mapping any failure to a read-only plugin error.
@@ -1817,6 +1841,10 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
             })
             .unwrap_or_default(),
         manifest_hash: Some(record.manifest_hash.clone()),
+        settings: manifest
+            .as_ref()
+            .map(|manifest| manifest.settings.clone())
+            .unwrap_or_default(),
     }
 }
 

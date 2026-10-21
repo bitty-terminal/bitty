@@ -252,6 +252,7 @@ mod observability;
 mod plugin_runtime;
 mod prefix_dispatch;
 mod profile;
+mod runtime_inspect;
 mod storage_backends;
 mod version;
 
@@ -1049,6 +1050,17 @@ fn main() {
     // deferred pin backend is installed before activation, so `init.lua`
     // already observes a working `bitty.panel.set_pinned`.
     let startup_targets = runtime.target_anchor_summaries();
+    // Issue #2396: cold-path inputs for `bitty.runtime.inspect()`. The
+    // snapshot itself is built only if a discovered package declares the
+    // capability; no plugin is loaded to produce it and the Lua call path
+    // performs no I/O.
+    let mut inspect_env = runtime_inspect::InspectEnv::from_process(args.config_path.as_deref());
+    inspect_env.profile_from_cli = args
+        .profile
+        .as_deref()
+        .is_some_and(|profile| !profile.trim().is_empty());
+    let inspect_context =
+        runtime_inspect::RuntimeInspectContext::from_app(&app_config, &inspect_env, args.safe);
     let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
         runtime.config().cols,
@@ -1060,6 +1072,7 @@ fn main() {
             pinned: &runtime.pinned_views(),
             image_roots: &runtime.config().background_image_roots,
             history_capture: app_config.effective.history.capture.clone(),
+            inspect: Some(&inspect_context),
         },
     );
     let live_snapshot = plugin_session

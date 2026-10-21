@@ -3997,7 +3997,10 @@ impl Runtime {
     /// plugin's declared style is honored instead of silently dropped. An
     /// unknown token falls back to the span default and counts
     /// [`BandHostStats::unknown_tokens`](super::band_host::BandHostStats), and
-    /// `bold` reuses the band renderer's synthetic double-strike.
+    /// `bold` reuses the band renderer's synthetic double-strike. A styled row
+    /// that paints no cell (empty text, or every span clipped away) falls back
+    /// to the same single pill, so CTX-1143's fail-open chrome holds on both
+    /// paths.
     #[allow(clippy::too_many_arguments)]
     fn paint_overlay_row(
         &mut self,
@@ -4015,8 +4018,12 @@ impl Runtime {
         let cell_h = live.height;
         // Width in display cells (wide glyphs count 2), clipped to the frame.
         let (clipped, text_cells) = clip_to_width_cells(&overlay_row.text, frame.cols);
-        // Center the pill in the focused frame on its row.
-        let pill_w = px_span_usize(text_cells, cell_w);
+        // Center the pill in the focused frame on its row. `text_cells` is
+        // already floored at one cell by `clip_to_width_cells`, and the floor
+        // is repeated here so the pill width never depends on that helper: an
+        // empty composer buffer must still paint a one-cell rect instead of a
+        // zero-width one (CTX-1143, CTX-1419, issue #2191).
+        let pill_w = px_span_usize(text_cells.max(1), cell_w);
         let origin_px_x = px_add(
             px_add(pad_px, frame.content.x),
             px_side(full_w.saturating_sub(pill_w)) / 2,
@@ -4026,24 +4033,22 @@ impl Runtime {
             .runs
             .iter()
             .any(|run| run.fg.is_some() || run.bg.is_some() || run.bold);
+        let pill = OverlayPill {
+            origin_x: origin_px_x,
+            origin_y: origin_px_y,
+            width_px: pill_w,
+            height_px: cell_h,
+            text_cells,
+        };
         if !styled {
-            layers.combined_overlay.push(bitty_render::grid::FillRect {
-                rect: bitty_render::geometry::RectPx::new(origin_px_x, origin_px_y, pill_w, cell_h),
-                color: self.config.theme.background,
-            });
-            let glyphs = self.renderer.overlay_text_glyphs(
-                &clipped,
-                (origin_px_x, origin_px_y),
-                text_cells,
-                self.config.theme.foreground,
-            );
-            layers.combined_glyphs.extend(glyphs);
+            self.paint_overlay_pill(layers, &clipped, pill);
             return;
         }
         let default_fg = self.config.theme.foreground;
         let default_bg = self.config.theme.background;
         let chars: Vec<char> = overlay_row.text.chars().collect();
         let cols = usize::from(frame.cols);
+        let mut painted_any = false;
         for run in &overlay_row.runs {
             let start = run.start_col;
             if start >= cols {
@@ -4081,13 +4086,13 @@ impl Runtime {
                 })
             });
             let run_x = px_add(
-                origin_px_x,
+                pill.origin_x,
                 px_offset_cells(0, u16::try_from(start).unwrap_or(u16::MAX), cell_w),
             );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(
                     run_x,
-                    origin_px_y,
+                    pill.origin_y,
                     px_span_usize(cells, cell_w),
                     cell_h,
                 ),
@@ -4095,7 +4100,7 @@ impl Runtime {
             });
             let mut glyphs =
                 self.renderer
-                    .overlay_text_glyphs(&span, (run_x, origin_px_y), cells, fg);
+                    .overlay_text_glyphs(&span, (run_x, pill.origin_y), cells, fg);
             if run.bold {
                 // Same synthetic double-strike the band renderer uses.
                 let mut doubled = glyphs.clone();
@@ -4105,7 +4110,39 @@ impl Runtime {
                 glyphs.extend(doubled);
             }
             layers.combined_glyphs.extend(glyphs);
+            painted_any = true;
         }
+        if !painted_any {
+            // Fail-open chrome (CTX-1143): a styled row whose runs produce no
+            // cell (empty text, or every span clipped away) still paints the
+            // default pill. The overlay holds keyboard capture while up, so an
+            // invisible surface would be a fail-open UX (CTX-1419, #2191).
+            self.paint_overlay_pill(layers, &clipped, pill);
+        }
+    }
+
+    /// Paints the default single pill for one overlay row (CTX-1170).
+    ///
+    /// Shared by the unstyled fast path and the styled-row fallback so a live
+    /// surface always keeps its one-cell chrome even when no styled run paints
+    /// (CTX-1143, issue #1966; CTX-1419, issue #2191).
+    fn paint_overlay_pill(&mut self, layers: &mut FrameLayers, clipped: &str, pill: OverlayPill) {
+        layers.combined_overlay.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(
+                pill.origin_x,
+                pill.origin_y,
+                pill.width_px,
+                pill.height_px,
+            ),
+            color: self.config.theme.background,
+        });
+        let glyphs = self.renderer.overlay_text_glyphs(
+            clipped,
+            (pill.origin_x, pill.origin_y),
+            pill.text_cells,
+            self.config.theme.foreground,
+        );
+        layers.combined_glyphs.extend(glyphs);
     }
 
     /// Present-time target annotation batch (W-29 successor, issue #2253).
@@ -4170,24 +4207,30 @@ impl Runtime {
 
     /// One text row per scene line for the overlay surface (CTX-1170).
     ///
-    /// A `List`/`Column` root yields one row per direct child (each child
-    /// flattened with [`flatten_band_runs`](super::band_host::flatten_band_runs),
-    /// so nested `Row` children still join horizontally); any other root
-    /// yields its single flattened line. Never empty: a childless scene falls
-    /// back to one empty row so a live surface keeps its one-cell pill chrome
+    /// A `List`/`Column` root yields one row per direct child, each child
+    /// flattened under the root's own declaration
+    /// ([`flatten_band_runs_under`](super::band_host::flatten_band_runs_under)),
+    /// so a root-level `fg`/`bg`/`bold` reaches its rows exactly like a band
+    /// container's declaration reaches its spans and nested `Row` children
+    /// still join horizontally (CTX-1419, issue #2191); any other root yields
+    /// its single flattened line. Never empty: a childless scene falls back to
+    /// one empty row so a live surface keeps its one-cell pill chrome
     /// (CTX-1143). Total text stays inside the mount-time `SCN-1`/`SCN-3`
     /// budgets the flattened walk already relied on.
     fn overlay_scene_rows(node: &bitty_lua::ui::UiNode) -> Vec<OverlayRow> {
-        use super::band_host::flatten_band_runs;
+        use super::band_host::{BandInherited, flatten_band_runs, flatten_band_runs_under};
         use bitty_lua::ui::UiNode;
         let mut rows: Vec<OverlayRow> = match node {
-            UiNode::Column { children, .. } | UiNode::List { children, .. } => children
-                .iter()
-                .map(|child| {
-                    let (text, runs) = flatten_band_runs(child);
-                    OverlayRow { text, runs }
-                })
-                .collect(),
+            UiNode::Column { children, .. } | UiNode::List { children, .. } => {
+                let inherited = BandInherited::of(node);
+                children
+                    .iter()
+                    .map(|child| {
+                        let (text, runs) = flatten_band_runs_under(child, &inherited);
+                        OverlayRow { text, runs }
+                    })
+                    .collect()
+            }
             _ => {
                 let (text, runs) = flatten_band_runs(node);
                 vec![OverlayRow { text, runs }]
@@ -4900,6 +4943,25 @@ struct OverlayRow {
     runs: Vec<super::band_host::BandRun>,
 }
 
+/// Clipped geometry of one overlay pill row (CTX-1170).
+///
+/// Shared by the unstyled fast path and the styled-row fallback so both paint
+/// the exact same one-cell chrome (CTX-1419, issue #2191).
+#[derive(Debug, Clone, Copy)]
+struct OverlayPill {
+    /// Left edge in window pixels.
+    origin_x: i32,
+    /// Top edge in window pixels.
+    origin_y: i32,
+    /// Pill width in pixels (never narrower than one cell; a row that clips to
+    /// zero text cells still reserves its one-cell chrome).
+    width_px: u32,
+    /// Pill height in pixels (one cell).
+    height_px: u32,
+    /// Width of the clipped row text in display cells.
+    text_cells: usize,
+}
+
 /// Combined draw layers assembled by the present phases (CTX-0474).
 ///
 /// The leaf pass fills the grid layers and the cursor; the overlay phases
@@ -5434,6 +5496,102 @@ mod plugin_overlay_paint_tests {
             [accent[0], accent[1], accent[2], 0xFF]
         );
         assert_eq!(layers.combined_overlay[1].color, rt.config.theme.selection);
+    }
+
+    #[test]
+    fn styled_empty_overlay_row_keeps_pill_chrome() {
+        // CTX-1143 fail-open guarantee, styled path (CTX-1419 review): a row
+        // that declares style but paints no cell (an empty composer buffer
+        // under `bold`) must still paint the default one-cell pill.
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with(bitty_lua::ui::UiNode::row(vec![
+            styled_text("", None, None, true),
+        ]))));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            1,
+            "a styled empty row falls back to one default pill fill"
+        );
+        assert_eq!(layers.combined_overlay[0].color, rt.config.theme.background);
+        // One-cell chrome is a pixel claim, not just a draw-layer count: a
+        // zero-width fallback rect would satisfy the fill/flag assertions while
+        // still rendering nothing (CTX-1419 review, issue #2191).
+        let cell_w = rt.live_cell_metrics().width;
+        assert!(cell_w > 0, "the deterministic cell width is nonzero");
+        assert_eq!(
+            layers.combined_overlay[0].rect.width, cell_w,
+            "the empty pill clamps to exactly one cell instead of collapsing to zero"
+        );
+        assert_eq!(
+            layers.combined_overlay[0].rect.height,
+            rt.live_cell_metrics().height,
+            "the one-cell chrome is one row tall"
+        );
+        assert!(
+            layers.combined_glyphs.is_empty(),
+            "empty text paints no glyphs"
+        );
+        assert!(layers.any_needs_draw);
+    }
+
+    #[test]
+    fn overlay_root_declaration_reaches_rows() {
+        // CTX-1419 review: the overlay stacks a `Column`/`List` root's direct
+        // children as rows, but the root's own declaration must still reach
+        // them, exactly like a band container's declaration reaches its spans.
+        let root = bitty_lua::ui::UiNode::Column {
+            children: vec![bitty_lua::ui::UiNode::text("hi")],
+            fg: Some("accent".to_string()),
+            bg: Some("selection".to_string()),
+            bold: Some(true),
+            on_click: Some(bitty_lua::ui::ClickCommand {
+                command: "test-bar:focus".to_string(),
+                args: Vec::new(),
+                region: Some(bitty_lua::ui::UiRegion {
+                    id: "ws:1".to_string(),
+                    kind: bitty_lua::ui::UiRegionKind::Item,
+                }),
+            }),
+            on_scroll: None,
+        };
+        let rows = Runtime::overlay_scene_rows(&root);
+        assert_eq!(rows.len(), 1, "one row per direct child");
+        assert_eq!(rows[0].runs[0].fg.as_deref(), Some("accent"));
+        assert_eq!(rows[0].runs[0].bg.as_deref(), Some("selection"));
+        assert!(rows[0].runs[0].bold, "root bold reaches the row run");
+        let click = rows[0].runs[0]
+            .on_click
+            .as_ref()
+            .expect("root click binding reaches the row run");
+        assert_eq!(click.command, "test-bar:focus");
+        assert_eq!(
+            rows[0].runs[0]
+                .region
+                .as_ref()
+                .map(|region| region.id.as_str()),
+            Some("ws:1"),
+            "root region identity reaches the row run (data only; overlay routing stays band-only)"
+        );
+
+        let mut rt = runtime();
+        rt.set_plugin_overlay(Some(surface_with(root)));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        let accent = rt
+            .config
+            .theme
+            .active_index(crate::runtime::band_host::BAND_ACCENT_ANSI_INDEX);
+        assert_eq!(
+            layers.combined_overlay[0].color, rt.config.theme.selection,
+            "root bg resolves through the closed token table"
+        );
+        assert_eq!(
+            layers.combined_glyphs[0].color,
+            [accent[0], accent[1], accent[2], 0xFF],
+            "root fg resolves through the closed token table"
+        );
     }
 }
 

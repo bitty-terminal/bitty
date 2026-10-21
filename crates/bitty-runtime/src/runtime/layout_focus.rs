@@ -218,6 +218,17 @@ impl Runtime {
         let rows = usize::from(rows_u16);
         if self.state.width() != cols || self.state.height() != rows {
             self.resize_primary_grid(cols, rows);
+        }
+        // Issue #2373: the grid and the kernel winsize are independent
+        // observations. A grid that already matches the target (for example
+        // a shell spawned after the layout synced) must not hide a stale
+        // PTY winsize — resync it on its own so every fullscreen/restore
+        // transition delivers SIGWINCH at the painted size.
+        let pty_stale = self
+            .pty
+            .as_ref()
+            .is_some_and(|pty| pty.size().ok() != Some((cols_u16, rows_u16)));
+        if pty_stale {
             if let Some(pty) = self.pty.as_mut() {
                 let _ = pty.resize(cols_u16, rows_u16);
             }
@@ -2336,8 +2347,14 @@ impl Runtime {
     /// [`Self::set_layout_closing`] re-homes on an explicit close.
     /// Best-effort like the pane sync: matching dims skip, PTY errors never
     /// fail the layout change.
+    ///
+    /// Zoom transitions use this same funnel (issue #2373): when the zoomed
+    /// leaf is the primary owner, the primary grid/PTY must follow the
+    /// full-bleed frame immediately; when zoom hides the owner, the
+    /// owner-absence rule above keeps the grid untouched for the return trip
+    /// (CTX-0790/#1435 scrollback preservation).
     pub fn set_layout(&mut self, layout: LayoutNode) {
-        self.replace_layout(layout, None, true);
+        self.replace_layout(layout, None);
     }
 
     /// Replaces the owned layout because leaf `closed` was explicitly closed.
@@ -2351,22 +2368,10 @@ impl Runtime {
     /// workspace installs) preserve the owner and its grid for the round
     /// trip back.
     pub fn set_layout_closing(&mut self, layout: LayoutNode, closed: ViewId) {
-        self.replace_layout(layout, Some(closed), true);
+        self.replace_layout(layout, Some(closed));
     }
 
-    /// Replaces the owned layout without syncing terminal grid geometry.
-    ///
-    /// CTX-0790 (#1435): zoom engage/disengage are temporary layout changes
-    /// that preserve the primary grid dimensions for the round trip. Syncing
-    /// geometry during these transitions triggers terminal grid resize with
-    /// content reflow, which is lossy — scrollback content does not restore
-    /// perfectly when the layout returns. This variant skips the geometry
-    /// sync so the grid stays unchanged across zoom operations.
-    pub fn set_layout_preserve_grid(&mut self, layout: LayoutNode) {
-        self.replace_layout(layout, None, false);
-    }
-
-    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>, sync_geometry: bool) {
+    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
         // Issue #2337: any layout install abandons an in-flight Mod+drag. A
         // close changes the tree under the drag pointer whether or not it
         // removed the dragged source; the ghost and candidate preview must
@@ -2419,12 +2424,16 @@ impl Runtime {
         // CTX-0359: primary grid + primary PTY winsize (SIGWINCH path) follow
         // the primary owner leaf — the tile that paints primary input/cursor
         // — not the focused leaf. A layout without the owner (fresh
-        // workspace) leaves the grid untouched until the owner returns.
-        // CTX-0790 (#1435): zoom operations skip this sync to preserve grid
-        // dimensions across the engage/disengage round trip.
-        if sync_geometry {
-            self.sync_primary_geometry();
-        }
+        // workspace, zoom onto a non-owner leaf) leaves the grid untouched
+        // until the owner returns.
+        //
+        // Issue #2373: this must also run for zoom transitions. Skipping it
+        // for every zoom (CTX-0790) left a zoomed primary owner painting its
+        // old small grid/PTY winsize inside the full-bleed frame, so TUIs
+        // clipped and the exposed area never updated. The owner-absence rule
+        // already preserves the grid for the zoom-onto-a-sibling round trip,
+        // which is the lossy-reflow case #1435 actually cares about.
+        self.sync_primary_geometry();
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.
         self.sync_pane_geometry_to(&frames);

@@ -245,6 +245,11 @@ impl ZoomState {
     /// Engages zoom on `view`: captures the real tree and installs the
     /// single-leaf proxy. Refuses when the active workspace is already
     /// zoomed or the view is not a leaf, leaving the layout untouched.
+    ///
+    /// Issue #2373: the proxy is installed through the normal layout funnel,
+    /// so a zoomed primary owner resizes its grid and PTY winsize to the
+    /// full-bleed frame (SIGWINCH included). Zooming a sibling still leaves
+    /// the hidden owner's grid untouched for the return trip (CTX-0790).
     pub(crate) fn engage(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
         self.prune(runtime);
         let Some(seq) = active_workspace_seq(runtime) else {
@@ -258,7 +263,7 @@ impl ZoomState {
         };
         let backup = runtime.layout().clone();
         let proxy = LayoutNode::leaf(leaf);
-        runtime.set_layout_preserve_grid(proxy.clone());
+        runtime.set_layout(proxy.clone());
         self.entries.insert(seq, ZoomEntry { backup, proxy });
         true
     }
@@ -275,7 +280,7 @@ impl ZoomState {
             return false;
         };
         if same_layout_shape(runtime.layout(), &entry.proxy) {
-            runtime.set_layout_preserve_grid(entry.backup);
+            runtime.set_layout(entry.backup);
             return true;
         }
         eprintln!(
@@ -768,6 +773,18 @@ pub(crate) fn two_pane_layout() -> LayoutNode {
     LayoutNode::split(
         SplitAxis::Horizontal,
         0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    )
+}
+
+/// Two-pane split after a gap drag at `ratio` (issue #2373 reproduction
+/// shape: the primary pane is narrower than the full-bleed frame).
+#[cfg(all(test, unix))]
+fn gap_resized_two_pane(ratio: f32) -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        ratio,
         LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
         LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
     )
@@ -9004,6 +9021,349 @@ claims = []
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fullscreen_after_gap_resize_fills_frame_and_close_is_bounded_2373() {
+        // Issue #2373 differential regression (direct ToggleZoom API): after
+        // gap resizes, maximizing the primary pane must reflow its grid and
+        // PTY winsize to the full frame. Fails on pre-fix main.
+        //
+        // The close half is a *guard*, not a demonstrated fix: the owner's
+        // close hang did not reproduce headlessly or live (pre-fix control
+        // closed in 15 ms). It asserts that closing from this state stays
+        // bounded and reaches the normal confirmation/teardown path; the
+        // unreproduced teardown symptom is tracked separately.
+        use bitty_config::ChromeAction;
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(two_pane_layout());
+        // Gap-drag shapes: shrink then widen the primary pane through the
+        // same layout funnel a divider drag uses.
+        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        app.runtime.set_layout(gap_resized_two_pane(0.6));
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell spawns");
+        let primary = app.runtime.primary_view().expect("primary owner");
+        let tiled = (app.runtime.state().width(), app.runtime.state().height());
+        assert!(app.runtime.set_focus(primary));
+
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        let full = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == primary)
+            .expect("zoomed primary frame");
+        assert!(
+            full.cols > u16::try_from(tiled.0).unwrap_or(u16::MAX)
+                || full.rows > u16::try_from(tiled.1).unwrap_or(u16::MAX),
+            "test shape must actually grow in at least one axis"
+        );
+        assert_eq!(
+            (app.runtime.state().width(), app.runtime.state().height()),
+            (usize::from(full.cols), usize::from(full.rows)),
+            "fullscreen primary grid must equal the full frame"
+        );
+        assert_eq!(
+            app.runtime.pty_size(),
+            Some((full.cols, full.rows)),
+            "fullscreen primary winsize must equal the full frame"
+        );
+        let leaf = app
+            .runtime
+            .layout()
+            .find_leaf(primary)
+            .expect("zoomed leaf");
+        assert_eq!((leaf.cols(), leaf.rows()), (full.cols, full.rows));
+
+        // Busy primary: the first close arms, the repeat confirms.
+        app.runtime.write_input(b"sleep 30\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.runtime.primary_foreground_job().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "primary job never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let started = std::time::Instant::now();
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.runtime.has_pending_close_confirm());
+        app.apply_chrome_action(ChromeAction::CloseView);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "close from fullscreen must complete bounded, took {elapsed:?}"
+        );
+        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_ne!(app.runtime.primary_view(), Some(primary));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mod_f_primary_fullscreen_resyncs_grid_and_winsize_2373() {
+        // Issue #2373 owner reproduction through the real Mod+F keybinding
+        // (shipped Alt-as-Mod default), not the direct ToggleZoom API: after
+        // gap resizes, the chord must resync the primary grid and PTY
+        // winsize to the full frame, and a second chord restores the tiled
+        // geometry.
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        app.runtime.set_layout(gap_resized_two_pane(0.55));
+        app.runtime
+            .spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell spawns");
+        let primary = app.runtime.primary_view().expect("primary owner");
+        assert!(app.runtime.set_focus(primary));
+        // Re-install the tiled shape after the spawn so the pre-fullscreen
+        // grid and winsize are the post-gap-drag pair (the fresh spawn starts
+        // at the container size before any layout sync).
+        app.runtime.set_layout(gap_resized_two_pane(0.55));
+        let tiled = (
+            app.runtime.state().width(),
+            app.runtime.state().height(),
+            app.runtime.pty_size(),
+        );
+
+        // Mod+F: modifier latch + the bound character, exactly the chord
+        // `intercept_chrome_key` resolves from a physical key event.
+        assert!(!drive_chrome(&mut app, alt_mods_event()));
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        let full = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == primary)
+            .expect("zoomed primary frame");
+        assert_eq!(
+            (app.runtime.state().width(), app.runtime.state().height()),
+            (usize::from(full.cols), usize::from(full.rows)),
+            "Mod+F fullscreen primary grid must equal the full frame"
+        );
+        assert_eq!(
+            app.runtime.pty_size(),
+            Some((full.cols, full.rows)),
+            "Mod+F fullscreen primary winsize must equal the full frame"
+        );
+        assert!(!drive_chrome(&mut app, char_release("f")));
+
+        // Second Mod+F restores the pre-fullscreen tiled state exactly.
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(
+            (
+                app.runtime.state().width(),
+                app.runtime.state().height(),
+                app.runtime.pty_size(),
+            ),
+            tiled,
+            "second Mod+F restores the tiled grid and winsize"
+        );
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    fn mod_f_zoom_preserves_primary_scrollback_offset_1435() {
+        // CTX-0790/#1435 tradeoff guard: the zoom lane must resize the owner
+        // grid (issue #2373), but the leaf's scroll offset and the scrollback
+        // line count must survive both engage and restore.
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        for line in 1..=200 {
+            app.runtime
+                .handle_pty_bytes(format!("Line {line}\r\n").as_bytes());
+        }
+        let primary = app.runtime.primary_view().expect("primary owner");
+        let scrollback_before = app.runtime.state().scrollback_len();
+        assert!(scrollback_before >= 150, "scrollback must exist");
+        app.runtime
+            .layout_mut()
+            .find_leaf_mut(primary)
+            .expect("primary leaf")
+            .set_scroll_offset(25, 1000);
+        assert!(app.runtime.set_focus(primary));
+
+        assert!(!drive_chrome(&mut app, alt_mods_event()));
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(primary)
+                .expect("zoomed owner")
+                .scroll_offset(),
+            25,
+            "zoom engage keeps the owner scroll offset"
+        );
+        assert!(
+            app.runtime.state().scrollback_len() >= scrollback_before,
+            "zoom engage must not drop scrollback lines"
+        );
+        assert!(!drive_chrome(&mut app, char_release("f")));
+
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(primary)
+                .expect("restored owner")
+                .scroll_offset(),
+            25,
+            "zoom restore keeps the owner scroll offset"
+        );
+        assert!(
+            app.runtime.state().scrollback_len() >= scrollback_before,
+            "zoom restore must not drop scrollback lines"
+        );
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mod_f_pane_session_fullscreen_resyncs_grid_and_winsize_2373() {
+        // Owner's second reproduction: an `opencode` TUI running in a split
+        // pane, fullscreened with Mod+F. The pane session's grid, PTY
+        // winsize, and presented frame must all follow the full frame.
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
+        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        let pane = ViewId::new(2);
+        let tiled = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("pane frame");
+        app.runtime
+            .spawn_shell_for_view(
+                pane,
+                "/bin/sh",
+                &["-c", "exec sleep 30"],
+                tiled.cols,
+                tiled.rows,
+            )
+            .expect("pane shell spawns");
+        assert!(app.runtime.set_focus(pane));
+
+        assert!(!drive_chrome(&mut app, alt_mods_event()));
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        let full = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("zoomed pane frame");
+        assert!(
+            full.cols > tiled.cols,
+            "pane must actually grow from the gap-resized tiled width"
+        );
+        assert_eq!(
+            app.runtime.pane_pty_size(&pane),
+            Some((full.cols, full.rows)),
+            "Mod+F pane winsize must equal the full frame"
+        );
+        let snapshot = app.runtime.pane_snapshot(&pane).expect("pane grid");
+        assert_eq!(
+            (snapshot.width, snapshot.height),
+            (usize::from(full.cols), usize::from(full.rows)),
+            "Mod+F pane grid must equal the full frame"
+        );
+
+        // Second Mod+F restores the tiled pane geometry.
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(
+            app.runtime.pane_pty_size(&pane),
+            Some((tiled.cols, tiled.rows)),
+            "second Mod+F restores the tiled pane winsize"
+        );
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fullscreen_pane_close_reaps_session_bounded_2373() {
+        // Guard for the owner's close-hang report (symptom not reproduced on
+        // either build): a zoomed pane closed from the gap-resized shape must
+        // tear down its shell within a bound and leave no live session behind.
+        // This is not the differential proof; it keeps the teardown path
+        // exercised while the unreproduced hang stays tracked separately.
+        use bitty_config::ChromeAction;
+        require_pty!();
+        let mut app = close_confirm_test_app(CloseConfirmMode::Always);
+        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        let pane = ViewId::new(2);
+        let tiled = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("pane frame");
+        app.runtime
+            .spawn_shell_for_view(
+                pane,
+                "/bin/sh",
+                &["-c", "exec sleep 30"],
+                tiled.cols,
+                tiled.rows,
+            )
+            .expect("pane shell spawns");
+        let pid = app.runtime.pane_pid(&pane).expect("pane child pid");
+        assert!(app.runtime.set_focus(pane));
+
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        let full = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("zoomed pane frame");
+        assert_eq!(
+            app.runtime.pane_pty_size(&pane),
+            Some((full.cols, full.rows)),
+            "zoomed pane winsize must equal the full frame"
+        );
+
+        let started = std::time::Instant::now();
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert!(app.runtime.has_pending_close_confirm());
+        app.apply_chrome_action(ChromeAction::CloseView);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "close must complete bounded, took {elapsed:?}"
+        );
+        assert!(!app.runtime.has_pending_close_confirm());
+        assert!(!app.runtime.has_pane_session(&pane), "session reaped");
+        assert_eq!(app.runtime.leaf_count(), 1);
+
+        // The owned child must be gone, not a zombie left holding the PTY.
+        // `/proc` is Linux-only; other Unix targets keep the session-drop
+        // assertions above as the portable liveness check.
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pane child {pid} must be reaped"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
     }
 
     #[test]

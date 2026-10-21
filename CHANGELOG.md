@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit effect opt-in, consent ledger, and CTX-1151 Landlock exec
   confinement are preserved. Registry refusals fail closed, and no PTY shell
   is routed through the registry.
+- **`bitty-runtime` drops `set_layout_preserve_grid` (CTX-1422, #2373):** the
+  separate no-sync layout funnel is gone. Zoom engage/disengage call
+  `set_layout`, which syncs the primary owner's grid/winsize when the owner
+  is visible and leaves a hidden owner untouched; any embedder that used the
+  preserve variant should call `set_layout` instead.
 
 ### Fixed
 
@@ -36,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TZ`-pinned child-process test covers `Asia/Shanghai`, `UTC`, and
   `America/New_York` across DST and standard time, so a UTC-only regression is
   caught on UTC CI runners.
+- **Fullscreen panel reflows its grid and PTY (CTX-1422, #2373):** making
+  the zoomed/fullscreen panel the primary owner now resizes the terminal grid
+  and delivers the PTY winsize (`SIGWINCH`) at the full content frame instead
+  of leaving the pre-fullscreen tiled size, so TUIs such as `btop` and
+  `opencode` stop painting a small grid inside an empty full-bleed frame.
+  Zooming a sibling still leaves the hidden owner's grid untouched for the
+  round trip (CTX-0790/#1435), and the winsize is resynced independently of
+  the grid when they diverge.
 - **`bitty init <shell>` hints the shell-init verb (CTX-1417, #2367):** a
   single positional token naming a supported shell (`bash`, `zsh`, `fish`,
   `powershell`, `nushell`) now prints

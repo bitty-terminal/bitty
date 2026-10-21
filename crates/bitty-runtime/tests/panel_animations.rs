@@ -1523,9 +1523,9 @@ fn zoom_engage_arms_close_and_disengage_arms_open() {
     rt.tick_at(settled);
     assert!(rt.tick_at(settled).is_none(), "idle baseline");
 
-    // Zoom engage: collapse to the focused leaf through the grid-preserving
+    // Zoom engage: collapse to the focused leaf through the layout
     // path (the toggle_zoom lane). The tree commits at once.
-    rt.set_layout_preserve_grid(single_leaf());
+    rt.set_layout(single_leaf());
     assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
     let _ = rt.tick_at(settled).expect("zoom engage presents");
     assert!(
@@ -1547,7 +1547,7 @@ fn zoom_engage_arms_close_and_disengage_arms_open() {
     );
 
     // Zoom disengage: restore the split. The restored leaf opens.
-    rt.set_layout_preserve_grid(two_pane_split());
+    rt.set_layout(two_pane_split());
     assert_eq!(rt.layout().leaf_ids().len(), 2);
     let _ = rt.tick_at(close_end).expect("zoom release presents");
     assert!(
@@ -1572,7 +1572,7 @@ fn zoom_commits_grid_and_hit_geometry_immediately() {
     let _ = rt.tick_at(start);
     rt.set_layout(two_pane_split());
     let _ = rt.tick_at(start);
-    rt.set_layout_preserve_grid(single_leaf());
+    rt.set_layout(single_leaf());
     assert_eq!(
         rt.layout().leaf_ids(),
         vec![ViewId::new(1)],
@@ -1704,7 +1704,7 @@ fn zoom_and_switch_suppressed_when_instant() {
         let _ = rt.tick_at(start);
         rt.set_layout(two_pane_split());
         let _ = rt.tick_at(start);
-        rt.set_layout_preserve_grid(single_leaf());
+        rt.set_layout(single_leaf());
         assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
         assert!(rt.tick_at(start).is_some(), "zoom presents once");
         assert!(

@@ -501,7 +501,7 @@ fn zoom_engage_and_disengage_envelopes() {
     let settled = start + Duration::from_millis(open_ms);
     harness.rt.tick_at(settled);
 
-    // Zoom engage collapses to one leaf through the grid-preserving path.
+    // Zoom engage collapses to one leaf through the layout funnel.
     // The tree commits at once; the hidden leaf fades its retained ring out.
     let closing_rect = harness
         .rt
@@ -510,7 +510,7 @@ fn zoom_engage_and_disengage_envelopes() {
         .find(|f| f.view == ViewId::new(2))
         .expect("split must show the second leaf")
         .frame;
-    harness.rt.set_layout_preserve_grid(single_leaf());
+    harness.rt.set_layout(single_leaf());
     assert_eq!(
         harness.rt.layout().leaf_ids(),
         vec![ViewId::new(1)],
@@ -569,7 +569,7 @@ fn zoom_engage_and_disengage_envelopes() {
     );
 
     // Zoom disengage restores the split; the restored leaf fades its ring in.
-    harness.rt.set_layout_preserve_grid(two_pane_split());
+    harness.rt.set_layout(two_pane_split());
     assert_eq!(harness.rt.layout().leaf_ids().len(), 2);
     let close_end_at = settled + Duration::from_millis(close_ms);
     harness.start = close_end_at;
@@ -765,7 +765,7 @@ fn reduced_motion_and_disabled_policies_cut_instantly() {
         assert_eq!(harness.rt.animation_deadline(), None);
 
         // Zoom still collapses without arming.
-        harness.rt.set_layout_preserve_grid(single_leaf());
+        harness.rt.set_layout(single_leaf());
         assert_eq!(harness.rt.layout().leaf_ids(), vec![ViewId::new(1)]);
         assert!(
             harness.rt.tick_at(start).is_some(),

@@ -922,6 +922,11 @@ impl Runtime {
                     // before any bottom-align into scrollback, so the former
                     // two-phase workaround is gone.
                     let _ = sess.state.resize(cols as usize, rows as usize);
+                }
+                // Issue #2373: keep the winsize honest even when the grid
+                // already matches (spawn after a layout sync, or a lost
+                // SIGWINCH), mirroring the primary-owner path.
+                if sess.pty.size().ok() != Some((cols, rows)) {
                     let _ = sess.pty.resize(cols, rows);
                 }
             }

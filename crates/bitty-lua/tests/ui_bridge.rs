@@ -1147,3 +1147,91 @@ fn targets_argument_validation_is_typed() {
         Some(LuaValue::String("E_DEF_INVALID".to_string()))
     );
 }
+
+/// CTX-1419 (issue #2191): the real Lua surface carries every accepted
+/// property into the same `UiNode` fields the host renders and routes.
+///
+/// This is the Lua-side half of the parity matrix: the runtime half lives in
+/// `bitty-runtime/tests/lua_ui_parity.rs`. A spelling mismatch between the Lua
+/// table and the validator fails here, before any host assertion can pass by
+/// constructing `UiNode` directly.
+#[test]
+fn lua_component_carries_every_accepted_property() {
+    use bitty_lua::ui::{ClickArg, UiRegionKind};
+
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("property-matrix");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        -- Full property set on a container (inheritance source).
+        bitty.ui.mount("bottom", {
+          kind = "Row",
+          fg = "accent",
+          bg = "selection",
+          bold = true,
+          on_click = {
+            command = "bar:focus",
+            args = { id = 2 },
+            region = { id = "ws:2", kind = "item" },
+          },
+          on_scroll = {
+            command = "bar:step",
+            args = { step = 1 },
+            region = { id = "ws:2", kind = "item" },
+          },
+          children = { { kind = "Text", text = "ws1" }, { kind = "Text", text = "ws2" } },
+        })
+        -- Same tree with one accepted property dropped (mutation probe).
+        bitty.ui.mount("bottom", {
+          kind = "Row",
+          fg = "accent",
+          bg = "selection",
+          on_click = { command = "bar:focus", args = { id = 2 } },
+          children = { { kind = "Text", text = "ws2" } },
+        })
+    "#,
+    );
+
+    let mounts = services.mounts.borrow();
+    assert_eq!(mounts.len(), 2, "both accepted trees mount");
+    let UiNode::Row {
+        fg,
+        bg,
+        bold,
+        on_click,
+        on_scroll,
+        children,
+    } = &mounts[0].1
+    else {
+        panic!("expected the declared Row, got {:?}", mounts[0].1.kind());
+    };
+    assert_eq!(fg.as_deref(), Some("accent"));
+    assert_eq!(bg.as_deref(), Some("selection"));
+    assert_eq!(*bold, Some(true));
+    assert_eq!(children.len(), 2);
+    let click = on_click.as_ref().expect("click binding");
+    assert_eq!(click.command, "bar:focus");
+    assert_eq!(click.args, vec![("id".to_string(), ClickArg::Number(2.0))]);
+    let region = click.region.as_ref().expect("region identity");
+    assert_eq!(region.id, "ws:2");
+    assert_eq!(region.kind, UiRegionKind::Item);
+    let scroll = on_scroll.as_ref().expect("scroll binding");
+    assert_eq!(scroll.command, "bar:step");
+    assert_eq!(
+        scroll.args,
+        vec![("step".to_string(), ClickArg::Number(1.0))]
+    );
+
+    // Dropping `bold` (and the scroll binding) must change the captured
+    // node: the matrix cannot pass vacuously.
+    let UiNode::Row {
+        bold, on_scroll, ..
+    } = &mounts[1].1
+    else {
+        panic!("expected the mutated Row");
+    };
+    assert_eq!(*bold, None);
+    assert!(on_scroll.is_none());
+}

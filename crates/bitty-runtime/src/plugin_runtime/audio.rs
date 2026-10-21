@@ -23,7 +23,7 @@
 //!   sink name parse exists in the contract but carries no `get()` field,
 //!   so it is not spawned here. The live monitor runs that read on a
 //!   short-lived sampler thread ([`SampledReads`], bitty#2425): a fresh
-//!   read blocks for 15-90 ms (three spawns, 5 ms `try_wait` cadence), which
+//!   read blocks for 15-92 ms (three spawns, 5 ms `try_wait` cadence), which
 //!   is the whole RC-1 50 ms slice of a plugin that polls
 //!   `audio.state.get()` during `init.lua`, so the executor thread only ever
 //!   observes a landed attempt or serves last-good. Injected (fixture)
@@ -496,7 +496,7 @@ struct SampleSlot {
 ///
 /// A fresh live read spawns `pactl` three times (sink volume, mute, sink
 /// list) and each spawn polls `try_wait` on a 5 ms cadence, so the read
-/// blocks the calling thread for 15-90 ms (92 ms measured on a cold process
+/// blocks the calling thread for 15-92 ms (92 ms measured on a cold process
 /// on the reference host, 15 ms warm). Charged to the executor thread that
 /// is the entire RC-1 50 ms activation slice: a bar mounting a `pulseaudio`
 /// module could not activate (bitty#2425, matrix `smoke-bar-heavy`).
@@ -1206,8 +1206,22 @@ mod tests {
         let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
         // First poll requests one read (three spawns) and hides.
         let _ = monitor.get(1000, true);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let served = monitor.get(2000, true).expect("landed sample serves");
+        // Bounded wait: a fixed sleep assumes the sampler thread is scheduled
+        // and runs three spawns within it, which a loaded shard does not
+        // guarantee. Poll with a deadline instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while spawns.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut served = None;
+        while served.is_none() && std::time::Instant::now() < deadline {
+            if let Ok(value) = monitor.get(2000, true) {
+                served = Some(value);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let served = served.expect("the landed sample serves");
         assert_eq!(served.get("volume_pct"), Some(&LuaValue::Integer(50)));
         let after_first = spawns.load(Ordering::SeqCst);
         assert_eq!(after_first, 3, "one composed read");
@@ -1223,7 +1237,10 @@ mod tests {
         );
         // Past the ceiling exactly one more read is requested.
         let _ = monitor.get(2000 + STATE_MIN_INTERVAL_MS, true);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while spawns.load(Ordering::SeqCst) < 6 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(spawns.load(Ordering::SeqCst), 6, "one read per window");
     }
 

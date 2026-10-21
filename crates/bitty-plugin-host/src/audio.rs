@@ -735,6 +735,11 @@ impl StateGate {
     /// malformed value never reaches the bar even when a future reader
     /// bypasses [`AudioState::validate`]. `last_ok_ms` is the landing instant,
     /// so every later age/grace computation reflects the sample.
+    ///
+    /// A sample that is already past [`STATE_STALE_HIDE_MS`] when it is first
+    /// observed still becomes last-good (the value is real), but this poll
+    /// hides: "hide, never fabricate" applies to a slow poller exactly as it
+    /// does to a silent monitor.
     fn accept_at(
         &mut self,
         now_ms: u64,
@@ -745,12 +750,18 @@ impl StateGate {
             return self.failed_read(now_ms, Some(check));
         }
         let landed_ms = sampled_at_ms.min(now_ms);
+        let age_ms = now_ms.saturating_sub(landed_ms);
         let mut stored = snapshot;
-        stored.stale_age_ms = now_ms.saturating_sub(landed_ms);
+        stored.stale_age_ms = age_ms;
         self.last = Some(stored.clone());
         self.last_ok_ms = landed_ms;
         self.last_poll_ms = now_ms;
         self.pre_init_last_ms = None;
+        if age_ms >= STATE_STALE_HIDE_MS {
+            return Err(AudioError::hidden(format!(
+                "audio state stale for {age_ms} ms (hide, never fabricate)"
+            )));
+        }
         Ok(StatePoll::Fresh(stored))
     }
 
@@ -1591,6 +1602,17 @@ mod tests {
                 .kind(),
             AudioErrorKind::Hidden
         );
+        // A sample first observed at or past the grace stores as last-good
+        // but this poll hides (CodeRabbit review: "hide, never fabricate"
+        // applies to a slow poller too).
+        let mut gate = StateGate::new();
+        let hidden = gate
+            .observe(STATE_STALE_HIDE_MS, 0, Ok(state(70)))
+            .expect_err("an already-expired sample hides");
+        assert_eq!(hidden.kind(), AudioErrorKind::Hidden);
+        // It is not fabricated later either: the stored sample is past the
+        // grace, so cached serves hide from the landing instant.
+        assert!(gate.serve_cached(STATE_STALE_HIDE_MS).is_err());
         // A failed attempt after the grace hides as well.
         assert!(
             gate.observe(

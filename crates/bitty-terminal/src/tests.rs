@@ -5399,6 +5399,11 @@ fn config_usage_names_verbs() {
     assert!(usage.contains("check"));
     assert!(usage.contains("edit"));
     assert!(usage.contains("init.lua"));
+    // The persisted selector is a profile source too (#2349).
+    assert!(
+        usage.contains("persisted init.lua selector"),
+        "usage lists the persisted selector as a profile source: {usage}"
+    );
 }
 
 #[test]

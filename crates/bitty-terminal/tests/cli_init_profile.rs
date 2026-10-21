@@ -350,6 +350,333 @@ fn legacy_init_is_never_replaced_even_with_force_and_can_migrate() {
 }
 
 #[test]
+fn migrate_rejects_value_flags_instead_of_discarding_them() {
+    let root = scratch_root("migrate-flags");
+    let legacy = "return { theme = \"dark\", window = { opacity = 0.9, padding = 9 } }\n";
+    std::fs::write(init_path(&root), legacy).expect("legacy config");
+
+    // Migration copies the legacy bytes verbatim, so a wizard value flag can
+    // never apply; each one is a usage error instead of a silent discard.
+    for flags in [
+        &["init", "--migrate", "--theme", "dark"][..],
+        &["init", "--migrate", "--font-family", "Fira Code"][..],
+        &["init", "--migrate", "--font-size", "13"][..],
+        &["init", "--migrate", "--scrollback", "2000"][..],
+        &["init", "--migrate", "--close-confirm", "never"][..],
+        &["init", "--migrate", "--gaps-in", "2"][..],
+        &["init", "--migrate", "--gaps-out", "4"][..],
+        &["init", "--migrate", "--border", "1"][..],
+        &["init", "--migrate", "--radius", "3"][..],
+    ] {
+        let refused = run_bitty(&root, flags);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{flags:?} must be a usage error, stderr={:?}",
+            stderr(&refused)
+        );
+        let err = stderr(&refused);
+        assert!(
+            err.contains("--migrate") && err.contains(flags[2]),
+            "{flags:?} names the rejected flag, stderr:\n{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(init_path(&root)).expect("legacy intact"),
+            legacy,
+            "{flags:?} writes nothing"
+        );
+        assert!(
+            !config_dir(&root).join("profiles").exists(),
+            "{flags:?} writes no profile"
+        );
+    }
+
+    // A flag-free migration still works after the refusals.
+    assert_ok(
+        &run_bitty(&root, &["init", "--migrate"]),
+        "flag-free migrate",
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "default")).expect("migrated profile"),
+        legacy
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrate_bounds_the_legacy_file_before_reading() {
+    let root = scratch_root("migrate-bound");
+    let path = init_path(&root);
+    // 11 bytes per line * 8192 lines = 88 KiB, above the 64 KiB config bound.
+    let oversized = "-- padding\n".repeat(8 * 1024);
+    std::fs::write(&path, &oversized).expect("oversized legacy config");
+
+    let refused = run_bitty(&root, &["init", "--migrate"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "oversized legacy config must fail closed, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("exceeds"),
+        "diagnostic names the size bound, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        !config_dir(&root).join("profiles").exists(),
+        "size refusal writes no profile"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("legacy intact"),
+        oversized
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_symlinked_legacy_file() {
+    let root = scratch_root("migrate-symlink");
+    let real = root.join("real.lua");
+    let legacy = "return { theme = \"dark\" }\n";
+    std::fs::write(&real, legacy).expect("real legacy config");
+    std::os::unix::fs::symlink(&real, init_path(&root)).expect("symlink");
+
+    let refused = run_bitty(&root, &["init", "--migrate"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "symlinked legacy config must fail closed, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("symlink"),
+        "diagnostic names the symlink, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        !config_dir(&root).join("profiles").exists(),
+        "symlink refusal writes no profile"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).expect("link target intact"),
+        legacy
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrate_after_default_profile_seed_has_a_safe_path() {
+    let root = scratch_root("migrate-after-seed");
+    let legacy = "return { theme = \"dark\", font = { family = \"Maple Mono\", size = 13 } }\n";
+    std::fs::write(init_path(&root), legacy).expect("legacy config");
+
+    // `init --profile default` on a legacy layout seeds the destination
+    // without touching the active legacy file.
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "default"]),
+        "seed default profile",
+    );
+    let seeded = std::fs::read_to_string(profile_path(&root, "default")).expect("seeded profile");
+    assert!(seeded.contains("theme = \"dark\""));
+    assert_ne!(seeded, legacy);
+
+    // Without --force the migration refuses, but the refusal names the
+    // explicit safe path instead of dead-ending.
+    let refused = run_bitty(&root, &["init", "--migrate"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "different destination content needs --force, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("--migrate --force"),
+        "refusal names the safe path, stderr={:?}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("legacy intact"),
+        legacy
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "default")).expect("seeded intact"),
+        seeded
+    );
+
+    // --force replaces the seeded profile, keeps its bytes in a collision-free
+    // backup, and completes the migration.
+    assert_ok(
+        &run_bitty(&root, &["init", "--migrate", "--force"]),
+        "forced migrate",
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "default")).expect("migrated profile"),
+        legacy
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "default").with_extension("lua.bak"))
+            .expect("seeded profile backup"),
+        seeded
+    );
+    let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
+    assert!(selector.contains("format = \"bitty-profile-v1\""));
+    assert!(selector.contains("profile = \"default\""));
+
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_ok(&check, "post-migration check");
+    assert!(
+        row(&stdout(&check), "font.family").starts_with("\"Maple Mono\""),
+        "migrated values resolve, output:\n{}",
+        stdout(&check)
+    );
+
+    // Re-running is not a new dead end: the selector short-circuits first.
+    let again = run_bitty(&root, &["init", "--migrate"]);
+    assert_eq!(again.status.code(), Some(2));
+    assert!(
+        stderr(&again).contains("already a profile selector"),
+        "stderr={:?}",
+        stderr(&again)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrate_reuses_an_identical_destination_profile() {
+    let root = scratch_root("migrate-identical");
+    let legacy = "return { theme = \"dark\", window = { opacity = 0.9, padding = 6 } }\n";
+    std::fs::write(init_path(&root), legacy).expect("legacy config");
+    std::fs::create_dir_all(config_dir(&root).join("profiles")).expect("profiles dir");
+    // A previous partial migration may already have copied the exact bytes.
+    std::fs::write(profile_path(&root, "default"), legacy).expect("identical destination");
+
+    assert_ok(
+        &run_bitty(&root, &["init", "--migrate"]),
+        "identical destination needs no force",
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "default")).expect("destination"),
+        legacy
+    );
+    assert!(
+        !profile_path(&root, "default")
+            .with_extension("lua.bak")
+            .exists(),
+        "an identical destination is reused, not rewritten"
+    );
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"default\"")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrated_config_lua_alias_is_switchable_by_profile_use() {
+    let root = scratch_root("alias-use");
+    let alias = config_dir(&root).join("config.lua");
+    let legacy = "return { theme = \"dark\", window = { opacity = 0.9, padding = 5 } }\n";
+    std::fs::write(&alias, legacy).expect("legacy alias");
+    assert!(!init_path(&root).exists(), "only the alias exists");
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "work"]),
+        "seed work profile",
+    );
+
+    // An unmigrated legacy alias still fails closed with the migration hint.
+    let legacy_refusal = run_bitty(&root, &["config", "profile", "use", "work"]);
+    assert_eq!(legacy_refusal.status.code(), Some(2));
+    assert!(
+        stderr(&legacy_refusal).contains("--migrate"),
+        "stderr={:?}",
+        stderr(&legacy_refusal)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&alias).expect("alias intact"),
+        legacy
+    );
+
+    assert_ok(&run_bitty(&root, &["init", "--migrate"]), "migrate alias");
+    let migrated = std::fs::read_to_string(&alias).expect("alias selector");
+    assert!(migrated.contains("format = \"bitty-profile-v1\""));
+    assert!(migrated.contains("profile = \"default\""));
+    assert!(!init_path(&root).exists(), "migration keeps the alias name");
+
+    // The migrated alias is a real selector: explicit activation rewrites it.
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "work"]),
+        "use on migrated alias",
+    );
+    let rewritten = std::fs::read_to_string(&alias).expect("rewritten alias");
+    assert!(rewritten.contains("profile = \"work\""));
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_ok(&check, "alias check");
+    assert!(
+        row(&stdout(&check), "profile").starts_with("\"work\" (profile: "),
+        "output:\n{}",
+        stdout(&check)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_show_attributes_shipped_defaults() {
+    let root = scratch_root("show-attribution");
+    assert_ok(
+        &run_bitty(&root, &["init", "--profile", "minimal"]),
+        "minimal profile",
+    );
+
+    let show = run_bitty(&root, &["config", "profile", "show", "minimal"]);
+    assert_ok(&show, "show minimal");
+    let text = stdout(&show);
+    let theme = row(&text, "appearance.theme");
+    assert!(
+        theme.contains("(profile: ") && theme.contains("minimal.lua"),
+        "a profile-set value names its file:\n{text}"
+    );
+    for key in [
+        "font.family",
+        "font.size",
+        "terminal.scrollback",
+        "window.opacity",
+        "window.padding",
+        "decoration.gaps_in",
+        "close_confirm",
+    ] {
+        assert!(
+            row(&text, key).ends_with("(default)"),
+            "{key} is a shipped default, never profile-owned:\n{text}"
+        );
+    }
+
+    // A preset that writes the value attributes it to its own layer.
+    assert_ok(
+        &run_bitty(&root, &["init", "--profile", "dark"]),
+        "dark profile",
+    );
+    let show = run_bitty(&root, &["config", "profile", "show", "dark"]);
+    assert_ok(&show, "show dark");
+    let text = stdout(&show);
+    assert!(
+        row(&text, "font.family").contains("(profile: ")
+            && row(&text, "font.family").contains("dark.lua"),
+        "a generated value names its profile file:\n{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn preset_profiles_seed_without_prompts_or_activation() {
     let mut lengths = Vec::new();
     for (name, want_theme) in [
@@ -638,6 +965,7 @@ fn invalid_profile_name_and_bitty_profile_never_target_output() {
     // An explicitly supplied blank name is a usage error, never a silent
     // fallback that overwrites the default profile.
     for blank in [
+        &["init", "--yes", "--profile", ""][..],
         &["init", "--yes", "--profile", "   "][..],
         &["init", "--yes", "--profile="][..],
     ] {

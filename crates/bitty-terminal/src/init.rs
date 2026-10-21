@@ -318,6 +318,43 @@ pub(crate) fn init_overrides_from_args(args: &Args) -> Result<InitOverrides, Str
     Ok(out)
 }
 
+/// Value flags that only seed wizard answers for [`init_overrides_from_args`].
+///
+/// `--migrate` copies the legacy bytes verbatim and can never apply them, so
+/// the dispatch refuses them instead of silently discarding a requested value
+/// (#2349).
+fn init_migrate_value_flags(overrides: &InitOverrides) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if overrides.theme.is_some() {
+        flags.push("--theme");
+    }
+    if overrides.font_family.is_some() {
+        flags.push("--font-family");
+    }
+    if overrides.font_size.is_some() {
+        flags.push("--font-size");
+    }
+    if overrides.scrollback.is_some() {
+        flags.push("--scrollback");
+    }
+    if overrides.close_confirm.is_some() {
+        flags.push("--close-confirm");
+    }
+    if overrides.gaps_in.is_some() {
+        flags.push("--gaps-in");
+    }
+    if overrides.gaps_out.is_some() {
+        flags.push("--gaps-out");
+    }
+    if overrides.border.is_some() {
+        flags.push("--border");
+    }
+    if overrides.radius.is_some() {
+        flags.push("--radius");
+    }
+    flags
+}
+
 /// Applies validated value-flag overrides to `answers` (CLI wins).
 pub(crate) fn init_apply_overrides(answers: &mut InitAnswers, overrides: &InitOverrides) {
     if let Some(v) = &overrides.theme {
@@ -3417,7 +3454,9 @@ fn run_init_interactive_impl(
 pub(crate) struct InitWriteOutcome {
     /// File that was written.
     pub(crate) path: std::path::PathBuf,
-    /// Backup of the overwritten file, if any (`<file>.lua.bak`).
+    /// Backup of the replaced file, if any: a collision-free `<name>.bak`
+    /// (or `<name>.bak.N` when that name is taken) sibling. An older backup
+    /// is never overwritten.
     pub(crate) backup: Option<std::path::PathBuf>,
     /// True when an existing file was replaced via `--force`.
     pub(crate) updated: bool,
@@ -3687,11 +3726,50 @@ fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), Ini
 /// values are unchanged, then replaces the legacy file with the thin
 /// selector. The original bytes are preserved in the selector write's
 /// collision-free backup. Nothing is written on any validation failure.
-fn run_init_migrate(target: &std::path::Path) -> i32 {
-    if !target.exists() {
+///
+/// The legacy file is inspected with `symlink_metadata` (never followed) and
+/// its size is bounded before any read. An existing destination profile is
+/// reused only when it already holds the legacy bytes; different content
+/// requires `--force`, which keeps the replaced bytes in the ordinary
+/// collision-free backup. A previous `init --profile default` on a legacy
+/// layout therefore never dead-ends the migration (#2349).
+fn run_init_migrate(target: &std::path::Path, force: bool) -> i32 {
+    let legacy_meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "bitty init: --migrate needs an existing legacy config at '{}'",
+                target.display()
+            );
+            return 2;
+        }
+        Err(err) => {
+            eprintln!(
+                "bitty init: cannot inspect legacy config '{}': {err}",
+                target.display()
+            );
+            return 1;
+        }
+    };
+    if legacy_meta.file_type().is_symlink() {
         eprintln!(
-            "bitty init: --migrate needs an existing legacy config at '{}'",
+            "bitty init: refusing to migrate through symlink '{}'",
             target.display()
+        );
+        return 2;
+    }
+    if !legacy_meta.is_file() {
+        eprintln!(
+            "bitty init: '{}' is not a regular file; refusing to migrate it",
+            target.display()
+        );
+        return 2;
+    }
+    if legacy_meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        eprintln!(
+            "bitty init: '{}' exceeds {} bytes; refusing to read or migrate it",
+            target.display(),
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
         );
         return 2;
     }
@@ -3724,9 +3802,58 @@ fn run_init_migrate(target: &std::path::Path) -> i32 {
         .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME))
         .unwrap_or_else(|| std::path::PathBuf::from(bitty_config::file::PROFILES_DIR_NAME));
     let profile_path = profile_dir.join(format!("{DEFAULT_PROFILE_NAME}.lua"));
-    if profile_path.exists() {
+    let destination_present = match std::fs::symlink_metadata(&profile_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                eprintln!(
+                    "bitty init: migration destination '{}' is a symlink; refusing to reuse or replace it",
+                    profile_path.display()
+                );
+                return 2;
+            }
+            if !meta.is_file() {
+                eprintln!(
+                    "bitty init: migration destination '{}' is not a regular file; refusing to reuse or replace it",
+                    profile_path.display()
+                );
+                return 2;
+            }
+            if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+                eprintln!(
+                    "bitty init: migration destination '{}' exceeds {} bytes; refusing to overwrite it",
+                    profile_path.display(),
+                    bitty_config::file::MAX_CONFIG_FILE_BYTES
+                );
+                return 2;
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            eprintln!(
+                "bitty init: cannot inspect migration destination '{}': {err}",
+                profile_path.display()
+            );
+            return 1;
+        }
+    };
+    let destination_matches = if destination_present {
+        match std::fs::read(&profile_path) {
+            Ok(bytes) => bytes == original.as_bytes(),
+            Err(err) => {
+                eprintln!(
+                    "bitty init: cannot read migration destination '{}': {err}",
+                    profile_path.display()
+                );
+                return 1;
+            }
+        }
+    } else {
+        false
+    };
+    if destination_present && !destination_matches && !force {
         eprintln!(
-            "bitty init: migration destination '{}' already exists; refusing to overwrite it",
+            "bitty init: migration destination '{}' already exists with different content; re-run `bitty init --migrate --force` to replace it (a collision-free .bak backup is kept), or remove/rename it first",
             profile_path.display()
         );
         return 2;
@@ -3799,15 +3926,23 @@ fn run_init_migrate(target: &std::path::Path) -> i32 {
         target.display(),
         profile_path.display()
     );
-    let profile_outcome = match write_init_config(&profile_path, &original, false) {
-        Ok(outcome) => outcome,
-        Err(InitWriteError::Refused(message)) => {
-            eprintln!("{message}");
-            return 2;
-        }
-        Err(InitWriteError::Io(message)) => {
-            eprintln!("{message}");
-            return 1;
+    let profile_outcome = if destination_matches {
+        println!(
+            "bitty init: '{}' already matches the legacy configuration; reusing it",
+            profile_path.display()
+        );
+        None
+    } else {
+        match write_init_config(&profile_path, &original, force) {
+            Ok(outcome) => Some(outcome),
+            Err(InitWriteError::Refused(message)) => {
+                eprintln!("{message}");
+                return 2;
+            }
+            Err(InitWriteError::Io(message)) => {
+                eprintln!("{message}");
+                return 1;
+            }
         }
     };
     match write_init_config(target, &selector_content, true) {
@@ -3818,9 +3953,17 @@ fn run_init_migrate(target: &std::path::Path) -> i32 {
                     backup.display()
                 );
             }
+            if let Some(outcome) = &profile_outcome {
+                if let Some(backup) = &outcome.backup {
+                    println!(
+                        "bitty init: preserved previous profile bytes in '{}'",
+                        backup.display()
+                    );
+                }
+            }
             println!(
                 "bitty init: migrated to '{}' + selector '{}'",
-                profile_outcome.path.display(),
+                profile_path.display(),
                 selector_outcome.path.display()
             );
             println!("bitty init: validate any time with `bitty config check`");
@@ -3830,7 +3973,7 @@ fn run_init_migrate(target: &std::path::Path) -> i32 {
             eprintln!("{message}");
             eprintln!(
                 "bitty init: migrated profile '{}' is not active; fix the selector, then run `bitty config profile use {DEFAULT_PROFILE_NAME}`",
-                profile_outcome.path.display()
+                profile_path.display()
             );
             2
         }
@@ -3838,7 +3981,7 @@ fn run_init_migrate(target: &std::path::Path) -> i32 {
             eprintln!("{message}");
             eprintln!(
                 "bitty init: migrated profile '{}' is not active; fix the selector, then run `bitty config profile use {DEFAULT_PROFILE_NAME}`",
-                profile_outcome.path.display()
+                profile_path.display()
             );
             1
         }
@@ -3871,8 +4014,10 @@ pub(crate) fn init_usage() -> String {
      \x20 --profile dark     generated defaults with the dark theme family\n\
      \x20 --profile light    generated defaults with the github-light palette\n\
      \x20 --migrate move an existing legacy init.lua to profiles/default.lua\n\
-     \x20           and replace init.lua with the thin selector (explicit only;\n\
-     \x20           --force never migrates a legacy file implicitly)\n\
+     \x20           and replace init.lua with the thin selector (never implied\n\
+     \x20           by --force alone). Value flags are refused because the\n\
+     \x20           legacy bytes are copied as-is; --force also replaces an\n\
+     \x20           existing profiles/default.lua (collision-free .bak backup)\n\
      \n\
      value flags (answer one step, skip its prompt; validated fail-closed):\n\
      \x20 --theme NAME         preset name or alias (e.g. dark, tokyo-night)\n\
@@ -4214,6 +4359,18 @@ pub(crate) fn run_init_subcommand_with_io(
             );
             return 2;
         }
+        // Migration copies the legacy bytes verbatim; a value flag can never
+        // apply. Refuse it instead of silently discarding a requested value
+        // (#2349).
+        let discarded = init_migrate_value_flags(&overrides);
+        if !discarded.is_empty() {
+            eprintln!(
+                "bitty init: --migrate copies the legacy file verbatim and cannot apply {}\n{}",
+                discarded.join(", "),
+                init_usage()
+            );
+            return 2;
+        }
         if plugin_flags_present {
             eprintln!(
                 "bitty init: --migrate does not run plugin or component follow-ups\n{}",
@@ -4263,7 +4420,7 @@ pub(crate) fn run_init_subcommand_with_io(
         }
     };
     if args.init_migrate {
-        return run_init_migrate(&target);
+        return run_init_migrate(&target, args.init_force);
     }
     let profile_dir = target
         .parent()

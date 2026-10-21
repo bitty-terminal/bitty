@@ -616,7 +616,8 @@ pub(crate) fn config_usage() -> String {
      \x20 profile  manage named profiles (list|show|use|path NAME)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
-     profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua (--profile, else BITTY_PROFILE)\n\
+     profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua\n\
+     \x20         (--profile, else BITTY_PROFILE, else the persisted init.lua selector)\n\
      env: BITTY_CONFIG (path), BITTY_PROFILE (name); CLI flags win over env"
         .to_string()
 }

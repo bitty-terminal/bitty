@@ -5,7 +5,7 @@
 use super::band_slots::BandEdge;
 use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
-use bitty_rich::KittyRasterBackend as _;
+use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
 /// Deterministic headless rasterizer: no font stack required, bit-identical
 /// on every platform and on both Linux and Windows CI.

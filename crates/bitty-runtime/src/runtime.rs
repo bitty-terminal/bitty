@@ -1292,13 +1292,15 @@ pub struct Runtime {
     pub(crate) kitty_local_test_panic: bool,
     /// Kitty decode/raster backend behind the Core-owned seam
     /// ([`bitty_rich::kitty_seam`]): the transmit and present paths call
-    /// decode and raster through the [`bitty_rich::KittyDecodeBackend`] and
-    /// [`bitty_rich::KittyRasterBackend`] traits, never the free functions
-    /// directly. The composition root holds the in-repo
-    /// [`bitty_rich::CoreKittyBackend`] here; the extension implements the
-    /// same traits on its side, so swapping implementations never touches
-    /// the call sites (W-147: no extension identifier in Core sources).
-    kitty_graphics: bitty_rich::CoreKittyBackend,
+    /// decode and raster through the
+    /// [`bitty_rich::kitty_seam::KittyDecodeBackend`] and
+    /// [`bitty_rich::kitty_seam::KittyRasterBackend`] traits, never the free
+    /// functions directly. The composition root holds the in-repo
+    /// [`bitty_rich::kitty_seam::CoreKittyBackend`] here; the extension
+    /// implements the same traits on its side, so swapping implementations
+    /// never touches the call sites (W-147: no extension identifier in Core
+    /// sources).
+    kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend,
     /// Scaled-blit raster cache across present frames (S6, #1849), keyed
     /// by image identity plus content generation (never a bare id), frame
     /// index, and full/visible geometry.
@@ -1889,7 +1891,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
-            kitty_graphics: bitty_rich::CoreKittyBackend::new(),
+            kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend::new(),
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
@@ -2166,7 +2168,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
-            kitty_graphics: bitty_rich::CoreKittyBackend::new(),
+            kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend::new(),
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),

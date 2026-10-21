@@ -79,16 +79,20 @@
 //! (PNG via the shared minimal `png` codec, raw RGB/RGBA inline) lives in
 //! [`kitty_decode`] and nearest-neighbor raster mechanics in
 //! [`kitty_raster`] (both Core-owned behind the [`kitty_seam`] traits; the
-//! `bitty-graphics` extension crate implements the same traits on its own
-//! side, and Core never depends on extension internals). Core retains the declared-size pre-check
-//! ([`kitty_place`]) and the pre-upload re-validation on decoded bitmaps. All tests run on
-//! GPU-less CI via pure logic on
-//! `State`/`Snapshot` values, except the host external-editor round-trip
-//! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
-//! exercised with fake editor scripts). Where rendering geometry is needed (hyperlink
-//! underline rects, kitty placeholder rects) the caller supplies a
-//! [`CellMetrics`] (`width x height` in pixels) and receives owned
-//! [`RectPx`] values; no renderer is borrowed.
+//! graphics extension implements the same traits on its own side, and Core
+//! never depends on extension internals). [`kitty_seam`] is the single
+//! source module that may name the graphics extension crate; every other
+//! module reaches the extension-bound mechanics through its traits. Seam
+//! items are public at [`kitty_seam`] only: the crate-root re-exports were
+//! removed in 0.0.25 (a source-visible API break in the pre-stable line, with
+//! no behavior change). Core retains the declared-size pre-check
+//! ([`kitty_place`]) and the pre-upload re-validation on decoded bitmaps. All
+//! tests run on GPU-less CI via pure logic on `State`/`Snapshot` values,
+//! except the host external-editor round-trip (OS temp file plus an allowlisted
+//! `$VISUAL`/`$EDITOR` child process, exercised with fake editor scripts).
+//! Where rendering geometry is needed (hyperlink underline rects, kitty
+//! placeholder rects) the caller supplies a [`CellMetrics`] (`width x height`
+//! in pixels) and receives owned [`RectPx`] values; no renderer is borrowed.
 
 #![forbid(unsafe_code)]
 
@@ -166,9 +170,6 @@ pub use kitty_place::{
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,
     rasterize_kitty, rasterize_kitty_clipped, rasterize_rgba_clipped,
-};
-pub use kitty_seam::{
-    CoreKittyBackend, KittyDecodeBackend, KittyRasterBackend, KittyTransmitFormat,
 };
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,

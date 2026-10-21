@@ -58,7 +58,7 @@
 //!   dropped) so a stalled animation resumes without a catch-up spiral.
 //!
 //! Pixel decode, file/shm reads, and paint compositing live downstream
-//! (`bitty-graphics` extension, `bitty-render` atlas layers): this store
+//! (graphics extension, `bitty-render` atlas layers): this store
 //! records display intent the renderer can composite once data arrives,
 //! and prunes references that can never resolve.
 //!

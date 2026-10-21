@@ -144,7 +144,13 @@ impl SessionFileBackend for StubBackend {
 
     fn session_file(&self) -> Option<PathBuf> {
         self.record("paths");
-        None
+        // Review of #2421: resolve a default path so the #2415 regression is
+        // genuinely red without the skip — the attempt reaches validation
+        // and reports `Corrupt("empty workspace")` instead of degrading into
+        // the quiet `SkippedNoStateDir` (which would not prove the guard).
+        // The stub keeps every commit in memory, so the relative path never
+        // touches the filesystem.
+        Some(PathBuf::from("stub-session"))
     }
 }
 
@@ -193,6 +199,83 @@ fn absent_backend_default_save_skips_quietly() {
         rt.save_session_on_exit(),
         bitty_runtime::SessionExitSaveOutcome::SkippedNoStateDir
     ));
+}
+
+/// Issue #2415: closing the last tiled pane while a detached float survives
+/// leaves a valid live state the v3 session file codec cannot encode. The
+/// exit save must skip that state before touching the backend, so a clean
+/// close never logs `session file corrupt (empty workspace)` and the last
+/// good session file keeps authority.
+#[test]
+fn exit_save_skips_close_to_empty_tiled_base_issue_2415() {
+    let backend = StubBackend::new();
+    let mut rt = present_runtime(&backend);
+    let host = rt.focused_view().expect("focus");
+    let float = ViewId::new(2);
+    let host_leaf = rt.layout().find_leaf(host).cloned().expect("host leaf");
+    rt.set_layout(LayoutNode::split(
+        bitty_runtime::SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(host_leaf),
+        LayoutNode::leaf(View::new(float, 40, 24)),
+    ));
+    rt.float_detach(float).expect("float detaches");
+    assert_eq!(rt.layout().leaf_ids(), vec![host]);
+
+    // Close the last tiled leaf: the float store keeps the surviving view and
+    // the layout collapses to the empty base (the close path's own surgery).
+    let mut layout = rt.layout().clone();
+    assert!(
+        layout.remove_leaf(host).is_some(),
+        "the bare last leaf must collapse to an empty base"
+    );
+    rt.set_layout_closing(layout, host);
+    assert!(rt.set_focus(float), "the float is a valid focus target");
+    assert!(rt.layout().leaf_ids().is_empty());
+    assert_eq!(rt.floated_views(), vec![float]);
+
+    assert_eq!(
+        rt.save_session_on_exit(),
+        bitty_runtime::SessionExitSaveOutcome::SkippedEmptyTiledBase,
+        "close-to-empty is skipped, never encoded and never failed"
+    );
+    assert_eq!(
+        backend.call_count("paths"),
+        0,
+        "a skipped save must not even resolve the session path"
+    );
+    assert_eq!(
+        backend.call_count("encode"),
+        0,
+        "a skipped save must not reach the codec"
+    );
+    assert_eq!(
+        backend.call_count("commit"),
+        0,
+        "a skipped save must not write any file"
+    );
+
+    // The same live state still refuses a direct save: that is the pre-fix
+    // exit outcome (a warning), so the regression proves the skip is what
+    // keeps a clean close quiet rather than a vacuous no-state-dir path.
+    let err = rt
+        .save_session_to_path(Path::new("stub-session"))
+        .expect_err("the v3 codec cannot encode an empty tiled base");
+    assert_eq!(
+        format!("{err}"),
+        "session file corrupt (empty workspace)",
+        "the direct save keeps the pre-fix corruption classification"
+    );
+    assert_eq!(
+        backend.call_count("encode"),
+        0,
+        "validation refuses before the codec"
+    );
+    assert_eq!(
+        backend.call_count("commit"),
+        0,
+        "the refused direct save writes nothing"
+    );
 }
 
 #[test]

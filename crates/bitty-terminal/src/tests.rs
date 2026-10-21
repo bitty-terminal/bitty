@@ -13066,3 +13066,232 @@ fn drive_tick_pumps_due_zero_delay_timers() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Issue #2415: the matrix close sequence (primary pane plus a real pane
+/// session, detach the pane-session leaf as a float, close the tiled host,
+/// then close the last live pane) ends on a valid live state the v3 session
+/// file codec cannot encode: an empty tiled base with a surviving detached
+/// float. The exit save used to capture that state, fail validation, and log
+/// `session save failed (session file corrupt (empty workspace))` on a close
+/// the user completed cleanly.
+///
+/// The accepted behaviour is to skip the write: nothing is saved, the last
+/// good session file stays authoritative and restorable, and the skip is
+/// reported at info class (never as corruption). A real save failure still
+/// reports at warning class.
+///
+/// The session backend resolves its default path into the scratch dir while
+/// delegating encode/decode/commit to the real storage adapter, so the
+/// assertion covers the authoritative file the exit hook would write and
+/// never the live XDG session.
+#[test]
+#[cfg(unix)]
+fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415() {
+    use crate::terminal_app::{SessionSaveLogClass, session_save_report};
+    use bitty_runtime::{
+        CloseConfirmMode, Runtime, RuntimeConfig, SessionError, SessionExitSaveOutcome,
+        SessionFileBackend as _, SessionSnapshot,
+    };
+
+    #[derive(Debug)]
+    struct ScratchPathBackend {
+        path: std::path::PathBuf,
+        inner: crate::storage_backends::StorageSessionBackend,
+    }
+
+    impl bitty_runtime::SessionFileBackend for ScratchPathBackend {
+        fn encode_snapshot(&self, snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
+            self.inner.encode_snapshot(snap)
+        }
+
+        fn decode_snapshot(&self, bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
+            self.inner.decode_snapshot(bytes)
+        }
+
+        fn commit_session_bytes(
+            &self,
+            path: &std::path::Path,
+            bytes: &[u8],
+        ) -> Result<(), SessionError> {
+            self.inner.commit_session_bytes(path, bytes)
+        }
+
+        fn load_session_bytes(&self, path: &std::path::Path) -> Result<Vec<u8>, SessionError> {
+            self.inner.load_session_bytes(path)
+        }
+
+        fn session_file_for(
+            &self,
+            xdg_state_home: Option<&str>,
+            home: Option<&str>,
+        ) -> Option<std::path::PathBuf> {
+            self.inner.session_file_for(xdg_state_home, home)
+        }
+
+        fn session_file(&self) -> Option<std::path::PathBuf> {
+            Some(self.path.clone())
+        }
+    }
+
+    require_pty!();
+
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-close-to-empty-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos())
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("session");
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::new(RuntimeConfig {
+        close_confirm: CloseConfirmMode::WhenBusy,
+        ..RuntimeConfig::default()
+    })
+    .expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.set_layout(two_pane_layout());
+    app.runtime
+        .set_session_backend(Some(std::sync::Arc::new(ScratchPathBackend {
+            path: path.clone(),
+            inner: crate::storage_backends::StorageSessionBackend::new(),
+        })));
+    app.runtime
+        .spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell spawns");
+    let primary = app.runtime.primary_view().expect("primary owner");
+    let float = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view(float, "/bin/sh", &[], 40, 12)
+        .expect("pane session spawns");
+    assert_eq!(app.runtime.pane_session_ids(), vec![float]);
+    assert!(app.runtime.set_focus(float));
+
+    // Last good session: both tiled panes with live attachment, saved before
+    // the close sequence through the same path the exit hook resolves.
+    app.runtime
+        .save_session_to_path(&path)
+        .expect("baseline save works");
+    let good = std::fs::read(&path).expect("baseline bytes");
+    let good_snapshot = crate::storage_backends::StorageSessionBackend::new()
+        .decode_snapshot(&good)
+        .expect("baseline decodes");
+    assert_eq!(good_snapshot.workspaces[0].panes.len(), 2);
+
+    // Matrix close sequence: detaching the pane-session leaf leaves a single
+    // tiled host plus a detached float; closing the host empties the tiled
+    // base and hands focus to the float.
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleFloating);
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
+    assert_eq!(
+        app.runtime.pane_session_ids(),
+        vec![float],
+        "the detached float keeps its pane session"
+    );
+    assert_eq!(app.runtime.focused_view(), Some(primary));
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "closing the host with a surviving float is a pane close"
+    );
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        Vec::new(),
+        "the tiled base is empty after the close"
+    );
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert_eq!(app.runtime.focused_view(), Some(float));
+    assert!(
+        !app.runtime.has_pty(),
+        "the tiled host's primary shell is torn down"
+    );
+
+    // The exit save skips that unencodable state instead of failing.
+    let outcome = app.runtime.save_session_on_exit();
+    assert_eq!(
+        outcome,
+        SessionExitSaveOutcome::SkippedEmptyTiledBase,
+        "close-to-empty must skip the save, not report file corruption"
+    );
+    let (class, line) = session_save_report(&outcome, "close-view").expect("skip is reported");
+    assert_eq!(
+        class,
+        SessionSaveLogClass::Info,
+        "an expected close path must not log at warning class"
+    );
+    assert!(
+        line.contains("session save skipped")
+            && line.contains("no tiled pane or pinned panel left")
+            && line.contains("keeping last good session"),
+        "the skip line must name the retained session: {line}"
+    );
+    assert!(
+        !line.contains("failed") && !line.contains("corrupt"),
+        "the skip must never claim corruption: {line}"
+    );
+
+    // No data loss: the authoritative file is untouched and restorable.
+    let after = std::fs::read(&path).expect("last good session still present");
+    assert_eq!(after, good, "the skip must not rewrite the session file");
+    assert_eq!(
+        crate::storage_backends::StorageSessionBackend::new()
+            .decode_snapshot(&after)
+            .expect("last good session still decodes"),
+        good_snapshot,
+        "the last good session stays restorable"
+    );
+
+    // The same state still refuses a direct save: that is exactly the pre-fix
+    // exit outcome, so the regression proves the skip removes the corruption
+    // warning rather than a benign no-state-dir path.
+    let direct = app
+        .runtime
+        .save_session_to_path(&path)
+        .expect_err("the v3 codec cannot encode an empty tiled base");
+    assert_eq!(
+        format!("{direct}"),
+        "session file corrupt (empty workspace)"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("failed direct save leaves the file"),
+        good,
+        "a refused save must not clobber the last good session"
+    );
+
+    // Closing the last live pane is the window-close gesture; the exit path
+    // tears the surviving pane session down during shutdown, not before the
+    // save it is reporting on.
+    assert!(
+        app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "the last live pane requests the window close"
+    );
+    assert_eq!(app.runtime.floated_views(), vec![float]);
+    app.runtime.shutdown();
+    assert!(
+        app.runtime.pane_session_ids().is_empty(),
+        "shutdown tears down the surviving pane session"
+    );
+    assert!(!app.runtime.has_pty());
+
+    // The classification is not a blanket silence: a real failure still
+    // warns (the pre-existing pin-only refusal keeps its own diagnostic).
+    let failed = SessionExitSaveOutcome::Warned(SessionError::PinOnlyEmptyBase);
+    let (failed_class, failed_line) =
+        session_save_report(&failed, "close-view").expect("failure is reported");
+    assert_eq!(failed_class, SessionSaveLogClass::Warn);
+    assert!(
+        failed_line.contains("session save failed"),
+        "a real failure still reports loudly: {failed_line}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

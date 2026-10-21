@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Restricted Lua `os.date` uses local time (#2375):** the restricted `os`
+  table converted every timestamp with a UTC-only civil algorithm, so the bar
+  clock module rendered `05:26` on a `13:26` UTC+8 host, and the `!` UTC marker
+  was matched only as the literal `!*t` instead of being stripped from string
+  formats. Calendar conversion now goes through `chrono`, so the default
+  follows the process `TZ`/host tz database while `!` (formats and `*t`) stays
+  UTC, and out-of-range timestamps return `nil` as in reference Lua. A
+  `TZ`-pinned child-process test covers `Asia/Shanghai`, `UTC`, and
+  `America/New_York` across DST and standard time, so a UTC-only regression is
+  caught on UTC CI runners.
 - **`bitty init <shell>` hints the shell-init verb (CTX-1417, #2367):** a
   single positional token naming a supported shell (`bash`, `zsh`, `fish`,
   `powershell`, `nushell`) now prints

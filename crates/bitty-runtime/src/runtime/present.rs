@@ -5518,7 +5518,7 @@ mod plugin_overlay_paint_tests {
         // One-cell chrome is a pixel claim, not just a draw-layer count: a
         // zero-width fallback rect would satisfy the fill/flag assertions while
         // still rendering nothing (CTX-1419 review, issue #2191).
-        let cell_w = u32::from(rt.live_cell_metrics().width);
+        let cell_w = rt.live_cell_metrics().width;
         assert!(cell_w > 0, "the deterministic cell width is nonzero");
         assert_eq!(
             layers.combined_overlay[0].rect.width, cell_w,
@@ -5526,7 +5526,7 @@ mod plugin_overlay_paint_tests {
         );
         assert_eq!(
             layers.combined_overlay[0].rect.height,
-            u32::from(rt.live_cell_metrics().height),
+            rt.live_cell_metrics().height,
             "the one-cell chrome is one row tall"
         );
         assert!(
@@ -5546,7 +5546,14 @@ mod plugin_overlay_paint_tests {
             fg: Some("accent".to_string()),
             bg: Some("selection".to_string()),
             bold: Some(true),
-            on_click: None,
+            on_click: Some(bitty_lua::ui::ClickCommand {
+                command: "test-bar:focus".to_string(),
+                args: Vec::new(),
+                region: Some(bitty_lua::ui::UiRegion {
+                    id: "ws:1".to_string(),
+                    kind: bitty_lua::ui::UiRegionKind::Item,
+                }),
+            }),
             on_scroll: None,
         };
         let rows = Runtime::overlay_scene_rows(&root);
@@ -5554,6 +5561,19 @@ mod plugin_overlay_paint_tests {
         assert_eq!(rows[0].runs[0].fg.as_deref(), Some("accent"));
         assert_eq!(rows[0].runs[0].bg.as_deref(), Some("selection"));
         assert!(rows[0].runs[0].bold, "root bold reaches the row run");
+        let click = rows[0].runs[0]
+            .on_click
+            .as_ref()
+            .expect("root click binding reaches the row run");
+        assert_eq!(click.command, "test-bar:focus");
+        assert_eq!(
+            rows[0].runs[0]
+                .region
+                .as_ref()
+                .map(|region| region.id.as_str()),
+            Some("ws:1"),
+            "root region identity reaches the row run (data only; overlay routing stays band-only)"
+        );
 
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with(root)));

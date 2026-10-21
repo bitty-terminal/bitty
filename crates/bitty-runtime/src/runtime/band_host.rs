@@ -217,18 +217,19 @@ impl BandInherited {
     }
 
     /// Layers `node`'s own declaration over this context (nearest wins).
+    ///
+    /// The region identity follows the same rule as the bindings: the node's
+    /// own click/scroll region when it declares one, else the ancestor's
+    /// (issue #2248).
     fn layered(&self, node: &UiNode) -> Self {
         let own = Self::of(node);
-        let on_click = own.on_click.or_else(|| self.on_click.clone());
-        let on_scroll = own.on_scroll.or_else(|| self.on_scroll.clone());
-        let region = inherited_region(on_click.as_ref(), on_scroll.as_ref(), self.region.clone());
         Self {
             fg: own.fg.or_else(|| self.fg.clone()),
             bg: own.bg.or_else(|| self.bg.clone()),
             bold: own.bold.or(self.bold),
-            on_click,
-            on_scroll,
-            region,
+            region: own.region.or_else(|| self.region.clone()),
+            on_click: own.on_click.or_else(|| self.on_click.clone()),
+            on_scroll: own.on_scroll.or_else(|| self.on_scroll.clone()),
         }
     }
 }

@@ -13893,3 +13893,207 @@ events = []
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+#[test]
+fn same_tick_band_update_keeps_the_queued_hover_enter_and_shows_the_tooltip() {
+    // Third review ordering regression: the pointer enters and queues an enter
+    // against band v1; the same tick then bumps the band to v2 before
+    // presenting. Revalidation must replace the stale queued entry with the
+    // v2 one, the dispatch must deliver exactly one current-origin enter, and
+    // the tooltip must appear; leaving still hides it.
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx2411-sametick-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx2411sametick";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-2411 same-tick hover"
+version = "0.1.0"
+description = "queued hover enter survives a same-tick band update"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+
+[lazy]
+commands = ["{id}:detail", "{id}:bump"]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local tooltip = bitty.ui.mount("overlay", { kind = "Text", text = "" })
+        local function bar_scene(label)
+          return { kind = "Row", children = {
+            { kind = "Row", anchor = "left", children = {
+              { kind = "Text", text = label,
+                on_hover = { command = "detail", region = { id = "clock" } } },
+            } },
+          } }
+        end
+        local bar = bitty.ui.mount("top", bar_scene("clock"))
+        bitty.commands.register({
+          id = "detail",
+          title = "Detail",
+          run = function(args)
+            local text = ""
+            if type(args) == "table" and args.phase == "enter" then
+              text = "detail:" .. tostring(args.region)
+            end
+            if tooltip then bitty.ui.update(tooltip, { kind = "Text", text = text }) end
+            return true
+          end,
+        })
+        bitty.commands.register({
+          id = "bump",
+          title = "Bump",
+          run = function()
+            bitty.ui.update(bar, bar_scene("clock!"))
+            return true
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime));
+    app.set_session_persistence(false);
+    let _ = app.drive_tick();
+    let row = app
+        .runtime
+        .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
+        .expect("top band row");
+    let (cw, ch) = app.runtime.live_cell_size();
+    let pad = f64::from(app.runtime.window_padding_physical());
+    let over_clock = bitty_platform::CursorPosition {
+        x: pad + 0.5 * f64::from(cw),
+        y: pad + (f64::from(row) + 0.5) * f64::from(ch),
+    };
+    let away = bitty_platform::CursorPosition {
+        x: pad + 0.5 * f64::from(cw),
+        y: pad + 12.0 * f64::from(ch),
+    };
+
+    // Pointer enters: a v1 enter is queued but not yet dispatched.
+    app.runtime.handle_cursor_moved(over_clock);
+    // Same tick: the plugin bumps the band, the app syncs the new snapshot,
+    // and the frame publishes v2 before the cold drain.
+    app.plugin_runtime
+        .as_mut()
+        .expect("runtime")
+        .dispatch_command(&pid, "bump", &[])
+        .expect("bump command");
+    let origin = app
+        .runtime
+        .published_band_origins()
+        .first()
+        .cloned()
+        .expect("presented origin");
+    let next_version = origin.version + 1;
+    let bands = bitty_runtime::ChromeBands {
+        top: app
+            .runtime
+            .chrome_bands()
+            .top
+            .iter()
+            .map(|band| bitty_runtime::BandContent {
+                version: next_version,
+                ..band.clone()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    app.runtime.set_chrome_bands_with_mounts(
+        bands,
+        vec![bitty_runtime::BandMount {
+            plugin_id: origin.plugin_id.clone(),
+            slot: bitty_lua::ui::UiSlot::Top,
+            version: next_version,
+            generation: origin.generation,
+            handle: origin.handle,
+        }],
+    );
+    app.runtime.tick().expect("present the updated band");
+
+    // One delivered enter for the current origin, not a stale v1 drop.
+    assert_eq!(
+        app.pump_cold_commands(),
+        1,
+        "the refreshed enter is delivered exactly once"
+    );
+    assert_eq!(
+        app.pump_cold_commands(),
+        0,
+        "the delivered enter is not re-fired"
+    );
+    let _ = app.drive_tick();
+    let surface = app
+        .runtime
+        .plugin_overlay()
+        .expect("tooltip appears for the same-tick update");
+    match &surface.root {
+        bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
+        other => panic!("expected the tooltip text, got {other:?}"),
+    }
+    assert!(app.runtime.plugin_overlay_anchor().is_some());
+
+    // Leaving still hides the tooltip with one leave.
+    app.runtime.handle_cursor_moved(away);
+    assert_eq!(app.pump_cold_commands(), 1, "one leave");
+    let _ = app.drive_tick();
+    assert!(app.runtime.plugin_overlay().is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

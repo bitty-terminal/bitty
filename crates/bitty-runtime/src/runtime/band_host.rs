@@ -2644,12 +2644,13 @@ impl Runtime {
 
     /// Queues one resolved hover transition (issue #2411).
     ///
-    /// At most one dispatch per region per drain: a newer phase for a region
-    /// already queued replaces that entry (a reversed transition collapses to
-    /// its final phase, so a transient enter/leave inside one frame cannot
-    /// leave a tooltip visible), and an identical phase coalesces. A full
-    /// queue drops the newest transition fail-closed and counts
-    /// [`BandHostStats::hover_queue_drops`].
+    /// At most one dispatch per region per drain: a newer phase **or a newer
+    /// presented origin** for a region already queued replaces that entry (a
+    /// reversed transition collapses to its final phase, and a revalidated
+    /// enter carries the current frame's origin instead of the stale one it
+    /// was first queued with). Only a transition identical in phase, origin,
+    /// plugin, and region coalesces. A full queue drops the newest transition
+    /// fail-closed and counts [`BandHostStats::hover_queue_drops`].
     ///
     /// `enter` is fenced by the presented origin: a remount, edge move,
     /// reflow, or version reset never retargets hover to different content,
@@ -2674,7 +2675,13 @@ impl Runtime {
             queued.plugin_id == request.plugin_id && queued.region == request.region
         };
         if let Some(index) = self.band_hover_queue.iter().position(same_region) {
-            if self.band_hover_queue[index].phase != request.phase {
+            // A newer phase replaces the queued one, and so does a newer
+            // presented origin for the same phase: a band version bump can
+            // re-derive an enter that was queued against the previous frame,
+            // and the old origin would be refused at dispatch (issue #2411
+            // third review). Only a byte-identical transition coalesces.
+            let queued = &self.band_hover_queue[index];
+            if queued.phase != request.phase || queued.origin != request.origin {
                 self.band_hover_queue[index] = request;
             }
             self.band_stats.hovers_coalesced = self.band_stats.hovers_coalesced.saturating_add(1);

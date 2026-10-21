@@ -2574,6 +2574,7 @@ impl TerminalApp {
                                 hover.plugin_id, hover.command
                             )
                         });
+                        self.runtime.abandon_band_hover();
                         continue;
                     };
                     if !self.runtime.band_origin_is_current(&origin) {
@@ -2583,6 +2584,11 @@ impl TerminalApp {
                                 hover.plugin_id, hover.command
                             )
                         });
+                        // Third review: a stale enter must not leave the
+                        // hover state silently unannounced (revalidation would
+                        // see a current origin and do nothing). Abandon it so
+                        // the next motion/revalidation starts a fresh hover.
+                        self.runtime.abandon_band_hover();
                         continue;
                     }
                     if self.dispatch_band_hover(hover, Some(&origin)) {

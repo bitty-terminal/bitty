@@ -838,3 +838,49 @@ fn abandoned_enter_owes_no_leave_and_reenters_on_motion() {
     let again = hover_and_confirm(&mut rt, row, 39);
     assert_eq!(again.len(), 1, "motion re-enters after an abandonment");
 }
+
+#[test]
+fn revalidated_enter_replaces_a_stale_queued_enter() {
+    // Third review ordering: the pointer enters and queues a v1 enter, then
+    // the same tick bumps the band to v2 and presents it. Revalidation
+    // refreshes the state to v2; the previously queued v1 entry must be
+    // replaced (not coalesced away), so the dispatch sees one current-origin
+    // enter and the tooltip can appear.
+    let mut rt = runtime_width(80);
+    let row = mount_top_version(&mut rt, waybar_band(), 1);
+
+    // Enter queued against v1, not drained yet (same-tick ordering).
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    assert_eq!(rt.band_host_stats().hovers_routed, 1);
+
+    // The band bumps to v2 and the frame publishes it before the cold drain.
+    set_band_version(&mut rt, waybar_band(), 2);
+    rt.tick().expect("present the updated band");
+    rt.revalidate_band_hover();
+
+    let enter = rt.drain_band_hovers();
+    assert_eq!(enter.len(), 1, "one enter for the region");
+    assert_eq!(
+        enter[0].origin.as_ref().map(|origin| origin.version),
+        Some(2),
+        "the refreshed origin replaced the stale v1 entry"
+    );
+    let origin = enter[0].origin.clone().expect("presented origin");
+    assert!(rt.band_origin_is_current(&origin));
+    assert!(
+        rt.band_host_stats().hovers_coalesced >= 1,
+        "the replacement is counted as coalescing"
+    );
+    rt.confirm_band_hover(&enter[0].region);
+    assert!(rt.hovered_band_region().is_some(), "tooltip can anchor");
+
+    // Revalidation on later frames does not re-fire the delivered enter.
+    rt.revalidate_band_hover();
+    assert!(rt.drain_band_hovers().is_empty(), "no duplicate enter");
+
+    // Leaving still delivers exactly one leave.
+    rt.handle_cursor_moved(cell_pixels(&rt, row + 5, 0));
+    let leave = rt.drain_band_hovers();
+    assert_eq!(leave.len(), 1);
+    assert_eq!(leave[0].phase, BandHoverPhase::Leave);
+}

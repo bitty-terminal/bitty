@@ -728,7 +728,7 @@ pub fn parse_component_request(
         ComponentVerb::List => {
             if version_operand.is_some() {
                 return Err(ComponentParseError::Usage(
-                    "bitty extension: `list` takes at most one name filter (e.g. `bitty extension list bitty-net`)"
+                    "bitty extension: `list` takes at most one name filter (e.g. `bitty extension list bitty-graphics`)"
                         .to_string(),
                 ));
             }
@@ -959,7 +959,7 @@ pub fn component_help_text() -> String {
      \x20                             on the active-version row, and covers both\n\
      \x20                             install tiers via $XDG_STATE_HOME. An\n\
      \x20                             optional name filters the table (aliases\n\
-     \x20                             accepted: `bitty extension list bitty-net`).\n\
+     \x20                             accepted: `bitty extension list bitty-graphics`).\n\
      \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
      \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
      \x20                             A directory holds bitty-component.toml plus\n\
@@ -999,7 +999,7 @@ pub fn component_help_text() -> String {
      \n\
      name aliases (#2381):\n\
      \x20 `list`, `install`, `remove`, and `show-source` accept one repo-style\n\
-     \x20 `bitty-` prefix (`bitty-net` resolves to `net`) because\n\
+     \x20 `bitty-` prefix (`bitty-graphics` resolves to `graphics`) because\n\
      \x20 extension repositories carry the workspace prefix while stored\n\
      \x20 component names do not. Resolution only selects the target: stored\n\
      \x20 names, directories, and TOFU pins are never rewritten. An exact\n\
@@ -1182,7 +1182,7 @@ pub fn component_help_text() -> String {
      examples:\n\
      \x20 bitty extension list\n\
      \x20 bitty extension list --format json\n\
-     \x20 bitty extension list bitty-net\n\
+     \x20 bitty extension list bitty-graphics\n\
      \x20 bitty extension add ./dist/net --version 0.0.1\n\
      \x20 bitty extension add ./dist/net --distro Ubuntu\n\
      \x20 bitty extension install graphics            # latest published release\n\
@@ -4474,8 +4474,8 @@ mod tests {
             .map(|name| (*name).to_string())
             .collect();
         assert_eq!(
-            resolve_component_name("bitty-ai", &known).expect("alias"),
-            "ai"
+            resolve_component_name("bitty-graphics", &known).expect("alias"),
+            "graphics"
         );
         assert_eq!(
             resolve_component_name("graphics", &known).expect("exact"),
@@ -4503,12 +4503,12 @@ mod tests {
         );
         // Both spellings known: fail closed, never guess.
         let mut ambiguous = known.clone();
-        ambiguous.insert("bitty-net".to_string());
-        let failure = resolve_component_name("bitty-net", &ambiguous).expect_err("ambiguous");
+        ambiguous.insert("bitty-graphics".to_string());
+        let failure = resolve_component_name("bitty-graphics", &ambiguous).expect_err("ambiguous");
         assert_eq!(failure.exit, EXIT_COMPONENT);
         assert!(failure.message.contains("ambiguous"), "{}", failure.message);
         assert!(
-            failure.message.contains("bitty-net") && failure.message.contains("net"),
+            failure.message.contains("bitty-graphics") && failure.message.contains("graphics"),
             "{}",
             failure.message
         );

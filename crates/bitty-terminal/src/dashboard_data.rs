@@ -739,6 +739,15 @@ mod tests {
         dir
     }
 
+    /// Normalizes a rendered row value to POSIX separators for assertion.
+    ///
+    /// The panel renders paths with the host separator, so a Windows run shows
+    /// `\` where a Unix run shows `/`; the tests assert the logical path shape
+    /// rather than the host spelling.
+    fn shown(value: &str) -> String {
+        value.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+
     #[test]
     fn overview_reports_profile_theme_font_and_paths() {
         let dir = scratch("overview");
@@ -989,16 +998,31 @@ mod tests {
         assert_eq!(value("bitty"), APP_VERSION);
         assert!(value("profile").contains("work"));
         assert!(value("profile").contains("cli"));
-        assert_eq!(value("config file"), "/xdg-config/bitty/init.lua (missing)");
-        assert_eq!(value("config dir"), "/xdg-config/bitty (missing)");
         assert_eq!(
-            value("plugin ledger"),
+            shown(&value("config file")),
+            "/xdg-config/bitty/init.lua (missing)"
+        );
+        assert_eq!(shown(&value("config dir")), "/xdg-config/bitty (missing)");
+        assert_eq!(
+            shown(&value("plugin ledger")),
             "/xdg-config/bitty/bitty-plugins.toml (missing)"
         );
-        assert_eq!(value("plugin store"), "/xdg-data/bitty/plugins (missing)");
-        assert_eq!(value("extensions user"), "/xdg-data/components (missing)");
-        assert_eq!(value("extensions system"), "/opt/components (missing)");
-        assert_eq!(value("extension state"), "/xdg-state/extensions (missing)");
+        assert_eq!(
+            shown(&value("plugin store")),
+            "/xdg-data/bitty/plugins (missing)"
+        );
+        assert_eq!(
+            shown(&value("extensions user")),
+            "/xdg-data/components (missing)"
+        );
+        assert_eq!(
+            shown(&value("extensions system")),
+            "/opt/components (missing)"
+        );
+        assert_eq!(
+            shown(&value("extension state")),
+            "/xdg-state/extensions (missing)"
+        );
         assert!(value("theme layer").contains("default"));
     }
 
@@ -1069,7 +1093,7 @@ mod tests {
         assert!(value("net: digest").starts_with("aaaaaaaaaaaaaaaa"));
         let target = value("net: target");
         assert!(target.starts_with("bitty-net (user) at "), "{target}");
-        assert!(target.ends_with("/net/0.0.1"), "{target}");
+        assert!(shown(&target).ends_with("/net/0.0.1"), "{target}");
         assert!(value("net: activation").contains("active"));
         assert!(value("net: activation").contains("not a live probe"));
         assert!(value("net: liveness").contains("not probed"));

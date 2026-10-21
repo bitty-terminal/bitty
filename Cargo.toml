@@ -21,7 +21,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.0.24"
+version = "0.0.25"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -64,7 +64,7 @@ windows-sys = { version = "0.61", default-features = false }
 # bitty#2249: the execution extension is compiled against the workspace's
 # current Core mechanism crates instead of its own older `bitty` git pin.
 # Without this patch Cargo builds two `bitty-pty`/`bitty-plugin-host` trees
-# (0.0.21 from the extension pin and 0.0.24 path crates), which duplicates
+# (0.0.21 from the extension pin and 0.0.25 path crates), which duplicates
 # Core code in the shipped graph and makes the compat-lab `live_compat` link
 # exceed the Linux runner's linker budget. The patch does not change the
 # extension's public contract or its exact `bitty-execution` pin; it aligns

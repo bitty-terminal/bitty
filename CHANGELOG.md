@@ -5,7 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.0.25] - unreleased
+## [0.0.25] - 2026-10-21
+
+### Added
+
+- **Shell integration for all five supported shells (#2386):** `bitty
+  shell-init <shell>` now emits the init script and nested Tab completion
+  inline for bash, zsh, fish, PowerShell, and Nushell, generated from the
+  parser-owned grammar tables (`config`/`profile`, `ctl` resources,
+  `plugin`/`config` actions, `extension`, `dev trace`/`dump`/`overlay`,
+  `inspect`/`list`, `shell-init`/`completion`). Sourcing never invokes
+  `bitty`, registers once per shell, and stays safe under strict mode or a
+  double source; absent or older binaries remain harmless. Every prompt path
+  emits OSC 133 A/B/D and OSC 7 (`PROMPT_COMMAND`/precmd+prexc, fish events,
+  wrapped prompt plus PSReadLine, Nushell `pre_prompt`/`pre_execution`).
+- **Profile-backed `bitty init` (#2344, #2382):** a bare `bitty init` writes
+  `profiles/default.lua` plus a thin `init.lua` selector. `--profile NAME`
+  creates or refreshes one named preset (`minimal`, `dark`, `light`, or a
+  custom name), `--migrate` moves a legacy `init.lua` to
+  `profiles/default.lua`, and `BITTY_PROFILE` selects a profile over the
+  persisted selector. Existing files are never overwritten: a conflicting
+  preset fails closed with a typed diagnostic.
+- **Bounded extension catalog install path (#2346):** extension installs can
+  resolve a catalog entry for the exact `(name, host target)` and enforce its
+  digest before staging, on top of the existing store and TOFU pin flow.
+- **Windows named-pipe IPC transport (#2351):** terminal IPC and devtools
+  inspection use a per-user named pipe on Windows with the same request
+  framing and denial behavior as the Unix socket, including the no-orphan
+  worker check.
+- **Interactive surfaces: band hit regions, anchors, and drag preview
+  (#2347, #2350, #2343):** bands expose per-item click and scroll regions
+  and target anchors/present annotations, and `Mod+LMB` drag shows a live
+  preview that reflows on release.
+- **Lua UI composition parity and scene style primitives (#2385, #2392,
+  #2363, #2369):** overlay style declarations are honored (pill chrome is
+  kept and root declarations inherit), a parity matrix pins the bounded Lua
+  UI composition surface, and candidate scene style primitives plus a
+  bounded component catalog provide reusable, capped building blocks. These
+  are candidate surfaces with no production consumer yet.
 
 ### Changed
 
@@ -43,9 +80,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_layout`, which syncs the primary owner's grid/winsize when the owner
   is visible and leaves a hidden owner untouched; any embedder that used the
   preserve variant should call `set_layout` instead.
+- **`window.blur_radius` rejects non-zero values (OQ-038):** the key is now
+  recognized by the Lua loader so a non-zero value fails closed with a typed
+  `window.blur_radius` diagnostic ("background blur is not supported
+  (OQ-038): only 0 is accepted") instead of an unknown-key error or a silent
+  no-op. `0` remains accepted; the platform blur seam stays reserved for a
+  future bounded contract.
+
+### Removed
+
+- **`bitty-rich` kitty stub and `wallpaper_theme` (#2358, #2359; #2365):** the
+  unwired kitty graphics stub and the wallpaper theme hook are gone instead
+  of remaining as dead seams.
+- **Unwired `bitty-rich` surfaces (#2117; #2357):** retire-out candidates that no
+  production path reached were removed in the first retire-out batch, leaving
+  the graphics seam fenced to the extension boundary; the remaining
+  candidates stay tracked in #2117.
+- **Core dependency resolver (#1999):** package-distribution resolution
+  semantics are retired from Core; their replacement in
+  `bitty-plugin-manager` is deferred, so no component currently owns them.
 
 ### Fixed
 
+- **Closing a pane tears down the session it painted (#2389, #2404):** close
+  teardown asked whether the focused leaf was the primary view, which can name
+  a leaf that owns a pane session after the documented re-home. A close could
+  then kill the hidden primary PTY and leave the pane session the panel was
+  painting without an owning leaf, keeping a foreground job alive behind an
+  unreachable close-confirm prompt. Teardown now follows the WS-INV-8 paint
+  precedence (`paints_primary_grid`), so a re-homed leaf's pane session is
+  torn down and the hidden primary shell is left intact.
 - **Profile init polish (#2349):** `--migrate` refuses wizard value flags
   (`--theme`, `--font-size`, ...) instead of silently discarding them and
   bounds the legacy file with `symlink_metadata` before reading it.
@@ -134,14 +198,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `apply_theme_request`) presents a frame byte-identical to a fresh render with
   no cell left on the old theme.
 
-### Changed
-
-- **`window.blur_radius` rejects non-zero values (OQ-038):** the key is now
-  recognized by the Lua loader so a non-zero value fails closed with a typed
-  `window.blur_radius` diagnostic ("background blur is not supported
-  (OQ-038): only 0 is accepted") instead of an unknown-key error or a silent
-  no-op. `0` remains accepted; the platform blur seam stays reserved for a
-  future bounded contract.
+- **Plugin hints stop advertising a dead scaffold command (#2384):**
+  `bitty plugin enable` and `bitty plugin install` printed
+  `bitty plugin config scaffold <id>` for every plugin, but the command exits
+  without writing when the manifest declares no `[settings]` (for example the
+  bundled `bitty-terminal.shell-integration`). Settings-less plugins now read
+  `scaffold: unavailable (no [settings] declared)`, while plugins with
+  declared settings keep the actionable pointer.
+- **Plugin next steps point at canonical Lua settings (#2377):** the
+  post-install guidance names `settings.lua` and the canonical scope keys
+  instead of the retired TOML example path.
+- **Shaped renderer coverage and cursor fixes (#2339):** block elements are
+  covered in the shaped render path, a cursor over a ligature un-shapes only
+  the affected run after blank cells, and block atlas slots are keyed by mask
+  dimensions so distinct block glyphs cannot collide.
+- **One-shot accessibility announcements (#2361):** `UiSnapshotHost` buffered
+  notices without a drain hook, so a host reused across ingests re-delivered
+  every notice it had ever accumulated. Notices now live in a bounded
+  one-shot queue (8 pending), and an ingest consumes them exactly once.
+- **Routine plugin use no longer raises OS notifications (#2341):** normal
+  plugin lifecycle traffic stays in the terminal instead of posting desktop
+  notifications.
+- **Accurate activation projections (#2328):** `bitty extension list`
+  reports per-version activation rows and last-recorded liveness, records
+  state in the XDG state directory for both tiers, protects the crash latch
+  from a denial downgrade, and sweeps stale temporary records.
+- **Suspended policy-host generations stay suspended (#2338):** a later
+  activation or refresh can no longer revive a suspended generation; it stays
+  suspended until explicitly resumed.
+- **Versioned AUR cached binary filename (#2353):** the AUR PKGBUILD cache
+  key includes the version, so an upgrade cannot reuse a stale binary.
 
 ## [0.0.24] - 2026-10-20
 

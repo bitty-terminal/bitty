@@ -2,17 +2,19 @@
 //!
 //! Like cargo ships with rustc, bitty ships a minimal install seed so the
 //! full `bitty-plugin-manager` itself can be installed on first use: `bitty
-//! component install <name> --version <semver>` fetches the prebuilt R2
+//! extension install <name> [--version <semver>]` fetches the prebuilt R2
 //! distribution packed by `scripts/make-component-dist.sh` (issue #1792),
 //! verifies it fail-closed, and stages it into the user tier through the
 //! same atomic publish path as `component add`. The full manager takes over
-//! after: the seed does nothing else (no version solving, no UI).
+//! after: the seed does nothing else (no dependency solving, no UI).
 //!
 //! # Contract (implemented, seed only)
 //!
-//! - Shape: `bitty extension install <name> --version <X.Y.Z>`. The version
-//!   is required and exact: components publish no `latest` pointer, and
-//!   version solving arrives with the full manager, not the seed.
+//! - Shape: `bitty extension install <name> [--version <X.Y.Z>]`.
+//!   `--version` pins exactly; omitting it selects the highest strict
+//!   `X.Y.Z` catalog entry for the exact `(name, host target)` (#2381). The
+//!   catalog grammar publishes no prereleases, so latest can never pick one,
+//!   and an unavailable/empty catalog fails closed instead of guessing.
 //! - Fetch: fixed-argv system `curl` (pinned to `https://cdn.bitty.run`,
 //!   `--proto =https`, no shell interpolation) plus system `tar` for
 //!   extraction plus Rust-side SHA-256 verification. No Rust network stack
@@ -28,9 +30,10 @@
 //!   all-available-must-match rule. A fetched catalog missing the requested
 //!   entry, or one that is malformed or oversize, fails closed; a catalog
 //!   transport failure (offline, 404, 5xx) falls back to the original
-//!   single-release `SHA256SUMS` path with explicit consent. The fallback
-//!   never skips hash verification, the member audit, or the TOFU pin, and
-//!   never authorizes silent installation.
+//!   single-release `SHA256SUMS` path for a pinned install only — a bare
+//!   latest install has no version to fall back to and fails closed with a
+//!   `--version` hint. The fallback never skips hash verification, the member
+//!   audit, or the TOFU pin, and never authorizes silent installation.
 //! - Trust: unsigned 0.1.0 verifies by hash only (Windows ships unsigned per
 //!   #1810, so hash-only is the uniform story). The catalog is canonical
 //!   metadata, not a signature: a CDN compromise can substitute both the

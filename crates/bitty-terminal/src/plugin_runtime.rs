@@ -693,19 +693,7 @@ pub(crate) fn discover_with_roots(
     // owns all file reads; the Lua call path stays pure.
     if runtime.declares_capability("runtime.inspect") {
         if let Some(context) = seed.inspect {
-            // Safe-mode parity is structural: a context built for one mode is
-            // never installed into a runtime running in the other. A mismatch
-            // leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
-            if context.safe_mode == safe_mode {
-                let snapshot = {
-                    let resolver =
-                        |id: &str, declarations: &[bitty_plugin_host::manifest::SettingDecl]| {
-                            runtime.resolve_settings_for_inspect(id, declarations)
-                        };
-                    crate::runtime_inspect::build(context, Some(&resolver))
-                };
-                runtime.set_runtime_inspect_snapshot(snapshot);
-            } else {
+            if !install_runtime_inspect_snapshot(&mut runtime, context, safe_mode) {
                 crate::logging::warn(|| {
                     "bitty: runtime.inspect snapshot safe-mode mismatch; not installed".to_string()
                 });
@@ -751,6 +739,30 @@ pub(crate) fn discover_with_roots(
         pin_state,
         history,
     })
+}
+
+/// Build and install the inspection snapshot for one runtime mode.
+///
+/// Returns `false` (and installs nothing) when the context was built for the
+/// other mode. Safe-mode parity is structural: a normal-mode snapshot never
+/// reaches a `--safe` runtime, and a safe-mode snapshot never reaches a normal
+/// runtime. Granted calls then fail closed with `E_NOT_IMPLEMENTED`.
+fn install_runtime_inspect_snapshot(
+    runtime: &mut PluginRuntime,
+    context: &crate::runtime_inspect::RuntimeInspectContext,
+    safe_mode: bool,
+) -> bool {
+    if context.safe_mode != safe_mode {
+        return false;
+    }
+    let snapshot = {
+        let resolver = |id: &str, declarations: &[bitty_plugin_host::manifest::SettingDecl]| {
+            runtime.resolve_settings_for_inspect(id, declarations)
+        };
+        crate::runtime_inspect::build(context, Some(&resolver))
+    };
+    runtime.set_runtime_inspect_snapshot(snapshot);
+    true
 }
 
 #[cfg(test)]
@@ -1010,6 +1022,30 @@ mod tests {
             message.contains("E_NOT_IMPLEMENTED"),
             "expected fail-closed inspect backend, got: {message}"
         );
+    }
+
+    /// Both directions of the safe-mode provenance gate refuse the snapshot.
+    #[test]
+    fn inspect_snapshot_refuses_both_mode_mismatches() {
+        let mut normal = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            ..PluginRuntimeConfig::default()
+        });
+        assert!(!install_runtime_inspect_snapshot(
+            &mut normal,
+            &inspect_context(true),
+            false
+        ));
+
+        let mut safe = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: true,
+            ..PluginRuntimeConfig::default()
+        });
+        assert!(!install_runtime_inspect_snapshot(
+            &mut safe,
+            &inspect_context(false),
+            true
+        ));
     }
 
     #[test]

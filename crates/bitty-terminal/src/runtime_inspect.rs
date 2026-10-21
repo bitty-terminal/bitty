@@ -362,6 +362,14 @@ fn build_plugins(rows: &[crate::plugin::PluginRow]) -> Section<InspectRows<Plugi
     Section::available(inspect)
 }
 
+/// Build the settings section.
+///
+/// A malformed per-plugin file makes the whole section `unavailable`: the
+/// accepted read contract carries one section-level error channel, not
+/// per-row errors, and a dashboard must never render partial rows as if the
+/// rest were valid. Activation still runs the plugin on lower layers; the
+/// inspector reports that the view is unavailable instead of silently showing
+/// defaults.
 fn build_settings(
     context: &RuntimeInspectContext,
     plugins: &[crate::plugin::PluginRow],
@@ -704,6 +712,33 @@ mod tests {
         std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
     }
 
+    fn write_component(root: &Path, name: &str, version: &str) {
+        let dir = root.join(name).join(version);
+        std::fs::create_dir_all(&dir).expect("component dirs");
+        let sha = "a".repeat(64);
+        std::fs::write(
+            dir.join("bitty-component.toml"),
+            format!(
+                "[component]\nname = \"{name}\"\nversion = \"{version}\"\nprotocol = [1, 1]\nexecutable = \"bitty-{name}\"\nsha256 = \"{sha}\"\n"
+            ),
+        )
+        .expect("descriptor");
+    }
+
+    fn lua_section_truncated(snapshot: &RuntimeInspectSnapshot, section_name: &str) -> usize {
+        let lua = snapshot.to_lua();
+        let section = lua.get(section_name).expect("section");
+        assert_eq!(
+            section.get("truncated"),
+            Some(&LuaValue::Bool(true)),
+            "{section_name} must carry truncated = true"
+        );
+        let LuaValue::Table(rows) = section.get("rows").expect("rows") else {
+            panic!("row array");
+        };
+        rows.len()
+    }
+
     #[test]
     fn safe_mode_returns_builtin_config_and_no_store_reads() {
         let env = InspectEnv {
@@ -867,44 +902,142 @@ mod tests {
 
     #[test]
     fn build_plugins_caps_rows_and_marks_truncation() {
-        let rows: Vec<crate::plugin::PluginRow> = (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS + 3)
+        let rows: Vec<crate::plugin::PluginRow> = (0..131)
             .map(|index| plugin_row(&format!("owner.plugin{index}"), Vec::new()))
             .collect();
         let section = build_plugins(&rows);
         let Section::Available(rows) = section else {
             panic!("plugins available");
         };
-        assert_eq!(rows.rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert_eq!(rows.rows.len(), 128);
         assert!(rows.truncated);
         let snapshot = RuntimeInspectSnapshot {
             plugins: Section::available(rows),
             ..RuntimeInspectSnapshot::default()
         };
-        let lua = snapshot.to_lua();
-        let plugins = lua.get("plugins").expect("plugins");
-        assert_eq!(plugins.get("truncated"), Some(&LuaValue::Bool(true)));
-        let LuaValue::Table(rows) = plugins.get("rows").expect("rows") else {
-            panic!("row array");
+        assert_eq!(lua_section_truncated(&snapshot, "plugins"), 128);
+    }
+
+    #[test]
+    fn build_settings_caps_rows_and_marks_truncation() {
+        let declarations: Vec<SettingDecl> = (0..260)
+            .map(|index| string_decl(&format!("key{index}"), "default"))
+            .collect();
+        let rows = vec![plugin_row("owner.settings", declarations)];
+        let context = RuntimeInspectContext {
+            config_dir: None,
+            ..RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false)
         };
-        assert_eq!(rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        let section = build_settings(&context, &rows, None);
+        let Section::Available(rows) = section else {
+            panic!("settings available");
+        };
+        assert_eq!(rows.rows.len(), 256);
+        assert!(rows.truncated);
+        let snapshot = RuntimeInspectSnapshot {
+            settings: Section::available(rows),
+            ..RuntimeInspectSnapshot::default()
+        };
+        assert_eq!(lua_section_truncated(&snapshot, "settings"), 256);
+    }
+
+    #[test]
+    fn build_extensions_caps_rows_and_marks_truncation() {
+        let base = scratch("extensions-cap");
+        let user_root = base.join("extensions");
+        for index in 0..68 {
+            write_component(&user_root, &format!("comp{index}"), "0.0.1");
+        }
+        let context = RuntimeInspectContext {
+            extension_user_root: Some(user_root),
+            extension_system_root: None,
+            extension_state_root: None,
+            ..RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false)
+        };
+        let section = build_extensions(&context);
+        let Section::Available(rows) = section else {
+            panic!("extensions available");
+        };
+        assert_eq!(rows.rows.len(), 64);
+        assert!(rows.truncated);
+        let snapshot = RuntimeInspectSnapshot {
+            extensions: Section::available(rows),
+            ..RuntimeInspectSnapshot::default()
+        };
+        assert_eq!(lua_section_truncated(&snapshot, "extensions"), 64);
+    }
+
+    #[test]
+    fn build_profiles_caps_rows_and_marks_truncation() {
+        let base = scratch("profiles-cap");
+        let dir = base.join("profiles");
+        std::fs::create_dir_all(&dir).expect("profiles dir");
+        for index in 0..68 {
+            std::fs::write(dir.join(format!("profile{index}.lua")), "return {}\n")
+                .expect("profile file");
+        }
+        let context = RuntimeInspectContext {
+            profiles_dir: Some(dir),
+            ..RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false)
+        };
+        let section = build_profiles(&context);
+        let Section::Available(rows) = section else {
+            panic!("profiles available");
+        };
+        assert_eq!(rows.rows.len(), 64);
+        assert!(rows.truncated);
+        let snapshot = RuntimeInspectSnapshot {
+            profiles: Section::available(rows),
+            ..RuntimeInspectSnapshot::default()
+        };
+        assert_eq!(lua_section_truncated(&snapshot, "profiles"), 64);
     }
 
     #[test]
     fn store_only_rows_are_not_marked_recorded() {
-        let mut store_row = plugin_row("xuepoo.store", Vec::new());
-        store_row.recorded = false;
-        let section = build_plugins(&[store_row]);
-        let Section::Available(rows) = section else {
-            panic!("plugins available");
-        };
-        assert!(!rows.rows[0].recorded);
+        use bitty_runtime::plugin_runtime::{PluginRecord, SourceClass, write_index};
 
-        let ledger_row = plugin_row("xuepoo.ledger", Vec::new());
-        let section = build_plugins(&[ledger_row]);
+        let store = scratch("store-recorded");
+        let id = "xuepoo.store";
+        let package = store.join("packages").join(id).join("1.0.0");
+        std::fs::create_dir_all(package.join("lua")).expect("package dirs");
+        std::fs::write(
+            package.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Store probe\"\nversion = \"1.0.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[lazy]\ncommands = []\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(package.join("lua/init.lua"), "return {}\n").expect("init");
+        write_index(
+            &store,
+            &[PluginRecord {
+                source_class: SourceClass::Registry,
+                plugin_id: id.to_string(),
+                version: "1.0.0".to_string(),
+                root: format!("packages/{id}/1.0.0"),
+                manifest_hash: "a".repeat(64),
+                content_digest: "b".repeat(64),
+                enabled: true,
+                granted: Vec::new(),
+            }],
+        )
+        .expect("index");
+
+        let rows = rows_for_inspect(&PluginState::default(), Some(&store)).expect("inventory");
+        let row = rows.iter().find(|row| row.id == id).expect("store row");
+        assert!(!row.recorded, "store index is not the managed ledger");
+
+        let section = build_plugins(&rows);
         let Section::Available(rows) = section else {
             panic!("plugins available");
         };
-        assert!(rows.rows[0].recorded);
+        let row = rows
+            .rows
+            .iter()
+            .find(|row| row.id == id)
+            .expect("store row");
+        assert!(!row.recorded);
     }
 
     #[test]

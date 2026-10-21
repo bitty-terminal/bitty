@@ -3109,6 +3109,44 @@ impl PluginServices {
         *self.runtime_inspect_snapshot.borrow_mut() = snapshot;
     }
 
+    /// [`HostServices::runtime_inspect`] with an injectable start time.
+    ///
+    /// The public call starts the wall clock immediately before this method;
+    /// tests pass an older `Instant` to exercise the 10 ms deadline without a
+    /// sleep. Authority order is fixed: grant check, backend-presence check,
+    /// rate budget, deadline. The unwired-backend check deliberately precedes
+    /// the rate budget (a failed call reads nothing and must not consume the
+    /// 16 calls/s allowance); the grant check stays first, so this is not an
+    /// authority or observability widening. VM fuel/wall budgets still bound
+    /// the surrounding Lua execution.
+    fn runtime_inspect_at(&self, started: Instant) -> Result<RuntimeInspectSnapshot, BridgeError> {
+        if !self.runtime_inspect_granted.get() {
+            return Err(BridgeError::capability_denied("runtime.inspect"));
+        }
+        // An unwired backend fails before consuming a rate-budget slot, so a
+        // granted-but-unavailable generation cannot exhaust its own budget on
+        // a call that never reads anything.
+        if self.runtime_inspect_snapshot.borrow().is_none() {
+            return Err(BridgeError::not_implemented("bitty.runtime.inspect"));
+        }
+        if !self.runtime_inspect_budget.borrow_mut().allow(started) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "runtime.inspect exceeded 16 calls per second",
+            ));
+        }
+        let snapshot = self
+            .runtime_inspect_snapshot
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.runtime.inspect"))?;
+        if started.elapsed() > Duration::from_millis(RUNTIME_INSPECT_MAX_WALL_MS) {
+            return Err(BridgeError::timeout());
+        }
+        Ok(snapshot)
+    }
+
     /// Record this generation's own granted capability ids (activation
     /// snapshot) for the `grants` inspect target. Stored sorted and
     /// de-duplicated; other plugins' grants are never reachable.
@@ -4875,35 +4913,7 @@ impl HostServices for PluginServices {
     }
 
     fn runtime_inspect(&self) -> Result<RuntimeInspectSnapshot, BridgeError> {
-        // Grant first: an ungranted generation must not learn whether a
-        // snapshot backend exists. `runtime.inspect` never implies
-        // `runtime.configure` and vice versa.
-        if !self.runtime_inspect_granted.get() {
-            return Err(BridgeError::capability_denied("runtime.inspect"));
-        }
-        // An unwired backend fails before consuming a rate-budget slot, so a
-        // granted-but-unavailable generation cannot exhaust its own budget on
-        // a call that never reads anything.
-        if self.runtime_inspect_snapshot.borrow().is_none() {
-            return Err(BridgeError::not_implemented("bitty.runtime.inspect"));
-        }
-        let started = Instant::now();
-        if !self.runtime_inspect_budget.borrow_mut().allow(started) {
-            return Err(BridgeError::new(
-                "validation",
-                "E_DEF_LIMIT",
-                "runtime.inspect exceeded 16 calls per second",
-            ));
-        }
-        let snapshot = self
-            .runtime_inspect_snapshot
-            .borrow()
-            .clone()
-            .ok_or_else(|| BridgeError::not_implemented("bitty.runtime.inspect"))?;
-        if started.elapsed() > Duration::from_millis(RUNTIME_INSPECT_MAX_WALL_MS) {
-            return Err(BridgeError::timeout());
-        }
-        Ok(snapshot)
+        self.runtime_inspect_at(Instant::now())
     }
 
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
@@ -10019,6 +10029,20 @@ mod history_tests {
         unwired.set_runtime_inspect(true, None);
         let error = unwired.runtime_inspect().expect_err("no backend");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn runtime_inspect_enforces_the_ten_millisecond_deadline() {
+        let services = services();
+        services.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(RUNTIME_INSPECT_MAX_WALL_MS + 1))
+            .expect("monotonic clock has enough history");
+        let error = services
+            .runtime_inspect_at(started)
+            .expect_err("deadline exceeded");
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert_eq!(error.class, "budget");
     }
 
     #[test]

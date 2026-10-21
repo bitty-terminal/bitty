@@ -1100,6 +1100,19 @@ mod tests {
     }
 
     #[test]
+    fn policy_bounds_are_the_documented_literals() {
+        assert_eq!(RUNTIME_INSPECT_MAX_BYTES, 65_536);
+        assert_eq!(RUNTIME_INSPECT_MAX_PLUGIN_ROWS, 128);
+        assert_eq!(RUNTIME_INSPECT_MAX_SETTING_ROWS, 256);
+        assert_eq!(RUNTIME_INSPECT_MAX_EXTENSION_ROWS, 64);
+        assert_eq!(RUNTIME_INSPECT_MAX_PROFILE_ROWS, 64);
+        assert_eq!(RUNTIME_INSPECT_MAX_PATH_BYTES, 240);
+        assert_eq!(RUNTIME_INSPECT_MAX_STRING_BYTES, 96);
+        assert_eq!(RUNTIME_INSPECT_CALLS_PER_SECOND, 16);
+        assert_eq!(RUNTIME_INSPECT_MAX_WALL_MS, 10);
+    }
+
+    #[test]
     fn bounded_display_stays_on_char_boundaries() {
         let value = "é".repeat(200);
         let bounded = bounded_display(&value, RUNTIME_INSPECT_MAX_STRING_BYTES);
@@ -1113,7 +1126,13 @@ mod tests {
     fn path_and_row_caps_are_enforced() {
         let long_path = "p".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES);
         let bounded = bounded_display(&long_path, RUNTIME_INSPECT_MAX_PATH_BYTES);
-        assert!(bounded.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert_eq!(bounded.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(bounded.ends_with('…'));
+        let exact_path = "p".repeat(RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert_eq!(
+            bounded_display(&exact_path, RUNTIME_INSPECT_MAX_PATH_BYTES),
+            exact_path
+        );
 
         let row = ExtensionInspectRow {
             name: "net".to_string(),
@@ -1162,8 +1181,12 @@ mod tests {
                 .collect(),
             truncated: true,
         };
+        let diagnostics = RuntimeDiagnostics {
+            config_file: Some("d".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES)),
+            ..diagnostic_fixture()
+        };
         let snapshot = RuntimeInspectSnapshot {
-            diagnostics: Section::available(diagnostic_fixture()),
+            diagnostics: Section::available(diagnostics),
             plugins: Section::available(plugins),
             settings: Section::available(InspectRows::new(Vec::new())),
             extensions: Section::available(InspectRows::new(vec![ExtensionInspectRow {
@@ -1179,6 +1202,12 @@ mod tests {
             profiles: Section::available(InspectRows::new(Vec::new())),
         };
         let lua = snapshot.to_lua();
+        let diagnostics = lua.get("diagnostics").expect("diagnostics");
+        let Some(LuaValue::String(config_file)) = diagnostics.get("config_file") else {
+            panic!("config_file is a string");
+        };
+        assert_eq!(config_file.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(config_file.ends_with('…'));
         let plugins = lua.get("plugins").expect("plugins");
         assert_eq!(plugins.get("truncated"), Some(&LuaValue::Bool(true)));
         let rows = plugins.get("rows").expect("rows");
@@ -1203,7 +1232,8 @@ mod tests {
                 _ => None,
             })
             .expect("executable_path");
-        assert!(path.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert_eq!(path.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(path.ends_with('…'));
     }
 
     #[test]

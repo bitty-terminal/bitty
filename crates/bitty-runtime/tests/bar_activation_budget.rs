@@ -16,15 +16,22 @@
 //! contract this test pins, and a bar change that needs different
 //! activation work should bump the pin in its own review.
 //!
-//! This test keeps the production RC-1 budget (no
-//! `set_vm_wall_budget_ms`), so moving provider I/O back into the executor
-//! thread fails it at 50 ms instead of silently widening the harness.
+//! Harness budget: this file widens only the wall dimension, for debug test
+//! builds of the pinned 4 000-line bar (`HARNESS_WALL_BUDGET_MS`, the
+//! bitty#1744/#1727 treatment). Production enforcement stays at
+//! `RC1_WALL_CLOCK_BUDGET_MS` and is pinned by `bitty-lua`'s
+//! `measurement_lua` / `load_gate` tests. What proves the #2425 fix here is
+//! not that ceiling but the injected-reader companion below: a read that
+//! takes 1.5 s (30x the production slice, 3x this headroom) must cost the
+//! activation slice nothing at all, so any inline read fails this suite even
+//! on a host where three warm `pactl` spawns would fit 50 ms.
 
 mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS, WorkspaceInfo};
@@ -122,10 +129,15 @@ fn three_group_runtime() -> (PluginRuntime, PathBuf) {
 /// Build the same plan with an optional injected state sampler.
 fn three_group_runtime_with(sampled: Option<SampledSpawnFn>) -> (PluginRuntime, PathBuf) {
     let root = pinned_bar_root();
+    // Tests in one binary run as parallel threads of the same process, so a
+    // pid-only name would collide and the first test's cleanup would delete
+    // the second test's data dir mid-activation. A process-wide counter keeps
+    // each runtime's data dir unique.
+    static DATA_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
     let data_dir = std::env::temp_dir().join(format!(
         "bitty-bar-pin-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        DATA_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("data dir");

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`bitty extension install` resolves the latest catalog release (#2381):**
+  a bare `bitty extension install graphics` selects the highest strict
+  `X.Y.Z` entry for the exact `(name, host target)` in
+  `extensions/catalog.v1` and prints the resolved version before the release
+  download; `--version X.Y.Z` still pins exactly. Consent, catalog/
+  `SHA256SUMS` digest agreement, and the TOFU pin are unchanged. A catalog
+  that is unavailable (including today's 404) or has no entry fails closed
+  with a concrete `--version` example instead of guessing a version;
+  prereleases never participate.
+- **Extension names accept a repo-style `bitty-` alias (#2381):**
+  `list`, `install`, `remove`, and `show-source` resolve one `bitty-` prefix
+  (`bitty-graphics` -> `graphics`) without rewriting stored names or TOFU
+  pins; an ambiguous alias fails closed. Errors now print a targeted hint
+  (closest known extension plus the exact command) and keep the full usage
+  behind `--help` instead of dumping it after every failure.
 - **`bitty init` plugin step is a checkbox multi-select (CTX-1417, #2366):**
   on a live TTY the Plugins follow-up renders the bundled catalog as `[ ]`
   rows with a `>` cursor and a key hint; Space toggles, `j`/`k` and arrows

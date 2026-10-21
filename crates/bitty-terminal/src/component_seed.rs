@@ -393,6 +393,51 @@ impl ExtensionCatalog {
             .get(&(name.to_owned(), version.to_owned(), target.to_owned()))
             .map(String::as_str)
     }
+
+    /// Highest strict `X.Y.Z` version published for exactly (`name`, `target`).
+    ///
+    /// Selection compares numeric components (so `0.0.10` beats `0.0.9`); a
+    /// lexical compare would silently install the wrong release. The catalog
+    /// grammar admits only strict numeric releases
+    /// ([`valid_seed_version`]), so a prerelease can never be published,
+    /// parsed, or selected as latest. An explicit `--version` is the only
+    /// pin, and it must pass the same grammar.
+    #[must_use]
+    pub fn latest_version_for(&self, name: &str, target: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .filter(|((entry_name, _, entry_target), _)| {
+                entry_name == name && entry_target == target
+            })
+            .max_by_key(|((_, version, _), _)| numeric_version_key(version))
+            .map(|((_, version, _), _)| version.as_str())
+    }
+
+    /// Published component names for `target`, sorted (hint candidates).
+    #[must_use]
+    pub fn names_for_target(&self, target: &str) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .entries
+            .keys()
+            .filter(|(_, _, entry_target)| entry_target == target)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+/// Total numeric key for a catalog version (grammar-validated `X.Y.Z`).
+///
+/// Unparsable parts cannot reach this helper through [`parse_catalog`]; the
+/// fallback keeps the ordering total regardless (defense in depth, no panic).
+fn numeric_version_key(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.split('.');
+    let next = |parts: &mut std::str::Split<'_, char>| {
+        parts.next().and_then(|part| part.parse().ok()).unwrap_or(0)
+    };
+    (next(&mut parts), next(&mut parts), next(&mut parts))
 }
 
 /// Outcome of one catalog fetch.
@@ -2062,6 +2107,70 @@ mod tests {
             catalog.digest_for("evil", "0.0.1", "x86_64-unknown-linux-gnu"),
             None
         );
+    }
+
+    #[test]
+    fn catalog_latest_selection_is_numeric_and_exact() {
+        let target = "x86_64-unknown-linux-gnu";
+        let digest = "a".repeat(64);
+        let mut text = String::from("schema 1\n");
+        for version in ["0.0.9", "0.0.10", "0.0.2"] {
+            text.push_str(&catalog_line("graphics", version, target, &digest));
+        }
+        // Wrong target and another component must never win.
+        text.push_str(&catalog_line(
+            "graphics",
+            "9.9.9",
+            "aarch64-apple-darwin",
+            &digest,
+        ));
+        text.push_str(&catalog_line("net", "8.0.0", target, &digest));
+        let catalog = parse_catalog(&text).expect("catalog");
+
+        // Numeric comparison, not lexical: 0.0.10 beats 0.0.9.
+        assert_eq!(
+            catalog.latest_version_for("graphics", target),
+            Some("0.0.10")
+        );
+        assert_eq!(catalog.latest_version_for("net", target), Some("8.0.0"));
+        assert_eq!(catalog.names_for_target(target), vec!["graphics", "net"]);
+        // Exact target only: a newer release for a foreign target is ignored.
+        assert_eq!(
+            catalog.latest_version_for("graphics", "aarch64-apple-darwin"),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            catalog.latest_version_for("graphics", "x86_64-apple-darwin"),
+            None
+        );
+        assert_eq!(catalog.latest_version_for("missing", target), None);
+    }
+
+    #[test]
+    fn catalog_latest_is_none_without_entries() {
+        let catalog = parse_catalog("schema 1\n").expect("schema-only catalog");
+        assert_eq!(
+            catalog.latest_version_for("graphics", "x86_64-unknown-linux-gnu"),
+            None
+        );
+        assert!(
+            catalog
+                .names_for_target("x86_64-unknown-linux-gnu")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn catalog_prereleases_are_never_published_or_selected() {
+        // The strict X.Y.Z pack policy is the reason latest can never pick a
+        // prerelease: a prerelease record is refused at parse time.
+        let text = format!(
+            "schema 1\nextension graphics 0.0.25-rc.1 x86_64-unknown-linux-gnu {}\n",
+            "a".repeat(64)
+        );
+        let error = parse_catalog(&text).expect_err("prerelease must fail");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("invalid version"), "{error}");
     }
 
     #[test]

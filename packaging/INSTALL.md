@@ -52,16 +52,23 @@ What each script installs:
 ## Package managers
 
 - **Arch Linux (AUR)**: `paru -S bitty-bin` (prebuilt, recommended) or
-  `paru -S bitty` (build from source). They conflict; install one. Only a
-  tag-time published recipe counts as supported (both publishes are gated
-  on secrets). See the top-level README `Install` section.
+  `paru -S bitty` (build from source). They conflict; install one. `bitty-bin`
+  downloads from the R2-backed CDN
+  (`https://cdn.bitty.run/releases/<TAG>/bitty-x86_64-unknown-linux-gnu`) and
+  verifies the sha256 in the recipe; the GitHub Releases URL is the documented
+  fallback. Only a tag-time published recipe counts as supported (both
+  publishes are gated on secrets). See the top-level README `Install` section.
 - **Homebrew**: only a tag-time published formula in the external tap
   `bitty-terminal/homebrew-tap` counts as supported (no in-repo copy); a
-  CI-built macOS binary is not support evidence.
+  CI-built macOS binary is not support evidence. The formula downloads from
+  the R2-backed CDN and embeds the published sha256, with the GitHub Releases
+  URL kept as a documented fallback.
 - **Scoop**: only a tag-time published manifest in the external bucket
   `bitty-terminal/scoop-bucket` counts as supported; it ships the bare
-  exes, sidestepping the setup-installer SmartScreen dialog. Windows may still
-  show a first-run reputation check. See `packaging/README.md`.
+  exes, sidestepping the setup-installer SmartScreen dialog. Manifest URLs and
+  `autoupdate` point at the R2-backed CDN with the published sha256 hash; its
+  `notes` field documents the GitHub Releases fallback. Windows may still show
+  a first-run reputation check. See `packaging/README.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`
@@ -69,13 +76,15 @@ What each script installs:
 
 ## Prebuilt binaries (manual download)
 
-[GitHub Releases](https://github.com/bitty-terminal/bitty/releases) carry
+The R2-backed CDN at `https://cdn.bitty.run/releases/<TAG>/` is the preferred
+download source for the channels above; [GitHub
+Releases](https://github.com/bitty-terminal/bitty/releases) carry the same
 binaries for Linux, macOS, and Windows plus `.deb`, `.rpm`, `.apk`, and Arch
-packages. Only release-matrix-verified artifacts count as supported (see
-`packaging/README.md` `Release Matrix` and `Support evidence`).
-Everything is mirrored to R2 at `releases/<tag>/` with read-back
-hash verification. Each artifact has a `.sha256` sidecar — check it before
-running anything.
+packages and remain the documented fallback. Only release-matrix-verified
+artifacts count as supported (see `packaging/README.md` `Release Matrix` and
+`Support evidence`). `r2-mirror` publishes every file under `dist/` with
+read-back hash verification. Each artifact has a `.sha256` sidecar — every
+channel verifies it, and you should too before running anything manually.
 
 ## Build from source
 

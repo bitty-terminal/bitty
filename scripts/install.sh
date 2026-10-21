@@ -39,9 +39,11 @@
 #
 # No Rust toolchain is needed: the script needs only curl, sha256sum (or
 # shasum), and tar+zstd for Linux bundles. Scoop/Homebrew/AUR manifests are
-# generated at tag time into external repos and need no code here; the Windows
-# x64 portable ZIP installed by install.ps1 carries the same bitty.exe payload
-# the Scoop manifest ships (portable parity is payload parity, not URL parity).
+# generated at tag time into external repos and need no code here; they use
+# the same R2-backed CDN as this script (CTX-1413, #1847), with GitHub
+# Releases kept as the documented fallback. The Windows x64 portable ZIP
+# installed by install.ps1 carries the same bitty.exe payload the Scoop
+# manifest ships (portable parity is payload parity, not URL parity).
 #
 # Usage:
 #   install.sh [--version VERSION] [--prefix DIR] [--bin-dir DIR] [--dry-run] [--print-url] [--target TRIPLE] [-h|--help]

@@ -31,10 +31,11 @@
   matrix extends (recorded follow-up, not a parity gap).
 
   Scoop-portable parity: the Scoop manifest (generated at tag time into the
-  external scoop-bucket repo) ships bare bitty exes from GitHub Releases,
-  while this script fetches the portable ZIP (x64) or bare exe (arm64) from
-  the CDN R2 mirror. Parity is payload parity — the same bitty.exe runs in
-  both paths — not URL parity. Like Scoop, this script installs user-local
+  external scoop-bucket repo) ships bare bitty exes from the same R2-backed
+  CDN, while this script fetches the portable ZIP (x64) or bare exe (arm64)
+  from that CDN. GitHub Releases carries the same bytes and is the documented
+  fallback for both paths. Parity is payload parity — the same bitty.exe runs
+  in both paths — not URL parity. Like Scoop, this script installs user-local
   with no admin rights and no Rust toolchain.
 
   FreeBSD is not a bootstrap target (manual tar.xz download); Linux/macOS

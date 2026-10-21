@@ -177,6 +177,7 @@ pub mod presentation;
 pub mod provider;
 pub mod pseudo;
 pub mod resolved_style;
+pub mod scene_style;
 pub mod scratchpad;
 pub mod scrollbar;
 pub mod search;
@@ -300,6 +301,11 @@ pub use pseudo::{
     resolve_pseudo_viewport, set_pseudo_aspect, set_pseudo_size, toggle_pseudo,
 };
 pub use resolved_style::{ResolvedStyle, StyleCascade, StyleError, StyleOrigin};
+pub use scene_style::{
+    BorderToken, ResolvedBorder, ResolvedSceneStyle, SCENE_STYLE_MAX_BORDER_PX,
+    SCENE_STYLE_MAX_NAME_BYTES, SCENE_STYLE_MAX_PADDING_CELLS, SCENE_STYLE_MAX_RADIUS_PX,
+    SceneStyle, SceneStyleError, StyleArg, StyleField, StylePaintOp, StyleSource, StyleValue,
+};
 pub use scratchpad::{
     HiddenEntry, SCRATCHPAD_CMD_TOGGLE, ScratchpadError, ScratchpadSlot, apply_scratchpad_toggle,
 };

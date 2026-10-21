@@ -1,7 +1,11 @@
-//! `bitty shell-init`: emit shell integration (CTX-1054, issue #1813).
+//! `bitty shell-init`: emit shell integration (CTX-1054, issue #1813;
+//! completed for all five shells by issue #2372).
 //!
-//! Canonical: issue #1813 (`bitty completion <shell>` already emits static
-//! completion scripts, but nothing installs or wires them).
+//! Canonical: issue #1813 (`bitty completion <shell>` emits completion
+//! scripts) and issue #2372 (nested completion generated from the CLI
+//! grammar, single registration, OSC 7 + OSC 133 on every prompt path,
+//! strict-shell safety, idempotent double-source, and tolerance for an
+//! absent or older `bitty` binary).
 //!
 //! # Contract (implemented)
 //!
@@ -12,9 +16,11 @@
 //!   The script prints to stdout, exit 0.
 //! - Class: local (no instance, no config load, no plugin VM, safe-mode
 //!   clean). The script is static: per-shell prompt hooks (OSC 7 cwd report
-//!   plus OSC 133 prompt-start `A` and command-done-with-status `D` marks,
-//!   observation only) followed by one eval line that wires the matching
-//!   `bitty completion <shell>` output, so Tab completion works after init.
+//!   plus OSC 133 prompt-start `A`, command-start `B`, and
+//!   command-done-with-status `D` marks, observation only) followed by the
+//!   matching `bitty completion <shell>` definitions inlined from the CLI
+//!   grammar. The script never invokes `bitty` at startup, so a machine
+//!   without the binary (or with an older one) still sources cleanly.
 //! - `--format` is accepted and ignored: shell-init emits a script, never the
 //!   output envelope. `--no-color` is accepted and ignored (scripts carry no
 //!   color). `--socket`/`--instance` combined with `shell-init` fail closed
@@ -22,17 +28,19 @@
 //! - Missing/unknown shell, extra positionals, unknown flags, and stray `--`
 //!   fail closed (exit 2, stderr only, no stdout script).
 //!
-//! # Wiring (the #1813 acceptance)
+//! # Wiring (the #1813/#2372 acceptance)
 //!
 //! - bash: `eval "$(bitty shell-init bash)"` in `~/.bashrc`.
 //! - zsh: `eval "$(bitty shell-init zsh)"` in `~/.zshrc`.
 //! - fish: `bitty shell-init fish | source` in `config.fish`.
 //! - powershell: `bitty shell-init powershell | Out-String | Invoke-Expression`
 //!   in `$PROFILE`.
-//! - nushell: save once and source from `config.nu` (see the script header).
+//! - nushell: save once and `source` it from `config.nu` (see the script
+//!   header).
 //!
-//! `bitty init` prints this hint after writing the config file, so a fresh
-//! shell gets working Tab completion plus cwd/status prompt marks after init.
+//! [`install_line`] is the single source for these lines: `bitty init` and
+//! the help text both render it, so a fresh shell gets the same working
+//! command everywhere.
 //!
 //! # Exit codes (stable taxonomy)
 //!
@@ -57,19 +65,55 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_USAGE: i32 = 2;
 
 // ---------------------------------------------------------------------------
-// Static scripts (prompt hooks + completion wiring; plugin subtrees stay out)
+// Install lines (single source for shell-init help and `bitty init`)
 // ---------------------------------------------------------------------------
 
-/// Bash integration: `PROMPT_COMMAND` hook (OSC 133 `D` status, OSC 7 cwd,
-/// OSC 133 `A` prompt-start) plus `bitty completion bash`.
-const BASH_SCRIPT: &str = r#"# bitty shell integration for Bash (static; generated, do not edit).
+/// Exact startup-file line that enables this shell's integration.
+#[must_use]
+pub fn install_line(shell: CompletionShell) -> &'static str {
+    match shell {
+        CompletionShell::Bash => "eval \"$(bitty shell-init bash)\"",
+        CompletionShell::Zsh => "eval \"$(bitty shell-init zsh)\"",
+        CompletionShell::Fish => "bitty shell-init fish | source",
+        CompletionShell::Powershell => {
+            "bitty shell-init powershell | Out-String | Invoke-Expression"
+        }
+        CompletionShell::Nushell => {
+            "bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu"
+        }
+    }
+}
+
+/// Extra follow-up line for shells whose install is two steps (Nushell).
+#[must_use]
+pub fn install_follow_up(shell: CompletionShell) -> &'static str {
+    match shell {
+        CompletionShell::Nushell => {
+            " Then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu."
+        }
+        _ => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static scripts (prompt hooks; the matching completion definitions follow)
+// ---------------------------------------------------------------------------
+
+/// Bash hooks: `PROMPT_COMMAND` (OSC 133 `D` status, OSC 7 cwd, OSC 133 `A`
+/// prompt-start) plus `PS0` (OSC 133 `B` command-start).
+const BASH_HOOKS: &str = r#"# bitty shell integration for Bash (static; generated, do not edit).
 # Enable with: eval "$(bitty shell-init bash)" in ~/.bashrc
-# - Tab completion via `bitty completion bash` (evaled below).
-# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
-#   command-done-with-status (D) marks (observation only; ignored by
-#   terminals without support).
+# - Tab completion follows this block (generated from the CLI grammar).
+#   The script never invokes `bitty` at startup, so an absent or older
+#   binary cannot break shell startup.
+# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A),
+#   command-start (B via PS0), and command-done-with-status (D) marks
+#   (observation only; ignored by terminals without support).
+# - Runs on every prompt path: PROMPT_COMMAND fires for multiline edits,
+#   vi-mode (set -o vi), and transient-prompt redraws alike.
 # - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
 #   Hostname passes through verbatim (DNS-safe, authority must match).
+# - Safe under `set -euo pipefail`; re-sourcing is a no-op.
 if [ -z "${_BITTY_SHELL_INIT:-}" ]; then
     _BITTY_SHELL_INIT=1
     # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
@@ -106,7 +150,7 @@ if [ -z "${_BITTY_SHELL_INIT:-}" ]; then
         printf '%s' "$_bitty_out"
     }
     _bitty_osc7() {
-        printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$(_bitty_urlencode "$PWD")"
+        printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-$(uname -n 2>/dev/null)}" "$(_bitty_urlencode "${PWD:-.}")"
     }
     _bitty_prompt_hook() {
         local _bitty_status=$?
@@ -124,21 +168,30 @@ if [ -z "${_BITTY_SHELL_INIT:-}" ]; then
     elif [[ "${PROMPT_COMMAND:-}" != *"_bitty_prompt_hook"* ]]; then
         PROMPT_COMMAND="_bitty_prompt_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
     fi
+    # Command-start (B): PS0 expands after a command line is read and before
+    # it executes, for single-line, multiline, and vi-mode edits alike.
+    if [[ "${PS0:-}" != *"]133;B"* ]]; then
+        PS0="${PS0:-}\[\e]133;B\e\\\]"
+    fi
 fi
-eval "$(bitty completion bash)"
 "#;
 
-/// Zsh integration: `precmd` hook (OSC 133 `D` status, OSC 7 cwd, OSC 133
-/// `A` prompt-start) plus `bitty completion zsh`.
-const ZSH_SCRIPT: &str = r#"# bitty shell integration for Zsh (static; generated, do not edit).
+/// Zsh hooks: `precmd` (OSC 133 `D` status, OSC 7 cwd, OSC 133 `A`
+/// prompt-start) plus `preexec` (OSC 133 `B` command-start).
+const ZSH_HOOKS: &str = r#"# bitty shell integration for Zsh (static; generated, do not edit).
 # Enable with: eval "$(bitty shell-init zsh)" in ~/.zshrc (after compinit,
 # so compdef can register Tab completion).
-# - Tab completion via `bitty completion zsh` (evaled below).
-# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
-#   command-done-with-status (D) marks (observation only; ignored by
-#   terminals without support).
+# - Tab completion follows this block (generated from the CLI grammar).
+#   The script never invokes `bitty` at startup, so an absent or older
+#   binary cannot break shell startup.
+# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A),
+#   command-start (B via preexec), and command-done-with-status (D) marks
+#   (observation only; ignored by terminals without support).
+# - Runs on every prompt path: precmd/preexec fire for multiline edits,
+#   vi-mode (bindkey -v), and transient-prompt redraws alike.
 # - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
 #   Hostname passes through verbatim (DNS-safe, authority must match).
+# - Safe under `setopt no_unset`; re-sourcing is a no-op.
 if (( ! ${+_BITTY_SHELL_INIT} )); then
     typeset -g _BITTY_SHELL_INIT=1
     # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
@@ -175,7 +228,7 @@ if (( ! ${+_BITTY_SHELL_INIT} )); then
         printf '%s' "$_bitty_out"
     }
     _bitty_osc7() {
-        printf '\e]7;file://%s%s\e\\' "$HOST" "$(_bitty_urlencode "$PWD")"
+        printf '\e]7;file://%s%s\e\\' "${HOST:-localhost}" "$(_bitty_urlencode "${PWD:-.}")"
     }
     _bitty_prompt_hook() {
         local _bitty_status=$?
@@ -183,26 +236,36 @@ if (( ! ${+_BITTY_SHELL_INIT} )); then
         _bitty_osc7
         printf '\e]133;A\e\\'
     }
+    _bitty_preexec_hook() {
+        printf '\e]133;B\e\\'
+    }
+    typeset -ga precmd_functions preexec_functions
     if (( ! ${precmd_functions[(Ie)_bitty_prompt_hook]} )); then
         precmd_functions+=(_bitty_prompt_hook)
     fi
-fi
-eval "$(bitty completion zsh)"
-if (( $+functions[compdef] )); then
-    compdef _bitty bitty
+    if (( ! ${preexec_functions[(Ie)_bitty_preexec_hook]} )); then
+        preexec_functions+=(_bitty_preexec_hook)
+    fi
 fi
 "#;
 
-/// Fish integration: `fish_prompt`-event hook (OSC 133 `D` status, OSC 7
-/// cwd, OSC 133 `A` prompt-start) plus `bitty completion fish`.
-const FISH_SCRIPT: &str = r#"# bitty shell integration for Fish (static; generated, do not edit).
+/// Fish hooks: `fish_prompt` event (OSC 133 `D` status, OSC 7 cwd, OSC 133
+/// `A` prompt-start) plus `fish_preexec` event (OSC 133 `B` command-start).
+const FISH_HOOKS: &str = r#"# bitty shell integration for Fish (static; generated, do not edit).
 # Enable with: bitty shell-init fish | source in config.fish
-# - Tab completion via `bitty completion fish` (sourced below).
-# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
-#   command-done-with-status (D) marks (observation only; ignored by
-#   terminals without support).
+# - Tab completion follows this block (generated from the CLI grammar).
+#   The script never invokes `bitty` at startup, so an absent or older
+#   binary cannot break shell startup.
+# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A),
+#   command-start (B via fish_preexec), and command-done-with-status (D)
+#   marks (observation only; ignored by terminals without support).
+# - Runs on every prompt path: the fish_prompt event fires for multiline
+#   edits and vi-mode (fish_vi_key_bindings) alike.
+# - Safe in non-interactive fish (`status is-interactive` false): no hook
+#   fires and no completion is queried, so sourcing stays silent.
 # - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
 #   Hostname passes through verbatim (DNS-safe, authority must match).
+# - Re-sourcing is a no-op.
 if not set -q _BITTY_SHELL_INIT
     set -g _BITTY_SHELL_INIT 1
     # Encode a path for OSC 7: keep unreserved and slash, encode the rest.
@@ -217,27 +280,31 @@ if not set -q _BITTY_SHELL_INIT
     function _bitty_prompt_hook --on-event fish_prompt
         set -l _bitty_status $status
         printf '\e]133;D;%s\e\\' $_bitty_status
-        printf '\e]7;file://%s%s\e\\' (hostname) (_bitty_urlencode (pwd))
+        printf '\e]7;file://%s%s\e\\' (hostname 2>/dev/null) (_bitty_urlencode (pwd))
         printf '\e]133;A\e\\'
     end
+    function _bitty_preexec_hook --on-event fish_preexec
+        printf '\e]133;B\e\\'
+    end
 end
-bitty completion fish | source
 "#;
 
-/// PowerShell integration: wrapped `prompt` (OSC 133 `D` status, OSC 7 cwd,
-/// OSC 133 `A` prompt-start; the previous prompt is chained, never dropped)
-/// plus `bitty completion powershell`.
-const POWERSHELL_SCRIPT: &str = r#"# bitty shell integration for PowerShell (static; generated, do not edit).
+/// PowerShell hooks: wrapped `prompt` (OSC 133 `D` status, OSC 7 cwd, OSC 133
+/// `A` prompt-start; the previous prompt is chained, never dropped) plus a
+/// guarded PSReadLine Enter handler (OSC 133 `B` command-start).
+const POWERSHELL_HOOKS: &str = r#"# bitty shell integration for PowerShell (static; generated, do not edit).
 # Enable with: bitty shell-init powershell | Out-String | Invoke-Expression in $PROFILE
-# - Tab completion via `bitty completion powershell` (invoked below).
-# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
-#   command-done-with-status (D) marks (observation only; ignored by
-#   terminals without support).
-# - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
-#   Hostname passes through verbatim (DNS-safe, authority must match).
+# - Tab completion follows this block (generated from the CLI grammar and
+#   registered once). The script never invokes `bitty` at startup, so an
+#   absent or older binary cannot break shell startup.
+# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A),
+#   command-start (B via PSReadLine Enter), and command-done-with-status (D)
+#   marks (observation only; ignored by terminals without support).
+# - Safe under `Set-StrictMode -Version Latest`; re-sourcing is a no-op.
 if (-not (Test-Path variable:global:_BittyShellInit)) {
     $global:_BittyShellInit = $true
-    $global:_BittyPromptChain = (Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue).ScriptBlock
+    $bitty_previous_prompt = Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue | Select-Object -First 1
+    $global:_BittyPromptChain = if ($bitty_previous_prompt) { $bitty_previous_prompt.ScriptBlock } else { $null }
     # Encode a path for OSC 7: backslashes become slashes, then each
     # segment is escaped. Drive-letter colon (C:) survives for file URIs.
     function Global:_BittyUrlEncode([string]$Path) {
@@ -254,8 +321,9 @@ if (-not (Test-Path variable:global:_BittyShellInit)) {
     function global:prompt {
         # Prefer the native exit code: $? alone collapses every native
         # failure to 1 (a native command exiting 42 must report D;42).
-        $status = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
-        $host_name = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { hostname }
+        # Test-Path guards StrictMode when no native command ran yet.
+        $status = if ($?) { 0 } elseif (Test-Path variable:global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
+        $host_name = [System.Net.Dns]::GetHostName()
         $uri_path = _BittyUrlEncode (Get-Location).Path
         if ($uri_path -notmatch '^/') { $uri_path = '/' + $uri_path }
         $esc = [char]27
@@ -264,13 +332,31 @@ if (-not (Test-Path variable:global:_BittyShellInit)) {
         Write-Host -NoNewline "$esc]133;A$esc\"
         if ($global:_BittyPromptChain) { & $global:_BittyPromptChain } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
     }
+    if (Get-Module -ListAvailable -Name PSReadLine) {
+        try {
+            # Command-start mark from the validation hook: PSReadLine calls
+            # it before execution for every accepted line, including commands
+            # dropped from history as duplicates. Multiline Enter behavior is
+            # untouched (unlike replacing the Enter key handler).
+            $global:_BittyCommandValidationHandler = (Get-PSReadLineOption).CommandValidationHandler
+            Set-PSReadLineOption -CommandValidationHandler {
+                param($commandAst)
+                if ($global:_BittyCommandValidationHandler) {
+                    & $global:_BittyCommandValidationHandler $commandAst
+                }
+                $esc = [char]27
+                [Console]::Write("$esc]133;B$esc\")
+            }
+        } catch {
+            # A host without a usable PSReadLine keeps prompt marks only.
+        }
+    }
 }
-bitty completion powershell | Out-String | Invoke-Expression
 "#;
 
-/// Nushell integration: `pre_prompt` hook (OSC 133 `D` status, OSC 7 cwd,
-/// OSC 133 `A` prompt-start; existing hooks are kept) plus the inlined
-/// `bitty completion nushell` definitions.
+/// Nushell hooks: `pre_prompt` (OSC 133 `D` status, OSC 7 cwd, OSC 133 `A`
+/// prompt-start) plus an optional `pre_execution` (OSC 133 `B`
+/// command-start). Existing hooks are kept.
 ///
 /// The completion definitions are inlined (shared with the
 /// `bitty completion nushell` output) because Nushell resolves `source`
@@ -285,13 +371,15 @@ bitty completion powershell | Out-String | Invoke-Expression
 /// registration in the child and it would emit no marks (#1856). Probing
 /// actual hook state keeps re-sourcing exactly-once per session while child
 /// sessions self-configure.
-const NUSHELL_HEADER: &str = r##"# bitty shell integration for Nushell (static; generated, do not edit).
+const NUSHELL_HOOKS: &str = r##"# bitty shell integration for Nushell (static; generated, do not edit).
 # Enable with: bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu
 # then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu
 # - Tab completion inlined below (same output as `bitty completion nushell`).
 #   Inlined because Nushell parses `source` paths before running `save -f`,
 #   so a save-then-source roundtrip of a just-written file cannot load.
-# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A) and
+#   The script never invokes `bitty` at startup.
+# - Prompt hooks: OSC 7 cwd report plus OSC 133 prompt-start (A),
+#   command-start (B via pre_execution when the session supports it), and
 #   command-done-with-status (D) marks (observation only; ignored by
 #   terminals without support).
 # - OSC 7 cwd is percent-encoded (RFC 3986 unreserved plus slash kept).
@@ -303,30 +391,39 @@ const NUSHELL_HEADER: &str = r##"# bitty shell integration for Nushell (static; 
 if not (try { $env.config.hooks.pre_prompt? | default [] | any {|h| try { $h | to nuon --serialize | str contains "# bitty-shell-init" } catch { false } } } catch { false }) {
     $env.config = ($env.config | default {} hooks | upsert hooks.pre_prompt ((try { $env.config.hooks.pre_prompt } catch { [] }) ++ [{||
         # bitty-shell-init
-        print -n $"\e]133;D;($env.LAST_EXIT_CODE)\e\\"
+        print -n $"\e]133;D;($env.LAST_EXIT_CODE? | default 0)\e\\"
         print -n $"\e]7;file://(sys host | get hostname)(pwd | str replace --all "\\" "/" | url encode | str replace --all ':' '%3A' | str replace --regex '^([A-Za-z])%3A/' '$1:/')\e\\"
         print -n "\e]133;A\e\\"
     }]))
 }
+# Command-start (B) is separate and optional: older Nushell versions have no
+# pre_execution hook key, so an unsupported session simply skips this mark.
+try {
+    if not ($env.config.hooks.pre_execution? | default [] | any {|h| try { $h | to nuon --serialize | str contains "# bitty-shell-init-command" } catch { false } }) {
+        $env.config = ($env.config | upsert hooks.pre_execution ((try { $env.config.hooks.pre_execution } catch { [] }) ++ [{||
+            # bitty-shell-init-command
+            print -n "\e]133;B\e\\"
+        }]))
+    }
+} catch {
+}
 "##;
 
-/// Static shell-integration script for a shell (hooks + completion wiring).
+/// Static shell-integration script for a shell (hooks + inlined completion).
 ///
-/// Nushell returns an owned script: the prompt-hook header plus the shared
-/// `bitty completion nushell` definitions inlined, so no parse-time `source`
-/// of a just-written file is needed.
+/// The completion definitions are generated from [`crate::grammar`] and
+/// inlined rather than evaled from `bitty completion <shell>`, so sourcing
+/// never runs the binary (absent/older binaries stay harmless).
 #[must_use]
 pub fn shell_init_script(shell: CompletionShell) -> Cow<'static, str> {
-    match shell {
-        CompletionShell::Bash => Cow::Borrowed(BASH_SCRIPT),
-        CompletionShell::Zsh => Cow::Borrowed(ZSH_SCRIPT),
-        CompletionShell::Fish => Cow::Borrowed(FISH_SCRIPT),
-        CompletionShell::Powershell => Cow::Borrowed(POWERSHELL_SCRIPT),
-        CompletionShell::Nushell => Cow::Owned(format!(
-            "{NUSHELL_HEADER}{}",
-            completion_script(CompletionShell::Nushell)
-        )),
-    }
+    let hooks = match shell {
+        CompletionShell::Bash => BASH_HOOKS,
+        CompletionShell::Zsh => ZSH_HOOKS,
+        CompletionShell::Fish => FISH_HOOKS,
+        CompletionShell::Powershell => POWERSHELL_HOOKS,
+        CompletionShell::Nushell => NUSHELL_HOOKS,
+    };
+    Cow::Owned(format!("{hooks}\n{}", completion_script(shell)))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,17 +476,24 @@ pub fn shell_init_help_text() -> String {
          Usage: bitty shell-init <shell>\n\
          \n\
          Prints a static shell-integration script for <shell> (one of {}) to stdout.\n\
-         The script wires Tab completion (via the matching `bitty completion <shell>`\n\
-         output) and installs prompt hooks that report cwd (OSC 7) plus\n\
-         prompt-start and exit-status marks (OSC 133) for shell-integration parity.\n\
+         The script inlines Tab completion for the full CLI grammar (first-level\n\
+         words, nested verbs, and flags) and installs prompt hooks that report\n\
+         cwd (OSC 7) plus prompt-start, command-start, and exit-status marks\n\
+         (OSC 133). It never invokes `bitty` while sourcing, so an absent or\n\
+         older binary cannot break shell startup.\n\
          \n\
          Enable it from your shell startup file:\n\
-         \x20 bash:       eval \"$(bitty shell-init bash)\"  (~/.bashrc)\n\
-         \x20 zsh:        eval \"$(bitty shell-init zsh)\"  (~/.zshrc)\n\
-         \x20 fish:       bitty shell-init fish | source  (config.fish)\n\
-         \x20 powershell: bitty shell-init powershell | Out-String | Invoke-Expression  ($PROFILE)\n\
-         \x20 nushell:    save once, then `source` it from config.nu (see the script header).\n",
-        shell_list()
+         \x20 bash:       {}  (~/.bashrc)\n\
+         \x20 zsh:        {}  (~/.zshrc)\n\
+         \x20 fish:       {}  (config.fish)\n\
+         \x20 powershell: {}  ($PROFILE)\n\
+         \x20 nushell:    {}  (then `source` it from config.nu)\n",
+        shell_list(),
+        install_line(CompletionShell::Bash),
+        install_line(CompletionShell::Zsh),
+        install_line(CompletionShell::Fish),
+        install_line(CompletionShell::Powershell),
+        install_line(CompletionShell::Nushell),
     )
 }
 
@@ -496,6 +600,14 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    const SHELLS: [CompletionShell; 5] = [
+        CompletionShell::Bash,
+        CompletionShell::Zsh,
+        CompletionShell::Fish,
+        CompletionShell::Powershell,
+        CompletionShell::Nushell,
+    ];
+
     #[test]
     fn shells_parse_case_insensitive_with_aliases() {
         assert_eq!(
@@ -519,70 +631,49 @@ mod tests {
     }
 
     #[test]
-    fn scripts_carry_hooks_and_completion_wiring() {
-        let wiring = [
-            (CompletionShell::Bash, "bitty completion bash"),
-            (CompletionShell::Zsh, "bitty completion zsh"),
-            (CompletionShell::Fish, "bitty completion fish"),
-            (CompletionShell::Powershell, "bitty completion powershell"),
-            (CompletionShell::Nushell, "bitty completion nushell"),
-        ];
-        for (shell, wire) in wiring {
+    fn scripts_carry_hooks_and_inlined_completion() {
+        for shell in SHELLS {
             let script = shell_init_script(shell);
             assert!(script.contains("bitty"), "shell: {shell:?}");
-            assert!(
-                script.contains("]133;"),
-                "shell {shell:?} marks OSC 133 prompt/status"
-            );
+            for mark in ["]133;A", "]133;B", "]133;D;"] {
+                assert!(
+                    script.contains(mark),
+                    "shell {shell:?} emits OSC 133 {mark:?}"
+                );
+            }
             assert!(script.contains("]7;"), "shell {shell:?} reports OSC 7 cwd");
             assert!(
-                script.contains(wire),
-                "shell {shell:?} wires Tab completion via {wire:?}"
+                script.contains(completion_script(shell).trim()),
+                "shell {shell:?} inlines the matching completion script"
             );
         }
-        // Every script guards its hook wiring with a shell-native
-        // conditional, so re-sourcing never duplicates hooks. Each guard
-        // must textually precede the hook it protects (marker presence
-        // alone is not enough: an unguarded marker would pass that check
-        // while still duplicating hooks on re-source).
-        let guards = [
-            (
-                CompletionShell::Bash,
-                r#"if [ -z "${_BITTY_SHELL_INIT:-}" ]"#,
-                "_bitty_prompt_hook",
-            ),
-            (
-                CompletionShell::Zsh,
-                "if (( ! ${+_BITTY_SHELL_INIT} ))",
-                "_bitty_prompt_hook",
-            ),
-            (
-                CompletionShell::Fish,
-                "if not set -q _BITTY_SHELL_INIT",
-                "_bitty_prompt_hook",
-            ),
-            (
-                CompletionShell::Powershell,
-                "if (-not (Test-Path variable:global:_BittyShellInit))",
-                "global:prompt",
-            ),
-            (
-                CompletionShell::Nushell,
-                "to nuon --serialize",
-                "upsert hooks.pre_prompt",
-            ),
-        ];
-        for (shell, guard, hook) in guards {
+    }
+
+    #[test]
+    fn scripts_never_invoke_bitty_at_startup() {
+        // #2372: sourcing must not fail when `bitty` is absent or older.
+        // Only comment lines may mention `bitty completion` / `bitty shell-init`.
+        for shell in SHELLS {
             let script = shell_init_script(shell);
+            for line in script.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || trimmed.starts_with("extern \"bitty") {
+                    continue;
+                }
+                assert!(
+                    !trimmed.contains("bitty completion") && !trimmed.contains("bitty shell-init"),
+                    "shell {shell:?} invokes bitty while sourcing: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_install_line_is_emitted_verbatim() {
+        for shell in SHELLS {
             assert!(
-                script.contains(guard),
-                "shell {shell:?} guards double-sourcing with {guard:?}"
-            );
-            let guard_pos = script.find(guard).unwrap_or(usize::MAX);
-            let hook_pos = script.find(hook).unwrap_or(0);
-            assert!(
-                guard_pos < hook_pos,
-                "shell {shell:?} guard precedes hook wiring"
+                shell_init_script(shell).contains(install_line(shell)),
+                "shell {shell:?} header/help names its install line"
             );
         }
     }
@@ -590,10 +681,6 @@ mod tests {
     #[test]
     fn bash_hook_runs_first_and_keeps_array_prompt_command() {
         let script = shell_init_script(CompletionShell::Bash);
-        // The hook must precede existing prompt commands: anything running
-        // before it would overwrite $? and mask the previous command's
-        // real status (verified: append form captures 0 after `false`
-        // when a prior entry succeeds; prepend form captures 1).
         assert!(
             script.contains(
                 r#"PROMPT_COMMAND="_bitty_prompt_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}""#
@@ -606,7 +693,6 @@ mod tests {
             ),
             "bash no longer appends the hook after existing PROMPT_COMMAND"
         );
-        // Array-valued PROMPT_COMMAND keeps every existing entry.
         assert!(
             script.contains("declare -a "),
             "bash detects array-valued PROMPT_COMMAND"
@@ -618,10 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn zsh_registers_completion_via_compdef() {
+    fn zsh_registers_completion_and_preexec_once() {
         let script = shell_init_script(CompletionShell::Zsh);
-        // Evaluating the completion body only defines _bitty; Tab
-        // completion needs compdef registration once compinit has run.
         assert!(
             script.contains("compdef _bitty bitty"),
             "zsh registers _bitty via compdef"
@@ -630,42 +714,82 @@ mod tests {
             script.contains("$+functions[compdef]"),
             "zsh only calls compdef when the completion system is loaded"
         );
-    }
-
-    #[test]
-    fn powershell_reports_native_exit_code() {
-        let script = shell_init_script(CompletionShell::Powershell);
-        // $? is boolean: a native command exiting 42 must report D;42,
-        // not D;1. A zero/unset LASTEXITCODE still falls back to 1 so a
-        // failed cmdlet after a successful native command is not masked.
         assert!(
-            script.contains("$LASTEXITCODE"),
-            "powershell prefers the native exit code"
+            script.contains("preexec_functions+=(_bitty_preexec_hook)"),
+            "zsh registers the command-start hook"
+        );
+        assert!(
+            script.contains("precmd_functions[(Ie)_bitty_prompt_hook]"),
+            "zsh registers the prompt hook exactly once"
         );
     }
 
     #[test]
+    fn fish_registers_prompt_preexec_and_completion_once() {
+        let script = shell_init_script(CompletionShell::Fish);
+        assert!(
+            script.contains("--on-event fish_prompt"),
+            "fish hooks every prompt"
+        );
+        assert!(
+            script.contains("--on-event fish_preexec"),
+            "fish marks command start"
+        );
+        assert!(
+            script.contains("if not set -q _BITTY_COMPLETION_FISH"),
+            "fish registers completion exactly once"
+        );
+    }
+
+    #[test]
+    fn powershell_is_strict_mode_safe() {
+        let script = shell_init_script(CompletionShell::Powershell);
+        // StrictMode throws on an unset variable; LASTEXITCODE is only
+        // defined after the first native command.
+        assert!(
+            script.contains("Test-Path variable:global:LASTEXITCODE"),
+            "powershell guards LASTEXITCODE under StrictMode"
+        );
+        assert!(
+            script.contains("_BittyCompletionRegistered"),
+            "powershell registers completion exactly once"
+        );
+        assert!(
+            script.contains("PSReadLine"),
+            "powershell marks command start via PSReadLine"
+        );
+        assert!(
+            script.contains("CommandValidationHandler"),
+            "powershell marks every accepted line, including history duplicates"
+        );
+    }
+
+    #[test]
+    fn bash_ps0_emits_command_start_mark() {
+        let script = shell_init_script(CompletionShell::Bash);
+        assert!(script.contains("PS0="), "bash sets PS0 for command start");
+        assert!(script.contains("]133;B"), "PS0 carries the B mark");
+    }
+
+    #[test]
     fn osc7_cwd_is_percent_encoded() {
-        // CTX-1074: every hook must encode cwd before OSC 7 insertion.
-        // Table: RFC 3986 unreserved plus slash kept, rest pct-encoded.
-        // Hostname passes through verbatim. Drive colon survives.
         let bash = shell_init_script(CompletionShell::Bash);
         assert!(bash.contains("_bitty_urlencode"), "bash defines encoder");
         assert!(
-            bash.contains(r#"$(_bitty_urlencode "$PWD")"#),
+            bash.contains(r#"$(_bitty_urlencode "${PWD:-.}")"#),
             "bash encodes PWD for OSC 7"
         );
         assert!(bash.contains("%%%02X"), "bash pct-encodes via printf");
         assert!(bash.contains("%3A"), "bash encodes non-drive colons");
         assert!(
-            bash.contains(r#""$HOSTNAME""#),
+            bash.contains(r#""${HOSTNAME:-$(uname -n 2>/dev/null)}""#),
             "bash passes hostname through verbatim"
         );
 
         let zsh = shell_init_script(CompletionShell::Zsh);
         assert!(zsh.contains("_bitty_urlencode"), "zsh defines encoder");
         assert!(
-            zsh.contains(r#"$(_bitty_urlencode "$PWD")"#),
+            zsh.contains(r#"$(_bitty_urlencode "${PWD:-.}")"#),
             "zsh encodes PWD for OSC 7"
         );
         assert!(zsh.contains("%%%02X"), "zsh pct-encodes via printf");
@@ -681,7 +805,7 @@ mod tests {
             "fish encodes pwd for OSC 7"
         );
         assert!(
-            fish.contains("(hostname)"),
+            fish.contains("(hostname 2>/dev/null)"),
             "fish passes hostname through verbatim"
         );
         assert!(fish.contains("%3[Aa]"), "fish preserves drive-letter colon");
@@ -734,10 +858,6 @@ mod tests {
 
     #[test]
     fn nushell_inlines_completion_without_save_then_source() {
-        // Nushell parses `source` paths before running `save -f`, so a
-        // save-then-source roundtrip of a just-written file cannot load on
-        // first setup. The init script inlines the shared completion
-        // definitions instead (comment lines still name the install step).
         let script = shell_init_script(CompletionShell::Nushell);
         let code_lines: Vec<&str> = script
             .lines()
@@ -753,7 +873,7 @@ mod tests {
                 .any(|line| line.split_whitespace().any(|word| word == "source")),
             "nushell init must not source a just-written file at runtime"
         );
-        for marker in ["nu-complete bitty commands", "extern \"bitty\""] {
+        for marker in ["extern \"bitty\"", "extern \"bitty ctl\""] {
             assert!(
                 script.contains(marker),
                 "nushell init inlines completion ({marker:?} missing)"
@@ -767,11 +887,6 @@ mod tests {
 
     #[test]
     fn nushell_guard_probes_hooks_not_env() {
-        // #1856: `$env.*` entries are real OS environment variables, so a
-        // child nu inherits the guard var while starting with a fresh
-        // `$env.config` — an env-var guard skips hook registration in the
-        // child and it emits no marks. The guard must probe the session's
-        // own hooks list for the marker closure instead.
         let script = shell_init_script(CompletionShell::Nushell);
         assert!(
             !script.contains("BITTY_SHELL_INIT"),
@@ -785,18 +900,10 @@ mod tests {
             script.contains(r##"str contains "# bitty-shell-init""##),
             "nushell guard looks for the full marker, not the bare filename stem"
         );
-        // Each hook is probed element-wise: a single unserializable entry
-        // (e.g. a plugin custom value, which `to nuon --serialize` rejects)
-        // must not poison the whole probe into re-registering on every
-        // re-source, nor may a probe error abort the init script (which
-        // would also drop the inlined completion below).
         assert!(
             script.contains("any {|h| try { $h | to nuon --serialize"),
             "nushell guard isolates per-hook serialization failures"
         );
-        // The marker lives inside the registered closure (header comments
-        // are not part of the hooks list, so only a closure-body marker is
-        // visible to the probe after registration).
         let register_pos = script.find("upsert hooks.pre_prompt").unwrap_or(usize::MAX);
         assert!(
             register_pos < script.len() && script[register_pos..].contains("# bitty-shell-init"),
@@ -845,7 +952,18 @@ mod tests {
         for shell in ["bash", "zsh", "fish", "powershell", "nushell"] {
             assert!(text.contains(shell), "help names {shell}");
         }
-        assert!(text.contains("bitty completion"), "help names wiring");
+        for line in [
+            install_line(CompletionShell::Bash),
+            install_line(CompletionShell::Zsh),
+            install_line(CompletionShell::Fish),
+            install_line(CompletionShell::Powershell),
+            install_line(CompletionShell::Nushell),
+        ] {
+            assert!(
+                text.contains(line),
+                "help names working install line {line:?}"
+            );
+        }
         assert!(text.contains("OSC 7"), "help names cwd report");
         assert!(text.contains("OSC 133"), "help names status marks");
     }

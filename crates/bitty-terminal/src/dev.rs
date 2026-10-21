@@ -265,6 +265,10 @@ pub enum CaptureLayout {
 }
 
 impl CaptureLayout {
+    /// Layout names accepted by `--layout` (single source for completion).
+    #[cfg(test)]
+    pub const NAMES: &[&str] = &["single", "split", "stack", "overlay"];
+
     /// Parses a `--layout` spec (case-insensitive, surrounding whitespace ignored).
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -305,6 +309,9 @@ pub enum OverlayName {
 }
 
 impl OverlayName {
+    /// Overlay names accepted by `overlay show` (single source for completion).
+    pub const NAMES: &[&str] = &["damage", "cells", "glyphs", "images", "layout", "banner"];
+
     /// Parses an overlay name (case-insensitive).
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -606,6 +613,16 @@ fn reject_remote_flag(token: &str) -> Result<(), DevParseError> {
     }
     Ok(())
 }
+
+/// `bitty dev` verbs in help order (single source for shell completion and
+/// the parser's documented grammar).
+pub const DEV_VERBS: &[&str] = &["trace", "capture", "synthesize", "dump", "overlay"];
+/// `bitty dev trace` subverbs.
+pub const DEV_TRACE_SUBVERBS: &[&str] = &["startup", "latency"];
+/// `bitty dev dump` subverbs.
+pub const DEV_DUMP_SUBVERBS: &[&str] = &["grid", "scene", "atlas"];
+/// `bitty dev overlay` subverbs.
+pub const DEV_OVERLAY_SUBVERBS: &[&str] = &["list", "show"];
 
 /// Parses raw tokens after the `dev` word into a validated request.
 ///

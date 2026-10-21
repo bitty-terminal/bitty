@@ -113,7 +113,7 @@ pub const EXIT_CONFLICT: i32 = 8;
 mod apply;
 mod client;
 mod render;
-mod request;
+pub(crate) mod request;
 
 // ---------------------------------------------------------------------------
 // `bitty ctl` CLI entry point (relocated from `main.rs`, CTX-0305)

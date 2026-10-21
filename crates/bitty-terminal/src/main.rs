@@ -242,6 +242,7 @@ mod ctl;
 mod dev;
 mod doctor;
 mod editor_host;
+mod grammar;
 mod init;
 mod inspect;
 mod ipc_serve;

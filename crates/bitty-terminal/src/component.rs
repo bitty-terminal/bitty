@@ -225,17 +225,23 @@ pub enum ComponentVerb {
 }
 
 impl ComponentVerb {
+    /// Every extension verb in help order (single source for parsing and
+    /// shell completion; never duplicate this list).
+    pub const VERBS: &[(&str, Self)] = &[
+        ("list", Self::List),
+        ("add", Self::Add),
+        ("install", Self::Install),
+        ("remove", Self::Remove),
+        ("show-source", Self::ShowSource),
+    ];
+
     /// Parse a verb token.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        match token {
-            "list" => Some(Self::List),
-            "add" => Some(Self::Add),
-            "install" => Some(Self::Install),
-            "remove" => Some(Self::Remove),
-            "show-source" => Some(Self::ShowSource),
-            _ => None,
-        }
+        Self::VERBS
+            .iter()
+            .find(|(name, _)| *name == token)
+            .map(|(_, verb)| *verb)
     }
 
     /// Canonical verb name for output/errors.

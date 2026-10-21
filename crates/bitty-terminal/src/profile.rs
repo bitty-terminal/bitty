@@ -40,7 +40,7 @@ pub(crate) fn profile_usage() -> String {
 
 /// A profile sub-verb parsed from `config_args`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileVerb {
+pub(crate) enum ProfileVerb {
     List,
     Show,
     Use,
@@ -48,14 +48,20 @@ enum ProfileVerb {
 }
 
 impl ProfileVerb {
+    /// Every profile sub-verb in help order (single source for shell
+    /// completion).
+    pub(crate) const VERBS: &[(&str, Self)] = &[
+        ("list", Self::List),
+        ("show", Self::Show),
+        ("use", Self::Use),
+        ("path", Self::Path),
+    ];
+
     fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "list" => Some(Self::List),
-            "show" => Some(Self::Show),
-            "use" => Some(Self::Use),
-            "path" => Some(Self::Path),
-            _ => None,
-        }
+        Self::VERBS
+            .iter()
+            .find(|(name, _)| *name == raw)
+            .map(|(_, verb)| *verb)
     }
 
     fn needs_name(self) -> bool {

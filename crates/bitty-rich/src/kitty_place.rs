@@ -3,9 +3,9 @@
 //! Bounded Kitty `APC G` intake (chunked `m=` assembly) is owned by
 //! `bitty-vt`'s `kitty_apc`; the retired `bitty-rich` placeholder stub is
 //! not part of this path (bitty#2358). The bounded Kitty payload decoder
-//! used to live here in
-//! `kitty_decode` (W-141 extraction): it now lives in the `bitty-graphics`
-//! extension crate, which mirrors texture-preparation mechanics
+//! used to live here in `kitty_decode` (W-141 extraction): it now lives in
+//! the graphics extension crate behind the Core-owned
+//! [`crate::kitty_seam`] traits, which mirrors texture-preparation mechanics
 //! (nearest-neighbor scaling, the per-frame blit budget, its own raster
 //! cache copy); Core owns its raster cache in [`crate::kitty_raster`]
 //! (S6, #1849).
@@ -118,7 +118,7 @@
 //! ([`KITTY_DECODE_MAX_DIMENSION`]/[`KITTY_DECODE_MAX_PIXELS`]/[`KITTY_DECODE_MAX_BYTES`]:
 //! 8192 px/side, 4096 x 4096 px area, 64 MiB RGBA) rather than
 //! inventing its own. These are Core policy constants mirroring the
-//! versioned graphics contract; the `bitty-graphics` extension holds its
+//! versioned graphics contract; the graphics extension holds its
 //! own copies and receives limits per request, never via a Core import
 //! (one-way dependencies). Every
 //! length is validated with checked arithmetic **before** any buffer is
@@ -142,7 +142,7 @@
 //! blits / [`KITTY_PRESENT_MAX_BYTES_PER_FRAME`] bytes per frame
 //! (skip-and-continue in paint order), so the pathological 128-placement
 //! transient (128 x 64 MiB) can never materialize. The frame-budget
-//! accounting type lives in the `bitty-graphics` extension with the rest
+//! accounting type lives in the graphics extension with the rest
 //! of the texture-preparation mechanics (which keeps its own cache copy);
 //! Core owns its bounded raster cache alongside it
 //! ([`crate::kitty_raster::KittyRasterCache`], S6 #1849, same 32 / 64 MiB
@@ -153,7 +153,7 @@
 //! normative site for the Kitty present per-frame quotas (32 blits,
 //! 64 MiB). `bitty-render`'s `MAX_IMAGE_BLITS_PER_FRAME` /
 //! `MAX_IMAGE_UPLOAD_BYTES_PER_FRAME` mirror these values (see
-//! `bitty-render/src/batch.rs`), and the `bitty-graphics` extension holds
+//! `bitty-render/src/batch.rs`), and the graphics extension holds
 //! its own `KITTY_PRESENT_MAX_*` copies received per request. Values here
 //! must not change without updating the mirrors; this note declares truth,
 //! no value changes.
@@ -300,7 +300,7 @@ use bitty_term_state::{KittyUnicodeCell, KittyUnicodeRun};
 
 /// Kitty `f=` value for PNG payloads (Core-retained contract mirror).
 ///
-/// The bounded decoder moved to the `bitty-graphics` extension (W-141),
+/// The bounded decoder moved to the graphics extension (W-141),
 /// which holds its own copy. Core keeps this mirror so wire-format
 /// admission (`UnknownFormat` mapping) and declared-size pre-checks stay
 /// Core-owned; the two sides must not drift (same values, per-request
@@ -2651,12 +2651,12 @@ pub fn placement_full_rect_for(
 }
 
 // ---------------------------------------------------------------------------
-// Texture-preparation mechanics (mirrored in `bitty-graphics`, W-141)
+// Texture-preparation mechanics (mirrored in the graphics extension, W-141)
 // ---------------------------------------------------------------------------
 
 // Nearest-neighbor scaling (`rasterize`, `rasterize_clipped`) and the
 // per-frame blit budget (`KittyFrameBudget`) are mirrored in the
-// `bitty-graphics` extension crate (which keeps its own cache copy).
+// graphics extension crate (which keeps its own cache copy).
 // Core owns its bounded raster cache in [`crate::kitty_raster`]
 // (`KittyRasterKey`/`KittyRasterCache` with the
 // `KITTY_RASTER_CACHE_MAX_*` caps, S6 #1849). The ceilings stay Core-owned

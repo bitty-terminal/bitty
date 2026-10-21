@@ -11,9 +11,9 @@
 //! 4096 x 4096 px area, 64 MiB RGBA) and the raster step
 //! ([`bitty_rich::kitty_raster`]: nearest-neighbor plus the Core-owned
 //! bounded raster cache, S6 #1849), both consumed behind the Core-owned
-//! [`bitty_rich::kitty_seam`] traits; the `bitty-graphics` extension
-//! implements the same traits on its side, and Core never depends on
-//! extension internals. Placement policy (admission, per-origin quotas, origin
+//! [`bitty_rich::kitty_seam`] traits; the graphics extension implements the
+//! same traits on its side, and Core never depends on extension internals.
+//! Placement policy (admission, per-origin quotas, origin
 //! tagging, alternate-screen suppression) is unchanged and unit-tested in
 //! `bitty-rich`.
 //!
@@ -93,7 +93,7 @@
 //! has deterministic two-layer semantics.
 
 use super::*;
-use bitty_rich::KittyDecodeBackend as _;
+use bitty_rich::kitty_seam::{KittyDecodeBackend as _, KittyTransmitFormat};
 
 /// Typed Kitty display-routing rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,8 +358,8 @@ impl Runtime {
         width_s: Option<u32>,
         height_v: Option<u32>,
         payload_len: usize,
-    ) -> Result<bitty_rich::KittyTransmitFormat, KittyImageError> {
-        let format = bitty_rich::KittyTransmitFormat::from_f(format_f)
+    ) -> Result<KittyTransmitFormat, KittyImageError> {
+        let format = KittyTransmitFormat::from_f(format_f)
             .ok_or(KittyImageError::UnknownFormat(format_f))?;
         bitty_rich::precheck_declared_image(format.raw_channels(), width_s, height_v, payload_len)
             .map_err(KittyImageError::Decode)?;
@@ -1741,7 +1741,7 @@ impl Runtime {
             // Support probe, spec (`i=` plus payload): test-load without
             // storing; `p=` (if any) is ignored per kitty `:2549`.
             let image_id = control.image_id;
-            let Some(format) = bitty_rich::KittyTransmitFormat::from_f(format_f) else {
+            let Some(format) = KittyTransmitFormat::from_f(format_f) else {
                 return Some((
                     crate::queries::kitty_probe_einval_reply(image_id, "unknown format"),
                     false,

@@ -7,6 +7,20 @@
 //! module owns the shape validation and the bounded `UiNode` representation
 //! that crosses the host bridge.
 //!
+//! # Additive style and interaction fields
+//!
+//! Every v1 kind additionally accepts optional `fg`/`bg` theme-token names, a
+//! `bold` boolean, and `on_click`/`on_scroll` command bindings carrying an
+//! optional per-item `region` identity (CTX-0890, CTX-1190, issue #2248). All
+//! fields are bounded declarative data: no functions, no coordinates, no raw
+//! colours, and no capability grants. A container's declaration applies to
+//! descendant spans that do not declare their own (nearest declaration wins).
+//!
+//! Host parity (issue #2191, CTX-1419): the band host paints `fg`/`bg`/`bold`
+//! and routes `on_click`/`on_scroll`; the overlay host paints the same style
+//! fields. Overlay click/scroll routing is not part of the accepted contract
+//! yet and remains a design note, not a shipped claim.
+//!
 //! # Budgets
 //!
 //! | ID     | Dimension                          | Bound  | Source |
@@ -288,9 +302,11 @@ pub struct UiRegion {
 /// Click command binding for interactive UiNode elements (CTX-0890).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickCommand {
-    /// Command identifier (max 128 bytes).
+    /// Command identifier (1..=[`UI_CLICK_MAX_COMMAND_BYTES`] bytes).
     pub command: String,
-    /// Command arguments (max 8 args, each max 256 bytes; only scalar values).
+    /// Command arguments (at most [`UI_CLICK_MAX_ARGS`] entries, keys at most
+    /// [`UI_CLICK_MAX_ARG_KEY_BYTES`] bytes, and string values at most
+    /// [`UI_CLICK_MAX_ARG_BYTES`] bytes; only scalar values).
     pub args: Vec<(String, ClickArg)>,
     /// Optional per-item hit region this binding belongs to (issue #2248).
     ///

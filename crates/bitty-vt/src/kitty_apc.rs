@@ -98,7 +98,7 @@ const KITTY_APC_CODEC_SCRATCH_BYTES: usize = 4;
 pub const KITTY_APC_STALL_MAX_BYTES: usize = 64 * 1024;
 
 /// Side cap mirroring `bitty-rich::kitty_place::KITTY_DECODE_MAX_DIMENSION`
-/// (W-141: the decoder moved to the `bitty-graphics` extension; the
+/// (W-141: the decoder moved to the graphics extension; the
 /// Core-retained ceiling now lives in `kitty_place`).
 pub const KITTY_APC_DECODE_MAX_DIMENSION: u32 = 8192;
 

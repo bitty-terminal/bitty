@@ -27,30 +27,65 @@
 //! `bitty-ipc` dependency to `crates/bitty-rich/Cargo.toml` fails a test
 //! here; removing the offending change passes again.
 //!
-//! Scope note: the retained scene/image/place/background modules, the
-//! legacy `kitty` placeholder stub, and the decode/raster seam copies are
-//! governed by the `W-133` retention decision and their own tracked
-//! follow-ups, not by this retirement.
+//! CTX-1415 (bitty#2358 / bitty#2359) retired the two remaining unwired
+//! legacy surfaces:
+//!
+//! - `src/kitty.rs` - the streaming Kitty placeholder stub. Real bounded
+//!   `APC G` intake lives in `bitty-vt/src/kitty_apc.rs`, and decode /
+//!   placement / ledger policy lives in `src/kitty_place.rs`; the two
+//!   surviving bounds moved there with values unchanged
+//!   (`KITTY_PLACE_MAX_IMAGES` = 64 via `IMAGE_STORE_MAX_ENTRIES`,
+//!   `KITTY_LEDGER_MAX_BYTES` = 320,000,000).
+//! - `src/wallpaper_theme.rs` - the wallpaper-derived colorscheme
+//!   derivation. Theme derivation is presentation policy owned by plugins
+//!   (the ADR 0014 Core-mechanism/plugin-presentation split): the wired path
+//!   is the plugin `bitty.image.read` bridge and preview/confirm intents
+//!   (CTX-1169 / bitty#1976), not a Core module. bitty#2359 records the
+//!   retire decision and its evidence.
+//!
+//! Scope note: the retained scene/image/place/background modules and the
+//! decode/raster seam copies are governed by the `W-133` retention decision
+//! and their own tracked follow-ups, not by this retirement.
 
 use std::path::{Path, PathBuf};
 
-/// Module files retired from Core by CTX-1412.
+/// Module files retired from Core.
 const RETIRED_MODULE_FILES: &[&str] = &[
     "crates/bitty-rich/src/presentation.rs",
     "crates/bitty-rich/src/projection.rs",
+    "crates/bitty-rich/src/kitty.rs",
+    "crates/bitty-rich/src/wallpaper_theme.rs",
 ];
 
 /// Lowercase module names that must not be re-declared in `lib.rs`.
-const RETIRED_MODULE_NAMES: &[&str] = &["presentation", "projection"];
+const RETIRED_MODULE_NAMES: &[&str] = &["presentation", "projection", "kitty", "wallpaper_theme"];
 
 /// Identifiers exported only by the retired modules. Generic words
-/// (`projection`, `presentation`) are deliberately absent: they appear in
-/// unrelated prose and UI types.
+/// (`projection`, `presentation`, `luminance`, `contrast_ratio`) are
+/// deliberately absent: they appear in unrelated prose and UI types.
 const RETIRED_IDENTIFIERS: &[&str] = &[
     "RichPresentation",
     "ProjectedBlock",
     "ProjectionError",
     "project_fragments",
+    "KittyGraphicsStub",
+    "KittyPlaceholder",
+    "KittyPlaceholderId",
+    "KittyChunkOutcome",
+    "KittyChunkError",
+    "KITTY_MAX_PLACEHOLDERS",
+    "KITTY_MAX_PAYLOAD_BYTES",
+    "KITTY_MAX_CHUNKED_BYTES",
+    "WallpaperPalette",
+    "WallpaperThemePreview",
+    "WallpaperThemeError",
+    "WALLPAPER_THEME_ANSI_COUNT",
+    "derive_palette",
+    "derive_palette_from_bytes",
+    "preview_from_bytes",
+    "preview_from_image",
+    "planned_sample_count",
+    "sample_stride",
 ];
 
 /// Workspace root derived from this crate's manifest dir (no hardcoded
@@ -204,8 +239,9 @@ fn retired_module_files_stay_absent() {
         let path = root.join(retired);
         assert!(
             !path.exists(),
-            "`{retired}` was retired by CTX-1412 (bitty#2117); no Core path consumed it. \
-             If the surface is needed again, it belongs on the extension side of the seam."
+            "`{retired}` was retired with no Core consumer (CTX-1412 / CTX-1415, \
+             bitty#2117 / bitty#2358 / bitty#2359). If the surface is needed again, \
+             it belongs on the extension or plugin side of the seam, not back in Core."
         );
     }
 }
@@ -218,7 +254,8 @@ fn retired_modules_are_not_redeclared() {
     for name in RETIRED_MODULE_NAMES {
         assert!(
             !declares_module(&text, name),
-            "`bitty-rich` must not re-declare the retired `{name}` module (CTX-1412 / bitty#2117)"
+            "`bitty-rich` must not re-declare the retired `{name}` module \
+             (CTX-1412 / CTX-1415, bitty#2117 / bitty#2358 / bitty#2359)"
         );
     }
 }
@@ -242,7 +279,7 @@ fn core_sources_never_name_retired_symbols() {
     assert!(
         offenders.is_empty(),
         "Core sources must not name retired rich-presentation symbols \
-         (CTX-1412 / bitty#2117): {offenders:?}"
+         (CTX-1412 / CTX-1415, bitty#2117 / bitty#2358 / bitty#2359): {offenders:?}"
     );
 }
 

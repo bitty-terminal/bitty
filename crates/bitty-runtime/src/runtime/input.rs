@@ -1462,6 +1462,10 @@ impl Runtime {
         // Change-gated inside, so steady hover costs bounded hit tests.
         self.update_hyperlink_hover(pos);
         self.update_plaintext_hover(pos);
+        // Issue #2411: refresh plugin band hover last, also change-gated.
+        // Hover is presentation-only: it queues at most one bounded
+        // transition per region and touches no capture or modal state.
+        self.update_band_hover(pos);
     }
 
     /// Current modifier bits for a mouse report: shift `4`, alt `8`, ctrl
@@ -1802,6 +1806,9 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // Issue #2411: a focus loss ends hover ownership too, so a plugin
+            // tooltip hides instead of staying anchored to a stale region.
+            self.clear_band_hover();
             // Issue #2337: losing window focus is capture loss for a pointer
             // gesture. Cancel the tiled drag without committing; the
             // present-only ghost clears on the next frame and the layout is

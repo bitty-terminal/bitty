@@ -1203,6 +1203,7 @@ fn lua_component_carries_every_accepted_property() {
         on_click,
         on_scroll,
         children,
+        ..
     } = &mounts[0].1
     else {
         panic!("expected the declared Row, got {:?}", mounts[0].1.kind());

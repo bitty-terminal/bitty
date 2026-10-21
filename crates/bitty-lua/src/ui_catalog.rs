@@ -612,12 +612,14 @@ fn compose_modal_sheet(sheet: &ModalSheetDescriptor) -> UiNode {
 
 fn text_node(text: &str, bold: bool) -> UiNode {
     UiNode::Text {
+        anchor: None,
         text: text.to_string(),
         fg: None,
         bg: None,
         bold: if bold { Some(true) } else { None },
         on_click: None,
         on_scroll: None,
+        on_hover: None,
     }
 }
 
@@ -629,16 +631,20 @@ fn text_node(text: &str, bold: bool) -> UiNode {
 fn plain_text(node: &UiNode, bold: bool) -> Option<&str> {
     match node {
         UiNode::Text {
+            anchor,
             text,
             fg,
             bg,
             bold: node_bold,
             on_click,
             on_scroll,
-        } if fg.is_none()
+            on_hover,
+        } if anchor.is_none()
+            && fg.is_none()
             && bg.is_none()
             && on_click.is_none()
             && on_scroll.is_none()
+            && on_hover.is_none()
             && if bold {
                 *node_bold == Some(true)
             } else {
@@ -654,33 +660,41 @@ fn plain_text(node: &UiNode, bold: bool) -> Option<&str> {
 fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
     match node {
         UiNode::Row {
+            anchor,
             children,
             fg,
             bg,
             bold,
             on_click,
             on_scroll,
+            on_hover,
         }
         | UiNode::Column {
+            anchor,
             children,
             fg,
             bg,
             bold,
             on_click,
             on_scroll,
+            on_hover,
         }
         | UiNode::List {
+            anchor,
             children,
             fg,
             bg,
             bold,
             on_click,
             on_scroll,
-        } if fg.is_none()
+            on_hover,
+        } if anchor.is_none()
+            && fg.is_none()
             && bg.is_none()
             && bold.is_none()
             && on_click.is_none()
-            && on_scroll.is_none() =>
+            && on_scroll.is_none()
+            && on_hover.is_none() =>
         {
             Some(children.as_slice())
         }
@@ -994,13 +1008,16 @@ mod tests {
         fn walk(node: &UiNode, out: &mut String) {
             match node {
                 UiNode::Text {
+                    anchor,
                     text,
                     fg,
                     bg,
                     bold,
                     on_click,
                     on_scroll,
+                    on_hover,
                 } => {
+                    assert!(anchor.is_none());
                     out.push_str("T(");
                     out.push_str(if bold.unwrap_or(false) { "b" } else { "-" });
                     out.push(',');
@@ -1011,6 +1028,8 @@ mod tests {
                     out.push(if on_click.is_some() { 'c' } else { '-' });
                     out.push(',');
                     out.push(if on_scroll.is_some() { 's' } else { '-' });
+                    out.push(',');
+                    out.push(if on_hover.is_some() { 'h' } else { '-' });
                     out.push(',');
                     out.push_str(&text.len().to_string());
                     out.push(':');
@@ -1605,12 +1624,14 @@ mod tests {
         };
         left.pop();
         let mutated = UiNode::Row {
+            anchor: None,
             children: mutated,
             fg: None,
             bg: None,
             bold: None,
             on_click: None,
             on_scroll: None,
+            on_hover: None,
         };
         assert_eq!(
             block.verify(&mutated),
@@ -1672,12 +1693,14 @@ mod tests {
             panic!("pill is Text");
         };
         let decorated = UiNode::row(vec![UiNode::Text {
+            anchor: None,
             text: text.clone(),
             fg: Some("accent".to_string()),
             bg: bg.clone(),
             bold: *bold,
             on_click: on_click.clone(),
             on_scroll: on_scroll.clone(),
+            on_hover: None,
         }]);
         assert_eq!(
             CatalogBlock::from_scene(CatalogEntry::PillRow, &decorated),
@@ -1688,12 +1711,14 @@ mod tests {
 
         // An explicit `bold = false` is not the canonical absent field.
         let explicit_false = UiNode::row(vec![UiNode::Text {
+            anchor: None,
             text: "[a]".to_string(),
             fg: None,
             bg: None,
             bold: Some(false),
             on_click: None,
             on_scroll: None,
+            on_hover: None,
         }]);
         assert_eq!(
             CatalogBlock::from_scene(CatalogEntry::PillRow, &explicit_false),
@@ -1720,29 +1745,37 @@ mod tests {
                     assert!(on_scroll.is_none());
                 }
                 UiNode::Row {
+                    anchor,
                     children,
                     fg,
                     bg,
                     bold,
                     on_click,
                     on_scroll,
+                    on_hover,
                 }
                 | UiNode::Column {
+                    anchor,
                     children,
                     fg,
                     bg,
                     bold,
                     on_click,
                     on_scroll,
+                    on_hover,
                 }
                 | UiNode::List {
+                    anchor,
                     children,
                     fg,
                     bg,
                     bold,
                     on_click,
                     on_scroll,
+                    on_hover,
                 } => {
+                    assert!(anchor.is_none());
+                    assert!(on_hover.is_none());
                     assert!(fg.is_none());
                     assert!(bg.is_none());
                     assert!(bold.is_none());
@@ -1787,7 +1820,7 @@ mod tests {
         let before = encode(&baseline);
         let _ = CatalogBlock::from_scene(CatalogEntry::TooltipDetailFallback, &baseline);
         assert_eq!(encode(&baseline), before);
-        assert_eq!(before, "R[T(-,N,N,-,-,6:plugin)C[L[T(-,N,N,-,-,1:a)]]]");
+        assert_eq!(before, "R[T(-,N,N,-,-,-,6:plugin)C[L[T(-,N,N,-,-,-,1:a)]]]");
 
         // A declared but empty block is a failure, never a silent no-op.
         assert!(

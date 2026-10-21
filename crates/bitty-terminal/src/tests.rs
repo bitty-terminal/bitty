@@ -13323,3 +13323,173 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hover_enter_shows_plugin_tooltip_overlay_and_leave_hides_it() {
+    // Issue #2411 end-to-end: a hovered band region dispatches the plugin's
+    // `on_hover` command with `region`/`phase` only; the plugin updates a
+    // non-capturing `overlay`-slot block with `bitty.ui.update`, Core paints
+    // it anchored below the band, and leaving the region removes it. No
+    // keyboard capture and no OS notification are involved.
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx2411-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx2411hover";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-2411 hover tooltip"
+version = "0.1.0"
+description = "band hover enters/leaves drive a non-capturing overlay tooltip"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+
+[lazy]
+commands = ["{id}:detail"]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local tooltip = bitty.ui.mount("overlay", { kind = "Text", text = "" })
+        bitty.commands.register({
+          id = "detail",
+          title = "Detail",
+          run = function(args)
+            local text = ""
+            if type(args) == "table" and args.phase == "enter" then
+              text = "detail:" .. tostring(args.region)
+            end
+            bitty.ui.update(tooltip, { kind = "Text", text = text })
+            return true
+          end,
+        })
+        bitty.ui.mount("top", { kind = "Row", children = {
+          { kind = "Row", anchor = "left", children = {
+            { kind = "Text", text = "clock",
+              on_hover = { command = "detail", region = { id = "clock" } } },
+          } },
+        } })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    let report = plugin_runtime.activate(&pid).expect("activate");
+    assert_eq!(
+        report.state,
+        bitty_runtime::plugin_runtime::LifecycleState::Active
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime));
+    app.set_session_persistence(false);
+    let _ = app.drive_tick();
+    let row = app
+        .runtime
+        .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
+        .expect("top band row");
+    assert!(
+        app.runtime.plugin_overlay().is_none(),
+        "no tooltip before hover"
+    );
+
+    let (cw, ch) = app.runtime.live_cell_size();
+    let pad = f64::from(app.runtime.window_padding_physical());
+    let over_clock = bitty_platform::CursorPosition {
+        x: pad + 0.5 * f64::from(cw),
+        y: pad + (f64::from(row) + 0.5) * f64::from(ch),
+    };
+    app.runtime.handle_cursor_moved(over_clock);
+    assert_eq!(app.pump_cold_commands(), 1, "one hover enter dispatched");
+    assert!(
+        !app.overlay_capture_active(),
+        "hover never takes keyboard capture"
+    );
+    let _ = app.drive_tick();
+    let surface = app
+        .runtime
+        .plugin_overlay()
+        .expect("hover tooltip surface is presented");
+    assert_eq!(surface.plugin_id, id);
+    match &surface.root {
+        bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
+        other => panic!("expected the tooltip text, got {other:?}"),
+    }
+    let anchor = app
+        .runtime
+        .plugin_overlay_anchor()
+        .expect("tooltip anchored to the hovered region");
+    assert_eq!(anchor.edge, bitty_runtime::BandEdge::Top);
+    assert_eq!((anchor.start_col, anchor.end_col), (0, 5));
+    assert_eq!(
+        app.runtime.notifications_os_delivered(),
+        0,
+        "hover never raises an OS notification"
+    );
+
+    // Leaving the region hides the tooltip on the next tick, without capture.
+    let away = bitty_platform::CursorPosition {
+        x: pad + 0.5 * f64::from(cw),
+        y: pad + 12.0 * f64::from(ch),
+    };
+    app.runtime.handle_cursor_moved(away);
+    assert_eq!(app.pump_cold_commands(), 1, "one hover leave dispatched");
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime.plugin_overlay().is_none(),
+        "leaving the region hides the tooltip"
+    );
+    assert!(app.runtime.plugin_overlay_anchor().is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

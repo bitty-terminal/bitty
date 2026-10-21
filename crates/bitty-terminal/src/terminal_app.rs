@@ -2028,11 +2028,22 @@ impl TerminalApp {
             }
             return;
         };
-        let owner = plugin_runtime
+        let capture_owner = plugin_runtime
             .overlay_capture()
             .borrow()
             .owner_plugin()
             .map(str::to_string);
+        let hover_region = self.runtime.hovered_band_region();
+        // Issue #2411: with no capture owner, the plugin that owns the live
+        // hovered band region may present its `overlay`-slot block as a
+        // non-modal tooltip. It paints only: no capture, no input routing,
+        // no modal state, and the surface disappears as soon as the hover
+        // leaves the region.
+        let (owner, tooltip) = match (capture_owner, hover_region.as_ref()) {
+            (Some(owner), _) => (Some(owner), false),
+            (None, Some(region)) => (Some(region.plugin_id.clone()), true),
+            (None, None) => (None, false),
+        };
         let Some(owner) = owner else {
             if self.runtime.plugin_overlay().is_some() {
                 self.runtime.set_plugin_overlay(None);
@@ -2054,7 +2065,22 @@ impl TerminalApp {
                 version,
             })
             .next();
+        // Issue #2411: a tooltip anchors to the live hovered band region when
+        // the surface belongs to the same plugin that owns that band; every
+        // other overlay keeps the centered modal placement. The anchor names
+        // the region Core is painting, so a reflow re-resolves the row.
+        let anchor = if tooltip {
+            surface.as_ref().and_then(|surface| {
+                hover_region
+                    .as_ref()
+                    .filter(|region| region.plugin_id == surface.plugin_id)
+                    .map(bitty_runtime::BandOverlayAnchor::from_region)
+            })
+        } else {
+            None
+        };
         self.runtime.set_plugin_overlay(surface);
+        self.runtime.set_plugin_overlay_anchor(anchor);
     }
 
     /// Sync the plugin targeting session's present-time annotation batch
@@ -2208,6 +2234,53 @@ impl TerminalApp {
             }
         }
         true
+    }
+
+    /// Dispatches one Core-routed band hover transition (issue #2411).
+    ///
+    /// Hover is presentation-only: it carries the stable region id plus an
+    /// `enter`/`leave` phase, never pointer coordinates, and it neither takes
+    /// the overlay capture nor sets `modal_active`. Dispatch still passes the
+    /// plugin runtime's registration, capability, and args-schema gates.
+    /// Results are not surfaced as banners: hover is high-frequency
+    /// presentation, and the plugin's tooltip goes through the overlay
+    /// surface instead.
+    fn dispatch_band_hover(&mut self, hover: bitty_runtime::BandHoverRequest) -> bool {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&hover.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band hover from '{}' dropped (invalid plugin id: {error})",
+                        hover.plugin_id
+                    )
+                });
+                return false;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band hover '{}:{}' dropped (plugin runtime is gone)",
+                    hover.plugin_id, hover.command
+                )
+            });
+            return false;
+        };
+        let args = bitty_runtime::band_hover_args_table(&hover.args, &hover.region, hover.phase);
+        match plugin_runtime.dispatch_command(&id, &hover.command, &[args]) {
+            Ok(_) => true,
+            Err(error) if error.is_parked() => true,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band hover '{}:{}' refused ({error})",
+                        hover.plugin_id, hover.command
+                    )
+                });
+                true
+            }
+        }
     }
 
     /// Dispatches one Core-routed plugin band scroll (CTX-1190, issue #2008).
@@ -2445,6 +2518,14 @@ impl TerminalApp {
         // window per plugin; a command that still needs work stays parked for
         // the next tick. New parks created below wait until the next tick.
         let mut attempted = self.pump_parked_plugin_commands();
+        // Issue #2411: hover transitions drain on the same cold phase, ahead
+        // of clicks (the pointer entered before it pressed). The queue is
+        // capped by `BAND_HOVER_QUEUE_MAX`, so this loop is bounded per tick.
+        for hover in self.runtime.drain_band_hovers() {
+            if self.dispatch_band_hover(hover) {
+                attempted = attempted.saturating_add(1);
+            }
+        }
         let admissions = self
             .runtime
             .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);

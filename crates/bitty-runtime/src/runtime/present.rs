@@ -3752,7 +3752,7 @@ impl Runtime {
     /// the layout container) skips the whole band, never a partial paint,
     /// and counts a diagnostic.
     fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
-        use super::band_host::{band_is_visible, flatten_band_runs};
+        use super::band_host::band_is_visible;
 
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
@@ -3809,7 +3809,7 @@ impl Runtime {
                     self.band_stats.paint_violations.saturating_add(1);
                 continue;
             }
-            let (text, runs) = flatten_band_runs(&band.root);
+            let (text, runs) = super::band_host::flatten_band_runs_in_width(&band.root, band_cells);
             if text.is_empty() {
                 continue;
             }
@@ -3971,19 +3971,66 @@ impl Runtime {
             return;
         }
         let full_w = px_span(frame.cols, live.width);
+        // Issue #2411: a hover-anchored tooltip places the row stack just
+        // below a top band / just above a bottom band, starting at the
+        // hovered region's column. The anchor names a live band item, so the
+        // row is resolved now, never baked in at set time. A missing band or
+        // violated geometry falls back to the centered modal placement
+        // instead of painting against stale coordinates.
+        let window = self.window_cells();
+        let anchored = self.plugin_overlay_anchor.and_then(|anchor| {
+            if window.width == 0 || window.height == 0 || self.band_geometry_violated() {
+                return None;
+            }
+            let band_row = self.visible_band_row(anchor.edge, anchor.visible_index)?;
+            let count = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+            let start_row = match anchor.edge {
+                BandEdge::Top => band_row.saturating_add(1),
+                BandEdge::Bottom => band_row.saturating_sub(count),
+                BandEdge::Left | BandEdge::Right => return None,
+            };
+            let x = u16::try_from(anchor.start_col)
+                .unwrap_or(u16::MAX)
+                .min(window.width.saturating_sub(1));
+            Some((start_row, x))
+        });
         let mid_row = frame.rows.saturating_sub(1) / 2;
         // Center the row stack on the middle row: the title row lands just
         // above middle for a two-row modal, exactly on it for one row.
         let half = u16::try_from(rows.len().saturating_sub(1) / 2).unwrap_or(u16::MAX);
         let start_row = mid_row.saturating_sub(half);
+        let mut painted = false;
         for (index, overlay_row) in rows.iter().enumerate() {
-            let row = start_row.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            if row >= frame.rows {
+            let offset = u16::try_from(index).unwrap_or(u16::MAX);
+            let (row, placement) = match anchored {
+                Some((anchor_row, x)) => (
+                    anchor_row.saturating_add(offset),
+                    Some(AnchoredOverlayRow {
+                        x,
+                        cols: window.width.saturating_sub(x),
+                        row: anchor_row.saturating_add(offset),
+                        window_x: window.x,
+                    }),
+                ),
+                None => (start_row.saturating_add(offset), None),
+            };
+            let out_of_bounds = match placement {
+                Some(placement) => {
+                    placement.row >= window.height
+                        || placement.cols == 0
+                        || placement.x >= window.width
+                }
+                None => row >= frame.rows,
+            };
+            if out_of_bounds {
                 continue;
             }
-            self.paint_overlay_row(pad_px, layers, frame, row, overlay_row, full_w);
+            painted |=
+                self.paint_overlay_row(pad_px, layers, frame, row, overlay_row, full_w, placement);
         }
-        layers.any_needs_draw = true;
+        if painted {
+            layers.any_needs_draw = true;
+        }
     }
 
     /// Paints one overlay scene row (CTX-1170; style parity CTX-1419).
@@ -4001,6 +4048,10 @@ impl Runtime {
     /// that paints no cell (empty text, or every span clipped away) falls back
     /// to the same single pill, so CTX-1143's fail-open chrome holds on both
     /// paths.
+    ///
+    /// Returns whether the row painted anything. An anchored (non-modal)
+    /// tooltip row with empty text paints nothing: the fail-open pill belongs
+    /// to the capture-holding modal, not to hover presentation (issue #2411).
     #[allow(clippy::too_many_arguments)]
     fn paint_overlay_row(
         &mut self,
@@ -4010,25 +4061,43 @@ impl Runtime {
         row: u16,
         overlay_row: &OverlayRow,
         full_w: u32,
-    ) {
+        anchored: Option<AnchoredOverlayRow>,
+    ) -> bool {
         use super::band_host::resolve_band_token;
 
+        if anchored.is_some() && overlay_row.text.is_empty() {
+            return false;
+        }
         let live = self.live_cell_metrics();
         let cell_w = live.width;
         let cell_h = live.height;
-        // Width in display cells (wide glyphs count 2), clipped to the frame.
-        let (clipped, text_cells) = clip_to_width_cells(&overlay_row.text, frame.cols);
+        // Clipping is to the focused frame for a centered modal and to the
+        // remaining window width for a hover-anchored tooltip (issue #2411).
+        let clip_cols = anchored.map_or(frame.cols, |anchor| anchor.cols);
+        // Width in display cells (wide glyphs count 2), clipped to the surface.
+        let (clipped, text_cells) = clip_to_width_cells(&overlay_row.text, clip_cols);
         // Center the pill in the focused frame on its row. `text_cells` is
         // already floored at one cell by `clip_to_width_cells`, and the floor
         // is repeated here so the pill width never depends on that helper: an
         // empty composer buffer must still paint a one-cell rect instead of a
         // zero-width one (CTX-1143, CTX-1419, issue #2191).
         let pill_w = px_span_usize(text_cells.max(1), cell_w);
-        let origin_px_x = px_add(
-            px_add(pad_px, frame.content.x),
-            px_side(full_w.saturating_sub(pill_w)) / 2,
-        );
-        let origin_px_y = px_add(pad_px, px_offset_cells(frame.content.y, row, cell_h));
+        let (origin_px_x, origin_px_y) = match anchored {
+            Some(anchor) => (
+                px_add(
+                    pad_px,
+                    px_offset_cells(i32::from(anchor.window_x), anchor.x, cell_w),
+                ),
+                px_add(pad_px, px_offset_cells(0, anchor.row, cell_h)),
+            ),
+            None => (
+                px_add(
+                    px_add(pad_px, frame.content.x),
+                    px_side(full_w.saturating_sub(pill_w)) / 2,
+                ),
+                px_add(pad_px, px_offset_cells(frame.content.y, row, cell_h)),
+            ),
+        };
         let styled = overlay_row
             .runs
             .iter()
@@ -4042,12 +4111,12 @@ impl Runtime {
         };
         if !styled {
             self.paint_overlay_pill(layers, &clipped, pill);
-            return;
+            return true;
         }
         let default_fg = self.config.theme.foreground;
         let default_bg = self.config.theme.background;
         let chars: Vec<char> = overlay_row.text.chars().collect();
-        let cols = usize::from(frame.cols);
+        let cols = usize::from(clip_cols);
         let mut painted_any = false;
         for run in &overlay_row.runs {
             let start = run.start_col;
@@ -4119,6 +4188,7 @@ impl Runtime {
             // invisible surface would be a fail-open UX (CTX-1419, #2191).
             self.paint_overlay_pill(layers, &clipped, pill);
         }
+        true
     }
 
     /// Paints the default single pill for one overlay row (CTX-1170).
@@ -4943,6 +5013,22 @@ struct OverlayRow {
     runs: Vec<super::band_host::BandRun>,
 }
 
+/// One overlay row placed against a live band item (issue #2411).
+///
+/// Window-cell coordinates, not frame-relative: an anchored tooltip belongs to
+/// the band's window row and to the hovered region's column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnchoredOverlayRow {
+    /// Window column the row starts at.
+    x: u16,
+    /// Display cells available from `x` to the window edge.
+    cols: u16,
+    /// Window row the row paints.
+    row: u16,
+    /// Window column origin the cells are measured from.
+    window_x: u16,
+}
+
 /// Clipped geometry of one overlay pill row (CTX-1170).
 ///
 /// Shared by the unstyled fast path and the styled-row fallback so both paint
@@ -5158,6 +5244,7 @@ mod plugin_overlay_paint_tests {
     use super::FrameLayers;
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
+    use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
 
     fn runtime() -> Runtime {
         Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
@@ -5242,6 +5329,48 @@ mod plugin_overlay_paint_tests {
             "non-empty text paints glyphs"
         );
         assert!(layers.any_needs_draw);
+    }
+
+    #[test]
+    fn hover_anchored_surface_paints_below_the_top_band_region() {
+        // Issue #2411: a tooltip overlay anchored to a live top-band region
+        // paints one row below the band, starting at the region's column, in
+        // window cells (never centered on the focused frame).
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![surface_with_rows(&["  bar content"])],
+            ..Default::default()
+        });
+        rt.tick()
+            .expect("tick presents the band and insets the container");
+        assert_eq!(rt.visible_band_row(BandEdge::Top, 0), Some(0));
+        assert!(!rt.band_geometry_violated());
+        rt.set_plugin_overlay(Some(surface_with_text("detail")));
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Top,
+            visible_index: 0,
+            start_col: 10,
+            end_col: 20,
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        let (cell_w, cell_h) = rt.live_cell_size();
+        let fill = layers.combined_overlay.first().expect("tooltip fill");
+        let expected_x =
+            8 + i32::try_from(u32::from(window.x) + 10).unwrap() * i32::try_from(cell_w).unwrap();
+        let expected_y = 8 + i32::try_from(cell_h).unwrap();
+        assert_eq!(fill.rect.x, expected_x, "anchored at the region column");
+        assert_eq!(fill.rect.y, expected_y, "one row below the top band");
+        assert_eq!(fill.rect.width, cell_w * 6, "six text cells wide");
+
+        // Clearing the anchor restores the centered modal placement.
+        rt.set_plugin_overlay_anchor(None);
+        let mut centered = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut centered);
+        let fill = centered.combined_overlay.first().expect("centered fill");
+        assert_ne!(fill.rect.x, expected_x, "no stale anchor placement");
+        assert_ne!(fill.rect.y, expected_y);
     }
 
     #[test]
@@ -5362,6 +5491,8 @@ mod plugin_overlay_paint_tests {
             bold: bold.then_some(true),
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -5555,6 +5686,8 @@ mod plugin_overlay_paint_tests {
                 }),
             }),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         };
         let rows = Runtime::overlay_scene_rows(&root);
         assert_eq!(rows.len(), 1, "one row per direct child");

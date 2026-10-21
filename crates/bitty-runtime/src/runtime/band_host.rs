@@ -36,11 +36,33 @@
 //! CTX-0979: Core draws no workspace display (Hyprland-style); there is no
 //! Core bar row to collide with or to reserve.
 //!
+//! Issue #2411 adds the Waybar-style layout and pointer surface on the same
+//! terms, with no new capability, slot, error code, or protocol:
+//!
+//! - **Group alignment.** A band root `Row` places its direct children by
+//!   declared `anchor` (`left`/`center`/`right`) against the presented width
+//!   ([`flatten_band_runs_in_width`]). `center` is centered on the full row,
+//!   `right` ends at the inset edge, and an over-subscribed row clips in the
+//!   documented priority (left, then right, then center) so runs never
+//!   overlap, never exceed the row, and never panic. Hit-testing, region
+//!   emission, and paint all read those same runs, so gap cells stay
+//!   unclaimed.
+//! - **Bounded hover.** `on_hover` bindings dispatch on pointer enter/leave
+//!   with the stable region id and a `phase`, through a bounded queue that
+//!   coalesces to one dispatch per region per drain ([`Runtime::update_band_hover`],
+//!   [`Runtime::drain_band_hovers`]). Hover carries no coordinates, grants no
+//!   authority, never captures input, and never sets `modal_active`; leaving
+//!   the region (or losing focus) queues the paired `leave`.
+//! - **Overlay anchor.** [`BandOverlayAnchor`] names a live band item, so the
+//!   application can paint a plugin tooltip next to the hovered region
+//!   without Core ever handing the plugin pointer geometry.
+//!
 //! Ownership direction follows the accepted W-74 disposition (Core owns
 //! mechanism — geometry, routing, confinement; plugins own presentation)
 //! and the W-82 spelling discipline: no new capability, no new slot, no new
 //! error code. The only new host surface is the drain queue
-//! ([`Runtime::drain_band_clicks`]) plus headless statistics, consistent
+//! ([`Runtime::drain_band_clicks`], [`Runtime::drain_band_scrolls`],
+//! [`Runtime::drain_band_hovers`]) plus headless statistics, consistent
 //! with the overlay/capture conventions (CTX-0941: Core holds the switch,
 //! the application moves the bytes).
 
@@ -51,7 +73,8 @@ use super::{BandContent, ChromeBands, Runtime};
 use bitty_lua::host::LuaValue;
 use bitty_lua::ui::{
     ClickArg, ClickCommand, UI_BUTTON_ARG, UI_BUTTON_LEFT, UI_BUTTON_MIDDLE, UI_BUTTON_RIGHT,
-    UI_REGION_ARG, UI_SCROLL_DELTA_ARG, UiNode, UiRegion, UiSlot,
+    UI_HOVER_PHASE_ARG, UI_HOVER_PHASE_ENTER, UI_HOVER_PHASE_LEAVE, UI_REGION_ARG,
+    UI_SCROLL_DELTA_ARG, UiAnchor, UiNode, UiRegion, UiSlot,
 };
 use bitty_platform::{CursorPosition, MouseButton};
 use bitty_render::grid::{Rgba8, ThemePalette};
@@ -133,6 +156,12 @@ pub struct BandRun {
     pub on_click: Option<ClickCommand>,
     /// Scroll binding effective for the span, if any (CTX-1190, #2008).
     pub on_scroll: Option<ClickCommand>,
+    /// Hover binding effective for the span, if any (issue #2411).
+    ///
+    /// A hover binding always carries a `region` (the parser refuses an
+    /// anonymous one), so the host has a stable transition identity without
+    /// ever carrying pointer coordinates.
+    pub on_hover: Option<ClickCommand>,
     /// Per-item hit region effective for the span, if declared (issue #2248).
     ///
     /// One identity per span: the click binding's region wins, else the
@@ -159,19 +188,21 @@ pub(crate) struct BandInherited {
     bold: Option<bool>,
     on_click: Option<ClickCommand>,
     on_scroll: Option<ClickCommand>,
+    on_hover: Option<ClickCommand>,
     region: Option<UiRegion>,
 }
 
 impl BandInherited {
     /// The declaration `node` applies to its descendants.
     pub(crate) fn of(node: &UiNode) -> Self {
-        let (fg, bg, bold, on_click, on_scroll) = match node {
+        let (fg, bg, bold, on_click, on_scroll, on_hover) = match node {
             UiNode::Text {
                 fg,
                 bg,
                 bold,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             }
             | UiNode::Row {
@@ -180,6 +211,7 @@ impl BandInherited {
                 bold,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             }
             | UiNode::Column {
@@ -188,6 +220,7 @@ impl BandInherited {
                 bold,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             }
             | UiNode::List {
@@ -196,6 +229,7 @@ impl BandInherited {
                 bold,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             } => (
                 fg.clone(),
@@ -203,6 +237,7 @@ impl BandInherited {
                 *bold,
                 on_click.clone(),
                 on_scroll.clone(),
+                on_hover.clone(),
             ),
         };
         let region = inherited_region(on_click.as_ref(), on_scroll.as_ref(), None);
@@ -212,6 +247,7 @@ impl BandInherited {
             bold,
             on_click,
             on_scroll,
+            on_hover,
             region,
         }
     }
@@ -220,7 +256,9 @@ impl BandInherited {
     ///
     /// The region identity follows the same rule as the bindings: the node's
     /// own click/scroll region when it declares one, else the ancestor's
-    /// (issue #2248).
+    /// (issue #2248). The hover binding carries its own region identity and
+    /// does not participate in the click identity (issue #2411): an item may
+    /// be hoverable as one module and clickable as a sub-item.
     fn layered(&self, node: &UiNode) -> Self {
         let own = Self::of(node);
         Self {
@@ -230,6 +268,7 @@ impl BandInherited {
             region: own.region.or_else(|| self.region.clone()),
             on_click: own.on_click.or_else(|| self.on_click.clone()),
             on_scroll: own.on_scroll.or_else(|| self.on_scroll.clone()),
+            on_hover: own.on_hover.or_else(|| self.on_hover.clone()),
         }
     }
 }
@@ -253,6 +292,12 @@ fn inherited_region(
 /// way (vertical stacking is deferred, matching the paint path). The text is
 /// the concatenation of every `Text` leaf in walk order; each leaf yields
 /// exactly one run, even when empty. Total and headless.
+///
+/// This is the **unbounded** walk: every group flows left-to-right from
+/// column 0, which is exactly the pre-#2411 layout. A host that presents one
+/// row at a known width uses [`flatten_band_runs_in_width`] so declared group
+/// anchors resolve; both walks emit text in the same order, so a plugin scene
+/// without anchors produces byte-identical runs either way.
 #[must_use]
 pub fn flatten_band_runs(root: &UiNode) -> (String, Vec<BandRun>) {
     flatten_band_runs_under(root, &BandInherited::default())
@@ -269,44 +314,252 @@ pub(crate) fn flatten_band_runs_under(
     root: &UiNode,
     inherited: &BandInherited,
 ) -> (String, Vec<BandRun>) {
-    let mut text = String::new();
-    let mut runs = Vec::new();
-    flatten_into(root, &mut text, &mut runs, inherited);
-    (text, runs)
+    let mut emit = BandEmit::default();
+    emit.node(root, 0, None, inherited, None);
+    (emit.text, emit.runs)
 }
 
-fn flatten_into(
-    node: &UiNode,
-    text: &mut String,
-    runs: &mut Vec<BandRun>,
-    inherited: &BandInherited,
-) {
-    let effective = inherited.layered(node);
-    match node {
-        UiNode::Text { text: leaf, .. } => {
-            let start = display_cells(text);
-            let start_char = text.chars().count();
-            text.push_str(leaf);
-            runs.push(BandRun {
-                start_col: start,
-                end_col: display_cells(text),
-                start_char,
-                end_char: text.chars().count(),
-                fg: effective.fg,
-                bg: effective.bg,
-                bold: effective.bold.unwrap_or(false),
-                on_click: effective.on_click,
-                on_scroll: effective.on_scroll,
-                region: effective.region,
-            });
-        }
-        UiNode::Row { children, .. }
-        | UiNode::Column { children, .. }
-        | UiNode::List { children, .. } => {
-            for child in children {
-                flatten_into(child, text, runs, &effective);
+/// Flattens a one-row band at its presented width (issue #2411).
+///
+/// The root `Row` resolves its direct children's group anchors against
+/// `width` display cells: `left` groups from column 0, `right` groups flush to
+/// `width`, `center` groups centered on the full width. Over-subscribed rows
+/// degrade deterministically (left first, then right, then center) by clipping
+/// at the group slot boundary, so runs never overlap, never exceed `width`,
+/// and never panic. A root that is not a `Row` flows left-to-right unchanged.
+///
+/// Runs carry absolute display-cell columns, so the paint path and the
+/// hit-test read one geometry. Characters clipped out of their group are not
+/// emitted at all: their runs are absent, which is what keeps a clipped item
+/// from claiming a hit region.
+#[must_use]
+pub fn flatten_band_runs_in_width(root: &UiNode, width: usize) -> (String, Vec<BandRun>) {
+    let mut emit = BandEmit::default();
+    emit.node(root, 0, None, &BandInherited::default(), Some(width));
+    (emit.text, emit.runs)
+}
+
+/// Accumulates one flattened band walk (issue #2411).
+#[derive(Debug, Default)]
+struct BandEmit {
+    text: String,
+    runs: Vec<BandRun>,
+    /// Retained chars so `start_char`/`end_char` stay O(1) per leaf instead of
+    /// rescanning the growing text on every node (hot-path allocation bound).
+    chars: usize,
+}
+
+impl BandEmit {
+    /// Emits `node` starting at display-cell column `origin`.
+    ///
+    /// `clip` restricts emitted characters to `[start, end)` display cells.
+    /// `bounded_width` makes this node the band root `Row`, whose direct
+    /// children are placed by declared anchor.
+    fn node(
+        &mut self,
+        node: &UiNode,
+        origin: usize,
+        clip: Option<(usize, usize)>,
+        inherited: &BandInherited,
+        bounded_width: Option<usize>,
+    ) {
+        if let Some((start, end)) = clip {
+            if end <= start {
+                // Nothing of this subtree fits its slot; emit nothing so a
+                // clipped item cannot claim a hit region.
+                return;
             }
         }
+        let effective = inherited.layered(node);
+        match node {
+            UiNode::Text { text: leaf, .. } => {
+                let start_char = self.chars;
+                let mut natural = 0usize;
+                let mut emitted = 0usize;
+                let mut run_start: Option<usize> = None;
+                for ch in leaf.chars() {
+                    let width = usize::from(bitty_term_state::char_cell_width(ch));
+                    let cell_start = origin.saturating_add(natural);
+                    let cell_end = cell_start.saturating_add(width);
+                    natural = natural.saturating_add(width);
+                    if let Some((clip_start, clip_end)) = clip {
+                        if cell_start < clip_start || cell_end > clip_end {
+                            // Keep only the fully visible slice of the leaf:
+                            // a clipped character is not emitted at all.
+                            continue;
+                        }
+                    }
+                    run_start.get_or_insert(cell_start);
+                    self.text.push(ch);
+                    emitted = emitted.saturating_add(width);
+                    self.chars = self.chars.saturating_add(1);
+                }
+                if run_start.is_none() && clip.is_some() {
+                    // A leaf clipped entirely out of its group emits no run:
+                    // it paints nothing and must not claim a hit region. An
+                    // unclipped empty leaf keeps its pre-#2411 zero-width run.
+                    return;
+                }
+                let start_col = run_start.unwrap_or(origin);
+                self.runs.push(BandRun {
+                    start_col,
+                    end_col: start_col.saturating_add(emitted),
+                    start_char,
+                    end_char: self.chars,
+                    fg: effective.fg,
+                    bg: effective.bg,
+                    bold: effective.bold.unwrap_or(false),
+                    on_click: effective.on_click,
+                    on_scroll: effective.on_scroll,
+                    on_hover: effective.on_hover,
+                    region: effective.region,
+                });
+            }
+            UiNode::Row { children, .. }
+            | UiNode::Column { children, .. }
+            | UiNode::List { children, .. } => {
+                if let Some(width) = bounded_width {
+                    // Issue #2411: only the band root Row has a row width to
+                    // resolve declared anchors against.
+                    for (child, slot) in children.iter().zip(anchored_slots(children, width)) {
+                        self.node(
+                            child,
+                            slot.origin,
+                            Some((slot.clip_start, slot.clip_end)),
+                            &effective,
+                            None,
+                        );
+                    }
+                    return;
+                }
+                let mut cursor = origin;
+                for child in children {
+                    self.node(child, cursor, clip, &effective, None);
+                    cursor = cursor.saturating_add(intrinsic_cells(child));
+                }
+            }
+        }
+    }
+}
+
+/// One anchored group's resolved placement inside the band row (issue #2411).
+///
+/// `origin` is the group's natural start; `clip_start`/`clip_end` is the
+/// display-cell interval it may paint. Over-subscription clips the group, it
+/// never moves or overlaps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupSlot {
+    origin: usize,
+    clip_start: usize,
+    clip_end: usize,
+}
+
+/// Resolves the declared anchors of a root `Row`'s direct children
+/// (issue #2411).
+///
+/// Placement policy, in order:
+///
+/// 1. `left` groups (and unanchored children, which default to `left`) claim
+///    `[0, left_total)` in declaration order.
+/// 2. `right` groups claim the trailing edge in declaration order measured
+///    from the edge inward, clipped so they never start before the left
+///    groups end.
+/// 3. `center` groups stack from the desired full-width center
+///    (`(width - center_total) / 2`), pushed right only as far as the left
+///    groups require and clipped at the right groups' start.
+///
+/// Total: `O(children)` time and one `Vec` of slots; the caller never sees an
+/// out-of-range or inverted interval.
+fn anchored_slots(children: &[UiNode], width: usize) -> Vec<GroupSlot> {
+    let widths: Vec<usize> = children.iter().map(intrinsic_cells).collect();
+    let anchor_at = |index: usize| children[index].anchor().unwrap_or(UiAnchor::Left);
+    let total = |anchor: UiAnchor| {
+        children
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| anchor_at(*index) == anchor)
+            .map(|(index, _)| widths[index])
+            .fold(0usize, usize::saturating_add)
+    };
+    let left_total = total(UiAnchor::Left).min(width);
+    let right_total = total(UiAnchor::Right);
+    let center_total = total(UiAnchor::Center);
+
+    let mut slots = vec![
+        GroupSlot {
+            origin: 0,
+            clip_start: 0,
+            clip_end: 0,
+        };
+        children.len()
+    ];
+
+    // Left groups: declaration order from the inset edge.
+    let mut cursor = 0usize;
+    for (index, width) in widths.iter().enumerate() {
+        if anchor_at(index) != UiAnchor::Left {
+            continue;
+        }
+        let end = cursor.saturating_add(*width).min(left_total);
+        slots[index] = GroupSlot {
+            origin: cursor,
+            clip_start: cursor.min(end),
+            clip_end: end,
+        };
+        cursor = cursor.saturating_add(*width);
+    }
+
+    // Right groups: right-to-left so the first declared group sits innermost.
+    let right_start = width.saturating_sub(right_total).max(left_total);
+    let mut cursor = width;
+    for index in (0..children.len()).rev() {
+        if anchor_at(index) != UiAnchor::Right {
+            continue;
+        }
+        let natural = cursor.saturating_sub(widths[index]);
+        let clip_start = natural.max(right_start).min(cursor);
+        slots[index] = GroupSlot {
+            origin: natural,
+            clip_start,
+            clip_end: cursor,
+        };
+        cursor = natural;
+    }
+
+    // Center groups: true centering on the full width, then clipped into the
+    // free middle between the left and right groups.
+    let mid_lo = left_total;
+    let mid_hi = right_start.max(mid_lo);
+    let desired = width.saturating_sub(center_total) / 2;
+    let latest = mid_hi.saturating_sub(center_total).max(mid_lo);
+    let mut cursor = desired.max(mid_lo).min(latest);
+    let center_end = cursor.saturating_add(center_total).min(mid_hi);
+    for (index, width) in widths.iter().enumerate() {
+        if anchor_at(index) != UiAnchor::Center {
+            continue;
+        }
+        let end = cursor.saturating_add(*width).min(center_end);
+        slots[index] = GroupSlot {
+            origin: cursor.min(end),
+            clip_start: cursor.min(end),
+            clip_end: end,
+        };
+        cursor = cursor.saturating_add(*width);
+    }
+
+    slots
+}
+
+/// Display-cell width of one subtree laid out without slack.
+fn intrinsic_cells(node: &UiNode) -> usize {
+    match node {
+        UiNode::Text { text, .. } => display_cells(text),
+        UiNode::Row { children, .. }
+        | UiNode::Column { children, .. }
+        | UiNode::List { children, .. } => children
+            .iter()
+            .map(intrinsic_cells)
+            .fold(0usize, usize::saturating_add),
     }
 }
 
@@ -389,7 +642,7 @@ pub fn band_regions_for(
     row: u16,
     window_width: usize,
 ) -> Result<Vec<BandItemRegion>, BandRegionError> {
-    let (_, runs) = flatten_band_runs(&band.root);
+    let (_, runs) = flatten_band_runs_in_width(&band.root, window_width);
     let mut regions: Vec<BandItemRegion> = Vec::new();
     let mut count = 0usize;
     // Identity and end column of the trailing distinct region, used both for
@@ -912,6 +1165,92 @@ pub fn band_scroll_args_table(
     LuaValue::Table(table)
 }
 
+/// Converts declared hover args plus the host-owned phase to the single Lua
+/// table arg (issue #2411).
+///
+/// Mirrors [`band_click_args_table`]: `dispatch_command` takes positional
+/// args; a hover carries one named table (`run({region = "clock", phase =
+/// "enter"})`), preserving declaration order with the region id and phase
+/// merged last. Both host keys overwrite declared entries of the same name
+/// (the parser reserves their slots), so a dispatch can never exceed
+/// `UI_CLICK_MAX_ARGS` and a plugin schema can never see a duplicate key.
+#[must_use]
+pub fn band_hover_args_table(
+    args: &[(String, ClickArg)],
+    region: &UiRegion,
+    phase: BandHoverPhase,
+) -> LuaValue {
+    let mut table: Vec<(LuaValue, LuaValue)> = args
+        .iter()
+        .filter(|(key, _)| key != UI_HOVER_PHASE_ARG && key != UI_REGION_ARG)
+        .map(|(key, value)| (LuaValue::String(key.clone()), click_arg_value(value)))
+        .collect();
+    table.push((
+        LuaValue::String(UI_REGION_ARG.to_string()),
+        LuaValue::String(region.id.clone()),
+    ));
+    table.push((
+        LuaValue::String(UI_HOVER_PHASE_ARG.to_string()),
+        LuaValue::String(phase.as_str().to_string()),
+    ));
+    LuaValue::Table(table)
+}
+
+/// Outcome of resolving the hoverable region at a display-cell column
+/// (issue #2411).
+///
+/// Pure over one band, mirroring [`resolve_click_in_band`]: the hover binding
+/// under the column wins (nearest declaration), an absent binding claims
+/// nothing, and an unroutable command is denied loudly instead of silently
+/// dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BandHoverOutcome {
+    /// A hover-bound span: report the transition to the owner.
+    Target(BandHoverTarget),
+    /// No span binds hover at the column.
+    NoClaim,
+    /// The binding is unroutable (foreign qualifier, empty verb).
+    Denied,
+}
+
+/// A resolved hover target: owner, region identity, and verb
+/// (issue #2411).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandHoverTarget {
+    /// Owning plugin id (the band that was hovered).
+    pub plugin_id: String,
+    /// Command verb, unqualified.
+    pub command: String,
+    /// Declared `on_hover.args` in declaration order.
+    pub args: Vec<(String, ClickArg)>,
+    /// Stable region identity declared beside the binding.
+    pub region: UiRegion,
+}
+
+/// Resolves a display-cell column into its hover outcome (issue #2411).
+#[must_use]
+pub fn resolve_hover_in_band(owner: &str, runs: &[BandRun], col: usize) -> BandHoverOutcome {
+    let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
+        return BandHoverOutcome::NoClaim;
+    };
+    let Some(hover) = run.on_hover.as_ref() else {
+        return BandHoverOutcome::NoClaim;
+    };
+    let Some(region) = hover.region.clone() else {
+        // Unreachable: the parser refuses an anonymous hover binding.
+        return BandHoverOutcome::NoClaim;
+    };
+    let Some(verb) = split_band_command(&hover.command, owner) else {
+        return BandHoverOutcome::Denied;
+    };
+    BandHoverOutcome::Target(BandHoverTarget {
+        plugin_id: owner.to_string(),
+        command: verb,
+        args: hover.args.clone(),
+        region,
+    })
+}
+
 /// Outcome of resolving a wheel column inside one band (CTX-1190, #2008).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BandScrollOutcome {
@@ -969,8 +1308,156 @@ pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], col: usize) -> Band
     })
 }
 
-/// Press-side band target stored by [`Runtime::band_press`] (CTX-0946 C1).
+/// Pointer phase a band hover dispatch carries (issue #2411).
 ///
+/// Two states only: the host never reports motion, coordinates, or dwell, so a
+/// plugin cannot reconstruct pointer geometry from hover events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandHoverPhase {
+    /// The pointer entered the declared region.
+    Enter,
+    /// The pointer left the declared region.
+    Leave,
+}
+
+impl BandHoverPhase {
+    /// Dispatch spelling carried under
+    /// [`UI_HOVER_PHASE_ARG`](bitty_lua::ui::UI_HOVER_PHASE_ARG).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => UI_HOVER_PHASE_ENTER,
+            Self::Leave => UI_HOVER_PHASE_LEAVE,
+        }
+    }
+}
+
+/// One Core-routed band hover transition (issue #2411).
+///
+/// Like [`BandClickRequest`] the plugin never sees pointer coordinates: only
+/// the owning plugin, the declared command verb and args, the stable region
+/// identity, and the [`BandHoverPhase`]. Hover carries no authority: the
+/// application dispatches it through the normal registration/capability gates,
+/// it never captures input, and it never sets `modal_active`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandHoverRequest {
+    /// Owning plugin id (the band that was hovered).
+    pub plugin_id: String,
+    /// Command verb, unqualified.
+    pub command: String,
+    /// Declared `on_hover.args` in declaration order.
+    pub args: Vec<(String, ClickArg)>,
+    /// Stable region identity declared beside the hover binding.
+    pub region: UiRegion,
+    /// Transition this dispatch reports.
+    pub phase: BandHoverPhase,
+}
+
+/// One live hover state: which band item the pointer is on (issue #2411).
+///
+/// The declared binding is captured at enter so the paired leave still names
+/// the same command and region after a content update replaced the tree.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct BandHoverState {
+    edge: BandEdge,
+    visible_index: usize,
+    plugin_id: String,
+    region: UiRegion,
+    command: String,
+    args: Vec<(String, ClickArg)>,
+    /// Display-cell column inside the band that entered the region. Re-probing
+    /// this column against the live tree is how a band replacement or a
+    /// content update proves the hover still names a real item.
+    col: usize,
+}
+
+impl BandHoverState {
+    /// Transition identity: two states are the same item exactly when these
+    /// agree, so re-declaring the same region does not re-fire enter.
+    fn same_item(&self, other: &Self) -> bool {
+        self.edge == other.edge
+            && self.visible_index == other.visible_index
+            && self.plugin_id == other.plugin_id
+            && self.region == other.region
+    }
+
+    /// The `leave` dispatch for this item.
+    fn leave_request(&self) -> BandHoverRequest {
+        BandHoverRequest {
+            plugin_id: self.plugin_id.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            region: self.region.clone(),
+            phase: BandHoverPhase::Leave,
+        }
+    }
+
+    /// The `enter` dispatch for this item.
+    fn enter_request(&self) -> BandHoverRequest {
+        BandHoverRequest {
+            plugin_id: self.plugin_id.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            region: self.region.clone(),
+            phase: BandHoverPhase::Enter,
+        }
+    }
+}
+
+/// Outcome of resolving the hoverable region under the pointer
+/// (issue #2411).
+#[derive(Debug, Clone, PartialEq)]
+enum HoverProbe {
+    /// The pointer is on a declared hover region whose command routes.
+    Target(BandHoverState),
+    /// The pointer is on a hover region whose command is unroutable.
+    Denied,
+    /// The pointer is off every hover region.
+    None,
+}
+
+/// Maximum queued band hover transitions (issue #2411).
+///
+/// One entry per distinct region and phase, so the cap is the same bounded
+/// per-frame work the accepted `UI_HOVER_QUEUE_MAX` names. Overflow drops the
+/// newest transition fail-closed and counts
+/// [`BandHostStats::hover_queue_drops`]; the next pointer motion re-derives
+/// the live target, so a dropped edge event cannot wedge the hover state.
+pub const BAND_HOVER_QUEUE_MAX: usize = bitty_lua::ui::UI_HOVER_QUEUE_MAX;
+
+/// Window-cell anchor for the focusable overlay surface (issue #2411).
+///
+/// A tooltip overlay can be placed against a live band item instead of the
+/// centered modal position. The anchor carries no absolute pointer data: it
+/// names the band (edge + visible index) and the item's Core-derived column
+/// span, so the paint path resolves the row live and a reflow can never place
+/// the surface against stale geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandOverlayAnchor {
+    /// Edge owning the band.
+    pub edge: BandEdge,
+    /// Visible band index on that edge.
+    pub visible_index: usize,
+    /// First display-cell column of the anchored region (inclusive).
+    pub start_col: usize,
+    /// One past the last display-cell column (exclusive).
+    pub end_col: usize,
+}
+
+impl BandOverlayAnchor {
+    /// Anchors to one live band item region.
+    #[must_use]
+    pub fn from_region(region: &BandItemRegion) -> Self {
+        Self {
+            edge: region.edge,
+            visible_index: region.visible_index,
+            start_col: region.start_col,
+            end_col: region.end_col,
+        }
+    }
+}
+
+/// Press-side band target stored by [`Runtime::band_press`] (CTX-0946 C1).///
 /// Standard button semantics: a release routes only onto the same target
 /// the press armed (band, run, and resolved request all equal). Anything
 /// else — a drag onto another span or band, or content that changed
@@ -1074,6 +1561,16 @@ pub struct BandHostStats {
     /// Band gestures refused because the band declared more than
     /// [`BAND_MAX_REGIONS`] distinct regions (issue #2248).
     pub region_overflows: u64,
+    /// Hover transitions queued for the cold phase (issue #2411).
+    pub hovers_routed: u64,
+    /// Hover transitions that collapsed into an already-queued transition of
+    /// the same region (issue #2411).
+    pub hovers_coalesced: u64,
+    /// Hover transitions dropped on a full queue (issue #2411).
+    pub hover_queue_drops: u64,
+    /// Hover bindings refused because their command is unroutable
+    /// (issue #2411).
+    pub hovers_denied: u64,
 }
 
 /// A resolved band hit: which visible band, and which text column.
@@ -1326,8 +1823,11 @@ impl Runtime {
         let cell_col = ((pos.x - origin_x) / cell_w).floor() as u64;
         let bands = self.visible_edge_bands(row_hit.edge);
         let band = bands.get(row_hit.visible_index)?;
-        let (text, _) = flatten_band_runs(&band.root);
-        let width_cells = u64::try_from(display_cells(&text)).unwrap_or(u64::MAX);
+        // Issue #2411: the band owns its laid-out span, not the raw text
+        // width — an anchored right group ends at the inset edge.
+        let (_, runs) = flatten_band_runs_in_width(&band.root, usize::from(window.width));
+        let width_cells = u64::try_from(runs.iter().map(|run| run.end_col).max().unwrap_or(0))
+            .unwrap_or(u64::MAX);
         let window_cells = u64::from(window.width);
         if cell_col >= width_cells.min(window_cells) {
             return None;
@@ -1451,7 +1951,8 @@ impl Runtime {
             return PressedBandTarget::NoClaim;
         };
         let owner = band.plugin_id.clone();
-        let (_, runs) = flatten_band_runs(&band.root);
+        let (_, runs) =
+            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
         let Some(hit) = self.plugin_band_hit(pos) else {
             return PressedBandTarget::NoClaim;
         };
@@ -1658,6 +2159,9 @@ impl Runtime {
     pub fn set_chrome_bands_with_mounts(&mut self, bands: ChromeBands, mounts: Vec<BandMount>) {
         self.chrome_bands = bands;
         self.rebuild_pending_band_origins(mounts);
+        // Issue #2411: same rule as `set_chrome_bands` — a replaced tree ends
+        // a hover whose region it no longer carries.
+        self.retain_live_band_hover();
     }
 
     /// Recomputes pending origins from the current bands and live mounts,
@@ -1940,7 +2444,8 @@ impl Runtime {
             return ScrollTargetOutcome::Unclaimed;
         };
         let owner = band.plugin_id.clone();
-        let (_, runs) = flatten_band_runs(&band.root);
+        let (_, runs) =
+            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
         let Some(hit) = self.plugin_band_hit(pos) else {
             return ScrollTargetOutcome::Unclaimed;
         };
@@ -2013,6 +2518,226 @@ impl Runtime {
         std::mem::take(&mut self.band_scroll_queue)
     }
 
+    /// Updates the hover state from a pointer position (issue #2411).
+    ///
+    /// One call per pointer motion. The host resolves the hover binding under
+    /// the pointer from the same width-aware runs paint and click hit-testing
+    /// use, and queues at most one transition per changed region: leaving the
+    /// previous item (when there was one) and entering the new one. Re-entering
+    /// the same region is a no-op, so steady hover costs one bounded hit test
+    /// and no dispatch.
+    ///
+    /// Hover is presentation-only: it never captures input, never sets
+    /// `modal_active`, and carries a stable region id plus a phase. A binding
+    /// with an unroutable command counts [`BandHostStats::hovers_denied`] and
+    /// is treated as no target (a leave for the previous item still fires).
+    pub fn update_band_hover(&mut self, pos: CursorPosition) {
+        let next = match self.band_hover_probe(pos) {
+            HoverProbe::Target(state) => Some(state),
+            HoverProbe::Denied => {
+                self.band_stats.hovers_denied = self.band_stats.hovers_denied.saturating_add(1);
+                None
+            }
+            HoverProbe::None => None,
+        };
+        let current = self.band_hover.clone();
+        match (&current, &next) {
+            (Some(current), Some(next)) if current.same_item(next) => return,
+            (None, None) => return,
+            _ => {}
+        }
+        if let Some(current) = current {
+            self.queue_band_hover(current.leave_request());
+        }
+        match next {
+            Some(next) => {
+                self.queue_band_hover(next.enter_request());
+                self.band_hover = Some(next);
+            }
+            None => self.band_hover = None,
+        }
+    }
+
+    /// Resolves the hoverable region under `pos` without mutating state
+    /// (issue #2411).
+    fn band_hover_probe(&self, pos: CursorPosition) -> HoverProbe {
+        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+            return HoverProbe::None;
+        };
+        let bands = self.visible_edge_bands(row_hit.edge);
+        let Some(band) = bands.get(row_hit.visible_index) else {
+            return HoverProbe::None;
+        };
+        let owner = band.plugin_id.clone();
+        let (_, runs) =
+            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
+        let Some(hit) = self.plugin_band_hit(pos) else {
+            return HoverProbe::None;
+        };
+        match resolve_hover_in_band(&owner, &runs, hit.col) {
+            BandHoverOutcome::Target(target) => HoverProbe::Target(BandHoverState {
+                edge: row_hit.edge,
+                visible_index: row_hit.visible_index,
+                plugin_id: target.plugin_id,
+                region: target.region,
+                command: target.command,
+                args: target.args,
+                col: hit.col,
+            }),
+            BandHoverOutcome::Denied => HoverProbe::Denied,
+            BandHoverOutcome::NoClaim => HoverProbe::None,
+        }
+    }
+
+    /// Queues one resolved hover transition (issue #2411).
+    ///
+    /// At most one dispatch per region per drain: a newer phase for a region
+    /// already queued replaces that entry (a reversed transition collapses to
+    /// its final phase, so a transient enter/leave inside one frame cannot
+    /// leave a tooltip visible), and an identical phase coalesces. A full
+    /// queue drops the newest transition fail-closed and counts
+    /// [`BandHostStats::hover_queue_drops`].
+    fn queue_band_hover(&mut self, request: BandHoverRequest) {
+        let same_region = |queued: &BandHoverRequest| {
+            queued.plugin_id == request.plugin_id && queued.region == request.region
+        };
+        if let Some(index) = self.band_hover_queue.iter().position(same_region) {
+            if self.band_hover_queue[index].phase != request.phase {
+                self.band_hover_queue[index] = request;
+            }
+            self.band_stats.hovers_coalesced = self.band_stats.hovers_coalesced.saturating_add(1);
+            return;
+        }
+        if self.band_hover_queue.len() >= BAND_HOVER_QUEUE_MAX {
+            self.band_stats.hover_queue_drops = self.band_stats.hover_queue_drops.saturating_add(1);
+            return;
+        }
+        self.band_hover_queue.push_back(request);
+        self.band_stats.hovers_routed = self.band_stats.hovers_routed.saturating_add(1);
+    }
+
+    /// Drains queued band hover transitions for application dispatch
+    /// (issue #2411).
+    ///
+    /// The application dispatches each through the plugin runtime's normal
+    /// command path (registration, capability, and schema gates unchanged);
+    /// the runtime never touches a VM. Order is transition order modulo
+    /// per-region coalescing; the queue is empty in the common case.
+    pub fn drain_band_hovers(&mut self) -> Vec<BandHoverRequest> {
+        self.band_hover_queue.drain(..).collect()
+    }
+
+    /// The live hovered band region rect, if any (issue #2411).
+    ///
+    /// Derived from the current tree, so an overlay host can anchor a tooltip
+    /// to the region Core is actually painting rather than to a stale
+    /// rectangle. `None` when nothing is hovered or the region no longer
+    /// exists in the live band.
+    #[must_use]
+    pub fn hovered_band_region(&self) -> Option<BandItemRegion> {
+        let state = self.band_hover.as_ref()?;
+        self.hover_region_rect(state)
+    }
+
+    /// Live rectangle of the hovered item, derived from the hover bindings
+    /// (issue #2411).
+    ///
+    /// Hover identity is declared on `on_hover`, which may differ from a
+    /// span's click/scroll identity, so this walks the hover bindings instead
+    /// of the click-region table. Adjacent runs that share the hover region
+    /// merge into one rect, exactly like the click table merges its items.
+    fn hover_region_rect(&self, state: &BandHoverState) -> Option<BandItemRegion> {
+        let row = self.visible_band_row(state.edge, state.visible_index)?;
+        let bands = self.visible_edge_bands(state.edge);
+        let band = bands.get(state.visible_index)?;
+        if band.plugin_id != state.plugin_id {
+            return None;
+        }
+        let width = usize::from(self.window_cells().width);
+        let (_, runs) = flatten_band_runs_in_width(&band.root, width);
+        let matches = |run: &BandRun| {
+            run.on_hover
+                .as_ref()
+                .and_then(|binding| binding.region.as_ref())
+                == Some(&state.region)
+        };
+        // The entered column must still hold the same hover region: a
+        // replacement tree, a reflow, or a moved item ends the hover instead
+        // of anchoring a tooltip to different content.
+        let covering = runs.iter().position(|run| {
+            state.col >= run.start_col && state.col < run.end_col && matches(run)
+        })?;
+        let mut start = runs[covering].start_col;
+        let mut end = runs[covering].end_col;
+        let mut index = covering;
+        while index > 0 {
+            let previous = &runs[index - 1];
+            if previous.end_col == start && matches(previous) {
+                start = previous.start_col;
+                index -= 1;
+            } else {
+                break;
+            }
+        }
+        index = covering;
+        while index + 1 < runs.len() {
+            let next = &runs[index + 1];
+            if next.start_col == end && matches(next) {
+                end = next.end_col;
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        let start = start.min(width);
+        let end = end.min(width);
+        if start >= end {
+            return None;
+        }
+        Some(BandItemRegion {
+            plugin_id: band.plugin_id.clone(),
+            edge: state.edge,
+            visible_index: state.visible_index,
+            row,
+            region: state.region.clone(),
+            start_col: start,
+            end_col: end,
+            version: band.version,
+        })
+    }
+
+    /// Queues a leave for the current hover and forgets it
+    /// (issue #2411).
+    ///
+    /// Used when hover ownership ends without a pointer transition: window
+    /// focus loss, or a band replacement that removed the hovered region.
+    /// The leave still dispatches once (a plugin can hide its tooltip), and
+    /// no capture or modal state is touched.
+    pub(super) fn clear_band_hover(&mut self) {
+        if let Some(state) = self.band_hover.take() {
+            self.queue_band_hover(state.leave_request());
+        }
+    }
+
+    /// Clears the hover when the live band no longer carries its region
+    /// (issue #2411).
+    ///
+    /// Called after a band replacement: the state names a band index and a
+    /// declared region, so a remount, an edge move, or an item disappearing
+    /// ends the hover instead of leaving a tooltip anchored to stale
+    /// geometry.
+    pub(super) fn retain_live_band_hover(&mut self) {
+        let Some(state) = self.band_hover.as_ref() else {
+            return;
+        };
+        let region_live = self
+            .hover_region_rect(state)
+            .is_some_and(|rect| rect.plugin_id == state.plugin_id);
+        if !region_live {
+            self.clear_band_hover();
+        }
+    }
+
     /// Whether a band-consumed press still owns its release.
     #[must_use]
     pub fn band_release_armed(&self) -> bool {
@@ -2061,6 +2786,8 @@ mod tests {
             bold: None,
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -2076,6 +2803,8 @@ mod tests {
                 region: None,
             }),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -2091,6 +2820,8 @@ mod tests {
                 args: vec![("step".to_string(), ClickArg::Number(2.0))],
                 region: None,
             }),
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -2121,6 +2852,8 @@ mod tests {
             bold: Some(true),
             on_click: Some(click.clone()),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         };
         let (_, runs) = flatten_band_runs(&root);
         assert_eq!(runs.len(), 1);
@@ -2139,12 +2872,16 @@ mod tests {
                 bold: Some(false),
                 on_click: None,
                 on_scroll: None,
+                anchor: None,
+                on_hover: None,
             }],
             fg: Some("accent".to_string()),
             bg: None,
             bold: Some(true),
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         };
         let (_, runs) = flatten_band_runs(&root);
         assert_eq!(runs[0].fg.as_deref(), Some("foreground"));
@@ -2167,6 +2904,8 @@ mod tests {
             bold: None,
             on_click: None,
             on_scroll: Some(scroll.clone()),
+            anchor: None,
+            on_hover: None,
         };
         let (_, runs) = flatten_band_runs(&root);
         assert_eq!(runs.len(), 2);
@@ -2198,6 +2937,8 @@ mod tests {
                     args: Vec::new(),
                     region: None,
                 }),
+                anchor: None,
+                on_hover: None,
             },
         ]));
         assert!(matches!(
@@ -2569,5 +3310,163 @@ mod tests {
             "one-over work stays queued, never dropped"
         );
         assert_eq!(rt.band_click_queue[0].command, "click-over");
+    }
+
+    fn hover_node(text: &str, command: &str, region: &str) -> UiNode {
+        UiNode::Text {
+            anchor: None,
+            text: text.to_string(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: Some(ClickCommand {
+                command: command.to_string(),
+                args: Vec::new(),
+                region: Some(UiRegion {
+                    id: region.to_string(),
+                    kind: bitty_lua::ui::UiRegionKind::Module,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn anchored_groups_center_and_flush_at_the_inset_edges() {
+        // Issue #2411: true centering and a flush right edge, independent of
+        // how wide the left group is (as long as the middle is free).
+        let root = UiNode::row(vec![
+            UiNode::row(vec![text_node("left")]),
+            UiNode::Row {
+                anchor: Some(UiAnchor::Center),
+                children: vec![text_node("mid")],
+                fg: None,
+                bg: None,
+                bold: None,
+                on_click: None,
+                on_scroll: None,
+                on_hover: None,
+            },
+            UiNode::Row {
+                anchor: Some(UiAnchor::Right),
+                children: vec![text_node("rt")],
+                fg: None,
+                bg: None,
+                bold: None,
+                on_click: None,
+                on_scroll: None,
+                on_hover: None,
+            },
+        ]);
+        let (text, runs) = flatten_band_runs_in_width(&root, 40);
+        assert_eq!(text, "leftmidrt");
+        let columns: Vec<(usize, usize)> = runs
+            .iter()
+            .map(|run| (run.start_col, run.end_col))
+            .collect();
+        assert_eq!(columns, vec![(0, 4), (18, 21), (38, 40)]);
+        assert_eq!((40 - 3) / 2, 18, "center is centered on the full width");
+
+        // Narrower than the left group: the right group keeps the trailing
+        // cell and the center is clipped away, never painted over the left.
+        let (_, runs) = flatten_band_runs_in_width(&root, 3);
+        for window in runs.windows(2) {
+            assert!(window[0].end_col <= window[1].start_col);
+        }
+        assert!(runs.iter().all(|run| run.end_col <= 3));
+    }
+
+    #[test]
+    fn hover_binding_inherits_to_descendant_runs() {
+        let root = UiNode::Row {
+            anchor: None,
+            children: vec![text_node("clock")],
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: Some(ClickCommand {
+                command: "test-bar:detail".to_string(),
+                args: Vec::new(),
+                region: Some(UiRegion {
+                    id: "clock".to_string(),
+                    kind: bitty_lua::ui::UiRegionKind::Module,
+                }),
+            }),
+        };
+        let (_, runs) = flatten_band_runs(&root);
+        let binding = runs[0].on_hover.as_ref().expect("inherited hover");
+        assert_eq!(binding.command, "test-bar:detail");
+        assert_eq!(binding.region.as_ref().expect("region").id, "clock");
+        match resolve_hover_in_band("test-bar", &runs, 0) {
+            BandHoverOutcome::Target(target) => {
+                assert_eq!(target.command, "detail");
+                assert_eq!(target.region.id, "clock");
+            }
+            outcome => panic!("expected hover target, got {outcome:?}"),
+        }
+        assert!(matches!(
+            resolve_hover_in_band("other-plugin", &runs, 0),
+            BandHoverOutcome::Denied
+        ));
+    }
+
+    #[test]
+    fn hover_args_overwrite_declared_region_and_phase() {
+        // The host keys win: a declared duplicate is replaced, never emitted
+        // twice, and the arg budget the parser reserved still holds.
+        let region = UiRegion {
+            id: "clock".to_string(),
+            kind: bitty_lua::ui::UiRegionKind::Module,
+        };
+        let args = vec![
+            ("region".to_string(), ClickArg::String("spoof".to_string())),
+            ("phase".to_string(), ClickArg::String("spoof".to_string())),
+            ("label".to_string(), ClickArg::String("detail".to_string())),
+        ];
+        let table = band_hover_args_table(&args, &region, BandHoverPhase::Leave);
+        let LuaValue::Table(pairs) = table else {
+            panic!("hover args are a table");
+        };
+        assert_eq!(pairs.len(), 3, "no duplicate keys");
+        let string_value = |name: &str| {
+            pairs.iter().find_map(|(key, value)| match (key, value) {
+                (LuaValue::String(key), LuaValue::String(value)) if key == name => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(string_value("label"), Some("detail"));
+        assert_eq!(string_value(UI_REGION_ARG), Some("clock"));
+        assert_eq!(string_value(UI_HOVER_PHASE_ARG), Some(UI_HOVER_PHASE_LEAVE));
+    }
+
+    #[test]
+    fn pua_glyph_widths_are_one_cell_each() {
+        // Icon maps are plugin data; Core only owes the existing text-cell
+        // rule, so a Nerd Font code point keeps a deterministic one-cell
+        // width and its module's hit region matches the paint.
+        for glyph in ['\u{e800}', '\u{f017}', '\u{e0b0}', '\u{f000}'] {
+            assert_eq!(
+                usize::from(bitty_term_state::char_cell_width(glyph)),
+                1,
+                "PUA glyph U+{:04X} keeps one cell",
+                glyph as u32
+            );
+        }
+        let root = UiNode::row(vec![text_node("\u{e800}\u{f017} 80%")]);
+        let (_, runs) = flatten_band_runs(&root);
+        assert_eq!(runs[0].end_col, 6, "two icons plus a space and label");
+
+        // A representative hoverable icon module resolves at the glyph cell.
+        let icon = UiNode::row(vec![hover_node("\u{e800}", "test-bar:detail", "clock")]);
+        let (_, runs) = flatten_band_runs(&icon);
+        match resolve_hover_in_band("test-bar", &runs, 0) {
+            BandHoverOutcome::Target(target) => assert_eq!(target.region.id, "clock"),
+            outcome => panic!("expected icon hover target, got {outcome:?}"),
+        }
     }
 }

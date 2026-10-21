@@ -84,7 +84,7 @@
 //!   and the bounded crossing.
 
 use crate::PanelLayoutMode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use bitty_platform::{
     Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
@@ -980,6 +980,13 @@ pub struct Runtime {
     /// armed (issue #2248). Its paired release is consumed so chrome keeps
     /// clipboard and capture authority even for multi-button gestures.
     band_extra_press: Option<band_host::BandButton>,
+    /// Live hover state: the band item the pointer is on (issue #2411).
+    /// Presentation-only; never part of capture or modal state.
+    band_hover: Option<band_host::BandHoverState>,
+    /// Window-cell anchor for the focusable overlay surface (issue #2411).
+    plugin_overlay_anchor: Option<band_host::BandOverlayAnchor>,
+    /// Bounded pending hover transitions for the cold phase (issue #2411).
+    band_hover_queue: VecDeque<band_host::BandHoverRequest>,
     /// Headless host statistics for band routing and paint (CTX-0946).
     band_stats: band_host::BandHostStats,
     search_state: SearchState,
@@ -1806,6 +1813,9 @@ impl Runtime {
             band_press_target: None,
             band_press_button: None,
             band_extra_press: None,
+            band_hover: None,
+            plugin_overlay_anchor: None,
+            band_hover_queue: VecDeque::new(),
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
@@ -2083,6 +2093,9 @@ impl Runtime {
             band_press_target: None,
             band_press_button: None,
             band_extra_press: None,
+            band_hover: None,
+            plugin_overlay_anchor: None,
+            band_hover_queue: VecDeque::new(),
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
@@ -2442,24 +2455,57 @@ impl Runtime {
         // cancelling queued/armed admissions; the release swallow is kept.
         self.pending_band_origins.clear();
         self.retain_live_band_admissions(&[]);
+        // Issue #2411: a replaced band tree ends any hover whose region it no
+        // longer carries, so a tooltip cannot stay anchored to stale geometry.
+        self.retain_live_band_hover();
     }
 
-    /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).
+    /// Core-hosted overlay surface (CTX-0943, W-28 follow-up; issue #2411).
     ///
-    /// The owner's `overlay`-slot block while the transient input capture
-    /// holds; `None` otherwise. Follows the `ChromeBands` LiveSnapshot
-    /// pattern: TerminalApp reads `PluginRuntime::ui_blocks()`, converts to
-    /// the plain [`BandContent`] struct, and pushes it here.
+    /// The owner's `overlay`-slot block: the transient-capture owner while a
+    /// focusable session holds, or — with no capture — the plugin that owns
+    /// the live hovered band region, painted as a non-modal tooltip and
+    /// anchored by [`Self::plugin_overlay_anchor`]. `None` otherwise. Follows
+    /// the `ChromeBands` LiveSnapshot pattern: TerminalApp reads
+    /// `PluginRuntime::ui_blocks()`, converts to the plain [`BandContent`]
+    /// struct, and pushes it here.
     #[must_use]
     pub fn plugin_overlay(&self) -> Option<&BandContent> {
         self.plugin_overlay.as_ref()
+    }
+
+    /// Window-cell anchor for the overlay surface (issue #2411).
+    ///
+    /// `None` means the centered modal placement; `Some` names the live band
+    /// item a hover-anchored tooltip is painted against.
+    #[must_use]
+    pub fn plugin_overlay_anchor(&self) -> Option<band_host::BandOverlayAnchor> {
+        self.plugin_overlay_anchor
+    }
+
+    /// Anchors the focusable overlay surface to a band item, or clears the
+    /// anchor (issue #2411).
+    ///
+    /// The application sets this from the live hover region of the surface's
+    /// owner; `None` restores the centered modal placement. A cleared surface
+    /// always clears the anchor, so a later overlay cannot inherit a stale
+    /// tooltip position.
+    pub fn set_plugin_overlay_anchor(&mut self, anchor: Option<band_host::BandOverlayAnchor>) {
+        let anchor = anchor.filter(|_| self.plugin_overlay.is_some());
+        if self.plugin_overlay_anchor != anchor {
+            self.plugin_overlay_anchor = anchor;
+            if self.plugin_overlay.is_some() {
+                self.pending_full_redraw = true;
+            }
+        }
     }
 
     /// Updates the focusable-overlay surface (CTX-0943).
     ///
     /// Marks a full redraw only when the surface actually changes (appears,
     /// clears, or the retained block's version/content moves), so ticks stay
-    /// idle while an unchanged overlay is up. `None` clears the surface.
+    /// idle while an unchanged overlay is up. `None` clears the surface and
+    /// its hover anchor.
     pub fn set_plugin_overlay(&mut self, overlay: Option<BandContent>) {
         let changed = match (&self.plugin_overlay, &overlay) {
             (None, None) => false,
@@ -2472,6 +2518,9 @@ impl Runtime {
             }
         };
         self.plugin_overlay = overlay;
+        if self.plugin_overlay.is_none() {
+            self.plugin_overlay_anchor = None;
+        }
         if changed {
             self.pending_full_redraw = true;
         }

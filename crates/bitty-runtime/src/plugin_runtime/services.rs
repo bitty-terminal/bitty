@@ -7368,6 +7368,8 @@ mod tests {
                 args: vec![("step".to_string(), ClickArg::Number(1.0))],
                 region: None,
             }),
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -7428,6 +7430,8 @@ mod tests {
                 region: None,
             }),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         };
         UiNode::Row {
             children: (0..(UI_MAX_NODES - 1)).map(|_| child.clone()).collect(),
@@ -7436,6 +7440,8 @@ mod tests {
             bold: None,
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }
     }
 

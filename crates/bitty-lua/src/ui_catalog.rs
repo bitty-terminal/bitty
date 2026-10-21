@@ -1,13 +1,16 @@
-//! Extension component catalog (candidate, bitty#2114 / `CTX-1416`).
+//! Extension component catalog (candidate catalog surface; no consumer yet).
 //!
 //! This module is the headless implementation slice of the candidate
 //! `bitty-terminal-docs/specifications/extension-component-catalog-candidate.md`
-//! record. It defines five typed descriptors for reusable extension building
+//! record. It defines five typed descriptors for candidate extension building
 //! blocks and composes them from the **accepted** Plugin API v1 node set only:
 //! `Text`, `Row`, `Column`, and `List` (`crate::ui::UI_V1_NODE_KINDS`).
 //!
-//! Nothing here is an accepted contract, a plugin-facing API, or a
-//! compatibility promise. The descriptors are host-side Rust data; no Lua
+//! Nothing here is an accepted contract, a plugin-facing API, a compatibility
+//! promise, or a shipped extension capability. **No production consumer
+//! exists:** no host path, band host, overlay path, bridge, render loop, Lua
+//! surface, or plugin installs, composes, or renders these descriptors, and no
+//! extension can opt in today. The descriptors are host-side Rust data; no Lua
 //! value, VM, callback, renderer handle, capability, coordinate, or command
 //! binding crosses this module.
 //!
@@ -50,9 +53,9 @@
 //! - **No style hooks yet.** The candidate Scene Style Primitives record is
 //!   not accepted and has no consumer here; the catalog emits no style field
 //!   and reserves hooks for a successor acceptance.
-//! - **Cold path.** Composition is a pure function over bounded data. It does
-//!   not construct or call a Lua VM and is not wired into PTY, input, damage,
-//!   or render loops.
+//! - **Cold path, no consumer.** Composition is a pure function over bounded
+//!   data. It does not construct or call a Lua VM and is not wired into PTY,
+//!   input, damage, or render loops; nothing in production calls it yet.
 //!
 //! # Caps (candidate; inclusive)
 //!
@@ -966,6 +969,16 @@ mod tests {
         }
     }
 
+    /// Every emitted text leaf in tree order, separators included.
+    fn emitted_texts(node: &UiNode) -> Vec<String> {
+        match node {
+            UiNode::Text { text, .. } => vec![text.clone()],
+            UiNode::Row { children, .. }
+            | UiNode::Column { children, .. }
+            | UiNode::List { children, .. } => children.iter().flat_map(emitted_texts).collect(),
+        }
+    }
+
     fn encode(node: &UiNode) -> String {
         fn option(out: &mut String, value: &Option<String>) {
             match value {
@@ -1117,6 +1130,69 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_inputs_compose_in_exact_declaration_order() {
+        // Every declaration below is deliberately shuffled and every token is
+        // unique: sorting, deduplicating, or reversing any collection changes
+        // the exact emitted sequence. The assertions observe what `compose`
+        // emitted (leaf texts and separators in tree order), not a sorted view
+        // of the inputs.
+        let left = ["zulu", "alpha", "mike"];
+        let center = ["yankee", "bravo"];
+        let right = ["xray", "delta", "echo"];
+        let band_node = CatalogBlock::Band(band(&left, &center, &right))
+            .compose()
+            .expect("bounded band");
+        assert_eq!(
+            emitted_texts(&band_node),
+            [
+                "zulu", " ", "alpha", " ", "mike", " ", "yankee", " ", "bravo", " ", "xray", " ",
+                "delta", " ", "echo",
+            ]
+        );
+        assert_eq!(
+            flatten(&band_node),
+            "zulu alpha mike yankee bravo xray delta echo"
+        );
+        let mut sorted = left
+            .into_iter()
+            .chain(center)
+            .chain(right)
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        assert_ne!(flatten(&band_node), sorted.join(" "));
+
+        let strip_node = CatalogBlock::StatusStrip(band(&right, &left, &center))
+            .compose()
+            .expect("bounded status strip");
+        assert_eq!(
+            emitted_texts(&strip_node),
+            [
+                "xray", " ", "delta", " ", "echo", " ", "zulu", " ", "alpha", " ", "mike", " ",
+                "yankee", " ", "bravo",
+            ]
+        );
+
+        let pill_node = CatalogBlock::PillRow(pills(&["zulu", "alpha", "mike", "bravo"]))
+            .compose()
+            .expect("bounded pill row");
+        assert_eq!(
+            emitted_texts(&pill_node),
+            ["[zulu]", " ", "[alpha]", " ", "[mike]", " ", "[bravo]"]
+        );
+
+        let sheet_node = CatalogBlock::ModalSheet(ModalSheetDescriptor {
+            title: "Title".to_string(),
+            rows: vec!["zulu".to_string(), "alpha".to_string(), "mike".to_string()],
+        })
+        .compose()
+        .expect("bounded sheet");
+        assert_eq!(
+            emitted_texts(&sheet_node),
+            ["Title", "zulu", "alpha", "mike"]
+        );
+    }
+
+    #[test]
     fn pill_row_preserves_order_duplicates_and_active_state() {
         let block = CatalogBlock::PillRow(PillRowDescriptor {
             pills: vec![Pill::new("b"), Pill::active("a"), Pill::new("a")],
@@ -1178,93 +1254,93 @@ mod tests {
     }
 
     #[test]
-    fn caps_are_inclusive_and_one_past_fails_closed() {
-        let max_segments: Vec<&str> = (0..CATALOG_MAX_SEGMENTS).map(|_| "s").collect();
+    fn segment_count_cap_is_inclusive_across_regions() {
+        let segments = |count: usize| -> Vec<Segment> {
+            (0..count)
+                .map(|index| Segment::new(format!("s{index}")))
+                .collect()
+        };
+        // The cap counts every region, and exactly 64 split across all three
+        // regions is accepted.
         let at_cap = CatalogBlock::Band(StripDescriptor {
-            left: max_segments
-                .iter()
-                .map(|text| Segment::new(*text))
-                .collect(),
-            center: Vec::new(),
-            right: Vec::new(),
+            left: segments(22),
+            center: segments(21),
+            right: segments(21),
         });
         assert!(at_cap.compose().is_ok());
 
-        let over: Vec<&str> = (0..=CATALOG_MAX_SEGMENTS).map(|_| "s").collect();
-        let over_cap = CatalogBlock::Band(StripDescriptor {
-            left: over.iter().map(|text| Segment::new(*text)).collect(),
-            center: Vec::new(),
-            right: Vec::new(),
+        // One segment past the cap is a typed rejection, never a clamp.
+        let over_cap = CatalogBlock::StatusStrip(StripDescriptor {
+            left: segments(22),
+            center: segments(21),
+            right: segments(22),
         });
         assert_eq!(
             over_cap.compose(),
             Err(CatalogError::TooManyItems {
-                entry: CatalogEntry::Band,
+                entry: CatalogEntry::StatusStrip,
                 found: CATALOG_MAX_SEGMENTS + 1,
                 cap: CATALOG_MAX_SEGMENTS,
             })
         );
+    }
 
-        let at_pill_cap: Vec<&str> = (0..CATALOG_MAX_PILLS).map(|_| "p").collect();
+    #[test]
+    fn pill_count_cap_is_inclusive() {
+        let row = |count: usize| PillRowDescriptor {
+            pills: (0..count)
+                .map(|index| Pill::new(format!("p{index}")))
+                .collect(),
+        };
         assert!(
-            CatalogBlock::PillRow(PillRowDescriptor {
-                pills: at_pill_cap.iter().map(|label| Pill::new(*label)).collect(),
-            })
-            .compose()
-            .is_ok()
+            CatalogBlock::PillRow(row(CATALOG_MAX_PILLS))
+                .compose()
+                .is_ok()
         );
-        let over_pills: Vec<&str> = (0..=CATALOG_MAX_PILLS).map(|_| "p").collect();
         assert_eq!(
-            CatalogBlock::PillRow(PillRowDescriptor {
-                pills: over_pills.iter().map(|label| Pill::new(*label)).collect(),
-            })
-            .compose(),
+            CatalogBlock::PillRow(row(CATALOG_MAX_PILLS + 1)).compose(),
             Err(CatalogError::TooManyItems {
                 entry: CatalogEntry::PillRow,
                 found: CATALOG_MAX_PILLS + 1,
                 cap: CATALOG_MAX_PILLS,
             })
         );
+    }
 
-        let at_rows: Vec<String> = (0..CATALOG_MAX_ROWS).map(|_| "r".to_string()).collect();
+    #[test]
+    fn modal_sheet_row_count_cap_is_inclusive() {
+        let sheet = |count: usize| ModalSheetDescriptor {
+            title: "title".to_string(),
+            rows: (0..count).map(|index| format!("r{index}")).collect(),
+        };
         assert!(
-            CatalogBlock::ModalSheet(ModalSheetDescriptor {
-                title: "t".to_string(),
-                rows: at_rows,
-            })
-            .compose()
-            .is_ok()
+            CatalogBlock::ModalSheet(sheet(CATALOG_MAX_ROWS))
+                .compose()
+                .is_ok()
         );
-        let over_rows: Vec<String> = (0..=CATALOG_MAX_ROWS).map(|_| "r".to_string()).collect();
         assert_eq!(
-            CatalogBlock::ModalSheet(ModalSheetDescriptor {
-                title: "t".to_string(),
-                rows: over_rows,
-            })
-            .compose(),
+            CatalogBlock::ModalSheet(sheet(CATALOG_MAX_ROWS + 1)).compose(),
             Err(CatalogError::TooManyItems {
                 entry: CatalogEntry::ModalSheet,
                 found: CATALOG_MAX_ROWS + 1,
                 cap: CATALOG_MAX_ROWS,
             })
         );
+    }
 
-        let max_segment = "x".repeat(CATALOG_MAX_SEGMENT_BYTES);
+    #[test]
+    fn segment_byte_cap_is_inclusive() {
+        let strip = |text: String| StripDescriptor {
+            left: vec![Segment::new(text)],
+            ..StripDescriptor::default()
+        };
         assert!(
-            CatalogBlock::StatusStrip(StripDescriptor {
-                left: vec![Segment::new(max_segment)],
-                ..StripDescriptor::default()
-            })
-            .compose()
-            .is_ok()
+            CatalogBlock::StatusStrip(strip("x".repeat(CATALOG_MAX_SEGMENT_BYTES)))
+                .compose()
+                .is_ok()
         );
-        let over_segment = "x".repeat(CATALOG_MAX_SEGMENT_BYTES + 1);
         assert_eq!(
-            CatalogBlock::StatusStrip(StripDescriptor {
-                left: vec![Segment::new(over_segment)],
-                ..StripDescriptor::default()
-            })
-            .compose(),
+            CatalogBlock::StatusStrip(strip("x".repeat(CATALOG_MAX_SEGMENT_BYTES + 1))).compose(),
             Err(CatalogError::ItemTooLong {
                 entry: CatalogEntry::StatusStrip,
                 index: 0,
@@ -1272,16 +1348,20 @@ mod tests {
                 cap: CATALOG_MAX_SEGMENT_BYTES,
             })
         );
+    }
 
-        let max_label = "x".repeat(CATALOG_MAX_PILL_LABEL_BYTES);
+    #[test]
+    fn pill_label_byte_cap_is_inclusive() {
+        let row = |len: usize| PillRowDescriptor {
+            pills: vec![Pill::new("x".repeat(len))],
+        };
         assert!(
-            CatalogBlock::PillRow(pills(&[max_label.as_str()]))
+            CatalogBlock::PillRow(row(CATALOG_MAX_PILL_LABEL_BYTES))
                 .compose()
                 .is_ok()
         );
-        let over_label = "x".repeat(CATALOG_MAX_PILL_LABEL_BYTES + 1);
         assert_eq!(
-            CatalogBlock::PillRow(pills(&[over_label.as_str()])).compose(),
+            CatalogBlock::PillRow(row(CATALOG_MAX_PILL_LABEL_BYTES + 1)).compose(),
             Err(CatalogError::ItemTooLong {
                 entry: CatalogEntry::PillRow,
                 index: 0,
@@ -1289,22 +1369,150 @@ mod tests {
                 cap: CATALOG_MAX_PILL_LABEL_BYTES,
             })
         );
+    }
 
-        let max_detail = "x".repeat(CATALOG_MAX_DETAIL_BYTES);
+    #[test]
+    fn detail_fallback_byte_cap_is_inclusive() {
         assert!(
-            CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor { text: max_detail })
-                .compose()
-                .is_ok()
+            CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor {
+                text: "x".repeat(CATALOG_MAX_DETAIL_BYTES),
+            })
+            .compose()
+            .is_ok()
         );
-        let over_detail = "x".repeat(CATALOG_MAX_DETAIL_BYTES + 1);
         assert_eq!(
-            CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor { text: over_detail })
-                .compose(),
+            CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor {
+                text: "x".repeat(CATALOG_MAX_DETAIL_BYTES + 1),
+            })
+            .compose(),
             Err(CatalogError::ItemTooLong {
                 entry: CatalogEntry::TooltipDetailFallback,
                 index: 0,
                 len: CATALOG_MAX_DETAIL_BYTES + 1,
                 cap: CATALOG_MAX_DETAIL_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn modal_sheet_title_byte_cap_is_inclusive() {
+        let sheet = |title: String| ModalSheetDescriptor {
+            title,
+            rows: vec!["row".to_string()],
+        };
+        assert!(
+            CatalogBlock::ModalSheet(sheet("x".repeat(CATALOG_MAX_DETAIL_BYTES)))
+                .compose()
+                .is_ok()
+        );
+        assert_eq!(
+            CatalogBlock::ModalSheet(sheet("x".repeat(CATALOG_MAX_DETAIL_BYTES + 1))).compose(),
+            Err(CatalogError::ItemTooLong {
+                entry: CatalogEntry::ModalSheet,
+                index: 0,
+                len: CATALOG_MAX_DETAIL_BYTES + 1,
+                cap: CATALOG_MAX_DETAIL_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn modal_sheet_row_byte_cap_is_inclusive() {
+        let sheet = |len: usize| ModalSheetDescriptor {
+            title: "title".to_string(),
+            rows: vec!["x".repeat(len)],
+        };
+        assert!(
+            CatalogBlock::ModalSheet(sheet(CATALOG_MAX_DETAIL_BYTES))
+                .compose()
+                .is_ok()
+        );
+        assert_eq!(
+            CatalogBlock::ModalSheet(sheet(CATALOG_MAX_DETAIL_BYTES + 1)).compose(),
+            Err(CatalogError::ItemTooLong {
+                entry: CatalogEntry::ModalSheet,
+                index: 1,
+                len: CATALOG_MAX_DETAIL_BYTES + 1,
+                cap: CATALOG_MAX_DETAIL_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_block_depth_cap_is_inclusive() {
+        // 15 wrappers put the leaf exactly at `CATALOG_MAX_DEPTH`; the tree is
+        // still outside the catalog shape, so the failure is a shape mismatch
+        // and not a depth breach.
+        let nested = |wrappers: usize| {
+            let mut node = UiNode::text("x");
+            for _ in 0..wrappers {
+                node = UiNode::row(vec![node]);
+            }
+            node
+        };
+        let at_cap = nested(CATALOG_MAX_DEPTH - 1);
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::Band, &at_cap),
+            Err(CatalogError::ShapeMismatch {
+                entry: CatalogEntry::Band,
+            })
+        );
+
+        let over_cap = nested(CATALOG_MAX_DEPTH);
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::Band, &over_cap),
+            Err(CatalogError::TooDeep {
+                found: CATALOG_MAX_DEPTH + 1,
+                cap: CATALOG_MAX_DEPTH,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_block_node_cap_is_inclusive() {
+        // A flat tree with exactly `CATALOG_MAX_NODES` nodes passes the bound
+        // check and fails later as a shape mismatch; one more node fails the
+        // bound itself.
+        let wide =
+            |children: usize| UiNode::row((0..children).map(|_| UiNode::text("x")).collect());
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::Band, &wide(CATALOG_MAX_NODES - 1)),
+            Err(CatalogError::ShapeMismatch {
+                entry: CatalogEntry::Band,
+            })
+        );
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::Band, &wide(CATALOG_MAX_NODES)),
+            Err(CatalogError::TooManyNodes {
+                found: CATALOG_MAX_NODES + 1,
+                cap: CATALOG_MAX_NODES,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregate_text_cap_is_inclusive() {
+        // One text leaf at exactly the aggregate budget passes the bound check;
+        // its per-entry detail cap then rejects it as an item, proving the
+        // aggregate cap did not fire at the boundary.
+        let at_cap = UiNode::text("x".repeat(CATALOG_MAX_TEXT_BYTES));
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::TooltipDetailFallback, &at_cap),
+            Err(CatalogError::ItemTooLong {
+                entry: CatalogEntry::TooltipDetailFallback,
+                index: 0,
+                len: CATALOG_MAX_TEXT_BYTES,
+                cap: CATALOG_MAX_DETAIL_BYTES,
+            })
+        );
+
+        let over_cap = UiNode::text("x".repeat(CATALOG_MAX_TEXT_BYTES + 1));
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::TooltipDetailFallback, &over_cap),
+            Err(CatalogError::TextTooLong {
+                entry: CatalogEntry::TooltipDetailFallback,
+                bytes: CATALOG_MAX_TEXT_BYTES + 1,
+                cap: CATALOG_MAX_TEXT_BYTES,
             })
         );
     }

@@ -21,7 +21,8 @@
 //! - **UI node model ([`ui`]) and candidate catalog ([`ui_catalog`]):** the
 //!   accepted v1 `Text`/`Row`/`Column`/`List` bridge types plus the headless
 //!   bitty#2114 component-catalog descriptors. Both are pure bounded data
-//!   handling; the catalog never constructs a VM and is not on a hot path.
+//!   handling; the catalog never constructs a VM, is not on a hot path, and
+//!   has no production consumer yet (candidate surface only).
 //!
 //! The crate is `std`-only, `#![forbid(unsafe_code)]`, `MSRV 1.85`,
 //! `edition = "2024"`, `publish = false` (workspace), headless and

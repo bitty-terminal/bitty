@@ -557,6 +557,30 @@ pub(crate) fn init_shell_name_from_path(raw: &str) -> Option<String> {
     Some(canonical.to_string())
 }
 
+/// One-token positional hint for `bitty init <shell>` (issue #2367).
+///
+/// `bitty init fish` reads like a `shell-init` invocation. Exactly one
+/// positional token that names a supported shell gets the targeted hint;
+/// every other unexpected argument (unknown words, shell paths, extra
+/// tokens) keeps the generic diagnostic unchanged. Returns `None` when the
+/// generic path applies.
+pub(crate) fn init_shell_name_hint(init_args: &[String]) -> Option<String> {
+    let [token] = init_args else {
+        return None;
+    };
+    let shell = crate::completion::CompletionShell::parse(token)?;
+    let canonical = match shell {
+        crate::completion::CompletionShell::Bash => "bash",
+        crate::completion::CompletionShell::Zsh => "zsh",
+        crate::completion::CompletionShell::Fish => "fish",
+        crate::completion::CompletionShell::Powershell => "powershell",
+        crate::completion::CompletionShell::Nushell => "nushell",
+    };
+    Some(format!(
+        "bitty init: `{token}` is a shell name; did you mean `bitty shell-init {canonical}`?"
+    ))
+}
+
 /// Detects the shell name for the handoff (CTX-1132, #1913): the wizard's
 /// chosen shell wins, else `$SHELL`, else `bash` fallback. Never reads the
 /// environment itself (pure over injected values, English-only).
@@ -4011,11 +4035,14 @@ pub(crate) fn run_init_subcommand_with_io(
     output: &mut dyn std::io::Write,
 ) -> i32 {
     if !args.init_args.is_empty() {
-        eprintln!(
-            "bitty init: unexpected argument '{}'\n{}",
-            args.init_args[0],
-            init_usage()
-        );
+        match init_shell_name_hint(&args.init_args) {
+            Some(hint) => eprintln!("{hint}\n{}", init_usage()),
+            None => eprintln!(
+                "bitty init: unexpected argument '{}'\n{}",
+                args.init_args[0],
+                init_usage()
+            ),
+        }
         return 2;
     }
     // A mutating command never inherits the launch resolver's

@@ -6111,6 +6111,30 @@ fn init_shell_candidates_order_and_fallback() {
 }
 
 #[test]
+fn init_shell_name_positional_gets_shell_init_hint() {
+    // `bitty init fish` reads like a shell-init invocation (#2367).
+    assert_eq!(
+        crate::init::init_shell_name_hint(&["fish".to_string()]).expect("fish hint"),
+        "bitty init: `fish` is a shell name; did you mean `bitty shell-init fish`?"
+    );
+    // Every supported shell name resolves to its canonical shell-init spelling.
+    for name in ["bash", "zsh", "fish", "powershell", "nushell"] {
+        let hint =
+            crate::init::init_shell_name_hint(&[name.to_string()]).expect("supported shell hint");
+        assert!(
+            hint.contains(&format!("`bitty shell-init {name}`")),
+            "{hint}"
+        );
+    }
+    // The generic unexpected-argument path stays generic: unknown words,
+    // shell paths, extra tokens, and no tokens get no hint.
+    assert!(crate::init::init_shell_name_hint(&["bogus".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&["/bin/fish".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&["fish".to_string(), "zsh".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&[]).is_none());
+}
+
+#[test]
 fn init_step_parsers_accept_and_reject() {
     let cands = vec!["/bin/bash".to_string(), "/bin/sh".to_string()];
     // Shell: empty takes the default, numbers pick, customs validate.

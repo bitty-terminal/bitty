@@ -19,12 +19,20 @@
 //! under theme B in one runtime must be byte-identical to the frame a runtime
 //! that rendered A produces after switching to B. A single stale cell,
 //! selection rect, cursor overlay, or retained leaf keeps A and fails.
+//!
+//! Issue #2340 follow-up: frame equality alone lets a chrome surface pass on
+//! both sides of the comparison while every production call site reads the
+//! wrong color. The pending/close-confirm banner, help panel, and IME preedit
+//! tests therefore also probe the exact pixels of their theme-derived fills
+//! after a live switch (`dracula` -> `github-light`), so reverting one fill to
+//! a fixed constant fails the test that owns that surface.
 
 use std::time::{Duration, Instant};
 
 use bitty_config::theme::{CustomPalette, resolve_theme};
+use bitty_render::grid::{HELP_PANEL_BG, HELP_PANEL_BORDER, PENDING_PASTE_BANNER_BG};
 use bitty_runtime::plugin_runtime::QueuedThemeRequest;
-use bitty_runtime::{AnimationPolicy, Runtime, RuntimeConfig, ThemePalette};
+use bitty_runtime::{AnimationPolicy, CloseConfirmMode, Runtime, RuntimeConfig, ThemePalette};
 use bitty_ui::{CellPos, Selection};
 
 const COLS: usize = 80;
@@ -42,6 +50,24 @@ fn runtime(theme: ThemePalette) -> Runtime {
         rows: ROWS,
         theme,
         theme_resolved: true,
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("deterministic headless runtime")
+}
+
+/// Runtime with the close-confirm gate forced to `Always`, so a window-close
+/// request arms the banner without a foreground job.
+fn close_confirm_runtime(theme: ThemePalette) -> Runtime {
+    Runtime::with_deterministic_rasterizer(RuntimeConfig {
+        cols: COLS,
+        rows: ROWS,
+        theme,
+        theme_resolved: true,
+        close_confirm: CloseConfirmMode::Always,
         animations: AnimationPolicy {
             enabled: false,
             ..AnimationPolicy::default()
@@ -133,6 +159,7 @@ struct Probe {
     width: usize,
     height: usize,
     rows: u16,
+    cols: u16,
     content_x: i32,
     content_y: i32,
     cell_w: usize,
@@ -151,6 +178,7 @@ impl Probe {
             width: extent.width() as usize,
             height: extent.height() as usize,
             rows: frame.rows,
+            cols: frame.cols,
             content_x: frame.content.x + pad,
             content_y: frame.content.y + pad,
             cell_w: frame.content.width as usize / usize::from(frame.cols),
@@ -158,17 +186,54 @@ impl Probe {
         }
     }
 
-    fn pixel(&self, rgba: &[u8], row: u16, col: u16) -> [u8; 4] {
-        let x = self.content_x + i32::from(col) * self.cell_w as i32 + self.cell_w as i32 / 2;
-        let y = self.content_y + i32::from(row) * self.cell_h as i32 + self.cell_h as i32 / 2;
+    /// Pixel at window-relative coordinates.
+    fn pixel_at(&self, rgba: &[u8], x: i32, y: i32) -> [u8; 4] {
         assert!(
             x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height,
-            "probe ({row},{col}) outside {}x{}",
+            "probe ({x},{y}) outside {}x{}",
             self.width,
             self.height
         );
         let offset = (y as usize * self.width + x as usize) * 4;
         rgba[offset..offset + 4].try_into().expect("four bytes")
+    }
+
+    fn pixel(&self, rgba: &[u8], row: u16, col: u16) -> [u8; 4] {
+        let x = self.content_x + i32::from(col) * self.cell_w as i32 + self.cell_w as i32 / 2;
+        let y = self.content_y + i32::from(row) * self.cell_h as i32 + self.cell_h as i32 / 2;
+        self.pixel_at(rgba, x, y)
+    }
+
+    /// Bounding box of every pixel equal to `color` (inclusive corners), or
+    /// `None`. Used to locate the opaque help-panel ring without duplicating
+    /// the panel layout math in the test.
+    fn color_bounds(&self, rgba: &[u8], color: [u8; 4]) -> Option<(i32, i32, i32, i32)> {
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                if self.pixel_at(rgba, x, y) == color {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        (x1 >= x0 && y1 >= y0).then_some((x0, y0, x1, y1))
+    }
+
+    /// Probes the bottom-right confirmation pill painted for `banner`.
+    ///
+    /// The pill is exactly as wide as the (right-aligned) banner text and one
+    /// cell high on the focused view's last content row; the probe sits one
+    /// pixel inside its top-left corner, above any glyph ink.
+    fn banner_pixel(&self, rgba: &[u8], banner: &str) -> [u8; 4] {
+        let text_cells = banner.chars().count().min(usize::from(self.cols)).max(1);
+        let pill_w = (text_cells * self.cell_w) as i32;
+        let full_w = (usize::from(self.cols) * self.cell_w) as i32;
+        let x = self.content_x + (full_w - pill_w) + 1;
+        let y = self.content_y + (i32::from(self.rows) - 1) * self.cell_h as i32 + 1;
+        self.pixel_at(rgba, x, y)
     }
 }
 
@@ -179,6 +244,24 @@ fn premultiply(color: [u8; 4], alpha: u8) -> [u8; 4] {
         ((u16::from(color[2]) * u16::from(alpha)) / 255) as u8,
         alpha,
     ]
+}
+
+fn opaque(rgb: [u8; 3]) -> [u8; 4] {
+    [rgb[0], rgb[1], rgb[2], 0xFF]
+}
+
+/// Expected pending/close-confirm pill ground (issue #2333 contract: ANSI 3).
+///
+/// Derived from the palette in the test, not from the production paint
+/// helper, so a helper reverted to a fixed color fails the pixel assertion
+/// rather than satisfying a self-referential comparison.
+fn banner_ground(palette: &ThemePalette) -> [u8; 4] {
+    opaque(palette.active_index(3))
+}
+
+/// Expected help-panel ring (issue #2333 contract: ANSI 12).
+fn help_ring(palette: &ThemePalette) -> [u8; 4] {
+    opaque(palette.active_index(12))
 }
 
 fn assert_role_probes(rt: &Runtime, rgba: &[u8], palette: &ThemePalette) {
@@ -359,11 +442,43 @@ fn pending_banner_follows_the_theme() {
         .tick_at(t0 + Duration::from_millis(100))
         .expect("pending banner presents");
     assert!(before.fills > 0, "banner frame must paint");
+    let probe = Probe::new(&live);
+    let banner = live
+        .paste_banner_text_at(t0 + Duration::from_millis(100))
+        .expect("banner text while pending");
+    let dark = dracula();
+    let light = github_light();
+    let dark_fill = banner_ground(&dark);
+    let light_fill = banner_ground(&light);
+    assert_ne!(
+        dark_fill, light_fill,
+        "precondition: the two presets must differ in the ANSI 3 banner ground"
+    );
+    assert_ne!(
+        light_fill, PENDING_PASTE_BANNER_BG,
+        "precondition: the switched ground must differ from the pre-#2333 fixed fill"
+    );
+    let rgba = live.headless_rgba().expect("rgba before switch").to_vec();
+    assert_eq!(
+        probe.banner_pixel(&rgba, &banner),
+        dark_fill,
+        "pending banner ground must use the active theme's ANSI 3, not a fixed fill"
+    );
 
-    live.set_theme_palette(github_light());
+    live.set_theme_palette(light);
     live.tick_at(t0 + Duration::from_millis(200))
         .expect("switch presents");
     let after = live.headless_rgba().expect("rgba after switch").to_vec();
+    assert_eq!(
+        probe.banner_pixel(&after, &banner),
+        light_fill,
+        "the switched theme must recolor the pending banner ground"
+    );
+    assert_ne!(
+        probe.banner_pixel(&after, &banner),
+        PENDING_PASTE_BANNER_BG,
+        "the switched banner must not keep the pre-#2333 fixed fill"
+    );
 
     let mut fresh = runtime(github_light());
     assert!(fresh.paste_text_via_gate("line1\nline2".to_string()));
@@ -378,14 +493,127 @@ fn pending_banner_follows_the_theme() {
 }
 
 #[test]
+fn close_confirm_banner_pixels_follow_the_switched_theme() {
+    let mut live = close_confirm_runtime(dracula());
+    assert!(
+        !live.window_close_request(),
+        "the close request must arm instead of exiting"
+    );
+    let banner = live
+        .close_confirm_banner_text()
+        .expect("armed close-confirm banner");
+    let _ = live.tick().expect("armed banner presents");
+    let probe = Probe::new(&live);
+    let dark = dracula();
+    let light = github_light();
+    let dark_fill = banner_ground(&dark);
+    let light_fill = banner_ground(&light);
+    let rgba = live.headless_rgba().expect("rgba before switch").to_vec();
+    assert_eq!(
+        probe.banner_pixel(&rgba, &banner),
+        dark_fill,
+        "close-confirm banner ground must use the active theme's ANSI 3"
+    );
+
+    live.set_theme_palette(light);
+    let _ = live.tick().expect("switch presents");
+    let after = live.headless_rgba().expect("rgba after switch").to_vec();
+    assert_eq!(
+        probe.banner_pixel(&after, &banner),
+        light_fill,
+        "the switched theme must recolor the close-confirm banner ground"
+    );
+    assert_ne!(
+        probe.banner_pixel(&after, &banner),
+        PENDING_PASTE_BANNER_BG,
+        "the switched close-confirm banner must not keep the pre-#2333 fixed fill"
+    );
+}
+
+#[test]
 fn help_panel_follows_the_theme() {
     let mut live = runtime(dracula());
     live.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
     assert!(live.toggle_help(), "help toggles on");
-    let _before = frame(&mut live);
+    let before = frame(&mut live);
+    let probe = Probe::new(&live);
+    let dark = dracula();
+    let light = github_light();
 
-    live.set_theme_palette(github_light());
+    // Locate the opaque ring by its theme color, then probe the ring and the
+    // inner ground directly. A hardcoded indigo/lavender fill (the pre-#2333
+    // behavior) has no ring in the theme color and fails here.
+    let dark_ring = help_ring(&dark);
+    let (x0, y0, x1, y1) = probe
+        .color_bounds(&before, dark_ring)
+        .expect("help ring must use the active theme's ANSI 12 accent");
+    let mid_x = (x0 + x1) / 2;
+    let mid_y = (y0 + y1) / 2;
+    for (x, y, edge) in [
+        (x0, mid_y, "left"),
+        (x1, mid_y, "right"),
+        (mid_x, y0, "top"),
+        (mid_x, y1, "bottom"),
+    ] {
+        assert_eq!(
+            probe.pixel_at(&before, x, y),
+            dark_ring,
+            "help panel {edge} border must use the theme accent"
+        );
+    }
+    // Top inner row, last inner cell: blank underlay, so the pixel is the
+    // panel's own opaque ground.
+    let ground_x = x1 - probe.cell_w as i32 - probe.cell_w as i32 / 2;
+    let ground_y = y0 + probe.cell_h as i32 + probe.cell_h as i32 / 2;
+    assert_eq!(
+        probe.pixel_at(&before, ground_x, ground_y),
+        dark.selection,
+        "help panel ground must use the theme selection fill"
+    );
+
+    live.set_theme_palette(light);
     let after = frame(&mut live);
+    let light_ring = help_ring(&light);
+    assert_ne!(
+        light_ring, HELP_PANEL_BORDER,
+        "precondition: the switched ring must differ from the pre-#2333 fixed accent"
+    );
+    assert_ne!(
+        light.selection, HELP_PANEL_BG,
+        "precondition: the switched ground must differ from the pre-#2333 fixed fill"
+    );
+    assert_ne!(
+        dark_ring, light_ring,
+        "precondition: ring colors must differ"
+    );
+    let light_bounds = probe
+        .color_bounds(&after, light_ring)
+        .expect("switched help ring must use the new theme's ANSI 12 accent");
+    assert_eq!(
+        light_bounds,
+        (x0, y0, x1, y1),
+        "the theme switch must not move the help panel"
+    );
+    assert_eq!(
+        probe.pixel_at(&after, x0, mid_y),
+        light_ring,
+        "the switched theme must recolor the help panel border"
+    );
+    assert_eq!(
+        probe.pixel_at(&after, ground_x, ground_y),
+        light.selection,
+        "the switched theme must recolor the help panel ground"
+    );
+    assert_ne!(
+        probe.pixel_at(&after, ground_x, ground_y),
+        HELP_PANEL_BG,
+        "the switched panel ground must not keep the pre-#2333 fixed fill"
+    );
+    assert_ne!(
+        probe.pixel_at(&after, x0, mid_y),
+        HELP_PANEL_BORDER,
+        "the switched panel border must not keep the pre-#2333 fixed accent"
+    );
 
     let mut fresh = runtime(github_light());
     fresh.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
@@ -394,5 +622,57 @@ fn help_panel_follows_the_theme() {
         after,
         frame(&mut fresh),
         "the help panel must be recolored by the live switch"
+    );
+}
+
+#[test]
+fn ime_preedit_pixels_follow_the_switched_theme() {
+    let mut live = runtime(dracula());
+    let _ = live.tick().expect("first tick arms the IME caret");
+    live.handle_ime_preedit(Some("ni ".to_string()), Some(0));
+    let _ = live.tick().expect("preedit presents");
+    let probe = Probe::new(&live);
+    let area = live.ime_cursor_area().expect("preedit caret armed");
+    let dark = dracula();
+    let light = github_light();
+    // Cell 2 is the preedit's trailing space: no glyph ink, so the middle of
+    // the cell is the preedit ground and the last two pixel rows are the
+    // underline. Cell 0 carries the caret bar, cell 1 the glyphs.
+    let x = area.x + 2 * probe.cell_w as i32 + probe.cell_w as i32 / 2;
+    let ground_y = area.y + probe.cell_h as i32 / 2;
+    let underline_y = area.y + probe.cell_h as i32 - 1;
+    let rgba = live.headless_rgba().expect("rgba before switch").to_vec();
+    assert_eq!(
+        probe.pixel_at(&rgba, x, ground_y),
+        dark.selection,
+        "IME preedit ground must use the active theme's selection fill"
+    );
+    assert_eq!(
+        probe.pixel_at(&rgba, x, underline_y),
+        dark.cursor,
+        "IME preedit underline must use the active theme's cursor accent"
+    );
+
+    live.set_theme_palette(light);
+    let _ = live.tick().expect("switch presents");
+    assert_eq!(
+        live.ime_cursor_area().expect("caret stays armed"),
+        area,
+        "the theme switch must not move the preedit"
+    );
+    let after = live.headless_rgba().expect("rgba after switch").to_vec();
+    assert_ne!(
+        dark.selection, light.selection,
+        "precondition: the two presets must differ in the preedit ground"
+    );
+    assert_eq!(
+        probe.pixel_at(&after, x, ground_y),
+        light.selection,
+        "the switched theme must recolor the IME preedit ground"
+    );
+    assert_eq!(
+        probe.pixel_at(&after, x, underline_y),
+        light.cursor,
+        "the switched theme must recolor the IME preedit underline"
     );
 }

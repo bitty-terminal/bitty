@@ -23,6 +23,11 @@
 //!   bitty#2114 component-catalog descriptors. Both are pure bounded data
 //!   handling; the catalog never constructs a VM, is not on a hot path, and
 //!   has no production consumer yet (candidate surface only).
+//! - **Registry read page ([`keymaps`]):** the bounded page model behind
+//!   `bitty.keymaps.list()` (issue #2405). Rows carry canonical
+//!   `chord`/`action`/`source`/`context` plus the optional `title`/`command`
+//!   only; the 256-row page, 1024-row addressable and 64 KiB response bounds
+//!   are enforced here, with deterministic whole-row tail truncation.
 //!
 //! The crate is `std`-only, `#![forbid(unsafe_code)]`, `MSRV 1.85`,
 //! `edition = "2024"`, `publish = false` (workspace), headless and
@@ -71,6 +76,7 @@ pub mod config;
 pub mod error;
 pub mod gate;
 pub mod host;
+pub mod keymaps;
 pub mod plain_config;
 pub mod runtime_inspect;
 mod stdlib;

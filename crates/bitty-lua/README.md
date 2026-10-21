@@ -63,6 +63,9 @@ the determinism contract are documented in `src/lib.rs`.
 - `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /
   `bitty.ui.update`), the closed v1 `UiSlot` enum, and the bounded `UiNode`
   model.
+- `src/keymaps.rs` — bounded keymap/action registry page for
+  `bitty.keymaps.list()` (issue #2405): canonical rows, 256-row pages, the
+  1024-row addressable cap, and 64 KiB whole-row tail truncation.
 - `src/config.rs` — configuration-chunk evaluation and table extraction.
 - `src/stdlib.rs` — restricted standard-library construction.
 - `src/gate.rs` — fail-closed plugin-VM build gate and safe-mode policy.

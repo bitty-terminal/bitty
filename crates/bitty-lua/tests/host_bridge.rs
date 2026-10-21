@@ -2786,3 +2786,322 @@ fn runtime_inspect_defaults_fail_closed_without_backend() {
         Some(&LuaValue::String("E_NOT_IMPLEMENTED".to_string()))
     );
 }
+
+/// Stub backend for `bitty.keymaps.list()` (issue #2405).
+struct KeymapsStub {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    rows: Vec<bitty_lua::keymaps::KeymapRow>,
+    fixed_page: Option<bitty_lua::keymaps::KeymapPage>,
+    queries: RefCell<Vec<bitty_lua::keymaps::KeymapQuery>>,
+}
+
+impl HostServices for KeymapsStub {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("terminal.snapshot"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn keymaps_list(
+        &self,
+        query: &bitty_lua::keymaps::KeymapQuery,
+    ) -> Result<bitty_lua::keymaps::KeymapPage, BridgeError> {
+        self.queries.borrow_mut().push(*query);
+        match self.fixed_page.clone() {
+            Some(page) => Ok(page),
+            None => Ok(bitty_lua::keymaps::KeymapPage::assemble(
+                self.rows.clone(),
+                *query,
+            )),
+        }
+    }
+}
+
+fn keymap_rows_fixture() -> Vec<bitty_lua::keymaps::KeymapRow> {
+    use bitty_lua::keymaps::{KEYMAP_CONTEXT_GLOBAL, KEYMAP_SOURCE_DEFAULT, KeymapRow};
+
+    vec![
+        KeymapRow::new(
+            "alt+h",
+            "goto_split:left",
+            KEYMAP_SOURCE_DEFAULT,
+            KEYMAP_CONTEXT_GLOBAL,
+            Some("Move focus spatially to the neighboring pane.".to_string()),
+            None,
+        )
+        .expect("core row"),
+        KeymapRow::new(
+            "alt+shift+p",
+            "command:bitty-terminal.help:toggle_help",
+            "user",
+            KEYMAP_CONTEXT_GLOBAL,
+            None,
+            Some("bitty-terminal.help:toggle_help".to_string()),
+        )
+        .expect("command row"),
+        KeymapRow::new(
+            "ctrl+shift+v",
+            "paste_from_clipboard",
+            KEYMAP_SOURCE_DEFAULT,
+            KEYMAP_CONTEXT_GLOBAL,
+            Some("Paste the system clipboard through the inspection gate.".to_string()),
+            None,
+        )
+        .expect("core row"),
+    ]
+}
+
+#[test]
+fn keymaps_list_serves_pages_and_validates_arguments() {
+    use bitty_lua::keymaps::KeymapQuery;
+
+    let services = Rc::new(KeymapsStub {
+        store: RefCell::new(BTreeMap::new()),
+        rows: keymap_rows_fixture(),
+        fixed_page: None,
+        queries: RefCell::new(Vec::new()),
+    });
+    let mut vm = gate_vm("keymaps-list");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local page = bitty.keymaps.list()
+            bitty.store.set("total", page.total)
+            bitty.store.set("offset", page.offset)
+            bitty.store.set("truncated", page.truncated and "true" or "false")
+            bitty.store.set("count", #page.entries)
+            local first = page.entries[1]
+            bitty.store.set("chord", first.chord)
+            bitty.store.set("action", first.action)
+            bitty.store.set("source", first.source)
+            bitty.store.set("context", first.context)
+            bitty.store.set("title", first.title)
+            bitty.store.set("command_absent", first.command == nil and "yes" or "no")
+            local second = page.entries[2]
+            bitty.store.set("command", second.command)
+            bitty.store.set("command_title_absent", second.title == nil and "yes" or "no")
+            -- Unknown option fields are ignored per the v1 rule; they never
+            -- become a path/exec/network selector or reach the host.
+            local ignored = bitty.keymaps.list({ offset = 2, limit = 1, path = "/etc/passwd" })
+            bitty.store.set("page_offset", ignored.offset)
+            bitty.store.set("page_count", #ignored.entries)
+            bitty.store.set("page_chord", ignored.entries[1].chord)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    {
+        let store = services.store.borrow();
+        assert_eq!(store.get("total"), Some(&LuaValue::Integer(3)));
+        assert_eq!(store.get("offset"), Some(&LuaValue::Integer(0)));
+        assert_eq!(
+            store.get("truncated"),
+            Some(&LuaValue::String("false".to_string()))
+        );
+        assert_eq!(store.get("count"), Some(&LuaValue::Integer(3)));
+        assert_eq!(
+            store.get("chord"),
+            Some(&LuaValue::String("alt+h".to_string()))
+        );
+        assert_eq!(
+            store.get("action"),
+            Some(&LuaValue::String("goto_split:left".to_string()))
+        );
+        assert_eq!(
+            store.get("source"),
+            Some(&LuaValue::String("default".to_string()))
+        );
+        assert_eq!(
+            store.get("context"),
+            Some(&LuaValue::String("global".to_string()))
+        );
+        assert_eq!(
+            store.get("command_absent"),
+            Some(&LuaValue::String("yes".into()))
+        );
+        assert_eq!(
+            store.get("command"),
+            Some(&LuaValue::String(
+                "bitty-terminal.help:toggle_help".to_string()
+            ))
+        );
+        assert_eq!(
+            store.get("command_title_absent"),
+            Some(&LuaValue::String("yes".to_string()))
+        );
+        assert_eq!(store.get("page_offset"), Some(&LuaValue::Integer(2)));
+        assert_eq!(store.get("page_count"), Some(&LuaValue::Integer(1)));
+        assert_eq!(
+            store.get("page_chord"),
+            Some(&LuaValue::String("ctrl+shift+v".to_string()))
+        );
+    }
+    assert_eq!(
+        *services.queries.borrow(),
+        vec![
+            KeymapQuery::default(),
+            KeymapQuery {
+                offset: 2,
+                limit: 1
+            }
+        ],
+        "ignored fields never reach the host"
+    );
+
+    // Bad shapes fail closed before the host is reached.
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local function code(f)
+              local ok, err = pcall(f)
+              return ok and "OK" or err.code
+            end
+            bitty.store.set("string_opts", code(function() return bitty.keymaps.list("all") end))
+            bitty.store.set("string_offset", code(function()
+              return bitty.keymaps.list({ offset = "0" }) end))
+            bitty.store.set("float_limit", code(function()
+              return bitty.keymaps.list({ limit = 1.5 }) end))
+            bitty.store.set("zero_limit", code(function()
+              return bitty.keymaps.list({ limit = 0 }) end))
+            bitty.store.set("negative_offset", code(function()
+              return bitty.keymaps.list({ offset = -1 }) end))
+            bitty.store.set("huge_offset", code(function()
+              return bitty.keymaps.list({ offset = 1025 }) end))
+            bitty.store.set("huge_limit", code(function()
+              return bitty.keymaps.list({ limit = 257 }) end))
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    {
+        let store = services.store.borrow();
+        for key in ["string_opts", "string_offset", "float_limit"] {
+            assert_eq!(
+                store.get(key),
+                Some(&LuaValue::String("E_VALUE_TYPE".to_string())),
+                "{key}"
+            );
+        }
+        for key in ["zero_limit", "negative_offset", "huge_offset", "huge_limit"] {
+            assert_eq!(
+                store.get(key),
+                Some(&LuaValue::String("E_DEF_LIMIT".to_string())),
+                "{key}"
+            );
+        }
+    }
+    assert_eq!(
+        services.queries.borrow().len(),
+        2,
+        "invalid arguments never reach the host"
+    );
+}
+
+#[test]
+fn keymaps_list_refuses_an_over_cap_page() {
+    use bitty_lua::keymaps::{
+        KEYMAP_CONTEXT_GLOBAL, KEYMAP_LIST_ACTION_MAX_BYTES, KEYMAP_LIST_CHORD_MAX_BYTES,
+        KEYMAP_LIST_MAX_ROWS, KEYMAP_LIST_TITLE_MAX_CHARS, KEYMAP_SOURCE_DEFAULT, KeymapPage,
+        KeymapQuery, KeymapRow,
+    };
+
+    let chord = "c".repeat(KEYMAP_LIST_CHORD_MAX_BYTES);
+    let action = "a".repeat(KEYMAP_LIST_ACTION_MAX_BYTES);
+    let title = "t".repeat(KEYMAP_LIST_TITLE_MAX_CHARS);
+    let rows: Vec<KeymapRow> = (0..KEYMAP_LIST_MAX_ROWS)
+        .map(|_| {
+            KeymapRow::new(
+                chord.clone(),
+                action.clone(),
+                KEYMAP_SOURCE_DEFAULT,
+                KEYMAP_CONTEXT_GLOBAL,
+                Some(title.clone()),
+                None,
+            )
+            .expect("row")
+        })
+        .collect();
+    let page = KeymapPage {
+        entries: rows,
+        total: KEYMAP_LIST_MAX_ROWS,
+        offset: 0,
+        truncated: false,
+    };
+    assert!(!page.fits_budget(), "fixture must exceed the response cap");
+
+    let services = Rc::new(KeymapsStub {
+        store: RefCell::new(BTreeMap::new()),
+        rows: Vec::new(),
+        fixed_page: Some(page),
+        queries: RefCell::new(Vec::new()),
+    });
+    let mut vm = gate_vm("keymaps-list-over-cap");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(function() return bitty.keymaps.list() end)
+            bitty.store.set("code", ok and "OK" or err.code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_LIMIT".to_string()))
+    );
+    assert_eq!(*services.queries.borrow(), vec![KeymapQuery::default()]);
+}
+
+#[test]
+fn keymaps_list_defaults_fail_closed_without_backend() {
+    let services = Rc::new(FakeServices::default());
+    let mut vm = gate_vm("keymaps-list-default");
+    install(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(function() return bitty.keymaps.list() end)
+            bitty.store.set("code", ok and "OK" or err.code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_NOT_IMPLEMENTED".to_string()))
+    );
+}

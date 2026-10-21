@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
-    BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, LuaValue, PanelCreateHandler,
-    PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest,
-    SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo,
-    WorkspaceSource,
+    BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
+    PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
+    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
+    WorkspaceInfo, WorkspaceSource,
 };
 use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
 use bitty_runtime::{TargetAnchorSummary, ViewId, WorkspaceSummary};
@@ -307,10 +307,45 @@ pub(crate) struct PluginSession {
     pub(crate) workspaces: Rc<LiveWorkspaces>,
     /// Live Core target/anchor source (issue #2253).
     pub(crate) targets: Rc<LiveTargets>,
+    /// Live resolved-keymap source (issue #2405).
+    pub(crate) keymaps: Rc<LiveKeymaps>,
     /// Live pin-target snapshot (CTX-1115).
     pub(crate) pin_state: Rc<LivePinState>,
     /// Bounded transcript provider published by the tick loop (CTX-1352).
     pub(crate) history: Rc<TranscriptHistory>,
+}
+
+/// Live resolved-keymap source for `bitty.keymaps.list()` (issue #2405).
+///
+/// Same publish pattern as [`LiveWorkspaces`], but for the app-owned chrome
+/// table: startup seeds it with the resolved defaults plus user overrides and
+/// [`crate::terminal_app::TerminalApp::adopt_live_config`] republishes after an
+/// accepted reload, so a read reflects the table the input path is using at
+/// call time. The source stores the typed [`bitty_config::ResolvedKeymap`]
+/// rows; conversion to canonical registry rows happens per call inside
+/// `PluginServices`, so no marshalled row is cached across calls and no
+/// config text ever enters the source.
+#[derive(Default)]
+pub(crate) struct LiveKeymaps {
+    rows: RefCell<Vec<bitty_config::ResolvedKeymap>>,
+}
+
+impl LiveKeymaps {
+    /// Commit the resolved table (already validated and sorted by Core).
+    pub(crate) fn publish(&self, rows: &[bitty_config::ResolvedKeymap]) {
+        let mut current = self.rows.borrow_mut();
+        if current.as_slice() != rows {
+            *current = rows.to_vec();
+        }
+    }
+}
+
+impl KeymapSource for LiveKeymaps {
+    fn keymaps(
+        &self,
+    ) -> Result<Vec<bitty_config::ResolvedKeymap>, bitty_runtime::plugin_runtime::BridgeError> {
+        Ok(self.rows.borrow().clone())
+    }
 }
 
 /// Live pin-target snapshot for `bitty.panel.set_pinned` (CTX-1115).
@@ -524,6 +559,8 @@ pub(crate) fn dev_roots() -> Vec<PathBuf> {
 pub(crate) struct StartupSeed<'a> {
     /// Workspace summaries for the live workspace source.
     pub(crate) workspaces: &'a [WorkspaceSummary],
+    /// Resolved keymap table for the live keymap source (issue #2405).
+    pub(crate) keymaps: &'a [bitty_config::ResolvedKeymap],
     /// Live Core target/anchor rows for the targeting source.
     pub(crate) targets: &'a [TargetAnchorSummary],
     /// Active-workspace leaf ids for the pin-target snapshot.
@@ -641,6 +678,13 @@ pub(crate) fn discover_with_roots(
     let workspaces = Rc::new(LiveWorkspaces::default());
     workspaces.publish(seed.workspaces);
     runtime.set_workspace_source(workspaces.clone());
+    // Issue #2405: seed the live resolved keymap table before activation so
+    // `init.lua` already observes the startup registry. The app republishes
+    // after an accepted reload; the call path converts per call and caches
+    // nothing.
+    let keymaps = Rc::new(LiveKeymaps::default());
+    keymaps.publish(seed.keymaps);
+    runtime.set_keymap_source(keymaps.clone());
     // Issue #2253: seed the live Core target/anchor rows before activation so
     // `init.lua` already observes panels and workspaces through
     // `bitty.ui.targets.snapshot`. The tick loop keeps them fresh.
@@ -736,6 +780,7 @@ pub(crate) fn discover_with_roots(
         snapshot,
         workspaces,
         targets,
+        keymaps,
         pin_state,
         history,
     })
@@ -896,6 +941,7 @@ mod tests {
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            keymaps: &[],
             targets: &[],
             leaves: &leaves,
             pinned: &pinned,
@@ -973,6 +1019,7 @@ mod tests {
     ) -> StartupSeed<'a> {
         StartupSeed {
             workspaces: &[],
+            keymaps: &[],
             targets: &[],
             leaves: &[],
             pinned: &[],
@@ -1051,6 +1098,78 @@ mod tests {
             &inspect_context(false),
             true
         ));
+    }
+
+    /// Development package declaring `runtime.keymaps.read` with one command
+    /// that returns a page-derived string (issue #2405).
+    fn keymaps_probe_root(tag: &str) -> PathBuf {
+        let root = fs_list_probe_root(tag);
+        let id = "xuepoo.keymaps";
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Keymaps\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\nruntime.keymaps.read = true\n\n[lazy]\ncommands = [\"{id}:list\"]\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            r#"
+            bitty.commands.register({ id = "list", title = "List", run = function()
+              local ok, page = pcall(bitty.keymaps.list)
+              if not ok then return "ERR:" .. page.code end
+              return page.total .. ":" .. #page.entries .. ":" .. tostring(page.truncated)
+            end })
+            "#,
+        )
+        .expect("init");
+        root
+    }
+
+    /// Issue #2405 end-to-end: a granted development plugin reads the live
+    /// resolved table through `bitty.keymaps.list()`, and a republished table
+    /// is visible on the next call with no cache in between.
+    #[test]
+    fn discover_serves_keymaps_list_to_a_granted_plugin() {
+        let root = keymaps_probe_root("keymaps");
+        let table = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let seed = StartupSeed {
+            workspaces: &[],
+            keymaps: &table,
+            targets: &[],
+            leaves: &[],
+            pinned: &[],
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
+            .expect("dev root must yield a session");
+        let live = Rc::clone(&session.keymaps);
+        let mut runtime = session.runtime;
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.keymaps").expect("id");
+        assert_eq!(
+            runtime
+                .dispatch_command(&plugin_id, "list", &[])
+                .expect("dispatch bitty.keymaps.list command"),
+            LuaValue::String(format!("{}:{}:false", table.len(), table.len())),
+        );
+        live.publish(&[bitty_config::ResolvedKeymap {
+            chord: bitty_config::Chord::parse("alt+9").expect("chord"),
+            action: bitty_config::ChromeAction::CloseView,
+            context: "global".to_string(),
+            from_default: true,
+        }]);
+        assert_eq!(
+            runtime
+                .dispatch_command(&plugin_id, "list", &[])
+                .expect("dispatch after republish"),
+            LuaValue::String("1:1:false".to_string()),
+            "the call reflects the live table, never a cached page"
+        );
     }
 
     #[test]
@@ -1209,6 +1328,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            keymaps: &[],
             targets: &[],
             leaves: &leaves,
             pinned: &pinned,
@@ -1437,6 +1557,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            keymaps: &[],
             targets: &[],
             leaves: &leaves,
             pinned: &pinned,
@@ -1599,6 +1720,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            keymaps: &[],
             targets: &[],
             leaves: &leaves,
             pinned: &pinned,
@@ -1995,6 +2117,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let pinned = live.pinned_views();
         let seed = StartupSeed {
             workspaces: &summaries,
+            keymaps: &[],
             targets: &[],
             leaves: &leaves,
             pinned: &pinned,

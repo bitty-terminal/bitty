@@ -11703,13 +11703,18 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     let base = bitty_config::EffectiveConfig::default();
     let maps = bitty_config::resolve_keymaps(&base).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
+    // Issue #2405: the live keymap source mirrors the app table so
+    // `bitty.keymaps.list()` never serves a stale registry after a reload.
+    let live_keymaps = std::rc::Rc::new(crate::plugin_runtime::LiveKeymaps::default());
+    live_keymaps.publish(&maps);
     let mut app = TerminalApp::with_theme(
         rt,
         bitty_config::theme::DEFAULT_THEME_NAME,
         "default",
         maps.clone(),
         SpawnSpec::default(),
-    );
+    )
+    .with_live_keymaps(Some(std::rc::Rc::clone(&live_keymaps)));
     app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
 
     let mut edited = base.clone();
@@ -11730,6 +11735,11 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     });
     assert_eq!(app.chrome.keymaps, keymaps);
     assert_ne!(app.chrome.keymaps, maps, "mod_key rebound the table");
+    assert_eq!(
+        bitty_runtime::plugin_runtime::KeymapSource::keymaps(&*live_keymaps).expect("rows"),
+        keymaps,
+        "the plugin keymap source follows the adopted table"
+    );
     assert_eq!(app.chrome.leader, leader);
     assert_eq!(app.chrome.leader.timeout_ms, 3_000);
     assert!(!app.chrome.hints_enabled);

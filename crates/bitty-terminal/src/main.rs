@@ -1067,6 +1067,7 @@ fn main() {
         runtime.config().rows,
         &plugin_runtime::StartupSeed {
             workspaces: &runtime.workspace_summaries(),
+            keymaps: &keymaps,
             targets: &startup_targets,
             leaves: &runtime.layout().leaf_ids(),
             pinned: &runtime.pinned_views(),
@@ -1081,6 +1082,9 @@ fn main() {
     let live_workspaces = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.workspaces));
+    let live_keymaps = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.keymaps));
     let live_targets = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.targets));
@@ -1254,6 +1258,8 @@ fn main() {
     .with_live_snapshot(live_snapshot)
     // CTX-0889: publish the live workspace source from the tick loop.
     .with_live_workspaces(live_workspaces)
+    // Issue #2405: republish the resolved keymap table after a live reload.
+    .with_live_keymaps(live_keymaps)
     .with_live_targets(live_targets)
     // CTX-1115: publish the live pin-target snapshot from the tick loop.
     .with_live_pin_state(live_pin_state)

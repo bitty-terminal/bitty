@@ -49,6 +49,7 @@ use phodopus::{
     Callback, CallbackReturn, Closure, Context, Error, ExecutorMode, Function, Table, Value,
 };
 
+use crate::keymaps::{KeymapPage, KeymapQuery};
 use crate::runtime_inspect::RuntimeInspectSnapshot;
 use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
 use crate::{LuaVm, SuspendReason, VmError};
@@ -2084,6 +2085,33 @@ pub trait HostServices {
         Err(BridgeError::not_implemented("bitty.runtime.inspect"))
     }
 
+    /// Read one bounded page of the resolved keymap registry for
+    /// `bitty.keymaps.list()` (issue #2405).
+    ///
+    /// Grant-gated on `runtime.keymaps.read` only (`E_CAPABILITY_DENIED`
+    /// otherwise) and never implied by `runtime.inspect`,
+    /// `runtime.configure`, or any UI head. A VM under safe policy is denied
+    /// the same way. The bridge validates `offset`/`limit` before the host is
+    /// reached ([`KeymapQuery`]), so the host never sees an out-of-range
+    /// query; this method receives the resolved, live table and must clone
+    /// bounded, canonical rows before returning, never hold a registry borrow
+    /// across marshalling, and never cache rows across calls.
+    ///
+    /// Rows carry registry data only (`chord`, `action`, `source`,
+    /// `context`, and the optional `title`/`command`). The host must never
+    /// add a configuration path, raw user text, argv, environment value, URL,
+    /// terminal content, clipboard content, plugin store value, or host
+    /// diagnostic. Plugin-suggested bindings are included only when they are
+    /// actually dispatchable; today the plugin-binding layer is not live, so
+    /// they are omitted instead of advertised.
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
+    /// host without a keymap source grants no ambient registry read.
+    fn keymaps_list(&self, query: &KeymapQuery) -> Result<KeymapPage, BridgeError> {
+        let _ = query;
+        Err(BridgeError::not_implemented("bitty.keymaps.list"))
+    }
+
     /// Open or close an event trace for `bitty.debug.trace` (CTX-0894,
     /// CTX-0897).
     ///
@@ -3672,6 +3700,55 @@ fn component_validation(code: &'static str, message: &str) -> BridgeError {
     BridgeError::new("validation", code, message)
 }
 
+/// Parse the optional `bitty.keymaps.list` options table (issue #2405).
+///
+/// Accepted shapes: `nil`, `{}`, or a table carrying integer `offset` and/or
+/// `limit`. Unknown keys are ignored (v1 rule). Any other argument type, or a
+/// non-integer bound, is `E_VALUE_TYPE`; an integer outside the documented
+/// range is `E_DEF_LIMIT`. Both failures happen before the host call, so the
+/// surface never reaches the registry with a caller-chosen shape.
+fn parse_keymap_query(opts: &LuaValue) -> Result<KeymapQuery, BridgeError> {
+    let defaults = KeymapQuery::default();
+    let (offset, limit) = match opts {
+        LuaValue::Nil => (defaults.offset, defaults.limit),
+        LuaValue::Table(_) => {
+            let offset = keymap_bound(opts.get("offset"), "offset")?.unwrap_or(defaults.offset);
+            let limit = keymap_bound(opts.get("limit"), "limit")?.unwrap_or(defaults.limit);
+            (offset, limit)
+        }
+        _ => {
+            return Err(BridgeError::new(
+                "validation",
+                "E_VALUE_TYPE",
+                "bitty.keymaps.list options must be a table",
+            ));
+        }
+    };
+    KeymapQuery::new(offset, limit)
+}
+
+/// One optional non-negative integer bound from the keymap options table.
+fn keymap_bound(value: Option<&LuaValue>, field: &str) -> Result<Option<usize>, BridgeError> {
+    match value {
+        None | Some(LuaValue::Nil) => Ok(None),
+        Some(LuaValue::Integer(raw)) => {
+            let parsed = usize::try_from(*raw).map_err(|_| {
+                BridgeError::new(
+                    "validation",
+                    "E_DEF_LIMIT",
+                    format!("bitty.keymaps.list {field} must be a non-negative integer"),
+                )
+            })?;
+            Ok(Some(parsed))
+        }
+        Some(_) => Err(BridgeError::new(
+            "validation",
+            "E_VALUE_TYPE",
+            format!("bitty.keymaps.list {field} must be an integer"),
+        )),
+    }
+}
+
 fn parse_history_query(
     source: HistoryQuerySource,
     opts: &LuaValue,
@@ -4503,6 +4580,42 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("keymaps table accepts 'suggest'");
+
+    // Issue #2405: `bitty.keymaps.list({ offset, limit })` — bounded,
+    // read-only registry pages for presentation plugins (the help overlay is
+    // the first consumer). `offset`/`limit` are the only accepted arguments
+    // and both are validated here, before the host is reached; there is no
+    // string input, so the call can never become a path, exec, or network
+    // primitive. The host checks `runtime.keymaps.read`, applies its call
+    // budget, resolves the live table at call time, and fails closed on an
+    // over-cap page. Unknown option fields are ignored per the v1 rule.
+    keymaps
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let opts = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let query = parse_keymap_query(&opts).map_err(|error| error.to_error(ctx))?;
+                    let page = state
+                        .bounded(|_expiry| state.services.keymaps_list(&query))
+                        .map_err(|error| error.to_error(ctx))?;
+                    if !page.fits_budget() {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_LIMIT",
+                            "bitty.keymaps.list payload exceeds 64 KiB",
+                        )
+                        .to_error(ctx));
+                    }
+                    stack.replace(ctx, page.to_lua().to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("keymaps table accepts 'list'");
 
     // `bitty.services.get`/`provide` are WIRED to the host backend
     // (LUA-OQ-8). The bridge validates shapes and owns the generation

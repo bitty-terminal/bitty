@@ -1791,6 +1791,177 @@ pub(crate) fn init_picker_key_loop<T>(
     result
 }
 
+/// Header line for the TTY bundled-plugin multi-select (#1913 follow-up).
+///
+/// The non-TTY line path keeps its own header byte-identical.
+const INIT_PLUGIN_MULTISELECT_PROMPT: &str = "Plugins (official, offline-safe):";
+
+/// Key hint under the bundled-plugin multi-select rows.
+const INIT_PLUGIN_MULTISELECT_HINT: &str =
+    "  (space toggles, j/k or arrows move, Enter confirms, Esc cancels)";
+
+/// Renders one multi-select frame: the prompt, one `[ ]`/`[x]` row per
+/// bundled id with the `>` cursor marker, then the key hint. Every frame has
+/// the same height (`ids.len() + 2`) so in-place repaints stay aligned.
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_block(
+    ids: &[String],
+    cursor: usize,
+    selected: &[bool],
+    color: bool,
+) -> Vec<String> {
+    let mut block = Vec::with_capacity(ids.len() + 2);
+    block.push(INIT_PLUGIN_MULTISELECT_PROMPT.to_string());
+    for (index, id) in ids.iter().enumerate() {
+        let is_cursor = index == cursor;
+        let marker = if is_cursor {
+            if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
+        } else {
+            " "
+        };
+        let checkbox = if selected.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let label = if color && is_cursor {
+            format!("\u{1b}[1m{id}\u{1b}[0m")
+        } else {
+            id.clone()
+        };
+        block.push(format!("{marker} {checkbox} {label}"));
+    }
+    block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+    block
+}
+
+/// Selected ids in catalog order (empty when nothing is checked).
+fn init_multiselect_selection(ids: &[String], selected: &[bool]) -> Vec<String> {
+    ids.iter()
+        .zip(selected)
+        .filter(|(_, checked)| **checked)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Runs the TTY bundled-plugin checkbox multi-select (#1913 follow-up).
+///
+/// Default selection is none (`[ ]` on every row). Keys:
+/// - `Space` toggles the entry under the cursor.
+/// - `j`/`Down` and `k`/`Up` move the cursor (wrapping); arrows carry any
+///   modifiers and application-cursor variants via [`init_parse_escape_at`].
+/// - `Enter` confirms and returns the checked ids in catalog order.
+/// - `Esc` cancels the wizard, `Ctrl-D`/EOF aborts fail-closed; every other
+///   byte is ignored, so a stray paste never changes the selection.
+///
+/// Ids come from the bundled catalog and are never fetched or validated
+/// here (recording happens later in the dispatch), so the step stays
+/// offline-safe. `inplace` repaints the frame in place (cursor-up plus
+/// clear-line, cursor hidden while looping) for live TTYs; otherwise every
+/// frame appends so headless output stays a plain transcript.
+/// `wait_for_more` decides whether an `ESC`-led prefix has more bytes coming
+/// (poll timeout on a TTY, EOF-terminated headlessly).
+///
+/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
+/// through tests, hence the dead-code allowance there.)
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_key_loop(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    ids: &[String],
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
+    assert!(!ids.is_empty(), "plugin list must not be empty");
+    let mut cursor = 0usize;
+    let mut selected = vec![false; ids.len()];
+    if inplace {
+        let _ = write!(output, "\x1b[?25l");
+    }
+    let mut rendered: usize = 0;
+    let result = loop {
+        let block = init_multiselect_block(ids, cursor, &selected, color);
+        if inplace && rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A");
+        }
+        for line in &block {
+            if inplace {
+                let _ = write!(output, "\r\x1b[K{line}\n");
+            } else {
+                let _ = writeln!(output, "{line}");
+            }
+        }
+        let _ = output.flush();
+        rendered = block.len();
+        // One key: a lone byte, or an `ESC`-led burst.
+        let Some(first) = init_key_read_byte(&mut *input) else {
+            break Err("bitty init: aborted (end of input)".to_string());
+        };
+        if first == 0x1b {
+            let mut key = vec![0x1b];
+            loop {
+                if init_escape_burst_complete(&key) {
+                    break;
+                }
+                if key.len() >= 64 {
+                    break;
+                }
+                if !wait_for_more(&mut *input) {
+                    break;
+                }
+                match init_key_read_byte(&mut *input) {
+                    Some(next) => key.push(next),
+                    None => break,
+                }
+            }
+            if key == [0x1b] {
+                break Err("bitty init: aborted (cancelled)".to_string());
+            }
+            let (action, consumed) = init_parse_escape_at(&key, 0);
+            if consumed == key.len() {
+                match action {
+                    InitEscapeAction::Up => {
+                        cursor = (cursor + ids.len() - 1) % ids.len();
+                        continue;
+                    }
+                    InitEscapeAction::Down => {
+                        cursor = (cursor + 1) % ids.len();
+                        continue;
+                    }
+                    InitEscapeAction::Submit => {
+                        break Ok(init_multiselect_selection(ids, &selected));
+                    }
+                    InitEscapeAction::InsertSpace => {
+                        // Kitty `CSI 32 u` spells Space as an escape
+                        // sequence; it toggles exactly like a raw `0x20`.
+                        selected[cursor] = !selected[cursor];
+                        continue;
+                    }
+                    _ => continue,
+                }
+            }
+            continue;
+        }
+        match first {
+            b'\r' | b'\n' => break Ok(init_multiselect_selection(ids, &selected)),
+            0x04 => break Err("bitty init: aborted (end of input)".to_string()),
+            b' ' => selected[cursor] = !selected[cursor],
+            b'j' | b'J' => cursor = (cursor + 1) % ids.len(),
+            b'k' | b'K' => cursor = (cursor + ids.len() - 1) % ids.len(),
+            _ => {}
+        }
+    };
+    if inplace {
+        let _ = write!(output, "\x1b[?25h");
+        let _ = output.flush();
+    }
+    result
+}
+
 /// Asks one wizard step from a visible option list (phase 1 of #1806).
 ///
 /// Renders `prompt` plus every entry with a visible cursor line and
@@ -3762,15 +3933,21 @@ pub(crate) fn init_preview_baseline(
 /// Prompts the optional first-batch plugin selection (CTX-1132, #1913).
 ///
 /// Lists bundled ids from the same source `plugin install <id>` uses
-/// ([`bitty_plugin_host::bundled::bundled_ids_sorted`], no duplicate list),
-/// then reads one comma-separated answer via [`init_ask`] (reprompt
+/// ([`bitty_plugin_host::bundled::bundled_ids_sorted`], no duplicate list).
+/// On a live TTY the step renders a checkbox multi-select and runs
+/// [`init_multiselect_key_loop`] under a cbreak guard (space toggles,
+/// `j`/`k`/arrows move, Enter confirms, Esc cancels, no Enter needed to
+/// toggle). Every other setup keeps the line loop and comma-separated
+/// parsing byte-identical for scripted input and `--yes` runs (reprompt
 /// fail-closed, EOF aborts, Esc cancels). Empty means none. Offline-safe:
-/// no fetch, no consent, no secrets — recording happens later in the dispatch.
-/// Returns the selected ids in catalog order.
-fn init_prompt_plugin_selection(
+/// no fetch, no consent, no secrets — recording happens later in the
+/// dispatch. Returns the selected ids in catalog order.
+pub(crate) fn init_prompt_plugin_selection(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     history: &mut Vec<String>,
+    color: bool,
+    tty_interactive: bool,
 ) -> Result<Vec<String>, String> {
     let ids = bitty_plugin_host::bundled::bundled_ids_sorted();
     if ids.is_empty() {
@@ -3778,6 +3955,23 @@ fn init_prompt_plugin_selection(
         let _ = output.flush();
         return Ok(Vec::new());
     }
+    // Single-keypress checkbox selection when both ends are live TTYs
+    // (Unix raw mode); piped runs, failed raw setup, and non-Unix setups
+    // keep the line loop byte-identical.
+    #[cfg(unix)]
+    if tty_interactive {
+        if let Some(_raw) = init_raw_guard() {
+            // One blank separator above the frame; the frame itself starts
+            // at column 0 so in-place cursor-up repaints stay aligned.
+            let _ = writeln!(output);
+            let _ = output.flush();
+            return init_multiselect_key_loop(input, output, &ids, color, true, &mut |stdin_buf| {
+                init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (tty_interactive, color);
     let _ = writeln!(output, "\nPlugins (optional first batch, offline-safe):");
     for id in &ids {
         let _ = writeln!(output, "  - {id}");
@@ -3935,6 +4129,20 @@ pub(crate) fn run_init_subcommand_with_io(
         None => default_profile.clone(),
     };
     let profile_mode = init_profile.is_some();
+    // Single-keypress navigation needs both ends live: a TTY stdin for
+    // immediate keys plus a TTY stdout for in-place repaints (#2136, reused
+    // by the plugin multi-select). Anything else keeps the line loop.
+    let tty_interactive = env.stdin_is_tty && std::io::stdout().is_terminal();
+    // Existing color convention only (no new flag): any shared
+    // `--no-color` (set in lockstep for a pre-word flag), `NO_COLOR`,
+    // or `TERM=dumb` disables init list colors.
+    let no_color = args.doctor_no_color
+        || args.list_no_color
+        || args.inspect_no_color
+        || args.dev_no_color
+        || args.plugin_no_color
+        || args.component_no_color;
+    let color = init_color_enabled(no_color);
     let answers = if args.init_yes {
         let mut answers = init_yes_defaults(env.shell);
         init_apply_overrides(&mut answers, &overrides);
@@ -3955,16 +4163,6 @@ pub(crate) fn run_init_subcommand_with_io(
             );
             return 2;
         }
-        // Existing color convention only (no new flag): any shared
-        // `--no-color` (set in lockstep for a pre-word flag), `NO_COLOR`,
-        // or `TERM=dumb` disables init list colors.
-        let no_color = args.doctor_no_color
-            || args.list_no_color
-            || args.inspect_no_color
-            || args.dev_no_color
-            || args.plugin_no_color
-            || args.component_no_color;
-        let color = init_color_enabled(no_color);
         // Live preview (phase 2 of #1806, seeded p3 CTX-1071, per-step live p4
         // CTX-1119, stdout echo DEC-0109): on a TTY the wizard overlays each
         // answer onto an in-memory preview seeded from the loaded effective
@@ -3996,10 +4194,7 @@ pub(crate) fn run_init_subcommand_with_io(
             color,
             Some(&mut preview),
             live_runtime.as_mut(),
-            // Single-keypress picker navigation needs both ends live: a TTY
-            // stdin for immediate keys plus a TTY stdout for in-place
-            // repaints (#2136). Anything else keeps the line loop.
-            env.stdin_is_tty && std::io::stdout().is_terminal(),
+            tty_interactive,
         ) {
             Ok(answers) => answers,
             Err(message) => {
@@ -4024,7 +4219,13 @@ pub(crate) fn run_init_subcommand_with_io(
     } else if args.init_yes {
         Vec::new()
     } else {
-        match init_prompt_plugin_selection(input, output, &mut followup_history) {
+        match init_prompt_plugin_selection(
+            input,
+            output,
+            &mut followup_history,
+            color,
+            tty_interactive,
+        ) {
             Ok(ids) => ids,
             Err(message) => {
                 eprintln!("{message}");

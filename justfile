@@ -279,6 +279,7 @@ binary-arch-test:
 # `/build/...` and the result is scanned for builder paths before it can be
 # packaged. The release workflow runs the same flag script, so local and CI
 # builds share one policy. Extra arguments go to `cargo build`.
+[positional-arguments]
 release-build *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -292,7 +293,12 @@ release-build *args:
     done
     export RUSTFLAGS="$(scripts/release-rustflags.sh)${RUSTFLAGS:+ $RUSTFLAGS}"
     cargo build --release --locked -p bitty-terminal "$@"
-    ./scripts/check-release-paths.sh --binary "${CARGO_TARGET_DIR:-target}/release/bitty"
+    gate_dir="${CARGO_TARGET_DIR:-target}"
+    gate_bin="$gate_dir/release/bitty"
+    if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+      gate_bin="$gate_dir/${CARGO_BUILD_TARGET}/release/bitty"
+    fi
+    ./scripts/check-release-paths.sh --binary "$gate_bin"
 
 # Fail when a built binary embeds a builder path (CTX-2402):
 # `just release-paths dist/bitty-x86_64-unknown-linux-gnu`

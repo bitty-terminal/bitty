@@ -90,7 +90,12 @@ printf '#!/bin/sh\nexit 2\n' >"$TMP/grep-shim/grep"
 chmod +x "$TMP/grep-shim/grep"
 PATH="$TMP/grep-shim:$PATH" expect_exit 1 'grep error is not a pass' --binary "$FIX/linux-leak.bin"
 
-# 12. Usage errors.
+# 12. Windows drive-letter/UNC roots are absolute, not joined onto $PWD.
+printf 'embedded at C:\cargo\\registry\\src\\foo\\lib.rs\n' >"$TMP/win-cargo.bin"
+CARGO_HOME='C:\cargo' expect_exit 1 'windows drive CARGO_HOME' --binary "$TMP/win-cargo.bin"
+expect_exit 1 'windows drive prefix' --binary "$TMP/win-cargo.bin" --prefix 'C:\cargo'
+
+# 13. Usage errors.
 expect_exit 2 'no arguments'
 expect_exit 2 'unknown argument' --frobnicate
 

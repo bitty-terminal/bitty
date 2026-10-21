@@ -40,6 +40,77 @@ scripts/install-smoke.sh --distro ubuntu --package dist/bitty-x86_64-unknown-lin
 scripts/install-smoke.sh --distro arch --dir pkg
 ```
 
+## Reproducible release binaries (`CTX-2402`)
+
+Shipped binaries carry no builder paths and no debug info. Both mechanisms
+are applied by every release build: `just release-build` locally and the
+`build`, `build-alpine`, and `build-freebsd` jobs in
+`.github/workflows/release.yml`.
+
+- **Builder-root remapping.** Rust embeds the absolute source path of every
+  panic location in read-only runtime data, so a plain release build records
+  the builder's cargo registry/git checkouts and rustup toolchain.
+  `scripts/release-rustflags.sh` derives those roots from the build
+  environment (never from a committed path) and emits
+  `--remap-path-prefix=<root>=/build/...`:
+
+  | Builder root                                  | Recorded as        |
+  | --------------------------------------------- | ------------------ |
+  | repository checkout                           | `/build/workspace` |
+  | `CARGO_TARGET_DIR`, when outside the checkout | `/build/target`    |
+  | `CARGO_HOME`                                  | `/build/cargo`     |
+  | `RUSTUP_HOME`                                 | `/build/rustup`    |
+  | rustc sysroot, when outside `RUSTUP_HOME`     | `/build/rustup`    |
+
+  Panic messages stay readable without naming the builder:
+
+  ```text
+  panicked at /build/workspace/crates/bitty-vt/src/lib.rs:42
+  ```
+
+  `/build/workspace` maps back to the reader's own checkout, `/build/cargo`
+  and `/build/rustup` to their cargo and rustup roots. Mappings are kept
+  disjoint on purpose: a nested root is skipped instead of relying on how
+  rustc resolves overlapping prefixes.
+
+- **Debug-info stripping.** `[profile.release] strip = "debuginfo"` (root
+  `Cargo.toml`) removes DWARF/STABS and the source-file symbols that travel
+  with them. The `.symtab` symbol table is deliberately kept because it is
+  what makes `RUST_BACKTRACE=1` name frames; stripping symbols as well leaves
+  a panic backtrace with zero frames (measured with the pinned 1.98
+  toolchain). Stripping cannot remove panic-location paths either way: they
+  are allocated runtime data, verified on the 0.0.25 artifact where
+  `strip --strip-all` still carried all of them.
+
+Size trade-off, measured on the 0.0.25 `x86_64-unknown-linux-gnu` artifact
+with the pinned toolchain:
+
+| Variant                                        | Uncompressed          | `zstd -19` (bundle) |
+| ---------------------------------------------- | --------------------- | ------------------- |
+| 0.0.25 baseline (unstripped, unremapped)       | 23,461,272 B          | 5,864,294 B         |
+| release policy (`strip = "debuginfo"` + remap) | 22,478,448 B (-4.2%)  | 5,844,998 B (-0.3%) |
+| `strip = "symbols"` opt-in                     | 17,657,160 B (-24.7%) | 5,357,472 B (-8.6%) |
+
+The opt-in row costs symbolized backtraces, so it is not the default. A
+packaging channel that prefers the smaller download can take it explicitly:
+
+```sh
+RUSTFLAGS="$(scripts/release-rustflags.sh)" \
+  cargo build --release --locked -p bitty-terminal \
+  --config 'profile.release.strip="symbols"'
+```
+
+For a symbolized binary for triage, rebuild the same commit with the default
+profile (`just release-build`, which keeps `.symtab` and adds no DWARF).
+Builds are not bit-identical across hosts: codegen, linker, and libc/target
+versions still differ, and only builder path metadata is normalized.
+
+`scripts/check-release-paths.sh` is the fail-closed gate. It scans the built
+bytes for the derived roots, Linux and macOS home shapes, and Windows
+user-profile paths, and fails the release before an artifact is renamed or
+packaged. Run it locally with `just release-paths <binary>`; its fixture test
+is part of `just check`.
+
 ## Nfpm
 
 Single source `nfpm.yaml` at repo root covers deb/rpm/apk/archlinux via `nfpm package --packager <type>`. Validation:

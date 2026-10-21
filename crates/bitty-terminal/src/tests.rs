@@ -10951,6 +10951,124 @@ fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {
     );
 }
 
+/// Issue #2389: close teardown must follow the paint precedence of WS-INV-8.
+///
+/// Closing the primary owner while a pane-session leaf survives re-homes
+/// `primary_view` onto that survivor (WS-INV-19), even though the survivor
+/// paints its own pane grid — so the owner id names a leaf that is not the
+/// primary painter. The last-tiled-panel close branch asked only
+/// `is_primary_view(&focused)`, tore down the hidden primary PTY the panel
+/// never painted, and left the pane session the panel *did* paint with no
+/// owning leaf (WS-INV-9 violation). The orphan's shell keeps running, so
+/// its foreground job stays in `first_running_job` forever: every later
+/// window close arms a "Running job" prompt for a job the user can no longer
+/// see or interrupt.
+#[test]
+#[cfg(unix)]
+fn close_last_tiled_pane_tears_down_the_session_it_painted_issue_2389() {
+    require_pty!();
+    let mut app = editor_test_app();
+    let owner = ViewId::new(1);
+    let pane = ViewId::new(2);
+    let survivor = ViewId::new(3);
+
+    app.runtime
+        .spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell spawns");
+    let pane_frame = app
+        .runtime
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == pane)
+        .expect("pane frame");
+    app.runtime
+        .spawn_shell_for_view(pane, "/bin/sh", &[], pane_frame.cols, pane_frame.rows)
+        .expect("pane shell spawns");
+
+    // Close the primary owner: the only survivor owns a pane session, so the
+    // documented re-home lands `primary_view` on a leaf that paints its own
+    // grid (WS-INV-8) instead of the primary one.
+    assert!(app.runtime.set_focus(owner));
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "closing the primary owner with a live sibling is a pane close"
+    );
+    assert_eq!(
+        app.runtime.primary_view(),
+        Some(pane),
+        "an explicit owner close re-homes the primary id to the survivor"
+    );
+    assert!(app.runtime.has_pane_session(&pane));
+    assert!(
+        !app.runtime.paints_primary_grid(&pane),
+        "the survivor paints its pane session, not the re-homed primary grid"
+    );
+
+    // Give the tiled survivor a detached float so closing it takes the
+    // last-tiled-panel branch (CTX-1336/#2221).
+    let trimmed = bitty_runtime::LayoutNode::split(
+        bitty_runtime::SplitAxis::Horizontal,
+        0.5,
+        bitty_runtime::LayoutNode::leaf(bitty_runtime::View::new(pane, 80, 24)),
+        bitty_runtime::LayoutNode::leaf(bitty_runtime::View::new(survivor, 80, 24)),
+    );
+    app.runtime.set_layout(trimmed);
+    let survivor_frame = app
+        .runtime
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == survivor)
+        .expect("survivor frame");
+    app.runtime
+        .spawn_shell_for_view(
+            survivor,
+            "/bin/sh",
+            &[],
+            survivor_frame.cols,
+            survivor_frame.rows,
+        )
+        .expect("survivor shell spawns");
+    app.runtime
+        .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(survivor))
+        .expect("survivor detaches as a float");
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![pane]);
+    assert_eq!(app.runtime.floated_views(), vec![survivor]);
+    assert_eq!(app.runtime.primary_view(), Some(pane));
+
+    assert!(app.runtime.set_focus(pane));
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
+        "the last tiled panel with a surviving float is a pane close"
+    );
+
+    assert!(
+        !app.runtime.has_pane_session(&pane),
+        "closing a leaf must tear down the session that leaf painted (WS-INV-9)"
+    );
+    assert!(
+        app.runtime.has_pane_session(&survivor),
+        "the surviving float keeps its own shell"
+    );
+    assert!(
+        app.runtime.has_pty(),
+        "a pane close must never tear down the hidden primary shell it did not paint"
+    );
+    let orphans: Vec<ViewId> = app
+        .runtime
+        .pane_session_ids()
+        .into_iter()
+        .filter(|view| {
+            !app.runtime.layout().leaf_ids().contains(view)
+                && !app.runtime.floated_views().contains(view)
+                && !app.runtime.pinned_views().contains(view)
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "no pane session may outlive its owning leaf, found {orphans:?}"
+    );
+}
+
 /// Issue #2221 / CTX-1336: closing the last live view (the surviving float)
 /// must be the window-close gesture. It must never discard the float into a
 /// session-less view that paints blank and drops input while the process

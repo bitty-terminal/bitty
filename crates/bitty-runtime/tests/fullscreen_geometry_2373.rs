@@ -11,9 +11,26 @@
 //! grid inside the full frame; zooming a sibling still needs the owner's grid
 //! preserved for the return trip (CTX-0790/#1435).
 //!
-//! These tests drive the same layout funnel the zoom engage/disengage path
-//! uses (`Runtime::set_layout`) and pin both arms: the visible owner follows
-//! the full frame, the hidden owner keeps its tiled grid.
+//! # Differential vs contract coverage
+//!
+//! These tests drive `Runtime::set_layout` directly — the funnel the zoom
+//! lane now uses. On pre-fix `main` that funnel already synced the primary
+//! grid, so **these are contract/guard tests, not the differential proof**:
+//! they pin the geometry/winsize/round-trip invariants for the layout funnel
+//! (including the independent PTY-winsize resync).
+//!
+//! The genuinely differential regressions live in `bitty-terminal`'s
+//! `chrome_keys` tests and fail on pre-fix `main`:
+//!
+//! - `fullscreen_after_gap_resize_fills_frame_and_close_is_bounded_2373`
+//!   (direct `ToggleZoom` API);
+//! - `mod_f_primary_fullscreen_resyncs_grid_and_winsize_2373` (the real
+//!   Mod+F keybinding dispatch, primary owner);
+//! - `mod_f_pane_session_fullscreen_resyncs_grid_and_winsize_2373`
+//!   (Mod+F on a split pane running a TUI).
+//!
+//! Both arms are pinned here: the visible owner follows the full frame, the
+//! hidden owner keeps its tiled grid.
 
 use bitty_runtime::{LayoutNode, PresentFrame, Runtime, SplitAxis, View, ViewId};
 

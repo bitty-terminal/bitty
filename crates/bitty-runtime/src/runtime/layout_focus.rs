@@ -218,6 +218,17 @@ impl Runtime {
         let rows = usize::from(rows_u16);
         if self.state.width() != cols || self.state.height() != rows {
             self.resize_primary_grid(cols, rows);
+        }
+        // Issue #2373: the grid and the kernel winsize are independent
+        // observations. A grid that already matches the target (for example
+        // a shell spawned after the layout synced) must not hide a stale
+        // PTY winsize — resync it on its own so every fullscreen/restore
+        // transition delivers SIGWINCH at the painted size.
+        let pty_stale = self
+            .pty
+            .as_ref()
+            .is_some_and(|pty| pty.size().ok() != Some((cols_u16, rows_u16)));
+        if pty_stale {
             if let Some(pty) = self.pty.as_mut() {
                 let _ = pty.resize(cols_u16, rows_u16);
             }

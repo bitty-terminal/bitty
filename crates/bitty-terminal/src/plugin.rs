@@ -4341,13 +4341,17 @@ fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Wri
 /// surface; the flat-key TOML file is a legacy compatibility fallback).
 const PLUGIN_LUA_FILE_EXTENSION: &str = "lua";
 
-/// Escape one string for a quoted TOML/Lua value in rendered reports.
+/// Escape one string for a TOML basic string in rendered reports.
 ///
 /// Manifest string defaults are bounded but attacker-controlled; raw control
 /// characters (including an ESC the settings grammar tolerates inside a
 /// default) must never reach the terminal unescaped. Emits `\\`, `\"`, `\n`,
 /// `\r`, `\t`, and `\uXXXX` for other C0/C1 controls and DEL; every other
 /// character passes through unchanged.
+///
+/// These are TOML basic-string escapes and are **not** valid Lua literals
+/// (`\uXXXX` is not a Lua escape); Lua-facing templates must use
+/// [`escape_lua_string`] instead.
 fn escape_toml_basic(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -4369,16 +4373,20 @@ fn escape_toml_basic(value: &str) -> String {
 /// Render post-install next steps for one plugin (CTX-1268, bitty#2144).
 ///
 /// Data-driven and display-only: the enable command, where the plugin landed,
-/// the canonical Lua settings path, the `config show`/`config scaffold`
-/// pointers, and the `bitty plugin info <id>` pointer always render;
-/// manifest-provided `[hints] next_steps` lines append when the manifest
-/// declares them, otherwise the output stays clean generic.
+/// the canonical Lua settings path, the `config show` pointer, and the
+/// `bitty plugin info <id>` pointer always render; the `config scaffold`
+/// pointer renders only when `has_settings` (the manifest declares at least
+/// one `[settings]` entry), because scaffolding a settings-less manifest
+/// exits without writing anything. Manifest-provided `[hints] next_steps`
+/// lines append when the manifest declares them, otherwise the output stays
+/// clean generic.
 /// `installed_under` names the store package root for external installs
 /// (`None` for bundled plugins, which ship with bitty). Nothing here grants
 /// authority, writes state, or runs plugin code.
 fn format_next_steps(
     id: &str,
     next_steps: &[String],
+    has_settings: bool,
     config_file: Option<&Path>,
     installed_under: Option<&Path>,
 ) -> String {
@@ -4406,10 +4414,16 @@ fn format_next_steps(
         }
     }
     let _ = writeln!(out, "  inspect: bitty plugin config show {id}");
-    let _ = writeln!(
-        out,
-        "  scaffold: bitty plugin config scaffold {id} (writes a commented Lua template)"
-    );
+    if has_settings {
+        let _ = writeln!(
+            out,
+            "  scaffold: bitty plugin config scaffold {id} (writes a commented Lua template)"
+        );
+    } else {
+        // `config scaffold` exits without writing for a manifest with no
+        // `[settings]`; never advertise a command that cannot act.
+        let _ = writeln!(out, "  scaffold: unavailable (no [settings] declared)");
+    }
     if !next_steps.is_empty() {
         out.push_str("  hints:\n");
         for hint in next_steps {
@@ -4458,10 +4472,17 @@ fn write_next_steps(
 ) {
     let config_file = plugin_config_file_display(config_dir, id);
     let next_steps: &[String] = manifest.map_or(&[], |manifest| &manifest.next_steps);
+    let has_settings = manifest.is_some_and(|manifest| !manifest.settings.is_empty());
     let _ = writeln!(
         output,
         "{}",
-        format_next_steps(id, next_steps, config_file.as_deref(), installed_under)
+        format_next_steps(
+            id,
+            next_steps,
+            has_settings,
+            config_file.as_deref(),
+            installed_under
+        )
     );
 }
 
@@ -6059,8 +6080,8 @@ mod tests {
 
     #[test]
     fn next_steps_generic_shape_is_stable() {
-        // Golden: no hints, no config root, bundled install.
-        let text = format_next_steps("xuepoo.demo", &[], None, None);
+        // Golden: no hints, no settings, no config root, bundled install.
+        let text = format_next_steps("xuepoo.demo", &[], false, None, None);
         assert!(text.contains("Next steps for 'xuepoo.demo':"), "{text}");
         assert!(
             text.contains("enable: bitty plugin enable xuepoo.demo"),
@@ -6081,10 +6102,13 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
-                "scaffold: bitty plugin config scaffold xuepoo.demo \
-                 (writes a commented Lua template)"
-            ),
+            text.contains("scaffold: unavailable (no [settings] declared)"),
+            "{text}"
+        );
+        // A settings-less manifest must never advertise a command that
+        // cannot act (`config scaffold` exits without writing).
+        assert!(
+            !text.contains("bitty plugin config scaffold xuepoo.demo"),
             "{text}"
         );
         assert!(!text.contains(".toml"), "{text}");
@@ -6101,6 +6125,7 @@ mod tests {
         let text = format_next_steps(
             "bitty-terminal.bar",
             &[],
+            true,
             Some(Path::new(
                 "/home/u/.config/bitty/plugins/bitty-terminal.bar.lua",
             )),
@@ -6134,11 +6159,38 @@ mod tests {
     }
 
     #[test]
+    fn next_steps_scaffold_pointer_follows_declared_settings() {
+        // #2384: a settings-less manifest gets a softened line, never a
+        // pointer at `config scaffold`, which exits 4 without writing.
+        let without = format_next_steps("bitty-terminal.shell-integration", &[], false, None, None);
+        assert!(
+            without.contains("scaffold: unavailable (no [settings] declared)"),
+            "{without}"
+        );
+        assert!(
+            !without.contains("bitty plugin config scaffold bitty-terminal.shell-integration"),
+            "{without}"
+        );
+
+        // A manifest that declares settings keeps the actionable pointer.
+        let with_settings = format_next_steps("xuepoo.settings", &[], true, None, None);
+        assert!(
+            with_settings.contains(
+                "scaffold: bitty plugin config scaffold xuepoo.settings \
+                 (writes a commented Lua template)"
+            ),
+            "{with_settings}"
+        );
+        assert!(!with_settings.contains("unavailable"), "{with_settings}");
+    }
+
+    #[test]
     fn next_steps_hints_append_and_escape_helpers_hold() {
         // Manifest hints render under `hints:`; absent hints stay generic.
         let text = format_next_steps(
             "xuepoo.demo",
             &["Add `modules = [\"clock\"]` to your bar config.".to_string()],
+            false,
             None,
             None,
         );
@@ -6192,7 +6244,13 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("scaffold: bitty plugin config scaffold bitty-terminal.shell-integration"),
+            out.contains("scaffold: unavailable (no [settings] declared)"),
+            "{out}"
+        );
+        // #2384: shell-integration declares no `[settings]`, so the hint must
+        // not advertise `config scaffold` (it would exit without writing).
+        assert!(
+            !out.contains("scaffold: bitty plugin config scaffold"),
             "{out}"
         );
         assert!(

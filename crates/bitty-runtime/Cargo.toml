@@ -81,7 +81,7 @@ bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-
 # the `bitty-ipc` revision shared with this workspace. Core's
 # `bitty-runtime::execution_jobs` is the only module allowed to name the
 # extension implementation (W-147 seam exception).
-bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "637afc2" }
+bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "b2137be" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of

@@ -150,8 +150,8 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # 2027-03-31 pin re-audit bound above.
 # bitty-execution is a first-party extraction target (W-132/W-140, bitty#2249,
 # CTX-1403): the accepted execution supervisor. Linked ONLY by `bitty-runtime`
-# at an exact rev (637afc2, post-merge main: host `SpawnPreparer` + Core IPC
-# pin), behind the Core-owned `execution_jobs` seam. The workspace
+# at an exact rev (b2137be, post-merge main: host `SpawnPreparer` + Core
+# IPC 9493674), behind the Core-owned `execution_jobs` seam. The workspace
 # `[patch]` compiles the extension against the current `bitty-pty`/
 # `bitty-plugin-host` path crates, so this graph has one Core mechanism set
 # and no `github.com/bitty-terminal/bitty` git source. A dated

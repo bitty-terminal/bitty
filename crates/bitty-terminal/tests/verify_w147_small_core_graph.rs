@@ -46,6 +46,15 @@
 //! library sources. It does not detect copied logic that contains none of
 //! these identifiers.
 //!
+//! The graphics seam (#2163) is the one source-restricted crate with no
+//! production edge: `crates/bitty-rich/src/kitty_seam.rs` is the designated
+//! naming point for the decode/raster contract, while the composition-root
+//! binding and worker protocol stay parked in `bitty-graphics` CTX-0003 /
+//! `bitty` W-141. No Core source names the crate today. The identifier scan,
+//! the crate-name scan, and the mutation test all reject a direct import or
+//! prose mention outside that module, and the crate-root re-export guard keeps
+//! the seam reachable only through `bitty_rich::kitty_seam`.
+//!
 //! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the
 //! CTX-0940 verification report) shows `bitty-storage` reachable only from
 //! `bitty-terminal`, and `cargo tree -i bitty-test-support/-test-vm -e normal`
@@ -132,19 +141,29 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
     ("bitty-execution", &["bitty-runtime"]),
 ];
 
+/// Graphics decode/raster seam module (#2163). It is the single Core source
+/// allowed to name the graphics extension crate. The crate has no production
+/// edge: the composition-root binding and worker protocol stay parked in
+/// `bitty-graphics` CTX-0003 / `bitty` W-141, so this module is a designated
+/// contract naming point rather than an import site.
+const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
+
 /// Seam crates whose Core source references are restricted to one file.
 ///
 /// `bitty-a11y` is a model seam, not a general-purpose contract Core may name
 /// anywhere: exactly `crates/bitty-ui/src/a11y_host.rs` implements
 /// `SnapshotHost`, and every other source imports the role vocabulary through
 /// that module's re-export. `bitty-execution` is likewise confined to the
-/// `bitty-runtime` `execution_jobs.rs` bridge (#2249).
+/// `bitty-runtime` `execution_jobs.rs` bridge (#2249). `bitty-graphics` has no
+/// dependency edge but is restricted to `GRAPHICS_SOURCE_SEAM` while its
+/// composition-root binding is parked (#2163).
 const SOURCE_SEAM_FILES: &[(&str, &str)] = &[
     ("bitty-a11y", "crates/bitty-ui/src/a11y_host.rs"),
     (
         "bitty-execution",
         "crates/bitty-runtime/src/execution_jobs.rs",
     ),
+    ("bitty-graphics", GRAPHICS_SOURCE_SEAM),
 ];
 
 /// Crates published from the bitty-terminal org that are intentionally not
@@ -461,6 +480,14 @@ fn names_crate(text: &str, krate: &str) -> bool {
         .any(|token| token == krate)
 }
 
+/// True when Rust source names the hyphenated crate spelling as a token
+/// (`bitty-graphics`, `bitty-graphics#15`). [`names_crate`] cannot catch it
+/// because the hyphen splits the token.
+fn names_crate_spelling(text: &str, krate: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .any(|token| token == krate)
+}
+
 #[test]
 fn normal_deps_detect_target_table_header() {
     // `[target.<cfg>.dependencies.<name>]` tables carry the edge in the
@@ -774,6 +801,85 @@ fn execution_source_naming_is_restricted_to_runtime_seam() {
     );
 }
 
+#[test]
+fn graphics_seam_is_the_only_crate_name_reference() {
+    // #2163 seam/fence part: the graphics crate name may appear only in the
+    // designated seam module. This catches prose references (`bitty-graphics`)
+    // that the identifier scan cannot see, so the boundary is not re-scattered
+    // across module docs.
+    let violations =
+        crate_name_reference_violations(&workspace_root(), "bitty-graphics", GRAPHICS_SOURCE_SEAM);
+    assert!(
+        violations.is_empty(),
+        "only `{GRAPHICS_SOURCE_SEAM}` may name the graphics extension crate: {violations:#?}"
+    );
+}
+
+#[test]
+fn graphics_seam_is_the_only_public_seam_path() {
+    // #2163 seam/fence part: the decode/raster traits and backend are reached
+    // through `bitty_rich::kitty_seam` only. A crate-root re-export would give
+    // call sites a second, un-fenced path to the extension boundary.
+    let root = workspace_root();
+    let lib = std::fs::read_to_string(root.join("crates/bitty-rich/src/lib.rs"))
+        .expect("read bitty-rich lib.rs");
+    assert!(
+        lib.contains("pub mod kitty_seam;"),
+        "the kitty_seam module must stay public"
+    );
+    assert!(
+        !lib.contains("pub use kitty_seam::"),
+        "seam types must be reached through `bitty_rich::kitty_seam`, not crate-root re-exports"
+    );
+}
+
+#[test]
+fn graphics_source_naming_is_restricted_to_kitty_seam() {
+    // #2163 mutation proof: a direct import or crate-name mention is reported
+    // everywhere except the designated graphics seam module.
+    let root = write_probe_workspace(
+        "graphics-source",
+        &[
+            ("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n"),
+            ("bitty-rich", "[package]\nname = \"bitty-rich\"\n"),
+            ("bitty-runtime", "[package]\nname = \"bitty-runtime\"\n"),
+        ],
+        &[
+            (
+                GRAPHICS_SOURCE_SEAM,
+                "use bitty_graphics::KittyDecodeBackend;\n// bitty-graphics seam\n",
+            ),
+            (
+                "crates/bitty-runtime/src/runtime.rs",
+                "use bitty_graphics::KittyDecodeBackend;\n// bitty-graphics elsewhere\n",
+            ),
+        ],
+    );
+    let identifier_violations = extension_source_violations(&root);
+    let crate_name_violations =
+        crate_name_reference_violations(&root, "bitty-graphics", GRAPHICS_SOURCE_SEAM);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        identifier_violations.len(),
+        1,
+        "only the non-seam source may name the identifier: {identifier_violations:#?}"
+    );
+    assert!(
+        identifier_violations[0].contains("runtime.rs")
+            && identifier_violations[0].contains("bitty_graphics"),
+        "the non-seam source must be the offender: {identifier_violations:#?}"
+    );
+    assert_eq!(
+        crate_name_violations.len(),
+        1,
+        "only the non-seam source may mention the crate name: {crate_name_violations:#?}"
+    );
+    assert!(
+        crate_name_violations[0].contains("runtime.rs"),
+        "the non-seam source must be the crate-name offender: {crate_name_violations:#?}"
+    );
+}
+
 /// Collect `*.rs` files under `dir` (non-recursive walk, skips `target/`).
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries =
@@ -794,7 +900,8 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Source-level fence violations: Core library sources may not name an
 /// implementation crate. Seam crates are legal by design, except a source
 /// seam restricted by [`SOURCE_SEAM_FILES`]; `bitty-storage` is legal only in
-/// its composition-root seam file.
+/// its composition-root seam file. The graphics entry is a source seam with no
+/// dependency edge, so it is legal only in [`GRAPHICS_SOURCE_SEAM`].
 fn extension_source_violations(root: &Path) -> Vec<String> {
     let members = workspace_members(root);
     let storage_seam = root
@@ -843,6 +950,32 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
     violations
 }
 
+/// Source-reference violations for the hyphenated crate spelling, which
+/// [`names_crate`] cannot see. Only `seam` may name the extension this way.
+fn crate_name_reference_violations(root: &Path, krate: &str, seam: &str) -> Vec<String> {
+    let members = workspace_members(root);
+    let seam = root.join(seam);
+    let mut violations = Vec::new();
+    for member in &members {
+        let src = root.join("crates").join(member).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        for file in files {
+            if file == seam {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read rs file");
+            if names_crate_spelling(&text, krate) {
+                violations.push(format!("{} names `{krate}`", file.display()));
+            }
+        }
+    }
+    violations
+}
+
 #[test]
 fn core_library_sources_never_name_extension_impls() {
     // Core-never-imports-extension at the source level (CTX-1086 / #1890,
@@ -861,7 +994,9 @@ fn core_library_sources_never_name_extension_impls() {
     // `crates/bitty-ui/src/a11y_host.rs` may name `bitty_a11y`
     // (`SOURCE_SEAM_FILES`, CTX-1362 / #2257). The execution mechanic seam is
     // likewise restricted to `crates/bitty-runtime/src/execution_jobs.rs`
-    // (`SOURCE_SEAM_FILES`, CTX-1403 / #2249).
+    // (`SOURCE_SEAM_FILES`, CTX-1403 / #2249). The graphics seam has no
+    // production edge yet, but its identifier is restricted to
+    // `crates/bitty-rich/src/kitty_seam.rs` (`SOURCE_SEAM_FILES`, #2163).
     let violations = extension_source_violations(&workspace_root());
     assert!(
         violations.is_empty(),

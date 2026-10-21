@@ -1,6 +1,6 @@
 //! Bounded Kitty payload decode (Core-owned, issue #1802).
 //!
-//! The `bitty-graphics` extension crate implements the same decode behind
+//! The graphics extension crate implements the same decode behind
 //! the Core-owned [`crate::kitty_seam`] traits (W-141 extraction); Core
 //! never depends on extension internals (one-way only), so this module is
 //! the Core-owned decode step the `Runtime` transmit seam calls. Bounds
@@ -21,7 +21,7 @@
 //! # PNG path (shared minimal codec)
 //!
 //! PNG decodes through the minimal `png` codec (CTX-1186): the same crate
-//! and pin the `bitty-graphics` extension seam uses, never the full
+//! and pin the graphics extension seam uses, never the full
 //! `image` facade (no format autodetect, no codecs beyond PNG, no
 //! color-management stack). The `IHDR` dimensions are sniffed and
 //! validated **before** the decoder runs, so a hostile header is refused
@@ -381,7 +381,7 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
 /// [`KITTY_DECODE_MAX_BYTES`] before it is accepted.
 ///
 /// PNG decodes through the shared minimal `png` codec (same crate and pin
-/// as the `bitty-graphics` extension seam, never the full `image`
+/// as the graphics extension seam, never the full `image`
 /// facade): `normalize_to_color8 | ALPHA` folds every PNG color type
 /// (palette, gray, gray-alpha, RGB, RGBA, 16-bit, interlaced) to 8-bit
 /// channels before the local expansion to RGBA8, text chunks are skipped,
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     /// 1x1 RGBA PNG, single red opaque pixel. Same fixture shape as the
-    /// `bitty-graphics` extension suite (generated with Python stdlib
+    /// graphics extension suite (generated with Python stdlib
     /// `zlib`; `IHDR` CRC verified at generation).
     const PNG_1X1_RGBA_RED: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,

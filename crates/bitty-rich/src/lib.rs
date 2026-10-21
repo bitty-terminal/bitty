@@ -79,9 +79,12 @@
 //! (PNG via the shared minimal `png` codec, raw RGB/RGBA inline) lives in
 //! [`kitty_decode`] and nearest-neighbor raster mechanics in
 //! [`kitty_raster`] (both Core-owned behind the [`kitty_seam`] traits; the
-//! `bitty-graphics` extension crate implements the same traits on its own
-//! side, and Core never depends on extension internals). Core retains the declared-size pre-check
-//! ([`kitty_place`]) and the pre-upload re-validation on decoded bitmaps. All tests run on
+//! graphics extension implements the same traits on its own side, and Core
+//! never depends on extension internals). [`kitty_seam`] is the single
+//! module that may name the graphics extension crate; every other module
+//! reaches the extension-bound mechanics through its traits. Core retains
+//! the declared-size pre-check ([`kitty_place`]) and the pre-upload
+//! re-validation on decoded bitmaps. All tests run on
 //! GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the host external-editor round-trip
 //! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
@@ -166,9 +169,6 @@ pub use kitty_place::{
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,
     rasterize_kitty, rasterize_kitty_clipped, rasterize_rgba_clipped,
-};
-pub use kitty_seam::{
-    CoreKittyBackend, KittyDecodeBackend, KittyRasterBackend, KittyTransmitFormat,
 };
 pub use kitty_unicode::{
     KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect, virtual_extent_cells,

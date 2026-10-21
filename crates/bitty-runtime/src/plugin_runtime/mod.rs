@@ -94,14 +94,15 @@ pub use resolution::{
     load_index_with_fs, write_index, write_index_with_fs,
 };
 pub use services::{
-    CommandDirectory, CommandRecord, EmptyEnv, EmptySettings, EnvSource, MAX_ENV_GRANTS,
-    MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue, OverlayPeers,
-    PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv,
+    CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
+    MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue,
+    OverlayPeers, PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv,
     QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest,
     SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord, ServiceDirectory,
-    ServiceRecord, SettingsSource, SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES,
-    TerminalSubmitQueue, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
-    UnavailableSnapshot, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
+    TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue, ThemePersistHandler,
+    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableTargets,
+    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -689,6 +690,9 @@ pub struct PluginRuntime {
     /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
     /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
     workspace_source: Option<Rc<dyn WorkspaceSource>>,
+    /// W-29 successor (issue #2253): live Core target/anchor source for
+    /// targeting sessions. `None` leaves the Core provider empty.
+    target_source: Option<Rc<dyn TargetSource>>,
     /// CTX-1352 (issue #2247): optional composition-root history provider.
     /// `None` leaves granted `bitty.history.*.query` calls failing closed
     /// with the typed `E_HISTORY_UNAVAILABLE` denial, never a nil-index.
@@ -793,6 +797,11 @@ pub struct PluginRuntime {
     target_lenses: Rc<RefCell<Vec<(String, bitty_ui::DerivedProvider)>>>,
     /// W-29: runtime-shared label allocator (existing `LabelAllocator`).
     label_allocator: Rc<RefCell<bitty_ui::LabelAllocator>>,
+    /// W-29 successor (issue #2253): runtime-shared present-time annotation
+    /// channel. The active targeting generation publishes its batched
+    /// annotation layer here; the application reads it once per tick and
+    /// hands it to the scene/compositor. `None` while no session is active.
+    target_annotations: Rc<RefCell<Option<Rc<bitty_ui::HintAnnotationLayer>>>>,
     /// Durable-commit backend behind disk-backed plugin stores (`data_dir`).
     ///
     /// `None` by default (no durable store configured): stores opened while
@@ -919,6 +928,7 @@ impl PluginRuntime {
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             workspace_source: None,
+            target_source: None,
             history_provider: None,
             workspace_requests: Rc::new(RefCell::new(WorkspaceRequestQueue::new(
                 WORKSPACE_REQUEST_QUEUE_CAPACITY,
@@ -942,6 +952,7 @@ impl PluginRuntime {
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
             target_lenses: Rc::new(RefCell::new(Vec::new())),
             label_allocator: Rc::new(RefCell::new(bitty_ui::LabelAllocator::default())),
+            target_annotations: Rc::new(RefCell::new(None)),
             store_backend: None,
             sensor_host,
             device_host,
@@ -1189,6 +1200,16 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Install the live Core target/anchor source for targeting sessions
+    /// (W-29 successor, issue #2253).
+    ///
+    /// Call before activation: each generation captures the source when its
+    /// services are built. Without it the Core provider is empty and plugin
+    /// lenses still work; presence grants no authority.
+    pub fn set_target_source(&mut self, source: Rc<dyn TargetSource>) {
+        self.target_source = Some(source);
     }
 
     /// Install the composition-root history snapshot provider (CTX-1352).
@@ -1494,6 +1515,43 @@ impl PluginRuntime {
         &self.label_allocator
     }
 
+    /// Current present-time annotation batch, if a targeting session is
+    /// active (W-29 successor, issue #2253).
+    ///
+    /// The application reads this once per tick on the cold path and hands it
+    /// to the scene/compositor. The batch is already bounded by
+    /// [`bitty_ui::MAX_HINT_ANNOTATIONS`]; the handle is shared, so the
+    /// per-tick read is a pointer clone, never a copy of the labels. It is
+    /// `None` with no session, after dispatch, and after cancel/timeout/unload.
+    #[must_use]
+    pub fn target_annotations(&self) -> Option<Rc<bitty_ui::HintAnnotationLayer>> {
+        self.target_annotations.borrow().clone()
+    }
+
+    /// Reconcile the active targeting session against the latest published
+    /// live target rows (issue #2253 review).
+    ///
+    /// Called on the cold tick after `LiveTargets` publishes the present
+    /// solve. Retires vanished panel/workspace ids, drops their labels and
+    /// dispatch bindings, and republishes the layer. No-op without an active
+    /// capture/session. Returns whether anything changed; source errors leave
+    /// the session untouched.
+    pub fn reconcile_target_session(&self) -> bool {
+        let Some(owner) = self
+            .overlay_capture
+            .borrow()
+            .owner_plugin()
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Ok(id) = PluginId::new(&owner) else {
+            return false;
+        };
+        self.services(&id)
+            .is_some_and(|services| services.reconcile_target_session().unwrap_or(false))
+    }
+
     /// Enqueue one captured input event for the active overlay capture, if any.
     ///
     /// This is the Core input-path entry: it appends to the capture queue and
@@ -1583,6 +1641,11 @@ impl PluginRuntime {
         };
         if let Some(services) = self.services(&id) {
             services.remove_spec_overlay_block(handle);
+            // W-29 successor: a runtime-ended session also clears the
+            // present-time annotation batch and dispatcher bindings, so a
+            // timed-out or focus-switched session cannot leave hints on
+            // screen or accept a late label.
+            services.clear_targeting_session();
         }
     }
 
@@ -2348,7 +2411,11 @@ impl PluginRuntime {
             self.target_registry.clone(),
             self.target_lenses.clone(),
             self.label_allocator.clone(),
+            self.target_annotations.clone(),
         );
+        // W-29 successor (issue #2253): the live Core target/anchor source.
+        // `None` leaves the Core provider empty; plugin lenses still work.
+        plugin_services.set_target_source(self.target_source.clone());
         // LUA-OQ-8: service backend wiring. The verified manifest's
         // `services.provided`/`services.required` become this generation's
         // declaration gate and resolution fallback; the runtime-shared

@@ -403,6 +403,72 @@ impl TargetRegistry {
             Some(_) => Err(TargetError::StaleTarget(target.to_string())),
         }
     }
+
+    /// Retires every live id that is absent from `live`.
+    ///
+    /// Only identity (kind plus id) is compared; the generations carried by
+    /// `live` are ignored. Retired ids record tombstones, so outstanding
+    /// handles resolve [`TargetError::StaleTarget`]. Returns the number of
+    /// retired identities. The live set must include every provider tier the
+    /// caller wants to keep (Core plus registered lenses).
+    pub fn retain_live(&mut self, live: &[TargetRef]) -> usize {
+        let mut panels = HashSet::new();
+        let mut workspaces = HashSet::new();
+        let mut blocks = HashSet::new();
+        let mut nodes = HashSet::new();
+        let mut links = HashSet::new();
+        for target in live {
+            match target {
+                TargetRef::Panel(r) => {
+                    panels.insert(r.id.0);
+                }
+                TargetRef::Workspace(r) => {
+                    workspaces.insert(r.id.0);
+                }
+                TargetRef::CommandBlock(r) => {
+                    blocks.insert(r.id.0);
+                }
+                TargetRef::UiNode(r) => {
+                    nodes.insert(r.id.0);
+                }
+                TargetRef::Link(r) => {
+                    links.insert(r.id.0);
+                }
+            }
+        }
+        let mut retired = 0;
+        for id in self.panels.keys().copied().collect::<Vec<_>>() {
+            if !panels.contains(&id) && self.panels.remove(&id).is_some() {
+                self.note_retired(KIND_PANEL, id);
+                retired += 1;
+            }
+        }
+        for id in self.workspaces.keys().copied().collect::<Vec<_>>() {
+            if !workspaces.contains(&id) && self.workspaces.remove(&id).is_some() {
+                self.note_retired(KIND_WORKSPACE, id);
+                retired += 1;
+            }
+        }
+        for id in self.blocks.keys().copied().collect::<Vec<_>>() {
+            if !blocks.contains(&id) && self.blocks.remove(&id).is_some() {
+                self.note_retired(KIND_BLOCK, id);
+                retired += 1;
+            }
+        }
+        for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+            if !nodes.contains(&id) && self.nodes.remove(&id).is_some() {
+                self.note_retired(KIND_NODE, id);
+                retired += 1;
+            }
+        }
+        for id in self.links.keys().copied().collect::<Vec<_>>() {
+            if !links.contains(&id) && self.links.remove(&id).is_some() {
+                self.note_retired(KIND_LINK, id);
+                retired += 1;
+            }
+        }
+        retired
+    }
 }
 
 /// Generation captured inside `target`.
@@ -542,5 +608,48 @@ mod tests {
             .insert_node(UiNodeId::new(MAX_TARGETS_PER_KIND as u64))
             .expect_err("cap must hold");
         assert!(matches!(err, TargetError::TooManyTargets { .. }));
+    }
+
+    #[test]
+    fn retain_live_retires_only_vanished_ids() {
+        let mut registry = TargetRegistry::new();
+        let panel = registry.insert_panel(PanelId::new(1)).expect("panel");
+        let workspace = registry
+            .insert_workspace(WorkspaceId::new(2))
+            .expect("workspace");
+        let block = registry
+            .insert_block(CommandBlockId::new(3))
+            .expect("block");
+        let node = registry.insert_node(UiNodeId::new(4)).expect("node");
+        let link = registry.insert_link(LinkId::new(5)).expect("link");
+        // Keep panel, block, and link; drop workspace and node.
+        let live = [
+            TargetRef::Panel(panel),
+            TargetRef::CommandBlock(block),
+            TargetRef::Link(link),
+        ];
+        assert_eq!(registry.retain_live(&live), 2);
+        assert_eq!(
+            registry.resolve(&TargetRef::Panel(panel)),
+            Ok(TargetRef::Panel(panel))
+        );
+        assert_eq!(
+            registry.resolve(&TargetRef::CommandBlock(block)),
+            Ok(TargetRef::CommandBlock(block))
+        );
+        assert_eq!(
+            registry.resolve(&TargetRef::Link(link)),
+            Ok(TargetRef::Link(link))
+        );
+        assert!(matches!(
+            registry.resolve(&TargetRef::Workspace(workspace)),
+            Err(TargetError::StaleTarget(_))
+        ));
+        assert!(matches!(
+            registry.resolve(&TargetRef::UiNode(node)),
+            Err(TargetError::StaleTarget(_))
+        ));
+        // Re-running with the same live set is a no-op.
+        assert_eq!(registry.retain_live(&live), 0);
     }
 }

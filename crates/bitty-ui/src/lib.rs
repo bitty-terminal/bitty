@@ -197,7 +197,8 @@ pub mod workspace_scene;
 
 // Re-exports for ergonomic root access.
 pub use annotation_layer::{
-    AnnotationLayerError, HintAnnotation, HintAnnotationLayer, MAX_HINT_ANNOTATIONS,
+    AnnotationLayerError, HintAnnotation, HintAnnotationLayer, HintAnnotationSpec,
+    MAX_HINT_ANNOTATIONS, MAX_HINT_LABEL_BYTES,
 };
 pub use budget::{
     Admission, BudgetDimension, BudgetTier, ESSENTIAL_TEXTURE_BYTES, Overrun, RICH_TEXTURE_BYTES,
@@ -313,10 +314,10 @@ pub use selection::{
 };
 pub use target_dispatch::{DispatchError, MAX_TARGET_BINDINGS, TargetDispatcher};
 pub use target_provider::{
-    CORE_TERMINAL_PROVIDER_NAME, CommandBlockProvider, DerivedProvider, MAX_SNAPSHOT_TARGETS,
-    MAX_TARGET_PROVIDER_NAME_LEN, MAX_TARGET_PROVIDERS, ProviderError, ProviderMediator,
-    ProviderTarget, ProviderTier, SnapshotEntry, TARGET_PROVIDER_CAPABILITY, TargetKind,
-    TargetProvider, TargetSnapshot, validate_provider_name,
+    CORE_TERMINAL_PROVIDER_NAME, CommandBlockProvider, CoreTargetProvider, DerivedProvider,
+    MAX_SNAPSHOT_TARGETS, MAX_TARGET_PROVIDER_NAME_LEN, MAX_TARGET_PROVIDERS, ProviderError,
+    ProviderMediator, ProviderTarget, ProviderTier, SnapshotEntry, TARGET_PROVIDER_CAPABILITY,
+    TargetKind, TargetProvider, TargetSnapshot, validate_provider_name,
 };
 pub use targeting::{
     CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,

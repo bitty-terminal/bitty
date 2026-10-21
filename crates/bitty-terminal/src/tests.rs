@@ -2654,6 +2654,217 @@ ui.overlay.focus = true
 }
 
 #[test]
+fn target_session_reconciles_closed_panel_on_cold_tick() {
+    // Review blocker for #2253: the cold tick that publishes live target rows
+    // must also reconcile the active session. A panel closed mid-session must
+    // lose its label and dispatch binding, not linger until timeout.
+    use bitty_lua::HostServices;
+    use bitty_runtime::TargetAnchorSummary;
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(
+            &self,
+            _scope: &str,
+        ) -> Result<LuaValue, bitty_runtime::plugin_runtime::BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1354-targets-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx1354targets";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-1354 target reconciliation"
+version = "0.1.0"
+description = "target session reconcile test"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+ui.overlay.focus = true
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local mount_ok, handle = pcall(bitty.ui.mount, "overlay", { kind = "Text", text = "targets" })
+        if not mount_ok then
+          bitty.store.set("start_error", "mount")
+          return {}
+        end
+        local rows = bitty.ui.targets.snapshot(16)
+        local anchors = {}
+        local commands = {}
+        for i = 1, #rows do
+          local idx = i - 1
+          anchors[i] = { x = idx % 80, y = math.floor(idx / 80) }
+          commands[i] = "acme.cmd:c" .. i
+        end
+        local ok, labels = pcall(bitty.ui.targets.session_start, handle, 80, anchors, commands)
+        if not ok then
+          bitty.store.set("start_error", labels.code or "unknown")
+        end
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut rt = Runtime::with_defaults().expect("runtime must build");
+    let first = rt.focused_view().expect("focused view");
+    let first_leaf = rt.layout().find_leaf(first).cloned().expect("first leaf");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(first_leaf),
+        LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+    ));
+    let rows: Vec<TargetAnchorSummary> = rt.target_anchor_summaries();
+    assert_eq!(rows.len(), 3, "one workspace plus two panels");
+    let live_targets = Rc::new(crate::plugin_runtime::LiveTargets::default());
+    live_targets.publish(&rows);
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: Rc::new(EmptySettings),
+        snapshot: Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.set_target_source(live_targets.clone());
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+    assert_eq!(
+        plugin_runtime
+            .services(&pid)
+            .expect("services")
+            .with_store(|store| store.get("start_error")),
+        None,
+        "fixture session_start must succeed"
+    );
+    assert!(
+        plugin_runtime.overlay_capture().borrow().is_active(),
+        "the fixture session must own the transient capture"
+    );
+    assert_eq!(
+        plugin_runtime.target_annotations().expect("layer").len(),
+        3,
+        "the session starts with one label per live target"
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime))
+    .with_live_targets(Some(Rc::clone(&live_targets)));
+
+    let _ = app.drive_tick();
+    let before_labels: Vec<String> = app
+        .plugin_runtime
+        .as_ref()
+        .expect("plugin runtime")
+        .target_annotations()
+        .expect("layer")
+        .annotations()
+        .iter()
+        .map(|annotation| annotation.label.clone())
+        .collect();
+    assert_eq!(before_labels.len(), 3);
+
+    // Close the second panel mid-session.
+    let leaves = app.runtime.layout().leaf_ids();
+    assert_eq!(leaves.len(), 2);
+    let remaining = app
+        .runtime
+        .layout()
+        .find_leaf(leaves[0])
+        .cloned()
+        .expect("remaining leaf");
+    app.runtime.set_layout(LayoutNode::leaf(remaining));
+
+    // First tick publishes the new rows and reconciles the session; the
+    // second tick pushes the reconciled layer into the scene.
+    let _ = app.drive_tick();
+    let _ = app.drive_tick();
+
+    let after = app
+        .plugin_runtime
+        .as_ref()
+        .expect("plugin runtime")
+        .target_annotations()
+        .expect("layer");
+    let after_labels: HashSet<String> = after
+        .annotations()
+        .iter()
+        .map(|annotation| annotation.label.clone())
+        .collect();
+    assert_eq!(after_labels.len(), 2, "workspace plus surviving panel");
+    let dropped = before_labels
+        .iter()
+        .find(|label| !after_labels.contains(*label))
+        .cloned()
+        .expect("exactly one label must disappear");
+    assert!(
+        !after.contains_label(&dropped),
+        "closed panel label remains in the session layer"
+    );
+    assert_eq!(
+        app.runtime
+            .target_annotations()
+            .expect("runtime layer")
+            .len(),
+        2,
+        "the presented layer must drop the closed panel label"
+    );
+    let error = app
+        .plugin_runtime
+        .as_ref()
+        .expect("plugin runtime")
+        .services(&pid)
+        .expect("services")
+        .ui_targets_dispatch(&dropped)
+        .expect_err("closed panel label must fail closed");
+    assert_eq!(error.code, "E_DEF_INVALID");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn overlay_input_available_pump_nudge_on_tick_with_released_ordering() {
     // CTX-1170 (issue #1972) host pump driver: when a live capture owner
     // has undrained queued input, `drive_tick` delivers one

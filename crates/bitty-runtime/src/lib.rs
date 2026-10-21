@@ -294,7 +294,7 @@ pub use runtime::{
     MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
     POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PTY_FORWARD_CAPACITY_CHUNKS,
     PanelAnimator, PresentStats, PtyWaker, QueuedFxPulse, ReducedMotionMode, Runtime,
-    SYNC_UPDATE_DEFER_TIMEOUT, TerminalDiagnostics, UrlActivation,
+    SYNC_UPDATE_DEFER_TIMEOUT, TargetAnchorSummary, TerminalDiagnostics, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

@@ -98,12 +98,12 @@ pub use host::{
     REGISTRATION_MAX_TIMERS, REGISTRATION_MAX_TITLE_BYTES, RegistrationCapture,
     SERVICE_MAX_IFACE_BYTES, SERVICE_MAX_METHOD_BYTES, SNAPSHOT_MAX_BYTES, SPAWN_TIMEOUT_MAX_MS,
     SPAWN_TIMEOUT_MS, ServiceMethod, ServiceProvision, ServiceRoute, StashedFunction,
-    THEME_ANSI_COUNT, THEME_COLOR_MAX_BYTES, TaskRegistration, ThemeTable, TimerRegistration,
-    WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_RENAME_MAX_BYTES,
-    WorkspaceAttention, WorkspaceInfo, WorkspaceRequest, component_bridge_error,
-    component_response_value, env_grant_authorizes, env_grant_shape_ok, env_key_shape_ok,
-    parse_fs_write_append, parse_theme_table, validate_env_key, validate_fs_content,
-    validate_fs_list_max, validate_fs_path, validate_image_path,
+    THEME_ANSI_COUNT, THEME_COLOR_MAX_BYTES, TargetSnapshotRow, TaskRegistration, ThemeTable,
+    TimerRegistration, WORKSPACE_LIST_MAX_ITEMS, WORKSPACE_NAME_MAX_CHARS,
+    WORKSPACE_RENAME_MAX_BYTES, WorkspaceAttention, WorkspaceInfo, WorkspaceRequest,
+    component_bridge_error, component_response_value, env_grant_authorizes, env_grant_shape_ok,
+    env_key_shape_ok, parse_fs_write_append, parse_theme_table, validate_env_key,
+    validate_fs_content, validate_fs_list_max, validate_fs_path, validate_image_path,
 };
 pub use plain_config::{ConfigLuaVm, PlainConfigError, PlainConfigLimits, PlainConfigValue};
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};

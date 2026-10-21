@@ -11,6 +11,13 @@
 #     and waits for r2-mirror before publishing
 #   - the renderer rejects a non-CDN base URL and malformed digests
 #
+# CTX-1433 (#2364) hardens the same contract: the AUR/Homebrew/Scoop publish
+# jobs must verify `${BASE_URL}/<asset>.sha256` through
+# `scripts/verify-cdn-sidecar.sh`, and this gate runs that verifier against a
+# file:// fixture so a digest computed from the local copy (a self-referential
+# hash) cannot pass. The docs must scope the sidecar claim to bare binaries and
+# archives and name the package/FreeBSD exceptions.
+#
 # The live tag-time fetch/verify path stays in release.yml; this gate pins the
 # generation contract on every PR.
 set -euo pipefail
@@ -177,6 +184,10 @@ expect_render_fail "a path-traversing asset name" scoop \
   --x64-asset "../${X64_ASSET}" --arm64-asset "$ARM64_ASSET" \
   --sha-x64 "$SHA_X64" --sha-arm64 "$SHA_ARM64"
 
+job_block() { # <job>
+  sed -n "/^  $1:/,/^  [a-z0-9-]*:/p" "$WORKFLOW"
+}
+
 # --- AUR bitty-bin ----------------------------------------------------------
 if bash scripts/check-pkgbuild-bin.sh >"$TMP/pkgbuild.log" 2>&1; then
   pass "check-pkgbuild-bin passes (CDN URL + real digest)"
@@ -194,10 +205,95 @@ expect_contains "$PKGBUILD" \
   "https://github.com/bitty-terminal/bitty/releases/download/v\${pkgver}/\${_bitty_asset}" \
   "AUR bitty-bin documents the GitHub Releases fallback"
 
+# --- AUR publish-time sidecar verification (CTX-1433, #2364) ----------------
+# Pin the *published* sidecar, not a local digest: the publisher must fetch
+# `${BASE_URL}/${ASSET}.sha256` and compare that value against the bytes it
+# downloaded. String assertions alone let a self-referential local hash pass,
+# so the fixture below runs the verifier release.yml actually calls.
+VERIFIER=./scripts/verify-cdn-sidecar.sh
+AUR_BLOCK="$(job_block aur-bin)"
+
+if [[ -x "$VERIFIER" ]]; then
+  pass "shared sidecar verifier is executable"
+else
+  fail "shared sidecar verifier is missing or not executable: $VERIFIER"
+fi
+bash -n "$VERIFIER" || fail "bash -n rejects $VERIFIER"
+expect_contains "$VERIFIER" '${BASE_URL}/${ASSET}.sha256' \
+  "verifier fetches the published <asset>.sha256 sidecar"
+
+if grep -qF 'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ASSET"' <<<"$AUR_BLOCK"; then
+  pass "aur-bin verifies the published sidecar through the shared verifier"
+else
+  fail "aur-bin does not verify through scripts/verify-cdn-sidecar.sh"
+fi
+if grep -q 'ACTUAL_SHA' <<<"$AUR_BLOCK"; then
+  fail "aur-bin compares a locally computed digest instead of the sidecar digest"
+else
+  pass "aur-bin has no local-only digest comparison"
+fi
+
+SIDE_CDN="$TMP/cdn-ok/releases/v${VERSION}"
+mkdir -p "$SIDE_CDN"
+printf 'published release payload\n' >"$SIDE_CDN/$INTEL_ASSET"
+SIDE_SHA="$(sha256sum "$SIDE_CDN/$INTEL_ASSET" | awk '{ print $1 }')"
+# GNU sha256sum records the build-time path, so the sidecar names dist/<asset>.
+printf '%s  dist/%s\n' "$SIDE_SHA" "$INTEL_ASSET" >"$SIDE_CDN/$INTEL_ASSET.sha256"
+
+if GOT="$("$VERIFIER" "file://$SIDE_CDN" "$INTEL_ASSET" "$TMP/dl-ok" 2>"$TMP/ok.err")"; then
+  if [[ "$GOT" == "$SIDE_SHA" ]]; then
+    pass "verifier accepts a sidecar that describes the published bytes"
+  else
+    fail "verifier printed '${GOT}', expected '${SIDE_SHA}'"
+  fi
+else
+  fail "verifier rejected a matching sidecar: $(tail -n 1 "$TMP/ok.err")"
+fi
+
+# A digest of some other local file (the classic self-referential hash) must
+# not satisfy the check.
+STALE_CDN="$TMP/cdn-stale"
+mkdir -p "$STALE_CDN"
+cp "$SIDE_CDN/$INTEL_ASSET" "$STALE_CDN/$INTEL_ASSET"
+printf '%s  dist/%s\n' \
+  "$(printf 'local rebuild\n' | sha256sum | awk '{ print $1 }')" "$INTEL_ASSET" \
+  >"$STALE_CDN/$INTEL_ASSET.sha256"
+if "$VERIFIER" "file://$STALE_CDN" "$INTEL_ASSET" "$TMP/dl-stale" >/dev/null 2>&1; then
+  fail "verifier accepted a self-referential local hash"
+else
+  pass "verifier rejects a self-referential local hash"
+fi
+
+BAD_HEX_CDN="$TMP/cdn-bad-hex"
+mkdir -p "$BAD_HEX_CDN"
+cp "$SIDE_CDN/$INTEL_ASSET" "$BAD_HEX_CDN/$INTEL_ASSET"
+printf '%s  dist/%s\n' "${SIDE_SHA^^}" "$INTEL_ASSET" >"$BAD_HEX_CDN/$INTEL_ASSET.sha256"
+if "$VERIFIER" "file://$BAD_HEX_CDN" "$INTEL_ASSET" "$TMP/dl-hex" >/dev/null 2>&1; then
+  fail "verifier accepted an uppercase digest"
+else
+  pass "verifier rejects an uppercase digest"
+fi
+
+MISSING_CDN="$TMP/cdn-missing"
+mkdir -p "$MISSING_CDN"
+cp "$SIDE_CDN/$INTEL_ASSET" "$MISSING_CDN/$INTEL_ASSET"
+if "$VERIFIER" "file://$MISSING_CDN" "$INTEL_ASSET" "$TMP/dl-missing" >/dev/null 2>&1; then
+  fail "verifier accepted an asset with no published sidecar"
+else
+  pass "verifier rejects an asset with no published sidecar"
+fi
+
+RENAMED_CDN="$TMP/cdn-renamed"
+mkdir -p "$RENAMED_CDN"
+cp "$SIDE_CDN/$INTEL_ASSET" "$RENAMED_CDN/$INTEL_ASSET"
+printf '%s  dist/bitty-other-asset\n' "$SIDE_SHA" >"$RENAMED_CDN/$INTEL_ASSET.sha256"
+if "$VERIFIER" "file://$RENAMED_CDN" "$INTEL_ASSET" "$TMP/dl-renamed" >/dev/null 2>&1; then
+  fail "verifier accepted a sidecar naming another file"
+else
+  pass "verifier rejects a sidecar naming another file"
+fi
+
 # --- Workflow wiring --------------------------------------------------------
-job_block() { # <job>
-  sed -n "/^  $1:/,/^  [a-z0-9-]*:/p" "$WORKFLOW"
-}
 
 for job in aur-bin homebrew scoop; do
   if grep -q 'needs: r2-mirror' <<<"$(job_block "$job")"; then
@@ -234,9 +330,18 @@ fi
 for needle in 'rendered formula lost the R2/CDN' 'rendered manifest lost the R2/CDN' \
   'rendered PKGBUILD does not use the R2/CDN' \
   'rendered PKGBUILD does not carry the verified sha256' \
-  'bitty-bin-asset' 'ACTUAL_SHA="$(sha256sum' \
-  'fetch_verified "$INTEL_ASSET"' 'fetch_verified "$X64_ASSET"'; do
+  'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ASSET"' \
+  'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$INTEL_ASSET"' \
+  'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$X64_ASSET"'; do
   expect_contains "$WORKFLOW" "$needle" "release.yml has a publish-time assertion: $needle"
+done
+
+for job in homebrew scoop; do
+  if grep -qF 'verify-cdn-sidecar.sh' <<<"$(job_block "$job")"; then
+    pass "release.yml $job verifies the published sidecar"
+  else
+    fail "release.yml $job does not verify through the shared verifier"
+  fi
 done
 
 # --- Documentation ----------------------------------------------------------
@@ -246,6 +351,25 @@ expect_contains "$INSTALL" 'R2-backed CDN' "packaging/INSTALL.md names the R2-ba
 expect_contains "$INSTALL" 'GitHub Releases' "packaging/INSTALL.md documents the GitHub fallback"
 expect_contains "$TOP_README" 'https://cdn.bitty.run/releases/' \
   "README.md names the CDN release path"
+
+# CTX-1433 (#2364): the sidecar claim must stay scoped to bare binaries and
+# archives, with the package/FreeBSD exceptions spelled out.
+for doc in "$README" "$INSTALL"; do
+  expect_contains "$doc" 'Every bare binary and archive' \
+    "$doc scopes the sidecar claim to binaries and archives"
+  if grep -qF 'Each artifact ships a `<artifact>.sha256` sidecar' "$doc" ||
+    grep -qF 'Each artifact has a `.sha256` sidecar' "$doc"; then
+    fail "$doc still claims every artifact has a sidecar"
+  else
+    pass "$doc no longer claims every artifact has a sidecar"
+  fi
+done
+for needle in '.deb' '.rpm' '.apk' '.pkg.tar.zst' 'bitty-x86_64-unknown-freebsd.sha256'; do
+  expect_contains "$README" "$needle" \
+    "packaging/README.md names the sidecar exception: $needle"
+done
+expect_contains "$README" 'scripts/verify-cdn-sidecar.sh' \
+  "packaging/README.md names the shared publish-time verifier"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "check-package-manifests.test: FAIL" >&2

@@ -1427,23 +1427,11 @@ jobs:
           BASE_URL="https://cdn.bitty.run/releases/${TAG}"
           echo "bitty-bin asset: $ASSET at $TAG (R2/CDN primary)"
           # Download the exact bytes the PKGBUILD will fetch and verify them
-          # against the published sidecar; never SKIP the binary checksum.
-          curl --fail --location --silent --show-error \
-            --output /tmp/bitty-bin-asset \
-            "${BASE_URL}/${ASSET}"
-          curl --fail --location --silent --show-error \
-            --output /tmp/bitty-bin.sha256 \
-            "${BASE_URL}/${ASSET}.sha256"
-          SHA="$(cut -d' ' -f1 /tmp/bitty-bin.sha256)"
-          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "CDN sha256 sidecar did not yield a 64-hex digest: $SHA" >&2
-            exit 1
-          fi
-          ACTUAL_SHA="$(sha256sum /tmp/bitty-bin-asset | cut -d' ' -f1)"
-          if [ "$ACTUAL_SHA" != "$SHA" ]; then
-            echo "CDN asset checksum mismatch for ${ASSET}: expected ${SHA}, got ${ACTUAL_SHA}" >&2
-            exit 1
-          fi
+          # against the published `${BASE_URL}/${ASSET}.sha256` sidecar; never
+          # SKIP the binary checksum. The shared verifier (CTX-1433, #2364) is
+          # the same code path the package-manifest gate exercises, so a local
+          # digest compared against a locally written sidecar cannot pass.
+          SHA="$(scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ASSET")"
           cp packaging/PKGBUILD.bin "$AUR_DIR/PKGBUILD"
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$AUR_DIR/PKGBUILD"
           sed -i "s/REPLACE_WITH_RELEASE_SHA256/$SHA/" "$AUR_DIR/PKGBUILD"
@@ -1502,25 +1490,10 @@ jobs:
           INTEL_ASSET="bitty-x86_64-apple-darwin"
           ARM_ASSET="bitty-aarch64-apple-darwin"
           # Fetch the artifact plus its published sidecar and fail closed on a
-          # mismatch; the sidecar digest is what the formula embeds.
-          fetch_verified() { # <asset> <dest>
-            local asset="$1" dest="$2" expected actual
-            curl --fail --location --silent --show-error --output "$dest" "${BASE_URL}/${asset}"
-            curl --fail --location --silent --show-error --output "${dest}.sha256" "${BASE_URL}/${asset}.sha256"
-            expected="$(cut -d' ' -f1 "${dest}.sha256")"
-            if ! printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$'; then
-              echo "CDN sha256 sidecar for ${asset} did not yield a 64-hex digest: ${expected}" >&2
-              return 1
-            fi
-            actual="$(sha256sum "$dest" | cut -d' ' -f1)"
-            if [ "$actual" != "$expected" ]; then
-              echo "CDN asset checksum mismatch for ${asset}: expected ${expected}, got ${actual}" >&2
-              return 1
-            fi
-            printf '%s' "$expected"
-          }
-          SHA_INTEL="$(fetch_verified "$INTEL_ASSET" "$INTEL_ASSET")"
-          SHA_ARM="$(fetch_verified "$ARM_ASSET" "$ARM_ASSET")"
+          # mismatch; the sidecar digest is what the formula embeds. The shared
+          # verifier (CTX-1433, #2364) pins `${BASE_URL}/${asset}.sha256`.
+          SHA_INTEL="$(scripts/verify-cdn-sidecar.sh "$BASE_URL" "$INTEL_ASSET")"
+          SHA_ARM="$(scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ARM_ASSET")"
 
           mkdir -p homebrew-tap
           git -C homebrew-tap init
@@ -1584,25 +1557,10 @@ jobs:
           X64_ASSET="bitty-x86_64-pc-windows-msvc.exe"
           ARM64_ASSET="bitty-aarch64-pc-windows-msvc.exe"
           # Fetch the artifact plus its published sidecar and fail closed on a
-          # mismatch; the sidecar digest is what the manifest embeds.
-          fetch_verified() { # <asset> <dest>
-            local asset="$1" dest="$2" expected actual
-            curl --fail --location --silent --show-error --output "$dest" "${BASE_URL}/${asset}"
-            curl --fail --location --silent --show-error --output "${dest}.sha256" "${BASE_URL}/${asset}.sha256"
-            expected="$(cut -d' ' -f1 "${dest}.sha256")"
-            if ! printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$'; then
-              echo "CDN sha256 sidecar for ${asset} did not yield a 64-hex digest: ${expected}" >&2
-              return 1
-            fi
-            actual="$(sha256sum "$dest" | cut -d' ' -f1)"
-            if [ "$actual" != "$expected" ]; then
-              echo "CDN asset checksum mismatch for ${asset}: expected ${expected}, got ${actual}" >&2
-              return 1
-            fi
-            printf '%s' "$expected"
-          }
-          SHA_X64="$(fetch_verified "$X64_ASSET" "$X64_ASSET")"
-          SHA_ARM64="$(fetch_verified "$ARM64_ASSET" "$ARM64_ASSET")"
+          # mismatch; the sidecar digest is what the manifest embeds. The shared
+          # verifier (CTX-1433, #2364) pins `${BASE_URL}/${asset}.sha256`.
+          SHA_X64="$(scripts/verify-cdn-sidecar.sh "$BASE_URL" "$X64_ASSET")"
+          SHA_ARM64="$(scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ARM64_ASSET")"
 
           mkdir -p scoop-bucket
           git -C scoop-bucket init

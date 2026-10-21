@@ -83,8 +83,12 @@ binaries for Linux, macOS, and Windows plus `.deb`, `.rpm`, `.apk`, and Arch
 packages and remain the documented fallback. Only release-matrix-verified
 artifacts count as supported (see `packaging/README.md` `Release Matrix` and
 `Support evidence`). `r2-mirror` publishes every file under `dist/` with
-read-back hash verification. Each artifact has a `.sha256` sidecar — every
-channel verifies it, and you should too before running anything manually.
+read-back hash verification. Every bare binary and archive has a `.sha256`
+sidecar plus a `SHA256SUMS` entry — every channel verifies it, and you should
+too before running anything manually. Two exceptions: the `.deb`, `.rpm`,
+`.apk`, and Arch packages ship only their `SHA256SUMS` line (no per-package
+sidecar), and FreeBSD publishes one `bitty-x86_64-unknown-freebsd.sha256`
+covering both the binary and the `.tar.xz`.
 
 ## Build from source
 

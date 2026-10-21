@@ -365,13 +365,28 @@ https://cdn.bitty.run/install/latest.txt
 
 ### Checksums and signatures
 
-Each artifact ships a `<artifact>.sha256` sidecar (one line,
+Every bare binary and archive ships a `<artifact>.sha256` sidecar (one line,
 `<hex>  <filename>`, GNU `sha256sum` format) for single-file script-side
-verification, plus the aggregate `SHA256SUMS` and `provenance.json`
-(`commit`, `tag`, `date`, `toolchain`, `build_runner`) as the authoritative
-release manifest. Bootstrap scripts verify the sidecar and fail closed on
-mismatch. The FreeBSD binary and tarball share one
-`bitty-x86_64-unknown-freebsd.sha256` sidecar listing both files. There are no signatures in 0.1.0: the Windows build is
+verification: the Linux, macOS, and Windows bare binaries, the Linux `.tar.zst`
+bundles, the portable Windows ZIP, the Windows setup `.exe`, and the macOS DMG.
+The aggregate `SHA256SUMS` (`<hex>  <filename>` for every file under `dist/`)
+and `provenance.json` (`commit`, `tag`, `date`, `toolchain`, `build_runner`)
+travel alongside the payload as the authoritative release manifest. Bootstrap
+scripts verify the sidecar and fail closed on mismatch.
+
+Two documented exceptions to "every artifact has a sidecar":
+
+- `.deb`, `.rpm`, `.apk`, and the pacman `.pkg.tar.zst` are assembled by nfpm
+  in the build jobs, after the per-file checksum step, and ship **no**
+  `<package>.sha256` sidecar. Verify them against their `SHA256SUMS` entry (one
+  line per package) or the package manager's own metadata chain.
+- FreeBSD publishes one `bitty-x86_64-unknown-freebsd.sha256` sidecar named
+  after the binary that lists **both** payloads (the bare binary and the
+  `.tar.xz` bundle, two lines) instead of one sidecar per file.
+
+The tag-time channel publishers (`aur-bin`, `homebrew`, `scoop`) verify the
+published sidecar through `scripts/verify-cdn-sidecar.sh` before they write a
+recipe or manifest. There are no signatures in 0.1.0: the Windows build is
 intentionally unsigned (paid signing deferred past 0.2.0 per #1810), so
 0.1.0 verifies by hash only. Sigstore or cosign stays a follow-up, not a
 silent addition.

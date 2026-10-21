@@ -328,8 +328,7 @@ else
   pass "release.yml no longer uses GitHub as a channel download source"
 fi
 for needle in 'rendered formula lost the R2/CDN' 'rendered manifest lost the R2/CDN' \
-  'rendered PKGBUILD does not use the R2/CDN' \
-  'rendered PKGBUILD does not carry the verified sha256' \
+  'scripts/assert-aur-bin-render.sh' \
   'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$ASSET"' \
   'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$INTEL_ASSET"' \
   'scripts/verify-cdn-sidecar.sh "$BASE_URL" "$X64_ASSET"'; do

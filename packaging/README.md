@@ -173,7 +173,11 @@ bytes are published on GitHub Releases, which the template documents as the
 fallback; the metadata tarball is not mirrored, so it keeps the GitHub archive
 URL. `makepkg` verifies the binary sha256 before packaging. The publish job
 waits for `r2-mirror` and verifies the downloaded asset against its `.sha256`
-sidecar before updating the recipe.
+sidecar before updating the recipe. It then resolves the rendered
+`source_x86_64` entry and checks the `.SRCINFO` it ships through
+`scripts/assert-aur-bin-render.sh`, so the recipe and the published metadata
+must both resolve to the CDN URL and the verified digest; a recipe that
+resolves anywhere else fails the channel.
 
 ```sh
 makepkg --printsrcinfo > .SRCINFO
@@ -189,7 +193,7 @@ paru -S bitty-bin   # or: yay -S bitty-bin
 
 The source package (`bitty`) compiles the whole workspace locally and needs the Rust toolchain; prefer `bitty-bin` unless you specifically need a source build. `bitty` and `bitty-bin` conflict, so install one or the other. Only a tag-time published recipe counts as supported; a locally built package is not support evidence.
 
-Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcinfo)`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-terminal/Cargo.toml`), `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
+Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcinfo)`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-terminal/Cargo.toml`), `bash scripts/check-pkgbuild-bin.sh` (template render test), `bash scripts/tests/check-aur-bin-render.test.sh` (publish-assertion regression) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
 
 ## Cargo
 
@@ -386,7 +390,10 @@ Two documented exceptions to "every artifact has a sidecar":
 
 The tag-time channel publishers (`aur-bin`, `homebrew`, `scoop`) verify the
 published sidecar through `scripts/verify-cdn-sidecar.sh` before they write a
-recipe or manifest. There are no signatures in 0.1.0: the Windows build is
+recipe or manifest. A `channel-summary` job always runs on tag builds and lists
+every package channel's result in the run summary, failing when any enabled
+channel did not publish, so one stale channel cannot hide behind the green
+ones. There are no signatures in 0.1.0: the Windows build is
 intentionally unsigned (paid signing deferred past 0.2.0 per #1810), so
 0.1.0 verifies by hash only. Sigstore or cosign stays a follow-up, not a
 silent addition.

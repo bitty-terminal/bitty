@@ -10,6 +10,8 @@
 #   - the binary source URL points at the R2/CDN release path (CTX-1413)
 #   - the GitHub Releases fallback URL is documented in the template
 #   - `package()` installs the binary to /usr/bin/bitty
+#   - the `aur-bin` publish checker (scripts/assert-aur-bin-render.sh) accepts
+#     the rendered file, including the resolved source URL (#2417)
 #
 # Usage: scripts/check-pkgbuild-bin.sh [PKGVER] [FAKE_SHA256]
 set -euo pipefail
@@ -79,6 +81,12 @@ grep -q "REPLACE_WITH_RELEASE_SHA256" "$RENDERED" &&
 BIN_SHA_LINE="$(awk '/sha256sums_x86_64/,/\)/' "$RENDERED" | grep -E "'[0-9a-f]{64}'" | head -n 1)"
 [[ -n "$BIN_SHA_LINE" ]] ||
   fail "rendered binary sha256 is not a real 64-hex digest"
+
+# CTX-1436 (#2417): run the same checker the `aur-bin` publish job runs, so a
+# gate failure here means the tag-time publish would fail too. It resolves the
+# source URL the way makepkg does instead of grepping a literal asset name.
+"$REPO_ROOT/scripts/assert-aur-bin-render.sh" "$RENDERED" "$PKGVER" "$FAKE_SHA" ||
+  fail "publish-time render checker rejects the rendered PKGBUILD"
 
 # Rendered file must still produce valid SRCINFO input shape (makepkg
 # --printsrcinfo needs Arch tooling; here we at least require the fields it

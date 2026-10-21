@@ -2587,6 +2587,25 @@ impl Runtime {
         self.primary_view == Some(*view)
     }
 
+    /// Whether leaf `view` actually paints the runtime-global primary grid.
+    ///
+    /// WS-INV-8: a leaf paints from at most one grid source — its own pane
+    /// session when present, otherwise the primary grid iff it is the
+    /// primary owner. `primary_view` alone is therefore not enough: a leaf
+    /// that owns a pane session paints that session even while the owner id
+    /// still names it, so the primary grid is hidden behind the pane grid.
+    ///
+    /// Issue #2389: close teardown must follow the same precedence as
+    /// painting. Asking [`Self::is_primary_view`] alone tore down the
+    /// hidden primary PTY and orphaned the pane session the closed panel was
+    /// showing, because the re-home on a primary-owner close lands on the
+    /// focused survivor even when that survivor owns a pane session.
+    /// Read-only and O(1).
+    #[must_use]
+    pub fn paints_primary_grid(&self, view: &ViewId) -> bool {
+        self.primary_view == Some(*view) && !self.pane_sessions.contains_key(view)
+    }
+
     /// Current terminal state (read-only) for assertions.
     #[must_use]
     pub fn state(&self) -> &State {

@@ -1714,7 +1714,12 @@ impl TerminalApp {
                         // and input was silently dropped (no focused writer,
                         // no primary owner). Remove the leaf and hand focus
                         // to the live float instead.
-                        let was_primary = self.runtime.is_primary_view(&focused);
+                        // Issue #2389: teardown follows paint precedence
+                        // (WS-INV-8). A leaf that owns a pane session paints
+                        // it even when the primary owner id names the leaf,
+                        // so killing the primary PTY here stranded the pane
+                        // session with no owning leaf.
+                        let was_primary = self.runtime.paints_primary_grid(&focused);
                         if was_primary {
                             if self.runtime.close_primary_session() {
                                 eprintln!(
@@ -1751,7 +1756,10 @@ impl TerminalApp {
                         // (no focused writer, no primary owner). Tear down
                         // the shell, retire the leaf, and hand focus plus
                         // primary ownership to the pin.
-                        let was_primary = self.runtime.is_primary_view(&focused);
+                        // Issue #2389: same paint-precedence rule as the
+                        // float base branch — retire the session the leaf
+                        // actually painted.
+                        let was_primary = self.runtime.paints_primary_grid(&focused);
                         if was_primary {
                             if self.runtime.close_primary_session() {
                                 eprintln!(
@@ -1780,7 +1788,7 @@ impl TerminalApp {
                             self.runtime.leaf_count(),
                             self.runtime.focused_view()
                         );
-                    } else if self.runtime.is_primary_view(&focused) {
+                    } else if self.runtime.paints_primary_grid(&focused) {
                         if self.runtime.close_primary_session() {
                             eprintln!(
                                 "bitty: keymap close_view tore down primary shell {focused:?} (workspace kept for float)"

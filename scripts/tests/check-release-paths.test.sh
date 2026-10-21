@@ -79,7 +79,18 @@ expect_exit 1 'one leaky binary among clean ones' \
 # 9. A missing binary is an inspection failure, not a pass.
 expect_fail_text 'binary not found' 'missing binary' --binary "$TMP/absent"
 
-# 10. Usage errors.
+# 10. A relative CARGO_TARGET_DIR is resolved before matching, so the bare
+# substring does not false-positive.
+printf 'built under target/debug/deps\n' >"$TMP/relative-target.bin"
+CARGO_TARGET_DIR=target expect_exit 0 'relative target dir' --binary "$TMP/relative-target.bin"
+
+# 11. A grep error is an inspection failure, not a pass.
+mkdir -p "$TMP/grep-shim"
+printf '#!/bin/sh\nexit 2\n' >"$TMP/grep-shim/grep"
+chmod +x "$TMP/grep-shim/grep"
+PATH="$TMP/grep-shim:$PATH" expect_exit 1 'grep error is not a pass' --binary "$FIX/linux-leak.bin"
+
+# 12. Usage errors.
 expect_exit 2 'no arguments'
 expect_exit 2 'unknown argument' --frobnicate
 

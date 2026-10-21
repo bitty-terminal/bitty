@@ -120,6 +120,7 @@ native_forms() {
 derive_root() {
   local root="$1" form
   [[ -n "$root" ]] || return 0
+  [[ "$root" == /* ]] || root="$PWD/$root"
   while [[ "$root" == */ && "$root" != "/" ]]; do
     root="${root%/}"
   done
@@ -140,6 +141,19 @@ for prefix in ${EXTRA_PREFIXES[@]+"${EXTRA_PREFIXES[@]}"}; do
   derive_root "$prefix"
 done
 
+# scan_grep ARGS... — run grep, tolerate only "no match" (exit 1).
+# A grep error (exit > 1) must fail the gate instead of silently passing.
+scan_grep() {
+  local out status=0
+  out="$(grep "$@" 2>/dev/null)" || status=$?
+  if ((status > 1)); then
+    printf 'check-release-paths[error]: grep failed while scanning (exit %s)\n' "$status" >&2
+    return 2
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
+}
+
 FAIL=0
 
 scan_binary() {
@@ -150,24 +164,28 @@ scan_binary() {
   # 1. Literal builder roots (fixed strings, one per line).
   prefix_hits=""
   if [[ -s "$PATTERNS" ]]; then
-    prefix_hits="$(grep -a -F -o -f "$PATTERNS" "$bin" 2>/dev/null || true)"
+    if ! prefix_hits="$(scan_grep -a -F -o -f "$PATTERNS" "$bin")"; then
+      die "grep failed while scanning $bin"
+    fi
   fi
 
   # 2. Generic builder-home shapes from any host. The leading boundary keeps
   # remapped `/build/...` paths (and URL segments) from matching: a `/home/`
   # that follows a path character is not a fresh absolute root.
-  generic_hits="$(
+  if ! generic_hits="$(
     {
-      grep -a -E -o '(^|[^A-Za-z0-9._/-])/home/[A-Za-z0-9._-]+/' "$bin" 2>/dev/null || true
-      grep -a -E -o '(^|[^A-Za-z0-9._/-])/Users/[A-Za-z0-9._-]+/' "$bin" 2>/dev/null || true
-      grep -a -E -o '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' "$bin" 2>/dev/null || true
+      scan_grep -a -E -o '(^|[^A-Za-z0-9._/-])/home/[A-Za-z0-9._-]+/' "$bin"
+      scan_grep -a -E -o '(^|[^A-Za-z0-9._/-])/Users/[A-Za-z0-9._-]+/' "$bin"
+      scan_grep -a -E -o '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' "$bin"
     } | sed -E 's|^[^/A-Za-z]||'
-  )"
+  )"; then
+    die "grep failed while scanning $bin"
+  fi
 
   hits="$(
     {
-      [[ -n "$prefix_hits" ]] && printf '%s\n' "$prefix_hits"
-      [[ -n "$generic_hits" ]] && printf '%s\n' "$generic_hits"
+      if [[ -n "$prefix_hits" ]]; then printf '%s\n' "$prefix_hits"; fi
+      if [[ -n "$generic_hits" ]]; then printf '%s\n' "$generic_hits"; fi
     } | sed '/^$/d' | sort -u
   )"
 
@@ -197,7 +215,7 @@ scan_binary() {
 }
 
 for bin in "${BINARIES[@]}"; do
-  scan_binary "$bin" || true
+  scan_binary "$bin"
 done
 
 if ((FAIL)); then

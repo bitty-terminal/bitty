@@ -128,6 +128,7 @@ HOME_DIR="${HOME:-}"
 CARGO_HOME_DIR="${CARGO_HOME:-${HOME_DIR:+$HOME_DIR/.cargo}}"
 RUSTUP_HOME_DIR="${RUSTUP_HOME:-${HOME_DIR:+$HOME_DIR/.rustup}}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+[[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$PWD/$TARGET_DIR"
 # A system toolchain (distro rustc, `rustup toolchain link`) lives outside
 # RUSTUP_HOME; remap its sysroot too so std/core panic locations stay stable.
 SYSROOT_DIR="$(rustc --print sysroot 2>/dev/null || true)"

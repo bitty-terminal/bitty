@@ -282,6 +282,14 @@ binary-arch-test:
 release-build *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    for arg in "$@"; do
+      case "$arg" in
+      --target | --target=*)
+        echo "release-build: --target is not supported; set CARGO_BUILD_TARGET" >&2
+        exit 2
+        ;;
+      esac
+    done
     export RUSTFLAGS="$(scripts/release-rustflags.sh)${RUSTFLAGS:+ $RUSTFLAGS}"
     cargo build --release --locked -p bitty-terminal "$@"
     ./scripts/check-release-paths.sh --binary "${CARGO_TARGET_DIR:-target}/release/bitty"
@@ -397,7 +405,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test aur-bin-render-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

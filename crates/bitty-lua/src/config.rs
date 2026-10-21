@@ -272,6 +272,11 @@ pub struct WindowData {
     pub padding: Option<i64>,
     /// Corner radius in physical px (CTX-0241 S0: parsed no-op, default 0).
     pub radius_px: Option<i64>,
+    /// Background blur radius in logical px (CTX-0832/OQ-038). Parsed so a
+    /// non-zero value is rejected with a typed `window.blur_radius`
+    /// diagnostic downstream instead of looking like a typo; the shipped
+    /// contract accepts only `0` until a blur design lands.
+    pub blur_radius: Option<i64>,
     /// Window background image path (CTX-1076, issue #1815
     /// `window.background_image`); raw string, syntax-checked downstream in
     /// `bitty-config` (fail-closed) and resolved only under an approved root.
@@ -1599,6 +1604,7 @@ impl ConfigData {
                             "opacity",
                             "padding",
                             "radius_px",
+                            "blur_radius",
                             "background_image",
                             "background_fit",
                             "background_opacity",
@@ -1615,6 +1621,14 @@ impl ConfigData {
                     };
                     let radius_px = match get_field(nested, "radius_px") {
                         Some(v) => Some(expect_integer("window.radius_px", v)?),
+                        None => None,
+                    };
+                    // OQ-038: the key is recognized so a non-zero value is
+                    // rejected as an explicitly unsupported feature (typed
+                    // `window.blur_radius` diagnostic) rather than as an
+                    // accidental typo. `0` remains the accepted no-blur value.
+                    let blur_radius = match get_field(nested, "blur_radius") {
+                        Some(v) => Some(expect_integer("window.blur_radius", v)?),
                         None => None,
                     };
                     // CTX-1076 (issue #1815): window background image and
@@ -1646,6 +1660,7 @@ impl ConfigData {
                         opacity,
                         padding,
                         radius_px,
+                        blur_radius,
                         background_image,
                         background_fit,
                         background_opacity,
@@ -2694,6 +2709,18 @@ mod tests {
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
         assert_eq!(term.scroll_lines_per_notch, Some(3));
         assert_eq!(term.scroll_pixels_per_notch, Some(16));
+    }
+
+    #[test]
+    fn window_blur_radius_extracts_for_downstream_rejection() {
+        // OQ-038: the Lua extractor must carry the raw value so
+        // `bitty-config` can reject it with a typed `window.blur_radius`
+        // diagnostic instead of treating the key as undeclared.
+        let data =
+            eval_ok(r#"return { window = { opacity = 1.0, padding = 8, blur_radius = 16 } }"#);
+        assert_eq!(data.window.unwrap().blur_radius, Some(16));
+        let data = eval_ok(r#"return { window = { opacity = 1.0, padding = 8 } }"#);
+        assert_eq!(data.window.unwrap().blur_radius, None);
     }
 
     #[test]

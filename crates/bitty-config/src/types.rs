@@ -1692,10 +1692,12 @@ pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
 /// Default `window.blur_radius` (CTX-0832: 0 = no blur).
 pub const DEFAULT_WINDOW_BLUR_RADIUS: u32 = 0;
 
-/// Maximum `window.blur_radius` in logical pixels (CTX-0832: `0..=128`).
+/// Maximum legacy `window.blur_radius` value kept in the schema (`0..=128`).
 ///
-/// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
-/// Bounds untrusted input; larger values fail closed.
+/// OQ-038 has no accepted blur design: the shipped contract accepts only
+/// `0`, and a positive value fails closed with a typed
+/// `window.blur_radius` diagnostic. The bound is retained so a future blur
+/// contract can reuse the parsed schema without changing the field width.
 pub const MAX_WINDOW_BLUR_RADIUS: u32 = 128;
 
 /// Default `window.background_opacity` (CTX-1076, issue #1815): `1.0`.
@@ -2331,8 +2333,12 @@ pub struct WindowConfig {
     /// Corner radius in physical px `0..=24` (CTX-0241 S0: parsed no-op,
     /// S1+ compositor opt-in).
     pub radius_px: u32,
-    /// Background blur radius in logical pixels `0..=128` (CTX-0832).
-    /// Platform support varies: Wayland (KDE/Hyprland), macOS NSVisualEffectView.
+    /// Background blur radius in logical pixels (CTX-0832/OQ-038).
+    ///
+    /// OQ-038 has no accepted blur design, so the shipped contract accepts
+    /// only `0` (no blur). The field stays in the schema for a future blur
+    /// implementation; a non-zero value fails closed with a typed
+    /// `window.blur_radius` diagnostic instead of being a silent no-op.
     pub blur_radius: u32,
     /// Window background image path (CTX-1076, issue #1815
     /// `window.background_image`). `None` means no image (the allocation-free
@@ -2399,6 +2405,12 @@ impl WindowConfig {
             return Err(ConfigError::validation(
                 "window.blur_radius",
                 format!("must be <= {MAX_WINDOW_BLUR_RADIUS}"),
+            ));
+        }
+        if self.blur_radius > 0 {
+            return Err(ConfigError::validation(
+                "window.blur_radius",
+                "background blur is not supported (OQ-038): only 0 is accepted",
             ));
         }
         if let Some(path) = &self.background_image {
@@ -5013,6 +5025,36 @@ mod tests {
         }
         .validate()
         .unwrap_err();
+    }
+
+    #[test]
+    fn window_blur_validation_accepts_only_zero() {
+        // OQ-038: no accepted blur design. Zero stays valid so existing
+        // configs and the schema round-trip; every non-zero value fails
+        // closed with a typed `window.blur_radius` diagnostic.
+        assert_eq!(
+            WindowConfig::default().blur_radius,
+            DEFAULT_WINDOW_BLUR_RADIUS
+        );
+        WindowConfig {
+            blur_radius: 0,
+            ..Default::default()
+        }
+        .validate()
+        .expect("zero blur valid");
+        for blur in [1, 32, MAX_WINDOW_BLUR_RADIUS] {
+            let err = WindowConfig {
+                blur_radius: blur,
+                ..Default::default()
+            }
+            .validate()
+            .expect_err("non-zero blur must fail closed");
+            assert_eq!(err.field(), Some("window.blur_radius"), "{err}");
+            assert!(
+                err.to_string().contains("OQ-038"),
+                "must name the open question: {err}"
+            );
+        }
     }
 
     #[test]

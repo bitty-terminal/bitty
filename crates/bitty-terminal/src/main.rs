@@ -1226,8 +1226,9 @@ fn main() {
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)
-    // CTX-0832: `window.blur_radius` flows effective -> window creation
-    // (platform-specific; silently ignored where unsupported).
+    // CTX-0832/OQ-038: `window.blur_radius` is schema-present but the
+    // config layer accepts only 0 (background blur has no accepted design);
+    // forwarding it keeps the platform seam ready for a future contract.
     .with_blur_radius(app_config.effective.window.blur_radius)
     // CTX-0481: commit the live plugin snapshot from the tick loop.
     .with_live_snapshot(live_snapshot)

@@ -108,7 +108,6 @@ pub mod kitty_unicode;
 pub mod loader;
 pub mod scene;
 pub mod shell;
-pub mod wallpaper_theme;
 
 pub use background::{
     BG_CACHE_MAX_BYTES, BG_CACHE_MAX_IMAGES, BG_MAX_DECODED_BYTES, BG_MAX_DIMENSION,
@@ -182,9 +181,3 @@ pub use scene::{
     SceneNode, ScrollBehavior, StyledSpan, TableModel,
 };
 pub use shell::{CommandRegion, ShellIntegration};
-pub use wallpaper_theme::{
-    MAX_CLUSTERS, MAX_SAMPLE_PIXELS, MIN_DISTINCT_COLORS, MIN_FG_CONTRAST, MIN_OPAQUE_ALPHA,
-    WALLPAPER_THEME_ANSI_COUNT, WallpaperPalette, WallpaperThemeError, WallpaperThemePreview,
-    contrast_ratio, derive_palette, derive_palette_from_bytes, luminance, planned_sample_count,
-    preview_from_bytes, preview_from_image, sample_stride,
-};

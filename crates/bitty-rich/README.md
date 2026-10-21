@@ -67,11 +67,14 @@ behind `kitty_seam.rs` until the composition-root binding and worker protocol
 land (W-141).
 
 Unwired helpers were removed in CTX-1412 (bitty#2117) and CTX-1415
-(bitty#2358): `src/presentation.rs` (`RichPresentation` snapshot
-aggregation), `src/projection.rs` (fragment-to-`RichBlock` projection), and
-`src/kitty.rs` (legacy Kitty placeholder stub — real intake is
-`bitty-vt/src/kitty_apc.rs`). This is not a boundary change — `scene.rs`
+(bitty#2358 / bitty#2359) because no Core path consumed them:
+`src/presentation.rs` (`RichPresentation` snapshot aggregation),
+`src/projection.rs` (fragment-to-`RichBlock` projection), `src/kitty.rs`
+(legacy Kitty placeholder stub — real intake is `bitty-vt/src/kitty_apc.rs`),
+and `src/wallpaper_theme.rs` (wallpaper-derived colorscheme; theme derivation
+is plugin presentation policy, and the wired path is the plugin
+`bitty.image.read` bridge). This is not a boundary change — `scene.rs`
 remains Core-retained with the SCN-1..5 limits — and the projection was the
 only reason this crate carried a production edge to the extracted `bitty-ipc`
-repository. `crates/bitty-rich/tests/retired_surface_guard.rs` keeps them
-retired.
+repository. `crates/bitty-rich/tests/retired_surface_guard.rs` keeps all four
+surfaces retired.

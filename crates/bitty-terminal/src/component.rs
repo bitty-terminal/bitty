@@ -57,7 +57,7 @@
 //!   a hash mismatch fails closed (exit 4) with nothing on stdout.
 //!   Provenance (name, version, source tier, path, sha256) goes to stderr so
 //!   stdout stays byte-identical for piping and hashing.
-//! - `install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]`:
+//! - `install <name> [--version <X.Y.Z>] [--digest <hex>] [--force] [--yes]`:
 //!   fetch one prebuilt release from R2 through the minimal install seed
 //!   (`crate::component_seed`, issue #1791 option A): fixed-argv system
 //!   `curl` 7.68.0 or newer (preflighted, pinned to `https://cdn.bitty.run`,
@@ -67,13 +67,25 @@
 //!   audit, TOFU pin of the verified CDN digest into
 //!   `<user>/<name>/tarball.sha256` (later differing digests fail closed as
 //!   pin-mismatch unless `--force` re-pins, never auto-updated), then the
-//!   same atomic publish path as `add`. The bounded
-//!   `extensions/catalog.v1` metadata is fetched after consent and must list
-//!   exactly the requested `(name, version, host target)`; malformed,
-//!   oversize, or missing entries fail closed, while a catalog transport
-//!   failure falls back to the single-release `SHA256SUMS` path with confirm.
-//!   The version is required and exact (no version solving); the full
-//!   manager takes over after the install.
+//!   same atomic publish path as `add`.
+//!
+//!   Version selection (#2381): `--version X.Y.Z` pins exactly; omitting it
+//!   resolves the *latest* release for the exact `(name, host target)` from
+//!   the bounded `extensions/catalog.v1` metadata, choosing the highest
+//!   strict `X.Y.Z` and never a prerelease (the pack grammar publishes none).
+//!   The catalog is fetched after consent, the resolved version is printed
+//!   before the release download, and existing consent/digest/TOFU rules are
+//!   unchanged. Catalog unavailable (offline, or 404 while the publication
+//!   jobs catch up) or a missing entry fails closed with a `--version` hint;
+//!   a version is never guessed from directory names. Latest is a
+//!   convenience: the trust decision stays the TLS catalog plus the digest
+//!   chain, not the absence of a pin.
+//! - Name aliases (#2381): `list`, `install`, `remove`, and `show-source`
+//!   accept one repo-style `bitty-` prefix (`bitty-net` resolves to
+//!   `net`) because extension repositories carry the workspace prefix
+//!   while stored component names do not. Resolution is display/selection
+//!   only: stored names, directories, and TOFU pins are never rewritten, and
+//!   an alias whose both spellings are known fails closed as ambiguous.
 //! - Class: local-only (no instance, no IPC, no component code is ever
 //!   loaded or executed; safe-mode clean).
 //!
@@ -111,6 +123,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,7 +131,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bitty_runtime::component::{
     ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
     ComponentSummary, component_search_roots_for, component_state_root_for, data_home_for,
-    discover_components, executable_file_name, incompatible_component_hint, missing_component_hint,
+    discover_components, executable_file_name, incompatible_component_hint,
     read_component_activation_with_state, remove_activation_artifacts, validate_component_name,
 };
 
@@ -169,6 +182,27 @@ pub const MAX_COMPONENT_DISTRO_BYTES: usize = 64;
 pub const TARBALL_PIN_FILE: &str = "tarball.sha256";
 /// Maximum bytes read from a TOFU pin file (64 hex plus newline and slack).
 pub const MAX_PIN_FILE_BYTES: u64 = 128;
+
+/// Repo-style prefix accepted as an extension-name alias (#2381).
+///
+/// Extension repositories carry the workspace prefix (`bitty-net`) while
+/// stored component names do not (`graphics`). The alias is accepted wherever
+/// a name operand is taken; it never rewrites a stored name or TOFU pin.
+pub const COMPONENT_ALIAS_PREFIX: &str = "bitty-";
+
+/// First-party extension names known without a registry index (#2381 hints).
+///
+/// These seed the typo suggestion for install/remove/show-source and for the
+/// list filter when nothing is installed locally. The catalog stays
+/// authoritative for releases; this list is only a hint.
+pub const KNOWN_BUILTIN_EXTENSIONS: [&str; 3] = ["graphics", "net", "ai"];
+
+/// One-line pointer shown after a usage error instead of the full usage block.
+///
+/// Full usage stays behind `--help` (owner directive, #2381): errors keep a
+/// targeted fix plus this pointer, never the whole wall of text.
+pub const COMPONENT_USAGE_POINTER: &str =
+    "hint: `bitty extension --help` lists the full usage, exit codes, and examples";
 
 // ---------------------------------------------------------------------------
 // Parsed request (headless, bounded, fail-closed)
@@ -348,6 +382,123 @@ fn valid_distro_flag(value: &str) -> bool {
         return true;
     }
     bitty_runtime::component::valid_wsl_distro(value)
+}
+
+/// Known extension names for hints and alias collision checks (#2381).
+///
+/// Built-in names plus anything installed in either tier. This is a hint set,
+/// not an authority: installs still require the catalog to list the release.
+fn known_extension_names(user_root: Option<&Path>, system_root: Option<&Path>) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = KNOWN_BUILTIN_EXTENSIONS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for summary in discover_components(user_root, system_root) {
+        names.insert(summary.name);
+    }
+    names
+}
+
+/// Resolve one user-supplied extension name to the stored component name.
+///
+/// One `bitty-` prefix is an accepted alias (`bitty-net` -> `net`);
+/// the resolved name is only used for selection, so stored names, directories,
+/// and TOFU pins never change. An exact known name always wins; when both the
+/// prefixed spelling and the unprefixed name are known the alias is ambiguous
+/// and fails closed (exit 4) instead of guessing.
+fn resolve_component_name(raw: &str, known: &BTreeSet<String>) -> Result<String, ComponentFailure> {
+    let Some(stripped) = raw.strip_prefix(COMPONENT_ALIAS_PREFIX) else {
+        return Ok(raw.to_string());
+    };
+    if stripped.is_empty() {
+        return Ok(raw.to_string());
+    }
+    let raw_known = known.contains(raw);
+    let stripped_known = known.contains(stripped);
+    if raw_known && stripped_known {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: ambiguous extension name '{raw}': both '{raw}' and '{stripped}' are known; use '{stripped}' (aliases never rewrite stored names)"
+        )));
+    }
+    if raw_known {
+        return Ok(raw.to_string());
+    }
+    Ok(stripped.to_string())
+}
+
+/// Levenshtein distance over ASCII tokens (bounded candidate names).
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<u8> = left.bytes().collect();
+    let right: Vec<u8> = right.bytes().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_byte) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_byte) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_byte != right_byte);
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Closest candidate within a small typo budget, if any.
+fn closest_known_name<'a>(
+    needle: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let budget = 2.max(needle.len() / 3);
+    let mut best: Option<(&str, usize)> = None;
+    for candidate in candidates {
+        if candidate == needle {
+            continue;
+        }
+        let distance = edit_distance(needle, candidate);
+        if distance <= budget && best.is_none_or(|(_, best_distance)| distance < best_distance) {
+            best = Some((candidate, distance));
+        }
+    }
+    best.map(|(candidate, _)| candidate)
+}
+
+/// Exact suggestion line for one verb, e.g. `bitty extension install graphics`.
+fn extension_command(verb: &str, name: &str) -> String {
+    format!("bitty extension {verb} {name}")
+}
+
+/// Actionable diagnostic for an unknown extension name (#2381).
+///
+/// Names the closest known extension and the exact command, never the full
+/// usage block. `verb` is the canonical verb (`install`, `remove`, ...).
+fn unknown_component_message(
+    verb: &str,
+    name: &str,
+    user_root: Option<&Path>,
+    system_root: Option<&Path>,
+) -> String {
+    let known = known_extension_names(user_root, system_root);
+    if known.contains(name) {
+        return format!(
+            "bitty extension: component '{name}' is not installed; install it with `bitty extension install {name}` (latest catalog release) or stage a local build with `bitty extension add <path>`"
+        );
+    }
+    let candidates: Vec<&str> = known.iter().map(String::as_str).collect();
+    let suggestion = closest_known_name(name, candidates.iter().copied());
+    let mut message = match suggestion {
+        Some(closest) => format!(
+            "bitty extension: unknown extension '{name}'; did you mean '{closest}'?\ntry: {}",
+            extension_command(verb, closest)
+        ),
+        None => format!(
+            "bitty extension: unknown extension '{name}' (known: {})",
+            candidates.join(", ")
+        ),
+    };
+    if verb == "install" {
+        message.push_str("\nnote: a bare install resolves the latest catalog release; pin one with `--version <X.Y.Z>`");
+    }
+    message
 }
 
 /// Parse the tokens captured after the `component` word (bounded, fail-closed).
@@ -575,15 +726,15 @@ pub fn parse_component_request(
 
     match verb {
         ComponentVerb::List => {
-            if operand.is_some() {
-                return Err(ComponentParseError::Usage(format!(
-                    "bitty extension: `{}` takes no operand",
-                    verb.name()
-                )));
+            if version_operand.is_some() {
+                return Err(ComponentParseError::Usage(
+                    "bitty extension: `list` takes at most one name filter (e.g. `bitty extension list bitty-graphics`)"
+                        .to_string(),
+                ));
             }
             if version_flag.is_some() {
                 return Err(ComponentParseError::Usage(format!(
-                    "bitty extension: --version only applies to `add` (got `{}`)",
+                    "bitty extension: --version only applies to `add` and `install` (got `{}`)",
                     verb.name()
                 )));
             }
@@ -653,19 +804,13 @@ pub fn parse_component_request(
         ComponentVerb::Install => {
             if operand.is_none() {
                 return Err(ComponentParseError::Usage(
-                    "bitty extension: `install` needs a component name (e.g. `bitty extension install net --version 0.0.23`)"
+                    "bitty extension: `install` needs a component name (e.g. `bitty extension install graphics` for the latest release, or `bitty extension install graphics --version 0.0.24` to pin)"
                         .to_string(),
                 ));
             }
             if version_operand.is_some() {
                 return Err(ComponentParseError::Usage(
                     "bitty extension: `install` takes the version from `--version <X.Y.Z>`, not a second operand"
-                        .to_string(),
-                ));
-            }
-            if version_flag.is_none() {
-                return Err(ComponentParseError::Usage(
-                    "bitty extension: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named; version solving arrives with the full manager)"
                         .to_string(),
                 ));
             }
@@ -791,36 +936,6 @@ pub fn parse_component_request(
     })
 }
 
-/// Short usage block (`stderr` on usage failures).
-#[must_use]
-pub fn component_usage() -> String {
-    "usage: bitty extension list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty extension add <path> [--version <semver>] [--distro <name|default>]\n\
-     \x20      bitty extension install <name> --version <X.Y.Z> [--digest <hex>] [--force] [--yes]\n\
-     \x20      bitty extension remove <name> [<version>]\n\
-     \x20      bitty extension show-source <name> [<version>]\n\
-     \n\
-     Components are upstream native binaries resolved user-first:\n\
-     $XDG_DATA_HOME/bitty/extensions/ wins over /usr/lib/bitty/extensions/.\n\
-     `add` stages from a local path only (v1 has no ad-hoc URL download);\n\
-     `install` fetches the bounded extension catalog plus one R2 prebuilt\n\
-     release through the hash-verified seed (builtin cdn.bitty.run:443 egress,\n\
-     all-available-must-match, explicit consent for unsigned 0.1.0,\n\
-     TOFU-pinned; catalog unavailable falls back to SHA256SUMS-only;\n\
-     --force re-pins, update-diff preview rendered before any pin change),\n\
-     then the full manager takes over; `remove` only touches the user tier\n\
-     (no root required).\n\
-     `show-source` prints the exact pinned executable bytes (hash-verified,\n\
-     provenance on stderr so stdout stays byte-identical).\n\
-     On Windows, `add --distro` routes execution through the WSL2 trampoline\n\
-     (wsl.exe --distribution D --exec, default distro with `default`);\n\
-     `install --distro` is rejected (install fetches the host triple and\n\
-     cannot stage a guest helper — use `add`); Unix ignores --distro\n\
-     (native execution). `bitty extension --help` explains sources, ABI\n\
-     checks, WSL2 paths and stdio, and exit codes."
-        .to_string()
-}
-
 /// Long help (`bitty extension --help`).
 #[must_use]
 pub fn component_help_text() -> String {
@@ -830,7 +945,7 @@ pub fn component_help_text() -> String {
      usage: bitty extension <verb> [args] [flags]\n\
      \n\
      verbs:\n\
-     \x20 list                        Show installed components across both tiers:\n\
+     \x20 list [<name>]               Show installed components across both tiers:\n\
      \x20                             name, version, active marker, source\n\
      \x20                             (user|system), ABI compat, path, and the\n\
      \x20                             last activation transition the broker\n\
@@ -842,7 +957,9 @@ pub fn component_help_text() -> String {
      \x20                             recorded, not that the process is running\n\
      \x20                             now. The label is shown once per component,\n\
      \x20                             on the active-version row, and covers both\n\
-     \x20                             install tiers via $XDG_STATE_HOME.\n\
+     \x20                             install tiers via $XDG_STATE_HOME. An\n\
+     \x20                             optional name filters the table (aliases\n\
+     \x20                             accepted: `bitty extension list bitty-graphics`).\n\
      \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
      \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
      \x20                             A directory holds bitty-component.toml plus\n\
@@ -851,15 +968,22 @@ pub fn component_help_text() -> String {
      \x20                             computed and ABI compat verified before\n\
      \x20                             anything is written. URLs fail closed (add\n\
      \x20                             accepts local paths only).\n\
-     \x20 install <name> --version V Fetch the bounded extension catalog plus one\n\
+     \x20 install <name> [--version V] Fetch the bounded extension catalog plus one\n\
      \x20 [--digest H] [--force]      prebuilt release from R2\n\
      \x20 [--yes]                     (https://cdn.bitty.run; SHA256SUMS and catalog\n\
      \x20                             digest verified, TOFU-pinned) into the user\n\
-     \x20                             tier, then hand off to the full manager. The\n\
-     \x20                             version is required and exact: the seed does\n\
-     \x20                             no solving. A fetched catalog missing the\n\
-     \x20                             release fails closed; an unavailable catalog\n\
-     \x20                             falls back to SHA256SUMS-only.\n\
+     \x20                             tier, then hand off to the full manager.\n\
+     \x20                             Omit --version to resolve the LATEST release\n\
+     \x20                             for the exact name and host target from the\n\
+     \x20                             catalog: the highest strict X.Y.Z wins, and\n\
+     \x20                             the resolved version is printed before the\n\
+     \x20                             download. `--version X.Y.Z` pins exactly.\n\
+     \x20                             Prereleases are never published by the pack\n\
+     \x20                             grammar, so latest never selects one. A\n\
+     \x20                             catalog with no entry for this name/target\n\
+     \x20                             fails closed; an unavailable catalog fails a\n\
+     \x20                             latest install with a --version hint (a\n\
+     \x20                             pinned install falls back to SHA256SUMS-only).\n\
      \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
      \x20                             user version when none is named. Removing\n\
      \x20                             the active version also drops `current`.\n\
@@ -872,6 +996,32 @@ pub fn component_help_text() -> String {
      \x20                             (exit 4) with nothing on stdout. Provenance\n\
      \x20                             (name, version, tier, path, sha256) goes to\n\
      \x20                             stderr so stdout stays byte-identical.\n\
+     \n\
+     name aliases (#2381):\n\
+     \x20 `list`, `install`, `remove`, and `show-source` accept one repo-style\n\
+     \x20 `bitty-` prefix (`bitty-graphics` resolves to `graphics`) because\n\
+     \x20 extension repositories carry the workspace prefix while stored\n\
+     \x20 component names do not. Resolution only selects the target: stored\n\
+     \x20 names, directories, and TOFU pins are never rewritten. An exact\n\
+     \x20 known name wins; when both `bitty-<name>` and `<name>` are known the\n\
+     \x20 alias is ambiguous and fails closed (exit 4) instead of guessing.\n\
+     \n\
+     latest resolution (#2381):\n\
+     \x20 A bare `install <name>` selects the highest strict X.Y.Z entry for\n\
+     \x20 the exact (name, host target) pair in the catalog. Host target is\n\
+     \x20 detected, never a flag, so a foreign target can never be confused\n\
+     \x20 with this one. Numeric comparison is per component, so 0.0.10 beats\n\
+     \x20 0.0.9. Prereleases are excluded by the pack grammar (no prerelease\n\
+     \x20 is ever published); an explicit `--version` must be X.Y.Z too.\n\
+     \x20 Trust boundary: the catalog is fetched over TLS from the single\n\
+     \x20 builtin egress, and its digest must match the downloaded bytes and\n\
+     \x20 the release SHA256SUMS (all-available-must-match), then the TOFU pin\n\
+     \x20 records first contact. `latest` is a convenience selector, NOT a\n\
+     \x20 security guarantee: it tracks a mutable catalog, so pin --version for\n\
+     \x20 reproducible automation. If the catalog is unavailable (offline, or a\n\
+     \x20 404 before publication catches up) or has no entry, a latest install\n\
+     \x20 fails closed with a concrete --version example; a version is never\n\
+     \x20 guessed from GitHub tags or R2 directory names.\n\
      \n\
      source transparency (issue #1986):\n\
      \x20 `show-source` prints pinned bytes (stdout) with provenance on\n\
@@ -887,7 +1037,9 @@ pub fn component_help_text() -> String {
      \x20 --format table|json|jsonl   list output shape (default table).\n\
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
      \x20 --version <semver>          add: version for a bare executable.\n\
-     \x20                             install: required exact R2 release.\n\
+     \x20                             install: pin this exact X.Y.Z release;\n\
+     \x20                             omit it to resolve the highest published\n\
+     \x20                             catalog version for the host target.\n\
      \x20 --digest <hex>              install only: caller-supplied expected tarball\n\
      \x20                             digest (64 hex, SHA-256). All-available-must-\n\
      \x20                             match with CDN SHA256SUMS and the registry\n\
@@ -963,12 +1115,17 @@ pub fn component_help_text() -> String {
      registry catalog:\n\
      \x20 `install` fetches https://cdn.bitty.run/extensions/catalog.v1 after\n\
      \x20 consent. The bounded line format is `schema 1` plus\n\
-     \x20 `extension <name> <version> <target> <sha256>` records. A fetched\n\
+     \x20 `extension <name> <version> <target> <sha256>` records. A pinned\n\
+     \x20 install uses the exact requested version; a bare install selects the\n\
+     \x20 highest strict X.Y.Z for the exact (name, host target). A fetched\n\
      \x20 catalog that is malformed, oversize, or missing the requested\n\
      \x20 name/version/host-target fails closed (exit 4) before the tarball;\n\
-     \x20 there is no allow-all fallback. A catalog *transport* failure\n\
-     \x20 (offline, 404, 5xx) falls back to the single-release SHA256SUMS path\n\
-     \x20 with the same explicit consent, TOFU pin, and exact-two-member audit.\n\
+     \x20 there is no allow-all fallback and no directory-name guessing. For a\n\
+     \x20 *pinned* install, a catalog *transport* failure (offline, 404, 5xx)\n\
+     \x20 falls back to the single-release SHA256SUMS path with the same\n\
+     \x20 explicit consent, TOFU pin, and exact-two-member audit; a latest\n\
+     \x20 install cannot fall back (there is no version) and prints a --version\n\
+     \x20 example instead.\n\
      \n\
      TOFU pinning:\n\
      \x20 First install of a component records (pins) the verified CDN\n\
@@ -982,9 +1139,11 @@ pub fn component_help_text() -> String {
      \x20 1 with nothing fetched or staged. Unsigned 0.1.0 therefore always\n\
      \x20 takes the explicit-confirm path for executable downloads; --digest\n\
      \x20 and the catalog digest do NOT grant silent. Without --yes the\n\
-     \x20 installer prompts `Grant download\n\
-     \x20 <name> <version>? [y/N]` (up to 3 attempts, 64 bytes per answer);\n\
-     \x20 `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
+     \x20 installer prompts for the exact pin (`Grant download\n\
+     \x20 <name> <version>? [y/N]`) or, for a bare install, for resolving and\n\
+     \x20 downloading the latest release for the host target (up to 3 attempts,\n\
+     \x20 64 bytes per answer); `y`/`yes` approves, `n`/`no`/empty declines, EOF\n\
+     \x20 aborts. The resolved version is printed before the release download.\n\
      \n\
      fetch environment:\n\
      \x20 `install` preflights `curl --version` once per invocation and needs\n\
@@ -1023,13 +1182,18 @@ pub fn component_help_text() -> String {
      examples:\n\
      \x20 bitty extension list\n\
      \x20 bitty extension list --format json\n\
+     \x20 bitty extension list bitty-graphics\n\
      \x20 bitty extension add ./dist/net --version 0.0.1\n\
      \x20 bitty extension add ./dist/net --distro Ubuntu\n\
-     \x20 bitty extension install net --version 0.0.23\n\
-     \x20 bitty extension install net --version 0.0.23 --digest <hex>\n\
-     \x20 bitty extension install net --version 0.0.23 --force --yes\n\
+     \x20 bitty extension install graphics            # latest published release\n\
+     \x20 bitty extension install graphics --version 0.0.24\n\
+     \x20 bitty extension install net --version 0.0.1\n\
+     \x20 bitty extension install bitty-net --version 0.0.1   # repo-style alias\n\
+     \x20 bitty extension install net --version 0.0.1 --digest <hex>\n\
+     \x20 bitty extension install net --version 0.0.1 --force --yes\n\
      \x20 bitty extension remove net 0.0.1\n\
      \x20 bitty extension show-source net\n\
+     \x20 bitty extension show-source bitty-net 0.0.1\n\
      \x20 bitty extension show-source net 0.0.1"
     )
         .to_string()
@@ -1171,7 +1335,10 @@ pub fn run_component_subcommand(
             return EXIT_OK;
         }
         Err(error) => {
-            eprintln!("{}\n{}", error.message(), component_usage());
+            // #2381: errors stay targeted. Full usage lives behind --help;
+            // the pointer keeps discoverability without the wall of text.
+            eprintln!("{}", error.message());
+            eprintln!("{COMPONENT_USAGE_POINTER}");
             return EXIT_USAGE;
         }
     };
@@ -1187,6 +1354,26 @@ pub fn run_component_subcommand(
         context.xdg_state_home,
         context.home,
     );
+
+    // Name aliases (#2381): resolve one `bitty-` prefix for every verb that
+    // takes a name. `add` keeps its path operand untouched.
+    let known = known_extension_names(user_root.as_deref(), system_root.as_deref());
+    let resolved_name = match request.verb {
+        ComponentVerb::Install
+        | ComponentVerb::Remove
+        | ComponentVerb::ShowSource
+        | ComponentVerb::List => match request.operand.as_deref() {
+            Some(raw) => match resolve_component_name(raw, &known) {
+                Ok(name) => Some(name),
+                Err(failure) => {
+                    eprintln!("{}", failure.message);
+                    return failure.exit;
+                }
+            },
+            None => None,
+        },
+        ComponentVerb::Add => None,
+    };
 
     // WSL2 trampoline gate (#1908): `add` stages guest helpers (validates,
     // probes on Windows, persists placement); `install` fetches the host
@@ -1225,7 +1412,22 @@ pub fn run_component_subcommand(
 
     match request.verb {
         ComponentVerb::List => {
-            let summaries = discover_components(user_root.as_deref(), system_root.as_deref());
+            let mut summaries = discover_components(user_root.as_deref(), system_root.as_deref());
+            if let Some(name) = resolved_name.as_deref() {
+                summaries.retain(|summary| summary.name == name);
+                if summaries.is_empty() {
+                    eprintln!(
+                        "{}",
+                        unknown_component_message(
+                            "list",
+                            name,
+                            user_root.as_deref(),
+                            system_root.as_deref()
+                        )
+                    );
+                    return EXIT_COMPONENT;
+                }
+            }
             let listed = summarize_list(
                 &summaries,
                 user_root.as_deref(),
@@ -1263,7 +1465,7 @@ pub fn run_component_subcommand(
             }
         }
         ComponentVerb::Install => {
-            let name = request.operand.as_deref().expect("install requires a name");
+            let name = resolved_name.as_deref().expect("install requires a name");
             let mut transport = crate::component_seed::SystemTransport;
             match op_install(
                 name,
@@ -1287,7 +1489,7 @@ pub fn run_component_subcommand(
             }
         }
         ComponentVerb::Remove => {
-            let name = request.operand.as_deref().expect("remove requires a name");
+            let name = resolved_name.as_deref().expect("remove requires a name");
             match op_remove(
                 name,
                 request.version_operand.as_deref(),
@@ -1306,8 +1508,7 @@ pub fn run_component_subcommand(
             }
         }
         ComponentVerb::ShowSource => {
-            let name = request
-                .operand
+            let name = resolved_name
                 .as_deref()
                 .expect("show-source requires a name");
             match op_show_source(
@@ -1673,6 +1874,147 @@ fn write_tofu_pin(user: &Path, name: &str, digest: &str) -> Result<(), Component
     publish_bytes_atomic(&path, format!("{digest}\n").as_bytes(), None)
 }
 
+// ---------------------------------------------------------------------------
+// latest-version resolution (#2381)
+// ---------------------------------------------------------------------------
+
+/// Typed failure while resolving a bare `install` from the catalog.
+///
+/// Kept separate from the rendered message so tests can pin the class (and
+/// so the "never guess a version" rule is structural, not prose).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestResolveError {
+    /// Catalog transport failure (offline, DNS, TLS, HTTP 4xx/5xx).
+    CatalogUnavailable { reason: String },
+    /// Catalog fetched, but no release exists for this exact name/target.
+    NoEntry {
+        name: String,
+        target: String,
+        known: Vec<String>,
+    },
+}
+
+/// Resolve `(version, digest)` for the latest exact `(name, target)` entry.
+///
+/// Highest strict `X.Y.Z` wins; a catalog without an entry is `NoEntry`,
+/// never a guess. The digest comes from the same entry, so selection and
+/// integrity cannot disagree.
+fn resolve_latest_entry(
+    catalog: &crate::component_seed::ExtensionCatalog,
+    name: &str,
+    target: &str,
+) -> Result<(String, String), LatestResolveError> {
+    match catalog.latest_version_for(name, target) {
+        Some(version) => {
+            let digest = catalog
+                .digest_for(name, version, target)
+                .expect("latest version implies a catalog entry");
+            Ok((version.to_owned(), digest.to_owned()))
+        }
+        None => Err(LatestResolveError::NoEntry {
+            name: name.to_owned(),
+            target: target.to_owned(),
+            known: catalog
+                .names_for_target(target)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }),
+    }
+}
+
+/// Real seed-release examples used only in pin hints (#2381).
+///
+/// These are the published artifacts recorded by the catalog evidence
+/// (graphics 0.0.24, net 0.0.1); they are hints, never selection input.
+fn example_version_for(name: &str) -> Option<&'static str> {
+    match name {
+        "graphics" => Some("0.0.24"),
+        "net" => Some("0.0.1"),
+        _ => None,
+    }
+}
+
+/// Locally installed versions for `name` in the user tier, newest first.
+fn local_installed_versions(user: Option<&Path>, name: &str) -> Vec<String> {
+    let Some(user) = user else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(user.join(name)) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|version| crate::component_seed::valid_seed_version(version))
+        .collect();
+    versions.sort_by_key(|version| std::cmp::Reverse(version_sort_key(version)));
+    versions
+}
+
+/// Numeric sort key for a strict `X.Y.Z` version (grammar-checked first).
+fn version_sort_key(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.split('.');
+    let next = |parts: &mut std::str::Split<'_, char>| {
+        parts.next().and_then(|part| part.parse().ok()).unwrap_or(0)
+    };
+    (next(&mut parts), next(&mut parts), next(&mut parts))
+}
+
+/// Concrete pinned-install command for a hint, using a real version when one
+/// is known locally or the release is a published example.
+fn pinned_install_hint(name: &str, user: Option<&Path>) -> String {
+    if let Some(version) = local_installed_versions(user, name).first() {
+        return format!("bitty extension install {name} --version {version}");
+    }
+    match example_version_for(name) {
+        Some(version) => format!("bitty extension install {name} --version {version}"),
+        None => format!("bitty extension install {name} --version <X.Y.Z>"),
+    }
+}
+
+/// Render the typed latest-resolution failure with an actionable hint.
+fn latest_failure(
+    error: LatestResolveError,
+    requested_name: &str,
+    user: Option<&Path>,
+) -> ComponentFailure {
+    match error {
+        LatestResolveError::CatalogUnavailable { reason } => ComponentFailure::component(format!(
+            "bitty extension: install failed: extension catalog unavailable ({reason}); \
+                 cannot resolve the latest version without guessing. \
+                 Pin an exact release instead: `{}`",
+            pinned_install_hint(requested_name, user)
+        )),
+        LatestResolveError::NoEntry {
+            name,
+            target,
+            known,
+        } => {
+            let suggestion = closest_known_name(&name, known.iter().map(String::as_str));
+            let mut message = match suggestion {
+                Some(closest) => format!(
+                    "bitty extension: install failed: the extension catalog has no release for '{name}' ({target}); did you mean '{closest}'?\ntry: bitty extension install {closest}"
+                ),
+                None => format!(
+                    "bitty extension: install failed: the extension catalog has no release for '{name}' ({target}) (published here: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            };
+            message.push_str(&format!(
+                "\npin an exact release: `{}`",
+                pinned_install_hint(&name, user)
+            ));
+            ComponentFailure::component(message)
+        }
+    }
+}
+
 // Nine args: install needs name/version/digest/force/roots/stdio/consent/
 // transport together (all bounded, fail-closed before mutation). A params
 // struct would obscure the call-site audit, so allow the lint here.
@@ -1692,12 +2034,6 @@ fn op_install(
     yes: bool,
     transport: &mut dyn crate::component_seed::SeedTransport,
 ) -> Result<String, ComponentFailure> {
-    // The parser requires `--version`; this is defense in depth.
-    let Some(version) = version_flag else {
-        return Err(ComponentFailure::usage(
-            "bitty extension: `install` needs `--version <X.Y.Z>` (the seed installs exactly the version named)".to_string(),
-        ));
-    };
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
             "bitty extension: no user component root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
@@ -1710,10 +2046,12 @@ fn op_install(
             &crate::component_seed::SeedError::InvalidName(format!("{name:?} ({error})")),
         ));
     }
-    if !crate::component_seed::valid_seed_version(version) {
-        return Err(seed_failure(
-            &crate::component_seed::SeedError::InvalidVersion(version.to_owned()),
-        ));
+    if let Some(version) = version_flag {
+        if !crate::component_seed::valid_seed_version(version) {
+            return Err(seed_failure(
+                &crate::component_seed::SeedError::InvalidVersion(version.to_owned()),
+            ));
+        }
     }
     // Defense in depth: the parser already rejects malformed `--digest` as
     // usage (exit 2); a malformed value reaching here fails the same way
@@ -1732,20 +2070,29 @@ fn op_install(
             std::env::consts::ARCH,
         )))
     })?;
-    // Build the allowlisted URLs first (pure: hostile input fails here with
-    // zero spawn) so the consent prompt names the exact fetch and the
-    // builtin-egress check runs before any child is spawned.
-    let urls = crate::component_seed::seed_urls(name, version, target)
-        .map_err(|error| seed_failure(&error))?;
+    // A pinned install builds its allowlisted URLs first (pure: hostile input
+    // fails here with zero spawn) so consent can name the exact fetch. A bare
+    // install has no version yet; its prompt names the catalog and target,
+    // and the resolved version is printed after resolution, before download.
+    let pinned_urls = match version_flag {
+        Some(version) => Some(
+            crate::component_seed::seed_urls(name, version, target)
+                .map_err(|error| seed_failure(&error))?,
+        ),
+        None => None,
+    };
     // Defense in depth: seed_urls only ever emits the pinned base, but the
     // egress gate owns the decision, so audit both URLs through it. A
     // non-builtin URL (unrepresentable today; future third-party hosts)
-    // always takes the confirm path.
-    let is_builtin = crate::component_seed::is_builtin_installer_url(&urls.tarball_url)
-        && crate::component_seed::is_builtin_installer_url(&urls.manifest_url);
+    // always takes the confirm path. A bare install only contacts the same
+    // builtin base (catalog plus one release).
+    let is_builtin = pinned_urls.as_ref().is_none_or(|urls| {
+        crate::component_seed::is_builtin_installer_url(&urls.tarball_url)
+            && crate::component_seed::is_builtin_installer_url(&urls.manifest_url)
+    });
     // Consent precedes *every* transport contact: a decline/EOF exits 1 with
     // zero spawn and no staging (pinned by the no-fetch decline tests). The
-    // registry catalog therefore cannot inform this prompt, and unsigned
+    // registry catalog therefore cannot inform the prompt, and unsigned
     // 0.1.0 keeps the explicit-confirm path for every executable download.
     // The predicate is still evaluated so the builtin+dual-digest rule
     // cannot drift silently into an accidental silent path.
@@ -1753,58 +2100,101 @@ fn op_install(
     let level = crate::component_seed::installer_consent_level(is_builtin, dual_verified);
     let needs_consent = level == crate::component_seed::InstallerConsentLevel::Confirm;
     if needs_consent && !yes {
-        match ask_component_install_consent(input, output, name, version, &urls)? {
-            true => {}
-            false => {
-                return Err(ComponentFailure::generic(format!(
-                    "bitty extension: download of '{name}' version {version} was not approved — nothing changed"
-                )));
+        let approved = match (version_flag, pinned_urls.as_ref()) {
+            (Some(version), Some(urls)) => {
+                ask_component_install_consent(input, output, name, version, urls)?
             }
+            _ => ask_latest_component_install_consent(input, output, name, target)?,
+        };
+        if !approved {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: download of '{name}' was not approved — nothing changed"
+            )));
         }
     } else if needs_consent && yes {
-        let _ = writeln!(
-            output,
-            "bitty extension: --yes approved download of '{name}' version {version} from {}",
-            crate::component_seed::BUILTIN_INSTALLER_EGRESS
-        );
+        let _ = match version_flag {
+            Some(version) => writeln!(
+                output,
+                "bitty extension: --yes approved download of '{name}' version {version} from {}",
+                crate::component_seed::BUILTIN_INSTALLER_EGRESS
+            ),
+            None => writeln!(
+                output,
+                "bitty extension: --yes approved latest-resolution and download of '{name}' ({target}) from {}",
+                crate::component_seed::BUILTIN_INSTALLER_EGRESS
+            ),
+        };
     }
-    // Registry backend (#2111): fetch the bounded catalog after consent and
-    // resolve exactly (name, version, host target). A transport failure is
-    // the explicit offline fallback (single-release SHA256SUMS, confirm
-    // already taken); malformed/oversize metadata and a missing entry fail
-    // closed, never "allow all".
-    let registry_digest = match crate::component_seed::fetch_catalog(transport)
-        .map_err(|error| seed_failure(&error))?
-    {
-        crate::component_seed::CatalogFetch::Available(catalog) => {
-            match catalog.digest_for(name, version, target) {
-                Some(digest) => {
+    // Registry backend (#2111, latest #2381): fetch the bounded catalog after
+    // consent. A pinned install resolves exactly (name, version, target); a
+    // bare install resolves the highest strict X.Y.Z for (name, target) and
+    // prints it before the release fetch. A transport failure is the explicit
+    // offline fallback for a pinned install only; a bare install cannot fall
+    // back without a version and fails closed with a --version hint.
+    let catalog_fetch =
+        crate::component_seed::fetch_catalog(transport).map_err(|error| seed_failure(&error))?;
+    let (version, registry_digest) = match version_flag {
+        Some(version) => {
+            let digest = match catalog_fetch {
+                crate::component_seed::CatalogFetch::Available(catalog) => {
+                    match catalog.digest_for(name, version, target) {
+                        Some(digest) => {
+                            let _ = writeln!(
+                                output,
+                                "bitty extension: catalog pins tarball digest {digest} for '{name}' {version} ({target})"
+                            );
+                            Some(digest.to_owned())
+                        }
+                        None => {
+                            let known = catalog.names_for_target(target);
+                            let suggestion = closest_known_name(name, known.iter().copied());
+                            let mut message = format!(
+                                "bitty extension: install failed: extension catalog has no entry for '{name}' version {version} target {target} (refusing to guess; publish the release in {} first)",
+                                crate::component_seed::SEED_CATALOG_URL,
+                            );
+                            if let Some(closest) = suggestion {
+                                message
+                                    .push_str(&format!("\ntry: bitty extension install {closest}"));
+                            }
+                            return Err(ComponentFailure::component(message));
+                        }
+                    }
+                }
+                crate::component_seed::CatalogFetch::Unavailable(reason) => {
                     let _ = writeln!(
                         output,
-                        "bitty extension: catalog pins tarball digest {digest} for '{name}' {version} ({target})"
+                        "bitty extension: extension catalog unavailable ({reason}); falling back to single-release SHA256SUMS verification (no registry pin; explicit consent already required)"
                     );
-                    Some(digest.to_owned())
+                    None
                 }
-                None => {
-                    return Err(ComponentFailure::component(format!(
-                        "bitty extension: install failed: extension catalog has no entry for '{name}' version {version} target {target} (refusing to guess; publish the release in {} first)",
-                        crate::component_seed::SEED_CATALOG_URL,
-                    )));
-                }
-            }
+            };
+            (version.to_owned(), digest)
         }
-        crate::component_seed::CatalogFetch::Unavailable(reason) => {
+        None => {
+            let catalog = match catalog_fetch {
+                crate::component_seed::CatalogFetch::Available(catalog) => catalog,
+                crate::component_seed::CatalogFetch::Unavailable(reason) => {
+                    return Err(latest_failure(
+                        LatestResolveError::CatalogUnavailable { reason },
+                        name,
+                        Some(user),
+                    ));
+                }
+            };
+            let (version, digest) = resolve_latest_entry(&catalog, name, target)
+                .map_err(|error| latest_failure(error, name, Some(user)))?;
             let _ = writeln!(
                 output,
-                "bitty extension: extension catalog unavailable ({reason}); falling back to single-release SHA256SUMS verification (no registry pin; explicit consent already required)"
+                "bitty extension: resolved latest version for '{name}' ({target}): {version} (from {})",
+                crate::component_seed::SEED_CATALOG_URL
             );
-            None
+            (version, Some(digest))
         }
     };
     let payload = if let Some(registry_digest) = registry_digest.as_deref() {
         crate::component_seed::fetch_seed_payload_with_registry(
             name,
-            version,
+            &version,
             target,
             digest_flag,
             Some(registry_digest),
@@ -1813,7 +2203,7 @@ fn op_install(
     } else {
         // Explicit offline fallback: the original single-release pipeline,
         // unchanged (manifest + tarball + exact-two-member audit + TOFU).
-        crate::component_seed::fetch_seed_payload(name, version, target, digest_flag, transport)
+        crate::component_seed::fetch_seed_payload(name, &version, target, digest_flag, transport)
     }
     .map_err(|error| seed_failure(&error))?;
     // ABI-compat check before any mutation (same gate as `add`).
@@ -1972,11 +2362,63 @@ fn ask_component_install_consent(
         output,
         "  trust: CDN SHA256SUMS plus the extension catalog digest when published (all-available-must-match); TOFU-pinned, unsigned 0.1.0 — explicit confirm required."
     );
+    confirm_component_download(
+        input,
+        output,
+        &format!("Grant download of '{name}' version {version}? [y/N]: "),
+    )
+}
+
+/// Interactive consent for a bare `install` (latest resolution, #2381).
+///
+/// Consent must precede every transport contact, so the catalog has not been
+/// fetched yet and the version is unknown at prompt time. The prompt names
+/// the catalog, the exact host target, and the trust chain; the resolved
+/// version is printed immediately after resolution and always before the
+/// release download. Decline/EOF behave exactly like the pinned prompt.
+fn ask_latest_component_install_consent(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    name: &str,
+    target: &str,
+) -> Result<bool, ComponentFailure> {
+    let _ = writeln!(
+        output,
+        "bitty extension: install '{name}' resolves the latest published release for {target} from the extension catalog:"
+    );
+    let _ = writeln!(
+        output,
+        "  catalog:  {}",
+        crate::component_seed::SEED_CATALOG_URL
+    );
+    let _ = writeln!(
+        output,
+        "  egress:   {} (same host as the release download)",
+        crate::component_seed::BUILTIN_INSTALLER_EGRESS
+    );
+    let _ = writeln!(
+        output,
+        "  trust: the catalog is fetched over TLS and must pin the release digest (all-available-must-match with CDN SHA256SUMS); latest is convenience, not a security guarantee. TOFU-pinned, unsigned 0.1.0 — explicit confirm required."
+    );
+    confirm_component_download(
+        input,
+        output,
+        &format!("Resolve and download the latest '{name}' release for {target}? [y/N]: "),
+    )
+}
+
+/// Bounded y/n prompt shared by both install consent shapes.
+///
+/// Returns `Ok(true)` on approval, `Ok(false)` on explicit decline, and
+/// `Err` (exit 1, nothing changed) on EOF/read error or too many invalid
+/// answers.
+fn confirm_component_download(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    question: &str,
+) -> Result<bool, ComponentFailure> {
     for attempt in 1..=MAX_COMPONENT_CONSENT_ATTEMPTS {
-        let _ = write!(
-            output,
-            "Grant download of '{name}' version {version}? [y/N]: "
-        );
+        let _ = write!(output, "{question}");
         let _ = output.flush();
         let Some(answer) = read_consent_answer(input, output, attempt) else {
             continue;
@@ -2528,7 +2970,12 @@ fn op_remove(
                 )));
             }
         }
-        return Err(ComponentFailure::component(missing_component_hint(name)));
+        return Err(ComponentFailure::component(unknown_component_message(
+            "remove",
+            name,
+            user_root,
+            system_root,
+        )));
     }
 
     match version {
@@ -2629,14 +3076,20 @@ fn op_show_source(
     }
     let summaries = bitty_runtime::component::discover_components(user_root, system_root);
     let Some(summary) = summaries.iter().find(|entry| entry.name == name) else {
-        return Err(ComponentFailure::component(
-            bitty_runtime::component::missing_component_hint(name),
-        ));
+        return Err(ComponentFailure::component(unknown_component_message(
+            "show-source",
+            name,
+            user_root,
+            system_root,
+        )));
     };
     if summary.versions.is_empty() {
-        return Err(ComponentFailure::component(
-            bitty_runtime::component::missing_component_hint(name),
-        ));
+        return Err(ComponentFailure::component(unknown_component_message(
+            "show-source",
+            name,
+            user_root,
+            system_root,
+        )));
     }
     let selected = match version {
         Some(requested) => summary
@@ -3072,11 +3525,11 @@ mod tests {
         .expect("install --yes");
         assert!(request.yes);
 
-        // `--version` is required for install.
-        assert!(
-            parse_component_request(&[String::from("install"), String::from("net")], None,)
-                .is_err()
-        );
+        // `--version` is optional: omitting it resolves the catalog latest.
+        let request =
+            parse_component_request(&[String::from("install"), String::from("net")], None)
+                .expect("bare install parses");
+        assert_eq!(request.version_flag, None);
         // The version comes from the flag, never a second operand.
         assert!(
             parse_component_request(
@@ -3781,11 +4234,15 @@ mod tests {
     }
 
     #[test]
-    fn install_requires_version_at_cli_level() {
+    fn install_without_version_requires_consent_before_any_fetch() {
         let base = scratch("install-no-version");
         let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        // Empty stdin is EOF: the consent prompt aborts (exit 1) before the
+        // catalog or any release is contacted, and nothing is staged.
         let (code, _) = run_with(&context, &["install", "net"]);
-        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(code, EXIT_GENERIC);
+        let user = Path::new(context.components_dir.expect("user"));
+        assert!(!user.join("net").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3992,6 +4449,402 @@ mod tests {
             ))))
             .expect("installed exe"),
             b"seed-net-bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- #2381: aliases, latest resolution, targeted hints ----------------
+
+    /// Parse a catalog for tests (schema + records).
+    fn parsed_catalog(records: &[(&str, &str, &str)]) -> crate::component_seed::ExtensionCatalog {
+        let mut text = String::from("schema 1\n");
+        for (name, version, target) in records {
+            text.push_str(&format!(
+                "extension {name} {version} {target} {}\n",
+                "a".repeat(64)
+            ));
+        }
+        crate::component_seed::parse_catalog(&text).expect("test catalog")
+    }
+
+    #[test]
+    fn alias_resolution_accepts_one_repo_prefix_and_rejects_ambiguity() {
+        let known: BTreeSet<String> = KNOWN_BUILTIN_EXTENSIONS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            resolve_component_name("bitty-graphics", &known).expect("alias"),
+            "graphics"
+        );
+        assert_eq!(
+            resolve_component_name("graphics", &known).expect("exact"),
+            "graphics"
+        );
+        assert_eq!(
+            resolve_component_name("bitty-net", &known).expect("alias"),
+            "net"
+        );
+        // Only one prefix is stripped; nested prefixes keep the remainder as
+        // the selected name and are validated later like any other name.
+        assert_eq!(
+            resolve_component_name("bitty-bitty-net", &known).expect("nested"),
+            "bitty-net"
+        );
+        assert_eq!(
+            resolve_component_name("bitty-", &known).expect("prefix only"),
+            "bitty-"
+        );
+        // A literal known name wins when its unprefixed spelling is unknown.
+        let literal: BTreeSet<String> = ["bitty-extra".to_string()].into_iter().collect();
+        assert_eq!(
+            resolve_component_name("bitty-extra", &literal).expect("literal"),
+            "bitty-extra"
+        );
+        // Both spellings known: fail closed, never guess.
+        let mut ambiguous = known.clone();
+        ambiguous.insert("bitty-graphics".to_string());
+        let failure = resolve_component_name("bitty-graphics", &ambiguous).expect_err("ambiguous");
+        assert_eq!(failure.exit, EXIT_COMPONENT);
+        assert!(failure.message.contains("ambiguous"), "{}", failure.message);
+        assert!(
+            failure.message.contains("bitty-graphics") && failure.message.contains("graphics"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn unknown_name_hint_suggests_closest_with_exact_command() {
+        let base = scratch("unknown-hint");
+        let user = base.join("user");
+        let system = base.join("system");
+        let message = unknown_component_message("remove", "grapics", Some(&user), Some(&system));
+        assert!(message.contains("did you mean 'graphics'"), "{message}");
+        assert!(
+            message.contains("bitty extension remove graphics"),
+            "{message}"
+        );
+        // A name with no close candidate still names the known set and never
+        // dumps usage.
+        let message =
+            unknown_component_message("show-source", "zzzzzz", Some(&user), Some(&system));
+        assert!(message.contains("unknown extension 'zzzzzz'"), "{message}");
+        assert!(message.contains("graphics"), "{message}");
+        assert!(!message.contains("usage: bitty extension"), "{message}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn latest_resolution_is_typed_and_never_guesses() {
+        let target = "x86_64-unknown-linux-gnu";
+        let catalog = parsed_catalog(&[
+            ("graphics", "0.0.9", target),
+            ("graphics", "0.0.10", target),
+            ("graphics", "9.9.9", "aarch64-apple-darwin"),
+            ("net", "8.0.0", target),
+        ]);
+        let (version, _) = resolve_latest_entry(&catalog, "graphics", target).expect("latest");
+        assert_eq!(version, "0.0.10");
+
+        let error = resolve_latest_entry(&catalog, "ai", target).expect_err("no entry");
+        match error {
+            LatestResolveError::NoEntry {
+                name,
+                target: got,
+                known,
+            } => {
+                assert_eq!(name, "ai");
+                assert_eq!(got, target);
+                assert_eq!(known, vec!["graphics", "net"]);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // An empty (schema-only) catalog is still typed as no-entry.
+        let empty = parsed_catalog(&[]);
+        assert!(matches!(
+            resolve_latest_entry(&empty, "graphics", target),
+            Err(LatestResolveError::NoEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn install_without_version_selects_highest_catalog_release() {
+        // #2391: the fixture must be host-independent. Every entry for every
+        // mapped host triple carries the fixture tarball's own digest, so the
+        // selected release always matches the fetched bytes and a selection
+        // regression surfaces as the version assertion below, never as a
+        // misleading digest error on a platform where a decoy target happens
+        // to be the host (macOS ARM64 took `9.9.9 aarch64-apple-darwin`).
+        let Some(host_target) = crate::component_seed::host_target_triple() else {
+            return;
+        };
+        let base = scratch("latest-e2e");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        // Any mapped triple that is not this host: the decoy must never be
+        // selectable here, on any platform. The stub tarball bytes ignore the
+        // target, so the fixture digest stays identical across triples.
+        let foreign_target = if host_target == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        assert_ne!(foreign_target, host_target);
+        let mut stub = InstallStub::canned("net", "0.0.10", host_target, b"latest-net-bytes");
+        let fixture_digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        // Older releases plus foreign-target and other-name decoys share the
+        // fixture digest: only the highest strict X.Y.Z for the exact host
+        // target may win, and a wrong pick fails the version assertions
+        // instead of the digest chain.
+        stub.catalog.push_str(&format!(
+            "extension net 0.0.9 {host_target} {fixture_digest}\nextension net 0.0.2 {host_target} {fixture_digest}\nextension net 9.9.9 {foreign_target} {fixture_digest}\nextension graphics 8.0.0 {host_target} {fixture_digest}\n"
+        ));
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let summary = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect("latest install");
+        assert!(
+            summary.contains("installed component 'net' version 0.0.10"),
+            "{summary}"
+        );
+        let printed = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            printed.contains(&format!(
+                "resolved latest version for 'net' ({host_target}): 0.0.10"
+            )),
+            "resolved version must be printed before download: {printed}"
+        );
+        assert!(
+            user.join("net").join("0.0.10").is_dir(),
+            "latest must stage the selected release"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_without_version_decline_fetches_nothing() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("latest-decline");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.10",
+            "x86_64-unknown-linux-gnu",
+            b"latest-net-bytes",
+        );
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b"n\n"[..]);
+        let error = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            false,
+            &mut stub,
+        )
+        .expect_err("decline must fail");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(stub.fetch_calls, 0, "decline must not touch the network");
+        assert!(!user.join("net").exists(), "decline must stage nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_without_version_catalog_unavailable_fails_with_pin_hint() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("latest-catalog-404");
+        let user = base.join("user");
+        std::fs::create_dir_all(user.join("net").join("0.0.7")).expect("local version");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.10",
+            "x86_64-unknown-linux-gnu",
+            b"latest-net-bytes",
+        );
+        stub.catalog_unavailable = true;
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("unavailable catalog cannot resolve a latest version");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("catalog unavailable"),
+            "{}",
+            error.message
+        );
+        // A known local version wins the pin hint over the published example.
+        assert!(
+            error
+                .message
+                .contains("bitty extension install net --version 0.0.7"),
+            "hint must use the known local version: {}",
+            error.message
+        );
+        assert!(!user.join("net").join("0.0.10").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_without_version_empty_catalog_fails_with_pin_hint() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("latest-catalog-empty");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.10",
+            "x86_64-unknown-linux-gnu",
+            b"latest-net-bytes",
+        );
+        stub.catalog = String::from("schema 1\n");
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("empty catalog cannot resolve a latest version");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("no release for 'net'"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("pin an exact release")
+                && error
+                    .message
+                    .contains("bitty extension install net --version 0.0.1"),
+            "{}",
+            error.message
+        );
+        assert!(!user.join("net").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_latest_refuses_catalog_digest_mismatch_before_unpack() {
+        // #2391: latest selection must not weaken the digest chain. The entry
+        // that wins selection still pins the fetched bytes, so a stale or
+        // tampered catalog fails closed before anything is staged or pinned.
+        let Some(host_target) = crate::component_seed::host_target_triple() else {
+            return;
+        };
+        let base = scratch("latest-catalog-mismatch");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned("net", "0.0.10", host_target, b"latest-net-bytes");
+        let fixture_digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        stub.catalog = stub.catalog.replace(&fixture_digest, &"b".repeat(64));
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("latest with a mismatched catalog digest must fail closed");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("extension catalog digest"),
+            "{}",
+            error.message
+        );
+        assert_eq!(stub.fetch_calls, 3, "catalog plus tarball plus manifest");
+        assert!(!user.join("net").exists(), "must not stage");
+        assert!(
+            !user.join("net").join(TARBALL_PIN_FILE).exists(),
+            "must not pin"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_pinned_catalog_miss_suggests_known_release() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("pinned-catalog-miss");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        // Catalog only publishes 0.0.10; 0.0.9 is a valid pin that the
+        // catalog does not list, so the install fails closed with the
+        // published alternatives named.
+        let mut stub = InstallStub::canned(
+            "net",
+            "0.0.10",
+            "x86_64-unknown-linux-gnu",
+            b"latest-net-bytes",
+        );
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.9"),
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("pinned miss must fail closed");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("no entry for 'net'"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("publish the release"),
+            "{}",
+            error.message
         );
         let _ = std::fs::remove_dir_all(&base);
     }

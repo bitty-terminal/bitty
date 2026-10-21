@@ -579,10 +579,15 @@ trust boundary for no security gain. Lua plugin registry metadata
 (`generated/registry.json` in `bitty-plugins`) is a separate corpus and is
 not read by `bitty extension install`.
 
-`bitty extension install <name> --version <X.Y.Z>` fetches this object after
-the explicit download consent and resolves exactly one
-`(name, version, host target)` key. The version stays exact: the catalog is a
-digest index, not a version solver and not a `latest` pointer.
+`bitty extension install <name>` fetches this object after the explicit
+download consent and, when `--version` is omitted, selects the highest strict
+`X.Y.Z` record for the exact `(name, host target)` pair. `--version X.Y.Z`
+still pins exactly one `(name, version, host target)` key. The catalog is a
+digest index plus a latest selector, not a version solver: prereleases are not
+published by the pack policy, so they never participate. A latest install
+prints the resolved version before the release download; a pinned install
+keeps the offline fallback described below, while a latest install cannot fall
+back (there is no version) and fails closed with a `--version` hint.
 
 #### Grammar
 
@@ -619,19 +624,22 @@ extension net 0.0.1 x86_64-unknown-linux-gnu 1764de2db9eb1a00dd80535dfcf744b28d4
 
 #### Read path and fail-closed matrix
 
-| Condition                                                  | Installer behavior                                                                                                  |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Catalog fetched, entry present, digests agree              | Continue: catalog digest and `SHA256SUMS` both must equal the tarball; the exact-two-member audit still runs        |
-| Catalog fetched, entry absent                              | Fail closed (exit `4`) before the tarball fetch; absence is authoritative, never "fall back and guess"              |
-| Catalog fetched, malformed/oversize/duplicate              | Fail closed (exit `4`) before the tarball fetch                                                                     |
-| Catalog transport failure (offline, DNS/TLS, HTTP 404/5xx) | Explicit offline fallback: fetch the release `SHA256SUMS` and verify it as before; explicit consent already applied |
-| Catalog digest differs from `SHA256SUMS` or the tarball    | Fail closed (exit `4`) before unpacking or staging                                                                  |
-| `--digest` supplied and differing                          | Fail closed (exit `4`); caller input is an extra constraint, never a replacement for canonical metadata             |
+| Condition                                               | Installer behavior                                                                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Catalog fetched, entry present, digests agree           | Continue: catalog digest and `SHA256SUMS` both must equal the tarball; the exact-two-member audit still runs        |
+| Catalog fetched, entry absent                           | Fail closed (exit `4`) before the tarball fetch; absence is authoritative, never "fall back and guess"              |
+| Catalog fetched, malformed/oversize/duplicate           | Fail closed (exit `4`) before the tarball fetch                                                                     |
+| Catalog transport failure, pinned `--version`           | Explicit offline fallback: fetch the release `SHA256SUMS` and verify it as before; explicit consent already applied |
+| Catalog transport failure, bare latest                  | Fail closed (exit `4`) with a concrete `--version` example; a version is never guessed                              |
+| Catalog digest differs from `SHA256SUMS` or the tarball | Fail closed (exit `4`) before unpacking or staging                                                                  |
+| `--digest` supplied and differing                       | Fail closed (exit `4`); caller input is an extra constraint, never a replacement for canonical metadata             |
 
-The offline fallback is deliberately narrow: it applies only to catalog
-transport failure, keeps the original hash-verified single-release pipeline
-and exact-two-member archive audit, and never enables a silent install. A
-successful catalog response is authoritative and cannot be bypassed.
+The offline fallback is deliberately narrow: it applies only to a pinned
+install whose catalog transport failed, keeps the original hash-verified
+single-release pipeline and exact-two-member archive audit, and never enables
+a silent install. A successful catalog response is authoritative and cannot be
+bypassed. Latest selection is a convenience, not a trust upgrade: the catalog
+stays mutable metadata, so reproducible automation should pin `--version`.
 
 #### Publisher contract (not yet implemented)
 

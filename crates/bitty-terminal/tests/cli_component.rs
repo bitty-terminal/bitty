@@ -314,15 +314,21 @@ fn component_add_rejects_remote_source() {
 }
 
 #[test]
-fn component_install_needs_an_exact_version() {
+fn component_install_needs_consent_and_an_exact_version_when_pinned() {
     let home = scratch_dir("install-version");
     let system = home.join("system-components");
     std::fs::create_dir_all(&system).expect("system dir");
-    // No `--version`: usage error, no fetch attempted.
+    // No `--version` resolves the catalog latest, but consent comes first:
+    // empty stdin aborts (exit 1) before any fetch or staging.
     let output = run_in(&home, &system, &["component", "install", "net"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(stderr(&output).contains("--version"), "{}", stderr(&output));
-    // Non-`X.Y.Z` versions fail before any fetch (usage, not integrity).
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not approved") || stderr(&output).contains("aborted"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!user_root(&home).join("net").exists());
+    // Non-`X.Y.Z` pins fail before any fetch (usage, not integrity).
     let output = run_in(
         &home,
         &system,
@@ -448,9 +454,15 @@ fn component_help_and_usage_have_stable_exit_codes() {
 
     let output = run_in(&home, &system, &["component", "frobnicate"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    // #2381: errors stay targeted; full usage lives behind --help.
     assert!(
-        stderr(&output).contains("usage: bitty extension"),
+        stderr(&output).contains("bitty extension --help"),
         "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("usage: bitty extension"),
+        "usage must not be dumped on errors: {}",
         stderr(&output)
     );
 
@@ -768,8 +780,13 @@ fn extension_help_and_usage_name_new_verb() {
     let output = run_in(&home, &system, &["extension", "frobnicate"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("usage: bitty extension"),
+        stderr(&output).contains("bitty extension --help"),
         "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("usage: bitty extension"),
+        "usage must not be dumped on errors: {}",
         stderr(&output)
     );
     let _ = std::fs::remove_dir_all(&home);
@@ -858,6 +875,154 @@ fn extension_show_source_prints_pinned_bytes() {
     );
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
     assert!(stdout(&output).is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_repo_prefix_alias_resolves_without_renaming_storage() {
+    // #2381: `bitty-net` is an alias for the stored component `net` in
+    // list/install/remove/show-source; directories and pins never change.
+    let home = scratch_dir("alias-lifecycle");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let source = write_source_dir(&home.join("source"), "net", "0.0.1", "[1, 1]");
+    let output = run_in(
+        &home,
+        &system,
+        &["extension", "add", &source.display().to_string()],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(user_root(&home).join("net/0.0.1").is_dir());
+    assert!(!user_root(&home).join("bitty-net").exists());
+
+    // list accepts the alias as a filter.
+    let output = run_in(&home, &system, &["extension", "list", "bitty-net"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("net") && text.contains("0.0.1"), "{text}");
+
+    // show-source prints the pinned bytes through the alias.
+    let output = run_in(&home, &system, &["extension", "show-source", "bitty-net"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "net-0.0.1-bytes");
+
+    // remove drops the stored `net` path, never a `bitty-net` path.
+    let output = run_in(&home, &system, &["extension", "remove", "bitty-net"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!user_root(&home).join("net").exists());
+    assert!(!user_root(&home).join("bitty-net").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_alias_ambiguity_fails_closed() {
+    // Both `net` and a literal `bitty-net` installed: the alias must not
+    // guess which one the operator meant.
+    let home = scratch_dir("alias-ambiguous");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    install_into(&user_root(&home), "net", "0.0.1", "[1, 1]");
+    install_into(&user_root(&home), "bitty-net", "0.0.1", "[1, 1]");
+    let output = run_in(&home, &system, &["extension", "remove", "bitty-net"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(diagnostic.contains("ambiguous"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("net") && diagnostic.contains("bitty-net"),
+        "{diagnostic}"
+    );
+    // Nothing was removed.
+    assert!(user_root(&home).join("net/0.0.1").is_dir());
+    assert!(user_root(&home).join("bitty-net/0.0.1").is_dir());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_unknown_name_suggests_closest_known_command() {
+    let home = scratch_dir("unknown-name-hint");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+
+    // Typo of a built-in extension: closest match plus the exact command.
+    let output = run_in(&home, &system, &["extension", "remove", "grahpics"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("did you mean 'graphics'"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("bitty extension remove graphics"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("usage: bitty extension"),
+        "error must not dump usage: {diagnostic}"
+    );
+
+    // A known but uninstalled name points at install, not at a typo guess.
+    let output = run_in(&home, &system, &["extension", "show-source", "net"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("'net' is not installed")
+            && diagnostic.contains("bitty extension install net"),
+        "{diagnostic}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_install_without_version_prompts_before_network() {
+    // Bare install resolves the catalog latest, but consent precedes every
+    // transport contact: empty stdin aborts with nothing fetched or staged.
+    let home = scratch_dir("latest-consent");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    // A scrubbed PATH would surface a tool-missing error if anything spawned;
+    // the consent abort must win first.
+    let empty_path = home.join("empty-path");
+    std::fs::create_dir_all(&empty_path).expect("empty path");
+    let output = run_with_env(
+        &home,
+        &system,
+        &["extension", "install", "bitty-graphics"],
+        &[("PATH", &empty_path.display().to_string())],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("aborted") || stderr(&output).contains("not approved"),
+        "{}",
+        stderr(&output)
+    );
+    // The alias resolved to `graphics` before the prompt: the install path
+    // names the stored component, never `bitty-graphics`.
+    let prompt = stdout(&output);
+    assert!(prompt.contains("latest 'graphics' release"), "{prompt}");
+    assert!(!prompt.contains("bitty-graphics"), "{prompt}");
+    assert!(!user_root(&home).join("graphics").exists());
+    assert!(!user_root(&home).join("bitty-graphics").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn extension_help_documents_latest_pinning_and_aliases() {
+    let home = scratch_dir("help-latest");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+    let output = run_in(&home, &system, &["extension", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("bitty extension install graphics --version 0.0.24"),
+        "{text}"
+    );
+    assert!(
+        text.contains("bitty extension install net --version 0.0.1"),
+        "{text}"
+    );
+    assert!(text.contains("latest"), "{text}");
+    assert!(text.contains("bitty-graphics"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

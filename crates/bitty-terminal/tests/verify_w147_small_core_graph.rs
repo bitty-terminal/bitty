@@ -494,6 +494,137 @@ fn names_crate_spelling(text: &str, krate: &str) -> bool {
         .any(|token| token == krate)
 }
 
+/// Strip the *bodies* of Rust string and char literals, keeping code,
+/// comments, and line structure.
+///
+/// The crate-name fence catches the hyphenated spelling, which can only occur
+/// in prose or metadata because a Rust identifier cannot carry a hyphen.
+/// Literal contents are data, not coupling: a user-facing command example such
+/// as `bitty extension install bitty-graphics` describes a CLI alias and says
+/// nothing about the extension crate. Comments stay visible on purpose - doc
+/// prose naming the crate is exactly what this fence exists to keep out of
+/// module docs. Input the scanner cannot lex (an unterminated literal) is left
+/// intact, so a lexer gap can never hide a real reference.
+fn strip_literal_bodies(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some((quote, hashes)) = raw_string_start(&chars, index) {
+            match raw_string_end(&chars, quote, hashes) {
+                Some(end) => {
+                    out.push(' ');
+                    index = end + 1;
+                }
+                None => {
+                    out.extend(chars[index..].iter());
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(quote) = quoted_start(&chars, index) {
+            match quoted_end(&chars, quote) {
+                Some(end) => {
+                    out.push(' ');
+                    index = end + 1;
+                }
+                None => {
+                    out.extend(chars[index..].iter());
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(end) = char_literal_end(&chars, index) {
+            out.push(' ');
+            index = end + 1;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Raw string opener (`r"`, `r#"`, `br#"`, `cr#"`):
+/// `(quote index, hash count)`.
+fn raw_string_start(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    let mut cursor = match *chars.get(index)? {
+        'r' => index + 1,
+        'b' | 'c' if chars.get(index + 1) == Some(&'r') => index + 2,
+        _ => return None,
+    };
+    let mut hashes = 0;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    // `r#foo` is a raw identifier, not a literal: only a quote opens one.
+    (chars.get(cursor) == Some(&'"')).then_some((cursor, hashes))
+}
+
+/// Closing quote index of a raw string with `hashes` terminator hashes.
+fn raw_string_end(chars: &[char], quote: usize, hashes: usize) -> Option<usize> {
+    let mut cursor = quote + 1;
+    while cursor < chars.len() {
+        if chars[cursor] == '"'
+            && (1..=hashes).all(|offset| chars.get(cursor + offset) == Some(&'#'))
+        {
+            return Some(cursor + hashes);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Normal/byte/C string opener (`"`, `b"`, `c"`): index of the quote.
+fn quoted_start(chars: &[char], index: usize) -> Option<usize> {
+    match *chars.get(index)? {
+        '"' => Some(index),
+        'b' | 'c' if chars.get(index + 1) == Some(&'"') => Some(index + 1),
+        _ => None,
+    }
+}
+
+/// Closing quote index of an escaped string starting at `quote`.
+fn quoted_end(chars: &[char], quote: usize) -> Option<usize> {
+    let mut cursor = quote + 1;
+    while cursor < chars.len() {
+        match chars[cursor] {
+            '\\' => cursor += 2,
+            '"' => return Some(cursor),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// Closing quote index of a char/byte-char literal at `index`.
+///
+/// Lifetimes (`'a`, `'static`, `'_`) are deliberately *not* literals: treating
+/// them as such would swallow the rest of the file and blind the fence.
+fn char_literal_end(chars: &[char], index: usize) -> Option<usize> {
+    let quote = match *chars.get(index)? {
+        '\'' => index,
+        'b' if chars.get(index + 1) == Some(&'\'') => index + 1,
+        _ => return None,
+    };
+    if chars.get(quote + 1) == Some(&'\\') {
+        let mut cursor = quote + 2;
+        while cursor < chars.len() {
+            match chars[cursor] {
+                '\\' => cursor += 2,
+                '\'' => return Some(cursor),
+                _ => cursor += 1,
+            }
+        }
+        return None;
+    }
+    // `'x'` is a one-char literal; `'a` is a lifetime.
+    (chars.get(quote + 2) == Some(&'\'')).then_some(quote + 2)
+}
+
 #[test]
 fn normal_deps_detect_target_table_header() {
     // `[target.<cfg>.dependencies.<name>]` tables carry the edge in the
@@ -821,6 +952,120 @@ fn graphics_seam_is_the_only_crate_name_reference() {
     );
 }
 
+#[test]
+fn crate_name_in_string_literals_is_not_source_coupling() {
+    // #2381: a user-facing CLI example or diagnostic may spell the repository
+    // name (`bitty extension install bitty-graphics`) without coupling Core to
+    // the crate. Literal bodies are data; identifiers, paths, and prose are not.
+    let root = write_probe_workspace(
+        "crate-name-literals",
+        &[("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n")],
+        &[
+            (
+                "crates/bitty-terminal/src/hint.rs",
+                "pub const HINT: &str = \"bitty extension install bitty-graphics\";\n",
+            ),
+            (
+                "crates/bitty-terminal/src/raw.rs",
+                "pub const RAW: &str = r#\"use bitty-graphics as g;\"#;\n",
+            ),
+            (
+                "crates/bitty-terminal/src/encoded.rs",
+                "pub const ESC: &str = \"a \\\" bitty-graphics \\\" b\";\npub const BYTES: &[u8] = b\"bitty-graphics\";\n",
+            ),
+        ],
+    );
+    let violations = crate_name_reference_violations(&root, "bitty-graphics", GRAPHICS_SOURCE_SEAM);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        violations.is_empty(),
+        "string literal text is user-facing data, not a source reference: {violations:#?}"
+    );
+}
+
+#[test]
+fn crate_name_outside_literals_still_fails_the_fence() {
+    // Mutation guard for the fence: comments stay visible (module-doc prose is
+    // the reason this scan exists) and a bare spelling outside a literal still
+    // fails, while a literal-only mention in the same workspace does not.
+    let root = write_probe_workspace(
+        "crate-name-prose",
+        &[("bitty-terminal", "[package]\nname = \"bitty-terminal\"\n")],
+        &[
+            (
+                "crates/bitty-terminal/src/module_docs.rs",
+                "//! the bitty-graphics extension implements these traits\n",
+            ),
+            (
+                "crates/bitty-terminal/src/line_comment.rs",
+                "// bitty-graphics seam\npub fn f() {}\n",
+            ),
+            (
+                "crates/bitty-terminal/src/literal_only.rs",
+                "pub const HINT: &str = \"bitty-graphics\";\n",
+            ),
+        ],
+    );
+    let violations = crate_name_reference_violations(&root, "bitty-graphics", GRAPHICS_SOURCE_SEAM);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        violations.len(),
+        2,
+        "doc and line comments must stay fenced: {violations:#?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("module_docs.rs")),
+        "{violations:#?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("line_comment.rs")),
+        "{violations:#?}"
+    );
+    assert!(
+        !violations.iter().any(|v| v.contains("literal_only.rs")),
+        "{violations:#?}"
+    );
+}
+
+#[test]
+fn literal_stripping_preserves_code_lifetimes_and_comments() {
+    // Helper mutation guard: a lifetime misread as a char literal would drop
+    // the rest of the file and blind the fence, and an unterminated literal
+    // must stay visible instead of swallowing a real reference.
+    let source = "fn f<'a>(s: &'a str) -> &'a str { let _ = r#\"bitty-graphics\"#; let _ = b'x'; s }\n// bitty-graphics\n";
+    let stripped = strip_literal_bodies(source);
+    assert!(
+        stripped.contains("fn f<'a>(s: &'a str) -> &'a str {"),
+        "code around literals must survive: {stripped:?}"
+    );
+    assert!(
+        !stripped.contains("'x'") && stripped.contains("s }"),
+        "byte char literals must strip without eating following code: {stripped:?}"
+    );
+    assert!(
+        !stripped.contains("bitty-graphics\"#"),
+        "raw literal bodies must strip: {stripped:?}"
+    );
+    assert!(
+        names_crate_spelling(&stripped, "bitty-graphics"),
+        "comment mentions must stay visible: {stripped:?}"
+    );
+    assert!(
+        !names_crate_spelling(
+            &strip_literal_bodies("pub const H: &str = \"bitty-graphics\";"),
+            "bitty-graphics"
+        ),
+        "literal-only text must not count as a reference"
+    );
+    assert!(
+        names_crate_spelling(
+            &strip_literal_bodies("pub const H: &str = \"oops bitty-graphics\n"),
+            "bitty-graphics"
+        ),
+        "an unterminated literal must not hide the rest of the file"
+    );
+}
+
 /// Code-line (`//` comments stripped, whitespace compacted) references to a
 /// Code-line (`//` comments stripped) references to the `kitty_seam` module.
 /// Catches `pub use`, plain `use`, type-alias paths, and module aliases
@@ -1020,6 +1265,11 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
 
 /// Source-reference violations for the hyphenated crate spelling, which
 /// [`names_crate`] cannot see. Only `seam` may name the extension this way.
+///
+/// String and char literal bodies are exempt ([`strip_literal_bodies`]): a CLI
+/// example or diagnostic that prints the repository-style name is user-facing
+/// data, not a source reference. Comments and code stay fenced, so prose in
+/// module docs and any bare spelling still fail.
 fn crate_name_reference_violations(root: &Path, krate: &str, seam: &str) -> Vec<String> {
     let members = workspace_members(root);
     let seam = root.join(seam);
@@ -1036,7 +1286,7 @@ fn crate_name_reference_violations(root: &Path, krate: &str, seam: &str) -> Vec<
                 continue;
             }
             let text = std::fs::read_to_string(&file).expect("read rs file");
-            if names_crate_spelling(&text, krate) {
+            if names_crate_spelling(&strip_literal_bodies(&text), krate) {
                 violations.push(format!("{} names `{krate}`", file.display()));
             }
         }

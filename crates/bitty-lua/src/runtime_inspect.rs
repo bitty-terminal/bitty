@@ -1146,6 +1146,64 @@ mod tests {
         rows.cap(RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
         assert_eq!(rows.rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
         assert!(rows.truncated);
+
+        // Exercise the production serialization path as well: bounded path in
+        // `to_lua` and the emitted truncation marker.
+        let plugins = InspectRows {
+            rows: (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS)
+                .map(|index| PluginInspectRow {
+                    id: format!("owner.plugin{index}"),
+                    name: "Plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "registry".to_string(),
+                    enabled: true,
+                    recorded: true,
+                })
+                .collect(),
+            truncated: true,
+        };
+        let snapshot = RuntimeInspectSnapshot {
+            diagnostics: Section::available(diagnostic_fixture()),
+            plugins: Section::available(plugins),
+            settings: Section::available(InspectRows::new(Vec::new())),
+            extensions: Section::available(InspectRows::new(vec![ExtensionInspectRow {
+                name: "net".to_string(),
+                version: "0.0.1".to_string(),
+                tier: "user".to_string(),
+                abi_compatible: true,
+                sha256: "a".repeat(64),
+                executable_path: "p".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES),
+                activation: ExtensionActivation::Installed,
+                trust: ExtensionTrust::Unverified,
+            }])),
+            profiles: Section::available(InspectRows::new(Vec::new())),
+        };
+        let lua = snapshot.to_lua();
+        let plugins = lua.get("plugins").expect("plugins");
+        assert_eq!(plugins.get("truncated"), Some(&LuaValue::Bool(true)));
+        let rows = plugins.get("rows").expect("rows");
+        let LuaValue::Table(rows) = rows else {
+            panic!("row array");
+        };
+        assert_eq!(rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        let extensions = lua.get("extensions").expect("extensions");
+        let rows = extensions.get("rows").expect("rows");
+        let LuaValue::Table(rows) = rows else {
+            panic!("row array");
+        };
+        let LuaValue::Table(row) = &rows[0].1 else {
+            panic!("row table");
+        };
+        let path = row
+            .iter()
+            .find_map(|(key, value)| match (key, value) {
+                (LuaValue::String(key), LuaValue::String(value)) if key == "executable_path" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("executable_path");
+        assert!(path.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
     }
 
     #[test]

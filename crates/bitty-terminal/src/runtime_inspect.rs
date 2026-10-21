@@ -655,7 +655,9 @@ mod tests {
 
     use bitty_plugin_host::manifest::{SettingDecl, SettingDefault, SettingKind};
     use bitty_runtime::plugin_runtime::plugin_settings::SettingLayer as RuntimeSettingLayer;
-    use bitty_runtime::plugin_runtime::{MapSettings, PluginRuntime, PluginRuntimeConfig};
+    use bitty_runtime::plugin_runtime::{
+        LuaValue, MapSettings, PluginRuntime, PluginRuntimeConfig,
+    };
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
@@ -861,6 +863,30 @@ mod tests {
             context.config_dir,
             Some(PathBuf::from("/xdg").join(bitty_config::file::CONFIG_DIR_NAME))
         );
+    }
+
+    #[test]
+    fn build_plugins_caps_rows_and_marks_truncation() {
+        let rows: Vec<crate::plugin::PluginRow> = (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS + 3)
+            .map(|index| plugin_row(&format!("owner.plugin{index}"), Vec::new()))
+            .collect();
+        let section = build_plugins(&rows);
+        let Section::Available(rows) = section else {
+            panic!("plugins available");
+        };
+        assert_eq!(rows.rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert!(rows.truncated);
+        let snapshot = RuntimeInspectSnapshot {
+            plugins: Section::available(rows),
+            ..RuntimeInspectSnapshot::default()
+        };
+        let lua = snapshot.to_lua();
+        let plugins = lua.get("plugins").expect("plugins");
+        assert_eq!(plugins.get("truncated"), Some(&LuaValue::Bool(true)));
+        let LuaValue::Table(rows) = plugins.get("rows").expect("rows") else {
+            panic!("row array");
+        };
+        assert_eq!(rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
     }
 
     #[test]

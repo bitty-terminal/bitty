@@ -1206,6 +1206,22 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "policy",
                     )
                 );
+                for row in contrast
+                    .iter()
+                    .filter(|row| row.advisory && row.ratio < row.floor)
+                {
+                    println!(
+                        "{}",
+                        check_row(
+                            &format!("theme.contrast.advisory.{}", row.role.label()),
+                            format!(
+                                "{:.2}:1 below the {:.1}:1 advisory (surface token, never gated)",
+                                row.ratio, row.floor
+                            ),
+                            "advisory",
+                        )
+                    );
+                }
                 for row in contrast.iter().filter(|row| row.exemption.is_some()) {
                     println!(
                         "{}",

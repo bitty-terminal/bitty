@@ -261,10 +261,11 @@ fn banner_ground(palette: &ThemePalette) -> [u8; 4] {
 
 /// Expected help-panel ring (issue #2333 contract: ANSI 12).
 fn help_ring(palette: &ThemePalette) -> [u8; 4] {
-    // CTX-1418: the ring is ANSI 12 when it clears 3:1 on the selection
-    // ground, else the renderer's theme-owned fallback. Use the production
-    // resolver so the test tracks that rule instead of duplicating it.
-    bitty_render::grid::help_panel_border_in(palette)
+    // Deliberately independent of the production resolver: the expected ring
+    // for the presets exercised here is the ANSI 12 accent, so the pixel
+    // assertions can catch a regression in the fallback rule instead of
+    // reusing it.
+    opaque(palette.active_index(12))
 }
 
 fn assert_role_probes(rt: &Runtime, rgba: &[u8], palette: &ThemePalette) {

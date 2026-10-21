@@ -76,8 +76,10 @@
 //! background, and [`MIN_SELECTION_CONTRAST`] (1.3:1) for the selection fill
 //! while selected text keeps [`MIN_TEXT_CONTRAST`]. ANSI 0/8 are surface
 //! tokens and may legally sit near the background; in light presets 7/15 are
-//! surface tokens too. They are reported by `bitty config check` but never
-//! treated as text. [`TEXT_CONTRAST_EXEMPTIONS`] and
+//! surface tokens too. They are reported by `bitty config check` as
+//! `theme.contrast.advisory.*` when they fall below [`MIN_SURFACE_CONTRAST`],
+//! but they are never gated and never treated as text.
+//! [`TEXT_CONTRAST_EXEMPTIONS`] and
 //! [`SELECTION_CONTRAST_EXEMPTIONS`] name the only accepted exceptions
 //! (Solarized, designed low-contrast); the catalog tests require each
 //! exemption to still measure below its floor, so exemptions cannot go dead.
@@ -244,8 +246,10 @@ pub const MIN_UI_CONTRAST: f64 = 3.0;
 /// Minimum visibility of the selection fill against the background (1.3:1).
 pub const MIN_SELECTION_CONTRAST: f64 = 1.3;
 
-/// Minimum visibility of a neutral surface token against the background
-/// (1.2:1). Surface tokens are never required to clear the text floor.
+/// Advisory visibility of a neutral surface token against the background
+/// (1.2:1). Surface tokens are never gated: the row is reported by
+/// `bitty config check` as `theme.contrast.advisory.*` and never treated as
+/// text.
 pub const MIN_SURFACE_CONTRAST: f64 = 1.2;
 
 /// Perceptual distance (CIE76 `ΔE*ab`) that keeps two different ANSI color
@@ -308,43 +312,49 @@ pub enum ContrastRole {
 }
 
 impl ContrastRole {
-    /// Stable diagnostic label (`foreground`, `ansi[2] text`, ...).
+    /// Stable diagnostic label (`foreground`, `ansi2.text`, ...).
     #[must_use]
     pub fn label(self) -> &'static str {
+        const TEXT: [&str; 16] = [
+            "ansi0.text",
+            "ansi1.text",
+            "ansi2.text",
+            "ansi3.text",
+            "ansi4.text",
+            "ansi5.text",
+            "ansi6.text",
+            "ansi7.text",
+            "ansi8.text",
+            "ansi9.text",
+            "ansi10.text",
+            "ansi11.text",
+            "ansi12.text",
+            "ansi13.text",
+            "ansi14.text",
+            "ansi15.text",
+        ];
+        const SURFACE: [&str; 16] = [
+            "ansi0.surface",
+            "ansi1.surface",
+            "ansi2.surface",
+            "ansi3.surface",
+            "ansi4.surface",
+            "ansi5.surface",
+            "ansi6.surface",
+            "ansi7.surface",
+            "ansi8.surface",
+            "ansi9.surface",
+            "ansi10.surface",
+            "ansi11.surface",
+            "ansi12.surface",
+            "ansi13.surface",
+            "ansi14.surface",
+            "ansi15.surface",
+        ];
         match self {
             Self::Foreground => "foreground",
-            Self::AnsiText(0) => "ansi[0] text",
-            Self::AnsiText(1) => "ansi[1] text",
-            Self::AnsiText(2) => "ansi[2] text",
-            Self::AnsiText(3) => "ansi[3] text",
-            Self::AnsiText(4) => "ansi[4] text",
-            Self::AnsiText(5) => "ansi[5] text",
-            Self::AnsiText(6) => "ansi[6] text",
-            Self::AnsiText(7) => "ansi[7] text",
-            Self::AnsiText(8) => "ansi[8] text",
-            Self::AnsiText(9) => "ansi[9] text",
-            Self::AnsiText(10) => "ansi[10] text",
-            Self::AnsiText(11) => "ansi[11] text",
-            Self::AnsiText(12) => "ansi[12] text",
-            Self::AnsiText(13) => "ansi[13] text",
-            Self::AnsiText(14) => "ansi[14] text",
-            Self::AnsiText(_) => "ansi[15] text",
-            Self::AnsiSurface(0) => "ansi[0] surface",
-            Self::AnsiSurface(1) => "ansi[1] surface",
-            Self::AnsiSurface(2) => "ansi[2] surface",
-            Self::AnsiSurface(3) => "ansi[3] surface",
-            Self::AnsiSurface(4) => "ansi[4] surface",
-            Self::AnsiSurface(5) => "ansi[5] surface",
-            Self::AnsiSurface(6) => "ansi[6] surface",
-            Self::AnsiSurface(7) => "ansi[7] surface",
-            Self::AnsiSurface(8) => "ansi[8] surface",
-            Self::AnsiSurface(9) => "ansi[9] surface",
-            Self::AnsiSurface(10) => "ansi[10] surface",
-            Self::AnsiSurface(11) => "ansi[11] surface",
-            Self::AnsiSurface(12) => "ansi[12] surface",
-            Self::AnsiSurface(13) => "ansi[13] surface",
-            Self::AnsiSurface(14) => "ansi[14] surface",
-            Self::AnsiSurface(_) => "ansi[15] surface",
+            Self::AnsiText(index) => TEXT[usize::from(index % 16)],
+            Self::AnsiSurface(index) => SURFACE[usize::from(index % 16)],
             Self::Cursor => "cursor",
             Self::SelectionText => "selection.text",
             Self::SelectionSurface => "selection.surface",
@@ -368,6 +378,11 @@ pub struct ThemeContrastCheck {
     pub passed: bool,
     /// Explicit reason when an upstream value is retained below the floor.
     pub exemption: Option<&'static str>,
+    /// Advisory rows are reported but never gate a preset. Neutral surface
+    /// tokens below [`MIN_SURFACE_CONTRAST`] are the only advisory rows: an
+    /// upstream palette may deliberately keep ANSI 0/8 (or light 7/15) close
+    /// to its background, and that is not a text-readability failure.
+    pub advisory: bool,
 }
 
 impl ThemeContrastCheck {
@@ -378,6 +393,18 @@ impl ThemeContrastCheck {
             floor,
             passed: ratio >= floor || exemption.is_some(),
             exemption,
+            advisory: false,
+        }
+    }
+
+    fn advisory(role: ContrastRole, ratio: f64, floor: f64) -> Self {
+        Self {
+            role,
+            ratio,
+            floor,
+            passed: true,
+            exemption: None,
+            advisory: true,
         }
     }
 }
@@ -650,32 +677,33 @@ pub fn contrast_checks(theme: &Theme) -> Vec<ThemeContrastCheck> {
                 MIN_TEXT_CONTRAST,
                 None,
             ));
-        } else if index == 7 || index == 15 {
-            if theme.category == ThemeCategory::Dark {
-                // Dark presets use white/bright-white as text.
-                rows.push(ThemeContrastCheck::new(
-                    ContrastRole::AnsiText(index),
-                    ratio,
-                    MIN_TEXT_CONTRAST,
-                    None,
-                ));
-            } else {
-                // Light presets use white/bright-white as surfaces; several
-                // canonical exports use the background itself as ANSI 15.
+        } else if (index == 7 || index == 15) && theme.category == ThemeCategory::Dark {
+            // Dark presets use white/bright-white as text.
+            rows.push(ThemeContrastCheck::new(
+                ContrastRole::AnsiText(index),
+                ratio,
+                MIN_TEXT_CONTRAST,
+                None,
+            ));
+        } else {
+            // Neutral surface token: ANSI 0/8, plus 7/15 on light presets.
+            // These are reported, never gated: canonical palettes
+            // deliberately place black near a dark background (and white
+            // near a light one), which is not a text failure.
+            if ratio >= MIN_SURFACE_CONTRAST {
                 rows.push(ThemeContrastCheck::new(
                     ContrastRole::AnsiSurface(index),
                     ratio,
                     MIN_SURFACE_CONTRAST,
-                    (ratio < MIN_SURFACE_CONTRAST).then_some("background alias (surface role)"),
+                    None,
+                ));
+            } else {
+                rows.push(ThemeContrastCheck::advisory(
+                    ContrastRole::AnsiSurface(index),
+                    ratio,
+                    MIN_SURFACE_CONTRAST,
                 ));
             }
-        } else {
-            rows.push(ThemeContrastCheck::new(
-                ContrastRole::AnsiSurface(index),
-                ratio,
-                MIN_SURFACE_CONTRAST,
-                (ratio < MIN_SURFACE_CONTRAST).then_some("background alias (surface role)"),
-            ));
         }
     }
     rows.push(ThemeContrastCheck::new(

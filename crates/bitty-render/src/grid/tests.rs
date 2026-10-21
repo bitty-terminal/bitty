@@ -2196,6 +2196,38 @@ fn chrome_accents_follow_the_resolved_palette() {
     );
     assert_ne!(help_panel_border_in(&dark), help_panel_border_in(&light));
 
+    // CTX-1418: the paint helper must agree with the measured policy for
+    // every preset. `contrast_checks` measures `help_ring_source`, so without
+    // this equivalence a broken fallback (or a deleted one) stays green.
+    for theme in bitty_config::theme::list_presets() {
+        let palette = ThemePalette::from_theme(theme);
+        let candidates = [
+            theme.ansi_entry(12),
+            theme.ansi_entry(4),
+            theme.ansi_entry(6),
+            theme.foreground,
+        ];
+        let expected = candidates[bitty_config::theme::help_ring_source(theme)];
+        assert_eq!(
+            help_panel_border_in(&palette),
+            [expected[0], expected[1], expected[2], 0xFF],
+            "preset {} ring must be the measured help-ring candidate",
+            theme.name
+        );
+        let row = bitty_config::theme::contrast_checks(theme)
+            .into_iter()
+            .find(|row| row.role == bitty_config::theme::ContrastRole::HelpRing)
+            .expect("every preset carries a help-ring row");
+        assert!(row.passed, "preset {} ring row must pass", theme.name);
+    }
+    // Fallback index pins: Latte's ANSI 12 (2.90:1) cannot clear 3:1 on its
+    // selection, so the ring is the foreground; Mocha's ANSI 4 (3.17:1)
+    // clears it before ANSI 6/foreground are consulted.
+    let latte = bitty_config::theme::resolve_theme(Some("catppuccin-latte"));
+    let mocha = bitty_config::theme::resolve_theme(Some("catppuccin-mocha"));
+    assert_eq!(bitty_config::theme::help_ring_source(latte), 3);
+    assert_eq!(bitty_config::theme::help_ring_source(mocha), 1);
+
     assert_eq!(ime_preedit_bg_in(&dark), dark.selection);
     assert_eq!(ime_preedit_underline_in(&dark), dark.cursor);
     assert_ne!(ime_preedit_bg_in(&dark), ime_preedit_bg_in(&light));

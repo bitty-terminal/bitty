@@ -7,9 +7,14 @@
 //! are retired; the old boundary tests now exercise the in-core
 //! implementations as parity. This module keeps the bounded bitty variants it
 //! still owns (`string.byte/char`, `table.concat`, `table.sort`) plus the
-//! restricted `os.time/clock/date` core does not ship. Nothing here grants
-//! ambient authority; every function only inspects or builds bounded in-VM
-//! strings/tables.
+//! restricted `os.time/clock/date` core does not ship. The string/table
+//! functions only inspect or build bounded in-VM values. The single host-state
+//! read is `os.date`'s default path: it resolves the process timezone
+//! environment (`TZ`) and the host timezone database through `chrono::Local`
+//! to local calendar fields, which intentionally exposes the host timezone to
+//! a plugin with no grant. `os.date("!...")` is deterministic UTC. Nothing
+//! here grants process, filesystem, or network authority, and `os.getenv` /
+//! `os.execute` stay absent.
 //!
 //! [Lua Runtime RFC]: https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/lua-runtime-rfc.md
 
@@ -65,7 +70,14 @@ pub(crate) fn install_config_stdlib(lua: &mut Lua) {
 
 /// Restricted `os` retained by the accepted baseline: `time`/`clock`/`date`
 /// only. `os.execute`, `os.getenv`, `os.remove`, `os.tmpname`, and the rest are
-/// deliberately absent (no process, environment, or filesystem authority).
+/// deliberately absent (no process, filesystem, or network authority).
+///
+/// `os.date` without a leading `!` is the one host-state read in this module:
+/// it resolves the process timezone environment (`TZ`) and the host timezone
+/// database through `chrono::Local` to local calendar fields, so a plugin gains
+/// the host timezone with no grant. `os.date("!...")` is deterministic UTC over
+/// the same fields. The read returns calendar values only — it is not an
+/// environment lookup, and no environment name/value is observable.
 fn install_os<'gc>(ctx: Context<'gc>) {
     static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let os = Table::new(&ctx);
@@ -131,9 +143,11 @@ fn install_os<'gc>(ctx: Context<'gc>) {
                 let _ = table.set(ctx, "sec", fields.second);
                 let _ = table.set(ctx, "wday", fields.weekday);
                 let _ = table.set(ctx, "yday", fields.year_day);
-                // chrono's `Local` exposes the offset but not the DST flag, so
-                // `isdst` keeps its historical constant here rather than
-                // guessing; `os.date` consumers in the bar clock use `%H:%M`.
+                // Known deviation: reference Lua reports `isdst = true` while
+                // daylight saving time is in effect. chrono's `Local` exposes
+                // the UTC offset but not the DST flag, so this stays constant
+                // `false` until a tz-aware source lands; tracked as a
+                // follow-up (the bar clock consumes `%H:%M` only).
                 let _ = table.set(ctx, "isdst", false);
                 stack.replace(ctx, Value::Table(table));
             } else {
@@ -158,9 +172,11 @@ struct DateFields {
 }
 
 /// Calendar fields for a Unix timestamp in UTC (`utc = true`) or the host's
-/// local timezone (Lua `os.date` default). Local conversion uses `chrono` so
-/// the restricted Lua `os.date` follows the process `TZ` instead of always
-/// returning UTC (owner report: the bar clock showed UTC).
+/// local timezone (Lua `os.date` default). The local path reads the process
+/// `TZ` environment and the host timezone database; `utc = true` is
+/// deterministic UTC. `chrono` resolves and caches the zone once per process,
+/// so a later `TZ` change is ignored (plugins cannot set environment variables
+/// anyway).
 ///
 /// Returns `None` when the timestamp lies outside the representable calendar
 /// range, matching reference Lua's `nil` result.
@@ -554,8 +570,30 @@ mod tests {
             before_dst = os.date("%Y-%m-%d %H:%M", {before_spring_forward}) == "{before_dst}"
             after_dst = os.date("%Y-%m-%d %H:%M", {after_spring_forward}) == "{after_dst}"
             utc_epoch = os.date("!%Y-%m-%d %H:%M", 0) == "1970-01-01 00:00"
-            summer_table = os.date("*t", {summer}).year == 2026
-            utc_table = os.date("!*t", {summer}).hour == 12
+
+            -- Full table field set for the local path (2026-07-01 is yday 182,
+            -- wday 4 = Wednesday with 1 = Sunday in every witness zone).
+            local summer_fields = os.date("*t", {summer})
+            summer_year = summer_fields.year == 2026
+            summer_month = summer_fields.month == 7
+            summer_day = summer_fields.day == 1
+            summer_min = summer_fields.min == 0
+            summer_sec = summer_fields.sec == 0
+            summer_wday = summer_fields.wday == 4
+            summer_yday = summer_fields.yday == 182
+            local before_fields = os.date("*t", {before_spring_forward})
+            before_min = before_fields.min == 59
+            before_sec = before_fields.sec == 59
+            before_wday = before_fields.wday == 1
+            before_yday = before_fields.yday == 67
+
+            -- UTC tables keep the same field set on the UTC side.
+            local utc_fields = os.date("!*t", {summer})
+            utc_hour = utc_fields.hour == 12
+            utc_min = utc_fields.min == 0
+            utc_sec = utc_fields.sec == 0
+            utc_wday = utc_fields.wday == 4
+            utc_yday = utc_fields.yday == 182
             overflow_is_nil = os.date("%Y", 9223372036854775807) == nil
             "#
         );
@@ -568,8 +606,22 @@ mod tests {
             "before_dst",
             "after_dst",
             "utc_epoch",
-            "summer_table",
-            "utc_table",
+            "summer_year",
+            "summer_month",
+            "summer_day",
+            "summer_min",
+            "summer_sec",
+            "summer_wday",
+            "summer_yday",
+            "before_min",
+            "before_sec",
+            "before_wday",
+            "before_yday",
+            "utc_hour",
+            "utc_min",
+            "utc_sec",
+            "utc_wday",
+            "utc_yday",
             "overflow_is_nil",
         ] {
             assert_eq!(vm.test_global(name), Some(1.0), "TZ={tz}: {name} failed");

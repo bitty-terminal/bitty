@@ -667,22 +667,14 @@ pub(crate) fn init_detect_shell_for_handoff(
 /// Renders the exact shell-integration handoff line for a shell name
 /// (CTX-1132, #1913; PRINT, never eval).
 ///
-/// `bash`/`zsh` use the `eval "$(bitty shell-init <shell>)"` form; the other
-/// shells use their documented wiring from `shell-init --help` (fish sources,
-/// PowerShell invokes, Nushell saves once then sources), so the printed line
-/// is runnable verbatim in the named shell.
+/// The line comes from [`crate::shell_init::install_line`], the same source
+/// `bitty shell-init --help` prints, so the handoff and the documented
+/// install command can never drift (issue #2372). Unknown names fall back to
+/// bash, matching [`init_detect_shell_for_handoff`].
 pub(crate) fn init_shell_init_line(shell: &str) -> String {
-    match shell.trim().to_ascii_lowercase().as_str() {
-        "fish" => "bitty shell-init fish | source".to_string(),
-        "powershell" | "pwsh" => {
-            "bitty shell-init powershell | Out-String | Invoke-Expression".to_string()
-        }
-        "nushell" | "nu" => {
-            "bitty shell-init nushell | save -f ~/.config/nushell/bitty-shell-init.nu".to_string()
-        }
-        "zsh" => "eval \"$(bitty shell-init zsh)\"".to_string(),
-        _ => "eval \"$(bitty shell-init bash)\"".to_string(),
-    }
+    let shell = crate::completion::CompletionShell::parse(shell.trim())
+        .unwrap_or(crate::completion::CompletionShell::Bash);
+    crate::shell_init::install_line(shell).to_string()
 }
 
 /// Second Nushell setup step (CTX-1132, #1913; CodeRabbit 4241676519).
@@ -690,13 +682,12 @@ pub(crate) fn init_shell_init_line(shell: &str) -> String {
 /// Nushell parses `source` paths before `save -f` runs, so the save command
 /// from [`init_shell_init_line`] alone leaves integration inactive. The
 /// dispatch appends this hint for `nushell` only (other shells get `""`),
-/// keeping their guidance unchanged.
+/// keeping their guidance unchanged. The text is shared with
+/// `bitty shell-init --help` so both name the same follow-up.
 pub(crate) fn init_shell_source_hint(shell: &str) -> &'static str {
-    match shell.trim().to_ascii_lowercase().as_str() {
-        "nushell" | "nu" => {
-            " Then add `source ~/.config/nushell/bitty-shell-init.nu` to config.nu."
-        }
-        _ => "",
+    match crate::completion::CompletionShell::parse(shell.trim()) {
+        Some(shell) => crate::shell_init::install_follow_up(shell),
+        None => "",
     }
 }
 

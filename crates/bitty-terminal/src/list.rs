@@ -154,6 +154,17 @@ pub enum ListKind {
 }
 
 impl ListKind {
+    /// Canonical plural names in help order (single source for shell
+    /// completion).
+    pub const NAMES: &[&str] = &[
+        "themes",
+        "plugins",
+        "instances",
+        "actions",
+        "keymaps",
+        "services",
+    ];
+
     /// Parse a kind token (case-insensitive, singular accepted).
     /// Returns `None` for unknown kinds (caller maps to exit 2).
     #[must_use]

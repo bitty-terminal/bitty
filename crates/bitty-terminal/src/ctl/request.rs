@@ -348,6 +348,31 @@ pub fn ctl_help_text() -> String {
 
 // ── parsing ───────────────────────────────────────────────────────────────
 
+/// Resource/verb grammar in `bitty ctl --help` order (single source for shell
+/// completion). The parser's match below remains the executable authority; a
+/// unit test asserts every pair is documented and that completion offers it.
+pub const CTL_RESOURCES: &[(&str, &[&str])] = &[
+    ("instance", &["list"]),
+    ("window", &["list"]),
+    ("view", &["list", "split", "focus"]),
+    ("panel", &["list"]),
+    ("terminal", &["list", "spawn", "close", "send", "text"]),
+    (
+        "workspace",
+        &[
+            "list",
+            "new",
+            "close",
+            "focus",
+            "move",
+            "rename",
+            "move-panel",
+        ],
+    ),
+    ("config", &["reload"]),
+    ("consent", &["grant", "revoke", "revoke-session"]),
+];
+
 /// Parse `tokens` (argv words after the `ctl` word) into a request plus targeting.
 ///
 /// Pure and total for unit testing: no env/fs/net. Global `--socket`,

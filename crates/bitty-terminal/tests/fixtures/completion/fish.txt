@@ -1,0 +1,122 @@
+# bitty completion for Fish (generated from the CLI grammar; do not edit).
+# Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
+#      or: bitty completion fish | source
+function __bitty_flag_takes_value
+    switch $argv[1]
+        case --log-level --split-ratio --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --cwd --env --title --scope --terminal --family --cap --iterations --rows --cols --version --digest --distro
+            return 0
+    end
+    return 1
+end
+function __bitty_path
+    set -l tokens (commandline -opc)
+    if test (count $tokens) -gt 0
+        set -e tokens[1]
+    end
+    set -l path
+    set -l skip_next 0
+    for token in $tokens
+        if test $skip_next -eq 1
+            set skip_next 0
+            continue
+        end
+        switch $token
+            case '--*=*'
+                continue
+            case '--*'
+                if __bitty_flag_takes_value $token
+                    set skip_next 1
+                end
+                continue
+            case '-*'
+                continue
+            case '*'
+                set -a path $token
+        end
+    end
+    if test (count $path) -eq 0
+        return 0
+    end
+    string join ' ' -- $path
+end
+function __bitty_complete
+    set -l path (__bitty_path)
+    switch "$path"
+        case ''
+            printf '%s\n' run ctl config cfg init doctor list ls inspect dev plugin extension version completion comp cmd x shell-init help --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'run'
+            printf '%s\n' --cwd --env --title --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl'
+            printf '%s\n' instance window view panel terminal workspace config consent --socket --instance --format --no-color --cwd --scope --terminal --family --left --right --up --down --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl instance'
+            printf '%s\n' list --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl window'
+            printf '%s\n' list --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl view'
+            printf '%s\n' list split focus --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl panel'
+            printf '%s\n' list --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl terminal'
+            printf '%s\n' list spawn close send text --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl workspace'
+            printf '%s\n' list new close focus move rename move-panel --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl config'
+            printf '%s\n' reload --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ctl consent'
+            printf '%s\n' grant revoke revoke-session --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config'
+            printf '%s\n' path check edit profile --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile'
+            printf '%s\n' list show use path --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'init'
+            printf '%s\n' --yes --force --config --profile --theme --font-family --font-size --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --print-shell-init --no-print-shell-init --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --opacity --format --socket --instance --no-color --no-components --without-components --no-shell-init
+        case 'doctor'
+            printf '%s\n' --format --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'list'
+            printf '%s\n' themes plugins instances actions keymaps services --format --socket --instance --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'inspect'
+            printf '%s\n' command key plugin config protocol --format --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev'
+            printf '%s\n' trace capture synthesize dump overlay --format --no-color --iterations --rows --cols --layout --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev trace'
+            printf '%s\n' startup latency --iterations --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev capture'
+            printf '%s\n' --layout --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev dump'
+            printf '%s\n' grid scene atlas --rows --cols --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev overlay'
+            printf '%s\n' list show --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'dev overlay show'
+            printf '%s\n' damage cells glyphs images layout banner --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'plugin'
+            printf '%s\n' list install remove enable disable info revoke config --format --no-color --yes --force --cap --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'plugin config'
+            printf '%s\n' show scaffold --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'extension'
+            printf '%s\n' list add install remove show-source --format --no-color --version --digest --distro --yes --force --help --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'version'
+            printf '%s\n' --format --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'completion'
+            printf '%s\n' bash zsh fish powershell nushell --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'shell-init'
+            printf '%s\n' bash zsh fish powershell nushell --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'cmd'
+            printf '%s\n' --format --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'x'
+            printf '%s\n' --format --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'help'
+            printf '%s\n' run ctl config cfg init doctor list ls inspect dev plugin extension version completion comp cmd x shell-init help --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'cfg'
+            printf '%s\n' path check edit profile --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'ls'
+            printf '%s\n' themes plugins instances actions keymaps services --format --socket --instance --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'comp'
+            printf '%s\n' bash zsh fish powershell nushell --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case '*'
+            return 0
+    end
+end
+if not set -q _BITTY_COMPLETION_FISH
+    set -g _BITTY_COMPLETION_FISH 1
+    complete -c bitty -f -a '(__bitty_complete)'
+end

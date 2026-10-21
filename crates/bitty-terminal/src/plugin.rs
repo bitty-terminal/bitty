@@ -249,32 +249,40 @@ pub enum ConfigAction {
 }
 
 impl ConfigAction {
+    /// Every plugin-config action in help order.
+    pub const ACTIONS: &[(&str, Self)] = &[("show", Self::Show), ("scaffold", Self::Scaffold)];
+
     /// Parse an explicit action token.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        match token {
-            "show" => Some(Self::Show),
-            "scaffold" => Some(Self::Scaffold),
-            _ => None,
-        }
+        Self::ACTIONS
+            .iter()
+            .find(|(name, _)| *name == token)
+            .map(|(_, action)| *action)
     }
 }
 
 impl PluginVerb {
+    /// Every plugin verb in help order (single source for parsing and shell
+    /// completion; never duplicate this list).
+    pub const VERBS: &[(&str, Self)] = &[
+        ("list", Self::List),
+        ("install", Self::Install),
+        ("remove", Self::Remove),
+        ("enable", Self::Enable),
+        ("disable", Self::Disable),
+        ("info", Self::Info),
+        ("revoke", Self::Revoke),
+        ("config", Self::Config),
+    ];
+
     /// Parse a verb token.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        match token {
-            "list" => Some(Self::List),
-            "install" => Some(Self::Install),
-            "remove" => Some(Self::Remove),
-            "enable" => Some(Self::Enable),
-            "disable" => Some(Self::Disable),
-            "info" => Some(Self::Info),
-            "revoke" => Some(Self::Revoke),
-            "config" => Some(Self::Config),
-            _ => None,
-        }
+        Self::VERBS
+            .iter()
+            .find(|(name, _)| *name == token)
+            .map(|(_, verb)| *verb)
     }
 
     /// Canonical verb name for output/errors.

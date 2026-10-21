@@ -64,15 +64,15 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn every_shell_emits_hooks_and_completion_wiring() {
-    let wiring = [
-        ("bash", "bitty completion bash"),
-        ("zsh", "bitty completion zsh"),
-        ("fish", "bitty completion fish"),
-        ("powershell", "bitty completion powershell"),
-        ("nushell", "bitty completion nushell"),
+fn every_shell_emits_hooks_and_inlined_completion() {
+    let inline = [
+        ("bash", "_bitty_complete"),
+        ("zsh", "_bitty() {"),
+        ("fish", "__bitty_complete"),
+        ("powershell", "Register-ArgumentCompleter"),
+        ("nushell", "extern \"bitty ctl\""),
     ];
-    for (shell, wire) in wiring {
+    for (shell, marker) in inline {
         let out = run_bitty(&["shell-init", shell]);
         assert_eq!(
             out.status.code(),
@@ -82,15 +82,29 @@ fn every_shell_emits_hooks_and_completion_wiring() {
         );
         let script = stdout(&out);
         assert!(script.contains("bitty"), "shell {shell} names bitty");
-        assert!(
-            script.contains("]133;"),
-            "shell {shell} marks OSC 133 prompt/status"
-        );
+        for mark in ["]133;A", "]133;B", "]133;D;"] {
+            assert!(
+                script.contains(mark),
+                "shell {shell} emits OSC 133 {mark:?}"
+            );
+        }
         assert!(script.contains("]7;"), "shell {shell} reports OSC 7 cwd");
         assert!(
-            script.contains(wire),
-            "shell {shell} wires Tab completion via {wire:?}"
+            script.contains(marker),
+            "shell {shell} inlines completion ({marker:?})"
         );
+        // Sourcing must never shell out to bitty (#2372): an absent or older
+        // binary cannot break shell startup.
+        for line in script.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.starts_with("extern \"bitty") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("bitty completion") && !trimmed.contains("bitty shell-init"),
+                "shell {shell} invokes bitty while sourcing: {line:?}"
+            );
+        }
     }
 }
 
@@ -112,7 +126,10 @@ fn shell_init_help_names_shells_and_wiring() {
     for shell in ["bash", "zsh", "fish", "powershell", "nushell"] {
         assert!(text.contains(shell), "help names {shell}");
     }
-    assert!(text.contains("bitty completion"), "help names wiring");
+    assert!(
+        text.contains("eval \"$(bitty shell-init zsh)\""),
+        "help names a working install line"
+    );
 }
 
 #[test]
@@ -288,7 +305,7 @@ fn osc7_scripts_encode_cwd() {
     let bash = stdout(&run_bitty(&["shell-init", "bash"]));
     assert!(bash.contains("_bitty_urlencode"), "bash defines encoder");
     assert!(
-        bash.contains(r#"$(_bitty_urlencode "$PWD")"#),
+        bash.contains(r#"$(_bitty_urlencode "${PWD:-.}")"#),
         "bash encodes PWD"
     );
     let zsh = stdout(&run_bitty(&["shell-init", "zsh"]));
@@ -539,4 +556,213 @@ fn init_points_at_shell_init() {
     );
     let target = home.join("bitty").join("init.lua");
     assert!(target.exists(), "init --yes writes init.lua");
+}
+
+#[test]
+fn init_handoff_matches_shell_init_install_line() {
+    for (shell_env, expected) in [
+        ("/bin/fish", "bitty shell-init fish | source"),
+        ("/bin/bash", "eval \"$(bitty shell-init bash)\""),
+        ("/bin/zsh", "eval \"$(bitty shell-init zsh)\""),
+    ] {
+        let home = scratch_dir("init-handoff");
+        let out = Command::new(BITTY_BIN)
+            .args(["init", "--yes"])
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_DATA_HOME", &home)
+            .env("HOME", &home)
+            .env("SHELL", shell_env)
+            .env("NO_COLOR", "1")
+            .env_remove("BITTY_CONFIG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap_or_else(|err| panic!("spawn init for {shell_env}: {err}"));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "init for {shell_env}: {}",
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).contains(expected),
+            "init handoff for {shell_env} must print {expected:?}: {}",
+            stdout(&out)
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[test]
+fn zsh_script_parses_cleanly_when_zsh_exists() {
+    let zsh = Command::new("zsh")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !zsh {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "zsh"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("zsh-parse");
+    let script = dir.join("bitty-shell-init.zsh");
+    std::fs::write(&script, stdout(&out)).expect("write zsh script");
+    let check = Command::new("zsh")
+        .arg("-n")
+        .arg(script.as_os_str())
+        .output()
+        .expect("spawn zsh -n");
+    assert!(
+        check.status.success(),
+        "zsh -n rejects emitted script: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn bash_sources_under_strict_mode_and_is_idempotent() {
+    let bash = Command::new("bash")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !bash {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "bash"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("bash-strict");
+    let script = dir.join("bitty-shell-init.bash");
+    std::fs::write(&script, stdout(&out)).expect("write bash script");
+    let script_arg = script.to_string_lossy().replace('\\', "/");
+    let probe = dir.join("strict.bash");
+    std::fs::write(
+        &probe,
+        format!(
+            "set -euo pipefail\nsource \"{script_arg}\"\nsource \"{script_arg}\"\n\
+             printf 'HOOKS=<%s>\\n' \"$PROMPT_COMMAND\"\n\
+             declare -F _bitty_complete >/dev/null\n\
+             printf 'OK\\n'\n"
+        ),
+    )
+    .expect("write strict probe");
+    let probe_arg = probe.to_string_lossy().replace('\\', "/");
+    let check = Command::new("bash")
+        .arg(&probe_arg)
+        .output()
+        .expect("spawn bash strict probe");
+    assert!(
+        check.status.success(),
+        "strict bash probe failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(text.contains("OK"), "strict probe completed: {text:?}");
+    assert_eq!(
+        text.matches("_bitty_prompt_hook").count(),
+        1,
+        "double-source registers the hook exactly once: {text:?}"
+    );
+}
+
+#[test]
+fn zsh_sources_under_no_unset_and_is_idempotent() {
+    let zsh = Command::new("zsh")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !zsh {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "zsh"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("zsh-strict");
+    let script = dir.join("bitty-shell-init.zsh");
+    std::fs::write(&script, stdout(&out)).expect("write zsh script");
+    let probe = dir.join("strict.zsh");
+    std::fs::write(
+        &probe,
+        format!(
+            "setopt no_unset\nsource {}\nsource {}\n\
+             print -r -- \"PRECMD=($precmd_functions)\"\n\
+             print -r -- \"PREEXEC=($preexec_functions)\"\n\
+             print OK\n",
+            script.display(),
+            script.display()
+        ),
+    )
+    .expect("write zsh strict probe");
+    let check = Command::new("zsh")
+        .arg(probe.as_os_str())
+        .output()
+        .expect("spawn zsh strict probe");
+    assert!(
+        check.status.success(),
+        "strict zsh probe failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(text.contains("OK"), "strict zsh probe completed: {text:?}");
+    assert_eq!(
+        text.matches("_bitty_prompt_hook").count(),
+        1,
+        "double-source registers the zsh prompt hook once: {text:?}"
+    );
+    assert_eq!(
+        text.matches("_bitty_preexec_hook").count(),
+        1,
+        "double-source registers the zsh preexec hook once: {text:?}"
+    );
+}
+
+#[test]
+fn fish_sources_non_interactively_and_is_idempotent() {
+    let fish = Command::new("fish")
+        .args(["--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !fish {
+        return;
+    }
+    let out = run_bitty(&["shell-init", "fish"]);
+    assert_eq!(out.status.code(), Some(0));
+    let dir = scratch_dir("fish-strict");
+    let script = dir.join("bitty-shell-init.fish");
+    std::fs::write(&script, stdout(&out)).expect("write fish script");
+    let probe = dir.join("strict.fish");
+    std::fs::write(
+        &probe,
+        format!(
+            "source {}\nsource {}\n\
+             status is-interactive; and echo INTERACTIVE=true; or echo INTERACTIVE=false\n\
+             complete -C 'bitty config '\n",
+            script.display(),
+            script.display()
+        ),
+    )
+    .expect("write fish probe");
+    let check = Command::new("fish")
+        .arg(probe.as_os_str())
+        .output()
+        .expect("spawn fish probe");
+    assert!(
+        check.status.success(),
+        "fish probe failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let text = String::from_utf8_lossy(&check.stdout).into_owned();
+    for verb in ["path", "check", "edit", "profile"] {
+        assert!(
+            text.lines().any(|line| line.trim() == verb),
+            "non-interactive fish completes `config {verb}` once: {text:?}"
+        );
+    }
+    assert!(
+        text.contains("INTERACTIVE=false"),
+        "probe is non-interactive: {text:?}"
+    );
 }

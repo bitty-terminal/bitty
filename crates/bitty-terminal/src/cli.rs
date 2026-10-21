@@ -402,15 +402,21 @@ pub(crate) enum ConfigCommand {
 }
 
 impl ConfigCommand {
+    /// Every config verb in help order (single source for parsing and shell
+    /// completion; never duplicate this list).
+    pub(crate) const VERBS: &[(&str, Self)] = &[
+        ("path", Self::Path),
+        ("check", Self::Check),
+        ("edit", Self::Edit),
+        ("profile", Self::Profile),
+    ];
+
     /// Parse a verb token.
     pub(crate) fn parse(token: &str) -> Option<Self> {
-        match token {
-            "path" => Some(Self::Path),
-            "check" => Some(Self::Check),
-            "edit" => Some(Self::Edit),
-            "profile" => Some(Self::Profile),
-            _ => None,
-        }
+        Self::VERBS
+            .iter()
+            .find(|(name, _)| *name == token)
+            .map(|(_, verb)| *verb)
     }
 
     /// Verb name for usage/errors.
@@ -2344,6 +2350,29 @@ pub(crate) fn help_text_short(color: bool) -> String {
 /// the hidden deprecated alias for `extension` (issue #1959, kept at least
 /// through 0.1.0): accepted but never listed. `help` itself shows this help.
 /// All names are lowercase, case-sensitive.
+///
+/// This table is the single source for the top-level command names used by
+/// `bitty help` and shell completion. The parser's word dispatch stays the
+/// executable authority; a unit test asserts every table entry round-trips.
+pub(crate) const SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("run", &[]),
+    ("ctl", &[]),
+    ("config", &["cfg"]),
+    ("init", &[]),
+    ("doctor", &[]),
+    ("list", &["ls"]),
+    ("inspect", &[]),
+    ("dev", &[]),
+    ("plugin", &[]),
+    ("extension", &[]),
+    ("version", &[]),
+    ("completion", &["comp"]),
+    ("cmd", &[]),
+    ("x", &[]),
+    ("shell-init", &[]),
+    ("help", &[]),
+];
+
 #[must_use]
 pub(crate) fn help_valid_commands() -> &'static str {
     "run, ctl, config (cfg), init, doctor, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
@@ -2356,26 +2385,15 @@ pub(crate) fn help_valid_commands() -> &'static str {
 /// `comp` -> `completion`, `component` -> `extension` (deprecated alias).
 #[must_use]
 pub(crate) fn help_canonical_cmd(raw: &str) -> Option<&'static str> {
-    match raw {
-        "run" => Some("run"),
-        "ctl" => Some("ctl"),
-        "config" | "cfg" => Some("config"),
-        "init" => Some("init"),
-        "doctor" => Some("doctor"),
-        "list" | "ls" => Some("list"),
-        "inspect" => Some("inspect"),
-        "dev" => Some("dev"),
-        "plugin" => Some("plugin"),
-        "extension" => Some("extension"),
-        "component" => Some("extension"),
-        "version" => Some("version"),
-        "completion" | "comp" => Some("completion"),
-        "cmd" => Some("cmd"),
-        "x" => Some("x"),
-        "shell-init" => Some("shell-init"),
-        "help" => Some("help"),
-        _ => None,
+    // The hidden `component` alias is parser-only: it never appears in help
+    // or completion, but keeps resolving to the canonical `extension` help.
+    if raw == "component" {
+        return Some("extension");
     }
+    SUBCOMMANDS
+        .iter()
+        .find(|(name, aliases)| *name == raw || aliases.contains(&raw))
+        .map(|(name, _)| *name)
 }
 
 /// Short usage for `bitty help` failures (stderr, exit 2 trailer).

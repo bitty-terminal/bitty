@@ -118,6 +118,11 @@ pub enum InspectTarget {
 }
 
 impl InspectTarget {
+    /// Canonical target names in help order (single source for shell
+    /// completion). `parse` accepts the documented plural/alias spellings;
+    /// completions offer only these canonical forms.
+    pub const NAMES: &[&str] = &["command", "key", "plugin", "config", "protocol"];
+
     /// Parse a target token (case-insensitive, plural accepted).
     /// Returns `None` for unknown targets (caller maps to exit 2).
     #[must_use]

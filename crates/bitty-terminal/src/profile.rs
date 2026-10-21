@@ -262,19 +262,63 @@ fn run_show(dir: &Path, raw_name: &str) -> i32 {
         println!("layer[{index}] = \"{source}\"");
     }
     let e = &merged.effective;
+    // Real attribution: a sparse preset (for example `minimal`, which sets
+    // only `theme`) keeps the shipped defaults for every other row; labeling
+    // those `(profile)` overstates the profile's content (#2349). Extends
+    // ancestors are named by their own file path.
+    let source = |field: &str| -> String {
+        match merged.source_of(field) {
+            Some(found) if found.layer == bitty_config::LayerKind::Profile => match &found.path {
+                Some(path) => format!("profile: {path}"),
+                None => "profile".to_string(),
+            },
+            Some(found) if found.layer == bitty_config::LayerKind::CoreDefaults => {
+                "default".to_string()
+            }
+            Some(found) => found.layer.label().to_string(),
+            None => "default".to_string(),
+        }
+    };
     let theme = e
         .appearance
         .theme
         .as_deref()
         .map_or(String::from("(default)"), |theme| format!("\"{theme}\""));
-    println!("appearance.theme = {theme} (profile)");
-    println!("font.family = \"{}\" (profile)", e.font.family);
-    println!("font.size = {} (profile)", e.font.size);
-    println!("terminal.scrollback = {} (profile)", e.terminal.scrollback);
-    println!("window.opacity = {} (profile)", e.window.opacity);
-    println!("window.padding = {} (profile)", e.window.padding);
-    println!("decoration.gaps_in = {} (profile)", e.decoration.gaps_in);
-    println!("close_confirm = \"{}\" (profile)", e.close_confirm.as_str());
+    println!(
+        "appearance.theme = {theme} ({})",
+        source("appearance.theme")
+    );
+    println!(
+        "font.family = \"{}\" ({})",
+        e.font.family,
+        source("font.family")
+    );
+    println!("font.size = {} ({})", e.font.size, source("font.size"));
+    println!(
+        "terminal.scrollback = {} ({})",
+        e.terminal.scrollback,
+        source("terminal.scrollback")
+    );
+    println!(
+        "window.opacity = {} ({})",
+        e.window.opacity,
+        source("window.opacity")
+    );
+    println!(
+        "window.padding = {} ({})",
+        e.window.padding,
+        source("window.padding")
+    );
+    println!(
+        "decoration.gaps_in = {} ({})",
+        e.decoration.gaps_in,
+        source("decoration.gaps_in")
+    );
+    println!(
+        "close_confirm = \"{}\" ({})",
+        e.close_confirm.as_str(),
+        source("close_confirm")
+    );
     0
 }
 
@@ -312,11 +356,15 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> i32 {
         }
     };
     if probed.fallback_name {
+        // `config.lua` is the fallback *name*, not proof of a legacy file: a
+        // migration (or an earlier `init` on that alias) can leave a valid
+        // versioned selector there. The parse below decides by content, so a
+        // migrated alias stays switchable while a genuine legacy file still
+        // fails closed with the migration hint (#2349).
         eprintln!(
-            "bitty config profile use: legacy '{}' is not a selector; run `bitty init --migrate` first",
+            "bitty config profile use: using fallback '{}' (canonical is 'init.lua')",
             probed.path.display()
         );
-        return 2;
     }
     let selector = probed.path;
     if !selector.exists() {

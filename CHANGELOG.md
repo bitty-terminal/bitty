@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Profile init polish (#2349):** `--migrate` refuses wizard value flags
+  (`--theme`, `--font-size`, ...) instead of silently discarding them and
+  bounds the legacy file with `symlink_metadata` before reading it.
+  `config profile show` attributes shipped defaults as `(default)` rather than
+  `(profile)`, a migrated `config.lua` alias is switchable with
+  `config profile use`, and `init --profile default` on a legacy layout no
+  longer dead-ends `--migrate` (identical destination bytes are reused, and
+  `--migrate --force` replaces a different seeded profile with a
+  collision-free `.bak` backup). `bitty config` usage now lists the persisted
+  `init.lua` selector as a profile source. Blank `--profile` tokens remain a
+  fail-closed usage error with regression coverage.
 - **Restricted Lua `os.date` uses local time (#2375):** the restricted `os`
   table converted every timestamp with a UTC-only civil algorithm, so the bar
   clock module rendered `05:26` on a `13:26` UTC+8 host, and the `!` UTC marker

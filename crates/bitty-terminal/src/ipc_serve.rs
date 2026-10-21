@@ -159,6 +159,54 @@ impl Drop for IpcServeGuard {
     }
 }
 
+/// Advisory resolver input used by the production serve entry point.
+///
+/// Under `cfg(test)` a single test may substitute an explicit `SocketEnv`
+/// through `serve_in_background_for_tests`; production always reads the
+/// process environment. The override is a test seam, not a credential: the
+/// pipe/socket still attests its endpoint and every peer.
+fn socket_env_for_serve() -> bitty_ipc::devtools::SocketEnv {
+    #[cfg(all(test, windows))]
+    {
+        if let Ok(guard) = TEST_SOCKET_ENV.lock() {
+            if let Some(env) = guard.as_ref() {
+                return env.clone();
+            }
+        }
+    }
+    bitty_ipc::devtools::SocketEnv::from_process_env()
+}
+
+#[cfg(all(test, windows))]
+static TEST_SOCKET_ENV: Mutex<Option<bitty_ipc::devtools::SocketEnv>> = Mutex::new(None);
+
+/// Run the production [`serve_in_background`] entry with an explicit
+/// advisory environment (test-only).
+///
+/// The serial guard keeps the process-global override scoped to one test;
+/// the override is cleared before the guard is returned, so the accept loop
+/// and every connection use only the resolved endpoint. This lets the
+/// Windows servo test assert the production entry point itself, so replacing
+/// its Windows arm with `degraded_guard()` fails the named test.
+#[cfg(all(test, windows))]
+pub(crate) fn serve_in_background_for_tests(
+    descriptor: ServerDescriptor,
+    env: bitty_ipc::devtools::SocketEnv,
+) -> IpcServeGuard {
+    static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+    let _serial = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *TEST_SOCKET_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env);
+    let guard = serve_in_background(descriptor);
+    *TEST_SOCKET_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    guard
+}
+
 /// Serve `BITTY_SOCKET` on a background thread (fail-soft).
 ///
 /// Resolves the path from `BITTY_SOCKET` / `XDG_RUNTIME_DIR` /
@@ -170,17 +218,11 @@ impl Drop for IpcServeGuard {
 pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     #[cfg(unix)]
     {
-        unix_serve(
-            descriptor,
-            &bitty_ipc::devtools::SocketEnv::from_process_env(),
-        )
+        unix_serve(descriptor, &socket_env_for_serve())
     }
     #[cfg(windows)]
     {
-        windows_serve(
-            descriptor,
-            &bitty_ipc::devtools::SocketEnv::from_process_env(),
-        )
+        windows_serve(descriptor, &socket_env_for_serve())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -204,8 +246,8 @@ fn handle_panel_list(
     request: &bitty_ipc::devtools::DevtoolsRequest,
 ) -> Result<String, bitty_ipc::devtools::HandlerError> {
     // Use the re-exported wire name on all targets so the Windows
-    // `-D warnings` cross-check sees the import as used (the Unix-only
-    // registration below is cfg-gated).
+    // `-D warnings` cross-check sees the import as used; the shared
+    // `build_dispatcher` registers this handler for both transports.
     debug_assert_eq!(request.method, crate::ctl::METHOD_LIST_PANELS);
     let reply = if context.authority_required() {
         let Some(grant) = context.connection_grant() else {
@@ -1073,9 +1115,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_named_pipe_serves_ctl_roundtrip() {
-        // Mutation target (#2244): disabling the Windows serve path (or
-        // reverting to the old degraded guard) makes this fail because the
-        // pipe is never enabled / the ctl round-trip never answers.
+        // Mutation target (#2244): this calls the production
+        // `serve_in_background` entry point through a test-only advisory-env
+        // seam. Replacing its Windows arm with `degraded_guard()` makes the
+        // guard disabled and this test fail before the round-trip.
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1089,13 +1132,13 @@ mod tests {
             xdg_runtime_dir: None,
             instance_id: Some(instance.clone()),
         };
-        let guard = windows_serve(
+        let guard = serve_in_background_for_tests(
             ServerDescriptor {
                 cols: 80,
                 rows: 24,
                 test_mode: false,
             },
-            &env,
+            env,
         );
         assert!(
             guard.is_enabled(),

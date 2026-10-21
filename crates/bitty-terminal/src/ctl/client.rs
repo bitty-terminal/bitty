@@ -185,7 +185,7 @@ pub fn resolve_ctl_target(
 
     // Exactly-one-live shortcut: live pipes only, same-UID by construction
     // (owner SID is verified before the probe reports live).
-    let candidates = discover_live_pipes();
+    let candidates = discover_live_pipes().map_err(|err| err.message)?;
     match candidates.as_slice() {
         [one] => Ok(one.clone()),
         [] => Err(String::from(
@@ -215,11 +215,14 @@ pub fn resolve_ctl_target(
     Err(generic_ctl_unavailable_message())
 }
 
-/// Live Windows pipe instances as ctl targets (best-effort discovery).
+/// Live Windows pipe instances as ctl targets.
+///
+/// Registry/namespace read failures stay typed (`InstanceError`) so target
+/// resolution reports the documented exit-6 class instead of silently
+/// treating an unreadable registry as "no live instance".
 #[cfg(windows)]
-fn discover_live_pipes() -> Vec<ResolvedTarget> {
-    let mut live: Vec<ResolvedTarget> = crate::list::discover_instances(None, None)
-        .unwrap_or_default()
+fn discover_live_pipes() -> Result<Vec<ResolvedTarget>, crate::list::InstanceError> {
+    let mut live: Vec<ResolvedTarget> = crate::list::discover_instances(None, None)?
         .into_iter()
         .filter(|row| row.live)
         .map(|row| ResolvedTarget {
@@ -228,7 +231,7 @@ fn discover_live_pipes() -> Vec<ResolvedTarget> {
         })
         .collect();
     live.sort_by(|a, b| a.instance.cmp(&b.instance));
-    live
+    Ok(live)
 }
 
 /// Base directory for socket discovery (`XDG_RUNTIME_DIR` or `/run/user/<uid>`).
@@ -307,7 +310,8 @@ pub fn list_live_instances(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<Resol
 /// verified before a row reports live (CTX-1405, #2244).
 #[cfg(windows)]
 pub fn list_live_instances(_xdg_runtime_dir: Option<&str>, _uid: u32) -> Vec<ResolvedTarget> {
-    discover_live_pipes()
+    // Listing is best-effort; target resolution keeps the typed error.
+    discover_live_pipes().unwrap_or_default()
 }
 
 /// Platforms with neither Unix sockets nor Windows pipes: empty discovery.

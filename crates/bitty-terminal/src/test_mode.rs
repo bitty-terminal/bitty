@@ -11,7 +11,8 @@
 //! Bounds:
 //! - No new authority: test mode changes lifecycle only. It grants no scope,
 //!   issues no automation bearer, widens no rate/redaction bound, and opens
-//!   no transport beyond the same-UID `0600` Unix socket.
+//!   no transport beyond the same-user `0600` Unix socket or the
+//!   current-user-only Windows instance pipe (CTX-1405).
 //! - Fail-closed: a test-mode process that cannot serve the socket exits
 //!   non-zero instead of running a harness against no surface.
 //! - Flag-gated surface: `bitty.debug/testInfo` / `bitty.debug/testExit`

@@ -1377,6 +1377,10 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
         .to_ascii_lowercase()
 }
 
+/// Bounded wait for a free pipe instance during discovery probes.
+#[cfg(windows)]
+const WINDOWS_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Probe one Windows named pipe with a bounded authenticated open (CTX-0196,
 /// transport CTX-1405/#2244).
 ///
@@ -1386,10 +1390,6 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
 /// `NotFound` (stale registry entry); a present-but-inaccessible pipe fails
 /// `PermissionDenied`; a busy pipe waits at most 50 ms. The connect never
 /// blocks unboundedly, mirroring the fail-fast Unix probe.
-/// Bounded wait for a free pipe instance during discovery probes.
-#[cfg(windows)]
-const WINDOWS_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
-
 #[cfg(windows)]
 fn probe_windows_pipe(pipe_path: &str) -> (bool, String) {
     match bitty_ipc::winpipe::connect(pipe_path, WINDOWS_PROBE_WAIT) {
@@ -1435,8 +1435,10 @@ fn windows_explicit_instance_label(pipe_path: &str) -> String {
 /// liveness. Sorted by socket and capped at [`MAX_LIST_INSTANCES`] with the
 /// shed count folded into the last row's `detail` (same bound shape as the
 /// directory scan).
-pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
-    let mut rows: Vec<InstanceInfo> = pipe_names
+/// Map bare pipe-namespace names to candidate rows without applying the list
+/// cap, so ownership probing filters before the bound is spent.
+fn pipe_namespace_candidates(pipe_names: &[String]) -> Vec<InstanceInfo> {
+    pipe_names
         .iter()
         .filter_map(|name| {
             let instance = bitty_ipc::devtools::windows_instance_from_pipe_name(name)?;
@@ -1448,7 +1450,12 @@ pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
                 detail: "live".to_string(),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Sort rows by endpoint and truncate past [`MAX_LIST_INSTANCES`], folding the
+/// shed count into the last surviving row.
+fn cap_instance_rows(mut rows: Vec<InstanceInfo>) -> Vec<InstanceInfo> {
     rows.sort_by(|a, b| a.socket.cmp(&b.socket));
     let total = rows.len();
     rows.truncate(MAX_LIST_INSTANCES);
@@ -1463,6 +1470,7 @@ pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
     }
     rows
 }
+
 /// Enumerate live bitty pipes from the Windows pipe namespace (CTX-0196).
 ///
 /// Best-effort augmentation to the registry scan: a listing failure yields
@@ -1478,22 +1486,23 @@ pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
             .collect(),
         Err(_) => return Vec::new(),
     };
-    // Namespace existence alone is not ownership: a same-user filter runs
-    // through the authenticated probe so a foreign `bitty-*` pipe is never
-    // listed (CTX-1405, #2244). The probe is bounded per entry.
-    pipe_namespace_rows(&names)
+    // Namespace existence alone is not ownership: the authenticated probe
+    // filters candidates before the `MAX_LIST_INSTANCES` cap, so a foreign
+    // `bitty-*` pipe never consumes a surviving slot (CTX-1405, #2244).
+    let live: Vec<InstanceInfo> = pipe_namespace_candidates(&names)
         .into_iter()
         .filter(|row| probe_windows_pipe(&row.socket).0)
-        .collect()
+        .collect();
+    cap_instance_rows(live)
 }
 
 /// Non-Windows: no pipe namespace exists; the registry scan is authoritative.
 ///
-/// Routes through the shared [`pipe_namespace_rows`] transform so the
+/// Routes through the shared candidate transform so the
 /// [`discover_instances`] merge stays uniform across platforms.
 #[cfg(not(windows))]
 pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
-    pipe_namespace_rows(&[])
+    cap_instance_rows(pipe_namespace_candidates(&[]))
 }
 
 /// Merge registry rows with live pipe-namespace rows (CTX-0196).
@@ -2928,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn pipe_namespace_rows_maps_live_and_skips_foreign() {
+    fn pipe_namespace_candidates_map_live_and_skip_foreign() {
         let names = [
             "bitty-default".to_string(),
             "bitty-live_2".to_string(),
@@ -2938,7 +2947,7 @@ mod tests {
             "bitty-default.sock".to_string(),
             "BITTY-default".to_string(),
         ];
-        let rows = pipe_namespace_rows(&names);
+        let rows = cap_instance_rows(pipe_namespace_candidates(&names));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].instance, "default");
         assert_eq!(rows[1].instance, "live_2");
@@ -2951,11 +2960,11 @@ mod tests {
     }
 
     #[test]
-    fn pipe_namespace_rows_caps_with_shed_note() {
+    fn pipe_namespace_candidates_cap_with_shed_note() {
         let names: Vec<String> = (0..(MAX_LIST_INSTANCES + 5))
             .map(|i| format!("bitty-inst-{i:03}"))
             .collect();
-        let rows = pipe_namespace_rows(&names);
+        let rows = cap_instance_rows(pipe_namespace_candidates(&names));
         assert_eq!(rows.len(), MAX_LIST_INSTANCES);
         assert!(
             rows.last().unwrap().detail.contains("shed 5 of"),

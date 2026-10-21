@@ -25,6 +25,55 @@ pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
     format!("bitty \u{2014} Correct Terminal \u{2014} {theme_name} ({source})")
 }
 
+/// Stderr class for one exit-save outcome (issue #2415).
+///
+/// The close-to-empty skip is an expected close path, so it reports at
+/// [`LogLevel::Info`] and never claims a failure; only a real save failure
+/// reaches [`LogLevel::Warn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionSaveLogClass {
+    /// Key user-facing info (visible with `--verbose`/`--log-level info`).
+    Info,
+    /// Warning (visible at the quiet default).
+    Warn,
+}
+
+/// Renders the one-line exit-save report for `outcome`; `None` means silent.
+///
+/// Pure and content-free (counts and typed error kinds only), so the exit
+/// hook and its regression share one classification: nothing here can echo
+/// session contents.
+pub(crate) fn session_save_report(
+    outcome: &bitty_runtime::SessionExitSaveOutcome,
+    reason: &str,
+) -> Option<(SessionSaveLogClass, String)> {
+    use bitty_runtime::SessionExitSaveOutcome;
+    match outcome {
+        SessionExitSaveOutcome::Saved(summary) => Some((
+            SessionSaveLogClass::Info,
+            format!(
+                "bitty: session saved ({reason}: workspaces={} panes={} lines={} bytes={})",
+                summary.workspaces, summary.panes, summary.scrollback_lines, summary.bytes
+            ),
+        )),
+        SessionExitSaveOutcome::SkippedNoStateDir => None,
+        // Issue #2415: the window is closing down to a state the v3 codec
+        // cannot encode (no tiled pane in any workspace, no pinned panel);
+        // the last good session file stays authoritative.
+        SessionExitSaveOutcome::SkippedEmptyTiledBase => Some((
+            SessionSaveLogClass::Info,
+            format!(
+                "bitty: session save skipped ({reason}: no tiled pane or pinned panel left) \
+                 — keeping last good session"
+            ),
+        )),
+        SessionExitSaveOutcome::Warned(err) => Some((
+            SessionSaveLogClass::Warn,
+            format!("bitty: session save failed ({err}) — exiting anyway"),
+        )),
+    }
+}
+
 /// Maximum number of characters kept from a terminal-reported window title
 /// (CTX-0382).
 ///
@@ -814,21 +863,13 @@ impl TerminalApp {
         if !self.session_persistence {
             return;
         }
-        match self.runtime.save_session_on_exit() {
-            bitty_runtime::SessionExitSaveOutcome::Saved(summary) => {
-                crate::logging::info(|| {
-                    format!(
-                        "bitty: session saved ({reason}: workspaces={} panes={} lines={} bytes={})",
-                        summary.workspaces, summary.panes, summary.scrollback_lines, summary.bytes
-                    )
-                });
-            }
-            bitty_runtime::SessionExitSaveOutcome::Warned(err) => {
-                crate::logging::warn(|| {
-                    format!("bitty: session save failed ({err}) — exiting anyway")
-                });
-            }
-            bitty_runtime::SessionExitSaveOutcome::SkippedNoStateDir => {}
+        let outcome = self.runtime.save_session_on_exit();
+        let Some((class, line)) = session_save_report(&outcome, reason) else {
+            return;
+        };
+        match class {
+            SessionSaveLogClass::Info => crate::logging::info(|| line),
+            SessionSaveLogClass::Warn => crate::logging::warn(|| line),
         }
     }
 

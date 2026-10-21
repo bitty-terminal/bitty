@@ -581,6 +581,12 @@ pub enum SessionExitSaveOutcome {
     Saved(SessionSaveSummary),
     /// No usable state dir: nothing written, no warning.
     SkippedNoStateDir,
+    /// Nothing encodable is live: every workspace's tiled base is empty and
+    /// the window has no pinned panel (issue #2415). The close-to-empty
+    /// transition produces exactly this state, so the exit save skips the
+    /// write and the last good session file stays authoritative. Expected,
+    /// never a failure: callers report it below the warning class.
+    SkippedEmptyTiledBase,
     /// Save failed: stderr warning, exit proceeds.
     Warned(SessionError),
 }
@@ -1695,7 +1701,19 @@ impl Runtime {
     /// Best-effort exit save to the default XDG state path: bounded capture
     /// plus one atomic write, no retries. Never panics, never blocks shutdown;
     /// failures collapse to content-free outcomes for a one-line warning.
+    ///
+    /// Issue #2415: the close-to-empty transition (the last tiled pane closes
+    /// while a detached float outlives the tiled base) is a valid live state
+    /// with no v3 encoding, so saving it can only report the snapshot as file
+    /// corruption. That exact state is skipped: nothing is written, the last
+    /// good session file stays authoritative, and the caller reports the skip
+    /// below the warning class. Every other state attempts the save, so a
+    /// mixed layout or a pinned panel surfaces its own warning instead of
+    /// being dropped silently.
     pub fn save_session_on_exit(&self) -> SessionExitSaveOutcome {
+        if self.is_close_to_empty_window() {
+            return SessionExitSaveOutcome::SkippedEmptyTiledBase;
+        }
         match self.save_session_to_default_path() {
             Ok(summary) => SessionExitSaveOutcome::Saved(summary),
             // Nit: only a missing state dir is silent. Any other failure
@@ -1703,6 +1721,41 @@ impl Runtime {
             Err(SessionError::NoStateDir) => SessionExitSaveOutcome::SkippedNoStateDir,
             Err(err) => SessionExitSaveOutcome::Warned(err),
         }
+    }
+
+    /// True when the whole window is down to an empty tiled base: every live
+    /// workspace has no tiled leaf and the window has no pinned panel. This
+    /// is the close-to-empty shape of issue #2415.
+    ///
+    /// The v3 file codec has no encoding for a workspace without a tiled
+    /// leaf, so a save of exactly this shape can only fail as `empty
+    /// workspace`; skipping keeps the last good file authoritative. Every
+    /// other shape attempts the save because the skip would be lossy or
+    /// hide a typed diagnostic:
+    ///
+    /// * a mixed layout leaves at least one workspace tiled, so the save is
+    ///   attempted; an empty sibling base surfaces as a warning instead of
+    ///   silently discarding the populated workspace's latest state;
+    /// * any pinned panel keeps the save attempt: the pin store is
+    ///   window-global, and a pin-focused empty base keeps #2230's typed
+    ///   `PinOnlyEmptyBase` refusal (an empty base whose focus does not name
+    ///   the pin still warns, as `empty workspace` corruption);
+    /// * a zero-workspace runtime is uninitialised, not close-to-empty: the
+    ///   attempt reports the `workspace count` corruption.
+    ///
+    /// Detached floats do not count as a tiled base: they ride the in-memory
+    /// snapshot only and never reach the file.
+    fn is_close_to_empty_window(&self) -> bool {
+        !self.workspaces.is_empty()
+            && self.pinned.is_empty()
+            && self.workspaces.iter().enumerate().all(|(index, slot)| {
+                let layout = if index == self.active_workspace {
+                    &self.layout
+                } else {
+                    &slot.layout
+                };
+                strip_overlays(layout).leaf_ids().is_empty()
+            })
     }
 }
 
@@ -1713,9 +1766,33 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Recording stub: proves Core validates before any backend call.
+    ///
+    /// `default_path` stands in for the live XDG session file so an exit-save
+    /// test can distinguish "the save was attempted and refused by
+    /// validation" from the quiet no-state-dir skip. The stub never touches
+    /// the filesystem: commits stay in memory.
     #[derive(Debug, Default)]
     struct RecordingBackend {
         calls: Mutex<Vec<&'static str>>,
+        default_path: Option<PathBuf>,
+    }
+
+    impl RecordingBackend {
+        fn at(path: impl Into<PathBuf>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                default_path: Some(path.into()),
+            }
+        }
+
+        fn call_count(&self, call: &'static str) -> usize {
+            self.calls
+                .lock()
+                .expect("stub lock")
+                .iter()
+                .filter(|recorded| **recorded == call)
+                .count()
+        }
     }
 
     impl SessionFileBackend for RecordingBackend {
@@ -1750,7 +1827,7 @@ mod tests {
 
         fn session_file(&self) -> Option<PathBuf> {
             self.calls.lock().expect("stub lock").push("paths");
-            None
+            self.default_path.clone()
         }
     }
 
@@ -1775,6 +1852,160 @@ mod tests {
             backend.calls.lock().expect("stub lock").is_empty(),
             "no backend call may precede validation"
         );
+    }
+
+    /// Drives `rt` into the #2415 close-to-empty shape: one workspace with
+    /// an empty tiled base and one focused detached float. Returns the float.
+    fn close_to_empty_with_float(rt: &mut Runtime) -> ViewId {
+        let host = rt.focused_view().expect("seed focus");
+        let float = ViewId::new(2);
+        let host_leaf = rt.layout().find_leaf(host).cloned().expect("host leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(host_leaf),
+            LayoutNode::leaf(View::new(float, 40, 24)),
+        ));
+        rt.float_detach(float).expect("float detaches");
+        let mut layout = rt.layout().clone();
+        assert!(
+            layout.remove_leaf(host).is_some(),
+            "the bare last leaf must collapse to an empty base"
+        );
+        rt.set_layout_closing(layout, host);
+        assert!(rt.set_focus(float), "the float is a valid focus target");
+        float
+    }
+
+    #[test]
+    fn exit_save_skips_only_a_whole_window_close_to_empty() {
+        let backend = Arc::new(RecordingBackend::at("exit-save-close-to-empty"));
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_session_backend(Some(backend.clone()));
+
+        let float = close_to_empty_with_float(&mut rt);
+        assert_eq!(rt.floated_views(), vec![float]);
+        assert!(rt.layout().leaf_ids().is_empty());
+        assert_eq!(
+            rt.save_session_on_exit(),
+            SessionExitSaveOutcome::SkippedEmptyTiledBase,
+            "a whole-window close-to-empty is the only silent skip"
+        );
+        assert_eq!(
+            backend.call_count("paths"),
+            0,
+            "the skip precedes even path resolution"
+        );
+        assert_eq!(backend.call_count("encode"), 0);
+        assert_eq!(backend.call_count("commit"), 0);
+
+        // Mixed layout (review of #2421): a second workspace is still tiled,
+        // so the exit save must be attempted. Validation reports the empty
+        // sibling base and nothing is written; the populated workspace's
+        // latest state is never silently dropped.
+        rt.workspace_new().expect("second workspace opens");
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert!(
+            !rt.layout().leaf_ids().is_empty(),
+            "the active workspace stays tiled"
+        );
+        assert_eq!(
+            rt.save_session_on_exit(),
+            SessionExitSaveOutcome::Warned(SessionError::Corrupt("empty workspace")),
+            "a mixed layout warns instead of skipping"
+        );
+        assert_eq!(
+            backend.call_count("paths"),
+            1,
+            "the mixed layout reaches the save"
+        );
+        assert_eq!(
+            backend.call_count("encode"),
+            0,
+            "validation refuses before the codec"
+        );
+        assert_eq!(
+            backend.call_count("commit"),
+            0,
+            "the last good session file is untouched"
+        );
+    }
+
+    #[test]
+    fn exit_save_keeps_pin_states_out_of_the_silent_skip() {
+        let backend = Arc::new(RecordingBackend::at("exit-save-pinned-base"));
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_session_backend(Some(backend.clone()));
+
+        // Focused pin over an empty base: #2230's typed refusal survives.
+        let host = rt.focused_view().expect("seed focus");
+        let pinned = ViewId::new(2);
+        let host_leaf = rt.layout().find_leaf(host).cloned().expect("host leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(host_leaf),
+            LayoutNode::leaf(View::new(pinned, 40, 24)),
+        ));
+        assert!(rt.set_focus(pinned), "pin candidate is focusable");
+        rt.pin_floating(pinned).expect("pin detaches the leaf");
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_pinned(host),
+            Some(pinned),
+            "the pin owns the empty base"
+        );
+        assert!(rt.layout().leaf_ids().is_empty());
+        assert_eq!(rt.focused_view(), Some(pinned));
+        assert_eq!(
+            rt.save_session_on_exit(),
+            SessionExitSaveOutcome::Warned(SessionError::PinOnlyEmptyBase),
+            "a pinned panel must not be dropped as a silent close-to-empty"
+        );
+        assert_eq!(backend.call_count("commit"), 0);
+
+        // Same empty base, but focus on a surviving float: validation's
+        // typed refusal is focus-scoped (#2230), so the attempt reports the
+        // empty-base corruption warning instead of skipping. Any pin keeps
+        // the save attempt; only a pin-focused base earns the typed error.
+        let float = ViewId::new(3);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            leaf(4),
+            LayoutNode::leaf(View::new(float, 40, 24)),
+        ));
+        rt.float_detach(float).expect("float detaches");
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_pinned(ViewId::new(4)),
+            Some(pinned),
+            "the pin still anchors the empty base"
+        );
+        assert!(rt.set_focus(float), "the surviving float takes focus");
+        assert_eq!(
+            rt.save_session_on_exit(),
+            SessionExitSaveOutcome::Warned(SessionError::Corrupt("empty workspace")),
+            "an unfocused pin still keeps the save attempt"
+        );
+        assert_eq!(backend.call_count("commit"), 0);
+    }
+
+    #[test]
+    fn exit_save_treats_zero_workspaces_as_uninitialised() {
+        let backend = Arc::new(RecordingBackend::at("exit-save-zero-workspaces"));
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        rt.set_session_backend(Some(backend.clone()));
+        // No public API empties the workspace list; this is the defensive
+        // uninitialised path, not a user-reachable close-to-empty.
+        rt.workspaces.clear();
+        assert_eq!(
+            rt.save_session_on_exit(),
+            SessionExitSaveOutcome::Warned(SessionError::Corrupt("workspace count")),
+            "zero workspaces is uninitialised corruption, never a benign skip"
+        );
+        assert_eq!(backend.call_count("paths"), 1);
+        assert_eq!(backend.call_count("encode"), 0);
+        assert_eq!(backend.call_count("commit"), 0);
     }
 
     fn leaf(id: u64) -> LayoutNode {

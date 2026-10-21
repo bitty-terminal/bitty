@@ -42,6 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``bitty init: `fish` is a shell name; did you mean `bitty shell-init fish`?``
   before the usage and exits 2. Unknown words, shell paths, and extra tokens
   keep the generic unexpected-argument message unchanged.
+- **Readable built-in themes: preset contrast and ANSI hue audit (CTX-1418,
+  #2370):** every shipped preset is now measured against WCAG 2.1 floors
+  (4.5:1 normal text, 3:1 large/UI) for the default foreground, the chromatic
+  ANSI slots Vim and `ls --color` use, the cursor, the selection text and
+  fill, the derived IME underline, help-panel ring, and pending-paste banner,
+  plus a cross-family ANSI hue/`ΔE` separation rule. Palettes with a canonical
+  Ghostty theme file reproduce it; values that failed were repaired minimally
+  (lightness only, hue preserved) and the deviations are recorded in
+  `bitty-terminal-docs`. The help-panel ring falls back from ANSI 12 to ANSI
+  4/6/foreground when the accent cannot clear 3:1 on the selection ground.
+  `bitty config check` prints the measurements, and a catalog test over all
+  30 presets fails CI on any regression.
 - **Resumable RC-1 completion enforcement (CTX-1407, #2314):** app-dispatched
   plugin commands that reach the 50 ms charged wall budget now park with their
   executor, fuel, and cumulative clock intact and resume on later cold ticks

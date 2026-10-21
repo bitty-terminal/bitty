@@ -302,12 +302,19 @@ impl Runtime {
         }
     }
 
-    /// Suppresses hyperlink hover affordances while an overlay capture holds.
+    /// Suppresses hover affordances while an overlay capture holds.
     ///
     /// Set per tick by the app; while true, revalidates clear instead of
     /// re-arming and paints skip, so a modal never shows underlying URL
     /// affordances.
+    ///
+    /// Issue #2411: the rising edge also ends plugin band hover ownership
+    /// with exactly one `leave`, so a tooltip cannot stay visible or re-arm
+    /// under the modal; motion is inert while suppressed.
     pub fn set_hover_suppressed_by_overlay(&mut self, suppressed: bool) {
+        if suppressed && !self.hover_suppressed_by_overlay {
+            self.clear_band_hover_for_capture();
+        }
         self.hover_suppressed_by_overlay = suppressed;
     }
 

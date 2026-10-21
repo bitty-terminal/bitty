@@ -727,6 +727,10 @@ impl Runtime {
                     // no stale underline, preview, or pointer survives.
                     self.clear_hyperlink_hover();
                     self.clear_plaintext_hover();
+                    // Issue #2411: leaving also ends plugin band hover
+                    // ownership with one `leave`, so a tooltip cannot stay
+                    // anchored after the pointer is outside the window.
+                    self.clear_band_hover();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
                     }

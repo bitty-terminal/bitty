@@ -22,7 +22,7 @@ use bitty_lua::runtime_inspect::{
     RUNTIME_INSPECT_CALLS_PER_SECOND, RUNTIME_INSPECT_MAX_WALL_MS, RuntimeInspectSnapshot,
 };
 use bitty_lua::ui::UiSlot;
-use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
+use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode, UiSceneScope};
 use bitty_lua::{
     BridgeError, COMPONENT_CLASS_CAPABILITY_DENIED, CommandCatalogEntry, ComponentBridgeRequest,
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
@@ -3786,6 +3786,20 @@ impl HostServices for PluginServices {
         self.ui_blocks
             .borrow_mut()
             .mount(ui_slot, component.clone())
+    }
+
+    /// Scene scope of a mounted block (issue #2411): only a horizontal band
+    /// block has a row width that resolves group anchors.
+    fn ui_scene_scope(&self, handle: i64) -> UiSceneScope {
+        match self
+            .ui_blocks
+            .borrow()
+            .get(handle)
+            .map(crate::plugin_runtime::UiBlock::ui_slot)
+        {
+            Some(UiSlot::Top | UiSlot::Bottom) => UiSceneScope::Band,
+            _ => UiSceneScope::Unanchored,
+        }
     }
 
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {

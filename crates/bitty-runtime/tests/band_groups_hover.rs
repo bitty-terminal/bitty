@@ -22,10 +22,12 @@ use bitty_lua::ui::{
     UI_HOVER_PHASE_ARG, UI_HOVER_PHASE_ENTER, UI_HOVER_PHASE_LEAVE, UI_REGION_ARG, UiAnchor,
     UiNode, UiRegion, UiRegionKind, UiSlot,
 };
-use bitty_platform::{CursorPosition, MouseButton, PhysicalSize, PressState};
+use bitty_platform::{
+    CursorPosition, MouseButton, PhysicalSize, PlatformEvent, PressState, WindowEventKind, WindowId,
+};
 use bitty_runtime::{
     BAND_HOVER_QUEUE_MAX, BandButton, BandContent, BandEdge, BandHoverPhase, ChromeBands, Runtime,
-    flatten_band_runs_in_width,
+    flatten_band_runs, flatten_band_runs_in_width,
 };
 
 const PLUGIN: &str = "test-bar";
@@ -488,6 +490,7 @@ fn hover_dispatch_table_carries_only_region_and_phase() {
             kind: UiRegionKind::Module,
         },
         phase: BandHoverPhase::Enter,
+        origin: None,
     };
     let args = bitty_runtime::band_hover_args_table(&request.args, &request.region, request.phase);
     let bitty_lua::host::LuaValue::Table(pairs) = args else {
@@ -557,4 +560,133 @@ fn icon_glyphs_keep_text_path_cell_widths() {
         assert_eq!(clicks.len(), 1, "cell {col} routes");
         assert_eq!(clicks[0].region.as_ref().expect("region").id, "clock");
     }
+}
+
+fn cursor_left() -> PlatformEvent {
+    PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::CursorLeft,
+    }
+}
+
+#[test]
+fn cursor_left_ends_band_hover_with_one_leave() {
+    // Review B1: leaving the window must not leave a tooltip anchored with the
+    // plugin still believing it is hovered.
+    let mut rt = runtime_width(80);
+    let row = mount_top(&mut rt, waybar_band());
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    let enter = rt.drain_band_hovers();
+    assert_eq!(enter.len(), 1);
+    assert_eq!(enter[0].phase, BandHoverPhase::Enter);
+
+    rt.handle_platform_event(cursor_left());
+    let events = rt.drain_band_hovers();
+    assert_eq!(events.len(), 1, "exactly one leave on CursorLeft");
+    assert_eq!(events[0].region.id, "clock");
+    assert_eq!(events[0].phase, BandHoverPhase::Leave);
+    assert!(
+        rt.hovered_band_region().is_none(),
+        "no live hover survives the pointer leaving the window"
+    );
+
+    // A second CursorLeft is a no-op (no duplicate leave).
+    rt.handle_platform_event(cursor_left());
+    assert!(rt.drain_band_hovers().is_empty());
+}
+
+#[test]
+fn unfocused_motion_never_starts_band_hover() {
+    // Review B2: a background window must not dispatch plugin commands from
+    // pointer motion.
+    let mut rt = runtime_width(80);
+    let row = mount_top(&mut rt, waybar_band());
+    rt.set_focused(false);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    assert!(
+        rt.drain_band_hovers().is_empty(),
+        "no hover while unfocused"
+    );
+    assert!(rt.hovered_band_region().is_none());
+
+    rt.set_focused(true);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    let events = rt.drain_band_hovers();
+    assert_eq!(
+        events.len(),
+        1,
+        "focus gain re-arms hover on the next motion"
+    );
+    assert_eq!(events[0].phase, BandHoverPhase::Enter);
+}
+
+#[test]
+fn overlay_capture_clears_band_hover_once_and_mutes_motion() {
+    // Review B2: a focusable overlay capture owns the cold phase; a tooltip
+    // must not stay visible or re-arm under the modal.
+    let mut rt = runtime_width(80);
+    let row = mount_top(&mut rt, waybar_band());
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    assert_eq!(rt.drain_band_hovers().len(), 1, "enter delivered");
+
+    rt.set_hover_suppressed_by_overlay(true);
+    let events = rt.drain_band_hovers();
+    assert_eq!(events.len(), 1, "capture start queues exactly one leave");
+    assert_eq!(events[0].phase, BandHoverPhase::Leave);
+    assert!(rt.hovered_band_region().is_none());
+
+    // Motion while capture holds is inert, even over the same region.
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    assert!(rt.drain_band_hovers().is_empty());
+    assert!(rt.hovered_band_region().is_none());
+
+    // Releasing capture does not re-enter until the pointer moves again.
+    rt.set_hover_suppressed_by_overlay(false);
+    assert!(rt.drain_band_hovers().is_empty());
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    let events = rt.drain_band_hovers();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].phase, BandHoverPhase::Enter);
+}
+
+#[test]
+fn capture_teardown_drops_pending_transitions_and_keeps_one_leave() {
+    let mut rt = runtime_width(80);
+    let row = mount_top(&mut rt, waybar_band());
+    // Two un-drained transitions are pending when capture starts.
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 78));
+    rt.set_hover_suppressed_by_overlay(true);
+    let events = rt.drain_band_hovers();
+    assert_eq!(events.len(), 1, "pending enters dropped, one leave kept");
+    assert_eq!(events[0].region.id, "battery");
+    assert_eq!(events[0].phase, BandHoverPhase::Leave);
+}
+
+#[test]
+fn unanchored_empty_leaf_matches_the_unbounded_walk() {
+    // Review N1 golden: an unanchored scene with an empty Text leaf keeps the
+    // same text and run columns in the width-aware walk (including the
+    // zero-width empty run).
+    let root = UiNode::row(vec![
+        UiNode::text("ab"),
+        UiNode::text(""),
+        UiNode::text("c"),
+    ]);
+    let (unbounded_text, unbounded_runs) = flatten_band_runs(&root);
+    let (wide_text, wide_runs) = flatten_band_runs_in_width(&root, 80);
+    assert_eq!(unbounded_text, wide_text);
+    let columns = |runs: &[bitty_runtime::BandRun]| {
+        runs.iter()
+            .map(|run| (run.start_col, run.end_col))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(columns(&unbounded_runs), columns(&wide_runs));
+    assert_eq!(columns(&wide_runs), vec![(0, 2), (2, 2), (2, 3)]);
+
+    // A non-empty leaf that cannot fit its slot still emits no run at all.
+    let clipped = UiNode::row(vec![UiNode::text("ab"), UiNode::text("c")]);
+    let (text, runs) = flatten_band_runs_in_width(&clipped, 2);
+    assert_eq!(text, "ab");
+    assert_eq!(columns(&runs), vec![(0, 2)]);
 }

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::ui::{UI_MAX_BLOCKS, UiSlot};
+use bitty_lua::ui::{UI_MAX_BLOCKS, UiSceneScope, UiSlot};
 use bitty_lua::{
     BridgeError, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER, HostServices, LuaValue,
     RC1_WALL_CLOCK_BUDGET_MS, UiNode,
@@ -1467,4 +1467,51 @@ return {}
             .dispatch_ui_command(&fixture.id, "step", &[], &after_reload),
         Err(PluginRuntimeError::Lifecycle { .. })
     ));
+}
+
+#[test]
+fn block_scene_scope_follows_the_mount_slot() {
+    // Review N2: `ui.update` validates a replacement subtree against the
+    // block's mount scope; only horizontal band blocks resolve anchors.
+    let fixture = Fixture::activate(
+        "anchor-scope",
+        "bitty-featured.uianchorscope",
+        &["ui.rich", "ui.overlay"],
+        &[],
+        r#"
+        local band = bitty.ui.mount("bottom", { kind = "Text", text = "band" })
+        local overlay = bitty.ui.mount("overlay", { kind = "Text", text = "overlay" })
+        bitty.store.set("band", band)
+        bitty.store.set("overlay", overlay)
+        local anchored = { kind = "Row", children = {
+          { kind = "Row", anchor = "center", children = { { kind = "Text", text = "clock" } } },
+        } }
+        local band_update_ok, band_update_err = pcall(bitty.ui.update, band, anchored)
+        local overlay_update_ok, overlay_update_err = pcall(bitty.ui.update, overlay, anchored)
+        bitty.store.set("band_update_ok", band_update_ok)
+        bitty.store.set("overlay_update_code", overlay_update_ok and "NONE" or overlay_update_err.code)
+        return {}
+        "#,
+    );
+    let services = fixture.runtime.services(&fixture.id).expect("services");
+    let band = match store_value(&fixture.runtime, &fixture.id, "band") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("band handle, got {other:?}"),
+    };
+    let overlay = match store_value(&fixture.runtime, &fixture.id, "overlay") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("overlay handle, got {other:?}"),
+    };
+    assert_eq!(services.ui_scene_scope(band), UiSceneScope::Band);
+    assert_eq!(services.ui_scene_scope(overlay), UiSceneScope::Unanchored);
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "band_update_ok"),
+        Some(LuaValue::Bool(true)),
+        "a band update keeps resolving anchors"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "overlay_update_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string())),
+        "an overlay update rejects anchors instead of ignoring them"
+    );
 }

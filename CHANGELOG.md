@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Shell integration for all five supported shells (#2386):** `bitty
-shell-init <shell>` now emits the init script and nested Tab completion
+  shell-init <shell>` now emits the init script and nested Tab completion
   inline for bash, zsh, fish, PowerShell, and Nushell, generated from the
   parser-owned grammar tables (`config`/`profile`, `ctl` resources,
   `plugin`/`config` actions, `extension`, `dev trace`/`dump`/`overlay`,

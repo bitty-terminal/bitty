@@ -51,7 +51,7 @@ use phodopus::{
 
 use crate::keymaps::{KeymapPage, KeymapQuery};
 use crate::runtime_inspect::RuntimeInspectSnapshot;
-use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
+use crate::ui::{UiNode, UiSceneScope, UiSlot, component_invalid, read_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
 /// Version of the host bridge line exposed as `bitty.api_version`.
@@ -1568,6 +1568,17 @@ pub trait HostServices {
         }
         self.ui_mount(slot, component)
     }
+    /// Scene scope of a mounted block (issue #2411).
+    ///
+    /// `ui.update` validates a replacement subtree against the mount's scope,
+    /// so a band block may carry root-`Row` anchors while an overlay block
+    /// may not. A host that cannot name the block's slot must not accept a
+    /// placement it will never resolve, so the default is
+    /// [`UiSceneScope::Unanchored`] (anchors fail closed).
+    fn ui_scene_scope(&self, _handle: i64) -> UiSceneScope {
+        UiSceneScope::Unanchored
+    }
+
     /// Replace a mounted block's scene subtree, incrementing its version.
     ///
     /// Returns `Ok(false)` for a stale or foreign handle; the accepted
@@ -5830,14 +5841,21 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         );
                     }
                 };
-                if !is_ui_slot(&slot) {
+                let Some(ui_slot) = UiSlot::parse(&slot) else {
                     return Err(component_invalid(format!(
                         "unknown UI slot '{}'",
                         bounded_token(&slot)
                     ))
                     .to_error(ctx));
-                }
-                let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                };
+                // Issue #2411: only a horizontal band has a row width that
+                // can resolve a group anchor; every other surface rejects the
+                // placement instead of ignoring it.
+                let scope = match ui_slot {
+                    UiSlot::Top | UiSlot::Bottom => UiSceneScope::Band,
+                    _ => UiSceneScope::Unanchored,
+                };
+                let component = read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
                 let handle = state
                     .bounded_mutation(|expiry| {
                         state
@@ -5866,7 +5884,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         .to_error(ctx));
                     }
                 };
-                let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                // Issue #2411: an update keeps the mount's scene scope, so a
+                // band block may carry anchors and an overlay block may not.
+                let scope = state.services.ui_scene_scope(handle);
+                let component = read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
                 let updated = state
                     .bounded_mutation(|expiry| {
                         state
@@ -5954,7 +5975,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    // The focusable overlay stacks rows vertically; it has no
+                    // bounded row width, so anchors are rejected here
+                    // (issue #2411).
+                    let component = read_component(stack.get(1), UiSceneScope::Unanchored)
+                        .map_err(|e| e.to_error(ctx))?;
                     let updated = state
                         .bounded_mutation(|expiry| {
                             state

@@ -1236,3 +1236,37 @@ fn lua_component_carries_every_accepted_property() {
     assert_eq!(*bold, None);
     assert!(on_scroll.is_none());
 }
+
+#[test]
+fn anchors_are_band_only_across_mount_and_update() {
+    // Review N2: a root-Row child anchor is accepted for a band slot and
+    // rejected for the overlay slot and for an update whose block scope the
+    // host cannot name (the mock default is `Unanchored`).
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("anchor-scope");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local anchored = { kind = "Row", children = {
+          { kind = "Row", anchor = "left", children = { { kind = "Text", text = "clock" } } },
+        } }
+        local band_ok, band_err = pcall(bitty.ui.mount, "bottom", anchored)
+        local overlay_ok, overlay_err = pcall(bitty.ui.mount, "overlay", anchored)
+        bitty.store.set("band_ok", band_ok)
+        bitty.store.set("overlay_code", overlay_ok and "NONE" or overlay_err.code)
+        local handle = bitty.ui.mount("bottom", { kind = "Text", text = "plain" })
+        local update_ok, update_err = pcall(bitty.ui.update, handle, anchored)
+        bitty.store.set("update_code", update_ok and "NONE" or update_err.code)
+    "#,
+    );
+    assert_eq!(stored(&services, "band_ok"), Some(LuaValue::Bool(true)));
+    assert_eq!(
+        stored(&services, "overlay_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "update_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+}

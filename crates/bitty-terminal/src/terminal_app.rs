@@ -2240,12 +2240,21 @@ impl TerminalApp {
     ///
     /// Hover is presentation-only: it carries the stable region id plus an
     /// `enter`/`leave` phase, never pointer coordinates, and it neither takes
-    /// the overlay capture nor sets `modal_active`. Dispatch still passes the
-    /// plugin runtime's registration, capability, and args-schema gates.
+    /// the overlay capture nor sets `modal_active`. Dispatch uses the same
+    /// presented-frame origin fence as clicks
+    /// ([`bitty_runtime::PluginRuntime::dispatch_ui_command`]), so a band that
+    /// was replaced, moved, or reflowed after the transition was queued is
+    /// refused instead of retargeted. Registration, capability, and args-schema
+    /// gates are unchanged.
+    ///
     /// Results are not surfaced as banners: hover is high-frequency
     /// presentation, and the plugin's tooltip goes through the overlay
     /// surface instead.
-    fn dispatch_band_hover(&mut self, hover: bitty_runtime::BandHoverRequest) -> bool {
+    fn dispatch_band_hover(
+        &mut self,
+        hover: bitty_runtime::BandHoverRequest,
+        origin: &bitty_runtime::BandOrigin,
+    ) -> bool {
         let id = match bitty_plugin_host::manifest::PluginId::new(&hover.plugin_id) {
             Ok(id) => id,
             Err(error) => {
@@ -2268,7 +2277,7 @@ impl TerminalApp {
             return false;
         };
         let args = bitty_runtime::band_hover_args_table(&hover.args, &hover.region, hover.phase);
-        match plugin_runtime.dispatch_command(&id, &hover.command, &[args]) {
+        match plugin_runtime.dispatch_ui_command(&id, &hover.command, &[args], origin) {
             Ok(_) => true,
             Err(error) if error.is_parked() => true,
             Err(error) => {
@@ -2521,9 +2530,33 @@ impl TerminalApp {
         // Issue #2411: hover transitions drain on the same cold phase, ahead
         // of clicks (the pointer entered before it pressed). The queue is
         // capped by `BAND_HOVER_QUEUE_MAX`, so this loop is bounded per tick.
-        for hover in self.runtime.drain_band_hovers() {
-            if self.dispatch_band_hover(hover) {
-                attempted = attempted.saturating_add(1);
+        // Issue #2411: a focusable overlay capture owns the cold phase; hover
+        // transitions stay queued (bounded) instead of entering a plugin VM
+        // under a modal, and dispatch when the capture ends. Core never paints
+        // a hover tooltip while capture holds.
+        if !self.overlay_capture_active() {
+            for hover in self.runtime.drain_band_hovers() {
+                let Some(origin) = hover.origin.clone() else {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: band hover '{}:{}' dropped (no presented origin)",
+                            hover.plugin_id, hover.command
+                        )
+                    });
+                    continue;
+                };
+                if !self.runtime.band_origin_is_current(&origin) {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: band hover '{}:{}' dropped (origin is stale)",
+                            hover.plugin_id, hover.command
+                        )
+                    });
+                    continue;
+                }
+                if self.dispatch_band_hover(hover, &origin) {
+                    attempted = attempted.saturating_add(1);
+                }
             }
         }
         let admissions = self

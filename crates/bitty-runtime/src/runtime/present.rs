@@ -5374,6 +5374,41 @@ mod plugin_overlay_paint_tests {
     }
 
     #[test]
+    fn bottom_band_anchor_paints_above_the_region() {
+        // Review N4: the bottom-edge branch stacks the tooltip rows above the
+        // band (last row at band_row - 1) and clips at the window edge.
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        rt.set_chrome_bands(ChromeBands {
+            bottom: vec![surface_with_rows(&["bar"])],
+            ..Default::default()
+        });
+        rt.tick().expect("tick presents the band");
+        let band_row = rt
+            .visible_band_row(BandEdge::Bottom, 0)
+            .expect("bottom band row");
+        rt.set_plugin_overlay(Some(surface_with_rows(&["detail", "more"])));
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Bottom,
+            visible_index: 0,
+            start_col: 4,
+            end_col: 10,
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        let (cell_w, cell_h) = rt.live_cell_size();
+        assert_eq!(layers.combined_overlay.len(), 2, "two tooltip rows");
+        for (index, fill) in layers.combined_overlay.iter().enumerate() {
+            let expected_row = band_row - 2 + u16::try_from(index).unwrap();
+            let expected_y = 8 + i32::from(expected_row) * i32::try_from(cell_h).unwrap();
+            let expected_x = 8 + i32::try_from(u32::from(window.x) + 4).unwrap()
+                * i32::try_from(cell_w).unwrap();
+            assert_eq!(fill.rect.x, expected_x, "anchored at the region column");
+            assert_eq!(fill.rect.y, expected_y, "stacked above the bottom band");
+        }
+    }
+
+    #[test]
     fn missing_surface_paints_nothing() {
         // No surface stays a no-op: capture-less frames are byte-identical.
         let mut rt = runtime();

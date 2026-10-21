@@ -1464,8 +1464,13 @@ impl Runtime {
         self.update_plaintext_hover(pos);
         // Issue #2411: refresh plugin band hover last, also change-gated.
         // Hover is presentation-only: it queues at most one bounded
-        // transition per region and touches no capture or modal state.
-        self.update_band_hover(pos);
+        // transition per region and touches no capture or modal state. Motion
+        // is inert while the window is unfocused (a background window must
+        // not dispatch plugin commands) and while a focusable overlay holds
+        // capture (no tooltip may re-arm under a modal).
+        if self.focused {
+            self.update_band_hover(pos);
+        }
     }
 
     /// Current modifier bits for a mouse report: shift `4`, alt `8`, ctrl

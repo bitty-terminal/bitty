@@ -325,6 +325,32 @@ impl std::fmt::Display for UiAnchor {
     }
 }
 
+/// Host context a scene is validated for (issue #2411).
+///
+/// Group anchors only resolve in a band scene, where the host owns one inset
+/// row of known width. Every other mount (the focusable overlay, a future
+/// terminal-attached block) has no row to resolve against, so an `anchor`
+/// there is rejected at parse time instead of being silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiSceneScope {
+    /// A horizontal band slot (`top`/`bottom`): root-`Row` child anchors
+    /// resolve against the presented width.
+    Band,
+    /// Any other host surface: anchors are invalid.
+    Unanchored,
+}
+
+impl UiSceneScope {
+    /// Host spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Band => "band",
+            Self::Unanchored => "unanchored",
+        }
+    }
+}
+
 /// Marshalling bounds for one raw component value, evaluated before shape
 /// validation. Generous enough for the v1 vocabulary (the scene-node walk
 /// enforces the exact `SCN-1`/`SCN-3` numbers) and tight enough that a
@@ -742,8 +768,23 @@ impl UiNode {
     /// `E_UI_COMPONENT_INVALID` when the value is not a v1 node table, carries
     /// an unknown or excluded kind, nests deeper than [`UI_MAX_DEPTH`], or
     /// exceeds [`UI_MAX_NODES`] / [`UI_MAX_TEXT_BYTES`].
+    ///
+    /// This is the band-scope convenience (anchors resolve); a host validating
+    /// any other surface calls [`Self::from_lua_value_in`] with
+    /// [`UiSceneScope::Unanchored`].
     pub fn from_lua_value(value: &LuaValue) -> Result<Self, BridgeError> {
-        let node = Self::from_value(value, 1, NodePlacement::Root)?;
+        Self::from_lua_value_in(value, UiSceneScope::Band)
+    }
+
+    /// Validate an already-marshalled bounded value for one host scope
+    /// (issue #2411).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::from_lua_value`], plus a declared `anchor` on a scene
+    /// validated with [`UiSceneScope::Unanchored`].
+    pub fn from_lua_value_in(value: &LuaValue, scope: UiSceneScope) -> Result<Self, BridgeError> {
+        let node = Self::from_value(value, 1, NodePlacement::Root, scope)?;
         let nodes = node.count_nodes();
         if nodes > UI_MAX_NODES {
             return Err(component_invalid(format!(
@@ -763,6 +804,7 @@ impl UiNode {
         value: &LuaValue,
         depth: usize,
         placement: NodePlacement,
+        scope: UiSceneScope,
     ) -> Result<Self, BridgeError> {
         if depth > UI_MAX_DEPTH {
             return Err(component_invalid(format!(
@@ -783,7 +825,7 @@ impl UiNode {
         }
 
         // Parse style attributes (CTX-0890).
-        let anchor = extract_anchor(value, placement)?;
+        let anchor = extract_anchor(value, placement, scope)?;
         let fg = extract_theme_token(value, "fg")?;
         let bg = extract_theme_token(value, "bg")?;
         let bold = extract_bool_opt(value, "bold")?;
@@ -833,7 +875,7 @@ impl UiNode {
                 } else {
                     NodePlacement::Nested
                 };
-                let nodes = Self::children_array(children, depth, child_placement)?;
+                let nodes = Self::children_array(children, depth, child_placement, scope)?;
                 Ok(match kind {
                     "Row" => Self::Row {
                         anchor,
@@ -875,6 +917,7 @@ impl UiNode {
         value: &LuaValue,
         depth: usize,
         placement: NodePlacement,
+        scope: UiSceneScope,
     ) -> Result<Vec<Self>, BridgeError> {
         let LuaValue::Table(pairs) = value else {
             return Err(component_invalid(
@@ -903,7 +946,7 @@ impl UiNode {
                     "component children must be a dense 1-based array",
                 ));
             }
-            nodes.push(Self::from_value(child, depth + 1, placement)?);
+            nodes.push(Self::from_value(child, depth + 1, placement, scope)?);
         }
         Ok(nodes)
     }
@@ -1038,6 +1081,7 @@ fn extract_hover_command(value: &LuaValue) -> Result<Option<ClickCommand>, Bridg
 fn extract_anchor(
     value: &LuaValue,
     placement: NodePlacement,
+    scope: UiSceneScope,
 ) -> Result<Option<UiAnchor>, BridgeError> {
     let Some(anchor) = value.get("anchor") else {
         return Ok(None);
@@ -1047,6 +1091,11 @@ fn extract_anchor(
             .ok_or_else(|| component_invalid("anchor must be 'left', 'center', or 'right'"))?,
         _ => return Err(component_invalid("anchor must be a string")),
     };
+    if scope != UiSceneScope::Band {
+        return Err(component_invalid(
+            "anchor is only valid in a band scene (top/bottom slot)",
+        ));
+    }
     if placement != NodePlacement::RootRowChild {
         return Err(component_invalid(
             "anchor is only valid on a direct child of the scene root Row",
@@ -1250,10 +1299,10 @@ pub fn component_invalid(message: impl Into<String>) -> BridgeError {
 /// [`BridgeError`] with class `validation` and code
 /// `E_UI_COMPONENT_INVALID` when the value cannot be marshalled or violates
 /// the v1 scene contract.
-pub fn read_component(value: Value<'_>) -> Result<UiNode, BridgeError> {
+pub fn read_component(value: Value<'_>, scope: UiSceneScope) -> Result<UiNode, BridgeError> {
     let marshalled = LuaValue::from_lua(value, UI_MARSHAL_LIMITS)
         .map_err(|error| component_invalid(error.message))?;
-    UiNode::from_lua_value(&marshalled)
+    UiNode::from_lua_value_in(&marshalled, scope)
 }
 
 #[cfg(test)]
@@ -2258,5 +2307,25 @@ mod tests {
             node.retained_string_bytes(),
             "clock".len() + "clock".len() + "bar.hover".len() + "label".len() + "detail".len()
         );
+    }
+
+    #[test]
+    fn anchors_are_band_scope_only() {
+        // Review N2: a scene validated for a host surface with no bounded row
+        // must reject a declared anchor instead of silently ignoring it.
+        let value = row(vec![anchored("Row", "left", vec![text("clock")])]);
+        let band = UiNode::from_lua_value_in(&value, UiSceneScope::Band)
+            .expect("band scene resolves anchors");
+        let UiNode::Row { children, .. } = &band else {
+            panic!("root is a Row");
+        };
+        assert_eq!(children[0].anchor(), Some(UiAnchor::Left));
+
+        let error = UiNode::from_lua_value_in(&value, UiSceneScope::Unanchored)
+            .expect_err("unanchored scene rejects anchors");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("band scene"));
+        assert_eq!(UiSceneScope::Band.as_str(), "band");
+        assert_eq!(UiSceneScope::Unanchored.as_str(), "unanchored");
     }
 }

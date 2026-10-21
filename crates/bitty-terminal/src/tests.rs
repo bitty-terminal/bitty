@@ -13493,3 +13493,181 @@ events = []
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+#[test]
+fn overlay_capture_gates_band_hover_and_delivers_the_leave_after_release() {
+    // Review B2: a focusable overlay capture owns the cold phase. A hovered
+    // tooltip is torn down with one leave, motion cannot re-arm it under the
+    // modal, and the queued leave dispatches once the capture ends.
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx2411-capture-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-featured.ctx2411capture";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-2411 hover capture gate"
+version = "0.1.0"
+description = "hover is muted while a focusable overlay capture holds"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+ui.overlay.focus = true
+
+[lazy]
+commands = ["{id}:detail", "{id}:capture", "{id}:release"]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local tooltip = bitty.ui.mount("overlay", { kind = "Text", text = "" })
+        local function set_detail(text)
+          if tooltip then bitty.ui.update(tooltip, { kind = "Text", text = text }) end
+        end
+        bitty.commands.register({
+          id = "detail",
+          title = "Detail",
+          run = function(args)
+            local text = ""
+            if type(args) == "table" and args.phase == "enter" then
+              text = "detail:" .. tostring(args.region)
+            end
+            set_detail(text)
+            return true
+          end,
+        })
+        bitty.commands.register({
+          id = "capture",
+          title = "Capture",
+          run = function()
+            local ok = pcall(bitty.ui.overlay.acquire, tooltip)
+            return ok
+          end,
+        })
+        bitty.commands.register({
+          id = "release",
+          title = "Release",
+          run = function()
+            local ok = pcall(bitty.ui.overlay.release, tooltip)
+            return ok
+          end,
+        })
+        bitty.ui.mount("top", { kind = "Row", children = {
+          { kind = "Row", anchor = "left", children = {
+            { kind = "Text", text = "clock",
+              on_hover = { command = "detail", region = { id = "clock" } } },
+          } },
+        } })
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime));
+    app.set_session_persistence(false);
+    let _ = app.drive_tick();
+    let row = app
+        .runtime
+        .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
+        .expect("top band row");
+
+    let (cw, ch) = app.runtime.live_cell_size();
+    let pad = f64::from(app.runtime.window_padding_physical());
+    let over_clock = bitty_platform::CursorPosition {
+        x: pad + 0.5 * f64::from(cw),
+        y: pad + (f64::from(row) + 0.5) * f64::from(ch),
+    };
+    app.runtime.handle_cursor_moved(over_clock);
+    assert_eq!(app.pump_cold_commands(), 1, "hover enter dispatched");
+    let _ = app.drive_tick();
+    assert!(app.runtime.plugin_overlay().is_some());
+    assert!(app.runtime.plugin_overlay_anchor().is_some());
+
+    // The plugin acquires a focusable capture (e.g. an unrelated modal).
+    app.plugin_runtime
+        .as_mut()
+        .expect("runtime")
+        .dispatch_command(&pid, "capture", &[])
+        .expect("capture command");
+    let _ = app.drive_tick();
+    assert!(app.overlay_capture_active());
+    assert!(
+        app.runtime.hovered_band_region().is_none(),
+        "capture start clears hover ownership"
+    );
+    assert!(
+        app.runtime.plugin_overlay_anchor().is_none(),
+        "no hover tooltip is anchored under the modal"
+    );
+
+    // Motion under the modal neither queues nor dispatches hover, even though
+    // the pointer sits on the same region.
+    app.runtime.handle_cursor_moved(over_clock);
+    assert_eq!(app.pump_cold_commands(), 0, "hover is muted while captured");
+
+    // Releasing the capture lets the single queued leave dispatch.
+    assert!(app.revoke_overlay_capture());
+    let _ = app.drive_tick();
+    assert!(!app.overlay_capture_active());
+    assert_eq!(
+        app.pump_cold_commands(),
+        1,
+        "the capture-start leave dispatches after release"
+    );
+    assert!(app.runtime.plugin_overlay().is_none());
+    assert!(app.runtime.plugin_overlay_anchor().is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

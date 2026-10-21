@@ -296,8 +296,11 @@ fn inherited_region(
 /// This is the **unbounded** walk: every group flows left-to-right from
 /// column 0, which is exactly the pre-#2411 layout. A host that presents one
 /// row at a known width uses [`flatten_band_runs_in_width`] so declared group
-/// anchors resolve; both walks emit text in the same order, so a plugin scene
-/// without anchors produces byte-identical runs either way.
+/// anchors resolve. Both walks emit text in the same order; for an unanchored
+/// scene whose leaves all fit they produce the same runs (including the
+/// zero-width run of an empty `Text`). The one difference is deliberate: the
+/// width walk drops the run of a non-empty leaf that does not fit its slot,
+/// so a clipped item can never claim a hit region.
 #[must_use]
 pub fn flatten_band_runs(root: &UiNode) -> (String, Vec<BandRun>) {
     flatten_band_runs_under(root, &BandInherited::default())
@@ -366,8 +369,13 @@ impl BandEmit {
         if let Some((start, end)) = clip {
             if end <= start {
                 // Nothing of this subtree fits its slot; emit nothing so a
-                // clipped item cannot claim a hit region.
-                return;
+                // clipped item cannot claim a hit region. The one exception is
+                // an empty `Text` leaf, which keeps its zero-width run (the
+                // unbounded walk's shape) clamped onto the slot boundary.
+                let empty_leaf = matches!(node, UiNode::Text { text, .. } if text.is_empty());
+                if !empty_leaf {
+                    return;
+                }
             }
         }
         let effective = inherited.layered(node);
@@ -394,13 +402,16 @@ impl BandEmit {
                     emitted = emitted.saturating_add(width);
                     self.chars = self.chars.saturating_add(1);
                 }
-                if run_start.is_none() && clip.is_some() {
-                    // A leaf clipped entirely out of its group emits no run:
-                    // it paints nothing and must not claim a hit region. An
-                    // unclipped empty leaf keeps its pre-#2411 zero-width run.
-                    return;
-                }
-                let start_col = run_start.unwrap_or(origin);
+                let start_col = match run_start {
+                    Some(start) => start,
+                    // A non-empty leaf clipped entirely out of its slot emits
+                    // no run: it paints nothing and must not claim a hit
+                    // region. An empty leaf still yields its zero-width run
+                    // (the pre-#2411 shape), clamped into its slot so even an
+                    // over-subscribed row keeps every span inside the width.
+                    None if clip.is_some() && !leaf.is_empty() => return,
+                    None => clip.map_or(origin, |(start, end)| origin.clamp(start, end)),
+                };
                 self.runs.push(BandRun {
                     start_col,
                     end_col: start_col.saturating_add(emitted),
@@ -461,9 +472,10 @@ struct GroupSlot {
 ///
 /// 1. `left` groups (and unanchored children, which default to `left`) claim
 ///    `[0, left_total)` in declaration order.
-/// 2. `right` groups claim the trailing edge in declaration order measured
-///    from the edge inward, clipped so they never start before the left
-///    groups end.
+/// 2. `right` groups claim the trailing edge with the **last declared child
+///    at the edge** and earlier declared children stacked inward (so the
+///    declaration order still reads left-to-right on screen), clipped so they
+///    never start before the left groups end.
 /// 3. `center` groups stack from the desired full-width center
 ///    (`(width - center_total) / 2`), pushed right only as far as the left
 ///    groups require and clipped at the right groups' start.
@@ -1351,6 +1363,14 @@ pub struct BandHoverRequest {
     pub region: UiRegion,
     /// Transition this dispatch reports.
     pub phase: BandHoverPhase,
+    /// Presentation-captured origin (CTX-1332 C-D4; issue #2411).
+    ///
+    /// Stamped from the last presented frame like a click or scroll, so the
+    /// cold pump can refuse a transition whose band was replaced, moved, or
+    /// reflowed after it was queued. A request without one is test-only and
+    /// is refused by the application, so hover can never mint a stale action.
+    #[doc(hidden)]
+    pub origin: Option<BandOrigin>,
 }
 
 /// One live hover state: which band item the pointer is on (issue #2411).
@@ -1369,6 +1389,9 @@ pub(super) struct BandHoverState {
     /// this column against the live tree is how a band replacement or a
     /// content update proves the hover still names a real item.
     col: usize,
+    /// Presented origin captured at enter; the paired leave carries the same
+    /// fence so a stale transition is refused rather than retargeted.
+    origin: Option<BandOrigin>,
 }
 
 impl BandHoverState {
@@ -1389,6 +1412,7 @@ impl BandHoverState {
             args: self.args.clone(),
             region: self.region.clone(),
             phase: BandHoverPhase::Leave,
+            origin: self.origin.clone(),
         }
     }
 
@@ -1400,6 +1424,7 @@ impl BandHoverState {
             args: self.args.clone(),
             region: self.region.clone(),
             phase: BandHoverPhase::Enter,
+            origin: self.origin.clone(),
         }
     }
 }
@@ -2531,7 +2556,16 @@ impl Runtime {
     /// `modal_active`, and carries a stable region id plus a phase. A binding
     /// with an unroutable command counts [`BandHostStats::hovers_denied`] and
     /// is treated as no target (a leave for the previous item still fires).
+    ///
+    /// Motion is inert while the window is unfocused or while a focusable
+    /// overlay capture holds: a modal must never re-arm a tooltip underneath
+    /// itself. The teardown transition (one leave) is queued by
+    /// [`Self::clear_band_hover`] when focus or capture state changes, not by
+    /// motion.
     pub fn update_band_hover(&mut self, pos: CursorPosition) {
+        if !self.focused || self.hover_suppressed_by_overlay {
+            return;
+        }
         let next = match self.band_hover_probe(pos) {
             HoverProbe::Target(state) => Some(state),
             HoverProbe::Denied => {
@@ -2583,6 +2617,9 @@ impl Runtime {
                 command: target.command,
                 args: target.args,
                 col: hit.col,
+                origin: self
+                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .cloned(),
             }),
             BandHoverOutcome::Denied => HoverProbe::Denied,
             BandHoverOutcome::NoClaim => HoverProbe::None,
@@ -2597,7 +2634,19 @@ impl Runtime {
     /// leave a tooltip visible), and an identical phase coalesces. A full
     /// queue drops the newest transition fail-closed and counts
     /// [`BandHostStats::hover_queue_drops`].
+    ///
+    /// A transition whose presented origin is no longer current is refused
+    /// here and counts [`BandHostStats::hovers_denied`], mirroring band
+    /// scrolls: a remount, edge move, reflow, or version reset never
+    /// retargets hover to different content. (Core tears the tooltip down
+    /// independently, so a refused stale `leave` cannot leave one visible.)
     fn queue_band_hover(&mut self, request: BandHoverRequest) {
+        if let Some(origin) = request.origin.as_ref() {
+            if !self.band_origin_is_current(origin) {
+                self.band_stats.hovers_denied = self.band_stats.hovers_denied.saturating_add(1);
+                return;
+            }
+        }
         let same_region = |queued: &BandHoverRequest| {
             queued.plugin_id == request.plugin_id && queued.region == request.region
         };
@@ -2619,10 +2668,12 @@ impl Runtime {
     /// Drains queued band hover transitions for application dispatch
     /// (issue #2411).
     ///
-    /// The application dispatches each through the plugin runtime's normal
-    /// command path (registration, capability, and schema gates unchanged);
-    /// the runtime never touches a VM. Order is transition order modulo
-    /// per-region coalescing; the queue is empty in the common case.
+    /// The application dispatches each through
+    /// `PluginRuntime::dispatch_ui_command` with the captured origin (the same
+    /// presented-frame fence clicks and scrolls use), so registration,
+    /// capability, args-schema, and origin-currency gates all apply; the
+    /// runtime never touches a VM. Order is transition order modulo per-region
+    /// coalescing; the queue is empty in the common case.
     pub fn drain_band_hovers(&mut self) -> Vec<BandHoverRequest> {
         self.band_hover_queue.drain(..).collect()
     }
@@ -2717,6 +2768,20 @@ impl Runtime {
         if let Some(state) = self.band_hover.take() {
             self.queue_band_hover(state.leave_request());
         }
+    }
+
+    /// Ends hover ownership when a focusable overlay capture starts
+    /// (issue #2411).
+    ///
+    /// Drops every pending transition first, then queues exactly one `leave`
+    /// for the item that was live. The application does not enter a plugin VM
+    /// for hover while capture holds, so the queued leave dispatches when the
+    /// modal ends — and a tooltip can neither stay visible nor re-arm under
+    /// the modal, because Core stops selecting the hover surface as soon as
+    /// capture is active.
+    pub(super) fn clear_band_hover_for_capture(&mut self) {
+        self.band_hover_queue.clear();
+        self.clear_band_hover();
     }
 
     /// Clears the hover when the live band no longer carries its region
@@ -3468,5 +3533,55 @@ mod tests {
             BandHoverOutcome::Target(target) => assert_eq!(target.region.id, "clock"),
             outcome => panic!("expected icon hover target, got {outcome:?}"),
         }
+    }
+
+    #[test]
+    fn hover_queue_fences_the_presented_origin() {
+        // Review N3: hover uses the same presented-frame fence as clicks and
+        // scrolls; a stale origin is refused instead of retargeted.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![super::BandContent {
+                plugin_id: "test-bar".to_string(),
+                slot: UiSlot::Top,
+                root: UiNode::text("clock"),
+                version: 1,
+            }],
+            ..Default::default()
+        });
+        let row = rt.visible_band_row(BandEdge::Top, 0).expect("band row");
+        let origin = BandOrigin {
+            plugin_id: "test-bar".to_string(),
+            generation: 1,
+            handle: 1,
+            slot: UiSlot::Top,
+            version: 1,
+            edge: BandEdge::Top,
+            visible_index: 0,
+            row,
+        };
+        let request = |origin: Option<BandOrigin>| BandHoverRequest {
+            plugin_id: "test-bar".to_string(),
+            command: "detail".to_string(),
+            args: Vec::new(),
+            region: UiRegion {
+                id: "clock".to_string(),
+                kind: bitty_lua::ui::UiRegionKind::Module,
+            },
+            phase: BandHoverPhase::Enter,
+            origin,
+        };
+
+        // Not pending/published yet: stale, refused.
+        rt.queue_band_hover(request(Some(origin.clone())));
+        assert!(rt.band_hover_queue.is_empty());
+        assert_eq!(rt.band_stats.hovers_denied, 1);
+
+        // Live capture: accepted, and the app can dispatch it.
+        rt.pending_band_origins = vec![origin.clone()];
+        rt.published_band_origins = vec![origin.clone()];
+        rt.queue_band_hover(request(Some(origin)));
+        assert_eq!(rt.band_hover_queue.len(), 1);
+        assert_eq!(rt.band_stats.hovers_routed, 1);
     }
 }

@@ -35,7 +35,7 @@
 //! - **Bounded, fail closed.** Every geometry value has a documented cap;
 //!   overflow is a typed error, never a silent clamp or default.
 //! - **Presentation only.** No input, terminal state, renderer handle, or
-//!   plugin VM participates. [`SceneStyle::resolve`] is a pure function of
+//!   plugin VM participates. [`resolve`] is a pure function of
 //!   its inputs, safe to run on the cold path.
 //! - **No-op when unused.** [`ResolvedSceneStyle::paint_signature`] is empty
 //!   for an unstyled node, so a consumer that only emits style paint ops for
@@ -568,7 +568,10 @@ pub struct ResolvedBorder {
     pub width_source: StyleSource,
 }
 
-/// A resolved style: concrete values plus per-field attribution.
+/// A resolved style: concrete values plus attribution for the resolved
+/// padding and radius fields and, when the border width is non-zero, for the
+/// border's width and colour token. An explicit `border = 0` resolves no
+/// border and therefore reports no border attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolvedSceneStyle {
     padding_cells: u16,
@@ -697,7 +700,7 @@ pub enum StylePaintOp {
 /// Resolves a node declaration over a theme content style.
 ///
 /// Per field the order is `node` > `theme` > framework default (`0`). A
-/// border colour comes from `tokens` (the accepted theme-token resolution
+/// border colour comes from `tokens` (the candidate theme-token resolution
 /// cascade) and inherits its winning [`TokenLayer`] as attribution. When the
 /// effective border width is `0`, no border is resolved and the colour token
 /// is inert.

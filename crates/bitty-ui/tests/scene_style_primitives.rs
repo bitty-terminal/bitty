@@ -3,7 +3,7 @@
 //! Candidate-status honesty: these tests pin the draft candidate primitive
 //! set, caps, precedence, wire round-trip, and no-authority boundary from the
 //! scene-style-primitives candidate record. They assert nothing beyond the
-//! accepted theme-token cascade and the accepted decoration ranges the caps
+//! candidate theme-token cascade and the accepted decoration ranges the caps
 //! reuse.
 //!
 //! Headless, deterministic, and bounded: no window, GPU, PTY, filesystem, or
@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use bitty_ui::decoration::{MAX_CONTENT_INSET_PX, MAX_RADIUS_PX};
 use bitty_ui::scene_style::{
     BorderToken, SCENE_STYLE_MAX_BORDER_PX, SCENE_STYLE_MAX_NAME_BYTES,
     SCENE_STYLE_MAX_PADDING_CELLS, SCENE_STYLE_MAX_RADIUS_PX, SceneStyle, SceneStyleError,
@@ -91,6 +92,58 @@ fn node_override_wins_per_field_and_keeps_theme_context() {
 }
 
 #[test]
+fn node_border_token_overrides_theme_token() {
+    let tokens = resolve_tokens(
+        &[("content.accent", "#112233"), ("state.error", "#445566")],
+        None,
+        &[],
+        false,
+    )
+    .expect("theme resolves");
+    let theme = styled_theme();
+    let node = SceneStyle::none().with_border_token(BorderToken::Error);
+    let resolved = resolve(&theme, &node, &tokens, false).expect("resolves");
+
+    let border = resolved.border().expect("border resolves");
+    assert_eq!(border.token, BorderToken::Error);
+    assert_eq!(border.color, TokenColor::parse("#445566").expect("hex"));
+    assert_eq!(border.token_layer, TokenLayer::ThemePreset);
+    assert_eq!(
+        border.width_px, 2,
+        "the node token does not claim the theme width"
+    );
+}
+
+#[test]
+fn node_border_width_overrides_theme_width_with_node_source() {
+    let node = SceneStyle::none().with_border(5).expect("within cap");
+    let resolved = resolve(&styled_theme(), &node, &tokens(), false).expect("resolves");
+
+    let border = resolved.border().expect("border resolves");
+    assert_eq!(border.width_px, 5);
+    assert_eq!(border.width_source, StyleSource::NodeOverride);
+    assert_eq!(
+        border.token,
+        BorderToken::Accent,
+        "the theme token survives a width-only override"
+    );
+}
+
+#[test]
+fn node_radius_overrides_theme_radius() {
+    let node = SceneStyle::none().with_radius(3).expect("within cap");
+    let resolved = resolve(&styled_theme(), &node, &tokens(), false).expect("resolves");
+
+    assert_eq!(resolved.radius_px(), 3);
+    assert_eq!(resolved.radius_source(), StyleSource::NodeOverride);
+    assert_eq!(
+        resolved.padding_cells(),
+        4,
+        "unclaimed fields still come from the theme"
+    );
+}
+
+#[test]
 fn safe_policy_ignores_every_declaration() {
     let resolved = resolve(&styled_theme(), &styled_theme(), &tokens(), true)
         .expect("safe resolution cannot fail on a valid declaration");
@@ -146,6 +199,27 @@ fn caps_are_inclusive_and_overflow_fails_closed() {
     assert!(matches!(error, SceneStyleError::PaddingOverCap { .. }));
     let error = parse(&[("radius", StyleArg::Int(-1))]).expect_err("negative fails");
     assert!(matches!(error, SceneStyleError::InvalidValue { .. }));
+}
+
+#[test]
+fn caps_track_the_accepted_decoration_ranges() {
+    // Shared-constant drift check: the candidate caps reuse accepted ranges.
+    assert_eq!(
+        SCENE_STYLE_MAX_PADDING_CELLS, MAX_CONTENT_INSET_PX,
+        "padding cap tracks decoration.content_inset"
+    );
+    assert_eq!(
+        SCENE_STYLE_MAX_RADIUS_PX, MAX_RADIUS_PX,
+        "radius cap tracks decoration.radius"
+    );
+    // A scene border is a stroke, not a View frame: the cap tracks the
+    // accepted outline `border_width` range (0..=16), not
+    // `decoration.border` (0..=8).
+    const ACCEPTED_OUTLINE_BORDER_WIDTH_MAX: u16 = 16;
+    assert_eq!(
+        SCENE_STYLE_MAX_BORDER_PX, ACCEPTED_OUTLINE_BORDER_WIDTH_MAX,
+        "border cap tracks the accepted outline width range"
+    );
 }
 
 #[test]

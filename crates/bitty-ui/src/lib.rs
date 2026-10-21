@@ -108,6 +108,10 @@
 //!   user rule above workspace rule above user theme above plugin
 //!   preference above plugin content theme above framework default) with
 //!   per-key attribution (UX-20, CTX-0669, candidate).
+//! - [`scene_style`] — closed candidate style primitives for extension-owned
+//!   scene nodes (`padding`, `radius`, `border`, `border_token`) resolved from
+//!   the theme with inclusive caps and fail-closed overflow (bitty#2112,
+//!   candidate; no paint consumer yet).
 
 //! - [`canvas`] — bounded `Canvas` display lists retained for compositor
 //!   replay at refresh, revision-gated like [`uitree`] (UX-25, CTX-0671,

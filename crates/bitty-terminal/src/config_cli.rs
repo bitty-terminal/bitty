@@ -1232,6 +1232,12 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     );
                 }
                 let hue_violations = bitty_config::theme::hue_violations(&theme);
+                if let Some(reason) = bitty_config::theme::hue_collision_exemption(&theme) {
+                    println!(
+                        "{}",
+                        check_row("theme.hue.exempt", reason.to_string(), "documented")
+                    );
+                }
                 for row in &hue_violations {
                     println!(
                         "{}",

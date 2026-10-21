@@ -4018,8 +4018,12 @@ impl Runtime {
         let cell_h = live.height;
         // Width in display cells (wide glyphs count 2), clipped to the frame.
         let (clipped, text_cells) = clip_to_width_cells(&overlay_row.text, frame.cols);
-        // Center the pill in the focused frame on its row.
-        let pill_w = px_span_usize(text_cells, cell_w);
+        // Center the pill in the focused frame on its row. `text_cells` is
+        // already floored at one cell by `clip_to_width_cells`, and the floor
+        // is repeated here so the pill width never depends on that helper: an
+        // empty composer buffer must still paint a one-cell rect instead of a
+        // zero-width one (CTX-1143, CTX-1419, issue #2191).
+        let pill_w = px_span_usize(text_cells.max(1), cell_w);
         let origin_px_x = px_add(
             px_add(pad_px, frame.content.x),
             px_side(full_w.saturating_sub(pill_w)) / 2,
@@ -4949,7 +4953,8 @@ struct OverlayPill {
     origin_x: i32,
     /// Top edge in window pixels.
     origin_y: i32,
-    /// Pill width in pixels (at least one cell).
+    /// Pill width in pixels (never narrower than one cell; a row that clips to
+    /// zero text cells still reserves its one-cell chrome).
     width_px: u32,
     /// Pill height in pixels (one cell).
     height_px: u32,
@@ -5510,6 +5515,20 @@ mod plugin_overlay_paint_tests {
             "a styled empty row falls back to one default pill fill"
         );
         assert_eq!(layers.combined_overlay[0].color, rt.config.theme.background);
+        // One-cell chrome is a pixel claim, not just a draw-layer count: a
+        // zero-width fallback rect would satisfy the fill/flag assertions while
+        // still rendering nothing (CTX-1419 review, issue #2191).
+        let cell_w = u32::from(rt.live_cell_metrics().width);
+        assert!(cell_w > 0, "the deterministic cell width is nonzero");
+        assert_eq!(
+            layers.combined_overlay[0].rect.width, cell_w,
+            "the empty pill clamps to exactly one cell instead of collapsing to zero"
+        );
+        assert_eq!(
+            layers.combined_overlay[0].rect.height,
+            u32::from(rt.live_cell_metrics().height),
+            "the one-cell chrome is one row tall"
+        );
         assert!(
             layers.combined_glyphs.is_empty(),
             "empty text paints no glyphs"

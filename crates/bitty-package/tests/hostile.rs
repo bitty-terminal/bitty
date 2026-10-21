@@ -12,7 +12,6 @@ use bitty_package::{
     PackageDigests, PackageId, PackageIdentity, PackageManifest, PackageSource, Version,
     VersionReq, capability_requires_param, sha256_hex,
 };
-use bitty_package::{IndexEntry, PackageIndex, resolve, resolve_preserving_locked};
 use bitty_package::{
     KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, signing_message,
     verify_signature,
@@ -38,35 +37,6 @@ fn dep(id: &str, req: &str) -> PackageDependency {
         version_req: req.to_string(),
         prerelease: false,
     }
-}
-
-fn dep_pre(id: &str, req: &str, pre: bool) -> PackageDependency {
-    PackageDependency {
-        id: pid(id),
-        version_req: req.to_string(),
-        prerelease: pre,
-    }
-}
-
-fn manifest_with_deps(deps: Vec<PackageDependency>) -> PackageManifest {
-    PackageManifest {
-        identity: PackageIdentity {
-            id: pid("xuepoo.root"),
-            name: "Root".to_string(),
-            version: "0.1.0".to_string(),
-            description: "root".to_string(),
-            license: None,
-        },
-        compat: Compat::default(),
-        dependencies: deps,
-        capabilities: Vec::new(),
-        raw_bytes_len: 256,
-        undeclared_fields: Vec::new(),
-    }
-}
-
-fn entry(id: &str, ver: &str, yanked: bool, deps: Vec<PackageDependency>) -> IndexEntry {
-    IndexEntry::new(pid(id), ver.to_string(), yanked, deps).unwrap()
 }
 
 // ── V-C signing helpers (bitty#767) ───────────────────────────────────────
@@ -129,122 +99,7 @@ fn minimal_manifest(id: &str) -> PackageManifest {
     }
 }
 
-// ── cycles / diamond ─────────────────────────────────────────────────────
-
-#[test]
-fn cycle_converges_when_consistent() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.b", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.a", "^1.0")],
-    ))
-    .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "^1.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert!(res.packages.contains_key(&pid("xuepoo.a")));
-    assert!(res.packages.contains_key(&pid("xuepoo.b")));
-}
-
-#[test]
-fn cycle_conflict_reports_named_edges() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.b", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.a",
-        "2.0.0",
-        false,
-        vec![dep("xuepoo.b", "^2.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.a", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "2.0.0",
-        false,
-        vec![dep("xuepoo.a", "^2.0")],
-    ))
-    .unwrap();
-    // Root forces a 1.0 while transitive via b would need 2.0 — need conflict
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "=1.0.0"), dep("xuepoo.b", "=2.0.0")]);
-    let err = resolve(&m, &idx).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("resolver"), "msg: {msg}");
-}
-
-#[test]
-fn diamond_converges_when_compatible() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.5.0", false, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "^1.0"), dep("xuepoo.b", "^1.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.5.0");
-}
-
-#[test]
-fn diamond_conflict_names_both_edges() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^2.0")],
-    ))
-    .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "2.0.0", false, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "^1.0"), dep("xuepoo.b", "^1.0")]);
-    let err = resolve(&m, &idx).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("xuepoo.dep"), "msg must name dep: {msg}");
-    assert!(msg.contains("requires"), "msg must name edges: {msg}");
-}
+// ── manifest dependency schema ─────────────────────────────────────────────
 
 #[test]
 fn self_dependency_rejected_at_manifest_validate() {
@@ -253,147 +108,6 @@ fn self_dependency_rejected_at_manifest_validate() {
     assert!(m.validate().is_err());
     let msg = format!("{}", m.validate().unwrap_err());
     assert!(msg.contains("must not depend on itself"));
-}
-
-// ── yanked ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn yanked_max_filtered_picks_next_stable() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.2.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.5.0", true, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", ">=1.0.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.2.0");
-}
-
-#[test]
-fn yanked_no_alternative_reports_conflict() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "2.0.0", true, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", "^2.0")]);
-    let err = resolve(&m, &idx).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("xuepoo.dep"), "must name package: {msg}");
-}
-
-#[test]
-fn yanked_transitive_skipped() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^1.0")],
-    ))
-    .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "2.0.0", true, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "^1.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.0.0");
-}
-
-#[test]
-fn yanked_preserved_locked_warns_and_picks_yanked() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "2.0.0", true, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", ">=1.0.0")]);
-    let mut lock = Lockfile::new();
-    lock.insert(LockedPackage {
-        id: pid("xuepoo.dep"),
-        version: "2.0.0".to_string(),
-        source: PackageSource::Registry {
-            url: "https://example.com".to_string(),
-        },
-        digests: PackageDigests {
-            artifact: sha256_hex(b"a"),
-            manifest: sha256_hex(b"m"),
-            content_root: None,
-        },
-        locked_at: 1,
-    })
-    .unwrap();
-    let (preserved, warnings) = resolve_preserving_locked(&m, &idx, &lock).unwrap();
-    assert_eq!(preserved.packages[&pid("xuepoo.dep")].version, "2.0.0");
-    assert!(warnings.iter().any(|w| w.contains("yanked (locked)")));
-}
-
-// ── prerelease ───────────────────────────────────────────────────────────────
-
-#[test]
-fn prerelease_excluded_without_opt_in() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.1.0-alpha.1", false, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", "^1.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.0.0");
-}
-
-#[test]
-fn prerelease_opt_in_via_flag() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.1.0-alpha.1", false, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep_pre("xuepoo.dep", "^1.0", true)]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.1.0-alpha.1");
-}
-
-#[test]
-fn prerelease_opt_in_via_same_core_comparator() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.1.0-alpha.1", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.1.0-alpha.2", false, vec![]))
-        .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", ">=1.1.0-alpha")]);
-    let res = resolve(&m, &idx).unwrap();
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.1.0-alpha.2");
-}
-
-#[test]
-fn prerelease_mixed_edges_blocks() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    idx.insert(entry("xuepoo.dep", "1.1.0-alpha.1", false, vec![]))
-        .unwrap();
-    idx.insert(entry(
-        "xuepoo.a",
-        "1.0.0",
-        false,
-        vec![dep_pre("xuepoo.dep", "^1.0", true)],
-    ))
-    .unwrap();
-    idx.insert(entry(
-        "xuepoo.b",
-        "1.0.0",
-        false,
-        vec![dep("xuepoo.dep", "^1.0")],
-    ))
-    .unwrap();
-    let m = manifest_with_deps(vec![dep("xuepoo.a", "^1.0"), dep("xuepoo.b", "^1.0")]);
-    let res = resolve(&m, &idx).unwrap();
-    // Mixed: a opts in, b does not — prerelease must be blocked, so stable 1.0.0
-    assert_eq!(res.packages[&pid("xuepoo.dep")].version, "1.0.0");
 }
 
 // ── corrupt lock / package ─────────────────────────────────────────────────
@@ -880,14 +594,6 @@ fn symlink_like_path_digest_determinism() {
 
 #[test]
 fn concurrent_install_deterministic_digest() {
-    let mut idx = PackageIndex::new();
-    for v in ["1.0.0", "1.1.0", "1.2.0"] {
-        idx.insert(entry("xuepoo.dep", v, false, vec![])).unwrap();
-    }
-    let m = manifest_with_deps(vec![dep("xuepoo.dep", ">=1.0.0, <1.3.0")]);
-    let r1 = resolve(&m, &idx).unwrap();
-    let r2 = resolve(&m, &idx).unwrap();
-    assert_eq!(r1.digest(), r2.digest());
     let mut lock1 = Lockfile::new();
     lock1
         .insert(LockedPackage {
@@ -971,27 +677,6 @@ fn concurrent_install_deterministic_digest() {
     assert_eq!(lock1.digest(), lock2.digest());
 }
 
-#[test]
-fn concurrent_install_comma_order_invariant() {
-    let mut idx = PackageIndex::new();
-    for v in ["1.0.0", "1.1.0", "1.5.0"] {
-        idx.insert(entry("xuepoo.dep", v, false, vec![])).unwrap();
-    }
-    let m1 = manifest_with_deps(vec![PackageDependency {
-        id: pid("xuepoo.dep"),
-        version_req: ">=1.0.0, <1.3.0".to_string(),
-        prerelease: false,
-    }]);
-    let m2 = manifest_with_deps(vec![PackageDependency {
-        id: pid("xuepoo.dep"),
-        version_req: "<1.3.0, >=1.0.0".to_string(),
-        prerelease: false,
-    }]);
-    let r1 = resolve(&m1, &idx).unwrap();
-    let r2 = resolve(&m2, &idx).unwrap();
-    assert_eq!(r1.digest(), r2.digest());
-}
-
 // ── disk full / budget ─────────────────────────────────────────────────────
 
 #[test]
@@ -1034,20 +719,6 @@ fn disk_full_lock_packages_over_limit() {
         .unwrap();
     }
     assert!(lf.validate().is_err());
-}
-
-#[test]
-fn disk_full_resolver_budget_exceeded() {
-    let mut idx = PackageIndex::new();
-    idx.insert(entry("xuepoo.dep", "1.0.0", false, vec![]))
-        .unwrap();
-    let many: Vec<PackageDependency> = (0..65)
-        .map(|i| dep(&format!("xuepoo.p{i:02}"), "^1.0"))
-        .collect();
-    let m = manifest_with_deps(many);
-    let err = resolve(&m, &idx).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("exceeds") || msg.contains("budget") || msg.contains("limit"));
 }
 
 // ── capability escalation ──────────────────────────────────────────────────

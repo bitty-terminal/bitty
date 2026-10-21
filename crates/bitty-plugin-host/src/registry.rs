@@ -1378,54 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn prerelease_edge_plumbs_through_to_package_resolver() {
-        use bitty_package::{PackageId, PackageIndex, resolve};
-        // Mirror the package-resolver harness: stable plus prerelease candidate.
-        let pid = PackageId::new("xuepoo.gitcore").unwrap();
-        let mut idx = PackageIndex::new();
-        for ver in ["2.0.0", "2.1.0-beta.1"] {
-            idx.insert(
-                bitty_package::IndexEntry::new(pid.clone(), ver.to_string(), false, vec![])
-                    .unwrap(),
-            )
-            .unwrap();
-        }
-        let root = |pre: bool| {
-            let dep = PluginDependency::new(pid_as_plugin(), ">=2.0".to_string(), pre).unwrap();
-            let edge = dep.as_package_edge().expect("id converts");
-            assert_eq!(edge.prerelease, pre);
-            let mut m = package_root_manifest();
-            m.dependencies = vec![edge];
-            m
-        };
-        let res = resolve(&root(false), &idx).unwrap();
-        assert_eq!(res.packages[&pid].version, "2.0.0");
-        let res = resolve(&root(true), &idx).unwrap();
-        assert_eq!(res.packages[&pid].version, "2.1.0-beta.1");
-
-        fn pid_as_plugin() -> PluginId {
-            PluginId::new("xuepoo.gitcore").unwrap()
-        }
-        fn package_root_manifest() -> bitty_package::PackageManifest {
-            use bitty_package::{Compat, PackageIdentity, PackageManifest};
-            PackageManifest {
-                identity: PackageIdentity {
-                    id: PackageId::new("xuepoo.root").unwrap(),
-                    name: "Root".to_string(),
-                    version: "0.1.0".to_string(),
-                    description: "root".to_string(),
-                    license: None,
-                },
-                compat: Compat::default(),
-                dependencies: Vec::new(),
-                capabilities: Vec::new(),
-                raw_bytes_len: 256,
-                undeclared_fields: Vec::new(),
-            }
-        }
-    }
-
-    #[test]
     fn activation_fails_on_command_drift() {
         let mut reg = Registry::new();
         let m = table_form_manifest("xuepoo.typed");

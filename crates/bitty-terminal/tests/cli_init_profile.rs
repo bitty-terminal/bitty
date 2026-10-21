@@ -350,11 +350,310 @@ fn legacy_init_is_never_replaced_even_with_force_and_can_migrate() {
 }
 
 #[test]
+fn preset_profiles_seed_without_prompts_or_activation() {
+    let mut lengths = Vec::new();
+    for (name, want_theme) in [
+        ("minimal", "dark"),
+        ("dark", "dark"),
+        ("light", "github-light"),
+    ] {
+        let root = scratch_root(&format!("preset-{name}"));
+        // No --yes and no TTY: presets are deterministic seeds, never prompts.
+        let output = run_bitty(&root, &["init", "--profile", name]);
+        assert_ok(&output, name);
+        assert!(
+            !stdout(&output).contains("Shell:"),
+            "preset {name} must not prompt, stdout={:?}",
+            stdout(&output)
+        );
+        assert!(
+            !init_path(&root).exists(),
+            "preset {name} never writes a selector"
+        );
+        assert!(
+            !profile_path(&root, "default").exists(),
+            "preset {name} never touches the default profile"
+        );
+
+        let body = std::fs::read_to_string(profile_path(&root, name)).expect("preset profile body");
+        assert!(
+            body.contains(&format!("theme = \"{want_theme}\"")),
+            "preset {name} seeds theme {want_theme}:\n{body}"
+        );
+        if name == "minimal" {
+            assert!(!body.contains("font ="), "minimal omits font:\n{body}");
+            assert!(
+                !body.contains("decoration ="),
+                "minimal omits decoration:\n{body}"
+            );
+            assert!(
+                !body.contains("terminal ="),
+                "minimal omits terminal:\n{body}"
+            );
+        } else {
+            assert!(body.contains("font = { family ="), "{body}");
+            assert!(
+                body.contains(&format!("theme = \"{want_theme}\"")),
+                "{body}"
+            );
+        }
+        lengths.push(body.len());
+
+        let check = run_bitty(&root, &["config", "check", "--profile", name]);
+        assert_ok(&check, &format!("{name} check"));
+        let text = stdout(&check);
+        assert!(
+            row(&text, "profile").starts_with(&format!("\"{name}\" (profile: ")),
+            "preset profile resolves:\n{text}"
+        );
+        assert!(
+            row(&text, "appearance.theme").starts_with(&format!("\"{want_theme}\"")),
+            "preset theme resolves:\n{text}"
+        );
+
+        let show = run_bitty(&root, &["config", "profile", "show", name]);
+        assert_ok(&show, &format!("{name} show"));
+        assert!(
+            row(&stdout(&show), "profile").starts_with(&format!("\"{name}\"")),
+            "profile show names the preset:\n{}",
+            stdout(&show)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    assert!(
+        lengths[0] < lengths[1] && lengths[0] < lengths[2],
+        "minimal stays the smallest seed (lengths: {lengths:?})"
+    );
+}
+
+#[test]
+fn preset_reinit_requires_force_and_backs_up_atomically() {
+    let root = scratch_root("preset-force");
+    assert_ok(
+        &run_bitty(&root, &["init", "--profile", "dark"]),
+        "seed dark",
+    );
+    let target = profile_path(&root, "dark");
+    let original = std::fs::read_to_string(&target).expect("dark profile");
+
+    let refused = run_bitty(&root, &["init", "--profile", "dark"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "re-init without --force must fail closed, stderr={:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("already exists"),
+        "refusal names the conflict, stderr={:?}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("profile intact"),
+        original
+    );
+    assert!(
+        !target.with_extension("lua.bak").exists(),
+        "a refusal creates no backup"
+    );
+
+    // A user edit survives in the recoverable backup, and the replacement is
+    // atomic (no temporary siblings survive).
+    let edited = format!("{original}-- local edit\n");
+    std::fs::write(&target, &edited).expect("user edit");
+    assert_ok(
+        &run_bitty(&root, &["init", "--profile", "dark", "--force"]),
+        "force seed dark",
+    );
+    let backup = target.with_extension("lua.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("backup body"),
+        edited,
+        "backup holds the exact previous bytes"
+    );
+    let profiles_dir = config_dir(&root).join("profiles");
+    let leftovers: Vec<String> = std::fs::read_dir(&profiles_dir)
+        .expect("profiles dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+
+    // The forced replacement re-validates through the normal load path.
+    let check = run_bitty(&root, &["config", "check", "--profile", "dark"]);
+    assert_ok(&check, "forced profile re-validates");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn named_profile_reinit_backups_are_collision_free() {
+    let root = scratch_root("named-force");
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "work"]),
+        "work profile",
+    );
+    let target = profile_path(&root, "work");
+    let first = std::fs::read_to_string(&target).expect("work body");
+    assert_ok(
+        &run_bitty(
+            &root,
+            &[
+                "init",
+                "--yes",
+                "--profile",
+                "work",
+                "--font-size",
+                "15",
+                "--force",
+            ],
+        ),
+        "force work",
+    );
+    let second = std::fs::read_to_string(&target).expect("work body 2");
+    assert_ne!(first, second, "forced re-init applies the new value flags");
+    assert_eq!(
+        std::fs::read_to_string(target.with_extension("lua.bak")).expect("first backup"),
+        first
+    );
+    assert_ok(
+        &run_bitty(
+            &root,
+            &[
+                "init",
+                "--yes",
+                "--profile",
+                "work",
+                "--font-size",
+                "16",
+                "--force",
+            ],
+        ),
+        "force work again",
+    );
+    let second_backup = config_dir(&root).join("profiles").join("work.lua.bak.1");
+    assert_eq!(
+        std::fs::read_to_string(&second_backup).expect("second backup"),
+        second,
+        "a second forced write never overwrites the sole recovery copy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.with_extension("lua.bak")).expect("first backup intact"),
+        first
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_precedence_cli_over_env_over_selector() {
+    let root = scratch_root("precedence");
+    assert_ok(&run_bitty(&root, &["init", "--yes"]), "fresh init");
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "work"]),
+        "work profile",
+    );
+    assert_ok(
+        &run_bitty(&root, &["init", "--yes", "--profile", "envp"]),
+        "env profile",
+    );
+    std::fs::write(
+        profile_path(&root, "work"),
+        "return { font = { family = \"Fira Code\", size = 14 } }\n",
+    )
+    .expect("work body");
+    std::fs::write(
+        profile_path(&root, "envp"),
+        "return { font = { family = \"Iosevka\", size = 13 } }\n",
+    )
+    .expect("env body");
+
+    // Persisted selector (bare launch).
+    let bare = run_bitty(&root, &["config", "check"]);
+    assert_ok(&bare, "selector check");
+    assert!(
+        row(&stdout(&bare), "profile").starts_with("\"default\" (profile: "),
+        "{}",
+        stdout(&bare)
+    );
+
+    // BITTY_PROFILE wins over the persisted selector.
+    let env_selected = Command::new(BITTY_BIN)
+        .args(["config", "check"])
+        .env("XDG_CONFIG_HOME", &root)
+        .env("HOME", &root)
+        .env("BITTY_PROFILE", "envp")
+        .env("NO_COLOR", "1")
+        .env_remove("BITTY_CONFIG")
+        .output()
+        .expect("spawn env check");
+    assert_ok(&env_selected, "env check");
+    let env_text = stdout(&env_selected);
+    assert!(
+        row(&env_text, "profile").starts_with("\"envp\" (profile: "),
+        "{env_text}"
+    );
+    assert!(
+        row(&env_text, "font.family").starts_with("\"Iosevka\""),
+        "{env_text}"
+    );
+
+    // --profile wins over BITTY_PROFILE for that one launch.
+    let cli_selected = Command::new(BITTY_BIN)
+        .args(["config", "check", "--profile", "work"])
+        .env("XDG_CONFIG_HOME", &root)
+        .env("HOME", &root)
+        .env("BITTY_PROFILE", "envp")
+        .env("NO_COLOR", "1")
+        .env_remove("BITTY_CONFIG")
+        .output()
+        .expect("spawn cli check");
+    assert_ok(&cli_selected, "cli check");
+    let cli_text = stdout(&cli_selected);
+    assert!(
+        row(&cli_text, "profile").starts_with("\"work\" (profile: "),
+        "{cli_text}"
+    );
+    assert!(
+        row(&cli_text, "font.family").starts_with("\"Fira Code\""),
+        "{cli_text}"
+    );
+
+    // The persisted selector is never rewritten by a one-launch selection.
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"default\"")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn invalid_profile_name_and_bitty_profile_never_target_output() {
     let root = scratch_root("names");
     let bad = run_bitty(&root, &["init", "--yes", "--profile", "../escape"]);
     assert_eq!(bad.status.code(), Some(2), "traversal name refused");
     assert!(!config_dir(&root).join("profiles").exists());
+
+    // An explicitly supplied blank name is a usage error, never a silent
+    // fallback that overwrites the default profile.
+    for blank in [
+        &["init", "--yes", "--profile", "   "][..],
+        &["init", "--yes", "--profile="][..],
+    ] {
+        let refused = run_bitty(&root, blank);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "blank profile name must fail closed for {blank:?}, stderr={:?}",
+            stderr(&refused)
+        );
+        assert!(!init_path(&root).exists(), "blank name writes no selector");
+        assert!(
+            !config_dir(&root).join("profiles").exists(),
+            "blank name writes no profile"
+        );
+    }
 
     // A mutating command rejects an omitted target instead of silently
     // falling back to a bare init.

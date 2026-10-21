@@ -8452,6 +8452,219 @@ fn init_write_new_refuse_force_backup_idempotent() {
 }
 
 #[test]
+fn init_profile_presets_are_deterministic_seeds() {
+    // Reserved names are exact lowercase; lookalikes stay custom profiles.
+    assert_eq!(
+        InitProfilePreset::parse("minimal"),
+        Some(InitProfilePreset::Minimal)
+    );
+    assert_eq!(
+        InitProfilePreset::parse("dark"),
+        Some(InitProfilePreset::Dark)
+    );
+    assert_eq!(
+        InitProfilePreset::parse("light"),
+        Some(InitProfilePreset::Light)
+    );
+    assert!(InitProfilePreset::parse("Minimal").is_none());
+    assert!(InitProfilePreset::parse("minimal-2").is_none());
+    assert_eq!(InitProfilePreset::Dark.name(), "dark");
+
+    let minimal = init_preset_answers(InitProfilePreset::Minimal);
+    assert_eq!(minimal.theme, bitty_config::theme::DARK_THEME_ALIAS);
+    assert!(
+        minimal.shell.is_none(),
+        "presets never derive a shell from the host"
+    );
+
+    let dark = init_preset_answers(InitProfilePreset::Dark);
+    assert_eq!(dark.theme, bitty_config::theme::DARK_THEME_ALIAS);
+    assert_eq!(dark.font_family, bitty_config::types::DEFAULT_FONT_FAMILY);
+    assert_eq!(dark.font_size, bitty_config::types::DEFAULT_FONT_SIZE);
+    assert_eq!(
+        dark.scrollback,
+        bitty_config::types::TerminalConfig::default().scrollback
+    );
+    assert_eq!(
+        dark.close_confirm,
+        bitty_config::types::DEFAULT_CLOSE_CONFIRM
+    );
+    assert_eq!(dark.key_preset, InitKeyPreset::Default);
+
+    let light = init_preset_answers(InitProfilePreset::Light);
+    assert_eq!(light.theme, PROFILE_LIGHT_THEME);
+    let (theme, status) = bitty_config::theme::resolve_theme_with_status(Some(&light.theme));
+    assert_eq!(status, bitty_config::theme::ThemeResolution::Named);
+    assert_eq!(theme.name, "github-light");
+    // dark/light differ only in the theme; every other generated default matches.
+    assert_eq!(light.font_family, dark.font_family);
+    assert_eq!(light.font_size, dark.font_size);
+    assert_eq!(light.scrollback, dark.scrollback);
+}
+
+#[test]
+fn init_minimal_profile_renders_smallest_config() {
+    let minimal = init_preset_answers(InitProfilePreset::Minimal);
+    let rendered = render_minimal_profile_lua(&minimal, &InitOverrides::default());
+    let full = render_init_lua(&minimal);
+    assert!(
+        rendered.len() < full.len(),
+        "minimal stays the smallest seed ({} vs {} bytes)",
+        rendered.len(),
+        full.len()
+    );
+    assert!(rendered.contains("theme = \"dark\""));
+    for absent in [
+        "font =",
+        "decoration =",
+        "terminal =",
+        "close_confirm =",
+        "keymaps =",
+    ] {
+        assert!(
+            !rendered.contains(absent),
+            "minimal omits {absent}:\n{rendered}"
+        );
+    }
+
+    let source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::Profile,
+        Some("profiles/minimal.lua"),
+    );
+    let plan =
+        bitty_config::file::parse_lua_config(&rendered, &source).expect("minimal profile parses");
+    let merged = bitty_config::file::resolve_effective_with_profiles(
+        None,
+        vec![bitty_config::LayeredPlan::new(source.clone(), plan)],
+        &bitty_config::file::CliOverrides::default(),
+    )
+    .expect("minimal profile resolves");
+    assert_eq!(merged.effective.appearance.theme.as_deref(), Some("dark"));
+    assert_eq!(
+        merged.effective.font.family,
+        bitty_config::types::DEFAULT_FONT_FAMILY,
+        "omitted keys keep the shipped font"
+    );
+    assert_eq!(
+        merged.effective.terminal.scrollback,
+        bitty_config::types::TerminalConfig::default().scrollback
+    );
+
+    // Explicit value flags still land in the minimal seed, but only the
+    // blocks they touch.
+    let overrides = InitOverrides {
+        font_size: Some(15.0),
+        scrollback: Some(9_000),
+        ..InitOverrides::default()
+    };
+    let mut answers = init_preset_answers(InitProfilePreset::Minimal);
+    init_apply_overrides(&mut answers, &overrides);
+    let rendered = render_minimal_profile_lua(&answers, &overrides);
+    assert!(rendered.contains(&format!(
+        "font = {{ family = \"{}\", size = 15 }}",
+        bitty_config::types::DEFAULT_FONT_FAMILY
+    )));
+    assert!(rendered.contains("terminal = { scrollback = 9000 }"));
+    assert!(!rendered.contains("decoration ="));
+    bitty_config::file::parse_lua_config(&rendered, &source)
+        .expect("minimal profile with overrides parses");
+}
+
+#[test]
+fn init_write_backups_are_collision_free_and_fail_closed() {
+    let dir = init_test_dir("write-backups");
+    let target = dir.join("init.lua");
+    let first = render_init_lua(&init_yes_defaults(None));
+    write_init_config(&target, &first, false).expect("fresh write");
+
+    let second = render_init_lua(&InitAnswers {
+        font_size: 15.0,
+        ..init_yes_defaults(None)
+    });
+    let outcome = write_init_config(&target, &second, true).expect("first forced write");
+    let backup = outcome.backup.expect("backup path");
+    assert_eq!(backup, target.with_extension("lua.bak"));
+    assert_eq!(std::fs::read_to_string(&backup).expect("backup"), first);
+
+    // A second forced write never overwrites the sole recovery copy.
+    let third = render_init_lua(&InitAnswers {
+        font_size: 16.0,
+        ..init_yes_defaults(None)
+    });
+    let outcome = write_init_config(&target, &third, true).expect("second forced write");
+    let second_backup = outcome.backup.expect("second backup path");
+    assert_eq!(second_backup, dir.join("init.lua.bak.1"));
+    assert_eq!(
+        std::fs::read_to_string(&second_backup).expect("second backup"),
+        second
+    );
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("first backup intact"),
+        first
+    );
+    assert_eq!(std::fs::read_to_string(&target).expect("target"), third);
+
+    // No temporary sibling survives a successful atomic replacement.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+
+    // Invalid generated content is refused before any mutation: the target
+    // keeps its bytes and no new backup is created.
+    let backups_before = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        .count();
+    let err = write_init_config(&target, "return { theme = }", true)
+        .expect_err("invalid content refused");
+    assert!(matches!(err, InitWriteError::Refused(_)));
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target intact"),
+        third
+    );
+    let backups_after = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        .count();
+    assert_eq!(backups_before, backups_after, "refusal writes no backup");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_write_refuses_symlink_targets() {
+    let dir = init_test_dir("write-symlink");
+    let real = dir.join("real.lua");
+    std::fs::write(&real, "-- outside\n").expect("real file");
+    let link = dir.join("init.lua");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let content = render_init_lua(&init_yes_defaults(None));
+    let err = write_init_config(&link, &content, true).expect_err("symlink refused");
+    assert!(matches!(err, InitWriteError::Refused(_)));
+    assert_eq!(
+        std::fs::read_to_string(&real).expect("real intact"),
+        "-- outside\n",
+        "refusal never writes through the link"
+    );
+    assert!(
+        link.symlink_metadata()
+            .expect("link")
+            .file_type()
+            .is_symlink()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn init_write_rejects_invalid_content_without_touching_fs() {
     let dir = init_test_dir("invalid");
     let target = dir.join("init.lua");
@@ -8796,9 +9009,15 @@ fn init_usage_names_flags_and_target() {
     let usage = init_usage();
     assert!(usage.contains("--yes"));
     assert!(usage.contains("--force"));
+    assert!(usage.contains("--profile"));
+    assert!(usage.contains("--migrate"));
+    assert!(usage.contains("minimal"));
+    assert!(usage.contains("dark"));
+    assert!(usage.contains("light"));
     assert!(usage.contains("--config"));
     assert!(usage.contains("BITTY_CONFIG"));
     assert!(usage.contains("init.lua"));
+    assert!(usage.contains("profiles/"));
     assert!(usage.contains("--theme"));
     assert!(usage.contains("--font-family"));
     assert!(usage.contains("--font-size"));

@@ -54,6 +54,60 @@ pub(crate) enum InitKeyPreset {
     Vim,
 }
 
+/// First-class named profile preset seeded by `bitty init --profile NAME`
+/// (issue #2371).
+///
+/// A preset is a deterministic seed: it never prompts (no TTY or `--yes`
+/// required), never consults the environment for a shell path, and never
+/// activates the profile it writes. Every other valid name keeps the ordinary
+/// generated defaults (interactive wizard, or `--yes` defaults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitProfilePreset {
+    /// Smallest seeded profile: only `theme`, everything else ships.
+    Minimal,
+    /// Generated defaults with the dark theme family (`bitty-dark` alias).
+    Dark,
+    /// Generated defaults with a light theme family preset.
+    Light,
+}
+
+/// Concrete light preset used by [`InitProfilePreset::Light`].
+///
+/// The theme registry has no selectable `light` category alias (selection is
+/// by name), so the preset pins the neutral GitHub light palette instead of
+/// inventing a registry name. `bitty list themes` lists it.
+pub(crate) const PROFILE_LIGHT_THEME: &str = "github-light";
+
+impl InitProfilePreset {
+    /// Parses a reserved preset name. Matching is exact and lowercase; any
+    /// other valid profile name remains a custom generated profile.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "minimal" => Some(Self::Minimal),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
+    /// Canonical reserved profile name.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    /// Theme seeded by this preset.
+    fn theme(self) -> &'static str {
+        match self {
+            Self::Minimal | Self::Dark => bitty_config::theme::DARK_THEME_ALIAS,
+            Self::Light => PROFILE_LIGHT_THEME,
+        }
+    }
+}
+
 /// Wizard answers: pure data, rendered to `init.lua` by [`render_init_lua`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InitAnswers {
@@ -163,6 +217,15 @@ pub(crate) fn init_yes_defaults(shell_env: Option<&str>) -> InitAnswers {
         close_confirm: bitty_config::types::DEFAULT_CLOSE_CONFIRM,
         key_preset: InitKeyPreset::Default,
     }
+}
+
+/// Deterministic answers for one first-class preset (`bitty init --profile
+/// minimal|dark|light`): generated defaults with the preset theme and no
+/// environment-derived shell path, so the bytes never depend on the host.
+pub(crate) fn init_preset_answers(preset: InitProfilePreset) -> InitAnswers {
+    let mut answers = init_yes_defaults(None);
+    answers.theme = preset.theme().to_string();
+    answers
 }
 
 /// Parses and validates the explicit value flags into [`InitOverrides`].
@@ -744,6 +807,61 @@ pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
             );
             out.push_str(&init_render_vim_keymaps());
         }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Renders the `minimal` preset: the smallest seeded profile is one `theme`
+/// key, and value blocks appear only for flags the caller explicitly set.
+///
+/// The output always parses via `bitty-config::file::parse_lua_config`; it
+/// never invents keys and never writes font/decoration/terminal/close_confirm
+/// blocks the user did not ask for. `answers` already carries the applied
+/// overrides, so the emitted values match `--help` and the recap.
+pub(crate) fn render_minimal_profile_lua(
+    answers: &InitAnswers,
+    overrides: &InitOverrides,
+) -> String {
+    let mut out = String::from(
+        "-- bitty minimal profile, written by `bitty init --profile minimal`.\n\
+         -- Everything not listed here uses the shipped defaults; add overrides\n\
+         -- freely. Evaluated in the bitty-lua sandbox (same budgets as plugins;\n\
+         -- no io/os). Unknown keys fail closed; validate with `bitty config check`.\n\
+         return {\n",
+    );
+    out.push_str(&format!(
+        "    theme = \"{}\",\n",
+        init_lua_escape(&answers.theme)
+    ));
+    if overrides.font_family.is_some() || overrides.font_size.is_some() {
+        out.push_str(&format!(
+            "    font = {{ family = \"{}\", size = {} }},\n",
+            init_lua_escape(&answers.font_family),
+            answers.font_size,
+        ));
+    }
+    if overrides.gaps_in.is_some()
+        || overrides.gaps_out.is_some()
+        || overrides.border.is_some()
+        || overrides.radius.is_some()
+    {
+        out.push_str(&format!(
+            "    decoration = {{ gaps_in = {}, gaps_out = {}, border = {}, radius = {} }},\n",
+            answers.gaps_in, answers.gaps_out, answers.border, answers.radius,
+        ));
+    }
+    if overrides.scrollback.is_some() {
+        out.push_str(&format!(
+            "    terminal = {{ scrollback = {} }},\n",
+            answers.scrollback,
+        ));
+    }
+    if overrides.close_confirm.is_some() {
+        out.push_str(&format!(
+            "    close_confirm = \"{}\",\n",
+            answers.close_confirm.as_str()
+        ));
     }
     out.push_str("}\n");
     out
@@ -2639,7 +2757,8 @@ fn run_init_interactive_impl(
 ) -> Result<InitAnswers, String> {
     let _ = writeln!(
         output,
-        "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
+        "Welcome to bitty! This wizard writes a bitty profile \
+         (profiles/default.lua for a bare init). (Enter takes the default.)"
     );
     let candidates = init_shell_candidates(shell_env, shell_exists);
     // Per-run recall for line editing: previous successful answers in this
@@ -3329,8 +3448,12 @@ pub(crate) enum InitWriteError {
 ///   filesystem mutation, so the wizard never writes a file startup would
 ///   reject.
 /// - An existing file is never overwritten without `force` ([`InitWriteError::Refused`]).
-/// - With `force`, the previous bytes are copied to `<file>.lua.bak` first
-///   (overwriting any older backup), then the new content is written.
+/// - With `force`, the previous bytes are copied to a collision-free
+///   `<file>.bak[.N]` sibling (exclusive creation, synced) before the
+///   replacement, so the sole recovery copy is never overwritten.
+/// - Replacements write and sync a unique sibling temporary file, then rename
+///   over the target (the rename is the commit point); new files use exclusive
+///   creation. A failed write leaves the previous bytes in place.
 /// - Parent directories are created as needed.
 ///
 /// Total: every failure maps to [`InitWriteError`], never a panic.
@@ -3742,6 +3865,9 @@ pub(crate) fn init_usage() -> String {
      writes profile defaults with shipped keys only (no secrets, no network).\n\
      Bare init writes profiles/default.lua plus a thin init.lua selector;\n\
      --profile NAME writes only profiles/NAME.lua and never activates it.\n\
+     First-class presets minimal|dark|light seed deterministic profiles\n\
+     without prompting; other names keep the generated defaults. Presets\n\
+     never read $SHELL or BITTY_PROFILE.\n\
      \n\
      flags:\n\
      \x20 --yes     skip prompts; write sane defaults ($SHELL when clean, dark\n\
@@ -3750,6 +3876,9 @@ pub(crate) fn init_usage() -> String {
      \x20 --force   overwrite existing generated files (collision-free .bak backups)\n\
      \x20 --profile NAME  create/refresh only profiles/NAME.lua; no selector\n\
      \x20           change, no plugin/component/shell follow-up\n\
+     \x20 --profile minimal  smallest seed: one theme key, shipped defaults elsewhere\n\
+     \x20 --profile dark     generated defaults with the dark theme family\n\
+     \x20 --profile light    generated defaults with the github-light palette\n\
      \x20 --migrate move an existing legacy init.lua to profiles/default.lua\n\
      \x20           and replace init.lua with the thin selector (explicit only;\n\
      \x20           --force never migrates a legacy file implicitly)\n\
@@ -3777,9 +3906,10 @@ pub(crate) fn init_usage() -> String {
      Shell integration (Tab completion + OSC 7/133 prompt hooks) is separate:\n\
      after init, run `bitty shell-init --help` and eval the line for your shell.\n\
      Without --force an existing file is never overwritten (exit 2).\n\
-     Without a TTY on stdin, prompts are skipped only with --yes (exit 2\n\
-     otherwise, never a hang). Re-runs are idempotent: same answers write\n\
-     the same files. Validate any file any time with `bitty config check`."
+     Without a TTY on stdin, prompts are skipped only with --yes or a preset\n\
+     profile (exit 2 otherwise, never a hang). Re-runs are idempotent: same\n\
+     answers write the same files. Validate any file any time with\n\
+     `bitty config check`."
         .to_string()
 }
 
@@ -4070,17 +4200,15 @@ pub(crate) fn run_init_subcommand_with_io(
     let init_profile = match args.profile.as_deref() {
         None => None,
         Some(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                // Preserve the launch parser's "empty means absent" rule.
-                None
-            } else {
-                match bitty_config::file::validate_profile_name(trimmed) {
-                    Ok(name) => Some(name),
-                    Err(err) => {
-                        eprintln!("bitty init: {err}\n{}", init_usage());
-                        return 2;
-                    }
+            // A mutating command never treats an explicitly supplied blank
+            // name as "absent" (the launch resolver's warn-and-ignore shape
+            // would silently fall back to a bare init and overwrite the
+            // default profile instead).
+            match bitty_config::file::validate_profile_name(raw) {
+                Ok(name) => Some(name),
+                Err(err) => {
+                    eprintln!("bitty init: {err}\n{}", init_usage());
+                    return 2;
                 }
             }
         }
@@ -4170,7 +4298,15 @@ pub(crate) fn run_init_subcommand_with_io(
         || args.plugin_no_color
         || args.component_no_color;
     let color = init_color_enabled(no_color);
-    let answers = if args.init_yes {
+    // First-class presets seed a deterministic profile without prompting;
+    // every other name keeps the generated-defaults flow below. `--yes` is
+    // accepted with a preset but changes nothing (the seed is already fixed).
+    let init_preset = init_profile.as_deref().and_then(InitProfilePreset::parse);
+    let answers = if let Some(preset) = init_preset {
+        let mut answers = init_preset_answers(preset);
+        init_apply_overrides(&mut answers, &overrides);
+        answers
+    } else if args.init_yes {
         let mut answers = init_yes_defaults(env.shell);
         init_apply_overrides(&mut answers, &overrides);
         // Warn when $SHELL existed but was unusable, so the omission is
@@ -4300,7 +4436,10 @@ pub(crate) fn run_init_subcommand_with_io(
         }
     };
     let print_shell_init: bool = followups_allowed && overrides.print_shell_init.unwrap_or(true);
-    let profile_content = render_init_lua(&answers);
+    let profile_content = match init_preset {
+        Some(InitProfilePreset::Minimal) => render_minimal_profile_lua(&answers, &overrides),
+        _ => render_init_lua(&answers),
+    };
     let selector_content = render_selector_lua(DEFAULT_PROFILE_NAME);
     // Preflight before preview or mutation. A complete legacy `init.lua` is
     // never silently overwritten or reinterpreted, even with `--force`;
@@ -4417,43 +4556,72 @@ pub(crate) fn run_init_subcommand_with_io(
                 bitty_config::keymap::DEFAULT_KEYMAPS.len()
             ),
         };
-        match &selector_outcome {
-            Some(selector) => println!(
-                "bitty init: wrote profile '{}' and selector '{}' (theme=\"{}\", shell={shell}, font={} {}pt, \
-                     scrollback={}, close_confirm={}, keymaps={keymaps})",
-                profile_outcome.path.display(),
-                selector.path.display(),
-                answers.theme,
-                answers.font_family,
-                answers.font_size,
-                answers.scrollback,
-                answers.close_confirm.as_str(),
-            ),
-            None => println!(
-                "bitty init: wrote profile '{}/{}.lua' (theme=\"{}\", shell={shell}, font={} {}pt, \
-                     scrollback={}, close_confirm={}, keymaps={keymaps}); the active selector was not changed",
-                profile_outcome.path.parent().map_or_else(
-                    || "(config root)".to_string(),
-                    |parent| parent.display().to_string()
-                ),
-                init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME),
-                answers.theme,
-                answers.font_family,
-                answers.font_size,
-                answers.scrollback,
-                answers.close_confirm.as_str(),
-            ),
-        }
-        if profile_mode {
+        if let Some(preset) = init_preset {
+            if matches!(preset, InitProfilePreset::Minimal) {
+                println!(
+                    "bitty init: seeded preset 'minimal' profile '{}' (theme=\"{}\"; values not set by flags use shipped defaults)",
+                    profile_outcome.path.display(),
+                    answers.theme,
+                );
+            } else {
+                println!(
+                    "bitty init: seeded preset '{}' profile '{}' (theme=\"{}\", font={} {}pt, \
+                         scrollback={}, close_confirm={}, keymaps={keymaps}); the active selector was not changed",
+                    preset.name(),
+                    profile_outcome.path.display(),
+                    answers.theme,
+                    answers.font_family,
+                    answers.font_size,
+                    answers.scrollback,
+                    answers.close_confirm.as_str(),
+                );
+            }
             println!(
                 "bitty init: activate explicitly with `bitty config profile use {}`",
-                init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME)
+                preset.name()
             );
         } else {
-            println!(
-                "bitty init: defaults live in the profile; add overrides to '{}'",
-                target.display()
-            );
+            match &selector_outcome {
+                Some(selector) => println!(
+                    "bitty init: wrote profile '{}' and selector '{}' (theme=\"{}\", shell={shell}, font={} {}pt, \
+                         scrollback={}, close_confirm={}, keymaps={keymaps})",
+                    profile_outcome.path.display(),
+                    selector.path.display(),
+                    answers.theme,
+                    answers.font_family,
+                    answers.font_size,
+                    answers.scrollback,
+                    answers.close_confirm.as_str(),
+                ),
+                None => println!(
+                    "bitty init: wrote profile '{}/{}.lua' (theme=\"{}\", shell={shell}, font={} {}pt, \
+                         scrollback={}, close_confirm={}, keymaps={keymaps}); the active selector was not changed",
+                    profile_outcome.path.parent().map_or_else(
+                        || "(config root)".to_string(),
+                        |parent| parent.display().to_string()
+                    ),
+                    init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME),
+                    answers.theme,
+                    answers.font_family,
+                    answers.font_size,
+                    answers.scrollback,
+                    answers.close_confirm.as_str(),
+                ),
+            }
+            if profile_mode {
+                println!(
+                    "bitty init: activate explicitly with `bitty config profile use {}`",
+                    init_profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME)
+                );
+            } else {
+                println!(
+                    "bitty init: defaults live in the profile; add overrides to '{}'",
+                    target.display()
+                );
+                println!(
+                    "bitty init: seed a ready-made profile with `bitty init --profile minimal|dark|light`"
+                );
+            }
         }
         println!("bitty init: validate any time with `bitty config check`");
         // CTX-1132 (#1913) follow-up commits (after the config write, so a

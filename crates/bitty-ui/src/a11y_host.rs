@@ -57,8 +57,8 @@ use std::collections::VecDeque;
 
 use bitty_a11y::{
     A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
-    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_PENDING_ANNOUNCEMENTS, SceneKind, Snapshot,
-    SnapshotBuilder, SnapshotHost, TextRun,
+    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
+    MAX_PENDING_ANNOUNCEMENTS, SceneKind, Snapshot, SnapshotBuilder, SnapshotHost, TextRun,
 };
 
 use crate::motion::MotionSpec;
@@ -175,7 +175,9 @@ pub fn terminal_runs(snapshot: &bitty_term_state::Snapshot) -> Vec<TextRun> {
 /// transition, and [`SnapshotHost::announcements`] reports the pending notices
 /// once and clears them, so the same host value reused across ingests reports
 /// each transition exactly once (#2352). The queue is bounded to
-/// [`MAX_PENDING_ANNOUNCEMENTS`] with drop-oldest overflow (W-134). A read
+/// [`MAX_PENDING_ANNOUNCEMENTS`] with drop-oldest overflow (W-134), and each
+/// stored notice is bounded to [`MAX_ANNOUNCEMENT_TEXT_LEN`] (over-limit input
+/// is replaced by a fixed marker so the ingest still fails closed). A read
 /// consumes the notices even when the surrounding ingest then fails closed
 /// (stale generation, over-bound announcement text): those transitions belong
 /// to a superseded or invalid generation and are never re-delivered.
@@ -303,14 +305,22 @@ impl UiSnapshotHost {
     /// Callers that abandon a generation's transitions (for example after
     /// replacing the host content wholesale) can discard the pending notices
     /// with [`Self::clear_notices`]. Text above the 256-character announcement
-    /// ceiling is rejected by the adapter at ingest
-    /// ([`A11yError::AnnouncementTooLong`]), never truncated here.
+    /// ceiling is never retained and never silently truncated or dropped: the
+    /// host stores a fixed over-limit marker instead, so the adapter still
+    /// rejects the ingest fail-closed with
+    /// [`A11yError::AnnouncementTooLong`] and the original payload is not kept
+    /// in memory.
     pub fn push_notice(&mut self, kind: AnnouncementKind, text: &str) {
+        let stored = if text.chars().count() <= MAX_ANNOUNCEMENT_TEXT_LEN {
+            text.to_string()
+        } else {
+            "!".repeat(MAX_ANNOUNCEMENT_TEXT_LEN + 1)
+        };
         let notices = self.notices.get_mut();
         if notices.len() >= MAX_PENDING_ANNOUNCEMENTS {
             notices.pop_front();
         }
-        notices.push_back((kind, text.to_string()));
+        notices.push_back((kind, stored));
     }
 
     /// Discards every notice queued for the next ingest.
@@ -542,5 +552,17 @@ mod tests {
         host.push_notice(AnnouncementKind::Focus, "shell focused");
         host.clear_notices();
         assert!(host.announcements().is_empty());
+    }
+
+    #[test]
+    fn overlong_notice_text_is_not_retained() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        let payload = "x".repeat(MAX_ANNOUNCEMENT_TEXT_LEN * 8);
+        host.push_notice(AnnouncementKind::AsyncState, &payload);
+        let notices = host.announcements();
+        assert_eq!(notices.len(), 1);
+        let stored = &notices[0].1;
+        assert_eq!(stored.chars().count(), MAX_ANNOUNCEMENT_TEXT_LEN + 1);
+        assert_ne!(stored, &payload, "the original payload must not be kept");
     }
 }

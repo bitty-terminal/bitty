@@ -1,0 +1,21 @@
+[plugin]
+id = "acme.acceptance-allowed"
+name = "Component Acceptance Allowed"
+version = "0.1.0"
+description = "CTX-1344 expanded matrix broker request fixture (allowed)."
+license = "MIT"
+
+[compat]
+bitty = ">=0.0.24,<0.1"
+plugin-api = "^1.0"
+
+[capabilities]
+"network.connect:127.0.0.1:__PORT__" = true
+platform.notify = true
+
+[[network.egress]]
+host = "127.0.0.1"
+ports = [__PORT__]
+
+[lazy]
+commands = ["acme.acceptance-allowed:go", "acme.acceptance-allowed:poll"]

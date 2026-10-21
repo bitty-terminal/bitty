@@ -1528,6 +1528,30 @@ impl PluginRuntime {
         self.target_annotations.borrow().clone()
     }
 
+    /// Reconcile the active targeting session against the latest published
+    /// live target rows (issue #2253 review).
+    ///
+    /// Called on the cold tick after `LiveTargets` publishes the present
+    /// solve. Retires vanished panel/workspace ids, drops their labels and
+    /// dispatch bindings, and republishes the layer. No-op without an active
+    /// capture/session. Returns whether anything changed; source errors leave
+    /// the session untouched.
+    pub fn reconcile_target_session(&self) -> bool {
+        let Some(owner) = self
+            .overlay_capture
+            .borrow()
+            .owner_plugin()
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Ok(id) = PluginId::new(&owner) else {
+            return false;
+        };
+        self.services(&id)
+            .is_some_and(|services| services.reconcile_target_session().unwrap_or(false))
+    }
+
     /// Enqueue one captured input event for the active overlay capture, if any.
     ///
     /// This is the Core input-path entry: it appends to the capture queue and

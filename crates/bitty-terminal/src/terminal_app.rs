@@ -1524,6 +1524,10 @@ impl TerminalApp {
         if let Some(targets) = self.live_targets.as_ref() {
             targets.publish(&self.runtime.target_anchor_summaries());
         }
+        // Issue #2253 review: reconcile the active targeting session against
+        // the rows just published, so a panel closed mid-session loses its
+        // label and dispatch binding before the next input is handled.
+        let _ = plugin_runtime.reconcile_target_session();
         // CTX-1115: publish the pin-target snapshot alongside the workspace
         // source, so handlers running on this tick validate against the
         // state this tick applied.

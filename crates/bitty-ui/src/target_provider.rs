@@ -42,7 +42,8 @@
 
 use crate::panel::PanelId;
 use crate::targeting::{
-    CommandBlockId, LinkId, TargetError, TargetRef, TargetRegistry, WorkspaceId,
+    CommandBlockId, CommandBlockRef, LinkId, LinkRef, PanelRef, TargetError, TargetRef,
+    TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
 };
 use crate::uitree::UiNodeId;
 
@@ -142,6 +143,24 @@ impl ProviderTarget {
             Self::CommandBlock(_) => TargetKind::CommandBlock,
             Self::UiNode(_) => TargetKind::UiNode,
             Self::Link(_) => TargetKind::Link,
+        }
+    }
+
+    /// Identity-only target handle (generation `0`) for live-set comparisons.
+    ///
+    /// Reconciliation only compares kind plus id; the generation is never
+    /// used as a handle here. Collection still issues real generations through
+    /// the mediator.
+    #[must_use]
+    pub const fn to_ref(self) -> TargetRef {
+        match self {
+            Self::Panel(id) => TargetRef::Panel(PanelRef { id, generation: 0 }),
+            Self::Workspace(id) => TargetRef::Workspace(WorkspaceRef { id, generation: 0 }),
+            Self::CommandBlock(id) => {
+                TargetRef::CommandBlock(CommandBlockRef { id, generation: 0 })
+            }
+            Self::UiNode(id) => TargetRef::UiNode(UiNodeRef { id, generation: 0 }),
+            Self::Link(id) => TargetRef::Link(LinkRef { id, generation: 0 }),
         }
     }
 

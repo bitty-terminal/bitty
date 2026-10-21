@@ -1750,10 +1750,13 @@ pub struct PluginServices {
     /// `None` leaves the channel unwired; session start then fails closed with
     /// `E_UI_UNAVAILABLE` rather than presenting an unowned batch.
     target_annotations: RefCell<Option<SharedTargetAnnotations>>,
-    /// Whether this generation published the layer currently in the shared
-    /// annotation channel. Only the publisher may clear it, so another
-    /// generation's suspend/dispose cannot erase a live session's labels.
-    target_annotations_owner: Cell<bool>,
+    /// The exact layer this generation published into the shared channel.
+    ///
+    /// Identity is the `Rc` allocation, so a later generation's layer can
+    /// never be mistaken for this one's: cleanup clears the channel only when
+    /// the published handle still matches. This also makes a stale owner
+    /// (expired capture, then a new owner) harmless.
+    target_annotations_published: RefCell<Option<Rc<HintAnnotationLayer>>>,
     env_grants: RefCell<BTreeSet<String>>,
     env_source: RefCell<Rc<dyn EnvSource>>,
     /// Safe-mode flag for this generation (CTX-0941, W-28 host API).
@@ -1920,7 +1923,7 @@ impl PluginServices {
             target_session_overlay: RefCell::new(None),
             target_source: RefCell::new(None),
             target_annotations: RefCell::new(None),
-            target_annotations_owner: Cell::new(false),
+            target_annotations_published: RefCell::new(None),
             env_grants: RefCell::new(BTreeSet::new()),
             env_source: RefCell::new(Rc::new(EmptyEnv)),
             safe_mode: Cell::new(false),
@@ -2342,6 +2345,11 @@ impl PluginServices {
     fn dispose_expired_spec_overlay(&self, plugin: &str, handle: i64) {
         if plugin == self.plugin_id {
             self.remove_spec_overlay_block(handle);
+            // The expired owner's targeting session ends with its capture,
+            // even when the surface was a mechanism block rather than a spec
+            // surface. `clear_targeting_session` is identity-gated, so it
+            // cannot clear a newer publisher's layer.
+            self.clear_targeting_session();
             return;
         }
         let peers = self.overlay_peers.borrow().clone();
@@ -2351,9 +2359,8 @@ impl PluginServices {
         let weaks = peers.borrow().get(plugin).cloned().unwrap_or_default();
         for weak in weaks {
             if let Some(peer) = weak.upgrade() {
-                if peer.remove_spec_overlay_block(handle) {
-                    break;
-                }
+                peer.remove_spec_overlay_block(handle);
+                peer.clear_targeting_session();
             }
         }
         let mut table = peers.borrow_mut();
@@ -2448,7 +2455,7 @@ impl PluginServices {
         *self.target_lenses.borrow_mut() = Some(lenses);
         *self.label_allocator.borrow_mut() = Some(allocator);
         *self.target_annotations.borrow_mut() = Some(annotations);
-        self.target_annotations_owner.set(false);
+        *self.target_annotations_published.borrow_mut() = None;
     }
 
     /// The `bitty.ui.targets`/`bitty.ui.labels` capability gate (W-29).
@@ -2507,12 +2514,21 @@ impl PluginServices {
     /// lenses, and allocator are untouched (revocation of lenses is owned by
     /// [`Self::revoke_targeting_lenses`]).
     pub fn clear_targeting_session(&self) {
-        let owned_annotations = self.target_annotations_owner.replace(false);
+        let published = self.target_annotations_published.borrow_mut().take();
         *self.target_dispatcher.borrow_mut() = TargetDispatcher::new();
         *self.target_session_overlay.borrow_mut() = None;
-        if owned_annotations {
+        if let Some(published) = published {
             if let Some(annotations) = self.target_annotations.borrow().clone() {
-                *annotations.borrow_mut() = None;
+                // Only the generation whose exact layer is still current may
+                // clear the shared channel; a foreign or stale owner leaves
+                // the new publisher's layer untouched.
+                let current = annotations.borrow().clone();
+                if current
+                    .as_ref()
+                    .is_some_and(|layer| Rc::ptr_eq(layer, &published))
+                {
+                    *annotations.borrow_mut() = None;
+                }
             }
         }
     }
@@ -2743,10 +2759,60 @@ impl PluginServices {
             .bind_layer(&layer, &parsed)
             .map_err(map_targets_dispatch_error)?;
         let annotations = self.require_target_annotations()?;
-        *annotations.borrow_mut() = Some(Rc::new(layer));
-        self.target_annotations_owner.set(true);
+        let layer = Rc::new(layer);
+        *annotations.borrow_mut() = Some(Rc::clone(&layer));
+        *self.target_annotations_published.borrow_mut() = Some(layer);
         *self.target_dispatcher.borrow_mut() = dispatcher;
         Ok(labels)
+    }
+
+    /// Reconcile the active targeting session against the latest live targets.
+    ///
+    /// Cold-path only. Reads the same `TargetSource` (plus every registered
+    /// lens) that a fresh collection would use, retires ids that vanished from
+    /// the session registry, drops their annotations, revokes their bindings,
+    /// and republishes the bounded layer. A closed panel therefore loses its
+    /// label and its dispatch succeeds no more. No-op without an active
+    /// session; returns whether the registry or layer changed.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError`] when the targeting state is unwired or the source
+    /// cannot serve live rows. On error nothing is retired.
+    pub fn reconcile_target_session(&self) -> Result<bool, BridgeError> {
+        if self.target_session_overlay.borrow().is_none() {
+            return Ok(false);
+        }
+        let registry = self.require_target_registry()?;
+        let infos = self.core_target_infos()?;
+        let lenses = self.require_target_lenses()?;
+        let mut live = Vec::with_capacity(infos.len());
+        for info in &infos {
+            live.push(targets_offer(&info.kind, info.id)?.to_ref());
+        }
+        for (_, lens) in lenses.borrow().iter() {
+            live.extend(lens.collect().into_iter().map(ProviderTarget::to_ref));
+        }
+        let retired = registry.borrow_mut().retain_live(&live);
+        let annotations = self.require_target_annotations()?;
+        let Some(current) = annotations.borrow().clone() else {
+            return Ok(retired > 0);
+        };
+        let mut updated = (*current).clone();
+        let dropped = {
+            let guard = registry.borrow();
+            updated.retain_live(&guard)
+        };
+        if dropped == 0 {
+            return Ok(retired > 0);
+        }
+        self.target_dispatcher
+            .borrow_mut()
+            .retain_presented(&updated);
+        let updated = Rc::new(updated);
+        *annotations.borrow_mut() = Some(Rc::clone(&updated));
+        *self.target_annotations_published.borrow_mut() = Some(updated);
+        Ok(true)
     }
 
     /// Invalidate every block handle this generation minted (suspend/dispose).
@@ -8579,6 +8645,27 @@ mod tests {
         }
     }
 
+    /// Mutable live Core target source for reconciliation tests.
+    #[derive(Clone, Debug)]
+    struct MutableTargets(Rc<RefCell<Vec<CoreTargetInfo>>>);
+
+    impl TargetSource for MutableTargets {
+        fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+            Ok(self.0.borrow().clone())
+        }
+    }
+
+    fn published_layer(services: &PluginServices) -> Rc<HintAnnotationLayer> {
+        services
+            .target_annotations
+            .borrow()
+            .clone()
+            .expect("annotation channel")
+            .borrow()
+            .clone()
+            .expect("published layer")
+    }
+
     #[test]
     fn targeting_surface_denies_without_overlay_grant() {
         // Deny-by-default: with no `ui.overlay` grant every entry point fails
@@ -8710,6 +8797,65 @@ mod tests {
     }
 
     #[test]
+    fn targeting_reconcile_drops_closed_panel_and_revokes_label() {
+        let services = targeting_services(true, true);
+        let rows = Rc::new(RefCell::new(vec![
+            CoreTargetInfo {
+                kind: "panel".to_string(),
+                id: 11,
+                workspace: Some(7),
+                rect: Some((1, 2, 20, 10)),
+            },
+            CoreTargetInfo {
+                kind: "panel".to_string(),
+                id: 12,
+                workspace: Some(7),
+                rect: Some((30, 2, 20, 10)),
+            },
+        ]));
+        services.set_target_source(Some(Rc::new(MutableTargets(Rc::clone(&rows)))));
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        let labels = services
+            .ui_targets_session_start(
+                handle,
+                80,
+                &[(0, 0), (0, 0)],
+                &["acme.cmd:p1".to_string(), "acme.cmd:p2".to_string()],
+            )
+            .expect("start");
+        assert!(published_layer(&services).contains_label(&labels[0]));
+        assert!(services.target_dispatcher.borrow().is_bound(&labels[0]));
+
+        // A panel closes mid-session: the next cold tick publishes only the
+        // surviving row and reconciles the session against it.
+        rows.borrow_mut().remove(0);
+        assert!(services.reconcile_target_session().expect("reconcile"));
+
+        let layer = published_layer(&services);
+        assert!(
+            !layer.contains_label(&labels[0]),
+            "closed panel label remains"
+        );
+        assert!(layer.contains_label(&labels[1]));
+        assert!(!services.target_dispatcher.borrow().is_bound(&labels[0]));
+        assert_eq!(
+            services
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("closed panel label must fail closed")
+                .code,
+            "E_DEF_INVALID"
+        );
+        // A second pass is a no-op.
+        assert!(
+            !services
+                .reconcile_target_session()
+                .expect("second reconcile")
+        );
+    }
+
+    #[test]
     fn targeting_presented_annotation_drop_revokes_label() {
         let services = targeting_services(true, true);
         let handle = services
@@ -8791,6 +8937,129 @@ mod tests {
                 .code,
             E_UI_NOT_OWNER
         );
+    }
+
+    #[test]
+    fn targeting_unload_clears_owned_annotations() {
+        let services = targeting_services(true, true);
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("targets"))
+            .expect("overlay mount");
+        services
+            .ui_targets_register("acme.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        let labels = services
+            .ui_targets_session_start(handle, 80, &targeting_anchors(1), &targeting_commands(1))
+            .expect("start");
+        let shared = services
+            .target_annotations
+            .borrow()
+            .clone()
+            .expect("channel");
+        assert!(shared.borrow().is_some());
+        assert!(services.revoke_targeting_lenses());
+        assert!(
+            shared.borrow().is_none(),
+            "unload/suspend must clear the owned layer"
+        );
+        assert_eq!(
+            services
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("session ended")
+                .code,
+            E_UI_NOT_OWNER
+        );
+    }
+
+    #[test]
+    fn targeting_lazy_expiry_clears_previous_owner_session() {
+        let registry = Rc::new(RefCell::new(TargetRegistry::new()));
+        let lenses: Rc<RefCell<Vec<(String, DerivedProvider)>>> = Rc::new(RefCell::new(Vec::new()));
+        let allocator = Rc::new(RefCell::new(LabelAllocator::default()));
+        let annotations: SharedTargetAnnotations = Rc::new(RefCell::new(None));
+        let capture = Rc::new(RefCell::new(OverlayCapture::new()));
+        let peers: OverlayPeers = Rc::new(RefCell::new(BTreeMap::new()));
+        let owner = Rc::new(generation_services("owner.plugin", 1, &capture));
+        let next = Rc::new(generation_services("next.plugin", 2, &capture));
+        for services in [&owner, &next] {
+            services.set_targeting_state(
+                Rc::clone(&registry),
+                Rc::clone(&lenses),
+                Rc::clone(&allocator),
+                Rc::clone(&annotations),
+            );
+            services.set_overlay_peers(Rc::clone(&peers));
+        }
+        peers
+            .borrow_mut()
+            .entry("owner.plugin".to_string())
+            .or_default()
+            .push(Rc::downgrade(&owner));
+        peers
+            .borrow_mut()
+            .entry("next.plugin".to_string())
+            .or_default()
+            .push(Rc::downgrade(&next));
+
+        owner
+            .ui_targets_register("owner.links", "plugin", &targeting_offers(1))
+            .expect("register");
+        let owner_handle = owner
+            .ui_mount("overlay", &UiNode::text("owner"))
+            .expect("owner overlay mount");
+        let labels = owner
+            .ui_targets_session_start(
+                owner_handle,
+                80,
+                &targeting_anchors(1),
+                &targeting_commands(1),
+            )
+            .expect("owner start");
+        assert!(annotations.borrow().is_some());
+
+        // The owner's capture expires; the next generation's session start
+        // lazily finishes it. The expired layer must clear, and the stale
+        // owner must not be able to clear the next publisher's layer.
+        assert!(
+            capture
+                .borrow_mut()
+                .force_expire("owner.plugin", owner_handle)
+        );
+        next.ui_targets_register("next.links", "plugin", &targeting_offers(1))
+            .expect("next register");
+        let next_handle = next
+            .ui_mount("overlay", &UiNode::text("next"))
+            .expect("next overlay mount");
+        let next_labels = next
+            .ui_targets_session_start(
+                next_handle,
+                80,
+                &targeting_anchors(2),
+                &targeting_commands(2),
+            )
+            .expect("next start");
+        assert!(
+            annotations.borrow().is_some(),
+            "next session publishes its layer"
+        );
+        assert_eq!(
+            owner
+                .ui_targets_dispatch(&labels[0])
+                .expect_err("expired session ended")
+                .code,
+            E_UI_NOT_OWNER
+        );
+        // A stale cancel from the expired owner cannot touch the next
+        // owner's channel (session marker already cleared by expiry).
+        assert!(
+            !owner
+                .ui_targets_session_cancel(owner_handle)
+                .expect("stale cancel")
+        );
+        // Even an explicit stale clear is identity-gated.
+        owner.clear_targeting_session();
+        let current = annotations.borrow().clone().expect("next layer");
+        assert!(current.contains_label(&next_labels[0]));
     }
 
     #[test]

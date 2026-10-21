@@ -700,9 +700,10 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   (#1375, CTX-0763); a program literally named `x` needs
 ///   `bitty run -- x ...` or `bitty -- x ...`. Tokens after the word are
 ///   kept verbatim for `x::parse_x_request`.
-/// - `init [--yes] [--force] [value flags]` → opt-in setup wizard (#243,
-///   CTX-0149; guided config surface CTX-0345); a program literally named
-///   `init` needs `bitty -- init ...`
+/// - `init [--yes] [--force] [--profile NAME] [value flags]` → opt-in setup
+///   wizard (#243, CTX-0149; guided config surface CTX-0345; profile-backed
+///   output and presets CTX-1404/CTX-1420); a program literally named `init`
+///   needs `bitty -- init ...`
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
@@ -2111,15 +2112,15 @@ pub(crate) fn help_text() -> String {
             config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
                              creates parents + starter when missing, never\n  \
                              overwrites existing content\n  \
-             init [--yes] [--force] [VALUE FLAGS]  Opt-in guided setup wizard\n  \
-                              (never auto-runs): shell/theme/\n  \
-                              font family+size/decoration gaps+border+radius/\n  \
-                              scrollback/close_confirm picks, vim keybinding\n  \
-                              preset, writes init.lua with shipped keys only.\n  \
-                              --yes skips prompts (sane defaults); without\n  \
-                              --force an existing file is never overwritten\n  \
-                              (--force backs it up to init.lua.bak first).\n  \
-                              Without a TTY on stdin, --yes is required\n  \
+             init [--yes] [--force] [--profile NAME] [--migrate]  Opt-in guided setup wizard\n  \
+                              (never auto-runs): writes profiles/default.lua\n  \
+                              plus a thin init.lua selector with shipped keys\n  \
+                              only. --profile NAME writes only profiles/NAME.lua;\n  \
+                              minimal|dark|light seed presets without prompts,\n  \
+                              other names keep generated defaults. --yes skips\n  \
+                              prompts; without --force an existing file is never\n  \
+                              overwritten (--force backs it up to <file>.bak first).\n  \
+                              Without a TTY on stdin, --yes or a preset is required\n  \
                               (otherwise exit 2; never a hang).\n  \
                               Honors --config PATH / BITTY_CONFIG as the target.\n  \
                               Value flags answer one step and skip its prompt:\n  \

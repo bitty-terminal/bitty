@@ -455,14 +455,37 @@ return {}
 
         fn read_marker(&mut self) -> i64 {
             let before = self.entries();
-            let result = self
-                .app
-                .plugin_runtime
-                .as_mut()
-                .expect("plugins")
-                .dispatch_command(&self.id, "read", &[])
-                .expect("separate marker read");
-            assert_eq!(self.entries() - before, 1, "marker read counted separately");
+            // bitty #2409: the marker read goes through the same resumable
+            // RC-1 dispatch as every other command, so a loaded runner can
+            // legitimately park it. Settle the park on the cold ticks instead
+            // of treating it as a failure, mirroring the app's cold phase.
+            let outcome = {
+                let runtime = self.app.plugin_runtime.as_mut().expect("plugins");
+                let mut outcome = runtime.dispatch_command(&self.id, "read", &[]);
+                if matches!(&outcome, Err(error) if error.is_parked()) {
+                    for _ in 0..200 {
+                        let mut completions = runtime.pump_parked_commands();
+                        if completions.is_empty() {
+                            continue;
+                        }
+                        assert_eq!(
+                            completions.len(),
+                            1,
+                            "one parked resume completes per cold tick"
+                        );
+                        outcome = completions.remove(0).outcome;
+                        break;
+                    }
+                }
+                outcome
+            };
+            let result = outcome.expect("separate marker read");
+            // A park adds its resume windows to the execution counter, so a
+            // settled read entered an owning VM at least once.
+            assert!(
+                self.entries() - before >= 1,
+                "marker read counted separately"
+            );
             let LuaValue::Integer(marker) = result else {
                 panic!("bounded integer marker expected: {result:?}");
             };

@@ -1051,19 +1051,92 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         .with_live_pin_state(Some(pin_state))
     }
 
-    fn dispatch_pin(app: &mut crate::terminal_app::TerminalApp, id: &str, command: &str) -> String {
+    /// Upper bound on cold ticks spent settling one parked dispatch
+    /// (bitty #2409).
+    ///
+    /// Each cold tick advances at most one RC-1 wall window and every callback
+    /// is bounded by the 5250 ms ceiling, so a legitimate park cannot need
+    /// more windows; the bound only turns a stuck park into a test failure
+    /// instead of a hang.
+    const PARK_RESUME_TICKS: usize = 200;
+
+    /// One host-mediated dispatch after cold-tick settling (bitty #2409).
+    struct SettledDispatch {
+        /// The command's string result.
+        value: String,
+        /// Completed parked resumes observed while settling (`0` or `1`).
+        resumes: usize,
+    }
+
+    /// Dispatch one probe command and settle an RC-1 park on the cold ticks.
+    ///
+    /// bitty #2314 made app-dispatched commands resumable at the 50 ms charged
+    /// RC-1 wall budget, so a dispatch may legitimately return [`Parked`]
+    /// instead of a value when the runner is loaded. A park is accepted work,
+    /// not a refusal: this helper drives the documented recovery — the same
+    /// `PluginRuntime::pump_parked_commands` step the app performs inside
+    /// [`crate::terminal_app::TerminalApp::pump_cold_commands`] — until the
+    /// parked invocation completes, then proves the completion happened
+    /// exactly once and never replays. The dispatch itself is never retried,
+    /// so the callback body still runs exactly once.
+    ///
+    /// [`Parked`]: bitty_runtime::plugin_runtime::PluginRuntimeError::Parked
+    fn settle_dispatch(runtime: &mut PluginRuntime, id: &str, command: &str) -> SettledDispatch {
         use bitty_plugin_host::manifest::PluginId;
         let pid = PluginId::new(id).expect("id");
-        match app
-            .plugin_runtime
-            .as_mut()
-            .expect("plugin runtime")
-            .dispatch_command(&pid, command, &[])
-        {
-            Ok(LuaValue::String(value)) => value,
+        match runtime.dispatch_command(&pid, command, &[]) {
+            Ok(LuaValue::String(value)) => SettledDispatch { value, resumes: 0 },
             Ok(other) => panic!("{command}: expected a string result, got {other:?}"),
+            Err(error) if error.is_parked() => {
+                assert_eq!(
+                    runtime.parked_command_count(),
+                    1,
+                    "{command}: the park must be recorded exactly once"
+                );
+                for _ in 0..PARK_RESUME_TICKS {
+                    let mut completions = runtime.pump_parked_commands();
+                    if completions.is_empty() {
+                        // Still parked: the next cold tick advances the next
+                        // RC-1 wall window.
+                        continue;
+                    }
+                    assert_eq!(
+                        completions.len(),
+                        1,
+                        "{command}: one parked invocation completes at most once per cold tick"
+                    );
+                    let completion = completions.remove(0);
+                    assert_eq!(completion.plugin.as_str(), id);
+                    assert_eq!(completion.command, command);
+                    let value = match completion.outcome {
+                        Ok(LuaValue::String(value)) => value,
+                        Ok(other) => {
+                            panic!("{command}: resumed with a non-string result {other:?}")
+                        }
+                        Err(error) => panic!("{command}: resume failed: {error:?}"),
+                    };
+                    assert_eq!(
+                        runtime.parked_command_count(),
+                        0,
+                        "{command}: a completed park must be dropped"
+                    );
+                    assert!(
+                        runtime.pump_parked_commands().is_empty(),
+                        "{command}: a completed command must never replay"
+                    );
+                    return SettledDispatch { value, resumes: 1 };
+                }
+                panic!(
+                    "{command}: the parked invocation did not resume within {PARK_RESUME_TICKS} cold ticks"
+                )
+            }
             Err(error) => panic!("{command}: dispatch failed: {error:?}"),
         }
+    }
+
+    fn dispatch_pin(app: &mut crate::terminal_app::TerminalApp, id: &str, command: &str) -> String {
+        let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+        settle_dispatch(runtime, id, command).value
     }
 
     /// Run the pin half of the app tick without a full `drive_tick`.
@@ -1456,11 +1529,25 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         // the tick drain writes it through the single input router.
         // Headless (no live writer) the frame buffers in pending input;
         // headed the same drain delivers it to the live PTY (verify3b).
+        //
+        // bitty #2409: `#2314` makes the dispatch resumable at the RC-1 wall
+        // budget, so under a loaded runner the startup `go` can legitimately
+        // park instead of completing inline. Parking is accepted work — the
+        // settle helper drives the documented cold-tick resume and reports
+        // which path ran. Both paths must land the same byte-exact frame.
         let mut app = submit_test_app("granted", "xuepoo.prodsubmit", &["terminal.input.submit"]);
+        let settled = {
+            let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+            settle_dispatch(runtime, "xuepoo.prodsubmit", "go")
+        };
         assert_eq!(
-            dispatch_pin(&mut app, "xuepoo.prodsubmit", "go"),
-            "OK:accepted:23",
+            settled.value, "OK:accepted:23",
             "granted submit reports the framed byte count"
+        );
+        assert!(
+            settled.resumes <= 1,
+            "a park resumes exactly once, observed {} resumed completions",
+            settled.resumes
         );
         assert!(
             app.runtime.pending_input().is_empty(),
@@ -1511,6 +1598,234 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         );
         app.apply_plugin_submit_requests();
         assert!(app.runtime.pending_input().is_empty());
+    }
+
+    // ── bitty #2409: deterministic Parked -> one resume -> byte-exact submit
+
+    /// Snapshot source that charges real host wall time per call.
+    ///
+    /// The RC-1 hard limit accounts charged time, and `terminal.snapshot` host
+    /// time stays charged (only supervised spawn waits and durable store
+    /// commits are credited), so eight calls charge ~80 ms against the 50 ms
+    /// budget. That parks a command on any runner, fast or loaded, without
+    /// approaching the instruction budget — the #2314 fixture shape.
+    struct ChargedSnapshot;
+
+    impl SnapshotSource for ChargedSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    /// Charged-time park probe (bitty #2409).
+    ///
+    /// `stall_go` burns 80 ms of charged host time and then submits the same
+    /// frame as the startup `go` probe, so it exercises the identical submit
+    /// backend while parking deterministically. `runs` reports how many
+    /// bodies completed, so a duplicated resume is visible as `2`.
+    const SUBMIT_PARK_PROBE: &str = r#"
+local runs = 0
+
+bitty.commands.register({ id = "stall_go", title = "Stall go", run = function()
+  for _ = 1, 8 do
+    pcall(bitty.terminal.snapshot, { scope = "semantic" })
+  end
+  runs = runs + 1
+  local submit = bitty.terminal.submit
+  if submit == nil then return "ABSENT" end
+  local ok, result = pcall(submit, "cargo test")
+  if not ok then return "ERR:" .. result.code end
+  if result.status == "accepted" then
+    return "OK:accepted:" .. tostring(result.bytes)
+  end
+  return "OK:" .. tostring(result.status) .. ":" .. tostring(result.deny)
+end })
+
+bitty.commands.register({ id = "runs", title = "Runs", run = function()
+  return tostring(runs) end })
+"#;
+
+    const SUBMIT_PARK_COMMANDS: &[&str] = &["stall_go", "runs"];
+
+    fn write_park_probe(root: &Path, id: &str) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let qualified: Vec<String> = SUBMIT_PARK_COMMANDS
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\nterminal.semantic-read = true\nterminal.input.submit = true\n\n[lazy]\ncommands = [{}]\nevents = []\n",
+                qualified.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), SUBMIT_PARK_PROBE).expect("init");
+    }
+
+    /// Headless app whose plugin VM charges real host wall time through
+    /// `terminal.snapshot`, so a command parks deterministically.
+    fn parked_submit_app(tag: &str, id: &str) -> crate::terminal_app::TerminalApp {
+        let root = pin_test_dir(tag);
+        write_park_probe(&root, id);
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+            third_party_roots: vec![root],
+            snapshot: Rc::new(ChargedSnapshot),
+            ..PluginRuntimeConfig::default()
+        });
+        runtime.discover();
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        let report = runtime.activate(&plugin_id).expect("activation");
+        assert_eq!(
+            report.state,
+            bitty_runtime::plugin_runtime::LifecycleState::Active
+        );
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        crate::terminal_app::TerminalApp::with_theme(
+            Runtime::with_defaults().expect("defaults must build"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(runtime))
+    }
+
+    #[test]
+    fn startup_terminal_submit_park_resumes_once_and_lands_byte_exact() {
+        // bitty #2409 regression: reaching the RC-1 wall budget parks the
+        // command instead of refusing it, and the documented recovery resumes
+        // the same executor on the cold ticks. The body must run exactly once,
+        // the terminal frame must stay byte-exact, and nothing may replay.
+        let id = "xuepoo.parksubmit";
+        let mut app = parked_submit_app("park", id);
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+
+        let error = app
+            .plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .dispatch_command(&plugin_id, "stall_go", &[])
+            .expect_err("80 ms of charged work must park at the 50 ms budget");
+        assert!(error.is_parked(), "expected a park, got {error:?}");
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .parked_command_count(),
+            1,
+            "the park is recorded exactly once"
+        );
+        assert!(
+            app.runtime.pending_input().is_empty(),
+            "a park lands no terminal bytes"
+        );
+        assert!(
+            app.runtime.notification_banner().is_none(),
+            "a park surfaces no result before the cold-tick resume"
+        );
+
+        // Drive the cold tick exactly as the app event loop does until the
+        // parked invocation resolves.
+        let mut pumps = 0usize;
+        let mut resumed = 0usize;
+        for _ in 0..PARK_RESUME_TICKS {
+            let completed = app.pump_cold_commands();
+            pumps = pumps.saturating_add(1);
+            resumed = resumed.saturating_add(completed);
+            if completed > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            resumed, 1,
+            "the park must complete exactly once (after {pumps} cold ticks)"
+        );
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .parked_command_count(),
+            0,
+            "the completed park is dropped"
+        );
+        assert_eq!(
+            app.pump_cold_commands(),
+            0,
+            "a completed command must never replay"
+        );
+        // Exactly one body ran. The park that reaches the budget on the window
+        // that finishes the body keeps that body's side effects (a real
+        // startup command has already queued its frame), which is exactly why
+        // the resume must extract the result instead of re-running anything.
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .submit_queue()
+                .borrow()
+                .len(),
+            1,
+            "the body queued its frame exactly once"
+        );
+        let runs = {
+            let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+            settle_dispatch(runtime, id, "runs")
+        };
+        assert_eq!(runs.value, "1", "the callback body must run exactly once");
+
+        app.apply_plugin_submit_requests();
+        assert_eq!(
+            app.runtime.pending_input(),
+            b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+            "the resumed submit is still the byte-exact paste frame"
+        );
+        assert!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .submit_queue()
+                .borrow()
+                .is_empty(),
+            "the drain consumes the single queued frame"
+        );
+        let banner = app
+            .runtime
+            .notification_banner()
+            .expect("the resumed result surfaces exactly once");
+        assert!(
+            banner.contains("stall_go") && banner.contains("OK:accepted:23"),
+            "unexpected resumed banner: {banner}"
+        );
+
+        // The settle helper every startup probe uses must drive the same
+        // recovery: one park, exactly one resumed completion, same value.
+        let settled = {
+            let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+            settle_dispatch(runtime, id, "stall_go")
+        };
+        assert_eq!(settled.value, "OK:accepted:23");
+        assert_eq!(
+            settled.resumes, 1,
+            "the settle helper resumes a park exactly once"
+        );
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .submit_queue()
+                .borrow()
+                .len(),
+            1,
+            "the second run queues exactly one more frame"
+        );
     }
 
     // ── CTX-1345: production panel.create backend ───────────────────────
@@ -1578,13 +1893,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
     }
 
     fn dispatch_panel(runtime: &mut PluginRuntime, id: &str, command: &str) -> String {
-        use bitty_plugin_host::manifest::PluginId;
-        let pid = PluginId::new(id).expect("id");
-        match runtime.dispatch_command(&pid, command, &[]) {
-            Ok(LuaValue::String(value)) => value,
-            Ok(other) => panic!("{command}: expected a string result, got {other:?}"),
-            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
-        }
+        settle_dispatch(runtime, id, command).value
     }
 
     #[test]

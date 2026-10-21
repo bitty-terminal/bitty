@@ -4378,17 +4378,15 @@ bitty.commands.register({
     }
 
     fn dispatch(app: &mut TerminalApp, id: &str, command: &str) -> String {
-        let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
-        match app
-            .plugin_runtime
-            .as_mut()
-            .expect("plugin runtime")
-            .dispatch_command(&pid, command, &[])
-        {
-            Ok(LuaValue::String(s)) => s,
-            Ok(other) => panic!("{command}: expected string, got {other:?}"),
-            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
-        }
+        // bitty #2409: settle an RC-1 park on the cold ticks instead of
+        // treating a resumable dispatch as a hard failure.
+        crate::test_support::settle_dispatch(
+            app.plugin_runtime.as_mut().expect("plugin runtime"),
+            id,
+            command,
+            &[],
+        )
+        .into_string(command)
     }
 
     #[test]

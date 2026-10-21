@@ -37,6 +37,59 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Cold ticks one legitimate RC-1 park may need to complete (bitty #2409).
+///
+/// Derived from the production constants: each cold tick opens one wall
+/// window and a callback is bounded by the cumulative ceiling. The bound only
+/// turns a stuck park into a test failure instead of a hang.
+const PARK_RESUME_TICKS: usize =
+    (bitty_lua::RC1_CALLBACK_CEILING_MS / bitty_lua::RC1_WALL_CLOCK_BUDGET_MS) as usize + 1;
+
+/// Dispatch one command and settle an RC-1 park on the cold ticks (#2409).
+///
+/// bitty #2314 makes app-dispatched commands resumable at the 50 ms charged
+/// wall budget, so a loaded runner can park even a trivial `greet` instead of
+/// returning its value inline. This drives the documented recovery (the same
+/// pump the app cold phase runs) and never re-dispatches, so the body still
+/// executes exactly once.
+fn dispatch_settled(rt: &mut PluginRuntime, id: &PluginId, command: &str) -> LuaValue {
+    match rt.dispatch_command(id, command, &[]) {
+        Ok(value) => value,
+        Err(error) if error.is_parked() => {
+            for _ in 0..PARK_RESUME_TICKS {
+                let completions = rt.pump_parked_commands();
+                if completions.is_empty() {
+                    // Still parked: the next cold tick opens the next window.
+                    continue;
+                }
+                assert_eq!(
+                    completions.len(),
+                    1,
+                    "{command}: one parked invocation completes per cold tick"
+                );
+                let completion = completions
+                    .into_iter()
+                    .next()
+                    .expect("checked exactly one completion");
+                assert_eq!(completion.plugin.as_str(), id.as_str());
+                assert_eq!(completion.command, command);
+                assert_eq!(
+                    rt.parked_command_count(),
+                    0,
+                    "{command}: a completed park must be dropped"
+                );
+                assert!(
+                    rt.pump_parked_commands().is_empty(),
+                    "{command}: a completed command must never replay"
+                );
+                return completion.outcome.expect("resumed dispatch");
+            }
+            panic!("{command}: the parked invocation did not complete");
+        }
+        Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+    }
+}
+
 /// Run the binary with an isolated config root and optional piped consent.
 ///
 /// Both XDG roots are pinned into the scratch home and the development plugin
@@ -364,9 +417,7 @@ fn plugin_fresh_zero_capability_install_is_staged_until_explicit_enable() {
         .activate(&id)
         .expect("explicitly enabled plugin activates");
     assert_eq!(
-        runtime
-            .dispatch_command(&id, "greet", &[])
-            .expect("dispatch"),
+        dispatch_settled(&mut runtime, &id, "greet"),
         LuaValue::String("fresh plugin ran".to_string())
     );
 
@@ -540,7 +591,7 @@ fn plugin_external_install_load_run_update_remove_live() {
     assert_eq!(rt.discover().len(), 1);
     rt.activate(&id).expect("activate");
     assert_eq!(
-        rt.dispatch_command(&id, "greet", &[]).expect("dispatch"),
+        dispatch_settled(&mut rt, &id, "greet"),
         LuaValue::String("hello v1".to_string())
     );
 
@@ -595,9 +646,7 @@ fn plugin_external_install_load_run_update_remove_live() {
     assert_eq!(updated_rt.discover().len(), 1);
     updated_rt.activate(&id).expect("activate v3");
     assert_eq!(
-        updated_rt
-            .dispatch_command(&id, "greet", &[])
-            .expect("dispatch"),
+        dispatch_settled(&mut updated_rt, &id, "greet"),
         LuaValue::String("hello v3".to_string())
     );
 

@@ -103,14 +103,15 @@ pub use resolution::{
 };
 pub use services::{
     CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
-    MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification, NotificationQueue,
-    OverlayPeers, PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv,
-    QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest,
-    SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord, ServiceDirectory,
-    ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
+    KeymapSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification,
+    NotificationQueue, OverlayPeers, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
+    PluginServices, ProcessEnv, QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest,
+    QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord,
+    ServiceDirectory, ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
     TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue, ThemePersistHandler,
-    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableSnapshot, UnavailableTargets,
-    UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource,
+    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps, UnavailableSnapshot,
+    UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource, keymap_row,
+    keymap_rows,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -702,6 +703,11 @@ pub struct PluginRuntime {
     /// is cloned into each `runtime.inspect` generation, so the call path
     /// performs no I/O and can meet its 10 ms budget.
     runtime_inspect: Option<RuntimeInspectSnapshot>,
+    /// Issue #2405: optional live resolved-keymap source for
+    /// `bitty.keymaps.list`. Installed for every generation; the grant and
+    /// safe-policy checks decide each call. `None` leaves granted reads
+    /// failing closed with `E_NOT_IMPLEMENTED`.
+    keymap_source: Option<Rc<dyn KeymapSource>>,
     /// CTX-0889: optional workspace read source for `bitty.workspace.list`.
     /// `None` leaves granted reads failing closed with `E_NOT_IMPLEMENTED`.
     workspace_source: Option<Rc<dyn WorkspaceSource>>,
@@ -943,6 +949,7 @@ impl PluginRuntime {
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             runtime_inspect: None,
+            keymap_source: None,
             workspace_source: None,
             target_source: None,
             history_provider: None,
@@ -1228,6 +1235,19 @@ impl PluginRuntime {
     /// per-generation `runtime.inspect` capability remains the only switch.
     pub fn set_runtime_inspect_snapshot(&mut self, snapshot: RuntimeInspectSnapshot) {
         self.runtime_inspect = Some(snapshot);
+    }
+
+    /// Install the live resolved-keymap source for `bitty.keymaps.list`
+    /// (issue #2405).
+    ///
+    /// Call before activation so `init.lua` already observes the startup
+    /// table; the application republishes into the source whenever it adopts a
+    /// configuration reload. Installing the source grants nothing: the
+    /// per-generation `runtime.keymaps.read` capability and the safe-policy
+    /// check remain the only switches, and the call path performs no file,
+    /// process, network, or environment access.
+    pub fn set_keymap_source(&mut self, source: Rc<dyn KeymapSource>) {
+        self.keymap_source = Some(source);
     }
 
     /// Resolve one plugin's declared settings exactly as activation does
@@ -2362,6 +2382,14 @@ impl PluginRuntime {
         let runtime_inspect = granted
             .iter()
             .any(|capability| capability.as_str() == "runtime.inspect");
+        // Issue #2405: the narrow keymap registry read head. Deny by default,
+        // independent of `runtime.inspect`/`runtime.configure` (read never
+        // implies write or inspection and neither implies this head). Safe
+        // policy additionally denies every call, so a VM that exists under
+        // safe policy cannot read the registry.
+        let runtime_keymaps_read = granted
+            .iter()
+            .any(|capability| capability.as_str() == "runtime.keymaps.read");
         let panel_create = granted
             .iter()
             .any(|capability| capability.as_str() == "panel.create");
@@ -2534,6 +2562,10 @@ impl PluginRuntime {
             .then(|| self.runtime_inspect.clone())
             .flatten();
         plugin_services.set_runtime_inspect(runtime_inspect, inspect_snapshot);
+        // Issue #2405: install the live keymap source for every generation;
+        // the grant flag inside the services is the only authority switch and
+        // a call without it fails closed before touching the source.
+        plugin_services.set_keymaps_access(runtime_keymaps_read, self.keymap_source.clone());
         plugin_services.set_panel_access(panel_create, panel_focus);
         // CTX-1099: the `bitty.panel.set_pinned` host backend. Installed
         // only for `panel.focus` generations (no backend without grant);

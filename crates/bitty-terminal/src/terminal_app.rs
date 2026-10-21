@@ -625,6 +625,11 @@ pub(crate) struct TerminalApp {
     /// Core's workspace summaries here so `bitty.workspace.list()` serves
     /// committed state. `None` without a plugin runtime.
     pub(crate) live_workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
+    /// Live resolved-keymap source shared with the plugin runtime (issue
+    /// #2405): startup seeds it and [`Self::adopt_live_config`] republishes
+    /// after an accepted reload, so `bitty.keymaps.list()` reflects the table
+    /// the input path uses. `None` without a plugin runtime.
+    pub(crate) live_keymaps: Option<std::rc::Rc<crate::plugin_runtime::LiveKeymaps>>,
     /// Live Core target/anchor source shared with the plugin runtime
     /// (issue #2253): `drive_tick` publishes the runtime's plain-data rows so
     /// target sessions read last-tick state without reaching live layout.
@@ -759,6 +764,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_keymaps: None,
             live_targets: None,
             live_pin_state: None,
             live_history: None,
@@ -803,6 +809,7 @@ impl TerminalApp {
             session_persistence: true,
             live_snapshot: None,
             live_workspaces: None,
+            live_keymaps: None,
             live_targets: None,
             live_pin_state: None,
             live_history: None,
@@ -914,6 +921,18 @@ impl TerminalApp {
         workspaces: Option<std::rc::Rc<crate::plugin_runtime::LiveWorkspaces>>,
     ) -> Self {
         self.live_workspaces = workspaces;
+        self
+    }
+
+    /// Attaches the live resolved-keymap source (issue #2405). Production
+    /// startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; plugin-less runs
+    /// leave it `None`.
+    pub(crate) fn with_live_keymaps(
+        mut self,
+        keymaps: Option<std::rc::Rc<crate::plugin_runtime::LiveKeymaps>>,
+    ) -> Self {
+        self.live_keymaps = keymaps;
         self
     }
 
@@ -1107,6 +1126,13 @@ impl TerminalApp {
         self.chrome.prefix_bindings = adoption.prefix_bindings;
         self.chrome.hints_enabled = adoption.hints_enabled;
         self.chrome.resize_step = crate::chrome_keys::sanitize_resize_step(adoption.resize_step);
+        // Issue #2405: keep the plugin keymap source on the exact table the
+        // input path now uses, so the next `bitty.keymaps.list()` observes the
+        // reloaded registry. No rows are cached: the source stores the typed
+        // table and every call converts a fresh bounded page.
+        if let Some(live) = self.live_keymaps.as_ref() {
+            live.publish(&self.chrome.keymaps);
+        }
         // An armed Leader window or hint session was opened under the old
         // binding/table; its follow-up chord could now mean something else,
         // so cancel it (fail-open: keys route normally again).

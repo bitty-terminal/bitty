@@ -359,6 +359,7 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "process.spawn",
     "network.connect",
     "runtime.inspect",
+    "runtime.keymaps.read",
     "runtime.configure",
     "runtime.plugin-manage",
     "debug.inspect",

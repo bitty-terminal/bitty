@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded keymap registry reads for plugins (CTX-2405, #2405):**
+  `bitty.keymaps.list({ offset, limit })` returns one bounded page
+  (`entries`, `total`, `offset`, `truncated`) of the live resolved bindings
+  under the new `runtime.keymaps.read` grant. Rows carry only the canonical
+  `chord`, `action`, `source`, `context`, and the optional `title` (static
+  Core description) or `command` (validated qualified `command:` target).
+  Caps: 256 rows per call, 1024 addressable rows, 64 KiB serialized response,
+  64/320/128/257 byte-or-character field bounds, deterministic whole-row tail
+  truncation, and 16 calls/s per generation. A missing grant, safe policy, or
+  absent source fails closed with `E_CAPABILITY_DENIED`/`E_NOT_IMPLEMENTED`;
+  wrong argument types and out-of-range bounds fail with
+  `E_VALUE_TYPE`/`E_DEF_LIMIT` before the host read. The call takes no string
+  input, has no path/exec/network selector, and returns no configuration
+  path, argv, environment value, URL, terminal content, or host diagnostic.
+  The read head never implies `runtime.inspect`, `runtime.configure`, or any
+  UI grant. Plugin-suggested bindings are omitted until the suggestion layer
+  actually dispatches.
 - **Read-only runtime inspection for plugins (CTX-2396, #2396):**
   `bitty.runtime.inspect()` returns one argument-free, bounded snapshot with
   `diagnostics`, `plugins`, `settings`, `extensions`, and `profiles` sections.

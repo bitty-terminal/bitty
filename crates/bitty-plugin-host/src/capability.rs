@@ -154,6 +154,11 @@ impl CapabilityFamily {
             Self::Network => &["network.connect"],
             Self::Runtime => &[
                 "runtime.inspect",
+                // Issue #2405: bounded read-only keymap/action registry pages
+                // for presentation plugins (help/which-key). Deny by default,
+                // distinct from `runtime.inspect`/`runtime.configure`, and it
+                // never implies either.
+                "runtime.keymaps.read",
                 "runtime.configure",
                 "runtime.plugin-manage",
             ],
@@ -462,6 +467,7 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         }
         "network.connect" => "Connect to the declared destination",
         "runtime.inspect" => "Inspect runtime state",
+        "runtime.keymaps.read" => "Read the resolved keymap registry (bounded, read-only)",
         "runtime.configure" => "Change runtime configuration",
         "runtime.plugin-manage" => "Manage other plugins (high-risk)",
         "debug.inspect" => "Inspect debug state (read-only)",
@@ -602,6 +608,7 @@ mod tests {
             "process.spawn:git",
             "network.connect:example.com:443",
             "runtime.inspect",
+            "runtime.keymaps.read",
             "debug.trace",
             "platform.notify",
             "platform.cpu-read",

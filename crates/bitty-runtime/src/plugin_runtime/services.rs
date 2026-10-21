@@ -13,6 +13,11 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use bitty_config::theme::CustomPalette;
+use bitty_config::{ChromeAction, ResolvedKeymap};
+use bitty_lua::keymaps::{
+    KEYMAP_LIST_CALLS_PER_SECOND, KEYMAP_SOURCE_DEFAULT, KEYMAP_SOURCE_USER, KeymapPage,
+    KeymapQuery, KeymapRow,
+};
 use bitty_lua::runtime_inspect::{
     RUNTIME_INSPECT_CALLS_PER_SECOND, RUNTIME_INSPECT_MAX_WALL_MS, RuntimeInspectSnapshot,
 };
@@ -117,6 +122,47 @@ impl InspectCallBudget {
     }
 }
 
+/// Per-generation `bitty.keymaps.list` call budget (issue #2405).
+///
+/// A strict sliding window: at most [`KEYMAP_LIST_CALLS_PER_SECOND`] accepted
+/// calls in any one-second span. Expired timestamps are dropped from the front
+/// before each decision, so a burst that crosses a wall-clock second boundary
+/// cannot exceed the documented rate — a fixed reset-on-call window would
+/// admit up to twice the rate around the boundary. Denials are typed
+/// (`E_DEF_LIMIT`) and never touch the keymap source. A full 1024-row scan
+/// costs at most four calls at the 256-row page cap, so the budget admits
+/// every legitimate paging loop with headroom.
+#[derive(Debug)]
+struct KeymapCallBudget {
+    /// Accept times of the calls inside the current window, oldest first.
+    /// Bounded by [`KEYMAP_LIST_CALLS_PER_SECOND`].
+    recent: VecDeque<Instant>,
+}
+
+impl KeymapCallBudget {
+    fn new() -> Self {
+        Self {
+            recent: VecDeque::new(),
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        const WINDOW: Duration = Duration::from_secs(1);
+        while self
+            .recent
+            .front()
+            .is_some_and(|accepted| now.duration_since(*accepted) >= WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= KEYMAP_LIST_CALLS_PER_SECOND as usize {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
+}
+
 /// Per-plugin `bitty.fs.list` rate window.
 ///
 /// Reuses the accepted RC-8 one-second rate window; the op and byte ceilings
@@ -210,6 +256,74 @@ impl WorkspaceSource for UnavailableWorkspaces {
     fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, BridgeError> {
         Err(BridgeError::not_implemented("bitty.workspace.list"))
     }
+}
+
+/// Read-only resolved-keymap source for `bitty.keymaps.list()` (issue #2405).
+///
+/// The application publishes its live resolved table into the implementation;
+/// the call path clones that bounded table, converts it to canonical rows, and
+/// releases the borrow before marshalling. No config path, raw user text,
+/// argv, environment value, URL, terminal content, or plugin store value
+/// crosses this trait.
+pub trait KeymapSource {
+    /// The resolved keymap table at call time, in resolved-table order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when no keymap table is available.
+    fn keymaps(&self) -> Result<Vec<ResolvedKeymap>, BridgeError>;
+}
+
+/// Keymap source for hosts without a registry: fails closed with
+/// `E_NOT_IMPLEMENTED` (a granted read still observes nothing).
+#[derive(Debug, Default)]
+pub struct UnavailableKeymaps;
+
+impl KeymapSource for UnavailableKeymaps {
+    fn keymaps(&self) -> Result<Vec<ResolvedKeymap>, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.keymaps.list"))
+    }
+}
+
+/// Convert one resolved binding into a canonical, bounded registry row.
+///
+/// The strings come from the typed [`ResolvedKeymap`] value (parsed chord,
+/// parsed [`ChromeAction`]), never from raw configuration text. A Core action
+/// contributes its static description as `title`; an
+/// [`ChromeAction::InvokeCommand`] contributes only the validated qualified
+/// target as `command`. Any row that fails [`KeymapRow::new`] validation is
+/// dropped by [`keymap_rows`] instead of echoed.
+#[must_use]
+pub fn keymap_row(binding: &ResolvedKeymap) -> Option<KeymapRow> {
+    let (title, command) = match &binding.action {
+        ChromeAction::InvokeCommand(target) => (None, Some(target.clone())),
+        action => (Some(action.description().to_string()), None),
+    };
+    KeymapRow::new(
+        binding.chord.canonical(),
+        binding.action.canonical(),
+        if binding.from_default {
+            KEYMAP_SOURCE_DEFAULT
+        } else {
+            KEYMAP_SOURCE_USER
+        },
+        binding.context.clone(),
+        title,
+        command,
+    )
+}
+
+/// Convert the live resolved table into addressable rows, dropping malformed
+/// entries.
+///
+/// Plugin-suggested bindings are deliberately absent: the plugin-binding
+/// dispatch slot (`DispatchPriority::Plugin` / `match_plugin_binding`) is a
+/// deny-by-default stub, so a suggestion is not dispatchable today and
+/// advertising it would promise a chord that does nothing. They join this
+/// list only when the suggestion layer actually dispatches.
+#[must_use]
+pub fn keymap_rows(bindings: &[ResolvedKeymap]) -> Vec<KeymapRow> {
+    bindings.iter().filter_map(keymap_row).collect()
 }
 
 /// One live Core target with its presentation anchor (W-29 successor).
@@ -1826,6 +1940,20 @@ pub struct PluginServices {
     runtime_inspect_snapshot: RefCell<Option<RuntimeInspectSnapshot>>,
     /// Per-generation call budget (`16 calls/s`, issue #2396).
     runtime_inspect_budget: RefCell<InspectCallBudget>,
+    /// Whether this generation holds `runtime.keymaps.read` (issue #2405).
+    ///
+    /// Deny by default; `runtime.inspect`, `runtime.configure`, and the UI
+    /// heads never imply it. A generation under safe policy is denied
+    /// regardless of the recorded grant.
+    keymaps_read: Cell<bool>,
+    /// Live resolved-keymap source for `bitty.keymaps.list()`.
+    ///
+    /// Installed for every generation; it carries no authority, and the
+    /// per-generation grant plus the safe-policy check decide every call.
+    /// `None` leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
+    keymap_source: RefCell<Option<Rc<dyn KeymapSource>>>,
+    /// Per-generation call budget (`16 calls/s`, issue #2405).
+    keymap_budget: RefCell<KeymapCallBudget>,
     granted_capabilities: RefCell<Vec<String>>,
     declared_events: RefCell<BTreeSet<String>>,
     debug_view: RefCell<Option<Rc<RefCell<DebugView>>>>,
@@ -1986,6 +2114,9 @@ impl PluginServices {
             runtime_inspect_granted: Cell::new(false),
             runtime_inspect_snapshot: RefCell::new(None),
             runtime_inspect_budget: RefCell::new(InspectCallBudget::new(Instant::now())),
+            keymaps_read: Cell::new(false),
+            keymap_source: RefCell::new(None),
+            keymap_budget: RefCell::new(KeymapCallBudget::new()),
             granted_capabilities: RefCell::new(Vec::new()),
             declared_events: RefCell::new(BTreeSet::new()),
             debug_view: RefCell::new(None),
@@ -3145,6 +3276,20 @@ impl PluginServices {
             return Err(BridgeError::timeout());
         }
         Ok(snapshot)
+    }
+
+    /// Install the `runtime.keymaps.read` grant and the live registry source
+    /// (issue #2405).
+    ///
+    /// `granted` is the only authority switch: the source is installed for
+    /// every generation and carries no authority, while an ungranted
+    /// generation fails closed with `E_CAPABILITY_DENIED` before the source is
+    /// touched. Safe policy denies the same way regardless of the grant. The
+    /// call budget starts at activation and never resets within the
+    /// generation.
+    pub fn set_keymaps_access(&self, granted: bool, source: Option<Rc<dyn KeymapSource>>) {
+        self.keymaps_read.set(granted);
+        *self.keymap_source.borrow_mut() = source;
     }
 
     /// Record this generation's own granted capability ids (activation
@@ -4914,6 +5059,36 @@ impl HostServices for PluginServices {
 
     fn runtime_inspect(&self) -> Result<RuntimeInspectSnapshot, BridgeError> {
         self.runtime_inspect_at(Instant::now())
+    }
+
+    fn keymaps_list(&self, query: &KeymapQuery) -> Result<KeymapPage, BridgeError> {
+        // Grant and safe policy first: an ungranted generation (or any VM
+        // under safe policy) must not learn whether a keymap source exists,
+        // and no registry row may cross the boundary. The read head is
+        // independent of `runtime.inspect` and `runtime.configure`.
+        if self.safe_mode.get() || !self.keymaps_read.get() {
+            return Err(BridgeError::capability_denied("runtime.keymaps.read"));
+        }
+        let started = Instant::now();
+        if !self.keymap_budget.borrow_mut().allow(started) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "runtime.keymaps.read exceeded 16 calls per second",
+            ));
+        }
+        // Clone the live table out of the source and release its borrow
+        // before converting or marshalling: no plugin or bridge code runs
+        // while the source is borrowed, and no row is cached across calls.
+        let bindings = {
+            let source = self
+                .keymap_source
+                .borrow()
+                .clone()
+                .ok_or_else(|| BridgeError::not_implemented("bitty.keymaps.list"))?;
+            source.keymaps()?
+        };
+        Ok(KeymapPage::assemble(keymap_rows(&bindings), *query))
     }
 
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
@@ -10071,6 +10246,239 @@ mod history_tests {
             assert!(services.runtime_inspect().is_ok(), "call {call}");
         }
         let error = services.runtime_inspect().expect_err("over budget");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert_eq!(error.class, "validation");
+    }
+
+    /// Fixed keymap source standing in for the app's `LiveKeymaps`.
+    struct FixedKeymaps(RefCell<Vec<ResolvedKeymap>>);
+
+    impl KeymapSource for FixedKeymaps {
+        fn keymaps(&self) -> Result<Vec<ResolvedKeymap>, BridgeError> {
+            Ok(self.0.borrow().clone())
+        }
+    }
+
+    fn binding(chord: &str, action: &str, from_default: bool) -> ResolvedKeymap {
+        ResolvedKeymap {
+            chord: bitty_config::Chord::parse(chord).expect("chord"),
+            action: ChromeAction::parse(action).expect("action"),
+            context: "global".to_string(),
+            from_default,
+        }
+    }
+
+    fn keymap_fixture() -> Vec<ResolvedKeymap> {
+        vec![
+            binding("alt+h", "goto_split:left", true),
+            binding("alt+1", "workspace_focus:1", true),
+            binding("alt+p", "toggle_pinned", false),
+            binding(
+                "alt+shift+p",
+                "command:bitty-terminal.help:toggle_help",
+                false,
+            ),
+            binding("ctrl+shift+v", "paste_from_clipboard", true),
+        ]
+    }
+
+    fn keymap_services(granted: bool) -> (PluginServices, Rc<FixedKeymaps>) {
+        let services = services();
+        let source = Rc::new(FixedKeymaps(RefCell::new(keymap_fixture())));
+        services.set_keymaps_access(granted, Some(source.clone()));
+        (services, source)
+    }
+
+    #[test]
+    fn keymaps_list_requires_its_own_read_grant() {
+        let (denied, _source) = keymap_services(false);
+        let error = denied
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("no grant");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'runtime.keymaps.read' is not granted"
+        );
+
+        // The runtime inspection read never implies the keymap read.
+        let inspect_only = services();
+        inspect_only.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        let error = inspect_only
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("inspect does not grant keymaps");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+
+        // The write-side colorscheme grant never implies it either.
+        let configure_only = services();
+        configure_only.set_theme_access(true);
+        let error = configure_only
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("configure does not grant keymaps");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+
+        // A granted generation without a wired source fails closed.
+        let unwired = services();
+        unwired.set_keymaps_access(true, None);
+        let error = unwired
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("no backend");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+
+        // The keymap read never implies `runtime.configure`.
+        let (read_only, _source) = keymap_services(true);
+        assert!(read_only.keymaps_list(&KeymapQuery::default()).is_ok());
+        assert!(
+            !read_only.theme_configure_granted.get(),
+            "runtime.keymaps.read must not grant runtime.configure"
+        );
+    }
+
+    #[test]
+    fn keymaps_list_safe_policy_denies_even_with_the_grant() {
+        let (services, _source) = keymap_services(true);
+        services.set_safe_mode(true);
+        let error = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("safe policy");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(
+            error.message,
+            "capability 'runtime.keymaps.read' is not granted"
+        );
+    }
+
+    #[test]
+    fn keymaps_list_serves_a_bounded_page_with_canonical_fields() {
+        let (services, _source) = keymap_services(true);
+        let page = services
+            .keymaps_list(&KeymapQuery::new(1, 2).expect("query"))
+            .expect("list");
+        assert_eq!(page.total, 5);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.truncated, "rows 3..5 are behind the page");
+        assert_eq!(page.entries[0].chord, "alt+1");
+        assert_eq!(page.entries[0].action, "workspace_focus:1");
+        assert_eq!(page.entries[0].source, "default");
+        assert_eq!(page.entries[0].context, "global");
+        assert_eq!(
+            page.entries[0].title.as_deref(),
+            Some("Jump to workspace N.")
+        );
+        assert!(page.entries[0].command.is_none());
+
+        let full = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect("full page");
+        assert_eq!(full.total, 5);
+        assert_eq!(full.entries.len(), 5);
+        assert!(!full.truncated);
+        assert!(full.fits_budget());
+        // User override attribution and the `command:` row shape.
+        assert_eq!(full.entries[2].source, "user");
+        assert!(full.entries[2].title.is_some());
+        let command = &full.entries[3];
+        assert_eq!(command.action, "command:bitty-terminal.help:toggle_help");
+        assert_eq!(
+            command.command.as_deref(),
+            Some("bitty-terminal.help:toggle_help")
+        );
+        assert!(command.title.is_none());
+        assert_eq!(command.source, "user");
+
+        // An offset at or past the total is an empty, untruncated page.
+        let past = services
+            .keymaps_list(&KeymapQuery::new(5, 256).expect("query"))
+            .expect("past end");
+        assert!(past.entries.is_empty());
+        assert_eq!(past.total, 5);
+        assert_eq!(past.offset, 5);
+        assert!(!past.truncated);
+        assert!(!page_contains(&full, "/"), "no path-shaped field leaks");
+        assert!(!page_contains(&full, "http"), "no URL-shaped field leaks");
+    }
+
+    /// Look for a forbidden field value in a page's Lua conversion.
+    fn page_contains(page: &KeymapPage, needle: &str) -> bool {
+        format!("{:?}", page.to_lua()).contains(needle)
+    }
+
+    #[test]
+    fn keymaps_list_drops_malformed_rows_instead_of_echoing_them() {
+        let (services, source) = keymap_services(true);
+        let mut rows = keymap_fixture();
+        rows.push(ResolvedKeymap {
+            chord: bitty_config::Chord::parse("alt+9").expect("chord"),
+            action: ChromeAction::CloseView,
+            // Only `"global"` is accepted today; a row outside it is dropped
+            // rather than advertised under a context the dispatcher ignores.
+            context: "unused-context".to_string(),
+            from_default: true,
+        });
+        *source.0.borrow_mut() = rows;
+        let page = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect("list");
+        assert_eq!(page.total, 5, "the malformed row is not addressable");
+        assert_eq!(page.entries.len(), 5);
+        assert!(!page_contains(&page, "unused-context"));
+    }
+
+    #[test]
+    fn keymaps_list_addressable_cap_hides_the_unreachable_tail() {
+        let (services, source) = keymap_services(true);
+        let wide = (0..bitty_lua::keymaps::KEYMAP_LIST_MAX_TOTAL + 76)
+            .map(|_| binding("alt+x", "close_view", true))
+            .collect();
+        *source.0.borrow_mut() = wide;
+        let page = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect("list");
+        assert_eq!(page.total, bitty_lua::keymaps::KEYMAP_LIST_MAX_TOTAL);
+        assert_eq!(page.entries.len(), bitty_lua::keymaps::KEYMAP_LIST_MAX_ROWS);
+        assert!(page.truncated);
+    }
+
+    #[test]
+    fn keymap_budget_is_a_strict_sliding_window() {
+        // Deterministic synthetic clock: a burst may never exceed the rate,
+        // even across a wall-clock second boundary, and each expired call
+        // frees exactly one slot.
+        let start = Instant::now();
+        let mut budget = KeymapCallBudget::new();
+        for call in 0..KEYMAP_LIST_CALLS_PER_SECOND {
+            assert!(
+                budget.allow(start + Duration::from_millis(u64::from(call))),
+                "call {call}"
+            );
+        }
+        let last = start + Duration::from_millis(u64::from(KEYMAP_LIST_CALLS_PER_SECOND - 1));
+        assert!(
+            !budget.allow(last + Duration::from_millis(1)),
+            "a 17th call inside the window is denied"
+        );
+        assert!(
+            !budget.allow(start + Duration::from_millis(999)),
+            "the window is one second from the oldest accept"
+        );
+        // The first accepted call expires at exactly +1s; one slot opens.
+        assert!(budget.allow(start + Duration::from_secs(1)));
+        assert!(!budget.allow(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn keymaps_list_enforces_sixteen_calls_per_second() {
+        let (services, _source) = keymap_services(true);
+        for call in 0..KEYMAP_LIST_CALLS_PER_SECOND {
+            assert!(
+                services.keymaps_list(&KeymapQuery::default()).is_ok(),
+                "call {call}"
+            );
+        }
+        let error = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect_err("over budget");
         assert_eq!(error.code, "E_DEF_LIMIT");
         assert_eq!(error.class, "validation");
     }

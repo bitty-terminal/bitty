@@ -40,6 +40,8 @@ mod input_vm_boundary {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::test_support::{PARK_RESUME_TICKS, settle_dispatch};
+
     const PLUGIN: &str = "bitty-featured.input-boundary";
     const BOUND_COLUMN: u16 = 1;
     const SLOW_COLUMN: u16 = 10;
@@ -405,7 +407,7 @@ return {}
 
         /// Pump cold ticks until no command remains parked (bitty#2314 F2).
         fn pump_until_unparked(&mut self) -> usize {
-            for pumps in 1..=200 {
+            for pumps in 1..=PARK_RESUME_TICKS {
                 self.app.pump_cold_commands();
                 if self
                     .app
@@ -418,7 +420,7 @@ return {}
                     return pumps;
                 }
             }
-            panic!("parked command did not complete within 200 cold ticks");
+            panic!("parked command did not complete within {PARK_RESUME_TICKS} cold ticks");
         }
 
         fn cursor(&mut self, column: u16) {
@@ -457,37 +459,19 @@ return {}
             let before = self.entries();
             // bitty #2409: the marker read goes through the same resumable
             // RC-1 dispatch as every other command, so a loaded runner can
-            // legitimately park it. Settle the park on the cold ticks instead
-            // of treating it as a failure, mirroring the app's cold phase.
-            let outcome = {
-                let runtime = self.app.plugin_runtime.as_mut().expect("plugins");
-                let mut outcome = runtime.dispatch_command(&self.id, "read", &[]);
-                if matches!(&outcome, Err(error) if error.is_parked()) {
-                    for _ in 0..200 {
-                        let mut completions = runtime.pump_parked_commands();
-                        if completions.is_empty() {
-                            continue;
-                        }
-                        assert_eq!(
-                            completions.len(),
-                            1,
-                            "one parked resume completes per cold tick"
-                        );
-                        outcome = completions.remove(0).outcome;
-                        break;
-                    }
-                }
-                outcome
-            };
-            let result = outcome.expect("separate marker read");
-            // A park adds its resume windows to the execution counter, so a
-            // settled read entered an owning VM at least once.
-            assert!(
-                self.entries() - before >= 1,
-                "marker read counted separately"
-            );
-            let LuaValue::Integer(marker) = result else {
-                panic!("bounded integer marker expected: {result:?}");
+            // legitimately park it. Settling drives the documented cold-tick
+            // resume and keeps the exactly-once accounting exact: a resume
+            // continues the same executor, so it never adds a second entry.
+            let value = settle_dispatch(
+                self.app.plugin_runtime.as_mut().expect("plugins"),
+                self.id.as_str(),
+                "read",
+                &[],
+            )
+            .expect_value("read");
+            assert_eq!(self.entries() - before, 1, "marker read counted separately");
+            let LuaValue::Integer(marker) = value else {
+                panic!("bounded integer marker expected: {value:?}");
             };
             marker
         }
@@ -691,7 +675,7 @@ return {}
             1
         );
         let mut completed = 0usize;
-        for _ in 0..200 {
+        for _ in 0..crate::test_support::PARK_RESUME_TICKS {
             completed = fixture.app.pump_cold_commands();
             if completed > 0 {
                 break;
@@ -789,13 +773,15 @@ return {}
             .enqueue_input_command(bitty_config::ChromeAction::OpenComposer);
         let pumps = fixture.pump_until_unparked();
         assert!(pumps >= 2, "composer open must span several cold ticks");
-        let runs = fixture
-            .app
-            .plugin_runtime
-            .as_mut()
-            .expect("plugins")
-            .dispatch_command(&fixture.id, "runs", &[])
-            .expect("composer runs command");
+        // bitty #2409: the follow-up read is a probe dispatch, so settle a
+        // park instead of assuming it completes inside one wall window.
+        let runs = settle_dispatch(
+            fixture.app.plugin_runtime.as_mut().expect("plugins"),
+            fixture.id.as_str(),
+            "runs",
+            &[],
+        )
+        .expect_value("runs");
         assert_eq!(runs, LuaValue::String("1".to_string()));
         assert_eq!(
             fixture.app.runtime.notification_banner().as_deref(),
@@ -928,13 +914,16 @@ return {}
     fn input_vm_boundary_direct_command_positive_control() {
         let mut fixture = Fixture::new("direct");
         let before = fixture.entries();
-        let result = fixture
-            .app
-            .plugin_runtime
-            .as_mut()
-            .expect("plugins")
-            .dispatch_command(&fixture.id, "step", &[])
-            .expect("valid direct command");
+        // bitty #2409: settle a park; a resume continues the same executor and
+        // never increments the owning-VM entry counter, so the exact delta
+        // stays the positive control for "one dispatch, one VM entry".
+        let result = settle_dispatch(
+            fixture.app.plugin_runtime.as_mut().expect("plugins"),
+            fixture.id.as_str(),
+            "step",
+            &[],
+        )
+        .expect_value("step");
         assert_eq!(fixture.entries() - before, 1);
         assert_eq!(result, LuaValue::String("1".to_string()));
         assert_eq!(fixture.read_marker(), 1);
@@ -3017,15 +3006,17 @@ fn overlay_input_available_pump_nudge_on_tick_with_released_ordering() {
     );
     // Session A opens, then ends by runtime revoke (focus-switch cause):
     // its `overlay.released` observation waits for the next tick.
-    plugin_runtime
-        .dispatch_command(&holder, "probe", &[])
-        .expect("open session A");
+    // bitty #2409: a probe dispatch can park at the RC-1 wall budget on a
+    // loaded runner; settle it instead of assuming synchronous completion.
+    let _ =
+        crate::test_support::settle_dispatch(&mut plugin_runtime, holder.as_str(), "probe", &[])
+            .expect_value("probe");
     assert!(plugin_runtime.overlay_capture().borrow().is_active());
     assert!(plugin_runtime.revoke_overlay_capture_with_reason("cancelled"));
     // Session B opens on the same tick window and queues three inputs.
-    plugin_runtime
-        .dispatch_command(&holder, "probe", &[])
-        .expect("open session B");
+    let _ =
+        crate::test_support::settle_dispatch(&mut plugin_runtime, holder.as_str(), "probe", &[])
+            .expect_value("probe");
     for text in ["h", "i", "!"] {
         assert!(
             plugin_runtime.push_overlay_input("key", text),
@@ -12193,11 +12184,16 @@ claims = []
     );
 
     // A user focus-switch through the chrome action runner revokes.
-    app.plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, "reacquire", &[])
-        .expect("reacquire");
+    // bitty #2409: settle a park; a probe dispatch can legitimately park at
+    // the RC-1 wall budget on a loaded runner before the harness observes the
+    // capture it opens.
+    crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        pid.as_str(),
+        "reacquire",
+        &[],
+    )
+    .expect_value("reacquire");
     assert!(app.overlay_capture_active());
     let before = app.runtime.focused_view();
     app.apply_chrome_action(bitty_config::ChromeAction::FocusNext);
@@ -12212,11 +12208,16 @@ claims = []
     );
 
     // Issue #1776: Mod+q (CloseView) closes the active overlay capture.
-    app.plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, "reacquire", &[])
-        .expect("reacquire");
+    // bitty #2409: settle a park; a probe dispatch can legitimately park at
+    // the RC-1 wall budget on a loaded runner before the harness observes the
+    // capture it opens.
+    crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        pid.as_str(),
+        "reacquire",
+        &[],
+    )
+    .expect_value("reacquire");
     assert!(app.overlay_capture_active());
     app.chrome.app_mods.alt = true;
     let key_q = test_key(LogicalKey::Character("q".to_string()), Some("q"));
@@ -12228,11 +12229,16 @@ claims = []
     app.chrome.app_mods.alt = false;
 
     // Issue #1776: Mod+z (ToggleZoom) suspends/releases the active overlay capture.
-    app.plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, "reacquire", &[])
-        .expect("reacquire");
+    // bitty #2409: settle a park; a probe dispatch can legitimately park at
+    // the RC-1 wall budget on a loaded runner before the harness observes the
+    // capture it opens.
+    crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        pid.as_str(),
+        "reacquire",
+        &[],
+    )
+    .expect_value("reacquire");
     assert!(app.overlay_capture_active());
     app.chrome.app_mods.alt = true;
     let key_z = test_key(LogicalKey::Character("z".to_string()), Some("z"));
@@ -12244,20 +12250,30 @@ claims = []
     app.chrome.app_mods.alt = false;
 
     // Window focus loss through the intercept revokes as well.
-    app.plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, "reacquire", &[])
-        .expect("reacquire");
+    // bitty #2409: settle a park; a probe dispatch can legitimately park at
+    // the RC-1 wall budget on a loaded runner before the harness observes the
+    // capture it opens.
+    crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        pid.as_str(),
+        "reacquire",
+        &[],
+    )
+    .expect_value("reacquire");
     assert!(!app.intercept_chrome_key(&WindowEventKind::Focused(false)));
     assert!(!app.overlay_capture_active());
 
     // The 30s idle timeout is enforced on the runtime tick.
-    app.plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, "reacquire", &[])
-        .expect("reacquire");
+    // bitty #2409: settle a park; a probe dispatch can legitimately park at
+    // the RC-1 wall budget on a loaded runner before the harness observes the
+    // capture it opens.
+    crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        pid.as_str(),
+        "reacquire",
+        &[],
+    )
+    .expect_value("reacquire");
     assert!(app.overlay_capture_active());
     assert!(
         app.plugin_runtime
@@ -12847,16 +12863,18 @@ bitty.commands.register({
 #[cfg(unix)]
 fn trace1828_dispatch(app: &mut TerminalApp, id: &str, command: &str) -> String {
     use bitty_runtime::plugin_runtime::LuaValue;
-    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
-    match app
-        .plugin_runtime
-        .as_mut()
-        .expect("plugin runtime")
-        .dispatch_command(&pid, command, &[])
-    {
-        Ok(LuaValue::String(s)) => s,
-        Ok(other) => panic!("{command}: expected string, got {other:?}"),
-        Err(error) => panic!("{command}: dispatch failed: {error:?}"),
+    // bitty #2409: settle a park at the RC-1 wall budget instead of assuming
+    // every probe dispatch completes inside one wall window.
+    let value = crate::test_support::settle_dispatch(
+        app.plugin_runtime.as_mut().expect("plugin runtime"),
+        id,
+        command,
+        &[],
+    )
+    .expect_value(command);
+    match value {
+        LuaValue::String(value) => value,
+        other => panic!("{command}: expected string, got {other:?}"),
     }
 }
 

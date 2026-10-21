@@ -768,6 +768,7 @@ fn install_runtime_inspect_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{PARK_RESUME_TICKS, settle_dispatch};
     use bitty_runtime::Runtime;
     use bitty_runtime::registry::{Generation, PanelId, PanelState};
     use bitty_runtime::{LayoutNode, SplitAxis, UiRect, View};
@@ -906,9 +907,10 @@ mod tests {
             .expect("dev root must yield a session");
         let mut runtime = session.runtime;
         let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
-        let value = runtime
-            .dispatch_command(&plugin_id, "list", &[])
-            .expect("dispatch fs.list command");
+        // bitty #2409: `fs.list` reads host paths, so the probe settles an
+        // RC-1 park on the cold ticks instead of assuming a synchronous value.
+        let value =
+            settle_dispatch(&mut runtime, plugin_id.as_str(), "list", &[]).expect_value("list");
         assert_eq!(
             value,
             LuaValue::String("~/docs/a.txt:file:true,~/docs/b.txt:file:true".to_string())
@@ -992,9 +994,10 @@ mod tests {
             .expect("dev root must yield a session");
         let mut runtime = session.runtime;
         let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
-        let value = runtime
-            .dispatch_command(&plugin_id, "inspect", &[])
-            .expect("dispatch runtime.inspect command");
+        // bitty #2409: runtime.inspect walks live state, so the probe settles
+        // an RC-1 park on the cold ticks instead of assuming one wall window.
+        let value = settle_dispatch(&mut runtime, plugin_id.as_str(), "inspect", &[])
+            .expect_value("inspect");
         assert_eq!(
             value,
             LuaValue::String("test-version:table:false".to_string())
@@ -1014,8 +1017,10 @@ mod tests {
             .expect("dev root must yield a session");
         let mut runtime = session.runtime;
         let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
-        let error = runtime
-            .dispatch_command(&plugin_id, "inspect", &[])
+        // bitty #2409: a park is settled first, so the terminal refusal under
+        // test is the resumed/inline error, never a non-terminal `Parked`.
+        let error = settle_dispatch(&mut runtime, plugin_id.as_str(), "inspect", &[])
+            .outcome
             .expect_err("mismatched snapshot must not serve");
         let message = format!("{error}");
         assert!(
@@ -1227,92 +1232,10 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         .with_live_pin_state(Some(pin_state))
     }
 
-    /// Upper bound on cold ticks spent settling one parked dispatch
-    /// (bitty #2409).
-    ///
-    /// Each cold tick advances at most one RC-1 wall window and every callback
-    /// is bounded by the 5250 ms ceiling, so a legitimate park cannot need
-    /// more windows; the bound only turns a stuck park into a test failure
-    /// instead of a hang.
-    const PARK_RESUME_TICKS: usize = 200;
-
-    /// One host-mediated dispatch after cold-tick settling (bitty #2409).
-    struct SettledDispatch {
-        /// The command's string result.
-        value: String,
-        /// Completed parked resumes observed while settling (`0` or `1`).
-        resumes: usize,
-    }
-
-    /// Dispatch one probe command and settle an RC-1 park on the cold ticks.
-    ///
-    /// bitty #2314 made app-dispatched commands resumable at the 50 ms charged
-    /// RC-1 wall budget, so a dispatch may legitimately return [`Parked`]
-    /// instead of a value when the runner is loaded. A park is accepted work,
-    /// not a refusal: this helper drives the documented recovery — the same
-    /// `PluginRuntime::pump_parked_commands` step the app performs inside
-    /// [`crate::terminal_app::TerminalApp::pump_cold_commands`] — until the
-    /// parked invocation completes, then proves the completion happened
-    /// exactly once and never replays. The dispatch itself is never retried,
-    /// so the callback body still runs exactly once.
-    ///
-    /// [`Parked`]: bitty_runtime::plugin_runtime::PluginRuntimeError::Parked
-    fn settle_dispatch(runtime: &mut PluginRuntime, id: &str, command: &str) -> SettledDispatch {
-        use bitty_plugin_host::manifest::PluginId;
-        let pid = PluginId::new(id).expect("id");
-        match runtime.dispatch_command(&pid, command, &[]) {
-            Ok(LuaValue::String(value)) => SettledDispatch { value, resumes: 0 },
-            Ok(other) => panic!("{command}: expected a string result, got {other:?}"),
-            Err(error) if error.is_parked() => {
-                assert_eq!(
-                    runtime.parked_command_count(),
-                    1,
-                    "{command}: the park must be recorded exactly once"
-                );
-                for _ in 0..PARK_RESUME_TICKS {
-                    let mut completions = runtime.pump_parked_commands();
-                    if completions.is_empty() {
-                        // Still parked: the next cold tick advances the next
-                        // RC-1 wall window.
-                        continue;
-                    }
-                    assert_eq!(
-                        completions.len(),
-                        1,
-                        "{command}: one parked invocation completes at most once per cold tick"
-                    );
-                    let completion = completions.remove(0);
-                    assert_eq!(completion.plugin.as_str(), id);
-                    assert_eq!(completion.command, command);
-                    let value = match completion.outcome {
-                        Ok(LuaValue::String(value)) => value,
-                        Ok(other) => {
-                            panic!("{command}: resumed with a non-string result {other:?}")
-                        }
-                        Err(error) => panic!("{command}: resume failed: {error:?}"),
-                    };
-                    assert_eq!(
-                        runtime.parked_command_count(),
-                        0,
-                        "{command}: a completed park must be dropped"
-                    );
-                    assert!(
-                        runtime.pump_parked_commands().is_empty(),
-                        "{command}: a completed command must never replay"
-                    );
-                    return SettledDispatch { value, resumes: 1 };
-                }
-                panic!(
-                    "{command}: the parked invocation did not resume within {PARK_RESUME_TICKS} cold ticks"
-                )
-            }
-            Err(error) => panic!("{command}: dispatch failed: {error:?}"),
-        }
-    }
-
+    /// Dispatch one probe command through the settling helper (bitty #2409).
     fn dispatch_pin(app: &mut crate::terminal_app::TerminalApp, id: &str, command: &str) -> String {
         let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
-        settle_dispatch(runtime, id, command).value
+        settle_dispatch(runtime, id, command, &[]).into_string(command)
     }
 
     /// Run the pin half of the app tick without a full `drive_tick`.
@@ -1716,17 +1639,25 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         let mut app = submit_test_app("granted", "xuepoo.prodsubmit", &["terminal.input.submit"]);
         let settled = {
             let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
-            settle_dispatch(runtime, "xuepoo.prodsubmit", "go")
+            settle_dispatch(runtime, "xuepoo.prodsubmit", "go", &[])
         };
+        let parked = settled.parked;
+        let resumes = settled.resumes;
         assert_eq!(
-            settled.value, "OK:accepted:23",
+            settled.into_string("go"),
+            "OK:accepted:23",
             "granted submit reports the framed byte count"
         );
-        assert!(
-            settled.resumes <= 1,
-            "a park resumes exactly once, observed {} resumed completions",
-            settled.resumes
+        // bitty #2409: assert the parked path rather than tolerate it. A park
+        // completes through exactly one resumed invocation (never a
+        // re-dispatch), and the inline path observes no resume at all; both
+        // report the identical framed byte count and land identical bytes.
+        assert_eq!(
+            resumes,
+            usize::from(parked),
+            "a park resumes exactly once and an inline dispatch never resumes"
         );
+        println!("startup submit: settled parked={parked} resumes={resumes}");
         assert!(
             app.runtime.pending_input().is_empty(),
             "nothing lands before the tick drain"
@@ -1955,9 +1886,13 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
         );
         let runs = {
             let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
-            settle_dispatch(runtime, id, "runs")
+            settle_dispatch(runtime, id, "runs", &[]).expect_value("runs")
         };
-        assert_eq!(runs.value, "1", "the callback body must run exactly once");
+        assert_eq!(
+            runs,
+            LuaValue::String("1".to_string()),
+            "the callback body must run exactly once"
+        );
 
         app.apply_plugin_submit_requests();
         assert_eq!(
@@ -1987,13 +1922,14 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
         // recovery: one park, exactly one resumed completion, same value.
         let settled = {
             let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
-            settle_dispatch(runtime, id, "stall_go")
+            settle_dispatch(runtime, id, "stall_go", &[])
         };
-        assert_eq!(settled.value, "OK:accepted:23");
+        assert!(settled.parked, "the charged probe must park every time");
         assert_eq!(
             settled.resumes, 1,
             "the settle helper resumes a park exactly once"
         );
+        assert_eq!(settled.into_string("stall_go"), "OK:accepted:23");
         assert_eq!(
             app.plugin_runtime
                 .as_ref()
@@ -2072,7 +2008,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
     }
 
     fn dispatch_panel(runtime: &mut PluginRuntime, id: &str, command: &str) -> String {
-        settle_dispatch(runtime, id, command).value
+        settle_dispatch(runtime, id, command, &[]).into_string(command)
     }
 
     #[test]

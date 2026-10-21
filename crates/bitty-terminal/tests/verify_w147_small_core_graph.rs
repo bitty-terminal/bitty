@@ -48,12 +48,15 @@
 //!
 //! The graphics seam (#2163) is the one source-restricted crate with no
 //! production edge: `crates/bitty-rich/src/kitty_seam.rs` is the designated
-//! naming point for the decode/raster contract, while the composition-root
-//! binding and worker protocol stay parked in `bitty-graphics` CTX-0003 /
-//! `bitty` W-141. No Core source names the crate today. The identifier scan,
-//! the crate-name scan, and the mutation test all reject a direct import or
-//! prose mention outside that module, and the crate-root re-export guard keeps
-//! the seam reachable only through `bitty_rich::kitty_seam`.
+//! naming point for the decode/raster contract. The composition-root binding
+//! has no separate open task; the remaining extension-side gate is
+//! `bitty-graphics#17` (the packed component is a version-only stub), and
+//! Core tracks the remainder in #2163. No Core **source** names the crate
+//! today; manifests and the crate README still name it by design. The
+//! identifier scan, the crate-name scan, and the mutation tests all reject a
+//! direct import, module alias, or prose mention outside that module, and the
+//! crate-root seam-reference guard keeps the seam reachable only through
+//! `bitty_rich::kitty_seam`.
 //!
 //! Graph evidence beyond assertion: `cargo tree -e normal` (recorded in the
 //! CTX-0940 verification report) shows `bitty-storage` reachable only from
@@ -141,11 +144,13 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
     ("bitty-execution", &["bitty-runtime"]),
 ];
 
-/// Graphics decode/raster seam module (#2163). It is the single Core source
-/// allowed to name the graphics extension crate. The crate has no production
-/// edge: the composition-root binding and worker protocol stay parked in
-/// `bitty-graphics` CTX-0003 / `bitty` W-141, so this module is a designated
-/// contract naming point rather than an import site.
+/// Graphics decode/raster seam module (#2163). It is the single Core **source**
+/// allowed to name the graphics extension crate; manifests and crate docs
+/// still name it by design. The crate has no production edge: the
+/// composition-root binding has no separate open task, the remaining
+/// extension-side gate is `bitty-graphics#17` (version-only stub), and Core
+/// tracks the remainder in #2163. This module is a designated contract naming
+/// point rather than an import site.
 const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
 
 /// Seam crates whose Core source references are restricted to one file.
@@ -155,8 +160,9 @@ const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
 /// `SnapshotHost`, and every other source imports the role vocabulary through
 /// that module's re-export. `bitty-execution` is likewise confined to the
 /// `bitty-runtime` `execution_jobs.rs` bridge (#2249). `bitty-graphics` has no
-/// dependency edge but is restricted to `GRAPHICS_SOURCE_SEAM` while its
-/// composition-root binding is parked (#2163).
+/// dependency edge but is restricted to `GRAPHICS_SOURCE_SEAM`; its
+/// composition-root binding has no separate open task, with `bitty-graphics#17`
+/// as the extension-side gate and #2163 as the Core tracker.
 const SOURCE_SEAM_FILES: &[(&str, &str)] = &[
     ("bitty-a11y", "crates/bitty-ui/src/a11y_host.rs"),
     (
@@ -815,11 +821,39 @@ fn graphics_seam_is_the_only_crate_name_reference() {
     );
 }
 
+/// Code-line (`//` comments stripped, whitespace compacted) references to a
+/// Code-line (`//` comments stripped) references to the `kitty_seam` module.
+/// Catches `pub use`, plain `use`, type-alias paths, and module aliases
+/// (`pub use crate::kitty_seam as seam;`), with or without `crate::`/`self::`
+/// qualification. The only allowed code lines are the module declarations.
+fn seam_module_references(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let code = line.split("//").next().unwrap_or("").trim();
+            let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.is_empty()
+                || matches!(compact.as_str(), "pubmodkitty_seam;" | "modkitty_seam;")
+            {
+                return None;
+            }
+            // Tokenize the original (whitespace keeps `use kitty_seam` from
+            // merging into one identifier); `crate::`/`self::`/`::` boundaries
+            // and aliases all leave `kitty_seam` as its own token.
+            let names_module = code
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == "kitty_seam");
+            names_module.then(|| code.to_string())
+        })
+        .collect()
+}
+
 #[test]
 fn graphics_seam_is_the_only_public_seam_path() {
     // #2163 seam/fence part: the decode/raster traits and backend are reached
-    // through `bitty_rich::kitty_seam` only. A crate-root re-export would give
-    // call sites a second, un-fenced path to the extension boundary.
+    // through `bitty_rich::kitty_seam` only. A crate-root re-export, use, type
+    // alias, or module alias would give call sites a second, un-fenced path to
+    // the extension boundary.
     let root = workspace_root();
     let lib = std::fs::read_to_string(root.join("crates/bitty-rich/src/lib.rs"))
         .expect("read bitty-rich lib.rs");
@@ -827,10 +861,44 @@ fn graphics_seam_is_the_only_public_seam_path() {
         lib.contains("pub mod kitty_seam;"),
         "the kitty_seam module must stay public"
     );
+    let references = seam_module_references(&lib);
     assert!(
-        !lib.contains("pub use kitty_seam::"),
-        "seam types must be reached through `bitty_rich::kitty_seam`, not crate-root re-exports"
+        references.is_empty(),
+        "crate-root seam references must go through `bitty_rich::kitty_seam` at call sites: {references:?}"
     );
+}
+
+#[test]
+fn graphics_seam_module_bypass_is_rejected() {
+    // #2163 guard mutation: the old literal prefix check missed
+    // `pub use crate::kitty_seam::... as Alias;`, type aliases, and
+    // `pub use crate::kitty_seam as seam;`. Every path/module form is now
+    // rejected; the module declarations and comments are not.
+    for probe in [
+        "pub use kitty_seam::CoreKittyBackend as SeamBackend;",
+        "pub use crate::kitty_seam::CoreKittyBackend as SeamBackend;",
+        "pub use self::kitty_seam::KittyDecodeBackend;",
+        "use self :: kitty_seam :: KittyTransmitFormat;",
+        "pub type SeamBackend = crate::kitty_seam::CoreKittyBackend;",
+        "pub use crate::kitty_seam as seam;",
+        "use crate::{kitty_seam as seam};",
+    ] {
+        assert!(
+            !seam_module_references(probe).is_empty(),
+            "seam module bypass must be rejected: {probe}"
+        );
+    }
+    for allowed in [
+        "pub mod kitty_seam;",
+        "mod kitty_seam;",
+        "// pub use kitty_seam::CoreKittyBackend;",
+        "//! [`kitty_seam`] traits",
+    ] {
+        assert!(
+            seam_module_references(allowed).is_empty(),
+            "module declaration/comment must stay allowed: {allowed}"
+        );
+    }
 }
 
 #[test]

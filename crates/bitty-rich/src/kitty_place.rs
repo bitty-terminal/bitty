@@ -4,7 +4,7 @@
 //! `bitty-vt`'s `kitty_apc`; the retired `bitty-rich` placeholder stub is
 //! not part of this path (bitty#2358). The bounded Kitty payload decoder
 //! used to live here in `kitty_decode` (W-141 extraction): it now lives in
-//! the `bitty-graphics` extension crate behind the Core-owned
+//! the graphics extension crate behind the Core-owned
 //! [`crate::kitty_seam`] traits, which mirrors texture-preparation mechanics
 //! extension crate, which mirrors texture-preparation mechanics
 //! (nearest-neighbor scaling, the per-frame blit budget, its own raster

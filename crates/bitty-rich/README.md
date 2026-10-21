@@ -19,39 +19,6 @@ lives in `src/lib.rs` and is not repeated here.
 Accepted contracts, per `src/lib.rs`: the rich-presentation RFC is accepted
 and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 
-## Graphics/scene retention decision (0.0.25, #2163)
-
-The accepted graphics extraction contract (`W-133`, ADR 0016 Boundary 2)
-assigns **decode and processing** to the graphics extension and keeps the
-trust decision in Core: bounded protocol intake, `ImageStore` /
-`ImagePlacement`, the aggregate image budget, pre-allocation and pre-upload
-validation, and Terminal Truth. The extension's own scope record keeps the
-whole placement-policy half and config-file background decode in Core.
-
-Consequently this crate's graphics/scene-shaped modules are **Core-retained
-implementation, not extraction candidates**:
-
-- `image.rs` — Core-owned `ImageStore` / `ImagePlacement` and the IMG-1..IMG-8
-  budget;
-- `scene.rs`, `presentation.rs`, `projection.rs` — scene composition,
-  presentation assembly, and fragment projection owned by the rich
-  presentation contract;
-- `kitty_place.rs`, `kitty_unicode.rs` — placement/admission/eviction policy,
-  origin confinement, scroll anchoring, alternate-screen suppression, and
-  placeholder geometry;
-- `background.rs` — config-file background decode, explicitly outside the
-  extension scope;
-- `wallpaper_theme.rs` — appearance and palette policy, not graphics decode;
-- `geometry.rs` — shared pixel-rect carriers.
-
-The only extension-bound mechanics are `kitty_decode.rs` and
-`kitty_raster.rs`. They already sit behind the Core-owned `kitty_seam.rs`
-traits (`CoreKittyBackend` is the Core-local backend). Removing the
-Core-local copies needs the composition-root binding and the graphics worker
-protocol, parked in the extension's `CTX-0003` and Core `W-141`; no wire
-contract is invented here. `kitty_seam.rs` is the single module that may name
-the graphics extension crate, and the W-147 source fence enforces it.
-
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
@@ -61,7 +28,7 @@ the graphics extension crate, and the W-147 source fence enforces it.
   dependency is declared. The graphics extension-side seam contract is
   published (`bitty-graphics#15`); Core keeps its bounded decode/raster
   backend behind `kitty_seam.rs` until the composition-root binding lands
-  (W-141, worker protocol parked).
+  (remaining extension-side gate: `bitty-graphics#17`; Core tracker: #2163).
 - No GPU, no window system, no filesystem, and no `unsafe`, except the
   `host` module: the external-editor round-trip writes a restricted temp
   file and spawns the configured editor with a bounded timeout plus kill.
@@ -81,8 +48,8 @@ the graphics extension crate, and the W-147 source fence enforces it.
   `src/kitty_seam.rs` (W-141 extraction); bounded `APC G` intake lives in
   `bitty-vt/src/kitty_apc.rs`.
 - `src/kitty_seam.rs` — Core-owned decode/raster traits, seam caps, and the
-  Core-local backend; the only module allowed to name the graphics extension
-  crate.
+  Core-local backend; the only Core source module allowed to name the graphics
+  extension crate.
 - `src/hyperlink.rs`, `src/shell.rs`, `src/clipboard.rs` — link table, shell
   zones plus the single OSC 7/133 read view (`ShellIntegration`: cwd, zones,
   command regions, last exit code), and clipboard helpers.
@@ -102,8 +69,14 @@ and the rich scene model. This crate's `image`, `scene`, `kitty_place`,
 `kitty_unicode`, `background`, and `geometry` modules are therefore
 Core-retained implementation, not extraction material; only
 `kitty_decode`/`kitty_raster` are extension-bound, and their Core copies stay
-behind `kitty_seam.rs` until the composition-root binding and worker protocol
-land (W-141).
+behind `kitty_seam.rs` (`CoreKittyBackend` is the Core-local backend).
+The composition-root binding has no separate open task: the remaining
+extension-side gate is `bitty-graphics#17` (the packed component is a
+version-only stub; its serve loop is not wired), and Core tracks the remainder
+in #2163. No wire contract is invented here. `kitty_seam.rs` is the single
+Core **source** module that may name the graphics extension crate; manifests
+and crate documentation still name it by design, and the W-147 source fence
+enforces the source rule.
 
 Unwired helpers were removed in CTX-1412 (bitty#2117) and CTX-1415
 (bitty#2358 / bitty#2359) because no Core path consumed them:
@@ -117,3 +90,12 @@ remains Core-retained with the SCN-1..5 limits — and the projection was the
 only reason this crate carried a production edge to the extracted `bitty-ipc`
 repository. `crates/bitty-rich/tests/retired_surface_guard.rs` keeps all four
 surfaces retired.
+
+## Compatibility
+
+`bitty-rich` is `publish = true`. This change removes the crate-root
+re-exports `CoreKittyBackend`, `KittyDecodeBackend`, `KittyRasterBackend`, and
+`KittyTransmitFormat`; downstream code must import them from
+`bitty_rich::kitty_seam`. This is a source-visible API break in the pre-stable
+0.0.x line, with no behavior change. The four items remain public at the seam
+module.

@@ -239,6 +239,8 @@ mod config_cli;
 mod config_reload;
 mod consent;
 mod ctl;
+mod dashboard_data;
+mod dashboard_keys;
 mod dev;
 mod doctor;
 mod editor_host;
@@ -1272,6 +1274,32 @@ fn main() {
     // info/warn diagnostics; user-facing key info (paste confirm/cancel)
     // stays unconditional; devtools keeps full fidelity via Runtime::tick.
     app.set_log_level(effective_log_level(&args));
+    // Issue #2380 / CTX-1429: the configuration dashboard reads the same
+    // paths this process resolved at startup (config file, profile, managed
+    // plugin manifest, package store, extension roots); no environment is
+    // re-derived later.
+    // `--safe` selects the built-in config and never reads the third-party
+    // store tree, so the dashboard gets no external sources there: it reports
+    // the live safe values and lists the static bundled catalog read-only.
+    let dashboard_sources = if args.safe {
+        dashboard_data::DashboardSources::default()
+    } else {
+        let profile_source = if args.profile.is_some() {
+            "cli"
+        } else if app_config.profile_name.is_some() {
+            "env"
+        } else {
+            "none"
+        };
+        dashboard_data::DashboardSources::discover(
+            args.config_path.as_deref(),
+            app_config.file_path.clone(),
+            app_config.profile_name.clone(),
+            profile_source,
+            app_config.theme.name,
+        )
+    };
+    app.set_dashboard_sources(dashboard_sources);
     // CTX-0393: safe recovery and headless smoke runs never overwrite the
     // saved session on exit (the safe run owns a default layout, not the
     // user's session).

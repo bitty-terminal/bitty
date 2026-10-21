@@ -1645,6 +1645,163 @@ pub struct CapabilityRow {
     pub denied: bool,
 }
 
+// ── dashboard read/toggle surface (issue #2380, CTX-1429) ────────────────
+
+/// One plugin as the configuration dashboard presents it.
+///
+/// Read-only projection: id, desired state, provenance, and the declared
+/// settings schema needed by the Settings section. Capability grants are
+/// deliberately absent (the dashboard never displays or widens authority).
+pub(crate) struct DashboardPlugin {
+    /// Fully qualified plugin id.
+    pub(crate) id: String,
+    /// Manifest version, or `-` for a record without a readable manifest.
+    pub(crate) version: String,
+    /// `bundled` / `registry` / `git` / `local-path`.
+    pub(crate) source: String,
+    /// `enabled` / `disabled` / `available`.
+    pub(crate) state: &'static str,
+    /// Recorded enabled flag.
+    pub(crate) enabled: bool,
+    /// Whether a managed record exists (toggle needs one).
+    pub(crate) recorded: bool,
+    /// Whether this id is the bundled catalog entry.
+    pub(crate) bundled: bool,
+    /// Declared `[settings]` schema, in manifest order.
+    pub(crate) settings: Vec<SettingDecl>,
+}
+
+/// Read the plugin list for the dashboard snapshot (cold path).
+///
+/// Order: bundled catalog first (sorted by id), then installed store
+/// records, then managed records without a readable source. A malformed
+/// managed manifest or store index is a typed error; the caller turns it
+/// into an `unavailable` section rather than an empty list, so a broken
+/// ledger can never read as "no plugins".
+pub(crate) fn dashboard_plugins(
+    state_path: Option<&Path>,
+    store_root: Option<&Path>,
+) -> Result<Vec<DashboardPlugin>, String> {
+    let state = match state_path {
+        Some(path) => load_state(path).map_err(|failure| failure.message)?,
+        None => PluginState::new(),
+    };
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<DashboardPlugin> = Vec::new();
+    let mut bundled = all_bundled_manifests();
+    bundled.sort_by_key(|manifest| manifest.id().as_str().to_string());
+    for manifest in &bundled {
+        let id = manifest.id().as_str().to_string();
+        seen.insert(id.clone());
+        let record = state.get(&id);
+        out.push(DashboardPlugin {
+            id,
+            version: manifest.identity.version.clone(),
+            source: "bundled".to_string(),
+            state: match record {
+                Some(record) if record.enabled => "enabled",
+                Some(_) => "disabled",
+                None => "available",
+            },
+            enabled: record.is_some_and(|record| record.enabled),
+            recorded: record.is_some(),
+            bundled: true,
+            settings: manifest.settings.clone(),
+        });
+    }
+    if let Some(root) = store_root.filter(|root| root.is_dir()) {
+        let records = load_store_index(root).map_err(|failure| failure.message)?;
+        for record in records {
+            seen.insert(record.plugin_id.clone());
+            let manifest = read_store_manifest(root, &record);
+            out.push(DashboardPlugin {
+                id: record.plugin_id.clone(),
+                version: record.version.clone(),
+                source: record.source_class.as_str().to_string(),
+                state: if record.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                enabled: record.enabled,
+                recorded: true,
+                bundled: false,
+                settings: manifest.map(|m| m.settings).unwrap_or_default(),
+            });
+        }
+    }
+    for id in state.ids() {
+        if seen.contains(id) {
+            continue;
+        }
+        let record = state.get(id).expect("id came from the record set");
+        out.push(DashboardPlugin {
+            id: id.clone(),
+            version: "-".to_string(),
+            source: record.source.clone(),
+            state: if record.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            enabled: record.enabled,
+            recorded: true,
+            bundled: false,
+            settings: Vec::new(),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
+}
+
+/// Resolve the managed plugin manifest beside the live config root.
+///
+/// Mirrors the CLI resolution (`--config` > `BITTY_CONFIG` > XDG/HOME), so
+/// the dashboard reads the exact ledger the running process was started
+/// with. `None` when no config root is resolvable (the panel then reports
+/// the section as unavailable instead of guessing a path).
+/// Resolve the managed plugin manifest from injected environment values
+/// (tests and the dashboard's startup source resolver).
+pub(crate) fn live_state_path_with(
+    explicit_config: Option<&str>,
+    bitty_config_env: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    resolve_state_path(explicit_config, bitty_config_env, xdg_config_home, home).ok()
+}
+
+/// Enable or disable one recorded plugin through the existing managed
+/// manifest path (`op_enable` / `op_disable` + the atomic, hardened
+/// `save_state` backup write).
+///
+/// This is the same operation `bitty plugin enable|disable` performs, with
+/// the same pin and grant re-checks; the dashboard's double-`Enter` is the
+/// UI consent, and a stale row is refused by those checks. Returns whether
+/// the record changed (an idempotent request returns `false`).
+pub(crate) fn dashboard_set_enabled(
+    state_path: &Path,
+    id: &str,
+    enabled: bool,
+) -> Result<bool, String> {
+    let mut state = load_state(state_path).map_err(|failure| failure.message)?;
+    if state.get(id).is_none() {
+        return Err(format!(
+            "bitty dashboard: '{id}' has no managed record (install it with `bitty plugin install {id}` first)"
+        ));
+    }
+    let output = if enabled {
+        op_enable(&mut state, id)
+    } else {
+        op_disable(&mut state, id)
+    }
+    .map_err(|failure| failure.message)?;
+    if output.changed {
+        save_state(state_path, &state).map_err(|failure| failure.message)?;
+    }
+    Ok(output.changed)
+}
+
 fn rows_from_state(
     state: &PluginState,
     store_root: Option<&Path>,

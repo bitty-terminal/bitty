@@ -2251,6 +2251,20 @@ impl TerminalApp {
                     }
                 }
             }
+            A::ToggleDashboard => {
+                // Issue #2380 / CTX-1429: core-owned configuration panel.
+                // Refused while a plugin overlay owns transient capture, so
+                // the two surfaces never compete for the same keys.
+                if self.overlay_capture_active() {
+                    self.warn_dashboard("a plugin overlay holds input capture; close it first");
+                    return false;
+                }
+                let visible = self.open_dashboard();
+                eprintln!(
+                    "bitty: keymap toggle_dashboard -> visible={visible} section={}",
+                    self.runtime.dashboard_section()
+                );
+            }
             A::ToggleHelp => {
                 // CTX-0265 which-key help popup: rows regenerate from the
                 // live keymap table on EVERY show, so the overlay lists
@@ -2788,6 +2802,14 @@ impl TerminalApp {
                         if let Some(win) = self.window.handle.as_ref() {
                             win.request_redraw();
                         }
+                        return true;
+                    }
+                    // Issue #2380 (CTX-1429): the configuration dashboard is
+                    // modal for unmodified keys. It sits above the user keymap
+                    // (like a capture surface) so `j`/`k`/`q` never reach the
+                    // shell; chorded presses fall through to the keymap, which
+                    // is what lets the toggle chord close it again.
+                    if self.runtime.dashboard_visible() && self.handle_dashboard_key(key, &keyref) {
                         return true;
                     }
                     let matched = match_chrome_keymap(&self.chrome.keymaps, keyref);
@@ -9021,6 +9043,272 @@ claims = []
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    // -------------------------------------------------------------------
+    // Configuration dashboard (issue #2380, CTX-1429)
+    // -------------------------------------------------------------------
+
+    fn dashboard_app() -> TerminalApp {
+        help_test_app(
+            bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("default maps"),
+        )
+    }
+
+    fn dashboard_scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bitty-dashboard-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// Managed manifest with one shell-integration record, correct pin hash
+    /// and the granted capability its bundled manifest requests.
+    fn write_dashboard_state(path: &std::path::Path, enabled: bool) {
+        let manifest =
+            bitty_plugin_host::bundled::bundled_manifest_for("bitty-terminal.shell-integration")
+                .expect("bundled manifest");
+        let body = format!(
+            "state_version = 1\n\n[plugins.\"bitty-terminal.shell-integration\"]\n\
+             source = \"bundled\"\n\
+             manifest_hash = \"{}\"\n\
+             enabled = {enabled}\n\
+             granted = [\"terminal.semantic-read\"]\n\
+             denied = []\n",
+            manifest.manifest_hash()
+        );
+        std::fs::write(path, body).expect("write state");
+    }
+
+    fn dashboard_sources(root: &std::path::Path) -> crate::dashboard_data::DashboardSources {
+        crate::dashboard_data::DashboardSources {
+            config_path: Some(root.join("init.lua")),
+            config_dir: Some(root.to_path_buf()),
+            profile_name: Some("work".to_string()),
+            startup_theme_name: Some(bitty_config::theme::DEFAULT_THEME_NAME.to_string()),
+            plugin_state_path: Some(root.join(crate::plugin::STATE_FILE_NAME)),
+            store_root: None,
+            extension_user_root: Some(root.join("extensions-user")),
+            extension_system_root: Some(root.join("extensions-system")),
+            component_state_root: Some(root.join("extensions-state")),
+            profile_source: "cli".to_string(),
+        }
+    }
+
+    #[test]
+    fn dashboard_toggle_opens_closes_and_swallows_navigation() {
+        let root = dashboard_scratch("toggle");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        assert!(!app.runtime.dashboard_visible());
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        assert!(app.runtime.dashboard_visible());
+        assert_eq!(
+            app.runtime.dashboard_section(),
+            bitty_runtime::runtime::dashboard::DashboardSection::Overview
+        );
+        // `j` is consumed and never typed into the shell.
+        let j = WindowEventKind::KeyboardInput(test_char_key("j"));
+        assert!(drive_chrome(&mut app, j));
+        assert_eq!(app.runtime.pending_input_len(), 0);
+        // `q` closes it.
+        let q = WindowEventKind::KeyboardInput(test_char_key("q"));
+        assert!(drive_chrome(&mut app, q));
+        assert!(!app.runtime.dashboard_visible());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_escape_closes_and_enter_is_modal() {
+        let root = dashboard_scratch("escape");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        // Enter on a read-only row does nothing but is still swallowed.
+        let enter = WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Enter)));
+        assert!(drive_chrome(&mut app, enter));
+        assert!(!app.runtime.dashboard_confirm_armed());
+        let esc = WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Escape)));
+        assert!(drive_chrome(&mut app, esc));
+        assert!(!app.runtime.dashboard_visible());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_section_keys_move_through_the_closed_set() {
+        let root = dashboard_scratch("sections");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        let press = |app: &mut TerminalApp, c: &str| {
+            drive_chrome(app, WindowEventKind::KeyboardInput(test_char_key(c)))
+        };
+        assert!(press(&mut app, "2"));
+        assert_eq!(
+            app.runtime.dashboard_section(),
+            bitty_runtime::runtime::dashboard::DashboardSection::Plugins
+        );
+        assert!(press(&mut app, "l"));
+        assert_eq!(
+            app.runtime.dashboard_section(),
+            bitty_runtime::runtime::dashboard::DashboardSection::Settings
+        );
+        assert!(press(&mut app, "h"));
+        assert!(press(&mut app, "1"));
+        assert_eq!(
+            app.runtime.dashboard_section(),
+            bitty_runtime::runtime::dashboard::DashboardSection::Overview
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_unavailable_sections_fail_closed() {
+        // No sources installed: the panel still opens, and the sections whose
+        // data cannot be resolved are explicitly unavailable rather than
+        // silently empty.
+        let mut app = dashboard_app();
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        assert!(app.runtime.dashboard_visible());
+        let snapshot = app.runtime.dashboard_snapshot();
+        use bitty_runtime::runtime::dashboard::DashboardSection as S;
+        assert!(snapshot.section(S::Overview).is_ready());
+        assert!(!snapshot.section(S::Profiles).is_ready());
+        assert!(!snapshot.section(S::Extensions).is_ready());
+        assert!(!snapshot.section(S::Settings).is_ready());
+    }
+
+    #[test]
+    fn dashboard_plugin_toggle_needs_confirmation_and_is_atomic() {
+        let root = dashboard_scratch("plugin-toggle");
+        let state = root.join(crate::plugin::STATE_FILE_NAME);
+        write_dashboard_state(&state, false);
+        let before = std::fs::read_to_string(&state).expect("read state");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        let enter = || WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Enter)));
+        // Plugins section, first row is the bundled catalog entry.
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_char_key("2"))
+        ));
+        assert!(drive_chrome(&mut app, enter()));
+        assert!(app.runtime.dashboard_confirm_armed());
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("read state"),
+            before,
+            "arming must not write"
+        );
+        assert!(drive_chrome(&mut app, enter()));
+        let after = std::fs::read_to_string(&state).expect("read state");
+        assert!(
+            after.contains("enabled = true"),
+            "confirmed write lands: {after}"
+        );
+        // The refreshed snapshot shows the new state, not the stale row.
+        let plugins = app
+            .runtime
+            .dashboard_snapshot()
+            .section(bitty_runtime::runtime::dashboard::DashboardSection::Plugins);
+        assert!(
+            plugins
+                .rows()
+                .iter()
+                .any(|row| row.label == "bitty-terminal.shell-integration"
+                    && row.value.starts_with("enabled"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_plugin_toggle_refuses_unknown_records() {
+        let root = dashboard_scratch("plugin-unknown");
+        let state = root.join(crate::plugin::STATE_FILE_NAME);
+        write_dashboard_state(&state, false);
+        let before = std::fs::read_to_string(&state).expect("read state");
+        let error = crate::plugin::dashboard_set_enabled(&state, "xuepoo.unknown", true)
+            .expect_err("unknown record must be refused");
+        assert!(error.contains("no managed record"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("read state"),
+            before,
+            "a refused write must not touch the ledger"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_plugin_write_is_refused_in_safe_mode() {
+        let root = dashboard_scratch("safe-mode");
+        let state = root.join(crate::plugin::STATE_FILE_NAME);
+        write_dashboard_state(&state, false);
+        let before = std::fs::read_to_string(&state).expect("read state");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        app.safe_mode = true;
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        app.apply_dashboard_action(
+            bitty_runtime::runtime::dashboard::DashboardAction::SetPluginEnabled {
+                id: "bitty-terminal.shell-integration".to_string(),
+                enabled: true,
+            },
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("read state"),
+            before,
+            "safe mode must never write the managed manifest"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_theme_preview_never_writes_the_config_file() {
+        let root = dashboard_scratch("theme-preview");
+        let config = root.join("init.lua");
+        std::fs::write(&config, b"return { theme = \"bitty-dark\" }\n").expect("write config");
+        let before = std::fs::read(&config).expect("read config");
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        let palette_before = app.runtime.config().theme.background;
+        let other = bitty_config::theme::ALL_PRESETS
+            .iter()
+            .find(|theme| theme.name != bitty_config::theme::DEFAULT_THEME_NAME)
+            .expect("catalog has more than one preset")
+            .name
+            .to_string();
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        app.apply_dashboard_action(
+            bitty_runtime::runtime::dashboard::DashboardAction::PreviewTheme { name: other },
+        );
+        assert_ne!(app.runtime.config().theme.background, palette_before);
+        assert_eq!(
+            std::fs::read(&config).expect("read config"),
+            before,
+            "a live preview must never rewrite init.lua"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dashboard_never_builds_a_plugin_runtime() {
+        let root = dashboard_scratch("no-vm");
+        let state = root.join(crate::plugin::STATE_FILE_NAME);
+        write_dashboard_state(&state, false);
+        let mut app = dashboard_app();
+        app.set_dashboard_sources(dashboard_sources(&root));
+        let _ = app.apply_chrome_action(bitty_config::ChromeAction::ToggleDashboard);
+        for key in ["2", "3", "4", "5", "j", "k", "l", "h", "r"] {
+            let _ = drive_chrome(&mut app, WindowEventKind::KeyboardInput(test_char_key(key)));
+        }
+        assert!(
+            app.plugin_runtime.is_none(),
+            "the dashboard is Core UI: no plugin runtime/services are built;              settings are read through the bounded plain-config loader"
+        );
+        assert!(app.runtime.plugin_overlay().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

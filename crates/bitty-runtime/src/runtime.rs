@@ -134,6 +134,7 @@ pub mod close_confirm;
 pub mod component_host;
 pub mod copy_mode;
 pub mod cw_live;
+pub mod dashboard;
 pub mod fx;
 pub mod help;
 pub mod input;
@@ -725,6 +726,13 @@ pub struct Runtime {
     /// [`help::HELP_MAX_ROWS`]. Painted only while `help_visible`; the
     /// paint truncates to the panel with a `+N more` tail.
     help_rows: Vec<String>,
+    /// Configuration dashboard state (issue #2380, CTX-1429).
+    ///
+    /// Open/closed bit, active section, cursor, armed confirmation, and the
+    /// app-built snapshot. Presentation-only: the panel performs no I/O and
+    /// owns no capability; writes are app-applied typed intents. See
+    /// `runtime::dashboard`.
+    dashboard: dashboard::DashboardState,
     /// Panel-overlay modal bit (CTX-0482, issue #763).
     ///
     /// Presentation-only authority fed by the panel overlay integration
@@ -1446,6 +1454,8 @@ impl std::fmt::Debug for Runtime {
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
+            .field("dashboard_visible", &self.dashboard.visible())
+            .field("dashboard_section", &self.dashboard.section().title())
             .field("container", &self.container)
             .field("window_cells", &self.window_cells)
             .field(
@@ -1928,6 +1938,7 @@ impl Runtime {
             panel_layout_mode: config.panel_layout_mode,
             panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
+            dashboard: dashboard::DashboardState::default(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
             ipc_socket_path: None,
@@ -2205,6 +2216,7 @@ impl Runtime {
             panel_layout_mode: config.panel_layout_mode,
             panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
+            dashboard: dashboard::DashboardState::default(),
             overlay_modal_active: false,
             next_workspace_seq: 2,
             ipc_socket_path: None,

@@ -592,6 +592,16 @@ pub(crate) struct TerminalApp {
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
+    /// Live theme preset name for the dashboard Overview (issue #2380).
+    ///
+    /// Seeded from the startup preset and updated on a config reload or a
+    /// dashboard preview; `RuntimeConfig` carries only the palette, so the
+    /// name has to travel with the app.
+    pub(crate) dashboard_theme_name: String,
+    /// Startup-resolved paths the configuration dashboard reads on demand
+    /// (issue #2380, CTX-1429). `None` until `main` installs them (or in
+    /// tests), which the panel reports as unavailable instead of guessing.
+    pub(crate) dashboard_sources: Option<crate::dashboard_data::DashboardSources>,
     /// Safe recovery latch (W-103 S-5, CTX-0929): mirrors the process
     /// `--safe` flag so the composer cutover (and any later plugin-owned
     /// UX) selects the retained Core path without consulting a VM.
@@ -714,6 +724,8 @@ impl TerminalApp {
             live_pin_state: None,
             live_history: None,
             plugin_runtime: None,
+            dashboard_theme_name: String::new(),
+            dashboard_sources: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
             chrome_close_exit_requested: false,
@@ -724,6 +736,77 @@ impl TerminalApp {
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
         }
+    }
+
+    /// Installs the startup-resolved dashboard sources (issue #2380).
+    ///
+    /// Called once from `main` with the already-resolved config/profile/
+    /// plugin/extension paths, so the panel reads the same tree the process
+    /// actually uses and never re-derives paths from a mutable environment.
+    pub(crate) fn set_dashboard_sources(
+        &mut self,
+        sources: crate::dashboard_data::DashboardSources,
+    ) {
+        self.dashboard_theme_name = sources.startup_theme_name.clone().unwrap_or_default();
+        self.dashboard_sources = Some(sources);
+    }
+
+    /// Theme source label for the dashboard Overview.
+    ///
+    /// A live preset that differs from the startup preset can only come from
+    /// an unsaved dashboard preview, so the layer label is replaced instead
+    /// of claiming the saved layer after a preview.
+    fn dashboard_theme_source(&self) -> String {
+        match self
+            .dashboard_sources
+            .as_ref()
+            .and_then(|sources| sources.startup_theme_name.as_deref())
+        {
+            Some(startup) if startup != self.dashboard_theme_name => {
+                "live preview, not saved".to_string()
+            }
+            _ => self.window.theme_source.clone(),
+        }
+    }
+
+    /// Rebuilds the dashboard snapshot from live runtime values plus the
+    /// startup sources (cold path: open, `r`, or after a write).
+    pub(crate) fn refresh_dashboard_snapshot(&mut self) {
+        let snapshot = {
+            let config = self.runtime.config();
+            let theme_source = self.dashboard_theme_source();
+            let theme_name = if self.dashboard_theme_name.is_empty() {
+                bitty_config::theme::DEFAULT_THEME_NAME
+            } else {
+                self.dashboard_theme_name.as_str()
+            };
+            let decoration = crate::dashboard_data::DashboardDecoration {
+                gaps_in: config.decoration.gaps_in,
+                gaps_out: config.decoration.gaps_out,
+                border: config.decoration.border,
+                radius: config.decoration.radius,
+                content_inset: config.decoration.content_inset,
+            };
+            let view = crate::dashboard_data::DashboardView {
+                theme_name,
+                theme_source: &theme_source,
+                font_family: &config.font_family,
+                font_size: config.font_size,
+                decoration,
+            };
+            crate::dashboard_data::build(self.dashboard_sources.as_ref(), &view)
+        };
+        self.runtime.set_dashboard_snapshot(snapshot);
+    }
+
+    /// Opens the configuration dashboard with fresh data.
+    ///
+    /// Returns the new visibility. The app refuses the open while a plugin
+    /// overlay holds transient capture (see `apply_chrome_action`), so the
+    /// dashboard never competes for the same keys.
+    pub(crate) fn open_dashboard(&mut self) -> bool {
+        self.refresh_dashboard_snapshot();
+        self.runtime.toggle_dashboard()
     }
 
     /// Test constructor with the synthetic demo pump attached.
@@ -758,6 +841,8 @@ impl TerminalApp {
             live_pin_state: None,
             live_history: None,
             plugin_runtime: None,
+            dashboard_theme_name: String::new(),
+            dashboard_sources: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
             chrome_close_exit_requested: false,
@@ -1057,6 +1142,7 @@ impl TerminalApp {
     /// ownership is kept: a press consumed under the old table still owns its
     /// release (CTX-0229).
     pub(crate) fn adopt_live_config(&mut self, adoption: crate::config_reload::AppAdoption) {
+        self.dashboard_theme_name = adoption.theme_name.to_string();
         let leader_changed = self.chrome.leader != adoption.leader;
         let keymaps_changed = self.chrome.keymaps != adoption.keymaps;
         let prefixes_changed = self.chrome.prefix_bindings != adoption.prefix_bindings;

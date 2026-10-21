@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.25] - unreleased
 
+### Added
+
+- **Configuration dashboard (CTX-1429, #2380):** a Core-owned full-panel
+  overlay listing the active profile, theme (with the layer that won), font,
+  decoration, the resolved config path, the built-in theme presets, installed
+  and bundled plugins, every installed plugin's settings
+  schema/default/current/source, named profiles, installed extensions
+  (version, tier, ABI, descriptor digest, target, last-recorded activation,
+  liveness, trust, and the exact CLI action), and a Diagnostics section with
+  the platform-resolved paths and versions. Open it with the
+  `toggle_dashboard` chrome action (no shipped default chord, so Normal Mode
+  stays byte-identical). Sections are bounded and fail closed with an explicit
+  `unavailable` reason instead of reading as empty. Two confirmed writes reuse
+  existing paths: a live non-persisting theme preview, and managed-manifest
+  plugin enable/disable with the CLI's pin and grant checks. No plugin runtime
+  or services, no shell, no network, and no new capability; settings are read
+  through the bounded plain-config loader.
+
 ### Changed
 
 - **`bitty extension install` resolves the latest catalog release (#2381):**

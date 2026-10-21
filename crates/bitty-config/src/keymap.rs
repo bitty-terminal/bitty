@@ -694,6 +694,16 @@ pub enum ChromeAction {
     /// Repeating the chord hides it again; `Esc` dismisses; the overlay
     /// never touches grid truth (present-layer only).
     ToggleHelp,
+    /// Toggle the configuration dashboard overlay (issue #2380, CTX-1429).
+    ///
+    /// A near-full-panel Core surface listing the current profile, theme,
+    /// font, decoration, plugins, one plugin's settings, profiles, and
+    /// extensions. It is modal while open (`j`/`k`, `h`/`l`, `1..=5`,
+    /// `Enter`, `r`, `q`/`Esc`) and is never part of
+    /// [`DEFAULT_KEYMAPS`](crate::keymap::DEFAULT_KEYMAPS): the user opts in
+    /// with `{ chord = "alt+c", action = "toggle_dashboard" }`, so a fresh
+    /// config keeps Normal Mode byte-identical.
+    ToggleDashboard,
     /// Focus next pane in depth-first order.
     FocusNext,
     /// Focus previous pane in depth-first order.
@@ -955,6 +965,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ToggleHelp)
             }
+            "toggle_dashboard" | "config_dashboard" | "dashboard" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ToggleDashboard)
+            }
             "focus_next" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::FocusNext)
@@ -1109,6 +1123,7 @@ impl ChromeAction {
             Self::CloseView => "close_view".to_string(),
             Self::ToggleZoom => "toggle_zoom".to_string(),
             Self::ToggleHelp => "toggle_help".to_string(),
+            Self::ToggleDashboard => "toggle_dashboard".to_string(),
             Self::FocusNext => "focus_next".to_string(),
             Self::FocusPrev => "focus_prev".to_string(),
             Self::FocusId(n) => format!("focus:{n}"),
@@ -1158,6 +1173,9 @@ impl ChromeAction {
             Self::CloseView => "Close the focused pane (confirm when busy).",
             Self::ToggleZoom => "Toggle single-pane zoom.",
             Self::ToggleHelp => "Toggle the help overlay listing bound shortcuts.",
+            Self::ToggleDashboard => {
+                "Toggle the configuration dashboard (profile, theme, plugins, settings)."
+            }
             Self::FocusNext => "Focus the next pane in depth-first order.",
             Self::FocusPrev => "Focus the previous pane in depth-first order.",
             Self::FocusId(_) => "Focus a pane by numeric view id.",
@@ -1241,6 +1259,7 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::CloseView,
         ChromeAction::ToggleZoom,
         ChromeAction::ToggleHelp,
+        ChromeAction::ToggleDashboard,
         ChromeAction::FocusNext,
         ChromeAction::FocusPrev,
         ChromeAction::FocusId(1),

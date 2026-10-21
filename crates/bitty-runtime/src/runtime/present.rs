@@ -3095,6 +3095,7 @@ impl Runtime {
         self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
         self.paint_hyperlink_hover(paint, basis.pad_px, layers);
         self.paint_help_overlay(paint, &basis.view_map, basis.pad_px, layers);
+        self.paint_dashboard_overlay(paint, &basis.view_map, basis.pad_px, layers);
         self.paint_bell_and_notification(paint, basis.pad_px, now, layers);
         self.paint_scrollbar_overlay(layers);
         self.paint_hint_overlay(paint, basis.pad_px, layers);
@@ -3636,6 +3637,30 @@ impl Runtime {
         // `runtime::help`; toggle/dismiss paths repaint via
         // `pending_full_redraw`.
         if self.paint_help_panel(
+            allocations,
+            view_map,
+            pad_px,
+            &mut layers.combined_overlay,
+            &mut layers.combined_glyphs,
+        ) {
+            layers.any_needs_draw = true;
+        }
+    }
+
+    /// Configuration dashboard overlay (issue #2380, CTX-1429).
+    ///
+    /// Presentation-only near-full-panel surface; the state, layout, and
+    /// glyph composition live in [`super::dashboard`]. Painted above the
+    /// help popup so an explicitly opened configuration surface wins on the
+    /// rare frame where both are visible.
+    fn paint_dashboard_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        view_map: &std::collections::HashMap<ViewId, View>,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        if self.paint_dashboard_panel(
             allocations,
             view_map,
             pad_px,

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.25] - unreleased
 
+### Changed
+
+- **Tool/plugin spawns route through `bitty-execution` (#2249, W-140
+  integration):** the plugin `process.spawn` and IPC execution providers now
+  spawn a real `JobRegistry` job instead of a Core-local one-shot supervisor.
+  Jobs get registry identity, lifecycle events, owned-tree cancellation, and
+  bounded newest-wins output; the existing `process.spawn:<family>` scope,
+  explicit effect opt-in, consent ledger, and CTX-1151 Landlock exec
+  confinement are preserved. Registry refusals fail closed, and no PTY shell
+  is routed through the registry.
+
 ### Fixed
 
 - **Resumable RC-1 completion enforcement (CTX-1407, #2314):** app-dispatched

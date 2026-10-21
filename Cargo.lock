@@ -213,6 +213,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-execution"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-execution?rev=b2137be#b2137beea59a0ebcf1883c9a4e5f0c3166c11f85"
+dependencies = [
+ "bitty-ipc",
+ "bitty-plugin-host",
+ "bitty-pty",
+ "nix 0.31.3",
+ "rustix 1.1.5",
+]
+
+[[package]]
 name = "bitty-ipc"
 version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
@@ -385,6 +397,7 @@ name = "bitty-runtime"
 version = "0.0.24"
 dependencies = [
  "bitty-config",
+ "bitty-execution",
  "bitty-ipc",
  "bitty-ipc-api",
  "bitty-lua",
@@ -968,7 +981,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2089,7 +2102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2586,7 +2599,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2963,10 +2976,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3582,7 +3595,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

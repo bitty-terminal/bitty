@@ -73,6 +73,15 @@ bitty-sandbox = { version = "0.0.24", path = "../bitty-sandbox" }
 # each); the git rev stays the build source until each crate lands on
 # crates.io (see CTX-1172 publish order notes).
 bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+# Issue #2249 (W-140 integration): tool/plugin spawns route through the
+# extracted execution supervisor's `JobRegistry`, so every mediated spawn has
+# a real job identity, lifecycle, cancellation, and bounded output instead of
+# a Core-local one-shot supervisor. The pin carries the host
+# `SpawnPreparer` seam Core uses for CTX-1151 Landlock exec confinement and
+# the `bitty-ipc` revision shared with this workspace. Core's
+# `bitty-runtime::execution_jobs` is the only module allowed to name the
+# extension implementation (W-147 seam exception).
+bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "b2137be" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of

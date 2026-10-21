@@ -148,11 +148,21 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # `bitty-a11y` owns no PTY, GPU, window, or plugin handle. The W-147 fence
 # records `bitty-ui` as the only allowed consumer. Falls under the same
 # 2027-03-31 pin re-audit bound above.
+# bitty-execution is a first-party extraction target (W-132/W-140, bitty#2249,
+# CTX-1403): the accepted execution supervisor. Linked ONLY by `bitty-runtime`
+# at an exact rev (b2137be, post-merge main: host `SpawnPreparer` + Core
+# IPC 9493674), behind the Core-owned `execution_jobs` seam. The workspace
+# `[patch]` compiles the extension against the current `bitty-pty`/
+# `bitty-plugin-host` path crates, so this graph has one Core mechanism set
+# and no `github.com/bitty-terminal/bitty` git source. A dated
+# ADR-0004/ADR-0012 revision recording this source is tracked as a CTX-1403
+# follow-up and falls under the same 2027-03-31 re-audit bound above.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",
     "https://github.com/bitty-terminal/bitty-network",
     "https://github.com/bitty-terminal/bitty-ipc",
+    "https://github.com/bitty-terminal/bitty-execution",
     "https://github.com/bitty-terminal/bitty-storage",
     "https://github.com/bitty-terminal/bitty-a11y",
     "https://github.com/bitty-terminal/bitty-observability",

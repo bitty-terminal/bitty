@@ -27,10 +27,10 @@
 //!   is the [`ExecutionService`](bitty_ipc::ExecutionService) provider that
 //!   routes through the CTX-0444 [`HostToolsAuthorizer`](super::spawn::HostToolsAuthorizer)
 //!   (real process spawn only where a `[tools.*]` declaration exists) and
-//!   then the CTX-0445 real-process runner (argv-direct, `env_clear`,
-//!   bounded drain, timeout-kill with `Unknown` reconcile). No other
-//!   executable can be reached through this provider: the authorizer owns
-//!   the tool vocabulary.
+//!   then the extracted `bitty-execution` registry (#2249: argv-direct,
+//!   closed env, owned-tree cancel, bounded output, `Unknown` reconcile). No
+//!   other executable can be reached through this provider: the authorizer
+//!   owns the tool vocabulary.
 //! - Rich projection: transport stays in `bitty-ipc`; the
 //!   fragment-to-`RichBlock` mapping lives in `bitty-rich` (`projection`).
 //!
@@ -158,7 +158,7 @@ pub fn live_tool_service() -> Result<ToolDispatchService, IpcError> {
 }
 
 /// [`ExecutionService`](bitty_ipc::ExecutionService) provider over the
-/// CTX-0445 real-process path, gated by the CTX-0444 authorizer.
+/// registry-backed CTX-0445 path, gated by the CTX-0444 authorizer.
 ///
 /// The executable name is treated as the `[tools.*]` tool identity:
 /// well-formed tools without a declaration fail as `NotFound`, and
@@ -178,7 +178,8 @@ pub fn live_tool_service() -> Result<ToolDispatchService, IpcError> {
 ///   authorizer rewrites the executable.
 /// - `NotFound` when the tool has no `[tools.*]` declaration.
 /// - `Denied[AllowlistDenied]` when the args fall outside the allowlist.
-/// - `Unavailable` when the child cannot be spawned at all.
+/// - `Unavailable` when the execution supervisor refuses or cannot start the
+///   job (including a missing confinement mechanism for an admitted tool).
 pub fn authorized_execution_provider(
     request: &ExecutionRequest,
 ) -> Result<RawExecutionOutput, IpcError> {

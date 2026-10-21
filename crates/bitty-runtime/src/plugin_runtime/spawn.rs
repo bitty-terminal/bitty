@@ -3695,6 +3695,37 @@ mod tests {
     }
 
     #[test]
+    fn completed_jobs_are_evicted_before_registry_capacity() {
+        // CodeRabbit Major: retained terminal records must not exhaust the
+        // thread-local/provider registry. A capacity-1 supervisor serves two
+        // sequential spawns because the first terminal record is evicted
+        // before the second admission.
+        let supervisor = ToolJobSupervisor::with_capacity(1);
+        let principal = JobPrincipal::new("ipc-execution").expect("principal");
+        let request = bitty_ipc::execution::ExecutionRequest::new(helper_exe(), helper_args())
+            .with_env_policy(
+                EnvPolicy::explicit(vec![
+                    (HELPER_ENV.to_owned(), "echo".to_owned()),
+                    (HELPER_PAYLOAD_ENV.to_owned(), "capacity".to_owned()),
+                ])
+                .expect("explicit env"),
+            )
+            .with_timeout_ms(10_000);
+        let first = supervisor
+            .spawn_and_wait(&request, &principal, Duration::from_millis(10))
+            .expect("first job");
+        let second = supervisor
+            .spawn_and_wait(&request, &principal, Duration::from_millis(10))
+            .expect("second job");
+        assert_ne!(first.job, second.job, "ids are never reused");
+        assert!(second.raw.stderr.contains("capacity"));
+        assert!(
+            supervisor.registry().len() <= 1,
+            "only the newest terminal record may remain"
+        );
+    }
+
+    #[test]
     fn production_spawn_path_has_no_direct_command_or_pid_kill() {
         // Source-level guard: the production half must route through the
         // registry. The provider anchor proves the slice actually includes

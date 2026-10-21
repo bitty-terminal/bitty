@@ -172,7 +172,13 @@ impl ToolJobSupervisor {
             .with_timeouts(
                 JobTimeouts::default()
                     .with_hard(Duration::from_millis(request.timeout_ms))
-                    .with_retention(Duration::from_secs(60)),
+                    // The synchronous bridge reads both streams before it
+                    // returns. Zero retention lets the next spawn on this
+                    // registry evict the finished record instead of keeping
+                    // 60 s of completed jobs that would exhaust
+                    // `JobRegistry` capacity (`RegistryFull`). The caller's
+                    // result/handle maps remain the durable synchronous view.
+                    .with_retention(Duration::ZERO),
             )
             .with_origin(JobOrigin::none());
         let job = self

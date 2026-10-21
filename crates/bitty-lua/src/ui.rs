@@ -25,10 +25,12 @@
 //! inset edge, `right` groups end at the opposite inset edge, and `center`
 //! groups are centered on the full row width (never "after left"). Children
 //! without an `anchor` are `left` groups, so an unanchored scene keeps its
-//! pre-#2411 left-to-right flow byte-for-byte. An `anchor` anywhere else — on
-//! the root itself or below the root's direct children — fails closed with
-//! `E_UI_COMPONENT_INVALID`: such a node has no bounded row to resolve against,
-//! and a silently ignored placement would be worse than a mount error.
+//! pre-#2411 left-to-right flow byte-for-byte. An `anchor` anywhere else fails
+//! closed with `E_UI_COMPONENT_INVALID`: on the root itself, below the root's
+//! direct children, or in a non-band scene validated with
+//! [`UiSceneScope::Unanchored`] (the focusable overlay, or an update of a
+//! non-band block). Such a node has no bounded row to resolve against, and a
+//! silently ignored placement would be worse than a mount error.
 //!
 //! # Hover bindings (issue #2411)
 //!

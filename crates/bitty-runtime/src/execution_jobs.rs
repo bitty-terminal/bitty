@@ -98,6 +98,10 @@ pub(crate) struct JobRun {
     /// stream budget. Computed from byte totals, not from the line-joined
     /// text length, so newline-heavy output still reports truncation.
     pub truncated: bool,
+    /// Per-stream lost-byte signal for the `ExecutionService` provider path.
+    pub stdout_truncated: bool,
+    /// Per-stream lost-byte signal for the `ExecutionService` provider path.
+    pub stderr_truncated: bool,
 }
 
 /// Core-owned wrapper around the extracted [`JobRegistry`] for tool spawns.
@@ -193,10 +197,9 @@ impl ToolJobSupervisor {
             });
         }
         let budget = request.effective_stream_budget() as u64;
-        let truncated = stdout_registry_truncated
-            || stderr_registry_truncated
-            || stdout_total > budget
-            || stderr_total > budget;
+        let stdout_truncated = stdout_registry_truncated || stdout_total > budget;
+        let stderr_truncated = stderr_registry_truncated || stderr_total > budget;
+        let truncated = stdout_truncated || stderr_truncated;
         if truncated {
             evidence.push(format!(
                 "job {job} output was bounded; newest bytes preserved"
@@ -214,6 +217,8 @@ impl ToolJobSupervisor {
                 effect_state,
             },
             truncated,
+            stdout_truncated,
+            stderr_truncated,
         })
     }
 

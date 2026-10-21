@@ -1467,11 +1467,9 @@ pub(crate) fn spawn_process_with_policy(
     // bridge so a future registry regression fails here, not downstream.
     debug_assert!(run.job.get() > 0, "supervised job ids start at one");
     let mut raw = run.raw;
-    if run.truncated {
-        let budget = request.effective_stream_budget();
-        raw.stdout = newest_for_execution_service(raw.stdout, budget);
-        raw.stderr = newest_for_execution_service(raw.stderr, budget);
-    }
+    let budget = request.effective_stream_budget();
+    raw.stdout = newest_for_execution_service(raw.stdout, budget, run.stdout_truncated);
+    raw.stderr = newest_for_execution_service(raw.stderr, budget, run.stderr_truncated);
     Ok(raw)
 }
 
@@ -1486,12 +1484,19 @@ pub(crate) fn spawn_process_with_policy(
 /// ASCII/valid-UTF-8 tails of exactly `budget` bytes; a char-boundary tail one
 /// or two bytes shorter may retain a bounded sentinel newline, and the
 /// evidence ref still names the bounding.
-fn newest_for_execution_service(text: String, budget: usize) -> String {
-    if text.len() <= budget {
+fn newest_for_execution_service(text: String, budget: usize, lost_bytes: bool) -> String {
+    if !lost_bytes {
         return text;
     }
     let (mut tail, _) = truncate_to_budget_tail(&text, budget);
-    tail.push('\n');
+    // The sentinel(s) force `ExecutionService` to mark truncation and are
+    // trimmed off its prefix. A char-boundary tail shorter than the budget
+    // needs enough sentinels to exceed it; the delivered summary then ends
+    // with at most two bounded newlines after the newest bytes.
+    let sentinels = budget.saturating_sub(tail.len()).saturating_add(1);
+    for _ in 0..sentinels {
+        tail.push('\n');
+    }
     tail
 }
 
@@ -1781,6 +1786,17 @@ mod tests {
                 // 256 KiB (A then B), so a newest-tail summary is all B.
                 eprint!("{}", "A".repeat(300_000));
                 eprint!("{}", "B".repeat(20_000));
+            }
+            Ok("lossy") => {
+                // Invalid UTF-8 is decoded lossily; the tail cut may land on
+                // a multi-byte replacement boundary, exercising the sentinel
+                // padding in `newest_for_execution_service`.
+                use std::io::Write as _;
+                let mut err = std::io::stderr();
+                for _ in 0..20_000 {
+                    let _ = err.write_all(&[0xFF]);
+                }
+                let _ = err.flush();
             }
             Ok("append") => {
                 // One line per spawned child; the #2249 tests use this to
@@ -2342,6 +2358,48 @@ mod tests {
             "the provider must deliver the newest bytes, got {:?}",
             &result.stderr_summary[..result.stderr_summary.len().min(32)]
         );
+    }
+
+    #[test]
+    fn execution_service_provider_preserves_per_stream_truncation() {
+        // Maximum caller budget, newline-heavy and lossily-decoded tails: the
+        // provider must force the downstream truncation flag per stream and
+        // never deliver more than the effective per-stream ceiling.
+        for (id, mode) in [(56u64, "newest"), (57, "newlines"), (58, "lossy")] {
+            let request = bitty_ipc::execution::ExecutionRequest::new(helper_exe(), helper_args())
+                .with_env_policy(
+                    EnvPolicy::explicit(vec![(HELPER_ENV.to_owned(), mode.to_owned())])
+                        .expect("explicit env"),
+                )
+                .with_timeout_ms(10_000)
+                .with_output_budget(MAX_EXEC_OUTPUT_BUDGET_BYTES)
+                .with_allow_effects(true);
+            let mut service = ExecutionService::with_provider(super::spawn_process);
+            let result = service
+                .dispatch(
+                    &request,
+                    &granted_spawn(),
+                    &consented(1_000),
+                    "plugin-test",
+                    1_000,
+                    id,
+                )
+                .expect("provider serves");
+            assert!(result.truncated, "{mode}: truncation must be reported");
+            assert!(
+                result.stderr_summary.len()
+                    <= SPAWN_PANEL_OUTPUT_BUDGET.max(bitty_ipc::execution::MAX_EXEC_STREAM_BYTES),
+                "{mode}: summary over budget: {}",
+                result.stderr_summary.len()
+            );
+            if mode == "newest" {
+                assert!(
+                    result.stderr_summary.bytes().all(|byte| byte == b'B'),
+                    "newest: expected the newest B tail, got {:?}",
+                    &result.stderr_summary[..result.stderr_summary.len().min(32)]
+                );
+            }
+        }
     }
 
     #[test]

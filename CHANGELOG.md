@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, command, URL, or host argument exists, and all reads happen on the
   cold path; payload paths are display strings only.
 
+### Fixed
+
+- **`runtime.inspect` review follow-up (CTX-2396, #2416):** a granted
+  generation whose read-only snapshot backend is not wired now checks
+  backend presence before consuming the 16 calls/s budget, so repeated
+  fail-closed `E_NOT_IMPLEMENTED` calls cannot exhaust the read allowance.
+  The grant check remains first, the call still reads nothing, and VM
+  fuel/wall budgets still bound the surrounding execution. Policy bounds are
+  pinned by literal tests (64 KiB, 128/256/64/64 rows, 240/96 bytes,
+  16 calls/s, 10 ms) and every cold-path section builder is covered with
+  over-cap inputs and serialized `truncated = true`.
+
 ### Changed
 
 - **Release binaries carry no builder paths (CTX-1434, #2402):** release

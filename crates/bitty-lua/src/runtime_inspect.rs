@@ -1100,6 +1100,19 @@ mod tests {
     }
 
     #[test]
+    fn policy_bounds_are_the_documented_literals() {
+        assert_eq!(RUNTIME_INSPECT_MAX_BYTES, 65_536);
+        assert_eq!(RUNTIME_INSPECT_MAX_PLUGIN_ROWS, 128);
+        assert_eq!(RUNTIME_INSPECT_MAX_SETTING_ROWS, 256);
+        assert_eq!(RUNTIME_INSPECT_MAX_EXTENSION_ROWS, 64);
+        assert_eq!(RUNTIME_INSPECT_MAX_PROFILE_ROWS, 64);
+        assert_eq!(RUNTIME_INSPECT_MAX_PATH_BYTES, 240);
+        assert_eq!(RUNTIME_INSPECT_MAX_STRING_BYTES, 96);
+        assert_eq!(RUNTIME_INSPECT_CALLS_PER_SECOND, 16);
+        assert_eq!(RUNTIME_INSPECT_MAX_WALL_MS, 10);
+    }
+
+    #[test]
     fn bounded_display_stays_on_char_boundaries() {
         let value = "é".repeat(200);
         let bounded = bounded_display(&value, RUNTIME_INSPECT_MAX_STRING_BYTES);
@@ -1107,6 +1120,120 @@ mod tests {
         assert!(bounded.ends_with('…'));
         assert!(bounded.is_char_boundary(bounded.len()));
         assert_eq!(bounded_display("short", 96), "short");
+    }
+
+    #[test]
+    fn path_and_row_caps_are_enforced() {
+        let long_path = "p".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES);
+        let bounded = bounded_display(&long_path, RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert_eq!(bounded.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(bounded.ends_with('…'));
+        let exact_path = "p".repeat(RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert_eq!(
+            bounded_display(&exact_path, RUNTIME_INSPECT_MAX_PATH_BYTES),
+            exact_path
+        );
+
+        let row = ExtensionInspectRow {
+            name: "net".to_string(),
+            version: "0.0.1".to_string(),
+            tier: "user".to_string(),
+            abi_compatible: true,
+            sha256: "a".repeat(64),
+            executable_path: long_path,
+            activation: ExtensionActivation::Installed,
+            trust: ExtensionTrust::Unverified,
+        };
+        let lua = extension_row_lua(&row);
+        let Some(LuaValue::String(path)) = lua.get("executable_path") else {
+            panic!("executable_path is a string");
+        };
+        assert!(path.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
+
+        let mut rows = InspectRows::new(
+            (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS + 5)
+                .map(|index| PluginInspectRow {
+                    id: format!("owner.plugin{index}"),
+                    name: "Plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "registry".to_string(),
+                    enabled: true,
+                    recorded: true,
+                })
+                .collect(),
+        );
+        rows.cap(RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert_eq!(rows.rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert!(rows.truncated);
+
+        // Exercise the production serialization path as well: bounded path in
+        // `to_lua` and the emitted truncation marker.
+        let plugins = InspectRows {
+            rows: (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS)
+                .map(|index| PluginInspectRow {
+                    id: format!("owner.plugin{index}"),
+                    name: "Plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "registry".to_string(),
+                    enabled: true,
+                    recorded: true,
+                })
+                .collect(),
+            truncated: true,
+        };
+        let diagnostics = RuntimeDiagnostics {
+            config_file: Some("d".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES)),
+            ..diagnostic_fixture()
+        };
+        let snapshot = RuntimeInspectSnapshot {
+            diagnostics: Section::available(diagnostics),
+            plugins: Section::available(plugins),
+            settings: Section::available(InspectRows::new(Vec::new())),
+            extensions: Section::available(InspectRows::new(vec![ExtensionInspectRow {
+                name: "net".to_string(),
+                version: "0.0.1".to_string(),
+                tier: "user".to_string(),
+                abi_compatible: true,
+                sha256: "a".repeat(64),
+                executable_path: "p".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES),
+                activation: ExtensionActivation::Installed,
+                trust: ExtensionTrust::Unverified,
+            }])),
+            profiles: Section::available(InspectRows::new(Vec::new())),
+        };
+        let lua = snapshot.to_lua();
+        let diagnostics = lua.get("diagnostics").expect("diagnostics");
+        let Some(LuaValue::String(config_file)) = diagnostics.get("config_file") else {
+            panic!("config_file is a string");
+        };
+        assert_eq!(config_file.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(config_file.ends_with('…'));
+        let plugins = lua.get("plugins").expect("plugins");
+        assert_eq!(plugins.get("truncated"), Some(&LuaValue::Bool(true)));
+        let rows = plugins.get("rows").expect("rows");
+        let LuaValue::Table(rows) = rows else {
+            panic!("row array");
+        };
+        assert_eq!(rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        let extensions = lua.get("extensions").expect("extensions");
+        let rows = extensions.get("rows").expect("rows");
+        let LuaValue::Table(rows) = rows else {
+            panic!("row array");
+        };
+        let LuaValue::Table(row) = &rows[0].1 else {
+            panic!("row table");
+        };
+        let path = row
+            .iter()
+            .find_map(|(key, value)| match (key, value) {
+                (LuaValue::String(key), LuaValue::String(value)) if key == "executable_path" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("executable_path");
+        assert_eq!(path.len(), RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(path.ends_with('…'));
     }
 
     #[test]

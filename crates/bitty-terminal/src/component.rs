@@ -4571,27 +4571,35 @@ mod tests {
 
     #[test]
     fn install_without_version_selects_highest_catalog_release() {
-        if crate::component_seed::host_target_triple().is_none() {
+        // #2391: the fixture must be host-independent. Every entry for every
+        // mapped host triple carries the fixture tarball's own digest, so the
+        // selected release always matches the fetched bytes and a selection
+        // regression surfaces as the version assertion below, never as a
+        // misleading digest error on a platform where a decoy target happens
+        // to be the host (macOS ARM64 took `9.9.9 aarch64-apple-darwin`).
+        let Some(host_target) = crate::component_seed::host_target_triple() else {
             return;
-        }
+        };
         let base = scratch("latest-e2e");
         let user = base.join("user");
         std::fs::create_dir_all(&user).expect("user dir");
-        let target = "x86_64-unknown-linux-gnu";
-        let host_target = crate::component_seed::host_target_triple().expect("mapped host target");
-        // A target guaranteed to differ from the host, so the decoy cannot
-        // accidentally become the host's latest on that platform.
+        // Any mapped triple that is not this host: the decoy must never be
+        // selectable here, on any platform. The stub tarball bytes ignore the
+        // target, so the fixture digest stays identical across triples.
         let foreign_target = if host_target == "aarch64-apple-darwin" {
             "x86_64-unknown-linux-gnu"
         } else {
             "aarch64-apple-darwin"
         };
-        let mut stub = InstallStub::canned("net", "0.0.10", target, b"latest-net-bytes");
-        // Older releases plus foreign-target and other-name decoys: only the
-        // highest strict X.Y.Z for the exact host target may win.
-        let decoy = "b".repeat(64);
+        assert_ne!(foreign_target, host_target);
+        let mut stub = InstallStub::canned("net", "0.0.10", host_target, b"latest-net-bytes");
+        let fixture_digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        // Older releases plus foreign-target and other-name decoys share the
+        // fixture digest: only the highest strict X.Y.Z for the exact host
+        // target may win, and a wrong pick fails the version assertions
+        // instead of the digest chain.
         stub.catalog.push_str(&format!(
-            "extension net 0.0.9 {host_target} {decoy}\nextension net 0.0.2 {host_target} {decoy}\nextension net 9.9.9 {foreign_target} {decoy}\nextension graphics 8.0.0 {host_target} {decoy}\n"
+            "extension net 0.0.9 {host_target} {fixture_digest}\nextension net 0.0.2 {host_target} {fixture_digest}\nextension net 9.9.9 {foreign_target} {fixture_digest}\nextension graphics 8.0.0 {host_target} {fixture_digest}\n"
         ));
         let mut out = Vec::new();
         let mut input = std::io::BufReader::new(&b""[..]);
@@ -4612,7 +4620,6 @@ mod tests {
             "{summary}"
         );
         let printed = String::from_utf8_lossy(&out).into_owned();
-        let host_target = crate::component_seed::host_target_triple().expect("mapped host target");
         assert!(
             printed.contains(&format!(
                 "resolved latest version for 'net' ({host_target}): 0.0.10"
@@ -4751,6 +4758,49 @@ mod tests {
             error.message
         );
         assert!(!user.join("net").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_latest_refuses_catalog_digest_mismatch_before_unpack() {
+        // #2391: latest selection must not weaken the digest chain. The entry
+        // that wins selection still pins the fetched bytes, so a stale or
+        // tampered catalog fails closed before anything is staged or pinned.
+        let Some(host_target) = crate::component_seed::host_target_triple() else {
+            return;
+        };
+        let base = scratch("latest-catalog-mismatch");
+        let user = base.join("user");
+        std::fs::create_dir_all(&user).expect("user dir");
+        let mut stub = InstallStub::canned("net", "0.0.10", host_target, b"latest-net-bytes");
+        let fixture_digest = bitty_package::integrity::sha256_hex(&stub.tarball);
+        stub.catalog = stub.catalog.replace(&fixture_digest, &"b".repeat(64));
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            None,
+            None,
+            false,
+            Some(&user),
+            &mut out,
+            &mut input,
+            true,
+            &mut stub,
+        )
+        .expect_err("latest with a mismatched catalog digest must fail closed");
+        assert_eq!(error.exit, EXIT_COMPONENT, "{}", error.message);
+        assert!(
+            error.message.contains("extension catalog digest"),
+            "{}",
+            error.message
+        );
+        assert_eq!(stub.fetch_calls, 3, "catalog plus tarball plus manifest");
+        assert!(!user.join("net").exists(), "must not stage");
+        assert!(
+            !user.join("net").join(TARBALL_PIN_FILE).exists(),
+            "must not pin"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

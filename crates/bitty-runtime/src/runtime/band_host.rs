@@ -141,6 +141,111 @@ pub struct BandRun {
     pub region: Option<UiRegion>,
 }
 
+/// Declarations one node passes down to its descendant spans (CTX-0946).
+///
+/// A container's `fg`/`bg`/`bold`/bindings apply to descendant spans that do
+/// not declare their own (nearest declaration wins). [`Self::of`] snapshots
+/// one node's own declaration in that shape, so a host that has to walk a
+/// subtree separately — the overlay stacks a `Column`/`List` root's direct
+/// children as rows — can still start each walk under the root's context
+/// instead of dropping it (CTX-1419, issue #2191).
+///
+/// `bold` stays an `Option` so an explicit `bold = false` overrides a `true`
+/// ancestor exactly like the single-walk band flattening.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BandInherited {
+    fg: Option<String>,
+    bg: Option<String>,
+    bold: Option<bool>,
+    on_click: Option<ClickCommand>,
+    on_scroll: Option<ClickCommand>,
+    region: Option<UiRegion>,
+}
+
+impl BandInherited {
+    /// The declaration `node` applies to its descendants.
+    pub(crate) fn of(node: &UiNode) -> Self {
+        let (fg, bg, bold, on_click, on_scroll) = match node {
+            UiNode::Text {
+                fg,
+                bg,
+                bold,
+                on_click,
+                on_scroll,
+                ..
+            }
+            | UiNode::Row {
+                fg,
+                bg,
+                bold,
+                on_click,
+                on_scroll,
+                ..
+            }
+            | UiNode::Column {
+                fg,
+                bg,
+                bold,
+                on_click,
+                on_scroll,
+                ..
+            }
+            | UiNode::List {
+                fg,
+                bg,
+                bold,
+                on_click,
+                on_scroll,
+                ..
+            } => (
+                fg.clone(),
+                bg.clone(),
+                *bold,
+                on_click.clone(),
+                on_scroll.clone(),
+            ),
+        };
+        let region = inherited_region(on_click.as_ref(), on_scroll.as_ref(), None);
+        Self {
+            fg,
+            bg,
+            bold,
+            on_click,
+            on_scroll,
+            region,
+        }
+    }
+
+    /// Layers `node`'s own declaration over this context (nearest wins).
+    fn layered(&self, node: &UiNode) -> Self {
+        let own = Self::of(node);
+        let on_click = own.on_click.or_else(|| self.on_click.clone());
+        let on_scroll = own.on_scroll.or_else(|| self.on_scroll.clone());
+        let region = inherited_region(on_click.as_ref(), on_scroll.as_ref(), self.region.clone());
+        Self {
+            fg: own.fg.or_else(|| self.fg.clone()),
+            bg: own.bg.or_else(|| self.bg.clone()),
+            bold: own.bold.or(self.bold),
+            on_click,
+            on_scroll,
+            region,
+        }
+    }
+}
+
+/// One span's effective region identity: the click binding's, else the scroll
+/// binding's, else the ancestor's (issue #2248).
+fn inherited_region(
+    on_click: Option<&ClickCommand>,
+    on_scroll: Option<&ClickCommand>,
+    parent: Option<UiRegion>,
+) -> Option<UiRegion> {
+    on_click
+        .and_then(|click| click.region.clone())
+        .or_else(|| on_scroll.and_then(|scroll| scroll.region.clone()))
+        .or(parent)
+}
+
 /// Flattens a band tree into its full text plus styled runs (CTX-0946).
 ///
 /// `Row` children join horizontally; `Column`/`List` children join the same
@@ -149,104 +254,56 @@ pub struct BandRun {
 /// exactly one run, even when empty. Total and headless.
 #[must_use]
 pub fn flatten_band_runs(root: &UiNode) -> (String, Vec<BandRun>) {
+    flatten_band_runs_under(root, &BandInherited::default())
+}
+
+/// Flattens `root` under an already-established ancestor declaration
+/// (CTX-1419, issue #2191).
+///
+/// The overlay host stacks a `Column`/`List` root's direct children as rows,
+/// so it flattens each child separately; passing the root's declaration here
+/// keeps "nearest declaration wins" identical on both hosted surfaces.
+#[must_use]
+pub(crate) fn flatten_band_runs_under(
+    root: &UiNode,
+    inherited: &BandInherited,
+) -> (String, Vec<BandRun>) {
     let mut text = String::new();
     let mut runs = Vec::new();
-    flatten_into(
-        root, &mut text, &mut runs, None, None, None, None, None, false,
-    );
+    flatten_into(root, &mut text, &mut runs, inherited);
     (text, runs)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flatten_into(
     node: &UiNode,
     text: &mut String,
     runs: &mut Vec<BandRun>,
-    fg: Option<String>,
-    bg: Option<String>,
-    on_click: Option<ClickCommand>,
-    on_scroll: Option<ClickCommand>,
-    region: Option<UiRegion>,
-    bold: bool,
+    inherited: &BandInherited,
 ) {
+    let effective = inherited.layered(node);
     match node {
-        UiNode::Text {
-            text: leaf,
-            fg: leaf_fg,
-            bg: leaf_bg,
-            bold: leaf_bold,
-            on_click: leaf_click,
-            on_scroll: leaf_scroll,
-        } => {
+        UiNode::Text { text: leaf, .. } => {
             let start = display_cells(text);
             let start_char = text.chars().count();
             text.push_str(leaf);
-            let on_click = leaf_click.clone().or(on_click);
-            let on_scroll = leaf_scroll.clone().or(on_scroll);
-            let region = on_click
-                .as_ref()
-                .and_then(|click| click.region.clone())
-                .or_else(|| on_scroll.as_ref().and_then(|scroll| scroll.region.clone()))
-                .or(region);
             runs.push(BandRun {
                 start_col: start,
                 end_col: display_cells(text),
                 start_char,
                 end_char: text.chars().count(),
-                fg: leaf_fg.clone().or(fg),
-                bg: leaf_bg.clone().or(bg),
-                bold: leaf_bold.unwrap_or(bold),
-                on_click,
-                on_scroll,
-                region,
+                fg: effective.fg,
+                bg: effective.bg,
+                bold: effective.bold.unwrap_or(false),
+                on_click: effective.on_click,
+                on_scroll: effective.on_scroll,
+                region: effective.region,
             });
         }
-        UiNode::Row {
-            children,
-            fg: row_fg,
-            bg: row_bg,
-            bold: row_bold,
-            on_click: row_click,
-            on_scroll: row_scroll,
-        }
-        | UiNode::Column {
-            children,
-            fg: row_fg,
-            bg: row_bg,
-            bold: row_bold,
-            on_click: row_click,
-            on_scroll: row_scroll,
-        }
-        | UiNode::List {
-            children,
-            fg: row_fg,
-            bg: row_bg,
-            bold: row_bold,
-            on_click: row_click,
-            on_scroll: row_scroll,
-        } => {
-            let fg = row_fg.clone().or(fg);
-            let bg = row_bg.clone().or(bg);
-            let bold = row_bold.unwrap_or(bold);
-            let on_click = row_click.clone().or(on_click);
-            let on_scroll = row_scroll.clone().or(on_scroll);
-            let region = on_click
-                .as_ref()
-                .and_then(|click| click.region.clone())
-                .or_else(|| on_scroll.as_ref().and_then(|scroll| scroll.region.clone()))
-                .or(region);
+        UiNode::Row { children, .. }
+        | UiNode::Column { children, .. }
+        | UiNode::List { children, .. } => {
             for child in children {
-                flatten_into(
-                    child,
-                    text,
-                    runs,
-                    fg.clone(),
-                    bg.clone(),
-                    on_click.clone(),
-                    on_scroll.clone(),
-                    region.clone(),
-                    bold,
-                );
+                flatten_into(child, text, runs, &effective);
             }
         }
     }

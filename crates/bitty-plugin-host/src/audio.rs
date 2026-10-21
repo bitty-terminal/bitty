@@ -667,23 +667,73 @@ impl StateGate {
             }
         }
         match read() {
-            Ok(snapshot) => {
-                // Defense in depth: the reader is Core-side, but a
-                // malformed snapshot must never reach the bar even if a
-                // future reader bypasses `AudioState::validate`.
-                if let Err(check) = Self::check_snapshot(&snapshot) {
-                    return self.failed_read(now_ms, Some(check));
-                }
-                let mut stored = snapshot;
-                stored.stale_age_ms = 0;
-                self.last = Some(stored.clone());
-                self.last_ok_ms = now_ms;
-                self.last_poll_ms = now_ms;
-                self.pre_init_last_ms = None;
-                Ok(StatePoll::Fresh(stored))
-            }
+            Ok(snapshot) => self.accept(now_ms, snapshot),
             Err(error) => self.failed_read(now_ms, Some(error)),
         }
+    }
+
+    /// Serve one `get()` from a snapshot produced outside this call.
+    ///
+    /// The live runtime reads `pactl` off the executor thread (bitty#2425:
+    /// three blocking spawns inside `init.lua` exceeded the RC-1 50 ms
+    /// activation slice) and hands each completed attempt here. Freshness,
+    /// validation, the stale grace, and the hide decision are exactly
+    /// [`Self::poll`]'s: a validated snapshot becomes last-good and serves
+    /// [`StatePoll::Fresh`], a failed attempt ages the previous snapshot or
+    /// hides. The 0.5 Hz ceiling stays with the caller, which schedules the
+    /// next attempt at [`STATE_MIN_INTERVAL_MS`]; this method never reads.
+    pub fn observe(
+        &mut self,
+        now_ms: u64,
+        sample: Result<AudioState, AudioError>,
+    ) -> Result<StatePoll, AudioError> {
+        match sample {
+            Ok(snapshot) => self.accept(now_ms, snapshot),
+            Err(error) => self.failed_read(now_ms, Some(error)),
+        }
+    }
+
+    /// Serve one `get()` from last-good without running a reader.
+    ///
+    /// Used while an off-thread sample is in flight (bitty#2425): the
+    /// snapshot ages exactly as it does after a failed read — stale inside
+    /// [`STATE_STALE_HIDE_MS`], hidden past it — and a gate that never
+    /// landed a snapshot hides. No poll window, pre-init ceiling, or
+    /// last-good state is advanced here, so an in-flight sample still owns
+    /// the next read slot.
+    pub fn serve_cached(&mut self, now_ms: u64) -> Result<StatePoll, AudioError> {
+        if let Some(cached) = self.last.clone() {
+            let age_ms = now_ms.saturating_sub(self.last_ok_ms);
+            if age_ms < STATE_STALE_HIDE_MS {
+                let mut served = cached;
+                served.stale_age_ms = age_ms;
+                return Ok(StatePoll::Stale(served));
+            }
+            return Err(AudioError::hidden(format!(
+                "audio state stale for {age_ms} ms (hide, never fabricate)"
+            )));
+        }
+        Err(AudioError::hidden(
+            "audio state not sampled yet (hide, never fabricate)",
+        ))
+    }
+
+    /// Store one validated snapshot as last-good and serve it fresh.
+    ///
+    /// Shared by the inline reader path and [`Self::observe`]; the snapshot
+    /// is re-checked here so a malformed value never reaches the bar even
+    /// when a future reader bypasses [`AudioState::validate`].
+    fn accept(&mut self, now_ms: u64, snapshot: AudioState) -> Result<StatePoll, AudioError> {
+        if let Err(check) = Self::check_snapshot(&snapshot) {
+            return self.failed_read(now_ms, Some(check));
+        }
+        let mut stored = snapshot;
+        stored.stale_age_ms = 0;
+        self.last = Some(stored.clone());
+        self.last_ok_ms = now_ms;
+        self.last_poll_ms = now_ms;
+        self.pre_init_last_ms = None;
+        Ok(StatePoll::Fresh(stored))
     }
 
     /// Re-validate one reader snapshot (shape the bar may rely on).
@@ -1439,6 +1489,81 @@ mod tests {
             .poll(4000, || Ok(state(50)))
             .expect("recovers after window");
         assert!(matches!(fresh, StatePoll::Fresh(_)));
+    }
+
+    #[test]
+    fn state_observe_serves_fresh_and_ages_through_serve_cached() {
+        // bitty#2425: the live runtime reads pactl off the executor thread
+        // and hands completed attempts to `observe`. Freshness, the grace,
+        // and the hide decision must match the inline `poll` path.
+        let mut gate = StateGate::new();
+        assert!(
+            gate.serve_cached(0).is_err(),
+            "a gate that never observed a sample hides"
+        );
+        let fresh = gate.observe(1000, Ok(state(42))).expect("sample serves");
+        assert!(matches!(fresh, StatePoll::Fresh(_)));
+        assert_eq!(fresh.state().volume_pct, 42);
+        assert_eq!(fresh.state().stale_age_ms, 0);
+        // No new attempt: the last-good snapshot ages without a reader.
+        let aged = gate.serve_cached(3000).expect("serves inside the grace");
+        assert!(matches!(aged, StatePoll::Stale(_)));
+        assert_eq!(aged.state().volume_pct, 42);
+        assert_eq!(aged.state().stale_age_ms, 2000);
+        // A failed attempt ages the same snapshot, never fabricates.
+        let stale = gate
+            .observe(5000, Err(AudioError::unavailable("monitor gone")))
+            .expect("failure inside the grace serves stale");
+        assert!(matches!(stale, StatePoll::Stale(_)));
+        assert_eq!(stale.state().volume_pct, 42);
+        assert_eq!(stale.state().stale_age_ms, 4000);
+    }
+
+    #[test]
+    fn state_observe_hides_past_the_grace_and_rejects_malformed_samples() {
+        let mut gate = StateGate::new();
+        gate.observe(0, Ok(state(50))).expect("lands");
+        assert_eq!(
+            gate.serve_cached(STATE_STALE_HIDE_MS)
+                .expect_err("grace exhausted hides")
+                .kind(),
+            AudioErrorKind::Hidden
+        );
+        // A malformed off-thread sample takes the failed-read path.
+        let mut gate = StateGate::new();
+        let mut bad = state(50);
+        bad.volume_pct = 101;
+        assert!(
+            gate.observe(0, Ok(bad)).is_err(),
+            "malformed sample never becomes last-good"
+        );
+        assert!(
+            gate.serve_cached(1).is_err(),
+            "nothing landed, so nothing serves"
+        );
+    }
+
+    #[test]
+    fn state_serve_cached_never_advances_the_read_window() {
+        // bitty#2425: `serve_cached` is a serve-only path. It must not
+        // consume the poll window, or an in-flight sampler would lose its
+        // slot and the gate could be starved by over-polls.
+        let mut gate = StateGate::new();
+        gate.observe(0, Ok(state(50))).expect("lands");
+        for tick in 1..=100_u64 {
+            let _ = gate.serve_cached(tick.saturating_mul(10));
+        }
+        // An inline poll at the ceiling still runs its reader: the serve
+        // path left `last_poll_ms` at the observation time.
+        let mut reads = 0_usize;
+        let fresh = gate
+            .poll(STATE_MIN_INTERVAL_MS, || {
+                reads += 1;
+                Ok(state(60))
+            })
+            .expect("ceiling elapsed");
+        assert!(matches!(fresh, StatePoll::Fresh(_)));
+        assert_eq!(reads, 1);
     }
 
     #[test]

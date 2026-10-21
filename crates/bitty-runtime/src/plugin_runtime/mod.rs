@@ -1230,6 +1230,33 @@ impl PluginRuntime {
         self.runtime_inspect = Some(snapshot);
     }
 
+    /// Resolve one plugin's declared settings exactly as activation does
+    /// (issue #2396).
+    ///
+    /// Read-only inspection must not invent a second resolution path: this
+    /// call uses the same per-plugin user file, unambiguous short alias,
+    /// shared host source, and safe-mode `None` directory as
+    /// [`Self::activate`]. Diagnostic side effects stay out of the read path;
+    /// only the resolved values, winning layers, and `file_error` cross.
+    #[must_use]
+    pub fn resolve_settings_for_inspect(
+        &self,
+        plugin_id: &str,
+        declared: &[bitty_plugin_host::manifest::SettingDecl],
+    ) -> plugin_settings::LoadedPluginSettings {
+        plugin_settings::load_plugin_settings_with_plugins(
+            if self.safe_mode {
+                None
+            } else {
+                self.settings_dir.as_deref()
+            },
+            plugin_id,
+            declared,
+            Some(&*self.settings),
+            self.settings_alias_registry.as_deref(),
+        )
+    }
+
     /// Whether any discovered package declares `capability`.
     ///
     /// Used by the cold-path wiring to build the `runtime.inspect` snapshot

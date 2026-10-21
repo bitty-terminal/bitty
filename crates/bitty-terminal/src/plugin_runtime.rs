@@ -697,7 +697,14 @@ pub(crate) fn discover_with_roots(
             // never installed into a runtime running in the other. A mismatch
             // leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
             if context.safe_mode == safe_mode {
-                runtime.set_runtime_inspect_snapshot(crate::runtime_inspect::build(context));
+                let snapshot = {
+                    let resolver =
+                        |id: &str, declarations: &[bitty_plugin_host::manifest::SettingDecl]| {
+                            runtime.resolve_settings_for_inspect(id, declarations)
+                        };
+                    crate::runtime_inspect::build(context, Some(&resolver))
+                };
+                runtime.set_runtime_inspect_snapshot(snapshot);
             } else {
                 crate::logging::warn(|| {
                     "bitty: runtime.inspect snapshot safe-mode mismatch; not installed".to_string()
@@ -896,12 +903,10 @@ mod tests {
         );
     }
 
-    /// Issue #2396 end-to-end: a granted development plugin reads the
-    /// cold-path snapshot through `bitty.runtime.inspect()`; the call path
-    /// takes no arguments and receives the bounded table.
-    #[test]
-    fn discover_serves_runtime_inspect_to_a_granted_plugin() {
-        let root = fs_list_probe_root("inspect");
+    /// Development package declaring `runtime.inspect` with one command
+    /// that returns a snapshot-derived string.
+    fn inspect_probe_root(tag: &str) -> PathBuf {
+        let root = fs_list_probe_root(tag);
         let id = "xuepoo.inspect";
         let plugin = root.join(id);
         std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
@@ -924,12 +929,11 @@ mod tests {
             "#,
         )
         .expect("init");
+        root
+    }
 
-        let live = Runtime::with_defaults().expect("defaults");
-        let summaries = live.workspace_summaries();
-        let leaves = live.layout().leaf_ids();
-        let pinned = live.pinned_views();
-        let context = crate::runtime_inspect::RuntimeInspectContext {
+    fn inspect_context(safe_mode: bool) -> crate::runtime_inspect::RuntimeInspectContext {
+        crate::runtime_inspect::RuntimeInspectContext {
             app_version: "test-version".to_string(),
             config_file: None,
             config_dir: None,
@@ -946,27 +950,65 @@ mod tests {
             font_family: "monospace".to_string(),
             font_size: 12.0,
             decoration: bitty_runtime::plugin_runtime::DecorationGeometry::default(),
-            safe_mode: false,
-        };
-        let seed = StartupSeed {
-            workspaces: &summaries,
+            safe_mode,
+        }
+    }
+
+    fn inspect_seed<'a>(
+        context: &'a crate::runtime_inspect::RuntimeInspectContext,
+    ) -> StartupSeed<'a> {
+        StartupSeed {
+            workspaces: &[],
             targets: &[],
-            leaves: &leaves,
-            pinned: &pinned,
+            leaves: &[],
+            pinned: &[],
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
-            inspect: Some(&context),
-        };
+            inspect: Some(context),
+        }
+    }
+
+    /// Issue #2396 end-to-end: a granted development plugin reads the
+    /// cold-path snapshot through `bitty.runtime.inspect()`; the call path
+    /// takes no arguments and receives the bounded table.
+    #[test]
+    fn discover_serves_runtime_inspect_to_a_granted_plugin() {
+        let root = inspect_probe_root("inspect");
+        let context = inspect_context(false);
+        let seed = inspect_seed(&context);
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
         let mut runtime = session.runtime;
-        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
         let value = runtime
             .dispatch_command(&plugin_id, "inspect", &[])
             .expect("dispatch runtime.inspect command");
         assert_eq!(
             value,
             LuaValue::String("test-version:table:false".to_string())
+        );
+    }
+
+    /// Safe-mode parity: a snapshot built for the other mode is refused at
+    /// installation, so a granted generation fails closed rather than reading
+    /// state it would not have been allowed to read.
+    #[test]
+    fn safe_mode_provenance_mismatch_refuses_snapshot() {
+        let root = inspect_probe_root("inspect-mismatch");
+        // Runtime is normal mode; the context claims safe mode.
+        let context = inspect_context(true);
+        let seed = inspect_seed(&context);
+        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
+            .expect("dev root must yield a session");
+        let mut runtime = session.runtime;
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
+        let error = runtime
+            .dispatch_command(&plugin_id, "inspect", &[])
+            .expect_err("mismatched snapshot must not serve");
+        let message = format!("{error}");
+        assert!(
+            message.contains("E_NOT_IMPLEMENTED"),
+            "expected fail-closed inspect backend, got: {message}"
         );
     }
 

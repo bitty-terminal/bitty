@@ -9999,6 +9999,15 @@ mod history_tests {
         let error = write_only.runtime_inspect().expect_err("read denied");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
 
+        // The read grant never implies the write-side colorscheme grant.
+        let read_only = services();
+        read_only.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        assert!(
+            !read_only.theme_configure_granted.get(),
+            "runtime.inspect must not grant runtime.configure"
+        );
+        assert!(read_only.runtime_inspect().is_ok());
+
         // A granted generation without a wired snapshot fails closed.
         let unwired = services();
         unwired.set_runtime_inspect(true, None);

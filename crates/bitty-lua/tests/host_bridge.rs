@@ -2709,6 +2709,61 @@ fn runtime_inspect_serves_a_snapshot_and_rejects_arguments() {
     assert_eq!(services.calls.get(), 1, "argument path never reaches host");
 }
 
+fn over_cap_inspect_snapshot() -> bitty_lua::runtime_inspect::RuntimeInspectSnapshot {
+    use bitty_lua::runtime_inspect::{
+        InspectRows, RUNTIME_INSPECT_MAX_SETTING_ROWS, RUNTIME_INSPECT_MAX_STRING_BYTES, Section,
+        SettingInspectRow, SettingSource,
+    };
+    let mut snapshot = inspect_snapshot();
+    snapshot.settings = Section::available(InspectRows::new(
+        (0..RUNTIME_INSPECT_MAX_SETTING_ROWS)
+            .map(|index| SettingInspectRow {
+                plugin_id: format!("owner.setting{index}"),
+                key: "k".repeat(RUNTIME_INSPECT_MAX_STRING_BYTES),
+                current: "c".repeat(RUNTIME_INSPECT_MAX_STRING_BYTES),
+                default: "d".repeat(RUNTIME_INSPECT_MAX_STRING_BYTES),
+                source: SettingSource::User,
+            })
+            .collect(),
+    ));
+    assert!(
+        !snapshot.fits_budget(),
+        "fixture must exceed the aggregate cap"
+    );
+    snapshot
+}
+
+#[test]
+fn runtime_inspect_refuses_an_over_cap_payload() {
+    use std::cell::Cell;
+    let services = Rc::new(RuntimeInspectStub {
+        store: RefCell::new(BTreeMap::new()),
+        calls: Cell::new(0),
+        snapshot: over_cap_inspect_snapshot(),
+    });
+    let mut vm = gate_vm("runtime-inspect-over-cap");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(function() return bitty.runtime.inspect() end)
+            bitty.store.set("code", ok and "OK" or err.code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_LIMIT".to_string()))
+    );
+    assert_eq!(services.calls.get(), 1);
+}
+
 #[test]
 fn runtime_inspect_defaults_fail_closed_without_backend() {
     let services = Rc::new(FakeServices::default());

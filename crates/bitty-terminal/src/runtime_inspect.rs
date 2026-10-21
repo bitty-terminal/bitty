@@ -38,13 +38,15 @@
 
 use std::path::{Path, PathBuf};
 
+use bitty_plugin_host::manifest::SettingDecl;
 use bitty_runtime::component::{
     ActivationState, COMPONENT_STATE_DIR_ENV, COMPONENTS_DIR_ENV, SYSTEM_COMPONENTS_DIR_ENV,
     component_state_root_for, components_root_for, discover_components,
     read_component_activation_with_state, system_components_root_for,
 };
 use bitty_runtime::plugin_runtime::plugin_settings::{
-    SettingLayer, default_to_lua, load_plugin_settings, resolve_plugin_settings,
+    LoadedPluginSettings, SettingLayer, default_to_lua, load_plugin_settings,
+    resolve_plugin_settings,
 };
 use bitty_runtime::plugin_runtime::{
     DecorationGeometry, ExtensionActivation, ExtensionInspectRow, ExtensionTrust, InspectRows,
@@ -78,6 +80,10 @@ pub(crate) struct InspectEnv {
     pub(crate) bitty_config_env: Option<String>,
     /// `XDG_CONFIG_HOME`.
     pub(crate) xdg_config_home: Option<String>,
+    /// Windows `APPDATA` (roaming config root fallback).
+    pub(crate) appdata: Option<String>,
+    /// Windows `LOCALAPPDATA` (last-resort config root fallback).
+    pub(crate) localappdata: Option<String>,
     /// `XDG_DATA_HOME`.
     pub(crate) xdg_data_home: Option<String>,
     /// `XDG_STATE_HOME`.
@@ -104,6 +110,8 @@ impl InspectEnv {
             config_path: config_path.map(str::to_string),
             bitty_config_env: std::env::var("BITTY_CONFIG").ok(),
             xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+            appdata: std::env::var("APPDATA").ok(),
+            localappdata: std::env::var("LOCALAPPDATA").ok(),
             xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
             xdg_state_home: std::env::var("XDG_STATE_HOME").ok(),
             home: std::env::var("HOME").ok(),
@@ -157,9 +165,16 @@ pub(crate) struct RuntimeInspectContext {
 impl RuntimeInspectContext {
     /// Build the context from the loaded app config plus explicit environment.
     pub(crate) fn from_app(app: &AppConfig, env: &InspectEnv, safe_mode: bool) -> Self {
-        let config_dir = bitty_config::file::config_dir_with_env(
+        // Same resolver as activation (`bitty_config::file::config_dir`):
+        // `XDG_CONFIG_HOME` > `APPDATA` > `HOME/.config` > `LOCALAPPDATA`.
+        // Using the XDG/HOME-only variant would show a different directory
+        // (and different settings/profiles) from the one plugins actually
+        // read on native Windows.
+        let config_dir = bitty_config::file::config_dir_with_platform_env(
             env.xdg_config_home.as_deref(),
             env.home.as_deref(),
+            env.appdata.as_deref(),
+            env.localappdata.as_deref(),
         );
         let plugin_ledger = if safe_mode {
             // Display-only, but safe mode deliberately does not name a ledger
@@ -243,6 +258,14 @@ impl RuntimeInspectContext {
     }
 }
 
+/// Activation-parity settings resolver for the cold-path builder.
+///
+/// Production passes [`bitty_runtime::plugin_runtime::PluginRuntime::resolve_settings_for_inspect`],
+/// so inspection reads the same user file, short alias, shared host layer,
+/// and safe-mode directory as activation. `None` is the test/default path and
+/// serves the same pure defaults the loader uses.
+pub(crate) type SettingsResolver<'a> = &'a dyn Fn(&str, &[SettingDecl]) -> LoadedPluginSettings;
+
 /// Build the bounded snapshot.
 ///
 /// Every section is independent: one failed source renders
@@ -250,7 +273,10 @@ impl RuntimeInspectContext {
 /// cap is enforced before return; the bridge still refuses an oversized
 /// payload fail-closed.
 #[must_use]
-pub(crate) fn build(context: &RuntimeInspectContext) -> RuntimeInspectSnapshot {
+pub(crate) fn build(
+    context: &RuntimeInspectContext,
+    settings_resolver: Option<SettingsResolver<'_>>,
+) -> RuntimeInspectSnapshot {
     let diagnostics = Section::available(RuntimeDiagnostics {
         app_version: context.app_version.clone(),
         config_file: display_path(context.config_file.as_deref()),
@@ -275,7 +301,7 @@ pub(crate) fn build(context: &RuntimeInspectContext) -> RuntimeInspectSnapshot {
         Err(reason) => Section::unavailable(reason.clone()),
     };
     let settings = match &inventory {
-        Ok(rows) => build_settings(context, rows),
+        Ok(rows) => build_settings(context, rows, settings_resolver),
         Err(_) => Section::unavailable("plugin inventory unavailable"),
     };
     let extensions = build_extensions(context);
@@ -328,7 +354,7 @@ fn build_plugins(rows: &[crate::plugin::PluginRow]) -> Section<InspectRows<Plugi
                 version: row.version.clone(),
                 source: row.source.clone(),
                 enabled: row.enabled,
-                recorded: row.state != "available",
+                recorded: row.recorded,
             })
             .collect(),
     );
@@ -339,18 +365,32 @@ fn build_plugins(rows: &[crate::plugin::PluginRow]) -> Section<InspectRows<Plugi
 fn build_settings(
     context: &RuntimeInspectContext,
     plugins: &[crate::plugin::PluginRow],
+    settings_resolver: Option<SettingsResolver<'_>>,
 ) -> Section<InspectRows<SettingInspectRow>> {
-    let config_dir = context.config_dir.as_deref();
     let mut rows = Vec::new();
     for plugin in plugins {
         if plugin.settings.is_empty() {
             continue;
         }
-        let (values, layers) = if context.safe_mode {
+        // Prefer the runtime resolver: it is the same call activation makes
+        // (per-plugin user file, short alias, shared host source, safe-mode
+        // directory). The direct loader is a test/default fallback only.
+        let (values, layers) = if let Some(resolve) = settings_resolver {
+            let loaded = resolve(&plugin.id, &plugin.settings);
+            if let Some(error) = &loaded.file_error {
+                return Section::unavailable(format!("plugin '{}' settings: {error}", plugin.id));
+            }
+            (loaded.source.values().clone(), loaded.layers)
+        } else if context.safe_mode {
             let resolved = resolve_plugin_settings(&plugin.settings, None, None);
             (resolved.values, resolved.layers)
         } else {
-            let loaded = load_plugin_settings(config_dir, &plugin.id, &plugin.settings, None);
+            let loaded = load_plugin_settings(
+                context.config_dir.as_deref(),
+                &plugin.id,
+                &plugin.settings,
+                None,
+            );
             if let Some(error) = &loaded.file_error {
                 return Section::unavailable(format!("plugin '{}' settings: {error}", plugin.id));
             }
@@ -613,6 +653,55 @@ mod tests {
         base
     }
 
+    use bitty_plugin_host::manifest::{SettingDecl, SettingDefault, SettingKind};
+    use bitty_runtime::plugin_runtime::plugin_settings::SettingLayer as RuntimeSettingLayer;
+    use bitty_runtime::plugin_runtime::{MapSettings, PluginRuntime, PluginRuntimeConfig};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    fn string_decl(key: &str, default: &str) -> SettingDecl {
+        SettingDecl::new(
+            key.to_string(),
+            SettingKind::String,
+            SettingDefault::String(default.to_string()),
+        )
+        .expect("declaration")
+    }
+
+    fn plugin_row(id: &str, settings: Vec<SettingDecl>) -> crate::plugin::PluginRow {
+        crate::plugin::PluginRow {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            bundled: false,
+            source: "registry".to_string(),
+            state: "enabled",
+            enabled: true,
+            recorded: true,
+            pin_ok: None,
+            requested: Default::default(),
+            granted: Default::default(),
+            denied: Default::default(),
+            commands: Vec::new(),
+            manifest_hash: None,
+            settings,
+        }
+    }
+
+    fn dev_plugin_with_settings(root: &Path, id: &str, key: &str, default: &str) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Settings probe\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[settings]\n{key} = {{ type = \"string\", default = \"{default}\" }}\n\n[lazy]\ncommands = []\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
+    }
+
     #[test]
     fn safe_mode_returns_builtin_config_and_no_store_reads() {
         let env = InspectEnv {
@@ -622,7 +711,7 @@ mod tests {
             ..InspectEnv::default()
         };
         let context = RuntimeInspectContext::from_app(&app_config(), &env, true);
-        let snapshot = build(&context);
+        let snapshot = build(&context, None);
         let Section::Available(diagnostics) = &snapshot.diagnostics else {
             panic!("diagnostics available");
         };
@@ -661,7 +750,7 @@ mod tests {
             RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
         context.plugin_ledger = Some(ledger);
         context.plugin_store = None;
-        let snapshot = build(&context);
+        let snapshot = build(&context, None);
         assert!(snapshot.plugins.is_unavailable());
         assert!(snapshot.settings.is_unavailable());
     }
@@ -676,7 +765,7 @@ mod tests {
         let mut context =
             RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
         context.profiles_dir = Some(profiles);
-        let snapshot = build(&context);
+        let snapshot = build(&context, None);
         assert!(snapshot.profiles.is_unavailable());
     }
 
@@ -692,7 +781,7 @@ mod tests {
             RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
         context.profiles_dir = Some(dir);
         context.profile = Some("work".to_string());
-        let snapshot = build(&context);
+        let snapshot = build(&context, None);
         let Section::Available(profiles) = &snapshot.profiles else {
             panic!("profiles available");
         };
@@ -739,5 +828,175 @@ mod tests {
             sha256: "a".repeat(64),
         };
         assert_eq!(version.sha256.len(), 64);
+    }
+    #[test]
+    fn platform_config_root_matches_activation_on_windows_roots() {
+        let env = InspectEnv {
+            appdata: Some("/appdata".to_string()),
+            localappdata: Some("/localappdata".to_string()),
+            ..InspectEnv::default()
+        };
+        let context = RuntimeInspectContext::from_app(&app_config(), &env, false);
+        assert_eq!(
+            context.config_dir,
+            Some(PathBuf::from("/appdata").join(bitty_config::file::CONFIG_DIR_NAME))
+        );
+        assert_eq!(
+            context.profiles_dir,
+            Some(
+                PathBuf::from("/appdata")
+                    .join(bitty_config::file::CONFIG_DIR_NAME)
+                    .join(bitty_config::file::PROFILES_DIR_NAME)
+            )
+        );
+
+        // XDG still wins over APPDATA, matching the shared resolver.
+        let env = InspectEnv {
+            xdg_config_home: Some("/xdg".to_string()),
+            appdata: Some("/appdata".to_string()),
+            ..InspectEnv::default()
+        };
+        let context = RuntimeInspectContext::from_app(&app_config(), &env, false);
+        assert_eq!(
+            context.config_dir,
+            Some(PathBuf::from("/xdg").join(bitty_config::file::CONFIG_DIR_NAME))
+        );
+    }
+
+    #[test]
+    fn store_only_rows_are_not_marked_recorded() {
+        let mut store_row = plugin_row("xuepoo.store", Vec::new());
+        store_row.recorded = false;
+        let section = build_plugins(&[store_row]);
+        let Section::Available(rows) = section else {
+            panic!("plugins available");
+        };
+        assert!(!rows.rows[0].recorded);
+
+        let ledger_row = plugin_row("xuepoo.ledger", Vec::new());
+        let section = build_plugins(&[ledger_row]);
+        let Section::Available(rows) = section else {
+            panic!("plugins available");
+        };
+        assert!(rows.rows[0].recorded);
+    }
+
+    #[test]
+    fn settings_inspection_uses_the_host_and_short_alias_layers() {
+        let base = scratch("settings-parity");
+        let config_dir = base.join("config");
+        let plugin_root = base.join("plugins");
+        dev_plugin_with_settings(&plugin_root, "xuepoo.parity", "theme", "default");
+
+        let host = BTreeMap::from([(
+            "theme".to_string(),
+            bitty_runtime::plugin_runtime::LuaValue::String("host-value".to_string()),
+        )]);
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+            third_party_roots: vec![plugin_root],
+            settings: Rc::new(MapSettings::new(host)),
+            ..PluginRuntimeConfig::default()
+        });
+        runtime.set_settings_dir(Some(config_dir.clone()));
+        runtime.discover();
+
+        let declarations = vec![string_decl("theme", "default")];
+        let loaded = runtime.resolve_settings_for_inspect("xuepoo.parity", &declarations);
+        assert_eq!(
+            loaded.source.values().get("theme"),
+            Some(&bitty_runtime::plugin_runtime::LuaValue::String(
+                "host-value".to_string()
+            ))
+        );
+        assert_eq!(loaded.layers.get("theme"), Some(&RuntimeSettingLayer::Host));
+
+        // Unambiguous short alias wins over the shared host layer, exactly as
+        // activation resolves it.
+        std::fs::create_dir_all(config_dir.join("plugins")).expect("plugins dir");
+        std::fs::write(
+            config_dir.join("plugins/parity.lua"),
+            "return { theme = \"alias-value\" }\n",
+        )
+        .expect("alias");
+        let loaded = runtime.resolve_settings_for_inspect("xuepoo.parity", &declarations);
+        assert_eq!(
+            loaded.source.values().get("theme"),
+            Some(&bitty_runtime::plugin_runtime::LuaValue::String(
+                "alias-value".to_string()
+            ))
+        );
+        assert_eq!(
+            loaded.layers.get("theme"),
+            Some(&RuntimeSettingLayer::UserFile)
+        );
+
+        // The builder consumes that resolver, so the served row agrees with
+        // `bitty.settings.get` for the same generation.
+        let context = RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
+        let rows = vec![plugin_row("xuepoo.parity", declarations.clone())];
+        let resolve = |id: &str, declarations: &[SettingDecl]| {
+            runtime.resolve_settings_for_inspect(id, declarations)
+        };
+        let section = build_settings(&context, &rows, Some(&resolve));
+        let Section::Available(rows) = section else {
+            panic!("settings available");
+        };
+        assert_eq!(rows.rows[0].current, "alias-value");
+        assert_eq!(rows.rows[0].source, SettingSource::User);
+    }
+
+    #[test]
+    fn credential_shaped_setting_value_is_redacted_end_to_end() {
+        let base = scratch("settings-redaction");
+        let config_dir = base.join("config");
+        std::fs::create_dir_all(config_dir.join("plugins")).expect("plugins dir");
+        std::fs::write(
+            config_dir.join("plugins/xuepoo.secret.toml"),
+            "api_key = \"s3cr3t-value\"\n",
+        )
+        .expect("settings file");
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        runtime.set_settings_dir(Some(config_dir.clone()));
+        let context = RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
+        let rows = vec![plugin_row(
+            "xuepoo.secret",
+            vec![string_decl("api_key", "default")],
+        )];
+        let resolver = |id: &str, declarations: &[SettingDecl]| {
+            runtime.resolve_settings_for_inspect(id, declarations)
+        };
+        let section = build_settings(&context, &rows, Some(&resolver));
+        let Section::Available(rows) = section else {
+            panic!("settings available");
+        };
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].current, REDACTED_SETTING_VALUE);
+        assert_eq!(rows.rows[0].default, REDACTED_SETTING_VALUE);
+        assert_eq!(rows.rows[0].source, SettingSource::User);
+    }
+
+    #[test]
+    fn malformed_settings_file_marks_the_section_unavailable() {
+        let base = scratch("settings-malformed");
+        let config_dir = base.join("config");
+        std::fs::create_dir_all(config_dir.join("plugins")).expect("plugins dir");
+        std::fs::write(config_dir.join("plugins/xuepoo.broken.lua"), "return {\n")
+            .expect("broken file");
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        runtime.set_settings_dir(Some(config_dir));
+        let context = RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);
+        let rows = vec![plugin_row(
+            "xuepoo.broken",
+            vec![string_decl("theme", "default")],
+        )];
+        let resolver = |id: &str, declarations: &[SettingDecl]| {
+            runtime.resolve_settings_for_inspect(id, declarations)
+        };
+        let section = build_settings(&context, &rows, Some(&resolver));
+        let Section::Unavailable(reason) = section else {
+            panic!("malformed file must mark the section unavailable");
+        };
+        assert!(reason.contains("xuepoo.broken"), "{reason}");
+        assert!(reason.contains("settings"), "{reason}");
     }
 }

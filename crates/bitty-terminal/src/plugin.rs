@@ -1584,6 +1584,13 @@ pub struct PluginRow {
     pub state: &'static str,
     /// Recorded enabled flag.
     pub enabled: bool,
+    /// Whether the managed `bitty-plugins.toml` ledger records this id.
+    ///
+    /// Store-index rows are **not** ledger records: `state` describes their
+    /// desired store state, not a managed record. Runtime inspection reports
+    /// this field verbatim so a dashboard can tell "installed and enabled"
+    /// from "recorded but not yet installed".
+    pub recorded: bool,
     /// Hash pin status: `Some(true)` verified, `Some(false)` stale, `None`
     /// when there is no manifest to verify against.
     pub pin_ok: Option<bool>,
@@ -1670,6 +1677,7 @@ fn rows_from_state(
             )
         })?;
         let record = state.get(&id);
+        let recorded = record.is_some();
         let (state_label, enabled, pin_ok, granted, denied, manifest_hash) = match record {
             Some(record) => (
                 if record.enabled {
@@ -1701,6 +1709,7 @@ fn rows_from_state(
             source: "bundled".to_string(),
             state: state_label,
             enabled,
+            recorded,
             pin_ok,
             requested,
             granted,
@@ -1735,6 +1744,7 @@ fn rows_from_state(
                 "disabled"
             },
             enabled: record.enabled,
+            recorded: true,
             pin_ok: None,
             requested: record.granted.clone(),
             granted: record.granted.clone(),
@@ -1825,6 +1835,7 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
             "disabled"
         },
         enabled: record.enabled,
+        recorded: false,
         pin_ok: None,
         requested,
         granted,

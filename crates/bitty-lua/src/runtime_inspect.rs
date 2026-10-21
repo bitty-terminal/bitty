@@ -139,16 +139,6 @@ impl<T> InspectRows<T> {
             self.truncated = true;
         }
     }
-
-    /// Drop the tail row; returns whether one existed.
-    fn pop_tail(&mut self) -> bool {
-        if self.rows.pop().is_some() {
-            self.truncated = true;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// Source layer that selected the active profile.
@@ -249,10 +239,19 @@ impl ExtensionActivation {
             Self::Active => "active".to_string(),
             Self::Stopped => "stopped".to_string(),
             Self::Crashed => "crashed".to_string(),
-            Self::Denied(class) => format!(
-                "denied:{}",
-                bounded_display(class, RUNTIME_INSPECT_MAX_STRING_BYTES)
-            ),
+            Self::Denied(class) => {
+                // Keep the whole label (prefix included) inside the same
+                // 96-byte display bound the JSON encoder applies, so Lua and
+                // canonical payload measurements can never disagree.
+                const PREFIX: &str = "denied:";
+                format!(
+                    "{PREFIX}{}",
+                    bounded_display(
+                        class,
+                        RUNTIME_INSPECT_MAX_STRING_BYTES.saturating_sub(PREFIX.len())
+                    )
+                )
+            }
         }
     }
 
@@ -444,20 +443,32 @@ impl RuntimeInspectSnapshot {
     ///
     /// Returns whether anything was dropped. Drop order is settings, plugins,
     /// extensions, then profiles (the sections with the least diagnostic
-    /// value at the tail). If the payload still cannot fit — impossible with
-    /// the per-string caps, but fail-closed anyway — every rows section is
-    /// replaced by an `unavailable` marker.
+    /// value at the tail). Each section is trimmed with a binary search over
+    /// its row count, so a pathological snapshot costs `O(log rows)` canonical
+    /// encodes per section instead of one encode per dropped row. If the
+    /// payload still cannot fit — impossible with the per-string caps, but
+    /// fail-closed anyway — every rows section is replaced by an
+    /// `unavailable` marker.
     pub fn enforce_budget(&mut self) -> bool {
+        if self.fits_budget() {
+            return false;
+        }
         let mut truncated = false;
-        loop {
-            if self.fits_budget() {
-                return truncated;
-            }
-            let dropped = self.pop_tail();
-            if !dropped {
-                break;
-            }
-            truncated = true;
+        truncated |= self.trim_section::<SettingInspectRow>(|snapshot| &mut snapshot.settings);
+        if self.fits_budget() {
+            return truncated;
+        }
+        truncated |= self.trim_section::<PluginInspectRow>(|snapshot| &mut snapshot.plugins);
+        if self.fits_budget() {
+            return truncated;
+        }
+        truncated |= self.trim_section::<ExtensionInspectRow>(|snapshot| &mut snapshot.extensions);
+        if self.fits_budget() {
+            return truncated;
+        }
+        truncated |= self.trim_section::<ProfileInspectRow>(|snapshot| &mut snapshot.profiles);
+        if self.fits_budget() {
+            return truncated;
         }
         // Defensive: the fixed diagnostics section alone is bounded well
         // below the ceiling, so this only runs if a caller injected a
@@ -471,29 +482,60 @@ impl RuntimeInspectSnapshot {
         true
     }
 
-    /// Drop the tail row from the first non-empty rows section.
-    fn pop_tail(&mut self) -> bool {
-        if let Section::Available(rows) = &mut self.settings {
-            if rows.pop_tail() {
-                return true;
+    /// Binary-search the largest fitting row count for one section.
+    ///
+    /// The caller has already established that the full payload does not
+    /// fit. Rows are only removed from the tail; the largest `k` whose prefix
+    /// fits is chosen, so the result matches sequential tail dropping while
+    /// avoiding a full re-encode per dropped row.
+    fn trim_section<T: Clone>(
+        &mut self,
+        section: impl Fn(&mut Self) -> &mut Section<InspectRows<T>>,
+    ) -> bool {
+        let original = match section(self) {
+            Section::Available(rows) => rows.rows.clone(),
+            Section::Unavailable(_) => return false,
+        };
+        let len = original.len();
+        if len == 0 {
+            return false;
+        }
+        // The caller has established that the full payload does not fit, so
+        // the answer is in `0..len`. Probes restore a prefix of the saved
+        // rows; destructive `truncate` cannot grow back after a smaller probe.
+        let mut low = 0usize;
+        let mut high = len - 1;
+        let mut best: Option<usize> = None;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            {
+                let Section::Available(rows) = section(self) else {
+                    return false;
+                };
+                rows.rows.clear();
+                rows.rows.extend(original[..middle].iter().cloned());
+            }
+            if self.fits_budget() {
+                best = Some(middle);
+                low = middle + 1;
+            } else if middle == 0 {
+                break;
+            } else {
+                high = middle - 1;
             }
         }
-        if let Section::Available(rows) = &mut self.plugins {
-            if rows.pop_tail() {
-                return true;
-            }
+        let best = best.unwrap_or(0);
+        let Section::Available(rows) = section(self) else {
+            return false;
+        };
+        rows.rows.clear();
+        rows.rows.extend(original[..best].iter().cloned());
+        if best < len {
+            rows.truncated = true;
+            true
+        } else {
+            false
         }
-        if let Section::Available(rows) = &mut self.extensions {
-            if rows.pop_tail() {
-                return true;
-            }
-        }
-        if let Section::Available(rows) = &mut self.profiles {
-            if rows.pop_tail() {
-                return true;
-            }
-        }
-        false
     }
 
     /// Convert the bounded snapshot to the Lua table returned to plugins.
@@ -1180,6 +1222,12 @@ mod tests {
         assert_eq!(
             ExtensionActivation::Denied("component_untrusted".to_string()).label(),
             "denied:component_untrusted"
+        );
+        let long = ExtensionActivation::Denied("x".repeat(200)).label();
+        assert!(
+            long.len() <= RUNTIME_INSPECT_MAX_STRING_BYTES,
+            "denied label must share the 96-byte display bound: {}",
+            long.len()
         );
     }
 

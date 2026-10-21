@@ -70,6 +70,9 @@ jobs:
       - name: Validate bitty-bin template (render test)
         run: |
           bash scripts/check-pkgbuild-bin.sh
+      - name: Validate AUR bitty-bin publish assertion (#2417)
+        run: |
+          bash scripts/tests/check-aur-bin-render.test.sh
       - name: Validate package-manager manifests (R2/CDN primary)
         run: |
           bash scripts/tests/check-package-manifests.test.sh
@@ -1439,16 +1442,6 @@ jobs:
             echo "sha256 placeholder not fully replaced" >&2
             exit 1
           fi
-          # Pin the rendered recipe to the R2/CDN host and the verified digest
-          # before it reaches AUR (the fallback GitHub URL is a comment only).
-          if ! grep -qF "https://cdn.bitty.run/releases/v\${pkgver}/${ASSET}" "$AUR_DIR/PKGBUILD"; then
-            echo "rendered PKGBUILD does not use the R2/CDN binary URL" >&2
-            exit 1
-          fi
-          if ! grep -qF "'$SHA'" "$AUR_DIR/PKGBUILD"; then
-            echo "rendered PKGBUILD does not carry the verified sha256" >&2
-            exit 1
-          fi
           id builder >/dev/null 2>&1 || useradd --create-home builder
           # Keep the AUR checkout root-owned so root git stays trusted; run
           # makepkg as builder only inside an isolated BUILD_DIR copy.
@@ -1458,6 +1451,17 @@ jobs:
           su builder -s /bin/bash -c "cd \"$BUILD_DIR\" && makepkg --printsrcinfo > .SRCINFO"
           install -m644 "$BUILD_DIR/.SRCINFO" "$AUR_DIR/.SRCINFO"
           rm -rf "$BUILD_DIR"
+          # Pin the rendered recipe to the R2/CDN host and the verified digest
+          # before it reaches AUR (the fallback GitHub URL is a comment only).
+          # CTX-1436 (#2417): assert the *resolved* source URL. The template
+          # renders the download name through `${_bitty_asset}`, so the former
+          # literal asset-name needle could never match and failed v0.0.25's
+          # bitty-bin channel after every other channel had published.
+          if ! scripts/assert-aur-bin-render.sh \
+            "$AUR_DIR/PKGBUILD" "$VERSION" "$SHA" "$AUR_DIR/.SRCINFO"; then
+            echo "::error::bitty-bin channel failed: rendered AUR recipe violates the R2/CDN + digest contract"
+            exit 1
+          fi
           git -C "$AUR_DIR" config user.name "github-actions[bot]"
           git -C "$AUR_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
           git -C "$AUR_DIR" add PKGBUILD .SRCINFO
@@ -1862,4 +1866,78 @@ jobs:
           else
             echo "::error::R2 content mismatch for install.ps1"
             exit 1
+          fi
+
+  # CTX-1436 (#2417): one table in the run summary for every package channel.
+  # v0.0.25 published all channels except `bitty-bin`; the run went red, but
+  # the only trace was that one job's log. This job names the failed channel in
+  # the summary and as an annotation, and fails so a partial release cannot be
+  # read as a successful one. Skipped channels are toggles or blocked upstream;
+  # they are listed but never counted as success or failure on their own.
+  channel-summary:
+    name: Summarize package channels
+    needs: [r2-mirror, aur, aur-bin, homebrew, scoop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Summarize package channels
+        env:
+          TAG: ${{ github.ref_name }}
+          R2_RESULT: ${{ needs.r2-mirror.result }}
+          AUR_RESULT: ${{ needs.aur.result }}
+          AUR_BIN_RESULT: ${{ needs.aur-bin.result }}
+          HOMEBREW_RESULT: ${{ needs.homebrew.result }}
+          SCOOP_RESULT: ${{ needs.scoop.result }}
+        run: |
+          set -euo pipefail
+          LABELS=(
+            "R2 mirror (prerequisite)"
+            "AUR source (bitty)"
+            "AUR binary (bitty-bin)"
+            "Homebrew (bitty formula)"
+            "Scoop (bitty manifest)"
+          )
+          RESULTS=(
+            "$R2_RESULT"
+            "$AUR_RESULT"
+            "$AUR_BIN_RESULT"
+            "$HOMEBREW_RESULT"
+            "$SCOOP_RESULT"
+          )
+          {
+            echo "## Package channels for ${TAG}"
+            echo
+            echo "| Channel | Result |"
+            echo "| --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          for i in "${!LABELS[@]}"; do
+            printf '| %s | %s |\n' "${LABELS[$i]}" "${RESULTS[$i]}" >>"$GITHUB_STEP_SUMMARY"
+          done
+          failed=0
+          skipped=0
+          for i in "${!LABELS[@]}"; do
+            case "${RESULTS[$i]}" in
+              success) ;;
+              skipped)
+                skipped=$((skipped + 1))
+                printf -- '- %s skipped (publish toggle disabled or an upstream job failed).\n' \
+                  "${LABELS[$i]}" >>"$GITHUB_STEP_SUMMARY"
+                ;;
+              *)
+                printf -- '- **%s failed** (result: %s).\n' \
+                  "${LABELS[$i]}" "${RESULTS[$i]}" >>"$GITHUB_STEP_SUMMARY"
+                echo "::error::package channel ${LABELS[$i]} result: ${RESULTS[$i]}"
+                failed=1
+                ;;
+            esac
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "one or more package channels failed; see the run summary" >&2
+            exit 1
+          fi
+          if [ "$skipped" -ne 0 ]; then
+            echo "${skipped} package channel(s) skipped; none failed"
+          else
+            echo "all package channels succeeded"
           fi

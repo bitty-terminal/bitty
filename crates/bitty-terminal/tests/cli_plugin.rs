@@ -670,10 +670,10 @@ fn plugin_capability_update_decline_and_eof_leave_index_and_grants_unchanged() {
 /// Post-install next steps for store installs (CTX-1268, bitty#2144).
 ///
 /// Golden: `install`/`enable` success prints the enable command, the store
-/// package root, the per-plugin config path with a minimal snippet derived
-/// from declared `[settings]`, the manifest's `[hints] next_steps`, and the
-/// `info` pointer. Data-driven: hints and the snippet come from the
-/// manifest, everything else is the generic shape.
+/// package root, the canonical Lua settings path, the `config show` and
+/// `config scaffold` pointers, the manifest's `[hints] next_steps`, and the
+/// `info` pointer. The hint never renders a legacy TOML example, even when
+/// the manifest declares `[settings]` defaults.
 #[test]
 fn plugin_store_install_and_enable_print_next_steps() {
     let home = scratch_dir("next-steps");
@@ -723,9 +723,20 @@ fn plugin_store_install_and_enable_print_next_steps() {
     // before matching the store/config layout.
     let portable = text.replace('\\', "/");
     assert!(portable.contains("packages/xuepoo.onboard/1.0.0"), "{text}");
-    assert!(portable.contains("plugins/xuepoo.onboard.toml"), "{text}");
-    assert!(text.contains("show = true"), "{text}");
-    assert!(text.contains("edge = \"bottom\""), "{text}");
+    assert!(portable.contains("plugins/xuepoo.onboard.lua"), "{text}");
+    assert!(!portable.contains(".toml"), "{text}");
+    assert!(
+        text.contains("inspect: bitty plugin config show xuepoo.onboard"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scaffold: bitty plugin config scaffold xuepoo.onboard"),
+        "{text}"
+    );
+    // Declared settings no longer leak a legacy TOML snippet into the hint.
+    assert!(!text.contains("show = true"), "{text}");
+    assert!(!text.contains("edge = \"bottom\""), "{text}");
+    assert!(!text.contains("minimal example"), "{text}");
     assert!(
         text.contains("- Pin the bar module in your config, then restart bitty."),
         "{text}"
@@ -747,7 +758,18 @@ fn plugin_store_install_and_enable_print_next_steps() {
         text.contains("enable: bitty plugin enable xuepoo.onboard"),
         "{text}"
     );
-    assert!(text.contains("edge = \"bottom\""), "{text}");
+    let portable = text.replace('\\', "/");
+    assert!(portable.contains("plugins/xuepoo.onboard.lua"), "{text}");
+    assert!(!portable.contains(".toml"), "{text}");
+    assert!(
+        text.contains("inspect: bitty plugin config show xuepoo.onboard"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scaffold: bitty plugin config scaffold xuepoo.onboard"),
+        "{text}"
+    );
+    assert!(!text.contains("edge = \"bottom\""), "{text}");
     assert!(
         text.contains("more: bitty plugin info xuepoo.onboard"),
         "{text}"

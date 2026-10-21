@@ -4578,12 +4578,20 @@ mod tests {
         let user = base.join("user");
         std::fs::create_dir_all(&user).expect("user dir");
         let target = "x86_64-unknown-linux-gnu";
+        let host_target = crate::component_seed::host_target_triple().expect("mapped host target");
+        // A target guaranteed to differ from the host, so the decoy cannot
+        // accidentally become the host's latest on that platform.
+        let foreign_target = if host_target == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "aarch64-apple-darwin"
+        };
         let mut stub = InstallStub::canned("net", "0.0.10", target, b"latest-net-bytes");
         // Older releases plus foreign-target and other-name decoys: only the
         // highest strict X.Y.Z for the exact host target may win.
         let decoy = "b".repeat(64);
         stub.catalog.push_str(&format!(
-            "extension net 0.0.9 {target} {decoy}\nextension net 0.0.2 {target} {decoy}\nextension net 9.9.9 aarch64-apple-darwin {decoy}\nextension graphics 8.0.0 {target} {decoy}\n"
+            "extension net 0.0.9 {host_target} {decoy}\nextension net 0.0.2 {host_target} {decoy}\nextension net 9.9.9 {foreign_target} {decoy}\nextension graphics 8.0.0 {host_target} {decoy}\n"
         ));
         let mut out = Vec::new();
         let mut input = std::io::BufReader::new(&b""[..]);

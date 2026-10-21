@@ -75,6 +75,20 @@ windows-sys = { version = "0.61", default-features = false }
 bitty-pty = { path = "crates/bitty-pty" }
 bitty-plugin-host = { path = "crates/bitty-plugin-host" }
 
+# Release packaging policy (CTX-2402, #2402): shipped binaries carry no debug
+# info and no builder paths. `strip = "debuginfo"` drops DWARF/STABS (and the
+# source-file symbols that travel with them) while keeping `.symtab`, because
+# the symbol table is what makes `RUST_BACKTRACE=1` name frames: stripping
+# symbols too leaves a panic backtrace with zero frames (measured on Rust
+# 1.98). Builder privacy comes from `scripts/release-rustflags.sh`, which
+# remaps every builder root to `/build/...`; stripping alone cannot remove
+# panic-location paths because those live in runtime read-only data. For a
+# smaller, fully stripped binary (about -25% uncompressed, -9% compressed on
+# the 0.0.25 artifact) opt in with
+# `--config 'profile.release.strip="symbols"'` and accept unnamed frames.
+[profile.release]
+strip = "debuginfo"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

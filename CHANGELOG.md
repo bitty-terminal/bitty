@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, command, URL, or host argument exists, and all reads happen on the
   cold path; payload paths are display strings only.
 
+### Changed
+
+- **Release binaries carry no builder paths (CTX-1434, #2402):** release
+  builds remap the workspace, cargo registry/git, rustup, and target roots to
+  `/build/...` at compile time (`scripts/release-rustflags.sh`, used by
+  `just release-build` and every release-workflow build job) and ship
+  without debug info (`[profile.release] strip = "debuginfo"`). The symbol
+  table is kept so `RUST_BACKTRACE=1` still names frames.
+  `scripts/check-release-paths.sh` fails the release when a built binary
+  embeds a builder path, and its fixture test runs in `just check`. The
+  0.0.25 Linux artifact carried hundreds of unique builder paths (545 in the
+  locally verified binary); the same build now carries none.
+
 ## [0.0.25] - 2026-10-21
 
 ### Added

@@ -150,6 +150,20 @@ jobs:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           targets: ${{ matrix.target }}
 
+      # CTX-2402: panic-location strings embed the builder's cargo/rustup
+      # roots, so every release build remaps them to `/build/...` first. The
+      # flag set is derived from this runner's environment by the repo-owned
+      # script (no runner path is committed) and is identical to what
+      # `just release-build` uses locally.
+      - name: Resolve release RUSTFLAGS (remapped builder roots)
+        id: release-flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags="$(scripts/release-rustflags.sh)"
+          printf 'flags=%s\n' "$flags" >>"$GITHUB_OUTPUT"
+          echo "release RUSTFLAGS: $flags"
+
       # Linux ARM64 is cross-compiled on x86_64 with Ubuntu's aarch64 toolchain
       # (CTX-0446 / 034 item 1). The container-based `cross` path never linked:
       # its image installs host-arch fontconfig/FreeType, and the old fallback
@@ -228,6 +242,7 @@ jobs:
       - name: Build bitty binary (Linux aarch64 cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
+          RUSTFLAGS: ${{ steps.release-flags.outputs.flags }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
@@ -239,7 +254,23 @@ jobs:
 
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
+        env:
+          RUSTFLAGS: ${{ steps.release-flags.outputs.flags }}
         run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
+
+      # CTX-2402: the fail-closed builder-path gate. Stripping cannot remove
+      # panic-location paths, so this proves the remap actually applied on
+      # every shipped target before the artifact is renamed or packaged.
+      - name: Check release binary has no builder paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          bin="target/${TARGET}/release/bitty"
+          if [[ "$TARGET" == *windows* ]]; then
+            bin="${bin}.exe"
+          fi
+          bash scripts/check-release-paths.sh --binary "$bin"
 
       # CTX-0502: host-cross is verified (#819), so a wrong-architecture
       # artifact must fail here instead of being renamed, packaged, and
@@ -378,11 +409,28 @@ jobs:
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
 
+      # CTX-2402: derive the builder-root remap from this container's
+      # environment; RUSTFLAGS also keeps the dynamic-musl link flag.
+      - name: Resolve release RUSTFLAGS (remapped builder roots)
+        id: release-flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags="$(scripts/release-rustflags.sh)"
+          printf 'flags=%s\n' "$flags" >>"$GITHUB_OUTPUT"
+          echo "release RUSTFLAGS: $flags"
+
       - name: Build bitty binary (native musl, dynamic)
         env:
-          RUSTFLAGS: "-C target-feature=-crt-static"
+          RUSTFLAGS: "-C target-feature=-crt-static ${{ steps.release-flags.outputs.flags }}"
         shell: bash
         run: cargo build --release --locked -p bitty-terminal
+
+      # CTX-2402: same fail-closed builder-path gate as the glibc/macOS/Windows
+      # legs; the musl target ships in the .apk.
+      - name: Check release binary has no builder paths
+        shell: bash
+        run: bash scripts/check-release-paths.sh --binary target/release/bitty
 
       - name: Rename artifact
         shell: bash
@@ -485,7 +533,7 @@ jobs:
         run: |
           set -eux
           sudo pkg update
-          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig
+          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
 
       - name: Install pinned Rust toolchain (rustup)
         run: |
@@ -500,7 +548,15 @@ jobs:
         run: |
           set -eux
           . "$HOME/.cargo/env"
-          cargo build --release --locked -p bitty-terminal
+          RUSTFLAGS="$(bash scripts/release-rustflags.sh)" \
+            cargo build --release --locked -p bitty-terminal
+
+      # CTX-2402: fail closed when the FreeBSD build embeds a builder path
+      # (the tier-2 tarball and bare binary ship this artifact).
+      - name: Check release binary has no builder paths
+        run: |
+          set -eux
+          bash scripts/check-release-paths.sh --binary target/release/bitty
 
       - name: Run core headless suites
         run: |

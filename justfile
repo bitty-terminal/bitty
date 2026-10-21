@@ -274,6 +274,36 @@ binary-arch binary arch:
 binary-arch-test:
     ./scripts/tests/check-binary-arch.test.sh
 
+# Build the release binary with the reproducible/privacy hardening flags
+# (CTX-2402): `scripts/release-rustflags.sh` remaps every builder root to
+# `/build/...` and the result is scanned for builder paths before it can be
+# packaged. The release workflow runs the same flag script, so local and CI
+# builds share one policy. Extra arguments go to `cargo build`.
+release-build *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export RUSTFLAGS="$(scripts/release-rustflags.sh)${RUSTFLAGS:+ $RUSTFLAGS}"
+    cargo build --release --locked -p bitty-terminal "$@"
+    ./scripts/check-release-paths.sh --binary "${CARGO_TARGET_DIR:-target}/release/bitty"
+
+# Fail when a built binary embeds a builder path (CTX-2402):
+# `just release-paths dist/bitty-x86_64-unknown-linux-gnu`
+release-paths *binaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bins=({{binaries}})
+    if [[ ${#bins[@]} -eq 0 ]]; then
+      bins=("${CARGO_TARGET_DIR:-target}/release/bitty")
+    fi
+    args=()
+    for bin in "${bins[@]}"; do
+      args+=(--binary "$bin")
+    done
+    ./scripts/check-release-paths.sh "${args[@]}"
+
+release-paths-test:
+    ./scripts/tests/check-release-paths.test.sh
+
 terminfo-check:
     ./scripts/check-terminfo.sh
 
@@ -367,7 +397,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test aur-bin-render-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

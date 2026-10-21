@@ -1,0 +1,2 @@
+panic at /build/cargo/registry/src/index/foo-1.0/src/lib.rs:42
+/build/workspace/crates/bitty-vt/src/lib.rs

@@ -6111,6 +6111,30 @@ fn init_shell_candidates_order_and_fallback() {
 }
 
 #[test]
+fn init_shell_name_positional_gets_shell_init_hint() {
+    // `bitty init fish` reads like a shell-init invocation (#2367).
+    assert_eq!(
+        crate::init::init_shell_name_hint(&["fish".to_string()]).expect("fish hint"),
+        "bitty init: `fish` is a shell name; did you mean `bitty shell-init fish`?"
+    );
+    // Every supported shell name resolves to its canonical shell-init spelling.
+    for name in ["bash", "zsh", "fish", "powershell", "nushell"] {
+        let hint =
+            crate::init::init_shell_name_hint(&[name.to_string()]).expect("supported shell hint");
+        assert!(
+            hint.contains(&format!("`bitty shell-init {name}`")),
+            "{hint}"
+        );
+    }
+    // The generic unexpected-argument path stays generic: unknown words,
+    // shell paths, extra tokens, and no tokens get no hint.
+    assert!(crate::init::init_shell_name_hint(&["bogus".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&["/bin/fish".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&["fish".to_string(), "zsh".to_string()]).is_none());
+    assert!(crate::init::init_shell_name_hint(&[]).is_none());
+}
+
+#[test]
 fn init_step_parsers_accept_and_reject() {
     let cands = vec!["/bin/bash".to_string(), "/bin/sh".to_string()];
     // Shell: empty takes the default, numbers pick, customs validate.
@@ -8820,6 +8844,211 @@ fn init_plugins_answer_parses_bundled_ids_offline() {
     // Flag values reject empty (missing value is usage error, never silent none).
     assert!(init_parse_plugins_flag("").is_err());
     assert!(init_parse_plugins_flag("   ").is_err());
+}
+
+// -- `bitty init` plugin multi-select: checkbox rows (#1913 follow-up) ------
+//
+// The loop is catalog-generic, so these tests inject a three-id list even
+// though the shipped bundled catalog currently holds one id. Keys are
+// injected bytes plus an EOF-terminated wait closure: no real TTY is needed
+// and no terminal mode is touched.
+
+/// Drives one plugin multi-select headlessly; returns the selected ids plus
+/// everything it printed.
+fn drive_plugin_multiselect(
+    ids: &[&str],
+    stdin_bytes: &[u8],
+    color: bool,
+) -> (Result<Vec<String>, String>, String) {
+    let ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    let mut input = std::io::BufReader::new(stdin_bytes);
+    let mut output = Vec::new();
+    // EOF-terminated: no more bytes means the escape (if any) is bare.
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_multiselect_key_loop(
+        &mut input,
+        &mut output,
+        &ids,
+        color,
+        false,
+        &mut wait,
+    );
+    let printed = String::from_utf8(output).expect("multiselect output is UTF-8");
+    (result, printed)
+}
+
+const PLUGIN_MULTISELECT_TEST_IDS: [&str; 3] = ["alpha.plugin", "beta.plugin", "gamma.plugin"];
+
+#[test]
+fn init_plugin_multiselect_toggles_move_and_confirms_in_catalog_order() {
+    // Space checks `alpha`; `j` moves to `beta`; space checks it; Enter
+    // confirms both in catalog order (not toggle order).
+    let (result, printed) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b" j \r", false);
+    assert_eq!(
+        result.expect("Enter confirms the checked rows"),
+        vec!["alpha.plugin".to_string(), "beta.plugin".to_string()]
+    );
+    assert!(
+        printed.contains("Plugins (official, offline-safe):"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("> [ ] alpha.plugin"),
+        "cursor row, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("[x] alpha.plugin") && printed.contains("[x] beta.plugin"),
+        "checked rows, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("[ ] gamma.plugin"),
+        "unchecked row, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("(space toggles, j/k or arrows move, Enter confirms, Esc cancels)"),
+        "hint, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains('\u{1b}'),
+        "plain output must not colorize, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_inplace_repaints_with_cursor_up() {
+    // In-place frames repaint over the previous frame (cursor-up plus
+    // clear-line) and hide the cursor while looping. Three ids make a
+    // five-line frame: prompt, three rows, hint.
+    let ids: Vec<String> = PLUGIN_MULTISELECT_TEST_IDS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect();
+    let mut input = std::io::BufReader::new(b"j\r".as_slice());
+    let mut output = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_multiselect_key_loop(
+        &mut input,
+        &mut output,
+        &ids,
+        false,
+        true,
+        &mut wait,
+    );
+    assert!(result.expect("in-place confirm").is_empty());
+    let printed = String::from_utf8(output).expect("multiselect output is UTF-8");
+    assert!(
+        printed.contains("\x1b[5A"),
+        "cursor-up repaint, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("\x1b[?25l") && printed.contains("\x1b[?25h"),
+        "cursor hide/show, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_empty_enter_selects_none() {
+    // Default selection is none: Enter alone returns an empty selection.
+    let (result, printed) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"\r", false);
+    assert!(
+        result.expect("Enter with nothing checked").is_empty(),
+        "{printed}"
+    );
+    assert!(printed.contains("> [ ] alpha.plugin"), "{printed}");
+}
+
+#[test]
+fn init_plugin_multiselect_space_toggles_off_again() {
+    // Space twice on the same row restores the unchecked state.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"  \r", false);
+    assert!(result.expect("toggle twice").is_empty());
+}
+
+#[test]
+fn init_plugin_multiselect_arrows_and_jk_wrap() {
+    // `k` on the first row wraps to the last row.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"k \r", false);
+    assert_eq!(
+        result.expect("k wraps to the last row"),
+        vec!["gamma.plugin".to_string()]
+    );
+    // Up arrow wraps the same way and toggles with Space.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"\x1b[A \r", false);
+    assert_eq!(
+        result.expect("arrow-up wraps to the last row"),
+        vec!["gamma.plugin".to_string()]
+    );
+    // `j` on the last row wraps to the first row.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"jjj \r", false);
+    assert_eq!(
+        result.expect("j wraps past the last row"),
+        vec!["alpha.plugin".to_string()]
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_kitty_space_toggles() {
+    // Kitty keyboard protocol can spell Space as `CSI 32 u`; it is still a
+    // toggle, never dead input.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"\x1b[32u\r", false);
+    assert_eq!(
+        result.expect("kitty Space toggles"),
+        vec!["alpha.plugin".to_string()]
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_esc_cancels() {
+    // A checked row does not survive Esc: cancel aborts the whole step.
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b" \x1b", false);
+    assert_eq!(
+        result.expect_err("Esc must cancel"),
+        "bitty init: aborted (cancelled)"
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_ctrl_d_aborts() {
+    let (result, _) = drive_plugin_multiselect(&PLUGIN_MULTISELECT_TEST_IDS, b"\x04", false);
+    assert_eq!(
+        result.expect_err("Ctrl-D must abort"),
+        "bitty init: aborted (end of input)"
+    );
+}
+
+#[test]
+fn init_plugin_prompt_line_fallback_parses_comma_ids() {
+    // Non-TTY input keeps the line loop and comma-separated parsing
+    // byte-identical (headless dispatch, scripted tests, `--yes`).
+    let mut input = std::io::BufReader::new(
+        b" bitty-terminal.shell-integration , bitty-terminal.shell-integration \n".as_slice(),
+    );
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let result = crate::init::init_prompt_plugin_selection(
+        &mut input,
+        &mut output,
+        &mut history,
+        false,
+        false,
+    );
+    assert_eq!(
+        result.expect("comma-separated ids parse"),
+        vec!["bitty-terminal.shell-integration".to_string()]
+    );
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("Plugins (optional first batch, offline-safe):"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("Plugins [comma-separated ids, empty for none]:"),
+        "{printed}"
+    );
 }
 
 #[test]

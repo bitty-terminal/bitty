@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`bitty init` plugin step is a checkbox multi-select (CTX-1417, #2366):**
+  on a live TTY the Plugins follow-up renders the bundled catalog as `[ ]`
+  rows with a `>` cursor and a key hint; Space toggles, `j`/`k` and arrows
+  move with wrapping, Enter confirms in catalog order, and Esc cancels. The
+  default is none, `Ctrl-D`/EOF aborts fail-closed, and piped/headless input
+  keeps the byte-identical comma-separated line prompt.
 - **Tool/plugin spawns route through `bitty-execution` (#2249, W-140
   integration):** the plugin `process.spawn` and IPC execution providers now
   spawn a real `JobRegistry` job instead of a Core-local one-shot supervisor.
@@ -20,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bitty init <shell>` hints the shell-init verb (CTX-1417, #2367):** a
+  single positional token naming a supported shell (`bash`, `zsh`, `fish`,
+  `powershell`, `nushell`) now prints
+  ``bitty init: `fish` is a shell name; did you mean `bitty shell-init fish`?``
+  before the usage and exits 2. Unknown words, shell paths, and extra tokens
+  keep the generic unexpected-argument message unchanged.
 - **Resumable RC-1 completion enforcement (CTX-1407, #2314):** app-dispatched
   plugin commands that reach the 50 ms charged wall budget now park with their
   executor, fuel, and cumulative clock intact and resume on later cold ticks

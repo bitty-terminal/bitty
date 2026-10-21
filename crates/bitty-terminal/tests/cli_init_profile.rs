@@ -520,3 +520,48 @@ fn profile_list_and_path_do_not_create_or_evaluate() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn init_shell_name_positional_hints_shell_init_and_writes_nothing() {
+    // `bitty init fish` is a common shell-init typo (#2367): a targeted hint
+    // precedes the usage and nothing is written. The generic unexpected-
+    // argument path keeps its existing shape.
+    let root = scratch_root("shell-hint");
+    let output = run_bitty(&root, &["init", "fish"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "shell-name positional is a usage error, stderr={:?}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("bitty init: `fish` is a shell name; did you mean `bitty shell-init fish`?"),
+        "targeted hint, stderr:\n{err}"
+    );
+    let hint_at = err.find("is a shell name").expect("hint present");
+    let usage_at = err.find("usage: bitty init").expect("usage present");
+    assert!(
+        hint_at < usage_at,
+        "hint must precede the usage, stderr:\n{err}"
+    );
+    assert!(!init_path(&root).exists(), "hint writes no config");
+    assert!(
+        !profile_path(&root, "default").exists(),
+        "hint writes no profile"
+    );
+
+    let generic = run_bitty(&root, &["init", "bogus"]);
+    assert_eq!(generic.status.code(), Some(2));
+    let generic_err = stderr(&generic);
+    assert!(
+        generic_err.contains("bitty init: unexpected argument 'bogus'"),
+        "generic path unchanged, stderr:\n{generic_err}"
+    );
+    assert!(
+        !generic_err.contains("is a shell name"),
+        "generic path gets no shell hint, stderr:\n{generic_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

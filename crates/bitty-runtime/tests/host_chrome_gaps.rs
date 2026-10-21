@@ -23,7 +23,8 @@ use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiRegion, UiRegionKind, UiSl
 use bitty_platform::{CursorPosition, MouseButton, PressState};
 use bitty_runtime::{
     BAND_MAX_REGIONS, BandButton, BandContent, BandEdge, BandItemRegion, BandMount,
-    BandRegionError, ChromeBands, Runtime, UiRect, band_click_args_table, resolve_item_region,
+    BandRegionError, ChromeBands, Runtime, UiRect, band_click_args_table, flatten_band_runs,
+    resolve_item_region,
 };
 
 fn minimal_runtime() -> Runtime {
@@ -1556,4 +1557,73 @@ fn stale_region_gesture_is_refused_after_a_version_bump() {
         "a region resolved under a superseded version never routes"
     );
     assert_eq!(rt.band_host_stats().clicks_unclaimed, 1);
+}
+
+#[test]
+fn wide_labels_route_each_workspace_pill_by_its_display_column() {
+    // Regression (bar workspace capsules, five non-contiguous ids): the bar
+    // renders `index` labels or `id:name` labels, and CJK workspace names make
+    // later capsules wide. Hit-testing must resolve the pointer's display
+    // column against the same display columns the paint path uses; converting
+    // the column to a char index first compresses wide text and makes the
+    // fourth/fifth pill resolve to an earlier run.
+    let rows = [
+        (2.0, "项目甲"),
+        (4.0, "代码库"),
+        (5.0, "日志"),
+        (6.0, "开发"),
+        (7.0, "终端"),
+    ];
+    for label in ["index", "both"] {
+        let mut children = Vec::new();
+        for (index, (id, name)) in rows.iter().enumerate() {
+            if index > 0 {
+                children.push(plain(" "));
+            }
+            let capsule = if label == "index" {
+                format!(" {id} ")
+            } else {
+                format!(" {id}:{name} ")
+            };
+            children.push(pill(&capsule, *id));
+        }
+        let root = UiNode::row(children);
+        let (_, runs) = flatten_band_runs(&root);
+        let clickable: Vec<(usize, f64)> = runs
+            .iter()
+            .filter_map(|run| {
+                let id = run
+                    .on_click
+                    .as_ref()?
+                    .args
+                    .iter()
+                    .find_map(|(key, value)| {
+                        if key == "id" {
+                            if let ClickArg::Number(id) = value {
+                                return Some(*id);
+                            }
+                        }
+                        None
+                    })?;
+                Some(((run.start_col + run.end_col) / 2, id))
+            })
+            .collect();
+        assert_eq!(clickable.len(), 5, "five pills in {label} mode");
+
+        let mut rt = minimal_runtime();
+        mount_bottom_bar(&mut rt, root);
+        rt.tick();
+        let row = bar_row(&rt);
+        for (col, id) in clickable {
+            let col = u16::try_from(col).expect("pill column fits");
+            click_at(&mut rt, row, col);
+            let clicks = rt.drain_band_clicks();
+            assert_eq!(clicks.len(), 1, "one click routes for id {id} ({label})");
+            assert_eq!(
+                clicks[0].args,
+                vec![("id".to_string(), ClickArg::Number(id))],
+                "column {col} must focus pill id {id} in {label} mode"
+            );
+        }
+    }
 }

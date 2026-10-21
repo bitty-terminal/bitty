@@ -120,7 +120,9 @@ native_forms() {
 derive_root() {
   local root="$1" form
   [[ -n "$root" ]] || return 0
-  [[ "$root" == /* ]] || root="$PWD/$root"
+  if [[ ! "$root" =~ ^(/|[A-Za-z]:[\\/]|\\\\) ]]; then
+    root="$PWD/$root"
+  fi
   while [[ "$root" == */ && "$root" != "/" ]]; do
     root="${root%/}"
   done
@@ -145,7 +147,7 @@ done
 # A grep error (exit > 1) must fail the gate instead of silently passing.
 scan_grep() {
   local out status=0
-  out="$(grep "$@" 2>/dev/null)" || status=$?
+  out="$(grep "$@" 2>/dev/null | tr -d '\000')" || status=$?
   if ((status > 1)); then
     printf 'check-release-paths[error]: grep failed while scanning (exit %s)\n' "$status" >&2
     return 2

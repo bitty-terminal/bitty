@@ -845,7 +845,7 @@ fn hex_byte(body: &str, start: usize) -> Option<u8> {
 }
 
 /// WCAG 2.1 relative luminance of an opaque sRGB byte triple.
-fn relative_luminance(rgb: [u8; 3]) -> f64 {
+pub(crate) fn relative_luminance(rgb: [u8; 3]) -> f64 {
     let channel = |c: u8| -> f64 {
         let c = f64::from(c) / 255.0;
         if c <= 0.039_28 {
@@ -858,7 +858,7 @@ fn relative_luminance(rgb: [u8; 3]) -> f64 {
 }
 
 /// WCAG 2.1 contrast ratio between two opaque colors.
-fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
+pub(crate) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
     let la = relative_luminance(a);
     let lb = relative_luminance(b);
     let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };

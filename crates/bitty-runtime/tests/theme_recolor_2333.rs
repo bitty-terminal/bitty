@@ -261,6 +261,10 @@ fn banner_ground(palette: &ThemePalette) -> [u8; 4] {
 
 /// Expected help-panel ring (issue #2333 contract: ANSI 12).
 fn help_ring(palette: &ThemePalette) -> [u8; 4] {
+    // Deliberately independent of the production resolver: the expected ring
+    // for the presets exercised here is the ANSI 12 accent, so the pixel
+    // assertions can catch a regression in the fallback rule instead of
+    // reusing it.
     opaque(palette.active_index(12))
 }
 

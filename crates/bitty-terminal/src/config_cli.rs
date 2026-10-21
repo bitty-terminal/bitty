@@ -1176,6 +1176,116 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         check_row("decoration.border_color_idle.advisory", warning, "advisory")
                     );
                 }
+                // CTX-1418 (#2370): report the built-in preset readability
+                // policy. The summary keeps one stable row; violations and
+                // documented exemptions are printed individually so a
+                // regression names the exact role and measurement. The same
+                // rows back the `bitty-config` catalog test, so `config check`
+                // and CI can never disagree about what "readable" means.
+                let contrast = bitty_config::theme::contrast_checks(&theme);
+                let ratio_of = |role: bitty_config::theme::ContrastRole| {
+                    contrast
+                        .iter()
+                        .find(|row| row.role == role)
+                        .map_or(0.0, |row| row.ratio)
+                };
+                let violations: Vec<_> = contrast.iter().filter(|row| !row.passed).collect();
+                println!(
+                    "{}",
+                    check_row(
+                        "theme.contrast",
+                        format!(
+                            "fg {:.2}:1, min ANSI {:.2}:1, cursor {:.2}:1, selection {:.2}:1/{:.2}:1, ring {:.2}:1",
+                            ratio_of(bitty_config::theme::ContrastRole::Foreground),
+                            bitty_config::theme::min_ansi_text_contrast(&theme),
+                            ratio_of(bitty_config::theme::ContrastRole::Cursor),
+                            ratio_of(bitty_config::theme::ContrastRole::SelectionText),
+                            ratio_of(bitty_config::theme::ContrastRole::SelectionSurface),
+                            ratio_of(bitty_config::theme::ContrastRole::HelpRing),
+                        ),
+                        "policy",
+                    )
+                );
+                for row in contrast
+                    .iter()
+                    .filter(|row| row.advisory && row.ratio < row.floor)
+                {
+                    println!(
+                        "{}",
+                        check_row(
+                            &format!("theme.contrast.advisory.{}", row.role.label()),
+                            format!(
+                                "{:.2}:1 below the {:.1}:1 advisory (surface token, never gated)",
+                                row.ratio, row.floor
+                            ),
+                            "advisory",
+                        )
+                    );
+                }
+                for row in contrast.iter().filter(|row| row.exemption.is_some()) {
+                    println!(
+                        "{}",
+                        check_row(
+                            &format!("theme.contrast.exempt.{}", row.role.label()),
+                            format!(
+                                "{:.2}:1 (floor {:.1}:1) - {}",
+                                row.ratio,
+                                row.floor,
+                                row.exemption.unwrap_or_default()
+                            ),
+                            "documented",
+                        )
+                    );
+                }
+                for row in &violations {
+                    println!(
+                        "{}",
+                        check_row(
+                            &format!("theme.contrast.violation.{}", row.role.label()),
+                            format!("{:.2}:1 (floor {:.1}:1)", row.ratio, row.floor),
+                            "policy",
+                        )
+                    );
+                }
+                let hue_violations = bitty_config::theme::hue_violations(&theme);
+                if let Some(reason) = bitty_config::theme::hue_collision_exemption(&theme) {
+                    println!(
+                        "{}",
+                        check_row("theme.hue.exempt", reason.to_string(), "documented")
+                    );
+                }
+                for row in &hue_violations {
+                    println!(
+                        "{}",
+                        check_row(
+                            &format!("theme.hue.violation.ansi{}-ansi{}", row.first, row.second),
+                            format!(
+                                "dE {:.1} (floor {:.1}), hue {:.0}deg (floor {:.0}deg)",
+                                row.delta_e,
+                                bitty_config::theme::MIN_ANSI_FAMILY_DELTA_E,
+                                row.hue_delta,
+                                bitty_config::theme::MIN_ANSI_FAMILY_HUE_DEGREES,
+                            ),
+                            "policy",
+                        )
+                    );
+                }
+                println!(
+                    "{}",
+                    check_row(
+                        "theme.contrast.result",
+                        if violations.is_empty() && hue_violations.is_empty() {
+                            String::from("pass")
+                        } else {
+                            format!(
+                                "{} contrast violation(s), {} hue collision(s)",
+                                violations.len(),
+                                hue_violations.len()
+                            )
+                        },
+                        "policy",
+                    )
+                );
                 // CTX-0343 (RFC-0001/OQ-041): report the merged per-View
                 // override set, one row per selector-qualified field, with
                 // per-field source attribution. The set is presentation-only

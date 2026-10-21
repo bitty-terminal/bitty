@@ -15,3 +15,4 @@ workspace = true
 
 [dependencies]
 phodopus = { version = "0.2.0-alpha.1", git = "https://github.com/bitty-terminal/phodopus", rev = "91b8a2c" }
+chrono.workspace = true

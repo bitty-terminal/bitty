@@ -53,6 +53,9 @@ nix = { version = "0.31.3", default-features = false }
 # classifier (`EPERM`/`ENOTTY` from the child `TIOCSCTTY`). Lock already
 # carries the 0.2 line via `portable-pty`; no new crate version.
 libc = { version = "0.2", default-features = false }
+# Local calendar conversion for the restricted Lua `os.date` (owner report:
+# the clock showed UTC). Safe Rust, MIT OR Apache-2.0, no build script.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # CTX-0903 (DEC-0083): Win32 bindings for the `bitty-winjob` Job Object
 # adapter only (MIT OR Apache-2.0, rust-version 1.71 <= MSRV 1.85). Reuses
 # the 0.61.2 line already in the lockfile; no new crate version.

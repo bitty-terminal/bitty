@@ -4604,9 +4604,11 @@ mod tests {
             "{summary}"
         );
         let printed = String::from_utf8_lossy(&out).into_owned();
+        let host_target = crate::component_seed::host_target_triple().expect("mapped host target");
         assert!(
-            printed
-                .contains("resolved latest version for 'net' (x86_64-unknown-linux-gnu): 0.0.10"),
+            printed.contains(&format!(
+                "resolved latest version for 'net' ({host_target}): 0.0.10"
+            )),
             "resolved version must be printed before download: {printed}"
         );
         assert!(

@@ -2240,12 +2240,14 @@ impl TerminalApp {
     ///
     /// Hover is presentation-only: it carries the stable region id plus an
     /// `enter`/`leave` phase, never pointer coordinates, and it neither takes
-    /// the overlay capture nor sets `modal_active`. Dispatch uses the same
+    /// the overlay capture nor sets `modal_active`. An `enter` uses the same
     /// presented-frame origin fence as clicks
     /// ([`bitty_runtime::PluginRuntime::dispatch_ui_command`]), so a band that
     /// was replaced, moved, or reflowed after the transition was queued is
-    /// refused instead of retargeted. Registration, capability, and args-schema
-    /// gates are unchanged.
+    /// refused instead of retargeted. A `leave` is deliberately unfenced: it
+    /// only hides/cleans up, so the plugin still hears about the transition
+    /// after a band version bump or removal. Registration, capability, and
+    /// args-schema gates are unchanged.
     ///
     /// Results are not surfaced as banners: hover is high-frequency
     /// presentation, and the plugin's tooltip goes through the overlay
@@ -2253,7 +2255,7 @@ impl TerminalApp {
     fn dispatch_band_hover(
         &mut self,
         hover: bitty_runtime::BandHoverRequest,
-        origin: &bitty_runtime::BandOrigin,
+        origin: Option<&bitty_runtime::BandOrigin>,
     ) -> bool {
         let id = match bitty_plugin_host::manifest::PluginId::new(&hover.plugin_id) {
             Ok(id) => id,
@@ -2277,7 +2279,17 @@ impl TerminalApp {
             return false;
         };
         let args = bitty_runtime::band_hover_args_table(&hover.args, &hover.region, hover.phase);
-        match plugin_runtime.dispatch_ui_command(&id, &hover.command, &[args], origin) {
+        let outcome = match origin {
+            // `enter` keeps the presented-frame fence (same as clicks and
+            // scrolls): a replaced, moved, or reflowed band is refused.
+            Some(origin) => {
+                plugin_runtime.dispatch_ui_command(&id, &hover.command, &[args], origin)
+            }
+            // `leave` is cleanup only; it must arrive even when the band that
+            // produced the enter is gone (issue #2411 review B1).
+            None => plugin_runtime.dispatch_command(&id, &hover.command, &[args]),
+        };
+        let delivered = match outcome {
             Ok(_) => true,
             Err(error) if error.is_parked() => true,
             Err(error) => {
@@ -2287,9 +2299,22 @@ impl TerminalApp {
                         hover.plugin_id, hover.command
                     )
                 });
-                true
+                if hover.phase == bitty_runtime::BandHoverPhase::Enter {
+                    // The plugin never saw the enter, so no leave is owed and
+                    // the tooltip must not anchor. Abandoning the state also
+                    // prevents a retry every cold phase; the next motion
+                    // starts a fresh hover against the live frame.
+                    self.runtime.abandon_band_hover();
+                }
+                false
             }
+        };
+        if delivered && hover.phase == bitty_runtime::BandHoverPhase::Enter {
+            // Stops revalidation from re-firing on later content updates and
+            // lets the overlay host anchor the tooltip for this item.
+            self.runtime.confirm_band_hover(&hover.region);
         }
+        delivered
     }
 
     /// Dispatches one Core-routed plugin band scroll (CTX-1190, issue #2008).
@@ -2535,26 +2560,38 @@ impl TerminalApp {
         // under a modal, and dispatch when the capture ends. Core never paints
         // a hover tooltip while capture holds.
         if !self.overlay_capture_active() {
+            // Issue #2411: re-derive a deferred/stale hover first, so an item
+            // whose band was newer than the last presented frame enters as
+            // soon as that frame is published (no extra pointer motion).
+            self.runtime.revalidate_band_hover();
             for hover in self.runtime.drain_band_hovers() {
-                let Some(origin) = hover.origin.clone() else {
-                    crate::logging::warn(|| {
-                        format!(
-                            "bitty: band hover '{}:{}' dropped (no presented origin)",
-                            hover.plugin_id, hover.command
-                        )
-                    });
-                    continue;
-                };
-                if !self.runtime.band_origin_is_current(&origin) {
-                    crate::logging::warn(|| {
-                        format!(
-                            "bitty: band hover '{}:{}' dropped (origin is stale)",
-                            hover.plugin_id, hover.command
-                        )
-                    });
-                    continue;
-                }
-                if self.dispatch_band_hover(hover, &origin) {
+                if hover.phase == bitty_runtime::BandHoverPhase::Enter {
+                    let Some(origin) = hover.origin.clone() else {
+                        // Unreachable: the queue defers origin-less enters.
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: band hover '{}:{}' dropped (no presented origin)",
+                                hover.plugin_id, hover.command
+                            )
+                        });
+                        continue;
+                    };
+                    if !self.runtime.band_origin_is_current(&origin) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: band hover '{}:{}' dropped (origin is stale)",
+                                hover.plugin_id, hover.command
+                            )
+                        });
+                        continue;
+                    }
+                    if self.dispatch_band_hover(hover, Some(&origin)) {
+                        attempted = attempted.saturating_add(1);
+                    }
+                } else if self.dispatch_band_hover(hover, None) {
+                    // `leave` is never origin-fenced: it hides/cleans up and
+                    // grants no authority, so a version bump or a removed band
+                    // still delivers exactly one leave.
                     attempted = attempted.saturating_add(1);
                 }
             }

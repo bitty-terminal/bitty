@@ -52,7 +52,10 @@
 //!   coalesces to one dispatch per region per drain ([`Runtime::update_band_hover`],
 //!   [`Runtime::drain_band_hovers`]). Hover carries no coordinates, grants no
 //!   authority, never captures input, and never sets `modal_active`; leaving
-//!   the region (or losing focus) queues the paired `leave`.
+//!   the region (or losing focus) queues the paired `leave`. `enter` is fenced
+//!   by the presented origin and deferred until its band frame is published
+//!   ([`Runtime::revalidate_band_hover`]); `leave` is deliberately unfenced
+//!   because cleanup must still arrive after a version bump or removal.
 //! - **Overlay anchor.** [`BandOverlayAnchor`] names a live band item, so the
 //!   application can paint a plugin tooltip next to the hovered region
 //!   without Core ever handing the plugin pointer geometry.
@@ -1389,9 +1392,18 @@ pub(super) struct BandHoverState {
     /// this column against the live tree is how a band replacement or a
     /// content update proves the hover still names a real item.
     col: usize,
-    /// Presented origin captured at enter; the paired leave carries the same
-    /// fence so a stale transition is refused rather than retargeted.
+    /// Presented origin captured at enter.
+    ///
+    /// The enter is queued only once this names a current presented frame;
+    /// `leave` is never fenced (it hides/cleans up and grants no authority).
     origin: Option<BandOrigin>,
+    /// Whether the `enter` transition reached the plugin runtime.
+    ///
+    /// A deferred enter (band newer than the last presented frame) stays
+    /// unannounced until the cold phase re-derives it, so the app never
+    /// anchors a tooltip for an item the plugin has not heard about, and a
+    /// presented-frame refresh never re-fires a delivered enter.
+    announced: bool,
 }
 
 impl BandHoverState {
@@ -1591,6 +1603,9 @@ pub struct BandHostStats {
     /// Hover transitions that collapsed into an already-queued transition of
     /// the same region (issue #2411).
     pub hovers_coalesced: u64,
+    /// Hover `enter` transitions held back until the band's frame is
+    /// presented (issue #2411).
+    pub hovers_deferred: u64,
     /// Hover transitions dropped on a full queue (issue #2411).
     pub hover_queue_drops: u64,
     /// Hover bindings refused because their command is unroutable
@@ -2620,6 +2635,7 @@ impl Runtime {
                 origin: self
                     .published_band_origin(row_hit.edge, row_hit.visible_index)
                     .cloned(),
+                announced: false,
             }),
             BandHoverOutcome::Denied => HoverProbe::Denied,
             BandHoverOutcome::NoClaim => HoverProbe::None,
@@ -2635,13 +2651,20 @@ impl Runtime {
     /// queue drops the newest transition fail-closed and counts
     /// [`BandHostStats::hover_queue_drops`].
     ///
-    /// A transition whose presented origin is no longer current is refused
-    /// here and counts [`BandHostStats::hovers_denied`], mirroring band
-    /// scrolls: a remount, edge move, reflow, or version reset never
-    /// retargets hover to different content. (Core tears the tooltip down
-    /// independently, so a refused stale `leave` cannot leave one visible.)
+    /// `enter` is fenced by the presented origin: a remount, edge move,
+    /// reflow, or version reset never retargets hover to different content,
+    /// and an enter whose band is newer than the last presented frame is
+    /// deferred ([`BandHostStats::hovers_deferred`]) until
+    /// [`Self::revalidate_band_hover`] can re-derive it. `leave` is **never**
+    /// fenced: it hides/cleans up and grants no authority, so a version bump
+    /// or a removed band must still deliver exactly one leave — refusing it
+    /// would strand the plugin's tooltip state.
     fn queue_band_hover(&mut self, request: BandHoverRequest) {
-        if let Some(origin) = request.origin.as_ref() {
+        if request.phase == BandHoverPhase::Enter {
+            let Some(origin) = request.origin.as_ref() else {
+                self.band_stats.hovers_deferred = self.band_stats.hovers_deferred.saturating_add(1);
+                return;
+            };
             if !self.band_origin_is_current(origin) {
                 self.band_stats.hovers_denied = self.band_stats.hovers_denied.saturating_add(1);
                 return;
@@ -2668,25 +2691,102 @@ impl Runtime {
     /// Drains queued band hover transitions for application dispatch
     /// (issue #2411).
     ///
-    /// The application dispatches each through
+    /// The application dispatches an `enter` through
     /// `PluginRuntime::dispatch_ui_command` with the captured origin (the same
-    /// presented-frame fence clicks and scrolls use), so registration,
-    /// capability, args-schema, and origin-currency gates all apply; the
-    /// runtime never touches a VM. Order is transition order modulo per-region
-    /// coalescing; the queue is empty in the common case.
+    /// presented-frame fence clicks and scrolls use), and a `leave` through
+    /// the unfenced command path (it only hides/cleans up). Registration,
+    /// capability, and args-schema gates apply to both; the runtime never
+    /// touches a VM. Order is transition order modulo per-region coalescing;
+    /// the queue is empty in the common case.
     pub fn drain_band_hovers(&mut self) -> Vec<BandHoverRequest> {
         self.band_hover_queue.drain(..).collect()
+    }
+
+    /// Re-derives a deferred or stale hover after a frame published new band
+    /// origins (issue #2411).
+    ///
+    /// Runs once per cold phase before the hover queue drains. When the
+    /// pointer still sits on the same item and the live band now has a
+    /// presented origin, the state picks up that origin; an `enter` that was
+    /// deferred because the band was newer than the last presented frame is
+    /// queued here, so a tooltip appears as soon as its band is presented
+    /// (without waiting for another pointer motion). A delivered enter is
+    /// never re-fired by a content/version bump.
+    pub fn revalidate_band_hover(&mut self) {
+        let Some(current) = self.band_hover.clone() else {
+            return;
+        };
+        let stale = current
+            .origin
+            .as_ref()
+            .is_none_or(|origin| !self.band_origin_is_current(origin));
+        if !stale {
+            return;
+        }
+        let Some(pos) = self.last_cursor else {
+            return;
+        };
+        let HoverProbe::Target(next) = self.band_hover_probe(pos) else {
+            return;
+        };
+        if !next.same_item(&current) {
+            return;
+        }
+        let Some(origin) = next.origin.clone() else {
+            // The band is still newer than the last presented frame: keep the
+            // unannounced state and retry on the next cold phase.
+            return;
+        };
+        let refreshed = BandHoverState {
+            origin: Some(origin),
+            announced: current.announced,
+            ..next
+        };
+        self.band_hover = Some(refreshed.clone());
+        if !current.announced {
+            self.queue_band_hover(refreshed.enter_request());
+        }
+    }
+
+    /// Forgets the live hover without queueing a leave (issue #2411).
+    ///
+    /// Used when an `enter` dispatch was refused outright (for example a
+    /// stale origin caught between the queue fence and the VM borrow): the
+    /// plugin never saw the enter, so no leave is owed, and the next pointer
+    /// motion starts a fresh hover instead of retrying every cold phase.
+    pub fn abandon_band_hover(&mut self) {
+        self.band_hover = None;
+    }
+
+    /// Records that an `enter` transition reached the plugin runtime
+    /// (issue #2411).
+    ///
+    /// The application calls this after dispatching (or accepting a parked)
+    /// enter. It stops [`Self::revalidate_band_hover`] from re-firing the
+    /// enter on later content/version bumps and lets the overlay host anchor
+    /// the tooltip for this item.
+    pub fn confirm_band_hover(&mut self, region: &UiRegion) {
+        if let Some(state) = self.band_hover.as_mut() {
+            if state.region == *region {
+                state.announced = true;
+            }
+        }
     }
 
     /// The live hovered band region rect, if any (issue #2411).
     ///
     /// Derived from the current tree, so an overlay host can anchor a tooltip
     /// to the region Core is actually painting rather than to a stale
-    /// rectangle. `None` when nothing is hovered or the region no longer
-    /// exists in the live band.
+    /// rectangle. `None` when nothing is hovered, when the region no longer
+    /// exists in the live band, or when the item's `enter` has not reached the
+    /// plugin yet (a deferred transition must not surface stale tooltip
+    /// content at a new anchor).
     #[must_use]
     pub fn hovered_band_region(&self) -> Option<BandItemRegion> {
         let state = self.band_hover.as_ref()?;
+        if !state.announced {
+            return None;
+        }
         self.hover_region_rect(state)
     }
 

@@ -26,8 +26,8 @@ use bitty_platform::{
     CursorPosition, MouseButton, PhysicalSize, PlatformEvent, PressState, WindowEventKind, WindowId,
 };
 use bitty_runtime::{
-    BAND_HOVER_QUEUE_MAX, BandButton, BandContent, BandEdge, BandHoverPhase, ChromeBands, Runtime,
-    flatten_band_runs, flatten_band_runs_in_width,
+    BAND_HOVER_QUEUE_MAX, BandButton, BandContent, BandEdge, BandHoverPhase, BandHoverRequest,
+    BandMount, ChromeBands, Runtime, flatten_band_runs, flatten_band_runs_in_width,
 };
 
 const PLUGIN: &str = "test-bar";
@@ -47,23 +47,53 @@ fn runtime_width(cols: u16) -> Runtime {
     rt
 }
 
-fn band(root: UiNode) -> BandContent {
-    BandContent {
-        plugin_id: PLUGIN.to_string(),
-        slot: UiSlot::Top,
-        root,
-        version: 1,
-    }
-}
-
-fn mount_top(rt: &mut Runtime, root: UiNode) -> u16 {
-    rt.set_chrome_bands(ChromeBands {
-        top: vec![band(root)],
-        ..Default::default()
-    });
+/// Mounts the top band with a live mount projection and presents it, so the
+/// hover fence runs against a real published origin.
+fn mount_top_version(rt: &mut Runtime, root: UiNode, version: u32) -> u16 {
+    set_band_version(rt, root, version);
     rt.tick().expect("tick");
     rt.plugin_band_row(BandEdge::Top, 0)
         .expect("top band occupies a row")
+}
+
+/// Replaces the top band and its mount projection without presenting, so the
+/// live tree is newer than the last published frame.
+fn set_band_version(rt: &mut Runtime, root: UiNode, version: u32) {
+    rt.set_chrome_bands_with_mounts(
+        ChromeBands {
+            top: vec![BandContent {
+                plugin_id: PLUGIN.to_string(),
+                slot: UiSlot::Top,
+                root,
+                version,
+            }],
+            ..Default::default()
+        },
+        vec![BandMount {
+            plugin_id: PLUGIN.to_string(),
+            slot: UiSlot::Top,
+            version,
+            generation: 1,
+            handle: 1,
+        }],
+    );
+}
+
+fn mount_top(rt: &mut Runtime, root: UiNode) -> u16 {
+    mount_top_version(rt, root, 1)
+}
+
+/// Moves onto `(row, col)`, drains the produced transitions, and confirms any
+/// enter as delivered (what the application does after dispatching it).
+fn hover_and_confirm(rt: &mut Runtime, row: u16, col: u16) -> Vec<BandHoverRequest> {
+    rt.handle_cursor_moved(cell_pixels(rt, row, col));
+    let events = rt.drain_band_hovers();
+    for event in &events {
+        if event.phase == BandHoverPhase::Enter {
+            rt.confirm_band_hover(&event.region);
+        }
+    }
+    events
 }
 
 fn click(command: &str, region: &str) -> ClickCommand {
@@ -329,12 +359,12 @@ fn hover_reports_enter_and_leave_per_region_without_capture() {
     let mut rt = runtime_width(80);
     let row = mount_top(&mut rt, waybar_band());
 
-    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
-    let events = rt.drain_band_hovers();
+    let events = hover_and_confirm(&mut rt, row, 39);
     assert_eq!(events.len(), 1, "one enter transition");
     assert_eq!(events[0].region.id, "clock");
     assert_eq!(events[0].phase, BandHoverPhase::Enter);
     assert_eq!(events[0].plugin_id, PLUGIN);
+    assert!(events[0].origin.is_some(), "real presented origin");
     assert!(
         !rt.band_release_armed(),
         "hover never arms a release swallow"
@@ -352,8 +382,7 @@ fn hover_reports_enter_and_leave_per_region_without_capture() {
     assert_eq!(events[0].phase, BandHoverPhase::Leave);
 
     // Moving between modules is a leave plus an enter, in that order.
-    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
-    let _ = rt.drain_band_hovers();
+    let _ = hover_and_confirm(&mut rt, row, 39);
     rt.handle_cursor_moved(cell_pixels(&rt, row, 78));
     let events = rt.drain_band_hovers();
     assert_eq!(events.len(), 2);
@@ -365,6 +394,7 @@ fn hover_reports_enter_and_leave_per_region_without_capture() {
         (events[1].region.id.as_str(), events[1].phase),
         ("battery", BandHoverPhase::Enter)
     );
+    rt.confirm_band_hover(&events[1].region);
 
     // The hovered rect is the live region geometry (overlay anchor input).
     let region = rt.hovered_band_region().expect("live hover region");
@@ -689,4 +719,122 @@ fn unanchored_empty_leaf_matches_the_unbounded_walk() {
     let (text, runs) = flatten_band_runs_in_width(&clipped, 2);
     assert_eq!(text, "ab");
     assert_eq!(columns(&runs), vec![(0, 2)]);
+}
+
+#[test]
+fn leave_after_a_band_version_bump_is_delivered() {
+    // Review B1: a clock tick bumps the band version after the enter was
+    // delivered. The leave must still reach the plugin (it only hides/cleans
+    // up), even though the enter's presented origin is now stale.
+    let mut rt = runtime_width(80);
+    let row = mount_top_version(&mut rt, waybar_band(), 1);
+    let enter = hover_and_confirm(&mut rt, row, 39);
+    assert_eq!(enter.len(), 1);
+    assert!(enter[0].origin.is_some(), "real presented origin");
+
+    // Live band v2, published frame still v1: the stored origin is stale.
+    set_band_version(&mut rt, waybar_band(), 2);
+
+    // The pointer leaves the item (and the band).
+    rt.handle_cursor_moved(cell_pixels(&rt, row + 5, 0));
+    let leave = rt.drain_band_hovers();
+    assert_eq!(leave.len(), 1, "exactly one leave after the version bump");
+    assert_eq!(leave[0].phase, BandHoverPhase::Leave);
+    assert_eq!(leave[0].region.id, "clock");
+    assert_eq!(
+        rt.band_host_stats().hovers_denied,
+        0,
+        "cleanup is never fenced"
+    );
+    assert!(rt.hovered_band_region().is_none());
+}
+
+#[test]
+fn leave_after_band_removal_is_delivered() {
+    // Review B1: the band disappears entirely (unmount/edge change). The
+    // plugin still receives exactly one leave for the item it was told about.
+    let mut rt = runtime_width(80);
+    let row = mount_top_version(&mut rt, waybar_band(), 1);
+    let enter = hover_and_confirm(&mut rt, row, 39);
+    assert_eq!(enter.len(), 1);
+
+    rt.set_chrome_bands_with_mounts(ChromeBands::default(), Vec::new());
+    let leave = rt.drain_band_hovers();
+    assert_eq!(leave.len(), 1, "exactly one leave after removal");
+    assert_eq!(leave[0].phase, BandHoverPhase::Leave);
+    assert_eq!(leave[0].region.id, "clock");
+    assert_eq!(
+        rt.band_host_stats().hovers_denied,
+        0,
+        "cleanup is never fenced"
+    );
+    assert!(rt.hovered_band_region().is_none());
+}
+
+#[test]
+fn deferred_enter_is_delivered_once_the_band_is_presented() {
+    // Review B2: the pointer enters while the live band is newer than the last
+    // presented frame. The enter is deferred (not dropped forever): the cold
+    // phase re-derives it as soon as the frame is published, without waiting
+    // for another pointer motion, and a later leave still works.
+    let mut rt = runtime_width(80);
+    let row = mount_top_version(&mut rt, waybar_band(), 1);
+
+    // Live band v2, published frame still v1.
+    set_band_version(&mut rt, waybar_band(), 2);
+    rt.handle_cursor_moved(cell_pixels(&rt, row, 39));
+    assert!(
+        rt.drain_band_hovers().is_empty(),
+        "enter is deferred, never queued without a presented origin"
+    );
+    assert_eq!(rt.band_host_stats().hovers_deferred, 1);
+    assert!(
+        rt.hovered_band_region().is_none(),
+        "no tooltip anchor before the plugin hears about the item"
+    );
+
+    // Revalidation before the frame publishes still waits.
+    rt.revalidate_band_hover();
+    assert!(rt.drain_band_hovers().is_empty());
+
+    // The frame publishes v2; revalidation now queues a fenced enter.
+    rt.tick().expect("present the new band");
+    rt.revalidate_band_hover();
+    let enter = rt.drain_band_hovers();
+    assert_eq!(enter.len(), 1, "deferred enter delivered after present");
+    assert_eq!(enter[0].phase, BandHoverPhase::Enter);
+    assert_eq!(enter[0].region.id, "clock");
+    let origin = enter[0].origin.clone().expect("presented origin");
+    assert!(rt.band_origin_is_current(&origin));
+    rt.confirm_band_hover(&enter[0].region);
+    assert!(rt.hovered_band_region().is_some());
+
+    // A delivered enter is not re-fired by revalidation on later frames.
+    rt.revalidate_band_hover();
+    assert!(rt.drain_band_hovers().is_empty(), "no duplicate enter");
+    assert_eq!(rt.band_host_stats().hovers_denied, 0);
+
+    // Leaving still delivers exactly one leave.
+    rt.handle_cursor_moved(cell_pixels(&rt, row + 5, 0));
+    let leave = rt.drain_band_hovers();
+    assert_eq!(leave.len(), 1);
+    assert_eq!(leave[0].phase, BandHoverPhase::Leave);
+}
+
+#[test]
+fn abandoned_enter_owes_no_leave_and_reenters_on_motion() {
+    // A refused enter (no state the plugin ever heard about) is abandoned
+    // silently; the next motion starts a fresh hover instead of retrying or
+    // sending a leave the plugin never earned.
+    let mut rt = runtime_width(80);
+    let row = mount_top_version(&mut rt, waybar_band(), 1);
+    assert_eq!(hover_and_confirm(&mut rt, row, 39).len(), 1);
+    rt.abandon_band_hover();
+    assert!(rt.hovered_band_region().is_none());
+    assert!(
+        rt.drain_band_hovers().is_empty(),
+        "no leave is owed for an undelivered enter"
+    );
+    let again = hover_and_confirm(&mut rt, row, 39);
+    assert_eq!(again.len(), 1, "motion re-enters after an abandonment");
 }

@@ -37,6 +37,19 @@ use bitty_runtime::plugin_runtime::{
 
 const BAR_ID: &str = "bitty-terminal.bar";
 
+/// Harness wall budget for the pinned real bar.
+///
+/// RC-1 (50 ms) is calibrated for release builds. This test drives the
+/// pinned 4 000-line bar `init.lua` in a debug test build: ~4 ms on a fast
+/// host but 61-117 ms on a sharded Linux CI runner, measured on the fixed
+/// code (the audio reader is off the executor thread in both numbers).
+/// Widen only the wall dimension for this harness, the bitty#1744/#1727
+/// treatment: production keeps `RC1_WALL_CLOCK_BUDGET_MS`, budget
+/// enforcement stays pinned by `bitty-lua/tests/measurement_lua.rs` and
+/// `load_gate.rs`, and the reader-latency regression below injects a read
+/// (3 x 500 ms) that exceeds this headroom, so an inline read still fails.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
+
 #[derive(Default)]
 struct MapSettings(BTreeMap<String, LuaValue>);
 
@@ -141,9 +154,8 @@ fn three_group_runtime_with(sampled: Option<SampledSpawnFn>) -> (PluginRuntime, 
         settings: Rc::new(MapSettings(settings)),
         snapshot: Rc::new(StaticSnapshot),
     });
-    // Production budget: `RC1_WALL_CLOCK_BUDGET_MS` (50 ms). This test
-    // never calls `set_vm_wall_budget_ms`; the fixture harness in
-    // `plugin_device_audio_native` owns the widened-load variant.
+    // Debug-build harness headroom; see `HARNESS_WALL_BUDGET_MS`.
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     rt.set_workspace_source(Rc::new(ThreeWorkspaces));
     if let Some(spawn) = sampled {
         // Same off-thread shape as the live monitor, with a reader slow
@@ -155,7 +167,7 @@ fn three_group_runtime_with(sampled: Option<SampledSpawnFn>) -> (PluginRuntime, 
 }
 
 #[test]
-fn three_group_bar_plan_activates_and_mounts_inside_the_rc1_slice() {
+fn three_group_bar_plan_activates_and_mounts() {
     let (mut rt, data_dir) = three_group_runtime();
     let discovery = rt.discover();
     let bar = PluginId::new(BAR_ID).expect("id");
@@ -167,18 +179,16 @@ fn three_group_bar_plan_activates_and_mounts_inside_the_rc1_slice() {
     );
 
     let started = Instant::now();
-    let report = rt.activate(&bar).expect(
-        "three-group bar activates inside the production RC-1 slice \
-         (provider I/O must not run on the executor thread)",
-    );
+    let report = rt
+        .activate(&bar)
+        .expect("three-group bar activates and mounts");
     let elapsed = started.elapsed();
     assert_eq!(report.state, LifecycleState::Active);
     assert_eq!(report.commands, 12, "pinned bar command set");
     assert_eq!(report.events, 6, "pinned bar event set");
     assert!(
-        elapsed.as_millis() < u128::from(RC1_WALL_CLOCK_BUDGET_MS) * 4,
-        "activation took {elapsed:?}; a regression that re-inlines provider I/O \
-         lands in the hundreds of milliseconds"
+        elapsed.as_millis() < u128::from(HARNESS_WALL_BUDGET_MS),
+        "activation took {elapsed:?} and suspended or regressed past the harness bound"
     );
 
     // The band mounted: one `ui.rich` block on the bottom edge with the
@@ -202,12 +212,13 @@ fn three_group_bar_plan_activates_and_mounts_inside_the_rc1_slice() {
 #[test]
 fn three_group_bar_plan_never_waits_for_the_audio_monitor() {
     // Deterministic companion to the live test above: the injected reader
-    // takes 300 ms per spawn (900 ms per composed read), twenty times the
-    // production slice. Activation must not observe that time at all, so
-    // this fails on any implementation that reads providers inline even on
-    // a fast host where the real `pactl` happens to fit 50 ms.
+    // takes 500 ms per spawn (1.5 s per composed read), three times the
+    // harness headroom and thirty times the production slice. Activation
+    // must not observe that time at all, so this fails on any
+    // implementation that reads providers inline even on a fast host where
+    // the real `pactl` happens to fit 50 ms.
     let spawn: SampledSpawnFn = std::sync::Arc::new(|argv: &[String]| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let joined = argv.join(" ");
         if joined.contains("get-sink-volume") {
             Ok("Volume: front-left: 32768 / 50% / -18.06 dB\n".to_string())
@@ -224,9 +235,15 @@ fn three_group_bar_plan_never_waits_for_the_audio_monitor() {
     let (mut rt, data_dir) = three_group_runtime_with(Some(spawn));
     let bar = PluginId::new(BAR_ID).expect("id");
     rt.discover();
+    let started = Instant::now();
     let report = rt
         .activate(&bar)
         .expect("provider latency never enters the activation slice");
+    assert!(
+        started.elapsed().as_millis() < u128::from(HARNESS_WALL_BUDGET_MS),
+        "activation waited on the injected 1.5 s reader: {:?}",
+        started.elapsed()
+    );
     assert_eq!(report.state, LifecycleState::Active);
     assert_eq!(rt.ui_blocks().len(), 1, "band still mounts while warming");
     let _ = std::fs::remove_dir_all(&data_dir);

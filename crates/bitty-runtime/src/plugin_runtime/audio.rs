@@ -617,21 +617,18 @@ impl AudioMonitor {
 
     /// Monitor whose state reads are sampled off the executor thread.
     ///
-    /// The injected spawner runs on the sampling thread, so it must be
-    /// `Send + Sync` (the inline [`SpawnFn`] is `Rc`-based and stays on the
-    /// executor thread). Test-only: it installs no inline spawner, so the
-    /// control verbs answer unavailable. Production enters through
-    /// [`Self::live`].
-    fn sampled(spawn: SampledSpawnFn) -> Self {
+    /// The sampled spawner runs on the sampler thread, so it must be
+    /// `Send + Sync`; `inline` is the executor-thread spawner (control verbs
+    /// and any future inline path). Test-only: production enters through
+    /// [`Self::live`]. Tests pass the same slow reader for both so a
+    /// regression that moves the state read back onto the executor thread
+    /// blocks instead of silently succeeding.
+    fn sampled(spawn: SampledSpawnFn, inline: SpawnFn) -> Self {
         Self {
             spectrum_gate: SpectrumGate::new(),
             state_gate: StateGate::new(),
             control_gate: ControlGate::new(),
-            spawn: Rc::new(|_: &[String]| {
-                Err(AudioError::unavailable(
-                    "sampled monitor has no inline reader",
-                ))
-            }),
+            spawn: inline,
             sampled: Some(SampledReads::new(spawn)),
         }
     }
@@ -894,8 +891,13 @@ impl AudioHost {
     /// (bitty#2425) without touching a real `pactl`.
     #[must_use]
     pub fn sampled_for_test(spawn: SampledSpawnFn, initial_now_ms: u64) -> Self {
+        // Mirror the reader into the inline slot: if a regression moves the
+        // state read back onto the executor thread, the injected latency is
+        // paid there and the activation budget catches it.
+        let inline_source = std::sync::Arc::clone(&spawn);
+        let inline: SpawnFn = Rc::new(move |argv: &[String]| inline_source(argv));
         Self {
-            monitor: AudioMonitor::sampled(spawn),
+            monitor: AudioMonitor::sampled(spawn, inline),
             start: Instant::now(),
             manual_now_ms: Some(initial_now_ms),
         }
@@ -1133,7 +1135,7 @@ mod tests {
                 Err(AudioError::unavailable("unexpected argv in fixture"))
             }
         });
-        let mut monitor = AudioMonitor::sampled(spawn);
+        let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
         let started = std::time::Instant::now();
         let first = monitor.get(0, true);
         assert!(
@@ -1185,7 +1187,7 @@ mod tests {
                 Err(AudioError::unavailable("unexpected argv in fixture"))
             }
         });
-        let mut monitor = AudioMonitor::sampled(spawn);
+        let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
         // First poll requests one read (three spawns) and hides.
         let _ = monitor.get(1000, true);
         std::thread::sleep(std::time::Duration::from_millis(100));

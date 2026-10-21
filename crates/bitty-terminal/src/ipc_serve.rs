@@ -1,43 +1,42 @@
-//! `BITTY_SOCKET` servo (CTX-0144, Issue #236).
+//! Terminal-instance IPC servo (CTX-0144, issue #236; Windows transport
+//! CTX-1405, issues #2244/#2243).
 //!
-//! Thin Unix-socket front-end over [`bitty_ipc::devtools`]: binds the socket
-//! the devtools protocol clients (the `devtools` Lua plugin) expect, accepts connections on a background thread, and
-//! dispatches the handshake plus the minimal read-only round-trip (`ping`,
-//! `getSnapshot`). Full introspection is CTX-0159, which registers new
-//! `bitty.debug/*` handlers on the shared [`bitty_ipc::devtools::Dispatcher`]
-//! without touching this file's lifecycle.
+//! Thin front-end over [`bitty_ipc::devtools`] for the two local transports:
+//! a Unix socket under `$XDG_RUNTIME_DIR/bitty` (mode `0700`/`0600`, peer
+//! UID) and a Windows named pipe `\\.\pipe\bitty-<instance>` (protected
+//! current-user DACL, client token SID comparison). Both paths accept on a
+//! background thread and register the same dispatcher, so the version
+//! handshake, `ping`/`getSnapshot`, devtools inspection (`debug.inspect`),
+//! bounded framing, continuation reassembly, `RC-9` budget, and the
+//! 16-connection cap are identical.
 //!
 //! # Fail-soft contract
 //!
-//! Socket failure must never crash the terminal: every setup error disables
+//! Transport failure must never crash the terminal: every setup error disables
 //! serving with one stderr line and the terminal continues normally. Stale
-//! socket files from dead instances are reclaimed after a live check; a live
-//! peer keeps its socket (no stealing). Directory and socket modes are
-//! `0700`/`0600` with owner and endpoint checks kept separate from peer proof.
-//! Normal Unix serving is disabled unless the accepted-stream platform seam
-//! can attest identity; per-connection `RC-9` rate limits and the 16-connection
-//! cap remain bounded.
+//! Unix socket files from dead instances are reclaimed after a live check; a
+//! live peer keeps its socket (no stealing). A Windows pipe has no filesystem
+//! object to reclaim: the kernel removes it when the last handle closes, and
+//! `FILE_FLAG_FIRST_PIPE_INSTANCE` refuses to share a live name. Endpoint
+//! ownership/mode checks stay separate from peer proof on Unix; the Windows
+//! pipe attests owner/DACL at creation and re-checks the client SID per
+//! connection. There is no TCP listener and no allow-all fallback.
 //!
 //! # Platform
 //!
-//! Unix only. Other platforms get a disabled guard (same fail-soft shape, no
-//! behavior fabricated).
-//!
-//! Windows degradation (issue #1800): no named-pipe transport exists yet, so
-//! Windows serving stays disabled with one actionable stderr line and the
-//! terminal continues normally. The disabled guard carries no failure reason,
-//! so `--fail-loud` never turns this platform shape into a fatal exit;
-//! `bitty ctl` IPC verbs report unavailable (exit 6) and `bitty list
-//! instances` reports discovery only until a pipe transport lands.
+//! Unix and Windows serve; other platforms get the documented disabled guard
+//! (no behavior fabricated). A genuine bind/attest failure on a serving
+//! platform carries a failure reason so `--fail-loud` can abort.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(any(unix, windows))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
 
 /// Static server facts handed to the servo at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +69,7 @@ pub struct IpcServeGuard {
     /// Shutdown flag for the accept loop.
     shutdown: Arc<AtomicBool>,
     /// Accept-loop thread (joined on drop).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -103,7 +102,7 @@ impl IpcServeGuard {
             socket_path: String::new(),
             failure_reason: None,
             shutdown: Arc::new(AtomicBool::new(true)),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             handle: None,
         }
     }
@@ -127,27 +126,18 @@ impl IpcServeGuard {
 /// Shared production constructor so the degraded shape is built in exactly
 /// one place: disabled, no socket path, and no failure reason (the
 /// fail-soft warning path is the documented behavior there, and
-/// `--fail-loud` never aborts it).
+/// `--fail-loud` never aborts it). Windows now serves a real pipe, so the
+/// constructor is reachable there only from the shared test.
+#[allow(dead_code)]
 fn degraded_guard() -> IpcServeGuard {
     IpcServeGuard {
         enabled: false,
         socket_path: String::new(),
         failure_reason: None,
         shutdown: Arc::new(AtomicBool::new(true)),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         handle: None,
     }
-}
-
-/// Windows degradation reason (issue #1800, tested on all platforms).
-///
-/// Names the missing named-pipe future and the CLI consequence so the
-/// one-line stderr warning is detect-and-advise, not a bare
-/// unavailable notice. Kept alive on Unix builds for the Windows
-/// `-D warnings` cross-check and the all-platform unit tests.
-#[allow(dead_code)]
-pub(crate) fn windows_ipc_unavailable_reason() -> &'static str {
-    "ipc socket serving is unavailable on Windows (named-pipe transport not yet implemented; continuing without IPC: `bitty ctl` IPC verbs report unavailable (exit 6), `bitty list instances` reports discovery only)"
 }
 
 /// Non-Windows, non-Unix degradation reason (same fail-soft shape).
@@ -162,11 +152,59 @@ pub(crate) fn generic_ipc_unavailable_reason() -> &'static str {
 impl Drop for IpcServeGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
+}
+
+/// Advisory resolver input used by the production serve entry point.
+///
+/// Under `cfg(test)` a single test may substitute an explicit `SocketEnv`
+/// through `serve_in_background_for_tests`; production always reads the
+/// process environment. The override is a test seam, not a credential: the
+/// pipe/socket still attests its endpoint and every peer.
+fn socket_env_for_serve() -> bitty_ipc::devtools::SocketEnv {
+    #[cfg(all(test, windows))]
+    {
+        if let Ok(guard) = TEST_SOCKET_ENV.lock() {
+            if let Some(env) = guard.as_ref() {
+                return env.clone();
+            }
+        }
+    }
+    bitty_ipc::devtools::SocketEnv::from_process_env()
+}
+
+#[cfg(all(test, windows))]
+static TEST_SOCKET_ENV: Mutex<Option<bitty_ipc::devtools::SocketEnv>> = Mutex::new(None);
+
+/// Run the production [`serve_in_background`] entry with an explicit
+/// advisory environment (test-only).
+///
+/// The serial guard keeps the process-global override scoped to one test;
+/// the override is cleared before the guard is returned, so the accept loop
+/// and every connection use only the resolved endpoint. This lets the
+/// Windows servo test assert the production entry point itself, so replacing
+/// its Windows arm with `degraded_guard()` fails the named test.
+#[cfg(all(test, windows))]
+pub(crate) fn serve_in_background_for_tests(
+    descriptor: ServerDescriptor,
+    env: bitty_ipc::devtools::SocketEnv,
+) -> IpcServeGuard {
+    static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+    let _serial = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *TEST_SOCKET_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env);
+    let guard = serve_in_background(descriptor);
+    *TEST_SOCKET_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    guard
 }
 
 /// Serve `BITTY_SOCKET` on a background thread (fail-soft).
@@ -180,17 +218,11 @@ impl Drop for IpcServeGuard {
 pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     #[cfg(unix)]
     {
-        unix_serve(
-            descriptor,
-            &bitty_ipc::devtools::SocketEnv::from_process_env(),
-        )
+        unix_serve(descriptor, &socket_env_for_serve())
     }
     #[cfg(windows)]
     {
-        let _ = descriptor;
-        let reason = windows_ipc_unavailable_reason();
-        crate::logging::warn(|| format!("bitty: {reason}"));
-        degraded_guard()
+        windows_serve(descriptor, &socket_env_for_serve())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -214,8 +246,8 @@ fn handle_panel_list(
     request: &bitty_ipc::devtools::DevtoolsRequest,
 ) -> Result<String, bitty_ipc::devtools::HandlerError> {
     // Use the re-exported wire name on all targets so the Windows
-    // `-D warnings` cross-check sees the import as used (the Unix-only
-    // registration below is cfg-gated).
+    // `-D warnings` cross-check sees the import as used; the shared
+    // `build_dispatcher` registers this handler for both transports.
     debug_assert_eq!(request.method, crate::ctl::METHOD_LIST_PANELS);
     let reply = if context.authority_required() {
         let Some(grant) = context.connection_grant() else {
@@ -254,6 +286,32 @@ fn handle_panel_list(
     }
 }
 
+/// Build the dispatcher shared by the Unix and Windows serve paths.
+///
+/// CTX-0506: test mode registers the E2E surface (`testInfo`, `testExit`);
+/// normal instances keep the default table. Issue #1520: the consent/revoke
+/// surface registers on both tables (additive-only; no existing method
+/// changes). CTX-1117 (issue #1900): the panel list surface registers
+/// additively with the same `handle_control` queue semantics.
+fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
+    let mut dispatcher = if test_mode {
+        bitty_ipc::devtools::Dispatcher::with_test_mode()
+    } else {
+        bitty_ipc::devtools::Dispatcher::with_defaults()
+    };
+    if let Err(err) = crate::consent::register_consent_methods(&mut dispatcher) {
+        crate::logging::warn(|| {
+            format!("bitty: consent methods unavailable: {err} (serving without them)")
+        });
+    }
+    if let Err(err) = dispatcher.register(crate::ctl::METHOD_LIST_PANELS, handle_panel_list) {
+        crate::logging::warn(|| {
+            format!("bitty: panel list unavailable: {err} (serving without it)")
+        });
+    }
+    Arc::new(dispatcher)
+}
+
 /// Unix serving path: resolve, prepare, reclaim, bind, attest, spawn.
 /// `env` is the advisory resolution input, passed explicitly so tests can
 /// cover the enabled path without mutating process-global state.
@@ -267,29 +325,7 @@ fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv
     }
     match try_listen(env) {
         Ok(listen) => {
-            // CTX-0506: test mode registers the E2E surface (`testInfo`,
-            // `testExit`); normal instances keep the default table.
-            // Issue #1520: the consent/revoke surface registers on both
-            // tables (additive-only; no existing method changes).
-            let mut dispatcher = if descriptor.test_mode {
-                bitty_ipc::devtools::Dispatcher::with_test_mode()
-            } else {
-                bitty_ipc::devtools::Dispatcher::with_defaults()
-            };
-            if let Err(err) = crate::consent::register_consent_methods(&mut dispatcher) {
-                crate::logging::warn(|| {
-                    format!("bitty: consent methods unavailable: {err} (serving without them)")
-                });
-            }
-            // CTX-1117 (issue #1900): additive panel list surface (same
-            // `handle_control` queue semantics as every other IPC verb).
-            if let Err(err) = dispatcher.register(crate::ctl::METHOD_LIST_PANELS, handle_panel_list)
-            {
-                crate::logging::warn(|| {
-                    format!("bitty: panel list unavailable: {err} (serving without it)")
-                });
-            }
-            let dispatcher = Arc::new(dispatcher);
+            let dispatcher = build_dispatcher(descriptor.test_mode);
             let server = bitty_ipc::devtools::ServerInfo::new(
                 listen.instance,
                 listen.socket_path.clone(),
@@ -335,6 +371,221 @@ fn unix_serve(descriptor: ServerDescriptor, env: &bitty_ipc::devtools::SocketEnv
     }
 }
 
+/// Windows serving path: resolve the instance-derived pipe, bind with a
+/// current-user-only DACL, and spawn the accept loop (CTX-1405, #2244).
+///
+/// A genuine pipe failure is reported with a failure reason (so
+/// `--fail-loud` can abort); there is no allow-all or TCP fallback.
+#[cfg(windows)]
+fn windows_serve(
+    descriptor: ServerDescriptor,
+    env: &bitty_ipc::devtools::SocketEnv,
+) -> IpcServeGuard {
+    match try_windows_listen(env) {
+        Ok(listen) => {
+            let dispatcher = build_dispatcher(descriptor.test_mode);
+            let server = bitty_ipc::devtools::ServerInfo::new(
+                listen.instance,
+                listen.pipe_path.clone(),
+                descriptor.cols,
+                descriptor.rows,
+            );
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let active = Arc::new(AtomicUsize::new(0));
+            let services = ConnectionServices::from_process_env();
+            let handle = std::thread::spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let active = Arc::clone(&active);
+                move || {
+                    windows_accept_loop(
+                        listen.listener,
+                        dispatcher,
+                        server,
+                        shutdown,
+                        active,
+                        services,
+                    );
+                }
+            });
+            IpcServeGuard {
+                enabled: true,
+                socket_path: listen.pipe_path,
+                failure_reason: None,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+        Err(reason) => {
+            crate::logging::warn(|| format!("bitty: ipc disabled (fail-soft): {reason}"));
+            IpcServeGuard {
+                enabled: false,
+                socket_path: String::new(),
+                failure_reason: Some(reason),
+                shutdown: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            }
+        }
+    }
+}
+
+/// Bound Windows pipe listener plus the instance identity it serves.
+#[cfg(windows)]
+struct WindowsBoundListener {
+    /// Attested listener with a current-user-only DACL.
+    listener: bitty_ipc::winpipe::PipeListener,
+    /// Pipe path served (`\\.\pipe\bitty-<instance>` by default).
+    pipe_path: String,
+    /// Instance identity derived from `BITTY_INSTANCE_ID`.
+    instance: String,
+}
+
+/// Resolve and bind the Windows instance pipe. Fail-soft: every failure is a
+/// reason string, never a panic or an unauthenticated transport.
+#[cfg(windows)]
+fn try_windows_listen(
+    env: &bitty_ipc::devtools::SocketEnv,
+) -> Result<WindowsBoundListener, String> {
+    let (pipe_path, instance) = bitty_ipc::devtools::resolve_windows_pipe_path_from_env(env)
+        .map_err(|err| format!("pipe path unavailable: {err}"))?;
+    let max_connections = u32::try_from(bitty_ipc::devtools::max_connections()).unwrap_or(16);
+    let listener = bitty_ipc::devtools::bind_windows_pipe_listener(&pipe_path, max_connections)
+        .map_err(|err| format!("{err}"))?;
+    Ok(WindowsBoundListener {
+        listener,
+        pipe_path,
+        instance,
+    })
+}
+
+/// Accept loop for the Windows pipe transport.
+///
+/// Mirrors the Unix loop: shed past the RC-9 connection cap (newest first) and
+/// hand each accepted pipe to a bounded handler thread. A connect error is
+/// fatal for the listener (the pending instance is gone), so the loop stops
+/// and the servo reports no further serving.
+#[cfg(windows)]
+fn windows_accept_loop(
+    mut listener: bitty_ipc::winpipe::PipeListener,
+    dispatcher: Arc<bitty_ipc::devtools::Dispatcher>,
+    server: bitty_ipc::devtools::ServerInfo,
+    shutdown: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+    services: ConnectionServices,
+) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept(&shutdown) {
+            Ok(connection) => {
+                if !reserve_connection_slot(&active) {
+                    crate::logging::warn(|| {
+                        String::from("bitty: ipc connection shed (at RC-9 cap, newest first)")
+                    });
+                    drop(connection);
+                    continue;
+                }
+                let dispatcher = Arc::clone(&dispatcher);
+                let server = server.clone();
+                let worker_active = Arc::clone(&active);
+                let services = services.clone();
+                let spawned = spawn_connection_worker(&active, || {
+                    std::thread::Builder::new()
+                        .name("bitty-ipc-connection".into())
+                        .spawn(move || {
+                            let _counted = ActiveCount::new(worker_active);
+                            windows_serve_stream(connection, &dispatcher, &server, &services);
+                        })
+                });
+                if let Err(err) = spawned {
+                    crate::logging::warn(|| format!("bitty: ipc worker unavailable: {err}"));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => break,
+            Err(err) => {
+                crate::logging::warn(|| format!("bitty: ipc accept error: {err}"));
+                break;
+            }
+        }
+    }
+}
+
+/// Serve one accepted Windows pipe connection with the same peer-proof,
+/// authority, budget, framing, and timeout sequence as the Unix path.
+#[cfg(windows)]
+fn windows_serve_stream(
+    mut connection: bitty_ipc::winpipe::PipeConnection,
+    dispatcher: &bitty_ipc::devtools::Dispatcher,
+    server: &bitty_ipc::devtools::ServerInfo,
+    services: &ConnectionServices,
+) {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    connection.set_read_timeout(Some(Duration::from_secs(
+        bitty_ipc::devtools::CONN_IDLE_TIMEOUT_SECS,
+    )));
+    connection.set_write_timeout(Some(Duration::from_secs(
+        bitty_ipc::devtools::CONN_WRITE_TIMEOUT_SECS,
+    )));
+    let capabilities = bitty_ipc::ctl::TerminalCapabilities::from_scopes(&services.granted);
+    let grant = match services
+        .authority
+        .open_connection(services.granted.clone(), capabilities)
+    {
+        Ok(grant) => grant,
+        Err(err) => {
+            crate::logging::warn(|| format!("bitty: ipc connection authority rejected: {err}"));
+            return;
+        }
+    };
+    let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(server, grant);
+    let proof = match context.bind_connected_pipe(&connection) {
+        Ok(proof) => proof,
+        Err(err) => {
+            crate::logging::warn(|| {
+                format!("bitty: ipc connection rejected (peer attestation): {err}")
+            });
+            return;
+        }
+    };
+    context.attest_local_peer(&proof.identity());
+    let clock = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    };
+    let result = bitty_ipc::devtools::serve_bound_pipe_connection_with_endpoint_budget(
+        &mut connection,
+        &proof,
+        dispatcher,
+        &context,
+        &services.endpoint_limiter,
+        &clock,
+    );
+    context.close_connection();
+    log_connection_result(result);
+}
+
+/// Log one served connection's close summary (shared by both transports).
+#[cfg(any(unix, windows))]
+fn log_connection_result(
+    result: Result<bitty_ipc::devtools::ConnectionStats, bitty_ipc::IpcError>,
+) {
+    match result {
+        Ok(stats) => {
+            if stats.denied > 0 || stats.framing_errors > 0 {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: ipc connection closed (requests={} denied={} framing_errors={})",
+                        stats.requests, stats.denied, stats.framing_errors
+                    )
+                });
+            }
+        }
+        Err(err) => {
+            crate::logging::warn(|| format!("bitty: ipc connection rejected: {err}"));
+        }
+    }
+}
+
 /// Bound listener plus the attested identity to serve as.
 #[cfg(unix)]
 struct BoundListener {
@@ -353,7 +604,7 @@ struct BoundListener {
 /// Built once per listener, never per connection: the authority mints one
 /// principal/session per accepted stream (#1403), and the endpoint limiter is
 /// the aggregate RC-9 budget every connection draws from (#1404).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone)]
 struct ConnectionServices {
     /// Mints and revokes one principal/session per accepted connection.
@@ -367,7 +618,7 @@ struct ConnectionServices {
     granted: bitty_ipc::ScopeSet,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ConnectionServices {
     fn from_process_env() -> Self {
         Self {
@@ -550,7 +801,7 @@ fn try_listen(env: &bitty_ipc::devtools::SocketEnv) -> Result<BoundListener, Str
 /// when the worker thread cannot be created (CTX-0792, #1404): a spawn failure
 /// must never leak the active count or leave the accept loop in a false
 /// serving state.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_connection_worker<F>(
     active: &AtomicUsize,
     spawn: F,
@@ -638,7 +889,7 @@ fn accept_loop(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reserve_connection_slot(active: &AtomicUsize) -> bool {
     let mut current = active.load(Ordering::SeqCst);
     loop {
@@ -666,13 +917,13 @@ fn normalize_accepted_stream(stream: &std::os::unix::net::UnixStream) -> std::io
 }
 
 /// RAII decrement for the active-connection counter.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ActiveCount {
     /// Counter to decrement on drop.
     active: Arc<AtomicUsize>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ActiveCount {
     /// Hold one active-connection slot.
     fn new(active: Arc<AtomicUsize>) -> Self {
@@ -680,7 +931,7 @@ impl ActiveCount {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for ActiveCount {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
@@ -784,21 +1035,7 @@ fn serve_stream(
     // bearer bound to it before the worker exits (the context's `Drop` does
     // the same on an unwinding path).
     context.close_connection();
-    match result {
-        Ok(stats) => {
-            if stats.denied > 0 || stats.framing_errors > 0 {
-                crate::logging::warn(|| {
-                    format!(
-                        "bitty: ipc connection closed (requests={} denied={} framing_errors={})",
-                        stats.requests, stats.denied, stats.framing_errors
-                    )
-                });
-            }
-        }
-        Err(err) => {
-            crate::logging::warn(|| format!("bitty: ipc connection rejected: {err}"));
-        }
-    }
+    log_connection_result(result);
 }
 
 #[cfg(test)]
@@ -812,7 +1049,7 @@ mod tests {
             socket_path: "/tmp/bitty-test.sock".to_string(),
             failure_reason: None,
             shutdown: Arc::new(AtomicBool::new(false)),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             handle: None,
         };
         assert!(guard.is_enabled());
@@ -845,23 +1082,9 @@ mod tests {
     }
 
     #[test]
-    fn windows_degradation_reason_is_actionable() {
-        // Issue #1800 detect-and-advise: the Windows warning names the
-        // missing named-pipe future and the CLI consequence (exit 6
-        // verbs, discovery-only list) instead of a bare unavailable note.
-        let reason = windows_ipc_unavailable_reason();
-        assert!(
-            reason.contains("named-pipe"),
-            "Windows reason must name the pipe future: {reason:?}"
-        );
-        assert!(
-            reason.contains("continuing without IPC"),
-            "Windows reason must state fail-soft: {reason:?}"
-        );
-        assert!(
-            reason.contains("exit 6"),
-            "Windows reason must name the ctl consequence: {reason:?}"
-        );
+    fn generic_degradation_reason_is_actionable() {
+        // Non-Unix/non-Windows platforms keep the documented fail-soft
+        // warning shape; Windows now serves a real named pipe.
         let generic = generic_ipc_unavailable_reason();
         assert!(
             generic.contains("continuing without IPC"),
@@ -873,11 +1096,12 @@ mod tests {
         );
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn degraded_platform_serves_nothing_with_no_failure_reason() {
-        // Runs on the Windows CI leg: serving stays disabled with an empty
-        // path and no failure reason, so `--fail-loud` stays non-fatal.
+        // Runs only on platforms with no transport: serving stays disabled
+        // with an empty path and no failure reason, so `--fail-loud` stays
+        // non-fatal there.
         let guard = serve_in_background(ServerDescriptor {
             cols: 80,
             rows: 24,
@@ -886,6 +1110,76 @@ mod tests {
         assert!(!guard.is_enabled());
         assert!(guard.socket_path().is_empty());
         assert_eq!(guard.failure_reason(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_named_pipe_serves_ctl_roundtrip() {
+        // Mutation target (#2244): this calls the production
+        // `serve_in_background` entry point through a test-only advisory-env
+        // seam. Replacing its Windows arm with `degraded_guard()` makes the
+        // guard disabled and this test fail before the round-trip.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let instance = format!(
+            "test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let env = bitty_ipc::devtools::SocketEnv {
+            bitty_socket: None,
+            xdg_runtime_dir: None,
+            instance_id: Some(instance.clone()),
+        };
+        let guard = serve_in_background_for_tests(
+            ServerDescriptor {
+                cols: 80,
+                rows: 24,
+                test_mode: false,
+            },
+            env,
+        );
+        assert!(
+            guard.is_enabled(),
+            "Windows pipe servo must serve: {:?}",
+            guard.failure_reason()
+        );
+        let pipe = bitty_ipc::devtools::windows_pipe_name(&instance);
+        assert_eq!(guard.socket_path(), pipe, "path derives from instance");
+        let outcome = crate::ctl::ctl_roundtrip(&pipe, "bitty.debug/ping", None, 0)
+            .expect("ctl round-trip over the named pipe");
+        assert!(outcome.ok, "ping failed: {:?}", outcome.message);
+        assert!(
+            outcome.result_json.contains("\"ok\":true"),
+            "ping result: {}",
+            outcome.result_json
+        );
+        // Issue #2243: the inspection surface is reachable over the same
+        // pipe and stays behind its debug scope. With no elevation in the
+        // environment, `debug.inspect` is denied with a typed error (skip
+        // the negative assertion if the test host exported an allowlist).
+        let denied = crate::ctl::ctl_roundtrip(&pipe, "bitty.debug/getGridText", None, 0)
+            .expect("inspection round-trip over the named pipe");
+        if std::env::var_os("BITTY_CTL_ELEVATE").is_none() {
+            assert!(!denied.ok, "ungranted inspection must be denied");
+            assert_eq!(denied.category, "scope");
+            assert_eq!(denied.code, "ScopeDenied");
+        }
+        drop(guard);
+        // No listening orphan after shutdown. The name disappears once the
+        // last handle closes (NotFound); a worker still winding down leaves a
+        // connected instance that cannot accept (busy/TimedOut). Either way a
+        // new client must not connect to a fresh listener.
+        let err = bitty_ipc::winpipe::connect(&pipe, std::time::Duration::from_millis(200))
+            .expect_err("no listener may remain after guard drop");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected post-shutdown connect error: {err:?}"
+        );
     }
 
     #[cfg(any(

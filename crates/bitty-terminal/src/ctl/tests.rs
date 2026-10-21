@@ -627,6 +627,7 @@ fn registry_ids_are_stable() {
     assert_eq!(CtlRequest::ConfigReload.registry_id(), "core.config.reload");
 }
 
+#[cfg(unix)]
 #[test]
 fn target_resolution_prefers_explicit_socket() {
     let targeting = CtlTargeting {
@@ -643,6 +644,55 @@ fn target_resolution_prefers_explicit_socket() {
     )
     .expect("must resolve");
     assert_eq!(t.socket_path, "/tmp/a.sock");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_target_resolution_prefers_explicit_pipe() {
+    // CTX-1405 (#2244): an explicit pipe path wins over the environment,
+    // and it must be a pipe device path (a filesystem socket is refused).
+    let pipe = bitty_ipc::devtools::windows_pipe_name("alpha");
+    let targeting = CtlTargeting {
+        socket: Some(pipe.clone()),
+        instance: None,
+        format: CtlFormat::Table,
+    };
+    let t = resolve_ctl_target(
+        &targeting,
+        Some(&bitty_ipc::devtools::windows_pipe_name("other")),
+        Some("other"),
+        None,
+        0,
+    )
+    .expect("explicit pipe must resolve");
+    assert_eq!(t.socket_path, pipe);
+    assert_eq!(t.instance, "alpha");
+
+    let targeting = CtlTargeting {
+        socket: Some(String::from("/tmp/a.sock")),
+        instance: None,
+        format: CtlFormat::Table,
+    };
+    assert!(
+        resolve_ctl_target(&targeting, None, None, None, 0).is_err(),
+        "filesystem socket override must fail closed on Windows"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_target_resolution_derives_from_instance() {
+    let targeting = CtlTargeting {
+        socket: None,
+        instance: Some(String::from("alpha-1")),
+        format: CtlFormat::Table,
+    };
+    let t = resolve_ctl_target(&targeting, None, None, None, 0).expect("instance must resolve");
+    assert_eq!(
+        t.socket_path,
+        bitty_ipc::devtools::windows_pipe_name("alpha-1")
+    );
+    assert_eq!(t.instance, "alpha-1");
 }
 
 #[test]
@@ -1806,17 +1856,21 @@ fn control_help_names_exact_elevation_verbs() {
 }
 
 #[test]
-fn control_help_documents_windows_degradation() {
-    // Issue #1800: `bitty ctl --help` must state the documented
-    // degradation so Windows users learn the exit-6 shape up front.
+fn control_help_documents_windows_pipe_transport() {
+    // CTX-1405 (#2244): `bitty ctl --help` must describe the real Windows
+    // pipe transport and keep `instance list` discovery-only.
     let help = ctl_help_text();
     assert!(
-        help.contains("Windows serving is unavailable"),
-        "help must name the Windows degradation, got {help:?}"
+        help.contains("Windows uses the instance-derived"),
+        "help must name the Windows pipe transport, got {help:?}"
     );
     assert!(
-        help.contains("named-pipe transport"),
-        "help must name the missing transport, got {help:?}"
+        help.contains("current-user ACL plus SID"),
+        "help must name the Windows identity check, got {help:?}"
+    );
+    assert!(
+        !help.contains("Windows serving is unavailable"),
+        "help must not keep the retired degradation, got {help:?}"
     );
     assert!(
         help.contains("instance list") && help.contains("local discovery"),
@@ -1824,7 +1878,7 @@ fn control_help_documents_windows_degradation() {
     );
     assert!(
         help.contains("no live instance"),
-        "help must distinguish the no-target Windows case, got {help:?}"
+        "help must distinguish the no-target case, got {help:?}"
     );
 }
 
@@ -1850,35 +1904,25 @@ fn control_help_documents_send_quoting() {
 }
 
 #[test]
-fn windows_ctl_degradation_message_is_actionable() {
-    // Issue #1800 detect-and-advise, tested on every platform: the
-    // Windows message names the missing transport and the surviving
-    // discovery verb; the generic message stays fail-soft.
-    let windows = super::client::windows_ctl_unavailable_message();
-    assert!(
-        windows.contains("unavailable on Windows"),
-        "Windows ctl message must name the platform: {windows:?}"
-    );
-    assert!(
-        windows.contains("named-pipe"),
-        "Windows ctl message must name the pipe future: {windows:?}"
-    );
-    assert!(
-        windows.contains("instance list"),
-        "Windows ctl message must keep discovery advice: {windows:?}"
-    );
+fn generic_ctl_degradation_message_is_actionable() {
+    // Platforms with no local transport keep the fail-soft message; Windows
+    // now has a real named-pipe client (CTX-1405/#2244).
     let generic = super::client::generic_ctl_unavailable_message();
     assert!(
         generic.contains("unavailable on this platform"),
         "generic ctl message must stay fail-soft: {generic:?}"
     );
+    assert!(
+        generic.contains("instance list"),
+        "generic ctl message must keep discovery advice: {generic:?}"
+    );
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[test]
 fn degraded_platform_ctl_roundtrip_reports_unavailable() {
-    // Runs on the Windows CI leg: every IPC verb fails closed with the
-    // documented degradation text (exit 6 at the caller).
+    // Runs only on platforms with no local transport: every IPC verb fails
+    // closed with the documented degradation text (exit 6 at the caller).
     let err = super::client::ctl_roundtrip("unused", "bitty.debug/ping", None, 0)
         .expect_err("degraded platform never round-trips");
     assert!(

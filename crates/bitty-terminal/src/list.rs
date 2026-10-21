@@ -23,10 +23,9 @@
 //!   parent) and probes each socket with a `connect`; Windows scans the same
 //!   registry inputs for `<instance>.sock` markers and probes each
 //!   `\\.\pipe\bitty-<instance>` named pipe, merging live pipe-namespace
-//!   enumeration (CTX-0196). Issue #1800: Windows serving is unavailable
-//!   until a named-pipe transport lands, so those probes report stale/empty
-//!   until then; the discovery code stays ready and tested. Only discovery
-//!   metadata is reported
+//!   enumeration (CTX-0196, transport since CTX-1405/#2244). A probe verifies
+//!   the serving process token SID before reporting live, so a foreign-owner
+//!   pipe is never listed. Only discovery metadata is reported
 //! - `--format table` (default) is human output, not a machine contract.
 //!   `--format json` / `--format jsonl` emit the versioned envelope (`v: 1`,
 //!   `command: "list"|"ls"`, `ok`, `result`, plus `error` on failure) on
@@ -376,9 +375,9 @@ pub fn list_help_text(invoked_as: &str) -> String {
                        Unix scans the socket directory and probes each socket with a connect;\n  \
                        Windows scans the instance registry and probes each named pipe, plus\n  \
                        live pipe-namespace enumeration; every platform reports discovery\n  \
-                       metadata only. Windows serving is unavailable until a named-pipe\n  \
-                       transport lands (issue #1800), so Windows rows report stale/empty\n  \
-                       until then. Terminal content is never fetched;\n  \
+                       metadata only. Windows serves the same instance-derived named pipe\n  \
+                       (CTX-1405) and probes verify the serving process identity before a\n  \
+                       row reports live. Terminal content is never fetched;\n  \
                        detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
                        respected by not reading privileged data here).\n  \
            actions    Machine-readable action catalog for users and doc tooling\n  \
@@ -1378,21 +1377,22 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
         .to_ascii_lowercase()
 }
 
-/// Probe one Windows named pipe with a bidirectional open (CTX-0196).
+/// Bounded wait for a free pipe instance during discovery probes.
+#[cfg(windows)]
+const WINDOWS_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Probe one Windows named pipe with a bounded authenticated open (CTX-0196,
+/// transport CTX-1405/#2244).
 ///
-/// Safe-`std` only (no `unsafe` in this crate): a pipe with a listening
-/// server opens; a missing pipe fails `NotFound` (stale registry entry); a
-/// present-but-inaccessible pipe fails `PermissionDenied`. The open never
-/// blocks: with no waiting listener the OS fails fast, mirroring the
-/// fail-fast Unix `connect` probe. The serving side must expose duplex pipes
-/// named `\\.\pipe\bitty-<instance>` for this probe to report `live`.
+/// The probe uses the shared pipe client, which verifies the serving process
+/// token SID against the current user before reporting success; a foreign
+/// server the ACL let us reach is still not `live`. A missing pipe fails
+/// `NotFound` (stale registry entry); a present-but-inaccessible pipe fails
+/// `PermissionDenied`; a busy pipe waits at most 50 ms. The connect never
+/// blocks unboundedly, mirroring the fail-fast Unix probe.
 #[cfg(windows)]
 fn probe_windows_pipe(pipe_path: &str) -> (bool, String) {
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_path)
-    {
+    match bitty_ipc::winpipe::connect(pipe_path, WINDOWS_PROBE_WAIT) {
         Ok(_) => (true, "live".to_string()),
         Err(err) => {
             let detail = match err.kind() {
@@ -1400,6 +1400,7 @@ fn probe_windows_pipe(pipe_path: &str) -> (bool, String) {
                 std::io::ErrorKind::PermissionDenied => {
                     "unreachable: permission denied".to_string()
                 }
+                std::io::ErrorKind::TimedOut => "unreachable: pipe busy".to_string(),
                 _ => format!("unreachable: {}", short_io_kind(err.kind())),
             };
             (false, detail)
@@ -1434,8 +1435,10 @@ fn windows_explicit_instance_label(pipe_path: &str) -> String {
 /// liveness. Sorted by socket and capped at [`MAX_LIST_INSTANCES`] with the
 /// shed count folded into the last row's `detail` (same bound shape as the
 /// directory scan).
-pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
-    let mut rows: Vec<InstanceInfo> = pipe_names
+/// Map bare pipe-namespace names to candidate rows without applying the list
+/// cap, so ownership probing filters before the bound is spent.
+fn pipe_namespace_candidates(pipe_names: &[String]) -> Vec<InstanceInfo> {
+    pipe_names
         .iter()
         .filter_map(|name| {
             let instance = bitty_ipc::devtools::windows_instance_from_pipe_name(name)?;
@@ -1447,7 +1450,12 @@ pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
                 detail: "live".to_string(),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Sort rows by endpoint and truncate past [`MAX_LIST_INSTANCES`], folding the
+/// shed count into the last surviving row.
+fn cap_instance_rows(mut rows: Vec<InstanceInfo>) -> Vec<InstanceInfo> {
     rows.sort_by(|a, b| a.socket.cmp(&b.socket));
     let total = rows.len();
     rows.truncate(MAX_LIST_INSTANCES);
@@ -1462,6 +1470,7 @@ pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
     }
     rows
 }
+
 /// Enumerate live bitty pipes from the Windows pipe namespace (CTX-0196).
 ///
 /// Best-effort augmentation to the registry scan: a listing failure yields
@@ -1477,16 +1486,23 @@ pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
             .collect(),
         Err(_) => return Vec::new(),
     };
-    pipe_namespace_rows(&names)
+    // Namespace existence alone is not ownership: the authenticated probe
+    // filters candidates before the `MAX_LIST_INSTANCES` cap, so a foreign
+    // `bitty-*` pipe never consumes a surviving slot (CTX-1405, #2244).
+    let live: Vec<InstanceInfo> = pipe_namespace_candidates(&names)
+        .into_iter()
+        .filter(|row| probe_windows_pipe(&row.socket).0)
+        .collect();
+    cap_instance_rows(live)
 }
 
 /// Non-Windows: no pipe namespace exists; the registry scan is authoritative.
 ///
-/// Routes through the shared [`pipe_namespace_rows`] transform so the
+/// Routes through the shared candidate transform so the
 /// [`discover_instances`] merge stays uniform across platforms.
 #[cfg(not(windows))]
 pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
-    pipe_namespace_rows(&[])
+    cap_instance_rows(pipe_namespace_candidates(&[]))
 }
 
 /// Merge registry rows with live pipe-namespace rows (CTX-0196).
@@ -1657,11 +1673,7 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
 fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceError> {
     if is_windows_pipe_path(path_str) {
         let instance = windows_explicit_instance_label(path_str);
-        return match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path_str)
-        {
+        return match bitty_ipc::winpipe::connect(path_str, WINDOWS_PROBE_WAIT) {
             Ok(_) => Ok(vec![InstanceInfo {
                 instance,
                 socket: path_str.to_string(),
@@ -1692,11 +1704,7 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path_str.to_string());
             let pipe = bitty_ipc::devtools::windows_pipe_name(&instance);
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pipe)
-            {
+            match bitty_ipc::winpipe::connect(&pipe, WINDOWS_PROBE_WAIT) {
                 Ok(_) => Ok(vec![InstanceInfo {
                     instance,
                     socket: path_str.to_string(),
@@ -2929,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn pipe_namespace_rows_maps_live_and_skips_foreign() {
+    fn pipe_namespace_candidates_map_live_and_skip_foreign() {
         let names = [
             "bitty-default".to_string(),
             "bitty-live_2".to_string(),
@@ -2939,7 +2947,7 @@ mod tests {
             "bitty-default.sock".to_string(),
             "BITTY-default".to_string(),
         ];
-        let rows = pipe_namespace_rows(&names);
+        let rows = cap_instance_rows(pipe_namespace_candidates(&names));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].instance, "default");
         assert_eq!(rows[1].instance, "live_2");
@@ -2952,11 +2960,11 @@ mod tests {
     }
 
     #[test]
-    fn pipe_namespace_rows_caps_with_shed_note() {
+    fn pipe_namespace_candidates_cap_with_shed_note() {
         let names: Vec<String> = (0..(MAX_LIST_INSTANCES + 5))
             .map(|i| format!("bitty-inst-{i:03}"))
             .collect();
-        let rows = pipe_namespace_rows(&names);
+        let rows = cap_instance_rows(pipe_namespace_candidates(&names));
         assert_eq!(rows.len(), MAX_LIST_INSTANCES);
         assert!(
             rows.last().unwrap().detail.contains("shed 5 of"),
@@ -2989,17 +2997,17 @@ mod tests {
     }
 
     #[test]
-    fn list_help_documents_windows_serving_degradation() {
-        // Issue #1800: `bitty list --help` must state that Windows rows
-        // report stale/empty until the named-pipe transport lands.
+    fn list_help_documents_windows_pipe_serving() {
+        // CTX-1405 (#2244): `bitty list --help` must describe the real
+        // Windows pipe transport and its identity-verified probe.
         let help = list_help_text("list");
         assert!(
-            help.contains("Windows serving is unavailable"),
-            "list help must name the Windows degradation, got {help:?}"
+            help.contains("Windows serves the same instance-derived named pipe"),
+            "list help must name the Windows pipe transport, got {help:?}"
         );
         assert!(
-            help.contains("#1800"),
-            "list help must link the degradation issue, got {help:?}"
+            !help.contains("Windows serving is unavailable"),
+            "list help must not keep the retired degradation, got {help:?}"
         );
     }
 

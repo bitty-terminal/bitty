@@ -1,7 +1,7 @@
 //! `bitty ctl` target resolution and IPC round-trip (split from `ctl.rs`, CTX-0307).
 
 use super::CtlTargeting;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use bitty_ipc::ctl as ipc_ctl;
 
 // ── socket resolution (client) ────────────────────────────────────────────
@@ -22,6 +22,7 @@ pub struct ResolvedTarget {
 /// Pure over injected env (no process-env access) so tests stay hermetic.
 /// `uid` seeds the last-resort base `/run/user/<uid>`; filesystem discovery
 /// (listing live sockets) runs only when no explicit target selects one.
+#[cfg(unix)]
 pub fn resolve_ctl_target(
     targeting: &CtlTargeting,
     env_socket: Option<&str>,
@@ -102,6 +103,137 @@ pub fn resolve_ctl_target(
     }
 }
 
+/// Resolve the Windows ctl target: an explicit pipe path, an
+/// instance-derived pipe, the inherited advisory environment, or the
+/// exactly-one-live shortcut (CTX-1405, #2244).
+///
+/// No hardcoded pipe name is used: `--instance` and `BITTY_INSTANCE_ID` resolve
+/// through [`bitty_ipc::devtools::windows_pipe_name`]. An explicit
+/// `--socket`/`BITTY_SOCKET` must be a `\\.\pipe\` device path; a filesystem
+/// socket path fails closed instead of silently falling back.
+///
+/// # Errors
+///
+/// Returns the documented exit-6 text for invalid pipe paths, invalid instance
+/// ids, no live instance, or an ambiguous live set. Every resolved target is
+/// still authenticated by [`ctl_roundtrip`] before a request byte is sent.
+#[cfg(windows)]
+pub fn resolve_ctl_target(
+    targeting: &CtlTargeting,
+    env_socket: Option<&str>,
+    env_instance: Option<&str>,
+    _xdg_runtime_dir: Option<&str>,
+    _uid: u32,
+) -> Result<ResolvedTarget, String> {
+    use bitty_ipc::devtools::{
+        DEFAULT_INSTANCE_ID, SocketEnv, WINDOWS_PIPE_NAMESPACE, resolve_windows_pipe_path_from_env,
+        windows_instance_from_pipe_name,
+    };
+
+    let from_pipe = |pipe: &str, instance: Option<String>| -> Result<ResolvedTarget, String> {
+        let instance = instance
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                pipe.strip_prefix(WINDOWS_PIPE_NAMESPACE)
+                    .and_then(windows_instance_from_pipe_name)
+            })
+            .unwrap_or_else(|| String::from(DEFAULT_INSTANCE_ID));
+        let env = SocketEnv {
+            bitty_socket: Some(pipe.to_string()),
+            xdg_runtime_dir: None,
+            instance_id: Some(instance),
+        };
+        let (path, instance) = resolve_windows_pipe_path_from_env(&env)
+            .map_err(|err| format!("bitty ctl: --socket is not a usable pipe path: {err}"))?;
+        Ok(ResolvedTarget {
+            socket_path: path,
+            instance,
+        })
+    };
+
+    fn by_instance(id: &str, origin: &str) -> Result<ResolvedTarget, String> {
+        let env = bitty_ipc::devtools::SocketEnv {
+            bitty_socket: None,
+            xdg_runtime_dir: None,
+            instance_id: Some(id.to_string()),
+        };
+        let (path, instance) = bitty_ipc::devtools::resolve_windows_pipe_path_from_env(&env)
+            .map_err(|err| format!("bitty ctl: cannot resolve {origin} {id:?}: {err}"))?;
+        Ok(ResolvedTarget {
+            socket_path: path,
+            instance,
+        })
+    }
+
+    if let Some(pipe) = targeting.socket.as_deref() {
+        if pipe.is_empty() {
+            return Err(String::from(
+                "bitty ctl: --socket is not a usable pipe path",
+            ));
+        }
+        return from_pipe(pipe, targeting.instance.clone());
+    }
+    if let Some(id) = targeting.instance.as_deref() {
+        return by_instance(id, "--instance");
+    }
+    if let Some(pipe) = env_socket.filter(|value| !value.is_empty()) {
+        return from_pipe(pipe, env_instance.map(String::from));
+    }
+    if let Some(id) = env_instance.filter(|value| !value.is_empty()) {
+        return by_instance(id, "inherited instance");
+    }
+
+    // Exactly-one-live shortcut: live pipes only, same-UID by construction
+    // (owner SID is verified before the probe reports live).
+    let candidates = discover_live_pipes().map_err(|err| err.message)?;
+    match candidates.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(String::from(
+            "bitty ctl: no live instance (set --socket or --instance, or run bitty first)",
+        )),
+        many => {
+            let mut names: Vec<String> = many.iter().map(|c| c.instance.clone()).collect();
+            names.sort();
+            Err(format!(
+                "bitty ctl: ambiguous instance ({} live: {}); pass --socket or --instance (see `bitty ctl instance list`)",
+                many.len(),
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// Platforms with neither Unix sockets nor Windows pipes: no target exists.
+#[cfg(not(any(unix, windows)))]
+pub fn resolve_ctl_target(
+    _targeting: &CtlTargeting,
+    _env_socket: Option<&str>,
+    _env_instance: Option<&str>,
+    _xdg_runtime_dir: Option<&str>,
+    _uid: u32,
+) -> Result<ResolvedTarget, String> {
+    Err(generic_ctl_unavailable_message())
+}
+
+/// Live Windows pipe instances as ctl targets.
+///
+/// Registry/namespace read failures stay typed (`InstanceError`) so target
+/// resolution reports the documented exit-6 class instead of silently
+/// treating an unreadable registry as "no live instance".
+#[cfg(windows)]
+fn discover_live_pipes() -> Result<Vec<ResolvedTarget>, crate::list::InstanceError> {
+    let mut live: Vec<ResolvedTarget> = crate::list::discover_instances(None, None)?
+        .into_iter()
+        .filter(|row| row.live)
+        .map(|row| ResolvedTarget {
+            socket_path: row.socket,
+            instance: row.instance,
+        })
+        .collect();
+    live.sort_by(|a, b| a.instance.cmp(&b.instance));
+    Ok(live)
+}
+
 /// Base directory for socket discovery (`XDG_RUNTIME_DIR` or `/run/user/<uid>`).
 #[cfg(unix)]
 fn discovery_base(xdg_runtime_dir: Option<&str>, uid: u32) -> Option<String> {
@@ -161,20 +293,31 @@ fn discover_live_sockets(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<Resolve
     live
 }
 
-/// Non-unix: no socket discovery (single-platform servo is unix-only).
-///
-/// Issue #1800: Windows has no serving endpoint yet, so discovery is
-/// always empty there; callers surface the usual exit-6 ambiguity text
-/// and `ctl_roundtrip` reports the documented degradation below.
-#[cfg(not(unix))]
+/// Platforms with neither Unix sockets nor Windows pipes: no discovery.
+#[cfg(not(any(unix, windows)))]
 fn discover_live_sockets(_xdg_runtime_dir: Option<&str>, _uid: u32) -> Vec<ResolvedTarget> {
     Vec::new()
 }
 
 /// Local `instance list` discovery: all live sockets (same-UID only by
 /// construction: the leaf dir is `0700` and sockets are `0600`).
+#[cfg(unix)]
 pub fn list_live_instances(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<ResolvedTarget> {
     discover_live_sockets(xdg_runtime_dir, uid)
+}
+
+/// Local `instance list` discovery on Windows: live instance pipes, owner-SID
+/// verified before a row reports live (CTX-1405, #2244).
+#[cfg(windows)]
+pub fn list_live_instances(_xdg_runtime_dir: Option<&str>, _uid: u32) -> Vec<ResolvedTarget> {
+    // Listing is best-effort; target resolution keeps the typed error.
+    discover_live_pipes().unwrap_or_default()
+}
+
+/// Platforms with neither Unix sockets nor Windows pipes: empty discovery.
+#[cfg(not(any(unix, windows)))]
+pub fn list_live_instances(_xdg_runtime_dir: Option<&str>, _uid: u32) -> Vec<ResolvedTarget> {
+    Vec::new()
 }
 
 // ── IPC client ────────────────────────────────────────────────────────────
@@ -196,10 +339,6 @@ pub struct CtlIpcOutcome {
 
 /// Connect, send one framed request, read one framed response.
 ///
-/// Unix-only (the servo is unix-only); non-unix returns unavailable (issue
-/// #1800: Windows named-pipe transport not yet implemented, so every IPC
-/// verb fails closed with exit 6 while `instance list` stays local
-/// discovery only).
 /// Time-bounded (`ipc_ctl::CTL_CLIENT_TIMEOUT` read timeout, which outlives
 /// the server-side reply wait by a fixed grace, and `ipc_ctl::CTL_TIMEOUT`
 /// write timeout) so a dead peer cannot hang the CLI.
@@ -219,8 +358,6 @@ pub fn ctl_roundtrip(
     params: Option<&str>,
     runtime_uid: u32,
 ) -> Result<CtlIpcOutcome, String> {
-    use std::io::{Read, Write};
-
     let expected =
         bitty_ipc::devtools::verify_socket_endpoint_for_connect(socket_path, runtime_uid).map_err(
             |err| {
@@ -234,7 +371,66 @@ pub fn ctl_roundtrip(
     stream
         .set_write_timeout(Some(ipc_ctl::CTL_TIMEOUT))
         .map_err(|err| format!("bitty ctl: cannot set write timeout: {err}"))?;
+    exchange(&mut stream, method, params)
+}
 
+/// Connect over the instance's Windows named pipe, then send one framed
+/// request and read one framed response (CTX-1405, #2244).
+///
+/// `connect` compares the serving process token SID with the current user's
+/// before returning, and the pipe's protected DACL already refuses a client
+/// that is not the current user; both checks fail closed before one request
+/// byte is written. Framing, timeout, and reply parsing are the same
+/// [`exchange`] used by the Unix path (no second protocol).
+#[cfg(windows)]
+pub fn ctl_roundtrip(
+    socket_path: &str,
+    method: &str,
+    params: Option<&str>,
+    _runtime_uid: u32,
+) -> Result<CtlIpcOutcome, String> {
+    let mut connection = bitty_ipc::winpipe::connect(socket_path, ipc_ctl::CTL_TIMEOUT)
+        .map_err(|err| format!("bitty ctl: cannot connect to pipe {socket_path:?}: {err}"))?;
+    connection.set_read_timeout(Some(ipc_ctl::CTL_CLIENT_TIMEOUT));
+    connection.set_write_timeout(Some(ipc_ctl::CTL_TIMEOUT));
+    exchange(&mut connection, method, params)
+}
+
+/// Non-Windows, non-Unix stub: no local IPC transport exists here.
+///
+/// # Errors
+///
+/// Always returns the documented generic unavailable message.
+#[cfg(not(any(unix, windows)))]
+pub fn ctl_roundtrip(
+    _socket_path: &str,
+    _method: &str,
+    _params: Option<&str>,
+    _runtime_uid: u32,
+) -> Result<CtlIpcOutcome, String> {
+    Err(generic_ctl_unavailable_message())
+}
+
+/// Non-Windows, non-Unix degradation message (same fail-soft shape).
+///
+/// Kept alive on Unix/Windows builds for the cross-check and the
+/// all-platform unit tests.
+#[allow(dead_code)]
+pub(crate) fn generic_ctl_unavailable_message() -> String {
+    String::from(
+        "bitty ctl: IPC control is unavailable on this platform (`bitty ctl instance list` stays local discovery only)",
+    )
+}
+
+/// Write one framed request and read one framed response over `stream`.
+///
+/// Shared by the Unix socket and Windows named-pipe clients so the envelope,
+/// frame bound, and reply parsing cannot drift (CTX-1405, #2244).
+fn exchange<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    method: &str,
+    params: Option<&str>,
+) -> Result<CtlIpcOutcome, String> {
     let params_part = match params {
         None => String::new(),
         Some(p) => format!(",\"params\":{p}"),
@@ -270,51 +466,6 @@ pub fn ctl_roundtrip(
     parse_ctl_response(&payload)
 }
 
-/// Windows degradation message for `bitty ctl` IPC verbs (issue #1800).
-///
-/// Detect-and-advise text shared by the Windows stub below and the
-/// all-platform unit tests. Kept alive on Unix builds for the Windows
-/// `-D warnings` cross-check.
-#[allow(dead_code)]
-pub(crate) fn windows_ctl_unavailable_message() -> String {
-    String::from(
-        "bitty ctl: IPC control is unavailable on Windows (named-pipe transport not yet implemented; `bitty ctl instance list` stays local discovery only, other verbs need a Unix instance with IPC serving)",
-    )
-}
-
-/// Non-Windows, non-Unix degradation message (same fail-soft shape).
-///
-/// Kept alive on Unix/Windows builds for the cross-check and the
-/// all-platform unit tests.
-#[allow(dead_code)]
-pub(crate) fn generic_ctl_unavailable_message() -> String {
-    String::from(
-        "bitty ctl: IPC control is unavailable on this platform (serving is Unix-only; `bitty ctl instance list` stays local discovery only)",
-    )
-}
-
-/// Windows stub: the servo never serves here yet (issue #1800).
-#[cfg(windows)]
-pub fn ctl_roundtrip(
-    _socket_path: &str,
-    _method: &str,
-    _params: Option<&str>,
-    _runtime_uid: u32,
-) -> Result<CtlIpcOutcome, String> {
-    Err(windows_ctl_unavailable_message())
-}
-
-/// Non-Windows, non-Unix stub: the servo never serves here.
-#[cfg(not(any(unix, windows)))]
-pub fn ctl_roundtrip(
-    _socket_path: &str,
-    _method: &str,
-    _params: Option<&str>,
-    _runtime_uid: u32,
-) -> Result<CtlIpcOutcome, String> {
-    Err(generic_ctl_unavailable_message())
-}
-
 /// Connect to `socket_path` and re-bind the live stream to the endpoint
 /// identity captured by the pre-connect verification (CTX-0539).
 ///
@@ -341,7 +492,6 @@ pub(super) fn connect_verified_endpoint(
 /// Parse a devtools response envelope into an outcome.
 ///
 /// Minimal manual scan (no new deps); malformed envelopes are transport errors.
-#[cfg(unix)]
 pub(super) fn parse_ctl_response(payload: &[u8]) -> Result<CtlIpcOutcome, String> {
     let text = std::str::from_utf8(payload)
         .map_err(|_| String::from("bitty ctl: response is not utf-8 json"))?;

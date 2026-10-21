@@ -4657,7 +4657,7 @@ mod tests {
         }
         let base = scratch("latest-catalog-404");
         let user = base.join("user");
-        std::fs::create_dir_all(&user).expect("user dir");
+        std::fs::create_dir_all(user.join("net").join("0.0.7")).expect("local version");
         let mut stub = InstallStub::canned(
             "net",
             "0.0.10",
@@ -4685,14 +4685,15 @@ mod tests {
             "{}",
             error.message
         );
+        // A known local version wins the pin hint over the published example.
         assert!(
             error
                 .message
-                .contains("bitty extension install net --version 0.0.1"),
-            "hint must give a real pin example: {}",
+                .contains("bitty extension install net --version 0.0.7"),
+            "hint must use the known local version: {}",
             error.message
         );
-        assert!(!user.join("net").exists());
+        assert!(!user.join("net").join("0.0.10").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

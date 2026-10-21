@@ -13,6 +13,9 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use bitty_config::theme::CustomPalette;
+use bitty_lua::runtime_inspect::{
+    RUNTIME_INSPECT_CALLS_PER_SECOND, RUNTIME_INSPECT_MAX_WALL_MS, RuntimeInspectSnapshot,
+};
 use bitty_lua::ui::UiSlot;
 use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
 use bitty_lua::{
@@ -81,6 +84,38 @@ pub const MAX_ENV_GRANTS: usize = 64;
 /// unbounded variable (e.g. a dumped keyring) fails closed with
 /// `E_DEF_LIMIT` instead of crossing the bridge.
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
+/// Per-generation `bitty.runtime.inspect` call budget (issue #2396).
+///
+/// One one-second window admits [`RUNTIME_INSPECT_CALLS_PER_SECOND`] calls;
+/// the window resets lazily on the first call after it expires. Denials are
+/// typed (`E_DEF_LIMIT`) and never touch the snapshot source.
+#[derive(Debug)]
+struct InspectCallBudget {
+    window_start: Instant,
+    calls: u32,
+}
+
+impl InspectCallBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            calls: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.calls = 0;
+        }
+        if self.calls >= RUNTIME_INSPECT_CALLS_PER_SECOND {
+            return false;
+        }
+        self.calls = self.calls.saturating_add(1);
+        true
+    }
+}
 
 /// Per-plugin `bitty.fs.list` rate window.
 ///
@@ -1777,6 +1812,20 @@ pub struct PluginServices {
     command_directory: RefCell<Option<Rc<RefCell<CommandDirectory>>>>,
     debug_inspect: Cell<bool>,
     debug_trace: Cell<bool>,
+    /// Whether this generation holds `runtime.inspect` (issue #2396).
+    ///
+    /// Read never implies `runtime.configure`, and `runtime.configure` never
+    /// implies this head; each is granted independently.
+    runtime_inspect_granted: Cell<bool>,
+    /// Prebuilt, already bounded snapshot for `bitty.runtime.inspect()`.
+    ///
+    /// Built by the application on its cold path (no file, process, network,
+    /// or environment access on the call path) and installed before
+    /// activation. `None` leaves granted calls failing closed with
+    /// `E_NOT_IMPLEMENTED`.
+    runtime_inspect_snapshot: RefCell<Option<RuntimeInspectSnapshot>>,
+    /// Per-generation call budget (`16 calls/s`, issue #2396).
+    runtime_inspect_budget: RefCell<InspectCallBudget>,
     granted_capabilities: RefCell<Vec<String>>,
     declared_events: RefCell<BTreeSet<String>>,
     debug_view: RefCell<Option<Rc<RefCell<DebugView>>>>,
@@ -1934,6 +1983,9 @@ impl PluginServices {
             command_directory: RefCell::new(None),
             debug_inspect: Cell::new(false),
             debug_trace: Cell::new(false),
+            runtime_inspect_granted: Cell::new(false),
+            runtime_inspect_snapshot: RefCell::new(None),
+            runtime_inspect_budget: RefCell::new(InspectCallBudget::new(Instant::now())),
             granted_capabilities: RefCell::new(Vec::new()),
             declared_events: RefCell::new(BTreeSet::new()),
             debug_view: RefCell::new(None),
@@ -3042,6 +3094,19 @@ impl PluginServices {
     /// snapshot. Absent grants fail closed with `E_CAPABILITY_DENIED`.
     pub fn set_debug_trace(&self, granted: bool) {
         self.debug_trace.set(granted);
+    }
+
+    /// Install the `runtime.inspect` grant and its prebuilt snapshot (issue
+    /// #2396).
+    ///
+    /// The application builds the snapshot on its cold path and installs it
+    /// before activation. `granted` is the only authority switch; a snapshot
+    /// installed without the grant is unreachable, and a granted generation
+    /// without a snapshot fails closed with `E_NOT_IMPLEMENTED`. Call budgets
+    /// start at activation and never reset within the generation.
+    pub fn set_runtime_inspect(&self, granted: bool, snapshot: Option<RuntimeInspectSnapshot>) {
+        self.runtime_inspect_granted.set(granted);
+        *self.runtime_inspect_snapshot.borrow_mut() = snapshot;
     }
 
     /// Record this generation's own granted capability ids (activation
@@ -4807,6 +4872,32 @@ impl HostServices for PluginServices {
                 "debug.inspect target must be one of plugins, commands, events, grants, panels",
             )),
         }
+    }
+
+    fn runtime_inspect(&self) -> Result<RuntimeInspectSnapshot, BridgeError> {
+        // Grant first: an ungranted generation must not learn whether a
+        // snapshot backend exists. `runtime.inspect` never implies
+        // `runtime.configure` and vice versa.
+        if !self.runtime_inspect_granted.get() {
+            return Err(BridgeError::capability_denied("runtime.inspect"));
+        }
+        let started = Instant::now();
+        if !self.runtime_inspect_budget.borrow_mut().allow(started) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "runtime.inspect exceeded 16 calls per second",
+            ));
+        }
+        let snapshot = self
+            .runtime_inspect_snapshot
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.runtime.inspect"))?;
+        if started.elapsed() > Duration::from_millis(RUNTIME_INSPECT_MAX_WALL_MS) {
+            return Err(BridgeError::timeout());
+        }
+        Ok(snapshot)
     }
 
     fn debug_trace(&self, opts: &LuaValue) -> Result<i64, BridgeError> {
@@ -9893,5 +9984,46 @@ mod history_tests {
                 &request(HistoryQueryOp::List),
             )
             .expect("budget restored");
+    }
+
+    #[test]
+    fn runtime_inspect_requires_its_own_read_grant() {
+        let denied = services();
+        let error = denied.runtime_inspect().expect_err("no grant");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(error.message, "capability 'runtime.inspect' is not granted");
+
+        // Holding the write-side colorscheme grant never implies the read.
+        let write_only = services();
+        write_only.set_theme_access(true);
+        let error = write_only.runtime_inspect().expect_err("read denied");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+
+        // The read grant never implies the write-side colorscheme grant.
+        let read_only = services();
+        read_only.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        assert!(
+            !read_only.theme_configure_granted.get(),
+            "runtime.inspect must not grant runtime.configure"
+        );
+        assert!(read_only.runtime_inspect().is_ok());
+
+        // A granted generation without a wired snapshot fails closed.
+        let unwired = services();
+        unwired.set_runtime_inspect(true, None);
+        let error = unwired.runtime_inspect().expect_err("no backend");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn runtime_inspect_serves_and_enforces_sixteen_calls_per_second() {
+        let services = services();
+        services.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        for call in 0..RUNTIME_INSPECT_CALLS_PER_SECOND {
+            assert!(services.runtime_inspect().is_ok(), "call {call}");
+        }
+        let error = services.runtime_inspect().expect_err("over budget");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert_eq!(error.class, "validation");
     }
 }

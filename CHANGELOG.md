@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Read-only runtime inspection for plugins (CTX-2396, #2396):**
+  `bitty.runtime.inspect()` returns one argument-free, bounded snapshot with
+  `diagnostics`, `plugins`, `settings`, `extensions`, and `profiles` sections.
+  Each section carries typed rows or an `unavailable: <reason>` marker;
+  aggregate payload is capped at 64 KiB, rows at 128/256/64/64, paths at 240
+  bytes, and other strings at 96 bytes. The host enforces the
+  `runtime.inspect` grant (independent of `runtime.configure`), 16 calls/s per
+  generation, and a 10 ms call budget. Safe mode returns the built-in config
+  and reads no third-party store, settings, extension, or profile state. No
+  path, command, URL, or host argument exists, and all reads happen on the
+  cold path; payload paths are display strings only.
+
 ## [0.0.25] - 2026-10-21
 
 ### Added
@@ -43,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UI composition surface, and candidate scene style primitives plus a
   bounded component catalog provide reusable, capped building blocks. These
   are candidate surfaces with no production consumer yet.
+ ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
 
 ### Changed
 

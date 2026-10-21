@@ -72,6 +72,7 @@ pub mod error;
 pub mod gate;
 pub mod host;
 pub mod plain_config;
+pub mod runtime_inspect;
 mod stdlib;
 pub mod store;
 pub mod ui;

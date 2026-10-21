@@ -161,6 +161,13 @@ pub struct InstalledVersion {
     /// Whether the protocol range includes Core's wire version
     /// (ABI-compat check before activation).
     pub compatible: bool,
+    /// Descriptor-recorded SHA-256 of the executable (issue #2396).
+    ///
+    /// This is the value the signed/staged descriptor declares. Inventory
+    /// never recomputes the digest, so a read-only inventory call performs
+    /// no executable hashing; spawn-time [`super::descriptor::resolve`]
+    /// remains the verification point.
+    pub sha256: String,
 }
 
 /// One component name with its installed versions and active pointer.
@@ -384,6 +391,7 @@ fn list_versions(root: &Path, name: &str, source: ComponentSource) -> Vec<Instal
             protocol_min: descriptor.protocol_min,
             protocol_max: descriptor.protocol_max,
             compatible: descriptor.supports_core_protocol(),
+            sha256: descriptor.sha256.clone(),
         });
     }
     out.sort_by_key(|entry| version_key(&entry.version));

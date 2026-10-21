@@ -49,6 +49,7 @@ use phodopus::{
     Callback, CallbackReturn, Closure, Context, Error, ExecutorMode, Function, Table, Value,
 };
 
+use crate::runtime_inspect::RuntimeInspectSnapshot;
 use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
@@ -2058,6 +2059,29 @@ pub trait HostServices {
     fn debug_inspect(&self, target: &str) -> Result<LuaValue, BridgeError> {
         let _ = target;
         Err(BridgeError::not_implemented("bitty.debug.inspect"))
+    }
+
+    /// Read-only bounded runtime/dashboard state for
+    /// `bitty.runtime.inspect()` (issue #2396).
+    ///
+    /// Grant-gated on `runtime.inspect` only (`E_CAPABILITY_DENIED`
+    /// otherwise). `runtime.inspect` never implies `runtime.configure`:
+    /// granting the read head authorizes no write, and granting the write
+    /// head authorizes no read. The bridge accepts no arguments, so the call
+    /// can never name a path, command, URL, or host.
+    ///
+    /// The returned snapshot carries five sections (diagnostics, plugins,
+    /// settings, extensions, profiles). Every section either carries bounded
+    /// rows or an `unavailable: <reason>` marker; a failed source is never
+    /// rendered as an empty list. The host enforces the 64 KiB aggregate
+    /// bound, the per-section row caps, 16 calls/s per generation, and a
+    /// 10 ms wall budget before returning.
+    ///
+    /// The default implementation fails closed with `E_NOT_IMPLEMENTED`:
+    /// a host without a runtime-inspection source grants no ambient read
+    /// authority.
+    fn runtime_inspect(&self) -> Result<RuntimeInspectSnapshot, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.runtime.inspect"))
     }
 
     /// Open or close an event trace for `bitty.debug.trace` (CTX-0894,
@@ -6275,6 +6299,45 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             .expect("history root accepts source namespace");
     }
 
+    // Issue #2396: `bitty.runtime.inspect()` — one argument-free, read-only,
+    // bounded state snapshot for dashboard plugins. The bridge rejects any
+    // argument before the host is reached, so the surface can never turn into
+    // a path/exec/network input. The host checks `runtime.inspect`, applies
+    // the call budget, and fails closed on a snapshot over the 64 KiB cap.
+    let runtime = Table::new(&ctx);
+    runtime
+        .set(
+            ctx,
+            "inspect",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(0), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "runtime.inspect takes no arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let snapshot = state
+                        .bounded(|_expiry| state.services.runtime_inspect())
+                        .map_err(|e| e.to_error(ctx))?;
+                    if !snapshot.fits_budget() {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_LIMIT",
+                            "runtime.inspect payload exceeds 64 KiB",
+                        )
+                        .to_error(ctx));
+                    }
+                    stack.replace(ctx, snapshot.to_lua().to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("runtime table accepts 'inspect'");
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -6325,6 +6388,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts workspace");
     root.set(ctx, "history", readonly_table(ctx, history))
         .expect("root accepts history");
+    root.set(ctx, "runtime", readonly_table(ctx, runtime))
+        .expect("root accepts runtime");
     root.set(ctx, "component", readonly_table(ctx, component))
         .expect("root accepts component");
     Value::Table(readonly_table(ctx, root))

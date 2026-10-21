@@ -4881,6 +4881,12 @@ impl HostServices for PluginServices {
         if !self.runtime_inspect_granted.get() {
             return Err(BridgeError::capability_denied("runtime.inspect"));
         }
+        // An unwired backend fails before consuming a rate-budget slot, so a
+        // granted-but-unavailable generation cannot exhaust its own budget on
+        // a call that never reads anything.
+        if self.runtime_inspect_snapshot.borrow().is_none() {
+            return Err(BridgeError::not_implemented("bitty.runtime.inspect"));
+        }
         let started = Instant::now();
         if !self.runtime_inspect_budget.borrow_mut().allow(started) {
             return Err(BridgeError::new(
@@ -10013,6 +10019,24 @@ mod history_tests {
         unwired.set_runtime_inspect(true, None);
         let error = unwired.runtime_inspect().expect_err("no backend");
         assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn runtime_inspect_unwired_calls_do_not_consume_the_budget() {
+        let services = services();
+        services.set_runtime_inspect(true, None);
+        for _ in 0..RUNTIME_INSPECT_CALLS_PER_SECOND * 2 {
+            let error = services.runtime_inspect().expect_err("unwired");
+            assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        }
+        services.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        for call in 0..RUNTIME_INSPECT_CALLS_PER_SECOND {
+            assert!(services.runtime_inspect().is_ok(), "call {call}");
+        }
+        assert_eq!(
+            services.runtime_inspect().expect_err("over budget").code,
+            "E_DEF_LIMIT"
+        );
     }
 
     #[test]

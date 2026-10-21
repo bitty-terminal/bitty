@@ -1110,6 +1110,45 @@ mod tests {
     }
 
     #[test]
+    fn path_and_row_caps_are_enforced() {
+        let long_path = "p".repeat(4 * RUNTIME_INSPECT_MAX_PATH_BYTES);
+        let bounded = bounded_display(&long_path, RUNTIME_INSPECT_MAX_PATH_BYTES);
+        assert!(bounded.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
+
+        let row = ExtensionInspectRow {
+            name: "net".to_string(),
+            version: "0.0.1".to_string(),
+            tier: "user".to_string(),
+            abi_compatible: true,
+            sha256: "a".repeat(64),
+            executable_path: long_path,
+            activation: ExtensionActivation::Installed,
+            trust: ExtensionTrust::Unverified,
+        };
+        let lua = extension_row_lua(&row);
+        let Some(LuaValue::String(path)) = lua.get("executable_path") else {
+            panic!("executable_path is a string");
+        };
+        assert!(path.len() <= RUNTIME_INSPECT_MAX_PATH_BYTES);
+
+        let mut rows = InspectRows::new(
+            (0..RUNTIME_INSPECT_MAX_PLUGIN_ROWS + 5)
+                .map(|index| PluginInspectRow {
+                    id: format!("owner.plugin{index}"),
+                    name: "Plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "registry".to_string(),
+                    enabled: true,
+                    recorded: true,
+                })
+                .collect(),
+        );
+        rows.cap(RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert_eq!(rows.rows.len(), RUNTIME_INSPECT_MAX_PLUGIN_ROWS);
+        assert!(rows.truncated);
+    }
+
+    #[test]
     fn payload_below_the_cap_is_unchanged() {
         let snapshot = snapshot_with_rows(3, 8);
         assert!(snapshot.fits_budget());

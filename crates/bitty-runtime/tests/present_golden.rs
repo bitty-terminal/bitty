@@ -45,6 +45,13 @@
 //! unshaped paint path now emits a cell's `zerowidth` combining marks over
 //! their base (CR-TERM-01), so `e` + U+0301 actually paints its acute. This
 //! is an explicit behavior change, not golden drift.
+//!
+//! The paste-banner, help-overlay, and IME-preedit digests were re-recorded
+//! under CTX-1395 (#2333): those chrome surfaces now take their colors from
+//! the resolved theme (ANSI 3 warning ground, ANSI 12 help accent, selection
+//! preedit ground) instead of fixed Bitty Dark constants, so a live theme
+//! switch recolors them with the terminal. Geometry, text, and stats are
+//! unchanged; only fill/glyph colors moved.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -179,7 +186,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(false),
         "banner must still be in the full phase"
     );
-    assert_digest("paste_full", &rt, &full, 0x3f31_5b86_7c46_0139);
+    assert_digest("paste_full", &rt, &full, 0xcfab_5f21_5a14_c6c3);
     // Issue #1438 (CTX-0843): the paste-confirm timeout (default 30s) is
     // shorter than PASTE_BANNER_FULL_DURATION + 30s, so the timer cancels
     // the pending paste first. Test the collapse at full-duration + 1s
@@ -191,7 +198,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(true),
         "banner must have collapsed to the flash"
     );
-    assert_digest("paste_flash", &rt, &flash, 0x68bc_ba92_6035_7fc8);
+    assert_digest("paste_flash", &rt, &flash, 0x7ad9_7eb9_743b_b536);
     assert!(
         rt.tick_at(flash_at + Duration::from_millis(200)).is_none(),
         "banner phase is steady -> idle"
@@ -208,7 +215,7 @@ fn golden_help_overlay_shown_then_hidden() {
     ]);
     assert!(rt.toggle_help(), "help toggles on");
     let shown = rt.tick().expect("overlay present");
-    assert_digest("help_shown", &rt, &shown, 0x1253_5c93_0b11_817d);
+    assert_digest("help_shown", &rt, &shown, 0xedde_b201_53a9_7109);
     assert!(!rt.toggle_help(), "help toggles off");
     let hidden = rt.tick().expect("dismissal present");
     assert_digest("help_hidden", &rt, &hidden, 0xa769_7a2c_a636_3963);
@@ -250,7 +257,7 @@ fn golden_ime_preedit_overlay() {
     // caret fills), so the same-cell cursor rect carries the cursor hue.
     // Delta is exactly one 9x19 cell (171 px) at the IME caret rect;
     // stats (fills=26, images=0) and the caret (21,21,9,19) are unchanged.
-    assert_digest("preedit_shown", &rt, &shown, 0x29a3_4e74_5a12_f3a7);
+    assert_digest("preedit_shown", &rt, &shown, 0x7af5_3b82_302c_66f3);
     rt.handle_ime_preedit(None, None);
     let cleared = rt.tick().expect("preedit clear present");
     assert_digest("preedit_cleared", &rt, &cleared, 0xa769_7a2c_a636_3963);

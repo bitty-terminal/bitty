@@ -1631,6 +1631,69 @@ pub struct CustomPalette {
 /// Expected ANSI entry count for [`CustomPalette`].
 pub const CUSTOM_PALETTE_ANSI_COUNT: usize = 16;
 
+/// Typed [`CustomPalette`] construction failure (CTX-1395, issue #2333).
+///
+/// Every variant names the exact dotted field path the caller must fix, so a
+/// rejected `appearance.colors` table produces one actionable diagnostic
+/// instead of a generic "invalid palette" message. The path grammar is the
+/// same one used by the rest of `bitty-config` (`appearance.colors.ansi[7]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomPaletteError {
+    /// A required top-level role is absent from the table.
+    MissingRole(&'static str),
+    /// A leaf is not canonical `#RRGGBB` hex.
+    InvalidHex {
+        /// Dotted field path of the offending leaf.
+        field: &'static str,
+        /// ANSI index when the leaf is an `ansi` entry.
+        index: Option<usize>,
+    },
+    /// The `ansi` array does not contain exactly [`CUSTOM_PALETTE_ANSI_COUNT`]
+    /// entries.
+    AnsiCount(usize),
+}
+
+impl CustomPaletteError {
+    /// Dotted field path of the failure (stable diagnostic key).
+    #[must_use]
+    pub fn field_path(&self) -> String {
+        match self {
+            Self::MissingRole(role) => format!("appearance.colors.{role}"),
+            Self::InvalidHex { field, index } => match index {
+                Some(index) => format!("{field}[{index}]"),
+                None => (*field).to_string(),
+            },
+            Self::AnsiCount(_) => "appearance.colors.ansi".to_string(),
+        }
+    }
+
+    /// Developer-facing English reason (bounded, no config values echoed).
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::MissingRole("ansi") => {
+                "table 'appearance.colors' requires 'ansi' as an array of 16 \"#RRGGBB\" strings"
+                    .to_string()
+            }
+            Self::MissingRole(role) => {
+                format!("table 'appearance.colors' requires '{role}' as a \"#RRGGBB\" string")
+            }
+            Self::InvalidHex { .. } => {
+                "must be canonical \"#RRGGBB\" hex (7 characters, no alpha)".to_string()
+            }
+            Self::AnsiCount(found) => {
+                format!("must contain exactly {CUSTOM_PALETTE_ANSI_COUNT} entries (found {found})")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CustomPaletteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field_path(), self.message())
+    }
+}
+
 impl CustomPalette {
     /// Parses one canonical `#RRGGBB` spelling into `sRGB` bytes.
     ///
@@ -1661,6 +1724,8 @@ impl CustomPalette {
     ///
     /// `ansi` must contain exactly [`CUSTOM_PALETTE_ANSI_COUNT`] entries.
     /// `None` on any malformed leaf or wrong `ansi` length (fail-closed).
+    /// This compatibility wrapper discards the typed diagnostic; config
+    /// loading uses [`Self::try_from_hex`] so the exact leaf is named.
     #[must_use]
     pub fn from_hex(
         background: &str,
@@ -1669,18 +1734,63 @@ impl CustomPalette {
         selection: &str,
         ansi: &[String],
     ) -> Option<Self> {
+        Self::try_from_hex(
+            Some(background),
+            Some(foreground),
+            Some(cursor),
+            Some(selection),
+            Some(ansi),
+        )
+        .ok()
+    }
+
+    /// Typed, fail-closed palette construction (CTX-1395, issue #2333).
+    ///
+    /// Every role is required: `background`, `foreground`, `cursor`,
+    /// `selection`, and exactly [`CUSTOM_PALETTE_ANSI_COUNT`] `ansi` entries.
+    /// The first missing role, wrong ANSI count, or non-canonical leaf wins and
+    /// is reported as a [`CustomPaletteError`] naming the exact field path.
+    /// Missing roles never inherit the previous theme's value: the whole table
+    /// is rejected, so a partial palette is unrepresentable.
+    ///
+    /// # Errors
+    ///
+    /// [`CustomPaletteError::MissingRole`] when a role is `None`,
+    /// [`CustomPaletteError::AnsiCount`] for a wrong-length array, and
+    /// [`CustomPaletteError::InvalidHex`] for a leaf outside `#RRGGBB`.
+    pub fn try_from_hex(
+        background: Option<&str>,
+        foreground: Option<&str>,
+        cursor: Option<&str>,
+        selection: Option<&str>,
+        ansi: Option<&[String]>,
+    ) -> Result<Self, CustomPaletteError> {
+        let background = background.ok_or(CustomPaletteError::MissingRole("background"))?;
+        let foreground = foreground.ok_or(CustomPaletteError::MissingRole("foreground"))?;
+        let cursor = cursor.ok_or(CustomPaletteError::MissingRole("cursor"))?;
+        let selection = selection.ok_or(CustomPaletteError::MissingRole("selection"))?;
+        let ansi = ansi.ok_or(CustomPaletteError::MissingRole("ansi"))?;
         if ansi.len() != CUSTOM_PALETTE_ANSI_COUNT {
-            return None;
+            return Err(CustomPaletteError::AnsiCount(ansi.len()));
         }
         let mut parsed = [[0u8; 3]; CUSTOM_PALETTE_ANSI_COUNT];
-        for (slot, raw) in parsed.iter_mut().zip(ansi.iter()) {
-            *slot = Self::parse_hex_rgb(raw)?;
+        for (index, (slot, raw)) in parsed.iter_mut().zip(ansi.iter()).enumerate() {
+            *slot = Self::parse_hex_rgb(raw).ok_or(CustomPaletteError::InvalidHex {
+                field: "appearance.colors.ansi",
+                index: Some(index),
+            })?;
         }
-        Some(Self {
-            background: Self::parse_hex_rgb(background)?,
-            foreground: Self::parse_hex_rgb(foreground)?,
-            cursor: Self::parse_hex_rgb(cursor)?,
-            selection: Self::parse_hex_rgb(selection)?,
+        let role = |name: &'static str, raw: &str| {
+            Self::parse_hex_rgb(raw).ok_or(CustomPaletteError::InvalidHex {
+                field: name,
+                index: None,
+            })
+        };
+        Ok(Self {
+            background: role("appearance.colors.background", background)?,
+            foreground: role("appearance.colors.foreground", foreground)?,
+            cursor: role("appearance.colors.cursor", cursor)?,
+            selection: role("appearance.colors.selection", selection)?,
             ansi: parsed,
         })
     }
@@ -2324,5 +2434,57 @@ mod tests {
             CustomPalette::from_hex("#1e1e2e", "not-a-color", "#f5e0dc", "#313244", &ansi16)
                 .is_none()
         );
+    }
+
+    // CTX-1395: every rejection names the exact missing/malformed leaf so
+    // `appearance.colors` diagnostics stay actionable.
+    #[test]
+    fn custom_palette_typed_errors_name_exact_leaf() {
+        let ansi16: Vec<String> = (0..16).map(|_| "#112233".to_string()).collect();
+        let missing = CustomPalette::try_from_hex(
+            Some("#1e1e2e"),
+            None,
+            Some("#f5e0dc"),
+            Some("#313244"),
+            Some(&ansi16),
+        )
+        .expect_err("missing foreground rejects");
+        assert_eq!(missing.field_path(), "appearance.colors.foreground");
+        assert!(missing.message().contains("requires 'foreground'"));
+
+        let short = CustomPalette::try_from_hex(
+            Some("#1e1e2e"),
+            Some("#cdd6f4"),
+            Some("#f5e0dc"),
+            Some("#313244"),
+            Some(&ansi16[..15]),
+        )
+        .expect_err("short ansi rejects");
+        assert_eq!(short, CustomPaletteError::AnsiCount(15));
+        assert_eq!(short.field_path(), "appearance.colors.ansi");
+        assert!(short.message().contains("found 15"));
+
+        let mut bad = ansi16.clone();
+        bad[7] = "not-a-color".to_string();
+        let invalid = CustomPalette::try_from_hex(
+            Some("#1e1e2e"),
+            Some("#cdd6f4"),
+            Some("#f5e0dc"),
+            Some("#313244"),
+            Some(&bad),
+        )
+        .expect_err("bad ansi entry rejects");
+        assert_eq!(invalid.field_path(), "appearance.colors.ansi[7]");
+        assert!(invalid.message().contains("#RRGGBB"));
+
+        let background = CustomPalette::try_from_hex(
+            Some("#12345"),
+            Some("#cdd6f4"),
+            Some("#f5e0dc"),
+            Some("#313244"),
+            Some(&ansi16),
+        )
+        .expect_err("bad background rejects");
+        assert_eq!(background.field_path(), "appearance.colors.background");
     }
 }

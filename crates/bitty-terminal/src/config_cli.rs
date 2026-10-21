@@ -1809,16 +1809,12 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         // CTX-0951: dual themes resolve to the half matching `prefer_light`
         // (previously `resolve_theme` on the raw dual string fell back to
         // Bitty Dark instead of the dark half).
-        cfg.theme = match &effective.appearance.colors {
-            Some(custom) => bitty_runtime::ThemePalette::from_custom(custom),
-            None => {
-                let preset = bitty_config::theme::resolve_selection(
-                    effective.appearance.theme.as_deref(),
-                    prefer_light,
-                );
-                bitty_runtime::ThemePalette::from_theme(preset)
-            }
-        };
+        // CTX-1395 (issue #2333): both paths resolve through the same merged
+        // `Theme`, so a custom palette and a preset feed `ThemePalette` from
+        // one mapping. A future theme-owned role cannot be silently dropped
+        // on the custom path, and "preset is shorthand over the same roles"
+        // stays true by construction.
+        cfg.theme = bitty_runtime::ThemePalette::from_theme(&theme);
         // CTX-0381/CTX-0392: mark the palette as user-resolved so OSC 10/11
         // and OSC 4 queries are answered from it; headless/unit configs keep
         // the false default and stay silent (no reply before theme

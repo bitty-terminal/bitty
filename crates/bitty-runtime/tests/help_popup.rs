@@ -179,7 +179,10 @@ fn help_panel_occludes_grid_inside_its_frame() {
     // Bracket the panel frame from the border pixels alone (no layout
     // internals duplicated here). The border is opaque and unique to the
     // panel, so its bounding box is exactly the panel rectangle.
-    let border = bitty_render::grid::HELP_PANEL_BORDER;
+    // CTX-1395: the panel ring is the resolved theme accent (ANSI 12), so
+    // bracket the frame with that palette value rather than a fixed constant.
+    let border =
+        bitty_render::grid::help_panel_border_in(&bitty_render::ThemePalette::bitty_dark());
     let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
     for y in 0..h as i64 {
         for x in 0..w as i64 {

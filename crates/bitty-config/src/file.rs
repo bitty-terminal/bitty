@@ -1409,64 +1409,21 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             // short/long, or malformed leaf rejects the whole reload
             // fail-closed so live state can never corrupt. Hex grammar is
             // `#RRGGBB` only; no file path is accepted (OQ-047 stays Open).
+            // CTX-1395 (issue #2333): the typed constructor names the exact
+            // offending leaf (`appearance.colors.ansi[7]`) instead of a
+            // generic palette error, so the diagnostic stays actionable.
             let colors = match colors_data {
                 None => None,
-                Some(c) => {
-                    let background = c.background.as_deref().ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors.background",
-                            "table 'appearance.colors' requires 'background' (\"#RRGGBB\")",
-                        )
-                    })?;
-                    let foreground = c.foreground.as_deref().ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors.foreground",
-                            "table 'appearance.colors' requires 'foreground' (\"#RRGGBB\")",
-                        )
-                    })?;
-                    let cursor = c.cursor.as_deref().ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors.cursor",
-                            "table 'appearance.colors' requires 'cursor' (\"#RRGGBB\")",
-                        )
-                    })?;
-                    let selection = c.selection.as_deref().ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors.selection",
-                            "table 'appearance.colors' requires 'selection' (\"#RRGGBB\")",
-                        )
-                    })?;
-                    let ansi = c.ansi.as_deref().ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors.ansi",
-                            "table 'appearance.colors' requires 'ansi' (16 \"#RRGGBB\" entries)",
-                        )
-                    })?;
-                    if ansi.len() != crate::theme::CUSTOM_PALETTE_ANSI_COUNT {
-                        return Err(ConfigError::validation(
-                            "appearance.colors.ansi",
-                            format!(
-                                "must contain exactly {} entries (found {})",
-                                crate::theme::CUSTOM_PALETTE_ANSI_COUNT,
-                                ansi.len()
-                            ),
-                        ));
-                    }
-                    let palette = crate::theme::CustomPalette::from_hex(
-                        background,
-                        foreground,
-                        cursor,
-                        selection,
-                        ansi,
+                Some(c) => Some(
+                    crate::theme::CustomPalette::try_from_hex(
+                        c.background.as_deref(),
+                        c.foreground.as_deref(),
+                        c.cursor.as_deref(),
+                        c.selection.as_deref(),
+                        c.ansi.as_deref(),
                     )
-                    .ok_or_else(|| {
-                        ConfigError::validation(
-                            "appearance.colors",
-                            "must be canonical \"#RRGGBB\" hex (background, foreground, cursor, selection plus 16 ansi entries)",
-                        )
-                    })?;
-                    Some(palette)
-                }
+                    .map_err(|err| ConfigError::validation(err.field_path(), err.message()))?,
+                ),
             };
             Some(AppearanceConfig {
                 theme,
@@ -6445,6 +6402,22 @@ mod ctx0392_tests {
             "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }}, theme_file = \"x.lua\" }} }} }}"
         );
         assert!(parse_lua_config(&bad, &ctx0392_source()).is_err());
+    }
+
+    #[test]
+    fn lua_custom_palette_error_names_the_malformed_ansi_entry() {
+        let mut ansi: Vec<String> = (0..16).map(|_| "\"#112233\"".to_string()).collect();
+        ansi[7] = "\"#zzzzzz\"".to_string();
+        let ansi = ansi.join(", ");
+        let bad = format!(
+            "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }} }} }} }}"
+        );
+        let err = parse_lua_config(&bad, &ctx0392_source()).expect_err("bad ansi rejects");
+        assert_eq!(
+            err.field(),
+            Some("appearance.colors.ansi[7]"),
+            "typed diagnostic must name the exact entry: {err}"
+        );
     }
 }
 

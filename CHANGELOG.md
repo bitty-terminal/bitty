@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (16:9/4:3/1:1 source x window), the resize/split destination updates, and
   the `background_opacity` versus `window.opacity` composition are pinned by
   headless tests.
+- **Theme switches recolor the whole terminal, and inline palettes are
+  first-class (CTX-1395, #2333):** the resolved theme now also colors the
+  pending/close-confirm banner (ANSI 3 ground with contrast-chosen text), the
+  help panel (selection ground, ANSI 12 accent, foreground text), and the IME
+  preedit (selection ground, cursor underline and caret, foreground glyphs).
+  Presets and `appearance.colors` resolve through one `Theme` -> `ThemePalette`
+  mapping, so a custom palette cannot silently miss a theme-owned role, and
+  `appearance.colors` validation now reports the exact offending leaf
+  (`appearance.colors.ansi[7]`). Headless tests pin plain text, all 16 ANSI
+  colors, cursor, selection, scrollback, and chrome under two presets and a
+  custom palette, and prove a live switch (`set_theme_palette` or
+  `apply_theme_request`) presents a frame byte-identical to a fresh render with
+  no cell left on the old theme.
 
 ### Changed
 

@@ -2161,6 +2161,89 @@ fn renderer_resolves_cells_from_selected_palette() {
     assert_ne!(green.glyphs[0].color, [0xA6, 0xE3, 0xA1, 0xFF]);
 }
 
+/// CTX-1395 (issue #2333): the banner, help, and IME chrome helpers all read
+/// the resolved palette instead of fixed Bitty Dark constants.
+#[test]
+fn chrome_accents_follow_the_resolved_palette() {
+    use super::{
+        ThemePalette, banner_fill_in, banner_text_in, help_panel_bg_in, help_panel_border_in,
+        help_panel_fg_in, ime_preedit_bg_in, ime_preedit_underline_in, readable_foreground_on,
+    };
+
+    let dark = ThemePalette::bitty_dark();
+    let light = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+
+    let dark_banner = dark.ansi[usize::from(super::BANNER_ANSI_INDEX)];
+    let light_banner = light.ansi[usize::from(super::BANNER_ANSI_INDEX)];
+    assert_eq!(
+        banner_fill_in(&dark),
+        [dark_banner[0], dark_banner[1], dark_banner[2], 0xFF]
+    );
+    assert_eq!(
+        banner_fill_in(&light),
+        [light_banner[0], light_banner[1], light_banner[2], 0xFF]
+    );
+    assert_ne!(banner_fill_in(&dark), banner_fill_in(&light));
+    assert_eq!(banner_text_in(&dark), readable_foreground_on(dark_banner));
+
+    assert_eq!(help_panel_bg_in(&dark), dark.selection);
+    assert_eq!(help_panel_bg_in(&light), light.selection);
+    assert_eq!(help_panel_fg_in(&dark), dark.foreground);
+    let dark_ring = dark.ansi[usize::from(super::HELP_PANEL_ACCENT_ANSI_INDEX)];
+    assert_eq!(
+        help_panel_border_in(&dark),
+        [dark_ring[0], dark_ring[1], dark_ring[2], 0xFF]
+    );
+    assert_ne!(help_panel_border_in(&dark), help_panel_border_in(&light));
+
+    assert_eq!(ime_preedit_bg_in(&dark), dark.selection);
+    assert_eq!(ime_preedit_underline_in(&dark), dark.cursor);
+    assert_ne!(ime_preedit_bg_in(&dark), ime_preedit_bg_in(&light));
+
+    // The contrast picker must choose the endpoint that wins the WCAG ratio.
+    assert_eq!(
+        readable_foreground_on([0x00, 0x00, 0x00]),
+        [0xFF, 0xFF, 0xFF, 0xFF]
+    );
+    assert_eq!(
+        readable_foreground_on([0xFF, 0xFF, 0xFF]),
+        [0x00, 0x00, 0x00, 0xFF]
+    );
+}
+
+/// CTX-1395 (issue #2333): cached glyph masks are color-independent, so a
+/// live palette switch must reuse the cached rasterization and only re-tint
+/// the emitted instances. A color-baked cache would keep the old theme here.
+#[test]
+fn palette_switch_retints_cached_glyphs_without_rerasterizing() {
+    use super::ThemePalette;
+
+    let dark = ThemePalette::bitty_dark();
+    let light = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+    let state = state_from(&[print('A')]);
+    let mut renderer = renderer();
+
+    let first = renderer
+        .render(&state.snapshot(), &full_damage(&state))
+        .unwrap();
+    assert_eq!(first.glyphs[0].color, dark.foreground);
+    let (hits_before, misses_before) = renderer.cache_stats();
+    assert_eq!(misses_before, 1, "first render rasterizes 'A' once");
+
+    renderer.set_theme_palette(light);
+    let second = renderer
+        .render(&state.snapshot(), &full_damage(&state))
+        .unwrap();
+    assert_eq!(
+        second.glyphs[0].color, light.foreground,
+        "cached glyph must be tinted with the new theme"
+    );
+    let (hits_after, misses_after) = renderer.cache_stats();
+    assert_eq!(misses_after, misses_before, "no re-rasterization");
+    assert!(hits_after > hits_before, "the second frame hits the cache");
+    assert_ne!(second.glyphs[0].color, first.glyphs[0].color);
+}
+
 /// Inverse video and default-preset fallbacks still hold under a custom
 /// palette (regression guard for the swapped pair).
 #[test]

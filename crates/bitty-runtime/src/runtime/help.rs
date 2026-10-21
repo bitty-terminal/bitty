@@ -200,6 +200,10 @@ impl Runtime {
             return false;
         };
         let live = self.live_cell_metrics();
+        // CTX-1395 (issue #2333): the panel is theme chrome, not a fixed
+        // indigo/lavender card. Copied once so the palette helpers never hold
+        // a borrow across the renderer calls below.
+        let palette = self.config.theme;
         // CTX-0253 F4: saturating origin/span math (see `super::present`
         // helpers) — hostile cell metrics must clip like compositors do,
         // never wrap the old `as i32` casts.
@@ -218,7 +222,7 @@ impl Runtime {
             rect: bitty_render::geometry::RectPx::new(
                 panel_px_x, panel_px_y, panel_px_w, panel_px_h,
             ),
-            color: bitty_render::grid::HELP_PANEL_BORDER,
+            color: bitty_render::grid::help_panel_border_in(&palette),
         });
         fills.push(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(
@@ -227,7 +231,7 @@ impl Runtime {
                 panel_px_w.saturating_sub(live.width.saturating_mul(2)),
                 panel_px_h.saturating_sub(live.height.saturating_mul(2)),
             ),
-            color: bitty_render::grid::HELP_PANEL_BG,
+            color: bitty_render::grid::help_panel_bg_in(&palette),
         });
         // CTX-0336: `DrawList` composites every glyph after every fill, so
         // the base grid's glyphs would otherwise draw on top of the opaque
@@ -246,7 +250,7 @@ impl Runtime {
             HELP_PANEL_TITLE,
             (text_x, px_add(panel_px_y, ch)),
             inner_cells,
-            bitty_render::grid::HELP_PANEL_FG,
+            bitty_render::grid::help_panel_fg_in(&palette),
         );
         glyphs.extend(title);
         for (i, row) in self.help_rows.iter().take(panel.visible_rows).enumerate() {
@@ -259,7 +263,7 @@ impl Runtime {
                 row,
                 (text_x, row_y),
                 inner_cells,
-                bitty_render::grid::HELP_PANEL_FG,
+                bitty_render::grid::help_panel_fg_in(&palette),
             );
             glyphs.extend(row_glyphs);
         }
@@ -272,7 +276,7 @@ impl Runtime {
                 &tail,
                 (text_x, px_add(panel_px_y, footer_row.saturating_mul(ch))),
                 inner_cells,
-                bitty_render::grid::HELP_PANEL_FG,
+                bitty_render::grid::help_panel_fg_in(&palette),
             );
             glyphs.extend(tail_glyphs);
             footer_row = footer_row.saturating_add(1);
@@ -281,7 +285,7 @@ impl Runtime {
             HELP_PANEL_FOOTER,
             (text_x, px_add(panel_px_y, footer_row.saturating_mul(ch))),
             inner_cells,
-            bitty_render::grid::HELP_PANEL_FG,
+            bitty_render::grid::help_panel_fg_in(&palette),
         );
         glyphs.extend(footer);
         // CTX-0336: keep the panel glyphs just pushed, drop any pre-existing

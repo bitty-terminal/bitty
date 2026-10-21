@@ -22,11 +22,9 @@ bitty-platform = { version = "0.0.24", path = "../bitty-platform" }
 # (`bitty_pty::OwnedTree`); workspace-internal path edge, no new
 # supply-chain surface.
 bitty-pty = { version = "0.0.24", path = "../bitty-pty" }
-# Fragment-to-RichBlock projection (CTX-0439) reads the bounded ingestion
-# DTOs; workspace-internal edge, no new supply-chain surface.
-# `version` is required for `cargo publish` (lockfile pins 0.0.1); the git
-# rev stays the build source until bitty-ipc lands on crates.io.
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+# CTX-1412 (#2117): the `bitty-ipc` edge existed only for the unwired
+# fragment-to-`RichBlock` projection; it is retired, so this Core crate keeps
+# no production edge to the extracted IPC repository.
 # 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
 # 0.4.x line; no other RNG is used so token entropy is auditable in one place.
 getrandom = "0.4"

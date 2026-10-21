@@ -102,8 +102,12 @@ const EXTENSION_CRATES: &[&str] = &[
 /// `EXTENSION_CRATES` that is absent here must have no normal edge at all.
 const SEAM_CRATES: &[(&str, &[&str])] = &[
     (
+        // CTX-1412 / bitty#2117: `bitty-rich` no longer links IPC. Its only
+        // consumer was the retired fragment-to-`RichBlock` projection
+        // (`src/projection.rs`), so the allowlist narrows to the runtime and
+        // the composition root.
         "bitty-ipc",
-        &["bitty-rich", "bitty-runtime", "bitty-terminal"],
+        &["bitty-runtime", "bitty-terminal"],
     ),
     ("bitty-network-wire", &["bitty-runtime"]),
     // Feature-gated provider-publication control-record contract (CTX-1390,

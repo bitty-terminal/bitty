@@ -611,7 +611,7 @@ fn char_literal_end(chars: &[char], index: usize) -> Option<usize> {
         _ => return None,
     };
     if chars.get(quote + 1) == Some(&'\\') {
-        let mut cursor = quote + 2;
+        let mut cursor = quote + 1;
         while cursor < chars.len() {
             match chars[cursor] {
                 '\\' => cursor += 2,
@@ -1063,6 +1063,13 @@ fn literal_stripping_preserves_code_lifetimes_and_comments() {
             "bitty-graphics"
         ),
         "an unterminated literal must not hide the rest of the file"
+    );
+    assert!(
+        names_crate_spelling(
+            &strip_literal_bodies("fn f() { let _ = '\\\\'; }\n// bitty-graphics\n"),
+            "bitty-graphics"
+        ),
+        "an escaped-backslash char literal must not swallow the next comment"
     );
 }
 

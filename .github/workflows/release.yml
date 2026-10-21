@@ -22,6 +22,12 @@ env:
   # Single pin for the Cloudflare Wrangler CLI used by release-time R2 jobs.
   WRANGLER_VERSION: 4.135.0
 
+# Channel source policy (CTX-1413, #1847): the package-manager publishers
+# (`aur-bin`, `homebrew`, `scoop`) prefer the R2-backed CDN at
+# https://cdn.bitty.run/releases/<TAG>/ and wait for `r2-mirror`. GitHub
+# Releases carries the same bytes and stays the documented fallback; every
+# channel verifies its published sha256 before publishing a recipe or manifest.
+
 jobs:
   # Validate packaging metadata before building (nfpm + nix)
   validate:
@@ -64,6 +70,9 @@ jobs:
       - name: Validate bitty-bin template (render test)
         run: |
           bash scripts/check-pkgbuild-bin.sh
+      - name: Validate package-manager manifests (R2/CDN primary)
+        run: |
+          bash scripts/tests/check-package-manifests.test.sh
       - name: Validate source PKGBUILD (artifact-install consistency)
         run: |
           bash scripts/check-pkgbuild-source.sh
@@ -1349,7 +1358,9 @@ jobs:
 
   aur-bin:
     name: Publish AUR bitty-bin (Arch, prebuilt)
-    needs: release
+    # The PKGBUILD points at the R2/CDN release path (CTX-1413, #1847), so the
+    # publish waits for the immutable mirror instead of racing it.
+    needs: r2-mirror
     runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 10
@@ -1411,14 +1422,26 @@ jobs:
             echo "could not derive _bitty_asset from packaging/PKGBUILD.bin" >&2
             exit 1
           fi
-          echo "bitty-bin asset: $ASSET at $TAG"
-          # Real sha256 from the published release asset; never SKIP the binary.
+          # R2/CDN is the preferred source for every package channel
+          # (CTX-1413, #1847); GitHub Releases stays the documented fallback.
+          BASE_URL="https://cdn.bitty.run/releases/${TAG}"
+          echo "bitty-bin asset: $ASSET at $TAG (R2/CDN primary)"
+          # Download the exact bytes the PKGBUILD will fetch and verify them
+          # against the published sidecar; never SKIP the binary checksum.
+          curl --fail --location --silent --show-error \
+            --output /tmp/bitty-bin-asset \
+            "${BASE_URL}/${ASSET}"
           curl --fail --location --silent --show-error \
             --output /tmp/bitty-bin.sha256 \
-            "https://github.com/bitty-terminal/bitty/releases/download/${TAG}/${ASSET}.sha256"
+            "${BASE_URL}/${ASSET}.sha256"
           SHA="$(cut -d' ' -f1 /tmp/bitty-bin.sha256)"
           if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "release sha256 asset did not yield a 64-hex digest: $SHA" >&2
+            echo "CDN sha256 sidecar did not yield a 64-hex digest: $SHA" >&2
+            exit 1
+          fi
+          ACTUAL_SHA="$(sha256sum /tmp/bitty-bin-asset | cut -d' ' -f1)"
+          if [ "$ACTUAL_SHA" != "$SHA" ]; then
+            echo "CDN asset checksum mismatch for ${ASSET}: expected ${SHA}, got ${ACTUAL_SHA}" >&2
             exit 1
           fi
           cp packaging/PKGBUILD.bin "$AUR_DIR/PKGBUILD"
@@ -1426,6 +1449,16 @@ jobs:
           sed -i "s/REPLACE_WITH_RELEASE_SHA256/$SHA/" "$AUR_DIR/PKGBUILD"
           if grep -q "REPLACE_WITH_RELEASE_SHA256" "$AUR_DIR/PKGBUILD"; then
             echo "sha256 placeholder not fully replaced" >&2
+            exit 1
+          fi
+          # Pin the rendered recipe to the R2/CDN host and the verified digest
+          # before it reaches AUR (the fallback GitHub URL is a comment only).
+          if ! grep -qF "https://cdn.bitty.run/releases/v\${pkgver}/${ASSET}" "$AUR_DIR/PKGBUILD"; then
+            echo "rendered PKGBUILD does not use the R2/CDN binary URL" >&2
+            exit 1
+          fi
+          if ! grep -qF "'$SHA'" "$AUR_DIR/PKGBUILD"; then
+            echo "rendered PKGBUILD does not carry the verified sha256" >&2
             exit 1
           fi
           id builder >/dev/null 2>&1 || useradd --create-home builder
@@ -1445,7 +1478,9 @@ jobs:
 
   homebrew:
     name: Bump Homebrew Formula
-    needs: release
+    # R2/CDN is the primary formula source (CTX-1413, #1847); wait for the
+    # immutable mirror so the rendered URLs and digests describe published bytes.
+    needs: r2-mirror
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_PUBLISH == 'true'
@@ -1462,13 +1497,30 @@ jobs:
           fi
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
-          BASE_URL="https://github.com/bitty-terminal/bitty/releases/download/${TAG}"
+          # GitHub Releases fallback is documented in the rendered formula.
+          BASE_URL="https://cdn.bitty.run/releases/${TAG}"
           INTEL_ASSET="bitty-x86_64-apple-darwin"
           ARM_ASSET="bitty-aarch64-apple-darwin"
-          curl --fail --location --silent --show-error --output "$INTEL_ASSET" "${BASE_URL}/${INTEL_ASSET}"
-          curl --fail --location --silent --show-error --output "$ARM_ASSET" "${BASE_URL}/${ARM_ASSET}"
-          SHA_INTEL="$(sha256sum "$INTEL_ASSET" | cut -d' ' -f1)"
-          SHA_ARM="$(sha256sum "$ARM_ASSET" | cut -d' ' -f1)"
+          # Fetch the artifact plus its published sidecar and fail closed on a
+          # mismatch; the sidecar digest is what the formula embeds.
+          fetch_verified() { # <asset> <dest>
+            local asset="$1" dest="$2" expected actual
+            curl --fail --location --silent --show-error --output "$dest" "${BASE_URL}/${asset}"
+            curl --fail --location --silent --show-error --output "${dest}.sha256" "${BASE_URL}/${asset}.sha256"
+            expected="$(cut -d' ' -f1 "${dest}.sha256")"
+            if ! printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "CDN sha256 sidecar for ${asset} did not yield a 64-hex digest: ${expected}" >&2
+              return 1
+            fi
+            actual="$(sha256sum "$dest" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "CDN asset checksum mismatch for ${asset}: expected ${expected}, got ${actual}" >&2
+              return 1
+            fi
+            printf '%s' "$expected"
+          }
+          SHA_INTEL="$(fetch_verified "$INTEL_ASSET" "$INTEL_ASSET")"
+          SHA_ARM="$(fetch_verified "$ARM_ASSET" "$ARM_ASSET")"
 
           mkdir -p homebrew-tap
           git -C homebrew-tap init
@@ -1481,31 +1533,23 @@ jobs:
             git -C homebrew-tap rm -rf . 2>/dev/null || true
           fi
           mkdir -p homebrew-tap/Formula
-          cat > homebrew-tap/Formula/bitty.rb <<EOF
-          class Bitty < Formula
-            desc "Bitty pre-alpha terminal workspace minimal correct terminal"
-            homepage "https://github.com/bitty-terminal/bitty"
-            version "${VERSION}"
-            license any_of: ["MIT", "Apache-2.0"]
-
-            if OS.mac? && Hardware::CPU.intel?
-              url "${BASE_URL}/${INTEL_ASSET}"
-              sha256 "${SHA_INTEL}"
-            elsif OS.mac? && Hardware::CPU.arm?
-              url "${BASE_URL}/${ARM_ASSET}"
-              sha256 "${SHA_ARM}"
-            end
-
-            def install
-              bin.install "${INTEL_ASSET}" => "bitty" if Hardware::CPU.intel?
-              bin.install "${ARM_ASSET}" => "bitty" if Hardware::CPU.arm?
-            end
-
-            test do
-              assert_match "${VERSION}", shell_output("#{bin}/bitty --version")
-            end
-          end
-          EOF
+          scripts/render-package-manifests.sh homebrew \
+            --version "$VERSION" \
+            --base-url "$BASE_URL" \
+            --intel-asset "$INTEL_ASSET" \
+            --arm-asset "$ARM_ASSET" \
+            --sha-intel "$SHA_INTEL" \
+            --sha-arm "$SHA_ARM" >homebrew-tap/Formula/bitty.rb
+          # The rendered formula must carry the R2/CDN host and the verified
+          # digests, not just whichever values the renderer happened to get.
+          grep -qF "url \"${BASE_URL}/${INTEL_ASSET}\"" homebrew-tap/Formula/bitty.rb ||
+            { echo "rendered formula lost the R2/CDN Intel URL" >&2; exit 1; }
+          grep -qF "url \"${BASE_URL}/${ARM_ASSET}\"" homebrew-tap/Formula/bitty.rb ||
+            { echo "rendered formula lost the R2/CDN ARM URL" >&2; exit 1; }
+          grep -qF "sha256 \"${SHA_INTEL}\"" homebrew-tap/Formula/bitty.rb ||
+            { echo "rendered formula lost the Intel digest" >&2; exit 1; }
+          grep -qF "sha256 \"${SHA_ARM}\"" homebrew-tap/Formula/bitty.rb ||
+            { echo "rendered formula lost the ARM digest" >&2; exit 1; }
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "github-actions[bot]@users.noreply.github.com"
           git -C homebrew-tap add Formula/bitty.rb
@@ -1516,7 +1560,9 @@ jobs:
 
   scoop:
     name: Bump Scoop Manifest
-    needs: release
+    # R2/CDN is the primary manifest source (CTX-1413, #1847); wait for the
+    # immutable mirror so the rendered URLs and hashes describe published bytes.
+    needs: r2-mirror
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v') && vars.SCOOP_PUBLISH == 'true'
@@ -1533,13 +1579,30 @@ jobs:
           fi
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
-          BASE_URL="https://github.com/bitty-terminal/bitty/releases/download/${TAG}"
+          # GitHub Releases fallback is documented in the rendered manifest.
+          BASE_URL="https://cdn.bitty.run/releases/${TAG}"
           X64_ASSET="bitty-x86_64-pc-windows-msvc.exe"
           ARM64_ASSET="bitty-aarch64-pc-windows-msvc.exe"
-          curl --fail --location --silent --show-error --output "$X64_ASSET" "${BASE_URL}/${X64_ASSET}"
-          curl --fail --location --silent --show-error --output "$ARM64_ASSET" "${BASE_URL}/${ARM64_ASSET}"
-          SHA_X64="$(sha256sum "$X64_ASSET" | cut -d' ' -f1)"
-          SHA_ARM64="$(sha256sum "$ARM64_ASSET" | cut -d' ' -f1)"
+          # Fetch the artifact plus its published sidecar and fail closed on a
+          # mismatch; the sidecar digest is what the manifest embeds.
+          fetch_verified() { # <asset> <dest>
+            local asset="$1" dest="$2" expected actual
+            curl --fail --location --silent --show-error --output "$dest" "${BASE_URL}/${asset}"
+            curl --fail --location --silent --show-error --output "${dest}.sha256" "${BASE_URL}/${asset}.sha256"
+            expected="$(cut -d' ' -f1 "${dest}.sha256")"
+            if ! printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "CDN sha256 sidecar for ${asset} did not yield a 64-hex digest: ${expected}" >&2
+              return 1
+            fi
+            actual="$(sha256sum "$dest" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "CDN asset checksum mismatch for ${asset}: expected ${expected}, got ${actual}" >&2
+              return 1
+            fi
+            printf '%s' "$expected"
+          }
+          SHA_X64="$(fetch_verified "$X64_ASSET" "$X64_ASSET")"
+          SHA_ARM64="$(fetch_verified "$ARM64_ASSET" "$ARM64_ASSET")"
 
           mkdir -p scoop-bucket
           git -C scoop-bucket init
@@ -1552,39 +1615,23 @@ jobs:
             git -C scoop-bucket rm -rf . 2>/dev/null || true
           fi
           mkdir -p scoop-bucket/bucket
-          cat > scoop-bucket/bucket/bitty.json <<EOF
-          {
-              "version": "${VERSION}",
-              "description": "Bitty pre-alpha terminal workspace minimal correct terminal",
-              "homepage": "https://github.com/bitty-terminal/bitty",
-              "license": "MIT OR Apache-2.0",
-              "architecture": {
-                  "64bit": {
-                      "url": "${BASE_URL}/${X64_ASSET}",
-                      "hash": "${SHA_X64}",
-                      "bin": "${X64_ASSET}"
-                  },
-                  "arm64": {
-                      "url": "${BASE_URL}/${ARM64_ASSET}",
-                      "hash": "${SHA_ARM64}",
-                      "bin": "${ARM64_ASSET}"
-                  }
-              },
-              "checkver": {
-                  "github": "https://github.com/bitty-terminal/bitty"
-              },
-              "autoupdate": {
-                  "architecture": {
-                      "64bit": {
-                          "url": "https://github.com/bitty-terminal/bitty/releases/download/v\$version/bitty-x86_64-pc-windows-msvc.exe"
-                      },
-                      "arm64": {
-                          "url": "https://github.com/bitty-terminal/bitty/releases/download/v\$version/bitty-aarch64-pc-windows-msvc.exe"
-                      }
-                  }
-              }
-          }
-          EOF
+          scripts/render-package-manifests.sh scoop \
+            --version "$VERSION" \
+            --base-url "$BASE_URL" \
+            --x64-asset "$X64_ASSET" \
+            --arm64-asset "$ARM64_ASSET" \
+            --sha-x64 "$SHA_X64" \
+            --sha-arm64 "$SHA_ARM64" >scoop-bucket/bucket/bitty.json
+          # The rendered manifest must carry the R2/CDN host and the verified
+          # digests, not just whichever values the renderer happened to get.
+          grep -qF "\"url\": \"${BASE_URL}/${X64_ASSET}\"" scoop-bucket/bucket/bitty.json ||
+            { echo "rendered manifest lost the R2/CDN x64 URL" >&2; exit 1; }
+          grep -qF "\"url\": \"${BASE_URL}/${ARM64_ASSET}\"" scoop-bucket/bucket/bitty.json ||
+            { echo "rendered manifest lost the R2/CDN arm64 URL" >&2; exit 1; }
+          grep -qF "\"hash\": \"${SHA_X64}\"" scoop-bucket/bucket/bitty.json ||
+            { echo "rendered manifest lost the x64 digest" >&2; exit 1; }
+          grep -qF "\"hash\": \"${SHA_ARM64}\"" scoop-bucket/bucket/bitty.json ||
+            { echo "rendered manifest lost the arm64 digest" >&2; exit 1; }
           git -C scoop-bucket config user.name "github-actions[bot]"
           git -C scoop-bucket config user.email "github-actions[bot]@users.noreply.github.com"
           git -C scoop-bucket add bucket/bitty.json
@@ -1593,6 +1640,10 @@ jobs:
             git -C scoop-bucket push origin main
           fi
 
+  # CTX-1413 (#1847): the immutable mirror is the preferred download source
+  # for the AUR bitty-bin, Homebrew, and Scoop publishers above. Those jobs
+  # wait on this one and verify every artifact against its published .sha256
+  # sidecar before rendering; GitHub Releases stays the documented fallback.
   r2-mirror:
     name: Mirror release to R2
     needs: release

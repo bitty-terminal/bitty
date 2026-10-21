@@ -7,7 +7,9 @@ configuration keys, and package names may change between releases.
 
 The product site is [bitty.run](https://bitty.run). Release artifacts and
 release notes are published on
-[GitHub Releases](https://github.com/bitty-terminal/bitty/releases).
+[GitHub Releases](https://github.com/bitty-terminal/bitty/releases) and on the
+R2-backed CDN at `https://cdn.bitty.run/releases/<tag>/` (the preferred
+download source).
 
 ## Install
 
@@ -22,11 +24,13 @@ paru -S bitty      # build from source
 
 ### Release binary
 
-Download a platform package or archive from
-[GitHub Releases](https://github.com/bitty-terminal/bitty/releases). Supported
-release artifacts include Linux, macOS, and Windows binaries, plus selected
-Linux packages. Packaging details are in
-[`packaging/README.md`](packaging/README.md).
+Download a platform package or archive from the R2-backed CDN at
+`https://cdn.bitty.run/releases/<tag>/` (preferred) or
+[GitHub Releases](https://github.com/bitty-terminal/bitty/releases) (the same
+bytes, documented fallback). Supported release artifacts include Linux, macOS,
+and Windows binaries, plus selected Linux packages. Every artifact has a
+`.sha256` sidecar, and the install scripts and package-manager channels verify
+it. Packaging details are in [`packaging/README.md`](packaging/README.md).
 
 ### Build from source
 

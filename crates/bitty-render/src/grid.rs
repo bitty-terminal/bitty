@@ -337,7 +337,8 @@ pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
 /// uses [`help_panel_bg_in`] (theme selection ground).
 pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
 /// Bitty Dark reference accent for the help popup ring (CTX-0265); production
-/// uses [`help_panel_border_in`] (theme ANSI 12 accent).
+/// uses [`help_panel_border_in`] (theme ANSI 12 accent, with a theme-owned
+/// fallback when the accent cannot clear the 3:1 non-text floor).
 pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
 /// Bitty Dark reference text for [`HELP_PANEL_BG`]; production uses
 /// [`help_panel_fg_in`] (theme foreground).
@@ -421,10 +422,38 @@ pub const fn help_panel_bg_in(palette: &ThemePalette) -> Rgba8 {
     palette.selection
 }
 
-/// Theme-aware help-panel accent ring (CTX-1395): ANSI 12.
+/// Theme-aware help-panel accent ring (CTX-1395, CTX-1418): ANSI 12.
+///
+/// The ring is a non-text UI boundary drawn on the selection ground, so it
+/// must clear the 3:1 non-text floor. ANSI 12 is the primary accent, but on
+/// several presets it sits too close to that ground; the helper then falls
+/// back through ANSI 4, ANSI 6, and finally the foreground. Every candidate
+/// is theme-owned (including any live OSC 4 override), so the ring never
+/// invents a color and follows a theme switch.
 #[must_use]
 pub fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
-    let rgb = palette.active_index(HELP_PANEL_ACCENT_ANSI_INDEX);
+    let candidates = [
+        palette.active_index(HELP_PANEL_ACCENT_ANSI_INDEX),
+        palette.active_index(4),
+        palette.active_index(6),
+        [
+            palette.foreground[0],
+            palette.foreground[1],
+            palette.foreground[2],
+        ],
+    ];
+    let selection = [
+        palette.selection[0],
+        palette.selection[1],
+        palette.selection[2],
+    ];
+    let winner = bitty_config::theme::readable_accent(
+        &candidates,
+        selection,
+        bitty_config::theme::MIN_UI_CONTRAST,
+    )
+    .unwrap_or(candidates.len() - 1);
+    let rgb = candidates[winner];
     [rgb[0], rgb[1], rgb[2], 0xFF]
 }
 

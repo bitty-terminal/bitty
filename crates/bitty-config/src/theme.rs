@@ -59,6 +59,52 @@
 //! No preset needs an AC-1/AC-2 exemption: every catalog pair satisfies both
 //! enforced rules, and the catalog tests below pin that.
 //!
+//! # Readability policy (CTX-1418, issue #2370)
+//!
+//! Presets are matched case- and space-insensitively to Ghostty's shipped
+//! theme corpus where a canonical file exists; matching presets reproduce the
+//! Ghostty palette rather than an older iTerm2 export. `bitty-dark` has no
+//! Ghostty counterpart and keeps its designed values. Where a canonical
+//! Ghostty value is unreadable under this policy the value is repaired
+//! minimally (lightness only, hue preserved) and the deviation is recorded in
+//! `bitty-terminal-docs`; the full per-preset table, including Ghostty
+//! provenance, lives in the configuration reference.
+//!
+//! The enforced floors are [`MIN_TEXT_CONTRAST`] (4.5:1) for the default
+//! foreground and the chromatic ANSI slots TUIs use for syntax highlighting
+//! (1–6 and 9–14), [`MIN_TEXT_CONTRAST`] for the cursor fill against the
+//! background, and [`MIN_SELECTION_CONTRAST`] (1.3:1) for the selection fill
+//! while selected text keeps [`MIN_TEXT_CONTRAST`]. ANSI 0/8 are surface
+//! tokens and may legally sit near the background; in light presets 7/15 are
+//! surface tokens too. They are reported by `bitty config check` but never
+//! treated as text. [`TEXT_CONTRAST_EXEMPTIONS`] and
+//! [`SELECTION_CONTRAST_EXEMPTIONS`] name the only accepted exceptions
+//! (Solarized, designed low-contrast); the catalog tests require each
+//! exemption to still measure below its floor, so exemptions cannot go dead.
+//!
+//! Derived chrome uses the same measurements and the same theme-owned
+//! colors: the IME preedit underline (cursor on selection) clears
+//! [`MIN_UI_CONTRAST`], the help-panel ring is the first of ANSI 12/4/6 or
+//! the foreground that clears [`MIN_UI_CONTRAST`] on the selection ground
+//! ([`help_ring_source`]), and the pending-paste banner picks black or white
+//! for [`MIN_TEXT_CONTRAST`] on ANSI 3 ([`banner_text`]). No chrome role
+//! invents a color outside the resolved palette.
+//!
+//! Contrast alone can hide a palette regression: two families may end up at
+//! the same hue and similar lightness after a repair. [`hue_checks`] measures
+//! every cross-family ANSI pair in CIE76 `ΔE*ab` and HSL hue separation,
+//! requiring [`MIN_ANSI_FAMILY_DELTA_E`] *or*
+//! [`MIN_ANSI_FAMILY_HUE_DEGREES`]. Normal/bright aliases inside one family
+//! are intentional and skipped.
+//! [`HUE_COLLISION_EXEMPTIONS`] documents Solarized's neutral bright ramp,
+//! and the catalog test requires that exemption to stay measurable.
+//!
+//! Cursor-vs-foreground contrast is deliberately not a floor: with a
+//! foreground/background pair at or above 4.5:1 no block fill can clear 3:1
+//! against both sides (the usable luminance interval is too narrow). The
+//! cursor is a block cue measured against the background; the glyph under it
+//! is a separate reverse-video rendering concern.
+//!
 //! # Bitty Dark palette — role table
 //!
 //! | Role | Swatch | Value | Serves |
@@ -160,6 +206,547 @@ impl Theme {
     }
 }
 
+// -- Contrast policy (CTX-1418, issue #2370) --------------------------------
+//
+// Built-in presets are user-facing defaults, so their readability is a
+// product contract, not a cosmetic preference. The policy below is the one
+// `bitty config check` reports and the catalog test enforces:
+//
+// - **Text**: the default foreground and every chromatic ANSI slot used by
+//   syntax-highlighting TUIs (indices 1–6 and 9–14) must clear WCAG AA
+//   normal-text contrast (>= 4.5:1) against the preset background.
+// - **Neutral ANSI**: `0`/`8` (black/bright black) are surface tokens, and in
+//   light presets `7`/`15` (white/bright white) are surface tokens too. They
+//   are exempt from the text floor but must stay visible against the
+//   background (>= 1.2:1) or be an explicit background alias.
+// - **Cursor**: a block-cursor fill must clear the normal-text floor against
+//   the background. A fill that also had to clear 3:1 against the foreground
+//   cannot exist whenever foreground/background is >= 4.5:1: the interval
+//   between the two luminances is too narrow. The cursor is therefore a
+//   block cue judged against the background (the glyph under it is a
+//   separate reverse-video concern), not a foreground-colored glyph.
+// - **Selection**: the selected text keeps the preset foreground, so
+//   foreground-on-selection must clear 4.5:1, and the selection fill itself
+//   must be visible against the background (>= 1.3:1).
+//
+// Exemptions are explicit and pinned by tests: a preset listed as exempt
+// must still measure below the floor, so an exemption cannot silently become
+// dead policy. Solarized is the only family with exemptions because its
+// upstream design is deliberately low-contrast (fg/bg 4.13 light, 4.75 dark)
+// and its visible selection necessarily eats part of that headroom.
+
+/// WCAG 2.1 AA contrast floor for normal text (4.5:1).
+pub const MIN_TEXT_CONTRAST: f64 = 4.5;
+
+/// WCAG 2.1 AA contrast floor for large text and non-text UI (3:1).
+pub const MIN_UI_CONTRAST: f64 = 3.0;
+
+/// Minimum visibility of the selection fill against the background (1.3:1).
+pub const MIN_SELECTION_CONTRAST: f64 = 1.3;
+
+/// Minimum visibility of a neutral surface token against the background
+/// (1.2:1). Surface tokens are never required to clear the text floor.
+pub const MIN_SURFACE_CONTRAST: f64 = 1.2;
+
+/// Perceptual distance (CIE76 `ΔE*ab`) that keeps two different ANSI color
+/// families visually distinct even when their hues are close (for example
+/// Nord's frost blue and cyan). A palette pair that fails this floor must
+/// separate by at least [`MIN_ANSI_FAMILY_HUE_DEGREES`] instead.
+pub const MIN_ANSI_FAMILY_DELTA_E: f64 = 14.0;
+
+/// Hue separation (degrees, HSL) that keeps two different ANSI color
+/// families distinguishable when their lightness is close.
+pub const MIN_ANSI_FAMILY_HUE_DEGREES: f64 = 15.0;
+
+/// Presets whose default foreground is an accepted upstream low-contrast
+/// value, with the reason. The catalog test requires each entry to still be
+/// below [`MIN_TEXT_CONTRAST`] so the exemption stays live.
+pub const TEXT_CONTRAST_EXEMPTIONS: &[(&str, &str)] = &[(
+    "solarized-light",
+    "Solarized is designed as a low-contrast scheme; foreground #657b83 on \
+     background #fdf6e3 is 4.13:1 upstream and is retained verbatim",
+)];
+
+/// Presets whose selection cannot hold both the text floor and the visibility
+/// floor because their foreground/background pair leaves no headroom, with
+/// the reason. Measured values are reported by `bitty config check`.
+pub const SELECTION_CONTRAST_EXEMPTIONS: &[(&str, &str)] = &[
+    (
+        "solarized-dark",
+        "Solarized is designed low-contrast (fg/bg 4.75:1); a visible \
+         selection necessarily drops selected text below 4.5:1",
+    ),
+    (
+        "solarized-light",
+        "Solarized is designed low-contrast (fg/bg 4.13:1, itself exempt); \
+         the selection tracks that documented ceiling",
+    ),
+];
+
+/// Role of one contrast check row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContrastRole {
+    /// Default foreground on the preset background.
+    Foreground,
+    /// A chromatic ANSI slot used as foreground text.
+    AnsiText(u8),
+    /// A neutral ANSI slot used as a surface tone.
+    AnsiSurface(u8),
+    /// Block-cursor fill against the background.
+    Cursor,
+    /// Preset foreground on the selection fill.
+    SelectionText,
+    /// Selection fill against the background.
+    SelectionSurface,
+    /// Cursor fill against the selection fill (IME preedit underline over
+    /// the preedit ground).
+    CursorSelection,
+    /// Derived help-panel ring against the help-panel ground (selection).
+    HelpRing,
+    /// Derived pending-paste banner text against the ANSI 3 ground.
+    BannerText,
+}
+
+impl ContrastRole {
+    /// Stable diagnostic label (`foreground`, `ansi[2] text`, ...).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::AnsiText(0) => "ansi[0] text",
+            Self::AnsiText(1) => "ansi[1] text",
+            Self::AnsiText(2) => "ansi[2] text",
+            Self::AnsiText(3) => "ansi[3] text",
+            Self::AnsiText(4) => "ansi[4] text",
+            Self::AnsiText(5) => "ansi[5] text",
+            Self::AnsiText(6) => "ansi[6] text",
+            Self::AnsiText(7) => "ansi[7] text",
+            Self::AnsiText(8) => "ansi[8] text",
+            Self::AnsiText(9) => "ansi[9] text",
+            Self::AnsiText(10) => "ansi[10] text",
+            Self::AnsiText(11) => "ansi[11] text",
+            Self::AnsiText(12) => "ansi[12] text",
+            Self::AnsiText(13) => "ansi[13] text",
+            Self::AnsiText(14) => "ansi[14] text",
+            Self::AnsiText(_) => "ansi[15] text",
+            Self::AnsiSurface(0) => "ansi[0] surface",
+            Self::AnsiSurface(1) => "ansi[1] surface",
+            Self::AnsiSurface(2) => "ansi[2] surface",
+            Self::AnsiSurface(3) => "ansi[3] surface",
+            Self::AnsiSurface(4) => "ansi[4] surface",
+            Self::AnsiSurface(5) => "ansi[5] surface",
+            Self::AnsiSurface(6) => "ansi[6] surface",
+            Self::AnsiSurface(7) => "ansi[7] surface",
+            Self::AnsiSurface(8) => "ansi[8] surface",
+            Self::AnsiSurface(9) => "ansi[9] surface",
+            Self::AnsiSurface(10) => "ansi[10] surface",
+            Self::AnsiSurface(11) => "ansi[11] surface",
+            Self::AnsiSurface(12) => "ansi[12] surface",
+            Self::AnsiSurface(13) => "ansi[13] surface",
+            Self::AnsiSurface(14) => "ansi[14] surface",
+            Self::AnsiSurface(_) => "ansi[15] surface",
+            Self::Cursor => "cursor",
+            Self::SelectionText => "selection.text",
+            Self::SelectionSurface => "selection.surface",
+            Self::CursorSelection => "cursor.on-selection",
+            Self::HelpRing => "chrome.help-ring",
+            Self::BannerText => "chrome.banner-text",
+        }
+    }
+}
+
+/// One measured contrast row for a preset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeContrastCheck {
+    /// What was measured.
+    pub role: ContrastRole,
+    /// Measured WCAG contrast ratio.
+    pub ratio: f64,
+    /// Floor that applies to this role.
+    pub floor: f64,
+    /// Whether the measurement clears the floor or carries an exemption.
+    pub passed: bool,
+    /// Explicit reason when an upstream value is retained below the floor.
+    pub exemption: Option<&'static str>,
+}
+
+impl ThemeContrastCheck {
+    fn new(role: ContrastRole, ratio: f64, floor: f64, exemption: Option<&'static str>) -> Self {
+        Self {
+            role,
+            ratio,
+            floor,
+            passed: ratio >= floor || exemption.is_some(),
+            exemption,
+        }
+    }
+}
+
+/// Returns the documented text-contrast exemption for `theme`, if any.
+#[must_use]
+pub fn text_contrast_exemption(theme: &Theme) -> Option<&'static str> {
+    TEXT_CONTRAST_EXEMPTIONS
+        .iter()
+        .find(|(name, _)| *name == theme.name)
+        .map(|(_, reason)| *reason)
+}
+
+/// Returns the documented selection-contrast exemption for `theme`, if any.
+#[must_use]
+pub fn selection_contrast_exemption(theme: &Theme) -> Option<&'static str> {
+    SELECTION_CONTRAST_EXEMPTIONS
+        .iter()
+        .find(|(name, _)| *name == theme.name)
+        .map(|(_, reason)| *reason)
+}
+
+/// First candidate color that clears `floor` against `background`.
+///
+/// Derived chrome (help-panel ring, IME accent) must stay legible without
+/// inventing a color: the caller supplies theme-owned candidates in
+/// preference order. Returns the index of the winning candidate so
+/// diagnostics can name the role that won.
+#[must_use]
+pub fn readable_accent(candidates: &[[u8; 3]], background: [u8; 3], floor: f64) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|candidate| crate::types::contrast_ratio(*candidate, background) >= floor)
+}
+
+/// Help-panel ring source for `theme`: the first of ANSI 12 (the primary
+/// accent), ANSI 4, ANSI 6, or the foreground that clears [`MIN_UI_CONTRAST`]
+/// against the help-panel ground (the selection fill). Mirrors
+/// `bitty-render`'s `help_panel_border_in`, which applies the same candidate
+/// order to the live palette (including OSC 4 overrides).
+#[must_use]
+pub fn help_ring_source(theme: &Theme) -> usize {
+    let candidates = [
+        theme.ansi_entry(12),
+        theme.ansi_entry(4),
+        theme.ansi_entry(6),
+        theme.foreground,
+    ];
+    // The foreground is always a candidate and selected text clears 4.5:1
+    // (or its documented Solarized exemption), so this cannot be `None`.
+    readable_accent(&candidates, theme.selection, MIN_UI_CONTRAST).unwrap_or(3)
+}
+
+/// Black or white, whichever reads better on `background` (the pending-paste
+/// banner's derived text role in `bitty-render`).
+#[must_use]
+pub fn banner_text(background: [u8; 3]) -> [u8; 3] {
+    use crate::types::contrast_ratio;
+    let black = contrast_ratio([0, 0, 0], background);
+    let white = contrast_ratio([255, 255, 255], background);
+    if black >= white {
+        [0, 0, 0]
+    } else {
+        [255, 255, 255]
+    }
+}
+
+/// One measured ANSI hue/lightness collision for a preset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeHueCheck {
+    /// Lower ANSI index of the pair (0–15).
+    pub first: u8,
+    /// Higher ANSI index of the pair (0–15).
+    pub second: u8,
+    /// CIE76 `ΔE*ab` between the two colors.
+    pub delta_e: f64,
+    /// HSL hue separation in degrees (0–180).
+    pub hue_delta: f64,
+    /// Whether the pair clears [`MIN_ANSI_FAMILY_DELTA_E`] or
+    /// [`MIN_ANSI_FAMILY_HUE_DEGREES`].
+    pub passed: bool,
+}
+
+/// Chromatic ANSI indices: the six normal families (1–6) and their bright
+/// counterparts (9–14).
+const CHROMATIC_ANSI: [u8; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
+
+/// ANSI family of one chromatic index (0 = red … 5 = cyan).
+const fn ansi_family(index: u8) -> Option<u8> {
+    match index {
+        1 | 9 => Some(0),
+        2 | 10 => Some(1),
+        3 | 11 => Some(2),
+        4 | 12 => Some(3),
+        5 | 13 => Some(4),
+        6 | 14 => Some(5),
+        _ => None,
+    }
+}
+
+/// `sRGB` byte to CIE L*a*b* (D65).
+fn lab(rgb: [u8; 3]) -> [f64; 3] {
+    fn linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let (r, g, b) = (linear(rgb[0]), linear(rgb[1]), linear(rgb[2]));
+    let x = r * 0.412_456_4 + g * 0.357_576_1 + b * 0.180_437_5;
+    let y = r * 0.212_672_9 + g * 0.715_152_2 + b * 0.072_175_0;
+    let z = r * 0.019_333_9 + g * 0.119_192_0 + b * 0.950_304_1;
+    let f = |t: f64| {
+        if t > 0.008_856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x / 0.950_47), f(y), f(z / 1.088_83));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIE76 `ΔE*ab` between two opaque colors.
+#[must_use]
+pub fn delta_e(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let (la, lb) = (lab(a), lab(b));
+    ((la[0] - lb[0]).powi(2) + (la[1] - lb[1]).powi(2) + (la[2] - lb[2]).powi(2)).sqrt()
+}
+
+/// HSL hue in degrees (0–360) for `rgb`; `None` for an achromatic color.
+fn hue_degrees(rgb: [u8; 3]) -> Option<f64> {
+    let (r, g, b) = (
+        f64::from(rgb[0]) / 255.0,
+        f64::from(rgb[1]) / 255.0,
+        f64::from(rgb[2]) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    if chroma == 0.0 {
+        return None;
+    }
+    let hue = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    Some(hue * 60.0)
+}
+
+/// Smallest separation between two hues, in degrees (0–180).
+fn hue_separation(a: [u8; 3], b: [u8; 3]) -> f64 {
+    match (hue_degrees(a), hue_degrees(b)) {
+        (Some(first), Some(second)) => {
+            let delta = (first - second).abs();
+            delta.min(360.0 - delta)
+        }
+        // An achromatic pair has no hue to collide; its lightness difference
+        // is measured by `delta_e` instead.
+        _ => 180.0,
+    }
+}
+
+/// Measures every cross-family ANSI pair of `theme` for hue/lightness
+/// collisions.
+///
+/// Normal (1–6) and bright (9–14) slots of the same family are skipped:
+/// aliasing a bright slot to its normal slot is an intentional design choice
+/// in several upstream palettes and is not a collision. Every pair of
+/// *different* families must separate by [`MIN_ANSI_FAMILY_DELTA_E`] or
+/// [`MIN_ANSI_FAMILY_HUE_DEGREES`].
+#[must_use]
+pub fn hue_checks(theme: &Theme) -> Vec<ThemeHueCheck> {
+    let mut rows = Vec::with_capacity(60);
+    for (offset, &first) in CHROMATIC_ANSI.iter().enumerate() {
+        for &second in &CHROMATIC_ANSI[offset + 1..] {
+            if ansi_family(first) == ansi_family(second) {
+                continue;
+            }
+            let a = theme.ansi_entry(first);
+            let b = theme.ansi_entry(second);
+            let delta_e = delta_e(a, b);
+            let hue_delta = hue_separation(a, b);
+            rows.push(ThemeHueCheck {
+                first,
+                second,
+                delta_e,
+                hue_delta,
+                passed: delta_e >= MIN_ANSI_FAMILY_DELTA_E
+                    || hue_delta >= MIN_ANSI_FAMILY_HUE_DEGREES,
+            });
+        }
+    }
+    rows
+}
+
+/// Presets whose bright ANSI slots are deliberately neutral `base0`–`base3`
+/// tones rather than distinct hues, with the reason. The catalog test
+/// requires an exempt preset to still measure at least one collision, so the
+/// exemption cannot become dead policy.
+pub const HUE_COLLISION_EXEMPTIONS: &[(&str, &str)] = &[
+    (
+        "solarized-dark",
+        "Solarized's bright slots 9–14 are the canonical base0/base1/orange \
+         tones, not six distinguishable hues; changing them would discard the \
+         scheme's defining neutral bright ramp",
+    ),
+    (
+        "solarized-light",
+        "Solarized's bright slots 9–14 are the canonical base0/base1/orange \
+         tones, not six distinguishable hues; changing them would discard the \
+         scheme's defining neutral bright ramp",
+    ),
+];
+
+/// Returns the documented hue-collision exemption for `theme`, if any.
+#[must_use]
+pub fn hue_collision_exemption(theme: &Theme) -> Option<&'static str> {
+    HUE_COLLISION_EXEMPTIONS
+        .iter()
+        .find(|(name, _)| *name == theme.name)
+        .map(|(_, reason)| *reason)
+}
+
+/// ANSI pairs that collapse by both hue and lightness. Presets with a
+/// documented [`HUE_COLLISION_EXEMPTIONS`] entry report no violations (the
+/// exemption is measured by the catalog test).
+#[must_use]
+pub fn hue_violations(theme: &Theme) -> Vec<ThemeHueCheck> {
+    if hue_collision_exemption(theme).is_some() {
+        return Vec::new();
+    }
+    hue_checks(theme)
+        .into_iter()
+        .filter(|row| !row.passed)
+        .collect()
+}
+
+/// Measures every contrast role the readability policy covers for `theme`.
+///
+/// The returned rows are stable in order: foreground, ANSI 0–15, cursor,
+/// selection text, selection surface, cursor-on-selection, help-panel ring,
+/// banner text. `bitty config check` prints them and the catalog test fails
+/// on any row with `passed == false`.
+#[must_use]
+pub fn contrast_checks(theme: &Theme) -> Vec<ThemeContrastCheck> {
+    use crate::types::contrast_ratio;
+
+    let bg = theme.background;
+    let mut rows = Vec::with_capacity(23);
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::Foreground,
+        contrast_ratio(theme.foreground, bg),
+        MIN_TEXT_CONTRAST,
+        text_contrast_exemption(theme),
+    ));
+    let selection_exempt = selection_contrast_exemption(theme);
+    for index in 0u8..16 {
+        let rgb = theme.ansi_entry(index);
+        let ratio = contrast_ratio(rgb, bg);
+        if (1..=6).contains(&index) || (9..=14).contains(&index) {
+            rows.push(ThemeContrastCheck::new(
+                ContrastRole::AnsiText(index),
+                ratio,
+                MIN_TEXT_CONTRAST,
+                None,
+            ));
+        } else if index == 7 || index == 15 {
+            if theme.category == ThemeCategory::Dark {
+                // Dark presets use white/bright-white as text.
+                rows.push(ThemeContrastCheck::new(
+                    ContrastRole::AnsiText(index),
+                    ratio,
+                    MIN_TEXT_CONTRAST,
+                    None,
+                ));
+            } else {
+                // Light presets use white/bright-white as surfaces; several
+                // canonical exports use the background itself as ANSI 15.
+                rows.push(ThemeContrastCheck::new(
+                    ContrastRole::AnsiSurface(index),
+                    ratio,
+                    MIN_SURFACE_CONTRAST,
+                    (ratio < MIN_SURFACE_CONTRAST).then_some("background alias (surface role)"),
+                ));
+            }
+        } else {
+            rows.push(ThemeContrastCheck::new(
+                ContrastRole::AnsiSurface(index),
+                ratio,
+                MIN_SURFACE_CONTRAST,
+                (ratio < MIN_SURFACE_CONTRAST).then_some("background alias (surface role)"),
+            ));
+        }
+    }
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::Cursor,
+        contrast_ratio(theme.cursor, bg),
+        MIN_TEXT_CONTRAST,
+        None,
+    ));
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::SelectionText,
+        contrast_ratio(theme.foreground, theme.selection),
+        MIN_TEXT_CONTRAST,
+        selection_exempt,
+    ));
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::SelectionSurface,
+        contrast_ratio(theme.selection, bg),
+        MIN_SELECTION_CONTRAST,
+        selection_exempt,
+    ));
+    // Derived chrome roles. These are the same expressions the renderer
+    // uses, so a preset cannot pass the policy and still ship an unreadable
+    // banner, IME underline, or help-panel ring.
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::CursorSelection,
+        contrast_ratio(theme.cursor, theme.selection),
+        MIN_UI_CONTRAST,
+        None,
+    ));
+    let ring = [
+        theme.ansi_entry(12),
+        theme.ansi_entry(4),
+        theme.ansi_entry(6),
+        theme.foreground,
+    ][help_ring_source(theme)];
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::HelpRing,
+        contrast_ratio(ring, theme.selection),
+        MIN_UI_CONTRAST,
+        None,
+    ));
+    rows.push(ThemeContrastCheck::new(
+        ContrastRole::BannerText,
+        contrast_ratio(banner_text(theme.ansi_entry(3)), theme.ansi_entry(3)),
+        MIN_TEXT_CONTRAST,
+        None,
+    ));
+    rows
+}
+
+/// Returns only the rows that fail the policy. Empty means the preset is
+/// readable under the documented floors (exempt rows count as passing).
+#[must_use]
+pub fn contrast_violations(theme: &Theme) -> Vec<ThemeContrastCheck> {
+    contrast_checks(theme)
+        .into_iter()
+        .filter(|row| !row.passed)
+        .collect()
+}
+
+/// Minimum measured contrast across the chromatic ANSI text slots (1–6 and
+/// 9–14), for the compact `bitty config check` summary.
+#[must_use]
+pub fn min_ansi_text_contrast(theme: &Theme) -> f64 {
+    use crate::types::contrast_ratio;
+    (1..=6)
+        .chain(9..=14)
+        .map(|index| contrast_ratio(theme.ansi_entry(index), theme.background))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// The designed default preset: Bitty Dark.
 ///
 /// Values are documented in the module-level role table.
@@ -208,7 +795,7 @@ pub static TOKYO_NIGHT: Theme = Theme {
     background: [0x1A, 0x1B, 0x26],
     foreground: [0xC0, 0xCA, 0xF5],
     cursor: [0xC0, 0xCA, 0xF5],
-    selection: [0x28, 0x34, 0x57],
+    selection: [0x33, 0x46, 0x7C],
     border_focused: OutlineColor([0xA4, 0xDA, 0xFF, 0xFF]),
     border_idle: OutlineColor([0x41, 0x48, 0x68, 0xFF]),
     ansi: [
@@ -221,12 +808,12 @@ pub static TOKYO_NIGHT: Theme = Theme {
         [0x7D, 0xCF, 0xFF], // 6 cyan
         [0xA9, 0xB1, 0xD6], // 7 white
         [0x41, 0x48, 0x68], // 8 black
-        [0xFF, 0x89, 0x9D], // 9 red
-        [0x9F, 0xE0, 0x44], // 10 green
-        [0xFA, 0xBA, 0x4A], // 11 yellow
-        [0x8D, 0xB0, 0xFF], // 12 blue
-        [0xC7, 0xA9, 0xFF], // 13 magenta
-        [0xA4, 0xDA, 0xFF], // 14 cyan
+        [0xF7, 0x76, 0x8E], // 9 red
+        [0x9E, 0xCE, 0x6A], // 10 green
+        [0xE0, 0xAF, 0x68], // 11 yellow
+        [0x7A, 0xA2, 0xF7], // 12 blue
+        [0xBB, 0x9A, 0xF7], // 13 magenta
+        [0x7D, 0xCF, 0xFF], // 14 cyan
         [0xC0, 0xCA, 0xF5], // 15 white
     ],
 };
@@ -244,7 +831,7 @@ pub static TOKYO_NIGHT_STORM: Theme = Theme {
     background: [0x24, 0x28, 0x3B],
     foreground: [0xC0, 0xCA, 0xF5],
     cursor: [0xC0, 0xCA, 0xF5],
-    selection: [0x2E, 0x3C, 0x64],
+    selection: [0x36, 0x4A, 0x82],
     border_focused: OutlineColor([0xA4, 0xDA, 0xFF, 0xFF]),
     border_idle: OutlineColor([0x41, 0x48, 0x68, 0xFF]),
     ansi: [
@@ -256,13 +843,13 @@ pub static TOKYO_NIGHT_STORM: Theme = Theme {
         [0xBB, 0x9A, 0xF7], // 5 magenta
         [0x7D, 0xCF, 0xFF], // 6 cyan
         [0xA9, 0xB1, 0xD6], // 7 white
-        [0x41, 0x48, 0x68], // 8 black
-        [0xFF, 0x89, 0x9D], // 9 red
-        [0x9F, 0xE0, 0x44], // 10 green
-        [0xFA, 0xBA, 0x4A], // 11 yellow
-        [0x8D, 0xB0, 0xFF], // 12 blue
-        [0xC7, 0xA9, 0xFF], // 13 magenta
-        [0xA4, 0xDA, 0xFF], // 14 cyan
+        [0x4E, 0x55, 0x75], // 8 black
+        [0xF7, 0x76, 0x8E], // 9 red
+        [0x9E, 0xCE, 0x6A], // 10 green
+        [0xE0, 0xAF, 0x68], // 11 yellow
+        [0x7A, 0xA2, 0xF7], // 12 blue
+        [0xBB, 0x9A, 0xF7], // 13 magenta
+        [0x7D, 0xCF, 0xFF], // 14 cyan
         [0xC0, 0xCA, 0xF5], // 15 white
     ],
 };
@@ -278,27 +865,27 @@ pub static TOKYO_NIGHT_DAY: Theme = Theme {
     source: "https://github.com/folke/tokyonight.nvim",
     license: "Apache-2.0",
     background: [0xE1, 0xE2, 0xE7],
-    foreground: [0x37, 0x60, 0xBF],
+    foreground: [0x2A, 0x4C, 0x9B],
     cursor: [0x37, 0x60, 0xBF],
-    selection: [0xB7, 0xC1, 0xE3],
+    selection: [0xBE, 0xC7, 0xDF],
     border_focused: OutlineColor([0x00, 0x71, 0x97, 0xFF]),
     border_idle: OutlineColor([0xB7, 0xC1, 0xE3, 0xFF]),
     ansi: [
-        [0xB4, 0xB5, 0xB9], // 0 black
-        [0xF5, 0x2A, 0x65], // 1 red
-        [0x58, 0x75, 0x39], // 2 green
-        [0x8C, 0x6C, 0x3E], // 3 yellow
-        [0x2E, 0x7D, 0xE9], // 4 blue
-        [0x98, 0x54, 0xF1], // 5 magenta
-        [0x00, 0x71, 0x97], // 6 cyan
+        [0xE9, 0xE9, 0xED], // 0 black
+        [0xC1, 0x21, 0x4F], // 1 red
+        [0x52, 0x6D, 0x35], // 2 green
+        [0x7C, 0x60, 0x37], // 3 yellow
+        [0x25, 0x63, 0xB9], // 4 blue
+        [0x7E, 0x46, 0xC8], // 5 magenta
+        [0x00, 0x6D, 0x91], // 6 cyan
         [0x61, 0x72, 0xB0], // 7 white
         [0xA1, 0xA6, 0xC5], // 8 black
-        [0xFF, 0x47, 0x74], // 9 red
-        [0x5C, 0x85, 0x24], // 10 green
-        [0xA2, 0x76, 0x29], // 11 yellow
-        [0x35, 0x8A, 0xFF], // 12 blue
-        [0xA4, 0x63, 0xFF], // 13 magenta
-        [0x00, 0x7E, 0xA8], // 14 cyan
+        [0xC1, 0x21, 0x4F], // 9 red
+        [0x52, 0x6D, 0x35], // 10 green
+        [0x7C, 0x60, 0x37], // 11 yellow
+        [0x25, 0x63, 0xB9], // 12 blue
+        [0x7E, 0x46, 0xC8], // 13 magenta
+        [0x00, 0x6D, 0x91], // 14 cyan
         [0x37, 0x60, 0xBF], // 15 white
     ],
 };
@@ -316,7 +903,7 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     background: [0x1E, 0x1E, 0x2E],
     foreground: [0xCD, 0xD6, 0xF4],
     cursor: [0xF5, 0xE0, 0xDC],
-    selection: [0xF5, 0xE0, 0xDC],
+    selection: [0x58, 0x5B, 0x70],
     border_focused: OutlineColor([0x94, 0xE2, 0xD5, 0xFF]),
     border_idle: OutlineColor([0x58, 0x5B, 0x70, 0xFF]),
     ansi: [
@@ -327,15 +914,15 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
         [0x89, 0xB4, 0xFA], // 4 blue
         [0xF5, 0xC2, 0xE7], // 5 magenta
         [0x94, 0xE2, 0xD5], // 6 cyan
-        [0xBA, 0xC2, 0xDE], // 7 white
+        [0xA6, 0xAD, 0xC8], // 7 white
         [0x58, 0x5B, 0x70], // 8 black
-        [0xF3, 0x8B, 0xA8], // 9 red
-        [0xA6, 0xE3, 0xA1], // 10 green
-        [0xF9, 0xE2, 0xAF], // 11 yellow
-        [0x89, 0xB4, 0xFA], // 12 blue
-        [0xF5, 0xC2, 0xE7], // 13 magenta
-        [0x94, 0xE2, 0xD5], // 14 cyan
-        [0xA6, 0xAD, 0xC8], // 15 white
+        [0xF3, 0x77, 0x99], // 9 red
+        [0x89, 0xD8, 0x8B], // 10 green
+        [0xEB, 0xD3, 0x91], // 11 yellow
+        [0x74, 0xA8, 0xFC], // 12 blue
+        [0xF2, 0xAE, 0xDE], // 13 magenta
+        [0x6B, 0xD7, 0xCA], // 14 cyan
+        [0xBA, 0xC2, 0xDE], // 15 white
     ],
 };
 
@@ -352,7 +939,7 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     background: [0x24, 0x27, 0x3A],
     foreground: [0xCA, 0xD3, 0xF5],
     cursor: [0xF4, 0xDB, 0xD6],
-    selection: [0xF4, 0xDB, 0xD6],
+    selection: [0x56, 0x5B, 0x72],
     border_focused: OutlineColor([0x8B, 0xD5, 0xCA, 0xFF]),
     border_idle: OutlineColor([0x5B, 0x60, 0x78, 0xFF]),
     ansi: [
@@ -363,15 +950,15 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
         [0x8A, 0xAD, 0xF4], // 4 blue
         [0xF5, 0xBD, 0xE6], // 5 magenta
         [0x8B, 0xD5, 0xCA], // 6 cyan
-        [0xB8, 0xC0, 0xE0], // 7 white
+        [0xA5, 0xAD, 0xCB], // 7 white
         [0x5B, 0x60, 0x78], // 8 black
-        [0xED, 0x87, 0x96], // 9 red
-        [0xA6, 0xDA, 0x95], // 10 green
-        [0xEE, 0xD4, 0x9F], // 11 yellow
-        [0x8A, 0xAD, 0xF4], // 12 blue
-        [0xF5, 0xBD, 0xE6], // 13 magenta
-        [0x8B, 0xD5, 0xCA], // 14 cyan
-        [0xA5, 0xAD, 0xCB], // 15 white
+        [0xEC, 0x74, 0x86], // 9 red
+        [0x8C, 0xCF, 0x7F], // 10 green
+        [0xE1, 0xC6, 0x82], // 11 yellow
+        [0x78, 0xA1, 0xF6], // 12 blue
+        [0xF2, 0xA9, 0xDD], // 13 magenta
+        [0x63, 0xCB, 0xC0], // 14 cyan
+        [0xB8, 0xC0, 0xE0], // 15 white
     ],
 };
 
@@ -388,7 +975,7 @@ pub static CATPPUCCIN_FRAPPE: Theme = Theme {
     background: [0x30, 0x34, 0x46],
     foreground: [0xC6, 0xD0, 0xF5],
     cursor: [0xF2, 0xD5, 0xCF],
-    selection: [0xF2, 0xD5, 0xCF],
+    selection: [0x54, 0x59, 0x70],
     border_focused: OutlineColor([0x81, 0xC8, 0xBE, 0xFF]),
     border_idle: OutlineColor([0x51, 0x57, 0x6D, 0xFF]),
     ansi: [
@@ -399,15 +986,15 @@ pub static CATPPUCCIN_FRAPPE: Theme = Theme {
         [0x8C, 0xAA, 0xEE], // 4 blue
         [0xF4, 0xB8, 0xE4], // 5 magenta
         [0x81, 0xC8, 0xBE], // 6 cyan
-        [0xB5, 0xBF, 0xE2], // 7 white
+        [0xA5, 0xAD, 0xCE], // 7 white
         [0x62, 0x68, 0x80], // 8 black
-        [0xE7, 0x82, 0x84], // 9 red
-        [0xA6, 0xD1, 0x89], // 10 green
-        [0xE5, 0xC8, 0x90], // 11 yellow
-        [0x8C, 0xAA, 0xEE], // 12 blue
-        [0xF4, 0xB8, 0xE4], // 13 magenta
-        [0x81, 0xC8, 0xBE], // 14 cyan
-        [0xA5, 0xAD, 0xCE], // 15 white
+        [0xE8, 0x7E, 0x7E], // 9 red
+        [0x8E, 0xC7, 0x72], // 10 green
+        [0xD9, 0xBA, 0x73], // 11 yellow
+        [0x7B, 0x9E, 0xF0], // 12 blue
+        [0xF2, 0xA4, 0xDB], // 13 magenta
+        [0x5A, 0xBF, 0xB5], // 14 cyan
+        [0xB5, 0xBF, 0xE2], // 15 white
     ],
 };
 
@@ -423,27 +1010,27 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     license: "MIT",
     background: [0xEF, 0xF1, 0xF5],
     foreground: [0x4C, 0x4F, 0x69],
-    cursor: [0xDC, 0x8A, 0x78],
-    selection: [0xDC, 0x8A, 0x78],
+    cursor: [0x93, 0x5C, 0x50],
+    selection: [0xBF, 0xC3, 0xCE],
     border_focused: OutlineColor([0x4C, 0x4F, 0x69, 0xFF]),
     border_idle: OutlineColor([0xAC, 0xB0, 0xBE, 0xFF]),
     ansi: [
-        [0xBC, 0xC0, 0xCC], // 0 black
+        [0x5C, 0x5F, 0x77], // 0 black
         [0xD2, 0x0F, 0x39], // 1 red
-        [0x40, 0xA0, 0x2B], // 2 green
-        [0xDF, 0x8E, 0x1D], // 3 yellow
-        [0x1E, 0x66, 0xF5], // 4 blue
-        [0xEA, 0x76, 0xCB], // 5 magenta
-        [0x17, 0x92, 0x99], // 6 cyan
-        [0x5C, 0x5F, 0x77], // 7 white
-        [0xAC, 0xB0, 0xBE], // 8 black
-        [0xD2, 0x0F, 0x39], // 9 red
-        [0x40, 0xA0, 0x2B], // 10 green
-        [0xDF, 0x8E, 0x1D], // 11 yellow
-        [0x1E, 0x66, 0xF5], // 12 blue
-        [0xEA, 0x76, 0xCB], // 13 magenta
-        [0x17, 0x92, 0x99], // 14 cyan
-        [0x6C, 0x6F, 0x85], // 15 white
+        [0x32, 0x7D, 0x22], // 2 green
+        [0x99, 0x62, 0x14], // 3 yellow
+        [0x1D, 0x63, 0xEF], // 4 blue
+        [0xA2, 0x51, 0x8C], // 5 magenta
+        [0x13, 0x79, 0x7F], // 6 cyan
+        [0xAC, 0xB0, 0xBE], // 7 white
+        [0x6C, 0x6F, 0x85], // 8 black
+        [0xD2, 0x27, 0x3B], // 9 red
+        [0x34, 0x7D, 0x2C], // 10 green
+        [0x95, 0x64, 0x1C], // 11 yellow
+        [0x3E, 0x63, 0xE4], // 12 blue
+        [0x9F, 0x54, 0x88], // 13 magenta
+        [0x22, 0x79, 0x80], // 14 cyan
+        [0xBC, 0xC0, 0xCC], // 15 white
     ],
 };
 
@@ -496,24 +1083,24 @@ pub static NORD: Theme = Theme {
     background: [0x2E, 0x34, 0x40],
     foreground: [0xD8, 0xDE, 0xE9],
     cursor: [0xEC, 0xEF, 0xF4],
-    selection: [0xEC, 0xEF, 0xF4],
+    selection: [0x43, 0x4C, 0x5E],
     border_focused: OutlineColor([0x88, 0xC0, 0xD0, 0xFF]),
     border_idle: OutlineColor([0x59, 0x63, 0x77, 0xFF]),
     ansi: [
         [0x3B, 0x42, 0x52], // 0 black
-        [0xBF, 0x61, 0x6A], // 1 red
+        [0xCF, 0x89, 0x8F], // 1 red
         [0xA3, 0xBE, 0x8C], // 2 green
         [0xEB, 0xCB, 0x8B], // 3 yellow
         [0x81, 0xA1, 0xC1], // 4 blue
-        [0xB4, 0x8E, 0xAD], // 5 magenta
+        [0xB6, 0x90, 0xAF], // 5 magenta
         [0x88, 0xC0, 0xD0], // 6 cyan
         [0xE5, 0xE9, 0xF0], // 7 white
         [0x59, 0x63, 0x77], // 8 black
-        [0xBF, 0x61, 0x6A], // 9 red
+        [0xCF, 0x89, 0x8F], // 9 red
         [0xA3, 0xBE, 0x8C], // 10 green
         [0xEB, 0xCB, 0x8B], // 11 yellow
         [0x81, 0xA1, 0xC1], // 12 blue
-        [0xB4, 0x8E, 0xAD], // 13 magenta
+        [0xB6, 0x90, 0xAF], // 13 magenta
         [0x8F, 0xBC, 0xBB], // 14 cyan
         [0xEC, 0xEF, 0xF4], // 15 white
     ],
@@ -537,15 +1124,15 @@ pub static GRUVBOX_DARK: Theme = Theme {
     border_idle: OutlineColor([0x66, 0x5C, 0x54, 0xFF]),
     ansi: [
         [0x28, 0x28, 0x28], // 0 black
-        [0xCC, 0x24, 0x1D], // 1 red
+        [0xDD, 0x6D, 0x68], // 1 red
         [0x98, 0x97, 0x1A], // 2 green
         [0xD7, 0x99, 0x21], // 3 yellow
-        [0x45, 0x85, 0x88], // 4 blue
-        [0xB1, 0x62, 0x86], // 5 magenta
+        [0x61, 0x98, 0x9A], // 4 blue
+        [0xBD, 0x7B, 0x99], // 5 magenta
         [0x68, 0x9D, 0x6A], // 6 cyan
         [0xA8, 0x99, 0x84], // 7 white
         [0x92, 0x83, 0x74], // 8 black
-        [0xFB, 0x49, 0x34], // 9 red
+        [0xFB, 0x54, 0x40], // 9 red
         [0xB8, 0xBB, 0x26], // 10 green
         [0xFA, 0xBD, 0x2F], // 11 yellow
         [0x83, 0xA5, 0x98], // 12 blue
@@ -568,25 +1155,25 @@ pub static GRUVBOX_LIGHT: Theme = Theme {
     background: [0xFB, 0xF1, 0xC7],
     foreground: [0x3C, 0x38, 0x36],
     cursor: [0x3C, 0x38, 0x36],
-    selection: [0x3C, 0x38, 0x36],
+    selection: [0xD5, 0xC4, 0xA1],
     border_focused: OutlineColor([0xB5, 0x76, 0x14, 0xFF]),
     border_idle: OutlineColor([0x3C, 0x38, 0x36, 0xFF]),
     ansi: [
         [0xFB, 0xF1, 0xC7], // 0 black
         [0xCC, 0x24, 0x1D], // 1 red
-        [0x98, 0x97, 0x1A], // 2 green
-        [0xD7, 0x99, 0x21], // 3 yellow
-        [0x45, 0x85, 0x88], // 4 blue
-        [0xB1, 0x62, 0x86], // 5 magenta
-        [0x68, 0x9D, 0x6A], // 6 cyan
+        [0x72, 0x71, 0x14], // 2 green
+        [0x90, 0x66, 0x16], // 3 yellow
+        [0x3D, 0x76, 0x79], // 4 blue
+        [0x9E, 0x57, 0x78], // 5 magenta
+        [0x4F, 0x77, 0x51], // 6 cyan
         [0x7C, 0x6F, 0x64], // 7 white
         [0x92, 0x83, 0x74], // 8 black
         [0x9D, 0x00, 0x06], // 9 red
-        [0x79, 0x74, 0x0E], // 10 green
-        [0xB5, 0x76, 0x14], // 11 yellow
+        [0x75, 0x70, 0x0E], // 10 green
+        [0x97, 0x62, 0x11], // 11 yellow
         [0x07, 0x66, 0x78], // 12 blue
         [0x8F, 0x3F, 0x71], // 13 magenta
-        [0x42, 0x7B, 0x58], // 14 cyan
+        [0x41, 0x79, 0x57], // 14 cyan
         [0x3C, 0x38, 0x36], // 15 white
     ],
 };
@@ -609,19 +1196,19 @@ pub static SOLARIZED_DARK: Theme = Theme {
     border_idle: OutlineColor([0x27, 0x4F, 0x58, 0xFF]),
     ansi: [
         [0x07, 0x36, 0x42], // 0 black
-        [0xDC, 0x32, 0x2F], // 1 red
+        [0xE5, 0x64, 0x62], // 1 red
         [0x85, 0x99, 0x00], // 2 green
         [0xB5, 0x89, 0x00], // 3 yellow
-        [0x26, 0x8B, 0xD2], // 4 blue
-        [0xD3, 0x36, 0x82], // 5 magenta
+        [0x36, 0x94, 0xD5], // 4 blue
+        [0xDD, 0x62, 0x9E], // 5 magenta
         [0x2A, 0xA1, 0x98], // 6 cyan
         [0xEE, 0xE8, 0xD5], // 7 white
         [0x33, 0x5E, 0x69], // 8 black
-        [0xCB, 0x4B, 0x16], // 9 red
-        [0x58, 0x6E, 0x75], // 10 green
-        [0x65, 0x7B, 0x83], // 11 yellow
+        [0xD6, 0x71, 0x47], // 9 red
+        [0x7F, 0x90, 0x95], // 10 green
+        [0x7E, 0x90, 0x97], // 11 yellow
         [0x83, 0x94, 0x96], // 12 blue
-        [0x6C, 0x71, 0xC4], // 13 magenta
+        [0x83, 0x87, 0xCD], // 13 magenta
         [0x93, 0xA1, 0xA1], // 14 cyan
         [0xFD, 0xF6, 0xE3], // 15 white
     ],
@@ -639,26 +1226,26 @@ pub static SOLARIZED_LIGHT: Theme = Theme {
     license: "MIT",
     background: [0xFD, 0xF6, 0xE3],
     foreground: [0x65, 0x7B, 0x83],
-    cursor: [0x65, 0x7B, 0x83],
+    cursor: [0x58, 0x6E, 0x75],
     selection: [0xEE, 0xE8, 0xD5],
     border_focused: OutlineColor([0x26, 0x8B, 0xD2, 0xFF]),
     border_idle: OutlineColor([0x00, 0x2B, 0x36, 0xFF]),
     ansi: [
         [0x07, 0x36, 0x42], // 0 black
-        [0xDC, 0x32, 0x2F], // 1 red
-        [0x85, 0x99, 0x00], // 2 green
-        [0xB5, 0x89, 0x00], // 3 yellow
-        [0x26, 0x8B, 0xD2], // 4 blue
-        [0xD3, 0x36, 0x82], // 5 magenta
-        [0x2A, 0xA1, 0x98], // 6 cyan
+        [0xD5, 0x31, 0x2E], // 1 red
+        [0x69, 0x78, 0x00], // 2 green
+        [0x8F, 0x6C, 0x00], // 3 yellow
+        [0x20, 0x76, 0xB3], // 4 blue
+        [0xCA, 0x34, 0x7D], // 5 magenta
+        [0x21, 0x7E, 0x77], // 6 cyan
         [0xBB, 0xB5, 0xA2], // 7 white
         [0x00, 0x2B, 0x36], // 8 black
-        [0xCB, 0x4B, 0x16], // 9 red
+        [0xC4, 0x49, 0x15], // 9 red
         [0x58, 0x6E, 0x75], // 10 green
-        [0x65, 0x7B, 0x83], // 11 yellow
-        [0x83, 0x94, 0x96], // 12 blue
-        [0x6C, 0x71, 0xC4], // 13 magenta
-        [0x93, 0xA1, 0xA1], // 14 cyan
+        [0x60, 0x74, 0x7C], // 11 yellow
+        [0x66, 0x73, 0x75], // 12 blue
+        [0x65, 0x6A, 0xB8], // 13 magenta
+        [0x69, 0x73, 0x73], // 14 cyan
         [0xFD, 0xF6, 0xE3], // 15 white
     ],
 };
@@ -711,26 +1298,26 @@ pub static ONE_LIGHT: Theme = Theme {
     license: "MIT",
     background: [0xF9, 0xF9, 0xF9],
     foreground: [0x2A, 0x2C, 0x33],
-    cursor: [0xBB, 0xBB, 0xBB],
-    selection: [0xED, 0xED, 0xED],
+    cursor: [0x72, 0x72, 0x72],
+    selection: [0xD9, 0xD9, 0xD9],
     border_focused: OutlineColor([0x2F, 0x5A, 0xF3, 0xFF]),
     border_idle: OutlineColor([0x00, 0x00, 0x00, 0xFF]),
     ansi: [
         [0x00, 0x00, 0x00], // 0 black
-        [0xDE, 0x3E, 0x35], // 1 red
-        [0x3F, 0x95, 0x3A], // 2 green
-        [0xD2, 0xB6, 0x7C], // 3 yellow
+        [0xD2, 0x3B, 0x32], // 1 red
+        [0x37, 0x82, 0x33], // 2 green
+        [0x82, 0x71, 0x4D], // 3 yellow
         [0x2F, 0x5A, 0xF3], // 4 blue
         [0x95, 0x00, 0x95], // 5 magenta
-        [0x3F, 0x95, 0x3A], // 6 cyan
+        [0x0B, 0x6E, 0x85], // 6 cyan
         [0xBB, 0xBB, 0xBB], // 7 white
         [0x00, 0x00, 0x00], // 8 black
-        [0xDE, 0x3E, 0x35], // 9 red
-        [0x3F, 0x95, 0x3A], // 10 green
-        [0xD2, 0xB6, 0x7C], // 11 yellow
+        [0xD2, 0x3B, 0x32], // 9 red
+        [0x37, 0x82, 0x33], // 10 green
+        [0x82, 0x71, 0x4D], // 11 yellow
         [0x2F, 0x5A, 0xF3], // 12 blue
         [0xA0, 0x00, 0x95], // 13 magenta
-        [0x3F, 0x95, 0x3A], // 14 cyan
+        [0x0B, 0x6E, 0x85], // 14 cyan
         [0xFF, 0xFF, 0xFF], // 15 white
     ],
 };
@@ -748,7 +1335,7 @@ pub static AYU_DARK: Theme = Theme {
     background: [0x0B, 0x0E, 0x14],
     foreground: [0xBF, 0xBD, 0xB6],
     cursor: [0xE6, 0xB4, 0x50],
-    selection: [0x40, 0x9F, 0xFF],
+    selection: [0x23, 0x4E, 0x7D],
     border_focused: OutlineColor([0x95, 0xE6, 0xCB, 0xFF]),
     border_idle: OutlineColor([0x68, 0x68, 0x68, 0xFF]),
     ansi: [
@@ -784,7 +1371,7 @@ pub static AYU_MIRAGE: Theme = Theme {
     background: [0x1F, 0x24, 0x30],
     foreground: [0xCC, 0xCA, 0xC2],
     cursor: [0xFF, 0xCC, 0x66],
-    selection: [0x40, 0x9F, 0xFF],
+    selection: [0x2D, 0x57, 0x87],
     border_focused: OutlineColor([0x95, 0xE6, 0xCB, 0xFF]),
     border_idle: OutlineColor([0x68, 0x68, 0x68, 0xFF]),
     ansi: [
@@ -819,26 +1406,26 @@ pub static AYU_LIGHT: Theme = Theme {
     license: "MIT",
     background: [0xF8, 0xF9, 0xFA],
     foreground: [0x5C, 0x61, 0x66],
-    cursor: [0xFF, 0xAA, 0x33],
-    selection: [0x03, 0x5B, 0xD6],
+    cursor: [0x9C, 0x68, 0x1F],
+    selection: [0xCC, 0xDD, 0xF4],
     border_focused: OutlineColor([0x9E, 0x75, 0xC7, 0xFF]),
     border_idle: OutlineColor([0x00, 0x00, 0x00, 0xFF]),
     ansi: [
         [0x00, 0x00, 0x00], // 0 black
-        [0xEA, 0x6C, 0x6D], // 1 red
-        [0x6C, 0xBF, 0x43], // 2 green
-        [0xEC, 0xA9, 0x44], // 3 yellow
-        [0x31, 0x99, 0xE1], // 4 blue
-        [0x9E, 0x75, 0xC7], // 5 magenta
-        [0x46, 0xBA, 0x94], // 6 cyan
+        [0xB7, 0x54, 0x55], // 1 red
+        [0x49, 0x80, 0x2D], // 2 green
+        [0x95, 0x6B, 0x2B], // 3 yellow
+        [0x27, 0x78, 0xB1], // 4 blue
+        [0x86, 0x64, 0xA9], // 5 magenta
+        [0x30, 0x80, 0x66], // 6 cyan
         [0xBA, 0xBA, 0xBA], // 7 white
         [0x68, 0x68, 0x68], // 8 black
-        [0xF0, 0x71, 0x71], // 9 red
-        [0x86, 0xB3, 0x00], // 10 green
-        [0xF2, 0xAE, 0x49], // 11 yellow
-        [0x39, 0x9E, 0xE6], // 12 blue
-        [0xA3, 0x7A, 0xCC], // 13 magenta
-        [0x4C, 0xBF, 0x99], // 14 cyan
+        [0xB5, 0x55, 0x55], // 9 red
+        [0x5E, 0x7D, 0x00], // 10 green
+        [0x94, 0x6B, 0x2D], // 11 yellow
+        [0x2B, 0x78, 0xAF], // 12 blue
+        [0x86, 0x64, 0xA8], // 13 magenta
+        [0x33, 0x7F, 0x66], // 14 cyan
         [0xD1, 0xD1, 0xD1], // 15 white
     ],
 };
@@ -855,13 +1442,13 @@ pub static KANAGAWA_WAVE: Theme = Theme {
     license: "MIT",
     background: [0x1F, 0x1F, 0x28],
     foreground: [0xDC, 0xD7, 0xBA],
-    cursor: [0xC8, 0xC0, 0x93],
+    cursor: [0xDC, 0xD7, 0xBA],
     selection: [0x2D, 0x4F, 0x67],
     border_focused: OutlineColor([0x7F, 0xB4, 0xCA, 0xFF]),
     border_idle: OutlineColor([0x2D, 0x4F, 0x67, 0xFF]),
     ansi: [
-        [0x16, 0x16, 0x1D], // 0 black
-        [0xC3, 0x40, 0x43], // 1 red
+        [0x09, 0x06, 0x18], // 0 black
+        [0xCF, 0x67, 0x69], // 1 red
         [0x76, 0x94, 0x6A], // 2 green
         [0xC0, 0xA3, 0x6E], // 3 yellow
         [0x7E, 0x9C, 0xD8], // 4 blue
@@ -869,7 +1456,7 @@ pub static KANAGAWA_WAVE: Theme = Theme {
         [0x6A, 0x95, 0x89], // 6 cyan
         [0xC8, 0xC0, 0x93], // 7 white
         [0x72, 0x71, 0x69], // 8 black
-        [0xE8, 0x24, 0x24], // 9 red
+        [0xEC, 0x4F, 0x4F], // 9 red
         [0x98, 0xBB, 0x6C], // 10 green
         [0xE6, 0xC3, 0x84], // 11 yellow
         [0x7F, 0xB4, 0xCA], // 12 blue
@@ -897,20 +1484,20 @@ pub static KANAGAWA_LOTUS: Theme = Theme {
     border_idle: OutlineColor([0x1F, 0x1F, 0x28, 0xFF]),
     ansi: [
         [0x1F, 0x1F, 0x28], // 0 black
-        [0xC8, 0x40, 0x53], // 1 red
-        [0x6F, 0x89, 0x4E], // 2 green
-        [0x77, 0x71, 0x3F], // 3 yellow
+        [0xBB, 0x3C, 0x4E], // 1 red
+        [0x5B, 0x70, 0x40], // 2 green
+        [0x71, 0x6B, 0x3C], // 3 yellow
         [0x4D, 0x69, 0x9B], // 4 blue
-        [0xB3, 0x5B, 0x79], // 5 magenta
-        [0x59, 0x7B, 0x75], // 6 cyan
+        [0x9F, 0x51, 0x6C], // 5 magenta
+        [0x51, 0x70, 0x6B], // 6 cyan
         [0x54, 0x54, 0x64], // 7 white
         [0x8A, 0x89, 0x80], // 8 black
-        [0xD7, 0x47, 0x4B], // 9 red
-        [0x6E, 0x91, 0x5F], // 10 green
-        [0x83, 0x6F, 0x4A], // 11 yellow
-        [0x66, 0x93, 0xBF], // 12 blue
+        [0xBB, 0x3E, 0x41], // 9 red
+        [0x56, 0x71, 0x4A], // 10 green
+        [0x7A, 0x67, 0x45], // 11 yellow
+        [0x4C, 0x6D, 0x8D], // 12 blue
         [0x62, 0x4C, 0x83], // 13 magenta
-        [0x5E, 0x85, 0x7A], // 14 cyan
+        [0x50, 0x70, 0x67], // 14 cyan
         [0x43, 0x43, 0x6C], // 15 white
     ],
 };
@@ -927,14 +1514,14 @@ pub static ROSE_PINE: Theme = Theme {
     license: "MIT",
     background: [0x19, 0x17, 0x24],
     foreground: [0xE0, 0xDE, 0xF4],
-    cursor: [0x52, 0x4F, 0x67],
+    cursor: [0xE0, 0xDE, 0xF4],
     selection: [0x40, 0x3D, 0x52],
     border_focused: OutlineColor([0xEB, 0xBC, 0xBA, 0xFF]),
     border_idle: OutlineColor([0x6E, 0x6A, 0x86, 0xFF]),
     ansi: [
         [0x26, 0x23, 0x3A], // 0 black
         [0xEB, 0x6F, 0x92], // 1 red
-        [0x31, 0x74, 0x8F], // 2 green
+        [0x4F, 0x89, 0xA0], // 2 green
         [0xF6, 0xC1, 0x77], // 3 yellow
         [0x9C, 0xCF, 0xD8], // 4 blue
         [0xC4, 0xA7, 0xE7], // 5 magenta
@@ -942,7 +1529,7 @@ pub static ROSE_PINE: Theme = Theme {
         [0xE0, 0xDE, 0xF4], // 7 white
         [0x6E, 0x6A, 0x86], // 8 black
         [0xEB, 0x6F, 0x92], // 9 red
-        [0x31, 0x74, 0x8F], // 10 green
+        [0x4F, 0x89, 0xA0], // 10 green
         [0xF6, 0xC1, 0x77], // 11 yellow
         [0x9C, 0xCF, 0xD8], // 12 blue
         [0xC4, 0xA7, 0xE7], // 13 magenta
@@ -963,14 +1550,14 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     license: "MIT",
     background: [0x23, 0x21, 0x36],
     foreground: [0xE0, 0xDE, 0xF4],
-    cursor: [0x56, 0x52, 0x6E],
+    cursor: [0xE0, 0xDE, 0xF4],
     selection: [0x44, 0x41, 0x5A],
     border_focused: OutlineColor([0x9C, 0xCF, 0xD8, 0xFF]),
     border_idle: OutlineColor([0x6E, 0x6A, 0x86, 0xFF]),
     ansi: [
         [0x39, 0x35, 0x52], // 0 black
         [0xEB, 0x6F, 0x92], // 1 red
-        [0x3E, 0x8F, 0xB0], // 2 green
+        [0x44, 0x93, 0xB2], // 2 green
         [0xF6, 0xC1, 0x77], // 3 yellow
         [0x9C, 0xCF, 0xD8], // 4 blue
         [0xC4, 0xA7, 0xE7], // 5 magenta
@@ -978,7 +1565,7 @@ pub static ROSE_PINE_MOON: Theme = Theme {
         [0xE0, 0xDE, 0xF4], // 7 white
         [0x6E, 0x6A, 0x86], // 8 black
         [0xEB, 0x6F, 0x92], // 9 red
-        [0x3E, 0x8F, 0xB0], // 10 green
+        [0x44, 0x93, 0xB2], // 10 green
         [0xF6, 0xC1, 0x77], // 11 yellow
         [0x9C, 0xCF, 0xD8], // 12 blue
         [0xC4, 0xA7, 0xE7], // 13 magenta
@@ -999,26 +1586,26 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     license: "MIT",
     background: [0xFA, 0xF4, 0xED],
     foreground: [0x57, 0x52, 0x79],
-    cursor: [0xCE, 0xCA, 0xCD],
-    selection: [0xDF, 0xDA, 0xD9],
+    cursor: [0x57, 0x52, 0x79],
+    selection: [0xDC, 0xD7, 0xD7],
     border_focused: OutlineColor([0x28, 0x69, 0x83, 0xFF]),
     border_idle: OutlineColor([0xB7, 0xC1, 0xC6, 0xFF]),
     ansi: [
         [0xF2, 0xE9, 0xE1], // 0 black
-        [0xB4, 0x63, 0x7A], // 1 red
-        [0x28, 0x69, 0x83], // 2 green
-        [0xEA, 0x9D, 0x34], // 3 yellow
-        [0x56, 0x94, 0x9F], // 4 blue
-        [0x90, 0x7A, 0xA9], // 5 magenta
-        [0xD7, 0x82, 0x7E], // 6 cyan
+        [0xA3, 0x5A, 0x6F], // 1 red
+        [0x20, 0x58, 0x70], // 2 green
+        [0x98, 0x66, 0x22], // 3 yellow
+        [0x46, 0x78, 0x80], // 4 blue
+        [0x7B, 0x68, 0x91], // 5 magenta
+        [0x9E, 0x5F, 0x5D], // 6 cyan
         [0x57, 0x52, 0x79], // 7 white
         [0x98, 0x93, 0xA5], // 8 black
-        [0xB4, 0x63, 0x7A], // 9 red
-        [0x28, 0x69, 0x83], // 10 green
-        [0xEA, 0x9D, 0x34], // 11 yellow
-        [0x56, 0x94, 0x9F], // 12 blue
-        [0x90, 0x7A, 0xA9], // 13 magenta
-        [0xD7, 0x82, 0x7E], // 14 cyan
+        [0xA3, 0x5A, 0x6F], // 9 red
+        [0x20, 0x58, 0x70], // 10 green
+        [0x98, 0x66, 0x22], // 11 yellow
+        [0x46, 0x78, 0x80], // 12 blue
+        [0x7B, 0x68, 0x91], // 13 magenta
+        [0x9E, 0x5F, 0x5D], // 14 cyan
         [0x57, 0x52, 0x79], // 15 white
     ],
 };
@@ -1049,10 +1636,10 @@ pub static EVERFOREST_DARK: Theme = Theme {
         [0x83, 0xC0, 0x92], // 6 cyan
         [0xF2, 0xEF, 0xDF], // 7 white
         [0xA6, 0xB0, 0xA0], // 8 black
-        [0xF8, 0x55, 0x52], // 9 red
+        [0xF8, 0x58, 0x55], // 9 red
         [0x8D, 0xA1, 0x01], // 10 green
         [0xDF, 0xA0, 0x00], // 11 yellow
-        [0x3A, 0x94, 0xC5], // 12 blue
+        [0x40, 0x98, 0xC7], // 12 blue
         [0xDF, 0x69, 0xBA], // 13 magenta
         [0x35, 0xA7, 0x7C], // 14 cyan
         [0xFF, 0xFB, 0xEF], // 15 white
@@ -1070,27 +1657,27 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     source: "https://github.com/sainnhe/everforest",
     license: "MIT",
     background: [0xEF, 0xEB, 0xD4],
-    foreground: [0x5C, 0x6A, 0x72],
-    cursor: [0xF5, 0x7D, 0x26],
-    selection: [0xEA, 0xED, 0xC8],
+    foreground: [0x4A, 0x56, 0x5D],
+    cursor: [0xA4, 0x54, 0x1A],
+    selection: [0xD0, 0xD0, 0xBF],
     border_focused: OutlineColor([0x5C, 0x6A, 0x72, 0xFF]),
     border_idle: OutlineColor([0xBC, 0xC2, 0xAC, 0xFF]),
     ansi: [
         [0x7A, 0x84, 0x78], // 0 black
-        [0xE6, 0x7E, 0x80], // 1 red
-        [0x9A, 0xB3, 0x73], // 2 green
-        [0xC1, 0xA2, 0x66], // 3 yellow
-        [0x7F, 0xBB, 0xB3], // 4 blue
-        [0xD6, 0x99, 0xB6], // 5 magenta
-        [0x83, 0xC0, 0x92], // 6 cyan
+        [0x9C, 0x55, 0x57], // 1 red
+        [0x60, 0x6F, 0x48], // 2 green
+        [0x7B, 0x67, 0x41], // 3 yellow
+        [0x4C, 0x70, 0x6C], // 4 blue
+        [0x85, 0x5F, 0x72], // 5 magenta
+        [0x4E, 0x72, 0x57], // 6 cyan
         [0xB2, 0xAF, 0x9F], // 7 white
         [0xA6, 0xB0, 0xA0], // 8 black
-        [0xF8, 0x55, 0x52], // 9 red
-        [0x8D, 0xA1, 0x01], // 10 green
-        [0xDF, 0xA0, 0x00], // 11 yellow
-        [0x3A, 0x94, 0xC5], // 12 blue
-        [0xDF, 0x69, 0xBA], // 13 magenta
-        [0x35, 0xA7, 0x7C], // 14 cyan
+        [0xB9, 0x40, 0x3D], // 9 red
+        [0x63, 0x70, 0x01], // 10 green
+        [0x8A, 0x63, 0x00], // 11 yellow
+        [0x2C, 0x70, 0x96], // 12 blue
+        [0xA0, 0x4C, 0x86], // 13 magenta
+        [0x26, 0x77, 0x59], // 14 cyan
         [0xFF, 0xFB, 0xEF], // 15 white
     ],
 };
@@ -1113,7 +1700,7 @@ pub static MONOKAI: Theme = Theme {
     border_idle: OutlineColor([0x6E, 0x70, 0x66, 0xFF]),
     ansi: [
         [0x27, 0x28, 0x22], // 0 black
-        [0xF9, 0x26, 0x72], // 1 red
+        [0xFA, 0x49, 0x88], // 1 red
         [0xA6, 0xE2, 0x2E], // 2 green
         [0xE6, 0xDB, 0x74], // 3 yellow
         [0xFD, 0x97, 0x1F], // 4 blue
@@ -1121,7 +1708,7 @@ pub static MONOKAI: Theme = Theme {
         [0x66, 0xD9, 0xEF], // 6 cyan
         [0xFD, 0xFF, 0xF1], // 7 white
         [0x6E, 0x70, 0x66], // 8 black
-        [0xF9, 0x26, 0x72], // 9 red
+        [0xFA, 0x49, 0x88], // 9 red
         [0xA6, 0xE2, 0x2E], // 10 green
         [0xE6, 0xDB, 0x74], // 11 yellow
         [0xFD, 0x97, 0x1F], // 12 blue
@@ -1143,8 +1730,8 @@ pub static NIGHT_OWL: Theme = Theme {
     license: "MIT",
     background: [0x01, 0x16, 0x27],
     foreground: [0xD6, 0xDE, 0xEB],
-    cursor: [0x7E, 0x57, 0xC2],
-    selection: [0x5F, 0x7E, 0x97],
+    cursor: [0xBD, 0xA8, 0xE0],
+    selection: [0x40, 0x5F, 0x78],
     border_focused: OutlineColor([0x7F, 0xDB, 0xCA, 0xFF]),
     border_idle: OutlineColor([0x57, 0x56, 0x56, 0xFF]),
     ansi: [
@@ -1179,8 +1766,8 @@ pub static GITHUB_DARK: Theme = Theme {
     license: "MIT",
     background: [0x0D, 0x11, 0x17],
     foreground: [0xE6, 0xED, 0xF3],
-    cursor: [0x2F, 0x81, 0xF7],
-    selection: [0xE6, 0xED, 0xF3],
+    cursor: [0x5B, 0x9C, 0xF9],
+    selection: [0x26, 0x4F, 0x78],
     border_focused: OutlineColor([0x56, 0xD4, 0xDD, 0xFF]),
     border_idle: OutlineColor([0x48, 0x4F, 0x58, 0xFF]),
     ansi: [
@@ -1216,7 +1803,7 @@ pub static GITHUB_LIGHT: Theme = Theme {
     background: [0xFF, 0xFF, 0xFF],
     foreground: [0x1F, 0x23, 0x28],
     cursor: [0x09, 0x69, 0xDA],
-    selection: [0x1F, 0x23, 0x28],
+    selection: [0xB6, 0xD7, 0xFF],
     border_focused: OutlineColor([0x09, 0x69, 0xDA, 0xFF]),
     border_idle: OutlineColor([0x1F, 0x23, 0x28, 0xFF]),
     ansi: [
@@ -1232,9 +1819,9 @@ pub static GITHUB_LIGHT: Theme = Theme {
         [0xA4, 0x0E, 0x26], // 9 red
         [0x1A, 0x7F, 0x37], // 10 green
         [0x63, 0x3C, 0x01], // 11 yellow
-        [0x21, 0x8B, 0xFF], // 12 blue
-        [0xA4, 0x75, 0xF9], // 13 magenta
-        [0x31, 0x92, 0xAA], // 14 cyan
+        [0x1C, 0x76, 0xD9], // 12 blue
+        [0x88, 0x61, 0xCE], // 13 magenta
+        [0x2B, 0x80, 0x96], // 14 cyan
         [0x8C, 0x95, 0x9F], // 15 white
     ],
 };
@@ -2139,6 +2726,177 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_meets_the_readability_policy() {
+        // CTX-1418 (#2370): the product policy behind `bitty config check`
+        // and this test are the same rows. Any regression — a darkened
+        // light-theme ANSI slot, a selection that matches the foreground, a
+        // cursor that disappears into the background — fails here.
+        for theme in list_presets() {
+            let violations = contrast_violations(theme);
+            let rendered: Vec<String> = violations
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} {:.2}:1 < {:.1}:1{}",
+                        row.role.label(),
+                        row.ratio,
+                        row.floor,
+                        row.exemption.map_or("", |_| " (exempt)")
+                    )
+                })
+                .collect();
+            assert!(
+                violations.is_empty(),
+                "preset {} fails the contrast policy: {}",
+                theme.name,
+                rendered.join(", ")
+            );
+        }
+    }
+
+    #[test]
+    fn documented_exemptions_stay_live_and_measured() {
+        // An exemption that no longer measures below its floor is dead
+        // policy: remove it instead of letting it hide a future regression.
+        for (name, reason) in TEXT_CONTRAST_EXEMPTIONS {
+            let theme = resolve_theme_with_status(Some(name)).0;
+            assert_eq!(theme.name, *name, "exemption names a catalog preset");
+            assert!(
+                contrast(theme.foreground, theme.background) < MIN_TEXT_CONTRAST,
+                "preset {name} no longer needs its text exemption"
+            );
+            assert!(!reason.is_empty());
+        }
+        for (name, reason) in SELECTION_CONTRAST_EXEMPTIONS {
+            let theme = resolve_theme_with_status(Some(name)).0;
+            assert_eq!(theme.name, *name, "exemption names a catalog preset");
+            assert!(
+                contrast(theme.foreground, theme.selection) < MIN_TEXT_CONTRAST
+                    || contrast(theme.selection, theme.background) < MIN_SELECTION_CONTRAST,
+                "preset {name} no longer needs its selection exemption"
+            );
+            assert!(!reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn contrast_checks_cover_every_policy_role_in_order() {
+        let checks = contrast_checks(&BITTY_DARK);
+        assert_eq!(checks.len(), 23);
+        assert_eq!(checks[0].role, ContrastRole::Foreground);
+        assert_eq!(checks[1].role, ContrastRole::AnsiSurface(0));
+        assert_eq!(checks[8].role, ContrastRole::AnsiText(7));
+        assert_eq!(checks[17].role, ContrastRole::Cursor);
+        assert_eq!(checks[18].role, ContrastRole::SelectionText);
+        assert_eq!(checks[19].role, ContrastRole::SelectionSurface);
+        assert_eq!(checks[20].role, ContrastRole::CursorSelection);
+        assert_eq!(checks[21].role, ContrastRole::HelpRing);
+        assert_eq!(checks[22].role, ContrastRole::BannerText);
+        assert!(checks.iter().all(|row| row.passed));
+        assert!(min_ansi_text_contrast(&BITTY_DARK) >= MIN_TEXT_CONTRAST);
+    }
+
+    #[test]
+    fn every_preset_keeps_ansi_families_distinguishable() {
+        // CTX-1418 (#2370): a contrast repair must not collapse two ANSI
+        // families into the same hue *and* lightness. Cross-family pairs must
+        // clear the perceptual distance or the hue separation; normal/bright
+        // aliases inside one family are an intentional upstream choice and
+        // are skipped.
+        for theme in list_presets() {
+            let violations = hue_violations(theme);
+            let rendered: Vec<String> = violations
+                .iter()
+                .map(|row| {
+                    format!(
+                        "ansi[{}]/ansi[{}] dE {:.1} < {:.1} and hue {:.0}deg < {:.0}deg",
+                        row.first,
+                        row.second,
+                        row.delta_e,
+                        MIN_ANSI_FAMILY_DELTA_E,
+                        row.hue_delta,
+                        MIN_ANSI_FAMILY_HUE_DEGREES
+                    )
+                })
+                .collect();
+            assert!(
+                violations.is_empty(),
+                "preset {} collapses ANSI families: {}",
+                theme.name,
+                rendered.join(", ")
+            );
+        }
+    }
+
+    #[test]
+    fn hue_collision_exemptions_stay_live() {
+        for (name, reason) in HUE_COLLISION_EXEMPTIONS {
+            let theme = resolve_theme_with_status(Some(name)).0;
+            assert_eq!(theme.name, *name, "exemption names a catalog preset");
+            assert!(
+                hue_checks(theme).iter().any(|row| !row.passed),
+                "preset {name} no longer needs its hue-collision exemption"
+            );
+            assert!(!reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn hue_checks_compare_every_cross_family_pair() {
+        // 12 chromatic slots, minus the 6 normal/bright pairs inside one
+        // family: 66 - 6 = 60 measured pairs.
+        let checks = hue_checks(&BITTY_DARK);
+        assert_eq!(checks.len(), 60);
+        assert!(
+            checks
+                .iter()
+                .all(|row| ansi_family(row.first) != ansi_family(row.second))
+        );
+        // Bitty Dark aliases every bright slot to its normal slot, which the
+        // family filter skips rather than reporting as a collision.
+        assert!(checks.iter().all(|row| row.passed));
+    }
+
+    #[test]
+    fn ghostty_aligned_presets_pin_their_canonical_values() {
+        // CTX-1418: presets with a canonical Ghostty theme file reproduce
+        // that file's palette. Pin the values that historically drifted so a
+        // later edit cannot silently undo the alignment. Deviations that the
+        // contrast policy requires are pinned too (Catppuccin selection is
+        // its upstream surface, not the cursor hue; GitHub's inverse
+        // selection is adapted to Bitty's foreground-preserving contract).
+        let latte = resolve_theme_with_status(Some("catppuccin-latte")).0;
+        assert_eq!(latte.background, [0xEF, 0xF1, 0xF5]);
+        assert_eq!(latte.foreground, [0x4C, 0x4F, 0x69]);
+        assert_eq!(latte.ansi[0], [0x5C, 0x5F, 0x77]);
+        assert_eq!(latte.ansi[15], [0xBC, 0xC0, 0xCC]);
+        assert_eq!(latte.selection, [0xBF, 0xC3, 0xCE]);
+
+        let mocha = resolve_theme_with_status(Some("catppuccin-mocha")).0;
+        assert_eq!(mocha.selection, [0x58, 0x5B, 0x70]);
+        assert_eq!(mocha.ansi[9], [0xF3, 0x77, 0x99]);
+
+        let tokyo = resolve_theme_with_status(Some("tokyo-night")).0;
+        assert_eq!(tokyo.selection, [0x33, 0x46, 0x7C]);
+        assert_eq!(tokyo.ansi[14], [0x7D, 0xCF, 0xFF]);
+
+        let github = resolve_theme_with_status(Some("github-light")).0;
+        assert_eq!(github.selection, [0xB6, 0xD7, 0xFF]);
+        assert_eq!(github.ansi[12], [0x1C, 0x76, 0xD9]);
+
+        // Cursor and pine repairs that keep derived chrome readable while
+        // preserving the upstream hue (CTX-1418).
+        assert_eq!(latte.cursor, [0x93, 0x5C, 0x50]);
+        assert_eq!(github.cursor, [0x09, 0x69, 0xDA]);
+        let night_owl = resolve_theme_with_status(Some("night-owl")).0;
+        assert_eq!(night_owl.cursor, [0xBD, 0xA8, 0xE0]);
+        let github_dark = resolve_theme_with_status(Some("github-dark")).0;
+        assert_eq!(github_dark.cursor, [0x5B, 0x9C, 0xF9]);
+        let dawn = resolve_theme_with_status(Some("rose-pine-dawn")).0;
+        assert_eq!(dawn.ansi[2], [0x20, 0x58, 0x70]);
+    }
+
+    #[test]
     fn focused_outline_meets_non_text_contrast_floor() {
         // CTX-0340 AC-1: the focused outline must clear 3:1 against the
         // workspace background. The derivation above guarantees it for every
@@ -2258,8 +3016,14 @@ mod tests {
         }
     }
 
-    /// A preset's expected upstream RGB values:
+    /// A preset's accepted RGB values:
     /// `(bg, fg, cursor, selection, ansi0, ansi1, ansi4, ansi15)`.
+    ///
+    /// These are the values the product ships after CTX-1418: Ghostty's
+    /// canonical theme file where one exists, with the minimal readability
+    /// repair recorded in `bitty-terminal-docs`. Updating a row is a palette
+    /// change and needs the same contrast evidence as the original landed
+    /// value.
     type ExpectedColors = (
         [u8; 3],
         [u8; 3],
@@ -2272,7 +3036,7 @@ mod tests {
     );
 
     #[test]
-    fn known_presets_match_upstream_values() {
+    fn known_presets_pin_their_accepted_values() {
         let checks: &[(&str, ExpectedColors)] = &[
             (
                 "tokyo-night",
@@ -2280,7 +3044,7 @@ mod tests {
                     [0x1A, 0x1B, 0x26],
                     [0xC0, 0xCA, 0xF5],
                     [0xC0, 0xCA, 0xF5],
-                    [0x28, 0x34, 0x57],
+                    [0x33, 0x46, 0x7C],
                     [0x15, 0x16, 0x1E],
                     [0xF7, 0x76, 0x8E],
                     [0x7A, 0xA2, 0xF7],
@@ -2293,11 +3057,11 @@ mod tests {
                     [0x1E, 0x1E, 0x2E],
                     [0xCD, 0xD6, 0xF4],
                     [0xF5, 0xE0, 0xDC],
-                    [0xF5, 0xE0, 0xDC],
+                    [0x58, 0x5B, 0x70],
                     [0x45, 0x47, 0x5A],
                     [0xF3, 0x8B, 0xA8],
                     [0x89, 0xB4, 0xFA],
-                    [0xA6, 0xAD, 0xC8],
+                    [0xBA, 0xC2, 0xDE],
                 ),
             ),
             (
@@ -2318,8 +3082,8 @@ mod tests {
                 (
                     [0x0D, 0x11, 0x17],
                     [0xE6, 0xED, 0xF3],
-                    [0x2F, 0x81, 0xF7],
-                    [0xE6, 0xED, 0xF3],
+                    [0x5B, 0x9C, 0xF9],
+                    [0x26, 0x4F, 0x78],
                     [0x48, 0x4F, 0x58],
                     [0xFF, 0x7B, 0x72],
                     [0x58, 0xA6, 0xFF],
@@ -2332,7 +3096,7 @@ mod tests {
                     [0xFF, 0xFF, 0xFF],
                     [0x1F, 0x23, 0x28],
                     [0x09, 0x69, 0xDA],
-                    [0x1F, 0x23, 0x28],
+                    [0xB6, 0xD7, 0xFF],
                     [0x24, 0x29, 0x2F],
                     [0xCF, 0x22, 0x2E],
                     [0x09, 0x69, 0xDA],
@@ -2345,9 +3109,9 @@ mod tests {
                     [0x2E, 0x34, 0x40],
                     [0xD8, 0xDE, 0xE9],
                     [0xEC, 0xEF, 0xF4],
-                    [0xEC, 0xEF, 0xF4],
+                    [0x43, 0x4C, 0x5E],
                     [0x3B, 0x42, 0x52],
-                    [0xBF, 0x61, 0x6A],
+                    [0xCF, 0x89, 0x8F],
                     [0x81, 0xA1, 0xC1],
                     [0xEC, 0xEF, 0xF4],
                 ),
@@ -2360,7 +3124,7 @@ mod tests {
                     [0xC0, 0xC1, 0xB5],
                     [0x57, 0x58, 0x4F],
                     [0x27, 0x28, 0x22],
-                    [0xF9, 0x26, 0x72],
+                    [0xFA, 0x49, 0x88],
                     [0xFD, 0x97, 0x1F],
                     [0xFD, 0xFF, 0xF1],
                 ),

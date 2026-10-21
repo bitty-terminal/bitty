@@ -397,6 +397,15 @@ bitty.store.set("first_hidden", not ok)
 if ok then
   bitty.store.set("vol", snap.volume_pct)
 end
+-- bitty#2425 review: `pcall` swallows a suspension raised inside the call,
+-- so a read that consumed the slice would go unnoticed here. Run bounded
+-- plugin work AFTER the protected call: the next slice check lands outside
+-- `pcall` and suspends the chunk if the read was charged to it.
+local acc = 0
+for i = 1, 20000 do
+  acc = (acc + i) % 1000003
+end
+bitty.store.set("post_loop", acc >= 0)
 return {}
 "#;
 
@@ -409,6 +418,13 @@ fn bar_activation_never_blocks_on_a_slow_audio_monitor() {
     // ms). The sampled monitor moves the read off the executor thread, so
     // activation completes on the production budget while the reader is
     // still running.
+    //
+    // This is the production-slice guard: the fixture polls audio through
+    // `pcall` and then runs bounded plugin work outside it, so a read that
+    // is charged to the slice suspends at the next non-`pcall` boundary
+    // instead of being swallowed. It runs on the default RC-1 budget (no
+    // `set_vm_wall_budget_ms`) with a 1.5 s composed reader, and the Rust
+    // elapsed assertion below bounds the activation far below that.
     let root = temp_dir("slow-audio");
     let third = root.join("third");
     write_plugin(
@@ -421,9 +437,9 @@ fn bar_activation_never_blocks_on_a_slow_audio_monitor() {
     );
     let mut rt = runtime(vec![third]);
     let spawn: SampledSpawnFn = std::sync::Arc::new(|argv: &[String]| {
-        // Three composed spawns per read: 300 ms total, six times the
+        // Three composed spawns per read: 1.5 s total, thirty times the
         // production 50 ms slice.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let text = argv.join(" ");
         if text.contains("get-sink-volume") {
             Ok(VOLUME_FIXTURE.to_string())
@@ -438,13 +454,26 @@ fn bar_activation_never_blocks_on_a_slow_audio_monitor() {
     *rt.audio_host().borrow_mut() = AudioHost::sampled_for_test(spawn, 0);
     let id = PluginId::new("xuepoo.slow").expect("id");
     rt.discover();
-    // Production RC-1: an inline 400 ms read would suspend here.
+    // Production RC-1: an inline read of the 1.5 s reader would suspend the
+    // activation chunk (and a suspension swallowed by `pcall` would still
+    // land on the post-loop slice check).
+    let started = std::time::Instant::now();
     let report = rt.activate(&id).expect("activation stays inside the slice");
+    let elapsed = started.elapsed();
     assert_eq!(report.state, LifecycleState::Active);
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "activation observed the reader latency: {elapsed:?} (five production slices)"
+    );
     assert_eq!(
         store_bool(&rt, &id, "first_hidden"),
         Some(true),
         "the first read hides instead of blocking activation"
+    );
+    assert_eq!(
+        store_bool(&rt, &id, "post_loop"),
+        Some(true),
+        "the post-pcall work ran, so no latent suspension was left behind"
     );
     // The off-thread read lands and serves through the same gate.
     let mut served = None;
@@ -528,11 +557,26 @@ fn repeated_audio_polls_never_extend_the_slice_with_host_work() {
         Some(0.0),
         "every poll before the first sample hides, none blocks"
     );
-    // One in-flight composed read at most: three spawns, never 5 000.
-    assert!(
-        spawns.load(Ordering::SeqCst) <= 3,
-        "poll loop multiplied monitor work: {} spawns",
-        spawns.load(Ordering::SeqCst)
+    // Wait for the single composed read to finish (three spawns), then
+    // assert the poll loop never started another: 500 calls must not
+    // multiply monitor work. Waiting here makes the bound an exact value
+    // instead of racing an in-flight read.
+    let mut waited_ms = 0_u32;
+    while spawns.load(Ordering::SeqCst) < 3 && waited_ms < 2_000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited_ms += 10;
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        3,
+        "the poll loop must produce exactly one composed read (three spawns)"
+    );
+    // Give a wrongly spawned second read time to appear, then re-check.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        3,
+        "poll loop multiplied monitor work after the first read"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

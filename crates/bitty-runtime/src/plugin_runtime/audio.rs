@@ -478,8 +478,13 @@ fn truncate_io_error(message: &str) -> String {
 /// Shared sampling slot between the executor thread and one sampler thread.
 #[derive(Default)]
 struct SampleSlot {
-    /// Completed attempt the next `get()` has not observed yet.
-    ready: Option<Result<AudioState, AudioError>>,
+    /// Completed attempt the next `get()` has not observed yet, with the
+    /// host-clock instant (milliseconds) at which the reader finished.
+    ///
+    /// The landing instant travels with the sample so the gate's
+    /// `stale_age_ms` and 10 s hide grace are measured from the read, not
+    /// from whichever tick happens to observe it (bitty#2425 review).
+    ready: Option<(Result<AudioState, AudioError>, u64)>,
     /// Executor-clock time of the last admitted request (`None` before the
     /// first attempt), so retries stay at the 0.5 Hz ceiling.
     request_ms: Option<u64>,
@@ -498,12 +503,17 @@ struct SampleSlot {
 ///
 /// The sampler runs that read on a short-lived named thread, at most one at
 /// a time and at most once per [`STATE_MIN_INTERVAL_MS`], and hands the
-/// completed attempt to [`AudioMonitor::get`]. `get()` therefore never
-/// spawns, waits, or sleeps: it either observes a landed attempt or serves
-/// the last-good snapshot through [`StateGate::serve_cached`]. The executor
-/// thread stays bounded by the plugin's own work; the sampler's own bounds
-/// are unchanged (`AUDIO_SPAWN_TIMEOUT_MS` per spawn, three spawns, one
-/// thread).
+/// completed attempt plus its landing instant to [`AudioMonitor::get`].
+/// `get()` therefore never spawns, waits, or sleeps: it either observes a
+/// landed attempt or serves the last-good snapshot through
+/// [`StateGate::serve_cached`]. The executor thread stays bounded by the
+/// plugin's own work; the sampler's own bounds are unchanged
+/// (`AUDIO_SPAWN_TIMEOUT_MS` per spawn, three spawns, one thread).
+///
+/// A read still in flight when the host is dropped keeps only the slot, the
+/// spawner, and its own stack alive: it is read-only, at most one thread,
+/// and bounded by three `AUDIO_SPAWN_TIMEOUT_MS` spawns (~3 s). Nothing
+/// joins it, so host teardown never waits on a monitor.
 struct SampledReads {
     spawn: SampledSpawnFn,
     slot: Arc<Mutex<SampleSlot>>,
@@ -525,7 +535,7 @@ impl SampledReads {
     /// moment the next read becomes useful, so serving one re-checks the
     /// 0.5 Hz window and keeps a steady cadence instead of waiting for a
     /// second tick.
-    fn take(&self, now_ms: u64) -> Option<Result<AudioState, AudioError>> {
+    fn take(&self, now_ms: u64) -> Option<(Result<AudioState, AudioError>, u64)> {
         let ready = lock_slot(&self.slot).ready.take();
         self.request(now_ms);
         ready
@@ -544,6 +554,9 @@ impl SampledReads {
         }
         slot.in_flight = true;
         slot.request_ms = Some(now_ms);
+        // Captured before the spawn so the landing instant includes thread
+        // startup, not just the reader itself.
+        let started = Instant::now();
         let slot_arc = Arc::clone(&self.slot);
         let spawn = Arc::clone(&self.spawn);
         let spawned = std::thread::Builder::new()
@@ -554,7 +567,10 @@ impl SampledReads {
                 let _flight = FlightGuard(Arc::clone(&slot_arc));
                 let inline: SpawnFn = Rc::new(move |argv: &[String]| spawn(argv));
                 let outcome = live_read(&inline);
-                lock_slot(&slot_arc).ready = Some(outcome);
+                let landed_ms = now_ms.saturating_add(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                lock_slot(&slot_arc).ready = Some((outcome, landed_ms));
             });
         if spawned.is_err() {
             slot.in_flight = false;
@@ -740,7 +756,7 @@ impl AudioMonitor {
         }
         if let Some(sampled) = self.sampled.as_ref() {
             let poll = match sampled.take(now_ms) {
-                Some(sample) => self.state_gate.observe(now_ms, sample),
+                Some((sample, landed_ms)) => self.state_gate.observe(now_ms, landed_ms, sample),
                 None => self.state_gate.serve_cached(now_ms),
             }
             .map_err(audio_error_to_gone)?;

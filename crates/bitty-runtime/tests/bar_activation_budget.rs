@@ -25,6 +25,11 @@
 //! takes 1.5 s (30x the production slice, 3x this headroom) must cost the
 //! activation slice nothing at all, so any inline read fails this suite even
 //! on a host where three warm `pactl` spawns would fit 50 ms.
+//!
+//! The production-budget guard for the same regression is
+//! `plugin_device_audio_native::bar_activation_never_blocks_on_a_slow_audio_monitor`
+//! (tiny fixture plugin, default RC-1, 1.5 s injected reader): forcing the
+//! inline path there suspends at 1 500 ms against the 50 ms budget.
 
 mod common;
 

@@ -13,9 +13,14 @@ License: MIT (see `LICENSE`, copied from the same revision).
 
 Purpose: `tests/bar_activation_budget.rs` activates the matrix `bar-heavy`
 plan (`workspaces` / `clock` / `memory` + `pulseaudio`) through
-`PluginRuntime` on the production RC-1 budget. The test fails if activation
-work goes back to the hundreds of milliseconds the matrix recorded
-(`WallClockExceeded { elapsed_ms: 159, budget_ms: 50 }`).
+`PluginRuntime` and asserts that the band mounts. That suite runs under a
+documented debug-build harness wall budget (10x the RC-1 slice), not the
+production 50 ms: the pinned 4 000-line `init.lua` costs 61-117 ms of pure
+Lua compile+run in a debug test build on sharded CI runners. The
+production-budget guard for the same regression is
+`plugin_device_audio_native::bar_activation_never_blocks_on_a_slow_audio_monitor`
+(a tiny fixture plugin on the default RC-1 budget with a 1.5 s injected
+reader); moving provider I/O back onto the executor thread suspends it.
 
 Do not refresh this fixture in passing. A deliberately bumped pin is its own
 change with the two hashes above updated in the same commit; the test's

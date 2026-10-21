@@ -181,17 +181,14 @@ end })
 bitty.commands.register({ id = "inspect", title = "Inspect", run = function()
   return code(function() return bitty.runtime.inspect() end)
 end })
-bitty.commands.register({ id = "flood", title = "Flood", run = function()
-  local accepted, refused = 0, 0
-  for _ = 1, 20 do
-    local ok = pcall(bitty.keymaps.list)
-    if ok then accepted = accepted + 1 else refused = refused + 1 end
-  end
-  return accepted .. "/" .. refused
+bitty.commands.register({ id = "call", title = "One list call", run = function()
+  local ok, err = pcall(bitty.keymaps.list)
+  if ok then return "OK" end
+  return "ERR:" .. err.code
 end })
 "##;
 
-const PROBE_COMMANDS: &[&str] = &["list", "page", "bad", "configure", "inspect", "flood"];
+const PROBE_COMMANDS: &[&str] = &["list", "page", "bad", "configure", "inspect", "call"];
 
 fn default_table() -> Vec<ResolvedKeymap> {
     bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults")
@@ -344,6 +341,33 @@ fn addressable_rows_are_capped_at_the_registry_bound() {
 
 #[test]
 fn per_generation_budget_stops_a_call_flood() {
-    let (mut rt, _source) = probe_runtime(&["runtime.keymaps.read"]);
-    assert_eq!(run(&mut rt, "flood"), "16/4");
+    let (mut rt, source) = probe_runtime(&["runtime.keymaps.read"]);
+    // Two-row pages keep each dispatch tiny, and the 20 calls are split
+    // across 20 separate dispatches: every call is its own VM slice, so the
+    // probe never approaches the production 50 ms RC-1 wall. The host call
+    // budget is per generation, so it still spans all dispatches.
+    *source.0.borrow_mut() = vec![
+        ResolvedKeymap {
+            chord: Chord::parse("alt+h").expect("chord"),
+            action: ChromeAction::CloseView,
+            context: "global".to_string(),
+            from_default: true,
+        },
+        ResolvedKeymap {
+            chord: Chord::parse("alt+j").expect("chord"),
+            action: ChromeAction::CloseView,
+            context: "global".to_string(),
+            from_default: true,
+        },
+    ];
+    let mut accepted = 0;
+    let mut refused = 0;
+    for _ in 0..20 {
+        match run(&mut rt, "call").as_str() {
+            "OK" => accepted += 1,
+            "ERR:E_DEF_LIMIT" => refused += 1,
+            other => panic!("unexpected keymaps.list result: {other}"),
+        }
+    }
+    assert_eq!((accepted, refused), (16, 4));
 }

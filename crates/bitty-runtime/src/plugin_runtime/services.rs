@@ -124,34 +124,41 @@ impl InspectCallBudget {
 
 /// Per-generation `bitty.keymaps.list` call budget (issue #2405).
 ///
-/// One one-second window admits [`KEYMAP_LIST_CALLS_PER_SECOND`] calls; the
-/// window resets lazily on the first call after it expires. Denials are typed
+/// A strict sliding window: at most [`KEYMAP_LIST_CALLS_PER_SECOND`] accepted
+/// calls in any one-second span. Expired timestamps are dropped from the front
+/// before each decision, so a burst that crosses a wall-clock second boundary
+/// cannot exceed the documented rate — a fixed reset-on-call window would
+/// admit up to twice the rate around the boundary. Denials are typed
 /// (`E_DEF_LIMIT`) and never touch the keymap source. A full 1024-row scan
 /// costs at most four calls at the 256-row page cap, so the budget admits
 /// every legitimate paging loop with headroom.
 #[derive(Debug)]
 struct KeymapCallBudget {
-    window_start: Instant,
-    calls: u32,
+    /// Accept times of the calls inside the current window, oldest first.
+    /// Bounded by [`KEYMAP_LIST_CALLS_PER_SECOND`].
+    recent: VecDeque<Instant>,
 }
 
 impl KeymapCallBudget {
-    fn new(now: Instant) -> Self {
+    fn new() -> Self {
         Self {
-            window_start: now,
-            calls: 0,
+            recent: VecDeque::new(),
         }
     }
 
     fn allow(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
-            self.window_start = now;
-            self.calls = 0;
+        const WINDOW: Duration = Duration::from_secs(1);
+        while self
+            .recent
+            .front()
+            .is_some_and(|accepted| now.duration_since(*accepted) >= WINDOW)
+        {
+            self.recent.pop_front();
         }
-        if self.calls >= KEYMAP_LIST_CALLS_PER_SECOND {
+        if self.recent.len() >= KEYMAP_LIST_CALLS_PER_SECOND as usize {
             return false;
         }
-        self.calls = self.calls.saturating_add(1);
+        self.recent.push_back(now);
         true
     }
 }
@@ -2109,7 +2116,7 @@ impl PluginServices {
             runtime_inspect_budget: RefCell::new(InspectCallBudget::new(Instant::now())),
             keymaps_read: Cell::new(false),
             keymap_source: RefCell::new(None),
-            keymap_budget: RefCell::new(KeymapCallBudget::new(Instant::now())),
+            keymap_budget: RefCell::new(KeymapCallBudget::new()),
             granted_capabilities: RefCell::new(Vec::new()),
             declared_events: RefCell::new(BTreeSet::new()),
             debug_view: RefCell::new(None),
@@ -10431,6 +10438,33 @@ mod history_tests {
         assert_eq!(page.total, bitty_lua::keymaps::KEYMAP_LIST_MAX_TOTAL);
         assert_eq!(page.entries.len(), bitty_lua::keymaps::KEYMAP_LIST_MAX_ROWS);
         assert!(page.truncated);
+    }
+
+    #[test]
+    fn keymap_budget_is_a_strict_sliding_window() {
+        // Deterministic synthetic clock: a burst may never exceed the rate,
+        // even across a wall-clock second boundary, and each expired call
+        // frees exactly one slot.
+        let start = Instant::now();
+        let mut budget = KeymapCallBudget::new();
+        for call in 0..KEYMAP_LIST_CALLS_PER_SECOND {
+            assert!(
+                budget.allow(start + Duration::from_millis(u64::from(call))),
+                "call {call}"
+            );
+        }
+        let last = start + Duration::from_millis(u64::from(KEYMAP_LIST_CALLS_PER_SECOND - 1));
+        assert!(
+            !budget.allow(last + Duration::from_millis(1)),
+            "a 17th call inside the window is denied"
+        );
+        assert!(
+            !budget.allow(start + Duration::from_millis(999)),
+            "the window is one second from the oldest accept"
+        );
+        // The first accepted call expires at exactly +1s; one slot opens.
+        assert!(budget.allow(start + Duration::from_secs(1)));
+        assert!(!budget.allow(start + Duration::from_secs(1)));
     }
 
     #[test]

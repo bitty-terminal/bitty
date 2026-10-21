@@ -20,6 +20,9 @@
 //!   `ElementHandle`, or `FocusOwner` beyond one ingest call; only persistent
 //!   identity (row ordinals, producer scene identities, kind and purpose
 //!   spellings, accessible names, the `Generation`) persists across ingests.
+//!   Notices are one-shot: the next [`bitty_a11y::Adapter::ingest_host`] read
+//!   reports every pending notice once and clears it, so a reused host never
+//!   re-delivers a transition (#2352).
 //! - [`A11ySettings`] — core-owned reduced-motion plus high-contrast
 //!   composition over [`MotionSpec`](crate::motion::MotionSpec) and theme
 //!   tokens. The extension crate is dependency-free and cannot own these; they
@@ -37,7 +40,9 @@
 //! - Pending announcements: at most 8
 //!   ([`MAX_PENDING_ANNOUNCEMENTS`](bitty_a11y::MAX_PENDING_ANNOUNCEMENTS)).
 //!   A full queue drops the oldest notice so the newest state wins (W-134);
-//!   overflow does not fail the ingest.
+//!   overflow does not fail the ingest. The host-side queue is bounded on
+//!   [`UiSnapshotHost::push_notice`], so an untouched host never grows past
+//!   the documented ceiling.
 //!
 //! The projection is derived and read-only: every constructor takes shared
 //! references and returns owned data. It never mutates terminal state, is
@@ -47,10 +52,13 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
+
 use bitty_a11y::{
     A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
-    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, SceneKind, Snapshot, SnapshotBuilder,
-    SnapshotHost, TextRun,
+    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_PENDING_ANNOUNCEMENTS, SceneKind, Snapshot,
+    SnapshotBuilder, SnapshotHost, TextRun,
 };
 
 use crate::motion::MotionSpec;
@@ -162,6 +170,15 @@ pub fn terminal_runs(snapshot: &bitty_term_state::Snapshot) -> Vec<TextRun> {
 /// accessible name of the surface Core reports as focused, or [`None`] when
 /// nothing is focused. The host never infers focus from a render, a cursor,
 /// or a default terminal attachment.
+///
+/// Notices are a one-shot handoff: [`UiSnapshotHost::push_notice`] queues a
+/// transition, and [`SnapshotHost::announcements`] reports the pending notices
+/// once and clears them, so the same host value reused across ingests reports
+/// each transition exactly once (#2352). The queue is bounded to
+/// [`MAX_PENDING_ANNOUNCEMENTS`] with drop-oldest overflow (W-134). A read
+/// consumes the notices even when the surrounding ingest then fails closed
+/// (stale generation, over-bound announcement text): those transitions belong
+/// to a superseded or invalid generation and are never re-delivered.
 #[derive(Clone, Debug)]
 pub struct UiSnapshotHost {
     root_name: String,
@@ -175,7 +192,7 @@ pub struct UiSnapshotHost {
     interactive: Vec<(InteractivePurpose, String, bool)>,
     modal_overlay: bool,
     focus_label: Option<String>,
-    notices: Vec<(AnnouncementKind, String)>,
+    notices: RefCell<VecDeque<(AnnouncementKind, String)>>,
 }
 
 impl UiSnapshotHost {
@@ -193,7 +210,7 @@ impl UiSnapshotHost {
             interactive: Vec::new(),
             modal_overlay: false,
             focus_label: None,
-            notices: Vec::new(),
+            notices: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -276,16 +293,33 @@ impl UiSnapshotHost {
 
     /// Queues one notice reported by the next ingest.
     ///
-    /// The notice is retained on the host until the host is rebuilt or the
-    /// caller clears it; there is deliberately no `clear`/`drain` on this
-    /// candidate API yet. A host value reused across ingests therefore
-    /// re-reports its accumulated notices, not only the current transition.
-    /// The adapter still bounds delivery at
-    /// [`MAX_PENDING_ANNOUNCEMENTS`](bitty_a11y::MAX_PENDING_ANNOUNCEMENTS)
-    /// with drop-oldest, so this is a reuse limitation, not an unbounded
-    /// path (follow-up: bitty#2352).
+    /// The notice is pending until [`SnapshotHost::announcements`] reads it:
+    /// that read reports every queued notice once and clears the queue, so a
+    /// host value reused across ingests never re-delivers a transition from a
+    /// previous ingest (#2352). Pushing past
+    /// [`MAX_PENDING_ANNOUNCEMENTS`] drops the oldest notice, keeping the
+    /// documented W-134 drop-oldest bound; the ingest does not fail.
+    ///
+    /// Callers that abandon a generation's transitions (for example after
+    /// replacing the host content wholesale) can discard the pending notices
+    /// with [`Self::clear_notices`]. Text above the 256-character announcement
+    /// ceiling is rejected by the adapter at ingest
+    /// ([`A11yError::AnnouncementTooLong`]), never truncated here.
     pub fn push_notice(&mut self, kind: AnnouncementKind, text: &str) {
-        self.notices.push((kind, text.to_string()));
+        let notices = self.notices.get_mut();
+        if notices.len() >= MAX_PENDING_ANNOUNCEMENTS {
+            notices.pop_front();
+        }
+        notices.push_back((kind, text.to_string()));
+    }
+
+    /// Discards every notice queued for the next ingest.
+    ///
+    /// Notices otherwise clear themselves when [`SnapshotHost::announcements`]
+    /// reads them; this is the explicit hook for transitions that no longer
+    /// belong to the generation about to be reported.
+    pub fn clear_notices(&mut self) {
+        self.notices.get_mut().clear();
     }
 }
 
@@ -365,7 +399,10 @@ impl SnapshotHost for UiSnapshotHost {
     }
 
     fn announcements(&self) -> Vec<(AnnouncementKind, String)> {
-        self.notices.clone()
+        // One-shot handoff: the notices queued for this ingest are reported
+        // once and cleared, so a host value reused across ingests reports
+        // only the transitions pushed since the previous read (#2352).
+        self.notices.borrow_mut().drain(..).collect()
     }
 }
 
@@ -478,5 +515,32 @@ mod tests {
             .ingest_host(&host, generation, None)
             .expect("host ingest");
         assert!(adapter.snapshot().is_some());
+    }
+
+    #[test]
+    fn notices_drain_once_and_stay_bounded() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        for index in 0..(MAX_PENDING_ANNOUNCEMENTS + 2) {
+            host.push_notice(AnnouncementKind::AsyncState, &format!("state {index}"));
+        }
+        let notices = host.announcements();
+        assert_eq!(notices.len(), MAX_PENDING_ANNOUNCEMENTS);
+        assert_eq!(notices.first().expect("nonempty").1, "state 2");
+        assert_eq!(
+            notices.last().expect("nonempty").1,
+            format!("state {}", MAX_PENDING_ANNOUNCEMENTS + 1)
+        );
+        assert!(
+            host.announcements().is_empty(),
+            "reading the notices must clear them"
+        );
+    }
+
+    #[test]
+    fn clear_notices_discards_pending_transitions() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        host.push_notice(AnnouncementKind::Focus, "shell focused");
+        host.clear_notices();
+        assert!(host.announcements().is_empty());
     }
 }

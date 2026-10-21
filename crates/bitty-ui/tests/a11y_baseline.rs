@@ -626,6 +626,60 @@ fn host_announcement_overflow_drops_oldest_not_fail_closed() {
     );
 }
 
+#[test]
+fn host_notices_are_reported_once_per_ingest() {
+    // #2352: the notice handoff is one-shot. A host value reused across
+    // ingests reports only the transitions pushed since the previous ingest;
+    // it never re-queues notices an earlier ingest already delivered. Draining
+    // between ingests also defeats the adapter queue's consecutive-duplicate
+    // coalescing, so an accumulating host would show up as a repeated notice.
+    let mut host = UiSnapshotHost::new("window", "shell");
+    host.set_focus_label(None);
+    host.push_notice(AnnouncementKind::Focus, "shell focused");
+    host.push_notice(AnnouncementKind::AsyncState, "build finished");
+
+    let mut adapter = Adapter::new();
+    let mut backend = HeadlessBackend::new();
+    backend.set_permission(true);
+    let generation = Generation::initial();
+
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("first ingest");
+    assert_eq!(
+        adapter.announce_to(&mut backend).expect("first drain"),
+        2,
+        "the first ingest reports every queued transition once"
+    );
+
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("identical re-ingest");
+    assert_eq!(
+        adapter.announce_to(&mut backend).expect("second drain"),
+        0,
+        "the second ingest must not repeat the first ingest's notices"
+    );
+    assert_eq!(backend.announcements().len(), 2);
+
+    // A transition pushed after the second ingest is delivered by the next
+    // ingest only, so the drain is per-generation, not a permanent mute.
+    host.push_notice(AnnouncementKind::Focus, "editor focused");
+    adapter
+        .ingest_host(&host, generation, None)
+        .expect("third ingest");
+    assert_eq!(adapter.announce_to(&mut backend).expect("third drain"), 1);
+    let delivered: Vec<&str> = backend
+        .announcements()
+        .iter()
+        .map(bitty_a11y::Announcement::text)
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["shell focused", "build finished", "editor focused"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Structural mutation: a dropped field fails closed with nothing swapped
 // ---------------------------------------------------------------------------

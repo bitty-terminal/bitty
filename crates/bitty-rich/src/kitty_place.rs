@@ -1,7 +1,9 @@
 //! Kitty placement: decoded images onto cell rects (CTX-0248, W-141).
 //!
-//! [`crate::kitty`] performs intake (chunked `m=` assembly, payloads held
-//! inert). The bounded Kitty payload decoder used to live here in
+//! Bounded Kitty `APC G` intake (chunked `m=` assembly) is owned by
+//! `bitty-vt`'s `kitty_apc`; the retired `bitty-rich` placeholder stub is
+//! not part of this path (bitty#2358). The bounded Kitty payload decoder
+//! used to live here in
 //! `kitty_decode` (W-141 extraction): it now lives in the `bitty-graphics`
 //! extension crate, which mirrors texture-preparation mechanics
 //! (nearest-neighbor scaling, the per-frame blit budget, its own raster
@@ -337,7 +339,22 @@ pub const KITTY_PRESENT_MAX_BLITS_PER_FRAME: usize = 32;
 pub const KITTY_PRESENT_MAX_BYTES_PER_FRAME: usize = 64 * 1024 * 1024;
 
 /// Maximum stored decoded images (kitty-ledger count parity).
-pub const KITTY_PLACE_MAX_IMAGES: usize = crate::kitty::KITTY_MAX_PLACEHOLDERS;
+///
+/// Aliases the legacy terminal-truth placeholder ceiling
+/// (`bitty_term_state::IMAGE_STORE_MAX_ENTRIES`, 64). The retired
+/// `bitty-rich` kitty stub used to be the single source of this alias; the
+/// placement layer now owns it directly with the value unchanged
+/// (bitty#2358).
+pub const KITTY_PLACE_MAX_IMAGES: usize = bitty_term_state::IMAGE_STORE_MAX_ENTRIES;
+
+/// Maximum total bytes per kitty ledger: resident images plus the in-flight
+/// chunk buffer, Ghostty `total_limit` parity (`320 * 1000 * 1000`).
+///
+/// Core-retained backstop for the kitty intake path. It bounds any future
+/// intake layer that stores or streams images; the retired placeholder stub
+/// used to define it (bitty#2358), and the decode path's compile-time
+/// headroom assertion below keeps its value load-bearing.
+pub const KITTY_LEDGER_MAX_BYTES: usize = 320 * 1000 * 1000;
 
 /// Maximum total decoded RGBA bytes held by the layer (RFC IMG-4 parity).
 pub const KITTY_PLACE_MAX_BYTES: usize = crate::image::IMAGE_STORE_MAX_BYTES;
@@ -3064,7 +3081,10 @@ mod tests {
         const _: () = assert!(KITTY_PER_ORIGIN_MAX_IMAGES == KITTY_PLACE_MAX_IMAGES);
         const _: () = assert!(KITTY_PER_ORIGIN_MAX_BYTES * 4 == KITTY_PLACE_MAX_BYTES);
         const _: () = assert!(KITTY_PER_ORIGIN_MAX_PLACEMENTS * 4 == KITTY_PLACE_MAX_ITEMS);
-        assert_eq!(KITTY_PLACE_MAX_IMAGES, crate::kitty::KITTY_MAX_PLACEHOLDERS);
+        assert_eq!(
+            KITTY_PLACE_MAX_IMAGES,
+            bitty_term_state::IMAGE_STORE_MAX_ENTRIES
+        );
         // Error strings stay stable for snapshot greps.
         assert_eq!(
             KittyPlacementError::ImageNotFound(KittyImageId(7)).to_string(),
@@ -3369,7 +3389,8 @@ mod tests {
         // Core-owned re-assertion of the moved decoder's ledger bound
         // (threat T-01/T-02): no admissible bitmap rivals stored+in-flight
         // pressure.
-        const _: () = assert!(KITTY_DECODE_MAX_BYTES * 4 < crate::kitty::KITTY_LEDGER_MAX_BYTES);
+        const _: () = assert!(KITTY_DECODE_MAX_BYTES * 4 < KITTY_LEDGER_MAX_BYTES);
+        assert_eq!(KITTY_LEDGER_MAX_BYTES, 320_000_000);
         const _: () = assert!(KITTY_DECODE_MAX_PIXELS == 4096 * 4096);
         const _: () = assert!(KITTY_DECODE_MAX_PIXELS * 4 == KITTY_DECODE_MAX_BYTES as u64);
         assert_eq!(KITTY_DECODE_MAX_DIMENSION, 8192);

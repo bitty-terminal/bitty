@@ -58,7 +58,8 @@
 //! decode-cap violation, unexpected control payload, or sandbox path
 //! rejection all store nothing and paint nothing. The caller
 //! (`Parser`) emits no action on rejection. Chunked streams drop only the
-//! offending stream on oversize, mirroring `KittyGraphicsStub` semantics.
+//! offending stream on oversize, mirroring the Core kitty placement ledger
+//! semantics.
 //!
 //! An open stream never outlives a protocol violation or a stall:
 //!

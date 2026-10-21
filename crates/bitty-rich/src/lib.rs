@@ -20,8 +20,9 @@
 //! `bitty_term_state::ImageStore` (64 entries, 4096 bytes each) remains as
 //! the legacy terminal-truth placeholder seam; this crate's `image`
 //! module is the RFC-compliant presentation store consumed by
-//! `bitty-render`. The `kitty` stub is retained for compatibility and
-//! mirrors the legacy term-state bounds; new code should use `image`.
+//! `bitty-render`. Kitty `APC G` intake is owned by `bitty-vt`
+//! (`kitty_apc`) and placement/ledger policy by [`kitty_place`]; the legacy
+//! `bitty-rich` placeholder stub is retired (bitty#2358).
 //!
 //! The `host` module holds the only filesystem/process seams
 //! in this crate: the external-editor round trip writes a `0600` temp file
@@ -43,8 +44,7 @@
 //! | [`clipboard::CLIPBOARD_MAX_HISTORY`] | 16 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_PAYLOAD_BYTES`] | 4096 | truncation at cap |
 //! | [`clipboard::CLIPBOARD_MAX_OUTSTANDING_GRANTS`] | 16 | oldest grant evicted (token dies) |
-//! | [`kitty::KITTY_MAX_PLACEHOLDERS`] (legacy) | 64 | oldest evicted |
-//! | [`kitty::KITTY_MAX_PAYLOAD_BYTES`] (legacy) | 4096 | truncation |
+//! | [`kitty_place::KITTY_LEDGER_MAX_BYTES`] kitty ledger (resident + in-flight) | 320,000,000 | Ghostty `total_limit` parity; decode headroom asserted at compile time |
 //! | [`kitty_place::KITTY_DECODE_MAX_DIMENSION`] | 8192 px/side | typed error, no allocation |
 //! | [`kitty_place::KITTY_DECODE_MAX_PIXELS`] (4096² area) | 16.7M px | typed error, no allocation |
 //! | [`kitty_place::KITTY_DECODE_MAX_BYTES`] declared/decoded RGBA | 64 MiB | typed error, no allocation |
@@ -100,7 +100,6 @@ pub mod hints;
 pub mod host;
 pub mod hyperlink;
 pub mod image;
-pub mod kitty;
 pub mod kitty_decode;
 pub mod kitty_place;
 pub mod kitty_raster;
@@ -152,19 +151,18 @@ pub use image::{
     ImageStoreError, PixelFormat, PlacementAnchor, PlacementGeometry, PlacementId,
     ScrollBehavior as ImageScrollBehavior, payload_fingerprint,
 };
-pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
 pub use kitty_decode::{KittyDecodeError, KittyDecodedImage, decode_kitty_payload};
 pub use kitty_place::{
     KITTY_ANIM_MAX_BYTES_PER_IMAGE, KITTY_ANIM_MAX_FRAMES, KITTY_COMPOSE_BLEND,
     KITTY_COMPOSE_REPLACE, KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, KITTY_DECODE_MAX_BYTES,
     KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG, KITTY_FORMAT_RGB,
-    KITTY_FORMAT_RGBA, KITTY_PER_ORIGIN_MAX_BYTES, KITTY_PER_ORIGIN_MAX_IMAGES,
-    KITTY_PER_ORIGIN_MAX_PLACEMENTS, KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES,
-    KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
-    KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyFrame, KittyImageId, KittyImageLayer,
-    KittyPlacedImage, KittyPlacement, KittyPlacementError, KittyPlacementId, KittyPrecheckError,
-    KittyVirtualPrototype, placement_full_rect_for, placement_rect_for, precheck_declared_image,
-    viewport_extent,
+    KITTY_FORMAT_RGBA, KITTY_LEDGER_MAX_BYTES, KITTY_PER_ORIGIN_MAX_BYTES,
+    KITTY_PER_ORIGIN_MAX_IMAGES, KITTY_PER_ORIGIN_MAX_PLACEMENTS, KITTY_PLACE_MAX_BYTES,
+    KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME,
+    KITTY_PRESENT_MAX_BYTES_PER_FRAME, KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyFrame,
+    KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
+    KittyPlacementId, KittyPrecheckError, KittyVirtualPrototype, placement_full_rect_for,
+    placement_rect_for, precheck_declared_image, viewport_extent,
 };
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,

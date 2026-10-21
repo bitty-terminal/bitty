@@ -53,19 +53,15 @@ fn store_quotas_alias_image_store() {
         bitty_rich::image::IMAGE_STORE_MAX_BYTES,
         "kitty place byte cap aliases image-store ceiling (CTX-1087 F11)"
     );
-    // 64-image Kitty ledger parity: aliases the kitty placeholder ceiling
-    // (term-state `IMAGE_STORE_MAX_ENTRIES`), distinct from the generic
-    // 256-image store cap — both normative in their own layer, values
-    // unchanged.
+    // 64-image Kitty ledger parity: aliases the term-state `IMAGE_STORE_MAX_ENTRIES`
+    // ceiling, distinct from the generic 256-image store cap — both normative
+    // in their own layer, values unchanged. The retired `bitty-rich` kitty
+    // stub used to be the intermediate alias; the placement layer now owns
+    // the alias directly (bitty#2358).
     assert_eq!(
         bitty_rich::KITTY_PLACE_MAX_IMAGES,
-        bitty_rich::kitty::KITTY_MAX_PLACEHOLDERS,
-        "kitty place count cap aliases kitty ledger ceiling (CTX-1087 F11)"
-    );
-    assert_eq!(
-        bitty_rich::kitty::KITTY_MAX_PLACEHOLDERS,
         bitty_term_state::IMAGE_STORE_MAX_ENTRIES,
-        "kitty ledger ceiling matches term-state placeholder entries (CTX-1087 F11)"
+        "kitty place count cap aliases term-state placeholder entries (CTX-1087 F11)"
     );
     assert_eq!(
         bitty_rich::KITTY_PLACE_MAX_ITEMS,

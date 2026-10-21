@@ -3984,15 +3984,22 @@ impl Runtime {
             }
             let band_row = self.visible_band_row(anchor.edge, anchor.visible_index)?;
             let count = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-            let start_row = match anchor.edge {
-                BandEdge::Top => band_row.saturating_add(1),
-                BandEdge::Bottom => band_row.saturating_sub(count),
+            let (start_row, limit_row) = match anchor.edge {
+                BandEdge::Top => (band_row.saturating_add(1), None),
+                // The stack ends at the band row (exclusive): a tooltip taller
+                // than the space above the band clips instead of painting over
+                // its own band (CodeRabbit, PR #2423).
+                BandEdge::Bottom => (band_row.saturating_sub(count), Some(band_row)),
                 BandEdge::Left | BandEdge::Right => return None,
             };
             let x = u16::try_from(anchor.start_col)
                 .unwrap_or(u16::MAX)
                 .min(window.width.saturating_sub(1));
-            Some((start_row, x))
+            Some(AnchoredOverlayStack {
+                start_row,
+                x,
+                limit_row,
+            })
         });
         let mid_row = frame.rows.saturating_sub(1) / 2;
         // Center the row stack on the middle row: the title row lands just
@@ -4002,21 +4009,26 @@ impl Runtime {
         let mut painted = false;
         for (index, overlay_row) in rows.iter().enumerate() {
             let offset = u16::try_from(index).unwrap_or(u16::MAX);
-            let (row, placement) = match anchored {
-                Some((anchor_row, x)) => (
-                    anchor_row.saturating_add(offset),
-                    Some(AnchoredOverlayRow {
-                        x,
-                        cols: window.width.saturating_sub(x),
-                        row: anchor_row.saturating_add(offset),
-                        window_x: window.x,
-                    }),
-                ),
-                None => (start_row.saturating_add(offset), None),
+            let (row, placement, limit_row) = match anchored {
+                Some(stack) => {
+                    let row = stack.start_row.saturating_add(offset);
+                    (
+                        row,
+                        Some(AnchoredOverlayRow {
+                            x: stack.x,
+                            cols: window.width.saturating_sub(stack.x),
+                            row,
+                            window_x: window.x,
+                        }),
+                        stack.limit_row,
+                    )
+                }
+                None => (start_row.saturating_add(offset), None, None),
             };
             let out_of_bounds = match placement {
                 Some(placement) => {
                     placement.row >= window.height
+                        || limit_row.is_some_and(|limit| placement.row >= limit)
                         || placement.cols == 0
                         || placement.x >= window.width
                 }
@@ -5013,6 +5025,21 @@ struct OverlayRow {
     runs: Vec<super::band_host::BandRun>,
 }
 
+/// Row stack placed against a live band item (issue #2411).
+///
+/// `limit_row` is the exclusive window row the stack must not reach: a bottom
+/// band sets it to its own row, so a tooltip taller than the space above the
+/// band clips at the band instead of painting over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnchoredOverlayStack {
+    /// Window row of the first tooltip row.
+    start_row: u16,
+    /// Window column the rows start at.
+    x: u16,
+    /// Exclusive window row the stack must not reach.
+    limit_row: Option<u16>,
+}
+
 /// One overlay row placed against a live band item (issue #2411).
 ///
 /// Window-cell coordinates, not frame-relative: an anchored tooltip belongs to
@@ -5245,6 +5272,7 @@ mod plugin_overlay_paint_tests {
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
     use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
+    use bitty_platform::PhysicalSize;
 
     fn runtime() -> Runtime {
         Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
@@ -5405,6 +5433,56 @@ mod plugin_overlay_paint_tests {
                 * i32::try_from(cell_w).unwrap();
             assert_eq!(fill.rect.x, expected_x, "anchored at the region column");
             assert_eq!(fill.rect.y, expected_y, "stacked above the bottom band");
+        }
+    }
+
+    #[test]
+    fn tall_bottom_anchor_clips_at_the_band_row() {
+        // CodeRabbit (PR #2423): a tooltip taller than the space above a
+        // bottom band must clip at the band row instead of painting over its
+        // own band.
+        let mut rt = runtime();
+        let (cell_w, cell_h) = rt.live_cell_size();
+        let pad = rt.window_padding_physical();
+        rt.handle_resize(PhysicalSize::new(
+            cell_w
+                .saturating_mul(80)
+                .saturating_add(pad.saturating_mul(2)),
+            cell_h
+                .saturating_mul(6)
+                .saturating_add(pad.saturating_mul(2)),
+        ))
+        .expect("resize to six rows");
+        rt.set_chrome_bands(ChromeBands {
+            bottom: vec![surface_with_rows(&["bar"])],
+            ..Default::default()
+        });
+        rt.tick().expect("present the bottom band");
+        let band_row = rt
+            .visible_band_row(BandEdge::Bottom, 0)
+            .expect("bottom band row");
+        let rows = vec!["detail"; 10];
+        rt.set_plugin_overlay(Some(surface_with_rows(&rows)));
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Bottom,
+            visible_index: 0,
+            start_col: 0,
+            end_col: 6,
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            usize::from(band_row),
+            "only the rows above the band paint"
+        );
+        for fill in &layers.combined_overlay {
+            let row = u16::try_from((fill.rect.y - 8) / i32::try_from(cell_h).unwrap())
+                .expect("row offset");
+            assert!(
+                row < band_row,
+                "row {row} must stay above the band row {band_row}"
+            );
         }
     }
 

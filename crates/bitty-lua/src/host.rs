@@ -1572,11 +1572,14 @@ pub trait HostServices {
     ///
     /// `ui.update` validates a replacement subtree against the mount's scope,
     /// so a band block may carry root-`Row` anchors while an overlay block
-    /// may not. A host that cannot name the block's slot must not accept a
-    /// placement it will never resolve, so the default is
-    /// [`UiSceneScope::Unanchored`] (anchors fail closed).
-    fn ui_scene_scope(&self, _handle: i64) -> UiSceneScope {
-        UiSceneScope::Unanchored
+    /// may not. `None` means the host cannot resolve the handle (stale after
+    /// `clear_ui_blocks`, foreign, or unknown): the bridge then validates the
+    /// subtree permissively and lets `ui_update` report its documented
+    /// `Ok(false)` stale-handle result instead of turning it into a parse
+    /// error. A host that can name the slot returns `Some(scope)`, and
+    /// anchors in a known non-band block still fail closed.
+    fn ui_scene_scope(&self, _handle: i64) -> Option<UiSceneScope> {
+        None
     }
 
     /// Replace a mounted block's scene subtree, incrementing its version.
@@ -5886,7 +5889,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                 };
                 // Issue #2411: an update keeps the mount's scene scope, so a
                 // band block may carry anchors and an overlay block may not.
-                let scope = state.services.ui_scene_scope(handle);
+                // An unresolvable handle (stale/foreign) keeps the documented
+                // `Ok(false)` contract: validate permissively and let the
+                // host's `ui_update` report it, never a parse error.
+                let scope = state
+                    .services
+                    .ui_scene_scope(handle)
+                    .unwrap_or(UiSceneScope::Band);
                 let component = read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
                 let updated = state
                     .bounded_mutation(|expiry| {

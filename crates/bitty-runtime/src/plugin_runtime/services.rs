@@ -3790,16 +3790,18 @@ impl HostServices for PluginServices {
 
     /// Scene scope of a mounted block (issue #2411): only a horizontal band
     /// block has a row width that resolves group anchors.
-    fn ui_scene_scope(&self, handle: i64) -> UiSceneScope {
-        match self
-            .ui_blocks
+    ///
+    /// `None` for a stale or foreign handle: `ui.update` must keep returning
+    /// its documented `Ok(false)` result for those instead of the bridge
+    /// rejecting an anchored replacement tree as malformed.
+    fn ui_scene_scope(&self, handle: i64) -> Option<UiSceneScope> {
+        self.ui_blocks
             .borrow()
             .get(handle)
-            .map(crate::plugin_runtime::UiBlock::ui_slot)
-        {
-            Some(UiSlot::Top | UiSlot::Bottom) => UiSceneScope::Band,
-            _ => UiSceneScope::Unanchored,
-        }
+            .map(|block| match block.ui_slot() {
+                UiSlot::Top | UiSlot::Bottom => UiSceneScope::Band,
+                _ => UiSceneScope::Unanchored,
+            })
     }
 
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {

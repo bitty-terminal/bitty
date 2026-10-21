@@ -1502,8 +1502,11 @@ fn block_scene_scope_follows_the_mount_slot() {
         Some(LuaValue::Integer(handle)) => handle,
         other => panic!("overlay handle, got {other:?}"),
     };
-    assert_eq!(services.ui_scene_scope(band), UiSceneScope::Band);
-    assert_eq!(services.ui_scene_scope(overlay), UiSceneScope::Unanchored);
+    assert_eq!(services.ui_scene_scope(band), Some(UiSceneScope::Band));
+    assert_eq!(
+        services.ui_scene_scope(overlay),
+        Some(UiSceneScope::Unanchored)
+    );
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "band_update_ok"),
         Some(LuaValue::Bool(true)),
@@ -1514,4 +1517,75 @@ fn block_scene_scope_follows_the_mount_slot() {
         Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string())),
         "an overlay update rejects anchors instead of ignoring them"
     );
+}
+
+#[test]
+fn stale_and_foreign_handles_keep_the_false_update_contract_for_anchored_trees() {
+    // CodeRabbit (PR #2423): the scene-scope check must not turn the
+    // documented `ui.update` stale-handle `Ok(false)` into a parse error.
+    // `clear_ui_blocks` mirrors suspend/dispose; a foreign handle is unknown
+    // for the same reason.
+    let mut fixture = Fixture::activate_with_commands(
+        "anchor-stale",
+        "bitty-featured.uianchorstale",
+        &["ui.rich", "ui.overlay"],
+        &[],
+        &["update_old", "update_foreign"],
+        r#"
+        local anchored = { kind = "Row", children = {
+          { kind = "Row", anchor = "left", children = { { kind = "Text", text = "clock" } } },
+        } }
+        local bar = bitty.ui.mount("bottom", anchored)
+        local function update(handle)
+          local ok, result = pcall(bitty.ui.update, handle, anchored)
+          return { ok = ok, result = result }
+        end
+        bitty.commands.register({
+          id = "update_old",
+          title = "Old handle",
+          run = function() return update(bar) end,
+        })
+        bitty.commands.register({
+          id = "update_foreign",
+          title = "Foreign handle",
+          run = function() return update(bar + 1000) end,
+        })
+        return {}
+        "#,
+    );
+
+    let assert_false_not_error = |value: LuaValue| match value {
+        LuaValue::Table(_) => {
+            assert_eq!(
+                value.get("ok"),
+                Some(&LuaValue::Bool(true)),
+                "pcall must not report a parse error: {value:?}"
+            );
+            assert_eq!(
+                value.get("result"),
+                Some(&LuaValue::Bool(false)),
+                "the stale-handle contract is Ok(false): {value:?}"
+            );
+        }
+        other => panic!("expected a result table, got {other:?}"),
+    };
+
+    // Foreign handle while the real block still exists.
+    let foreign = fixture
+        .runtime
+        .dispatch_command(&fixture.id, "update_foreign", &[])
+        .expect("dispatch");
+    assert_false_not_error(foreign);
+
+    // Pre-suspend handle after the registry is cleared (suspend/dispose).
+    fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .clear_ui_blocks();
+    let stale = fixture
+        .runtime
+        .dispatch_command(&fixture.id, "update_old", &[])
+        .expect("dispatch");
+    assert_false_not_error(stale);
 }

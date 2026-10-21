@@ -24,13 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lose real commands such as `bar:audio-toggle` (68 ms) and `composer:open`
   (212 ms).
 
-## [0.0.24] - unreleased
+## [0.0.24] - 2026-10-20
 
-Prepared from `v0.0.23..origin/main` (audited through `60c3d544`). The owner
-authorized publication on 2026-10-20; the tag, GitHub release, and artifact
-upload happen only after the frozen-candidate runtime matrix and artifact
-verification recorded under `recording/release-0.0.24-integration/`. Nothing
-below claims a published artifact.
+Published 2026-10-20 from candidate `bbd118e8` (tag `v0.0.24`, GitHub release
+with 37 assets, R2 mirror and stable pointers verified). Validation evidence:
+`recording/release-0.0.24-integration/` (candidate freeze, final matrix, artifact
+verification, independent review).
 
 ### Added
 
@@ -441,9 +440,9 @@ below claims a published artifact.
   `kv` answer `E_HISTORY_UNAVAILABLE`, and capture is off by default.
 - **Publication-control is not wired.** `#2286` is feature-gated and default
   off; nothing in this release spawns `ai_helper` through it.
-- **Lua RC-1 fuel accounting for host calls (#2285) is not included.** PR
-  #2292 is open and unmerged at this entry's head, so no bound is claimed for
-  it.
+- **A same-hash `Suspended` component generation could be re-activated by a
+  policy-host mirror run (#2325).** Latent while the mirror is startup-only;
+  fixed in 0.0.25.
 
 ### Follow-ups (not in this release)
 

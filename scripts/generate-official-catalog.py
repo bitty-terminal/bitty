@@ -38,6 +38,30 @@ GITLINK_RE = re.compile(r"^160000 commit ([0-9a-f]{40})\tplugins/(.+)$")
 HASH_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# Repository-location variables never inherited by `git`. `git` lets them
+# override `-C`, so a generator run from a hook that exports them (for
+# example `pre-commit`, which sets `GIT_INDEX_FILE`) would read the caller's
+# repository instead of the registry checkout. Mirrors the seven-variable
+# scrub in `crates/bitty-terminal/src/plugin.rs`; gitconfig, proxy, SSH-agent,
+# and CA handling still come free from the inherited environment.
+GIT_REPO_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+def git_env() -> dict[str, str]:
+    """Inherited environment with repository-location overrides removed."""
+    env = dict(os.environ)
+    for name in GIT_REPO_ENV_VARS:
+        env.pop(name, None)
+    return env
+
 
 class CatalogError(RuntimeError):
     """A registry input cannot be rendered safely."""
@@ -76,6 +100,7 @@ def run_git(registry: Path, *args: str) -> str:
             check=True,
             capture_output=True,
             text=True,
+            env=git_env(),
         ).stdout
     except FileNotFoundError as error:
         raise CatalogError("`git` is required to read registry pins") from error

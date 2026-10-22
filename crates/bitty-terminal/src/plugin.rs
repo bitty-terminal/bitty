@@ -2014,49 +2014,63 @@ fn rows_from_state_with_catalog(
                 continue;
             }
             seen.insert(entry.id.to_string());
-            let compatible = package::check_declared_compat(
-                entry.id,
-                entry.compat_bitty,
-                entry.compat_plugin_api,
-            )
-            .is_ok();
-            let description = if compatible {
-                entry.description.to_string()
-            } else {
-                format!(
-                    "{} [not installable on this host: compat.bitty '{}']",
-                    entry.description,
-                    entry.compat_bitty.unwrap_or("-")
-                )
-            };
-            rows.push(PluginRow {
-                id: entry.id.to_string(),
-                name: entry.name.to_string(),
-                version: "-".to_string(),
-                description,
-                bundled: false,
-                source: "registry".to_string(),
-                state: if compatible {
-                    "available"
-                } else {
-                    "incompatible"
-                },
-                enabled: false,
-                recorded: false,
-                pin_ok: None,
-                requested: BTreeSet::new(),
-                granted: BTreeSet::new(),
-                denied: BTreeSet::new(),
-                commands: Vec::new(),
-                manifest_hash: Some(entry.manifest_hash.to_string()),
-                settings: Vec::new(),
-                repair: None,
-            });
+            rows.push(official_row(entry));
         }
     }
 
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(rows)
+}
+
+/// Evaluate one official catalog entry against this host.
+///
+/// Shared by the `list`/`info` row label and the install pre-flight, so a
+/// listed entry can never disagree with the install refusal. Returns the
+/// structured [`PackageOpError::Incompatible`] carrying the exact declared
+/// range and the evaluated host version; no network access is involved.
+fn official_entry_compat(entry: &OfficialPlugin) -> Result<(), PackageOpError> {
+    package::check_declared_compat(entry.id, entry.compat_bitty, entry.compat_plugin_api)
+}
+
+/// One `PluginRow` for a not-yet-installed official catalog entry.
+///
+/// The catalog is compiled-in data, so compatibility is evaluated against the
+/// running host here; an entry outside its declared range is still listed,
+/// marked `incompatible`, and annotated with the exact range.
+fn official_row(entry: &OfficialPlugin) -> PluginRow {
+    let compatible = official_entry_compat(entry).is_ok();
+    let description = if compatible {
+        entry.description.to_string()
+    } else {
+        format!(
+            "{} [not installable on this host: compat.bitty '{}']",
+            entry.description,
+            entry.compat_bitty.unwrap_or("-")
+        )
+    };
+    PluginRow {
+        id: entry.id.to_string(),
+        name: entry.name.to_string(),
+        version: "-".to_string(),
+        description,
+        bundled: false,
+        source: "registry".to_string(),
+        state: if compatible {
+            "available"
+        } else {
+            "incompatible"
+        },
+        enabled: false,
+        recorded: false,
+        pin_ok: None,
+        requested: BTreeSet::new(),
+        granted: BTreeSet::new(),
+        denied: BTreeSet::new(),
+        commands: Vec::new(),
+        manifest_hash: Some(entry.manifest_hash.to_string()),
+        settings: Vec::new(),
+        repair: None,
+    }
 }
 
 /// Load the managed ledger for read-only runtime inspection (issue #2396).
@@ -4652,11 +4666,9 @@ fn install_official(
         return EXIT_USAGE;
     };
     // Catalog compatibility is known before any network access: an entry
-    // that excludes this host (statusline on 0.0.26) must be refused with the
-    // exact declared range, not a fetch or a manifest-parse diagnostic.
-    if let Err(error) =
-        package::check_declared_compat(entry.id, entry.compat_bitty, entry.compat_plugin_api)
-    {
+    // that excludes this host must be refused with the exact declared range,
+    // not a fetch or a manifest-parse diagnostic.
+    if let Err(error) = official_entry_compat(entry) {
         eprintln!("bitty plugin: {error}");
         return EXIT_PLUGIN;
     }
@@ -5843,8 +5855,7 @@ fn installable_ids_hint() -> String {
     let mut official_installable: Vec<&str> = Vec::new();
     let mut incompatible: Vec<String> = Vec::new();
     for entry in official_plugins() {
-        match package::check_declared_compat(entry.id, entry.compat_bitty, entry.compat_plugin_api)
-        {
+        match official_entry_compat(entry) {
             Ok(()) => official_installable.push(entry.id),
             Err(_) => incompatible.push(format!(
                 "{} (compat.bitty '{}', host {})",
@@ -7978,5 +7989,73 @@ mod tests {
         let (count, total) = parse_zip_list_total(zipped).expect("zip parses");
         assert_eq!((count, total), (2, 6));
         assert!(parse_zip_list_total(b"Archive: x\nno table here\n").is_err());
+    }
+
+    // ── official catalog compatibility (CTX-1446, #2461) ───────────────────
+
+    /// Synthetic catalog entry no supported host can install.
+    ///
+    /// The loopback repository and all-zero pin are deliberate: if the compat
+    /// gate ever moved after the fetch, the install would fail with
+    /// `EXIT_GENERIC` (transport) instead of `EXIT_PLUGIN` (incompatible), and
+    /// the test would catch the ordering regression without external network.
+    static HOST_INCOMPATIBLE_ENTRY: OfficialPlugin = OfficialPlugin {
+        id: "bitty-terminal.synthetic-incompatible",
+        name: "Synthetic Incompatible",
+        repository: "https://127.0.0.1:9/never-fetched.git",
+        pin: "0000000000000000000000000000000000000000",
+        manifest_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        compat_bitty: Some(">=99.0.0,<100.0.0"),
+        compat_plugin_api: None,
+        description: "synthetic entry that no supported host can install",
+        license: Some("MIT"),
+    };
+
+    #[test]
+    fn host_incompatible_official_entry_is_refused_before_fetch() {
+        let entry = &HOST_INCOMPATIBLE_ENTRY;
+
+        // `plugin list` / `info` advertise the entry as listed but
+        // incompatible, annotated with the exact declared range.
+        let row = official_row(entry);
+        assert_eq!(row.id, entry.id);
+        assert_eq!(row.source, "registry");
+        assert_eq!(row.state, "incompatible");
+        assert!(!row.recorded && !row.bundled);
+        assert!(
+            row.description.contains("compat.bitty '>=99.0.0,<100.0.0'"),
+            "{}",
+            row.description
+        );
+
+        // The shared pre-flight returns the structured incompatibility with
+        // the exact range and evaluated host, never a generic error.
+        match official_entry_compat(entry) {
+            Err(PackageOpError::Incompatible {
+                field,
+                requested,
+                host,
+                ..
+            }) => {
+                assert_eq!(field, "compat.bitty");
+                assert_eq!(requested, ">=99.0.0,<100.0.0");
+                assert_eq!(host, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected incompatible, got {other:?}"),
+        }
+
+        // End-to-end refusal happens before staging/fetch: exit code 4 is the
+        // incompatibility class, the loopback repository is never contacted,
+        // and the store and consent output stay untouched.
+        let store = scratch_dir("official-incompatible-store");
+        let request = parse_ok(&["install", entry.id, "--yes"]);
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let code = install_official(&request, entry, Some(&store), None, &mut input, &mut output);
+        assert_eq!(code, EXIT_PLUGIN);
+        assert!(output.is_empty(), "no fetch/progress output expected");
+        assert!(!store.join("current.json").exists());
+        assert!(!store.join("packages").exists());
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

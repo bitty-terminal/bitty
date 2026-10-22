@@ -262,6 +262,7 @@ mod run;
 mod shell_init;
 mod show_font;
 mod spawn;
+mod stall_watchdog;
 mod terminal_app;
 mod test_mode;
 mod x;

@@ -3558,47 +3558,65 @@ mod tests {
     fn spiral_phase_clears_on_a_non_focused_close() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
         rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
-        // 1 = left, 2 = top-right, 3 = bottom-left, 4 = bottom-right.
+        // Cross layout: the created pane 2 has a left (1), right (3),
+        // top (5), and bottom (4) neighbor:
+        //   V[5, V[H[H[1,2], 3], 4]]
         let layout = LayoutNode::split(
-            SplitAxis::Horizontal,
-            0.5,
-            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            SplitAxis::Vertical,
+            0.25,
+            LayoutNode::leaf(View::new(ViewId::new(5), 80, 6)),
             LayoutNode::split(
                 SplitAxis::Vertical,
                 0.5,
-                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
                 LayoutNode::split(
                     SplitAxis::Horizontal,
                     0.5,
-                    LayoutNode::leaf(View::new(ViewId::new(3), 20, 12)),
-                    LayoutNode::leaf(View::new(ViewId::new(4), 20, 12)),
+                    LayoutNode::split(
+                        SplitAxis::Horizontal,
+                        0.5,
+                        LayoutNode::leaf(View::new(ViewId::new(1), 20, 9)),
+                        LayoutNode::leaf(View::new(ViewId::new(2), 20, 9)),
+                    ),
+                    LayoutNode::leaf(View::new(ViewId::new(3), 40, 9)),
                 ),
+                LayoutNode::leaf(View::new(ViewId::new(4), 80, 9)),
             ),
         );
         rt.set_layout(layout);
-        let created = ViewId::new(3);
+        let created = ViewId::new(2);
         assert!(rt.set_focus(created));
-        // Prime a left/top phase for the created pane.
-        rt.note_panel_split_created(created, Some(2));
-        let plan = rt.panel_split_plan().expect("plan");
-        assert_eq!(plan.spiral_phase, Some(3));
-        assert!(plan.place_new_first, "stale chain would split left/top");
+        // Pin the neighbor geometry so the test cannot silently drift.
+        let rect = |id: u64| {
+            rt.layout_allocations()
+                .into_iter()
+                .find(|(leaf, _)| *leaf == ViewId::new(id))
+                .map(|(_, rect)| rect)
+                .expect("allocated")
+        };
+        assert!(rect(1).x < rect(2).x, "p1 is left of p2");
+        assert!(rect(3).x > rect(2).x, "p3 is right of p2");
+        assert!(rect(5).y < rect(2).y, "p5 is above p2");
+        assert!(rect(4).y > rect(2).y, "p4 is below p2");
 
-        // Close each neighboring pane while focus stays on `created`.
-        for neighbor in [ViewId::new(1), ViewId::new(2), ViewId::new(4)] {
+        // Prime a left/top phase for the created pane, then close each
+        // neighbor (left, right, top, bottom) while focus stays on it.
+        for neighbor in [1u64, 3, 5, 4] {
+            rt.note_panel_split_created(created, Some(2));
+            let plan = rt.panel_split_plan().expect("plan");
+            assert_eq!(plan.spiral_phase, Some(3));
+            assert!(plan.place_new_first, "stale chain would split left/top");
+
             let mut after = rt.layout().clone();
-            assert!(after.remove_leaf(neighbor).is_some());
-            rt.set_layout_closing(after, neighbor);
+            assert!(after.remove_leaf(ViewId::new(neighbor)).is_some());
+            rt.set_layout_closing(after, ViewId::new(neighbor));
             assert_eq!(rt.focused_view(), Some(created), "focus is untouched");
             let plan = rt.panel_split_plan().expect("plan after close");
             assert_eq!(
                 plan.spiral_phase,
                 Some(0),
-                "close of {neighbor:?} must reset the chain"
+                "close of neighbor {neighbor} must reset the chain"
             );
             assert!(!plan.place_new_first, "next split goes right/down");
-            // Re-prime for the next neighbor in the loop.
-            rt.note_panel_split_created(created, Some(2));
         }
     }
 

@@ -56,11 +56,12 @@ pub const IME_COMMIT_MAX_BYTES: usize = 1024;
 /// tick count cannot: a tick only happens when something arrives, and the
 /// keystroke we must not lose is exactly the next thing to arrive.
 ///
-/// 250 ms is far above any compositor echo latency (sub-millisecond to a few
-/// milliseconds even under load) and far below any human inter-key interval,
-/// so the absorbed keystroke this can cost a filtering backend is bounded to
-/// an immediate retype.
-pub const IME_COMMIT_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+/// 25 ms is above compositor echo latency (sub-millisecond to a few
+/// milliseconds even under load) and below a deliberate next keystroke. The
+/// previous 250 ms window was long enough to swallow the first Space/Enter/
+/// Delete after a composition committed without an echo (fcitx5 Shift
+/// toggle and X11 XIM both do this), which users experience as a lost key.
+pub const IME_COMMIT_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Protocol button bits for a platform mouse button (CTX-0566).
 ///
@@ -198,7 +199,30 @@ impl Runtime {
     /// `Composing`/`Free` paths), so it costs one vDSO call per committed
     /// composition, not per keystroke.
     fn ime_owns_key_press(&mut self, event: &KeyEvent, is_modifier: bool) -> bool {
-        if event.state != PressState::Pressed || event.is_synthetic || is_modifier {
+        if event.state != PressState::Pressed || event.is_synthetic {
+            // A modifier release can be the echo of a composition that closed
+            // on that modifier (fcitx5 Shift toggle). Its raw echo is a
+            // modifier, which never reaches the key path as text; holding the
+            // one-shot claim past the release would let it eat the next real
+            // keystroke — the first space after switching back to English.
+            // Modifier presses stay claim-neutral: the committing key's raw
+            // copy may still be in flight (see the existing chord contract).
+            if is_modifier
+                && event.state == PressState::Released
+                && matches!(
+                    event.logical_key,
+                    bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Shift)
+                )
+                && matches!(self.ime_key_claim, ImeKeyClaim::CommitKey { .. })
+            {
+                // fcitx5 toggles the input method on Shift; a Ctrl/Alt
+                // release around a normal commit must not clear the claim
+                // before that commit's raw echo lands.
+                self.ime_key_claim = ImeKeyClaim::Free;
+            }
+            return false;
+        }
+        if is_modifier {
             return false;
         }
         match self.ime_key_claim {

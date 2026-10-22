@@ -64,6 +64,28 @@ fn composed_commit_trims_single_trailing_space_but_unsolicited_preserves() {
 }
 
 #[test]
+fn shift_toggle_commit_does_not_swallow_the_next_space() {
+    // Owner reproduction: type Chinese, press Shift to switch back to
+    // English. fcitx5 commits/closes the composition on the Shift press, so
+    // the one-shot commit claim is armed; its echo is a modifier, not a text
+    // key. The claim must not eat the first real keystroke afterwards.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    rt.handle_ime_preedit(Some("nihao".to_string()), Some(5));
+    rt.handle_ime_commit(String::new());
+    let press = rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    assert_eq!(press, None, "Shift toggle must not produce bytes");
+    let release = rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+    assert_eq!(release, None, "Shift release must not produce bytes");
+    let space = rt.handle_key_event(named_key(NamedKey::Space, PressState::Pressed));
+    assert_eq!(
+        space,
+        Some(b" ".to_vec()),
+        "the first space after the Shift toggle must reach the PTY"
+    );
+    assert_eq!(rt.drain_pending_input(), b" ", "exactly one space is owed");
+}
+
+#[test]
 fn delete_release_under_report_events_produces_no_bytes() {
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
     send(&mut rt, b"\x1b[=2u");

@@ -366,7 +366,7 @@ fn commit_echo_in_the_next_batch_is_still_absorbed() {
     // handed the echo straight back to the terminal, and the fcitx5 trailing
     // space of #1449 returned on a perfectly ordinary compositor.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -394,7 +394,7 @@ fn commit_echo_stays_absorbed_across_several_ticks() {
     // A busy event loop can dispatch several batches inside the echo window;
     // ageing must not accumulate into an early release.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
@@ -418,7 +418,7 @@ fn presented_and_skipped_frames_alike_do_not_release_the_claim_early() {
     // window skips it. Neither may release a claim that is still inside its
     // echo window.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "n", "n");
     rt.handle_ime_preedit_at(Some("n".to_string()), Some(1), base);
@@ -471,6 +471,34 @@ fn commit_claim_expires_once_the_echo_window_elapses() {
         "an expired claim never absorbs a keystroke"
     );
     assert_eq!(rt.pending_input(), b"a");
+}
+
+#[test]
+fn expired_claim_does_not_eat_enter_or_delete_after_a_composition() {
+    // Owner reproduction: after composing Chinese, the first Enter/Delete must
+    // not be consumed as a phantom echo (fcitx5/XIM can commit without ever
+    // delivering the committing key). The shortened window releases the claim
+    // before a deliberate next key.
+    for key in [NamedKey::Enter, NamedKey::Delete] {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let base = std::time::Instant::now();
+        rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+        rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+        rt.drain_pending_input();
+        rt.tick_at(base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1));
+        let event = KeyEvent {
+            logical_key: LogicalKey::Named(key),
+            text: None,
+            location: KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert!(
+            rt.handle_key_event(event).is_some(),
+            "the first {key:?} after a composition must reach the PTY"
+        );
+    }
 }
 
 #[test]
@@ -633,7 +661,7 @@ fn empty_commit_restamps_the_claim_it_keeps() {
     // which is still well inside every window here, so the assertion is about
     // whether ageing dropped the claim at that tick.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "nihao", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -648,6 +676,23 @@ fn empty_commit_restamps_the_claim_it_keeps() {
         "the commit re-stamped the claim, so the echo is still the IME's"
     );
     assert_eq!(rt.drain_pending_input(), b"");
+}
+
+#[test]
+fn first_key_after_a_100ms_pause_is_not_eaten() {
+    // Pins the 250 ms -> 25 ms change: a deliberate next key 100 ms after the
+    // commit used to be swallowed as a phantom echo. The old window would fail
+    // this test; the current window must let the key through.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let base = std::time::Instant::now() - std::time::Duration::from_millis(100);
+    rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+    rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+    rt.drain_pending_input();
+    assert!(
+        rt.handle_key_event(char_key(" ")).is_some(),
+        "a key 100 ms after the commit is real input"
+    );
+    assert_eq!(rt.drain_pending_input(), b" ");
 }
 
 #[test]
@@ -758,6 +803,37 @@ fn modifier_chords_are_never_absorbed_by_the_claim() {
     assert!(
         rt.handle_key_event(char_key("a")).is_some(),
         "and the claim is still bounded to the one press"
+    );
+}
+
+#[test]
+fn unrelated_modifier_release_does_not_spend_the_claim() {
+    // Only Shift is the fcitx5 input-method toggle. A Ctrl/Alt release around
+    // a normal composition commit must not clear the claim before the raw
+    // committing key echo arrives.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+    rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+    rt.drain_pending_input();
+    for state in [PressState::Pressed, PressState::Released] {
+        let event = KeyEvent {
+            logical_key: LogicalKey::Named(NamedKey::Control),
+            text: None,
+            location: KeyLocation::Left,
+            state,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert!(rt.handle_key_event(event).is_none());
+    }
+    assert!(
+        rt.handle_key_event(char_key("a")).is_none(),
+        "a Ctrl release must not spend a non-modifier commit claim"
+    );
+    assert!(
+        rt.handle_key_event(char_key("b")).is_some(),
+        "claim is one-shot"
     );
 }
 

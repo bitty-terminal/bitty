@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reads no third-party store, settings, extension, or profile state. No
   path, command, URL, or host argument exists, and all reads happen on the
   cold path; payload paths are display strings only.
+- **Waybar-style band groups, hover, and button routing (#2411):** a band
+  scene's root `Row` resolves per-group `anchor = "left" | "center" |
+  "right"` against the presented width, so `modules_left`/`modules_center`/
+  `modules_right` get true centering and a flush right edge at any width.
+  Over-subscribed rows clip deterministically (left, then right, then center)
+  without overlapping runs or losing hit targets. `on_hover` bindings
+  dispatch on pointer enter/leave with the stable `region` id plus
+  `phase = "enter" | "leave"` through a bounded queue (one dispatch per region
+  per drain), never capturing input or setting modal state. Left, right, and
+  middle clicks on region-bound items carry distinct `button` values, and a
+  hover-anchored `overlay`-slot tooltip paints just below a top band (above a
+  bottom band) at the hovered region's column. PUA/Nerd Font glyphs keep the
+  text path's one-cell width so icon-first modules have exact hit regions;
+  icon maps remain plugin data with no new protocol.
 
 ### Fixed
 

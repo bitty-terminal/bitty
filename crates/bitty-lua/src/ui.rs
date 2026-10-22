@@ -10,16 +10,42 @@
 //! # Additive style and interaction fields
 //!
 //! Every v1 kind additionally accepts optional `fg`/`bg` theme-token names, a
-//! `bold` boolean, and `on_click`/`on_scroll` command bindings carrying an
-//! optional per-item `region` identity (CTX-0890, CTX-1190, issue #2248). All
-//! fields are bounded declarative data: no functions, no coordinates, no raw
-//! colours, and no capability grants. A container's declaration applies to
-//! descendant spans that do not declare their own (nearest declaration wins).
+//! `bold` boolean, and `on_click`/`on_scroll`/`on_hover` command bindings
+//! carrying an optional per-item `region` identity (CTX-0890, CTX-1190,
+//! issues #2248, #2411). All fields are bounded declarative data: no
+//! functions, no coordinates, no raw colours, and no capability grants. A
+//! container's declaration applies to descendant spans that do not declare
+//! their own (nearest declaration wins).
 //!
-//! Host parity (issue #2191, CTX-1419): the band host paints `fg`/`bg`/`bold`
-//! and routes `on_click`/`on_scroll`; the overlay host paints the same style
-//! fields. Overlay click/scroll routing is not part of the accepted contract
-//! yet and remains a design note, not a shipped claim.
+//! # Group anchors (issue #2411)
+//!
+//! A direct child of a scene's **root `Row`** may declare
+//! `anchor = "left" | "center" | "right"`. The band host resolves the
+//! declared group against the band's window width: `left` groups start at the
+//! inset edge, `right` groups end at the opposite inset edge, and `center`
+//! groups are centered on the full row width (never "after left"). Children
+//! without an `anchor` are `left` groups, so an unanchored scene keeps its
+//! pre-#2411 left-to-right flow byte-for-byte. An `anchor` anywhere else fails
+//! closed with `E_UI_COMPONENT_INVALID`: on the root itself, below the root's
+//! direct children, or in a non-band scene validated with
+//! [`UiSceneScope::Unanchored`] (the focusable overlay, or an update of a
+//! non-band block). Such a node has no bounded row to resolve against, and a
+//! silently ignored placement would be worse than a mount error.
+//!
+//! # Hover bindings (issue #2411)
+//!
+//! `on_hover` has the same shape as `on_click` and **requires** a `region`
+//! identity: the host dispatches the command on pointer enter/leave with that
+//! stable id plus `phase = "enter"` or `phase = "leave"` under
+//! [`UI_HOVER_PHASE_ARG`]. No coordinates ever reach the plugin, so a plugin
+//! anchors its tooltip by Core-owned region geometry, not by pointer math.
+//! Hover never captures input and never sets `modal_active`.
+//!
+//! Host parity (issue #2191, CTX-1419; issue #2411): the band host paints
+//! `fg`/`bg`/`bold`, routes `on_click`/`on_scroll`, resolves `anchor` groups,
+//! and dispatches `on_hover`; the overlay host paints the same style fields.
+//! Overlay click/scroll/hover routing is not part of the accepted contract yet
+//! and remains a design note, not a shipped claim.
 //!
 //! # Budgets
 //!
@@ -233,6 +259,100 @@ pub const UI_SCROLL_DELTA_ARG: &str = "delta";
 /// dispatch. Large enough to never clip legitimate gestures.
 pub const UI_SCROLL_DELTA_SATURATE: f64 = 4096.0;
 
+/// Argument name the host injects beside the declared hover args at dispatch
+/// (issue #2411).
+///
+/// A pointer entering or leaving an `on_hover` node's declared region invokes
+/// the declared command with the region id under [`UI_REGION_ARG`] plus this
+/// key, whose value is [`UI_HOVER_PHASE_ENTER`] or [`UI_HOVER_PHASE_LEAVE`].
+/// A declared `phase` entry is overwritten, never merged, and a declared
+/// `region` entry is overwritten because `on_hover` requires a region.
+pub const UI_HOVER_PHASE_ARG: &str = "phase";
+
+/// Hover phase spelling dispatched when the pointer enters a region.
+pub const UI_HOVER_PHASE_ENTER: &str = "enter";
+
+/// Hover phase spelling dispatched when the pointer leaves a region.
+pub const UI_HOVER_PHASE_LEAVE: &str = "leave";
+
+/// Maximum pending band hover dispatches per frame (issue #2411).
+///
+/// One entry per distinct region transition (enter or leave), so eight covers
+/// a pointer sweeping across a full bar in one frame. Overflow drops the
+/// newest transition fail-closed and counts a diagnostic; the next motion
+/// re-derives the live target, so a dropped edge event never wedges state.
+pub const UI_HOVER_QUEUE_MAX: usize = 8;
+
+/// Band group anchor (issue #2411).
+///
+/// Declared by a direct child of a scene's root `Row`; the band host resolves
+/// it against the band's window width. The spelling is closed and
+/// case-sensitive, and the value grants no authority: it is a placement hint
+/// over Core-owned geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UiAnchor {
+    /// Inset left edge, stacked in declaration order.
+    Left,
+    /// Centered on the full row width, stacked in declaration order.
+    Center,
+    /// Inset right edge, stacked in declaration order (right-to-left from the
+    /// edge, so the first declared group is the innermost one).
+    Right,
+}
+
+impl UiAnchor {
+    /// Every accepted anchor, in canonical declaration order.
+    pub const ALL: [Self; 3] = [Self::Left, Self::Center, Self::Right];
+
+    /// Lua spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+
+    /// Parse the closed anchor set; `None` for any other string.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|anchor| anchor.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for UiAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Host context a scene is validated for (issue #2411).
+///
+/// Group anchors only resolve in a band scene, where the host owns one inset
+/// row of known width. Every other mount (the focusable overlay, a future
+/// terminal-attached block) has no row to resolve against, so an `anchor`
+/// there is rejected at parse time instead of being silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiSceneScope {
+    /// A horizontal band slot (`top`/`bottom`): root-`Row` child anchors
+    /// resolve against the presented width.
+    Band,
+    /// Any other host surface: anchors are invalid.
+    Unanchored,
+}
+
+impl UiSceneScope {
+    /// Host spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Band => "band",
+            Self::Unanchored => "unanchored",
+        }
+    }
+}
+
 /// Marshalling bounds for one raw component value, evaluated before shape
 /// validation. Generous enough for the v1 vocabulary (the scene-node walk
 /// enforces the exact `SCN-1`/`SCN-3` numbers) and tight enough that a
@@ -356,6 +476,8 @@ impl ClickCommand {
 pub enum UiNode {
     /// Plain text leaf.
     Text {
+        /// Group anchor resolved by a parent root `Row` (issue #2411).
+        anchor: Option<UiAnchor>,
         /// Bounded text content (`SCN-3`).
         text: String,
         /// Foreground theme token name (e.g. "accent", "surface.2").
@@ -375,9 +497,19 @@ pub enum UiNode {
         /// authority: the binding invokes a registered command through the
         /// normal dispatch path.
         on_scroll: Option<ClickCommand>,
+        /// Pointer enter/leave command binding (issue #2411).
+        ///
+        /// Same [`ClickCommand`] shape as `on_click` and required to declare
+        /// a `region`: the host dispatches on enter/leave with the region id
+        /// under [`UI_REGION_ARG`] and [`UI_HOVER_PHASE_ARG`] set to
+        /// [`UI_HOVER_PHASE_ENTER`] or [`UI_HOVER_PHASE_LEAVE`]. No pointer
+        /// coordinates are carried, and hover never captures input.
+        on_hover: Option<ClickCommand>,
     },
     /// Horizontal composition of children.
     Row {
+        /// Group anchor resolved by a parent root `Row` (issue #2411).
+        anchor: Option<UiAnchor>,
         /// Child nodes in declared order.
         children: Vec<UiNode>,
         /// Foreground theme token name (e.g. "accent", "surface.2").
@@ -390,9 +522,13 @@ pub enum UiNode {
         on_click: Option<ClickCommand>,
         /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
         on_scroll: Option<ClickCommand>,
+        /// Pointer enter/leave command binding (issue #2411; see `Text`).
+        on_hover: Option<ClickCommand>,
     },
     /// Vertical composition of children.
     Column {
+        /// Group anchor resolved by a parent root `Row` (issue #2411).
+        anchor: Option<UiAnchor>,
         /// Child nodes in declared order.
         children: Vec<UiNode>,
         /// Foreground theme token name (e.g. "accent", "surface.2").
@@ -405,9 +541,13 @@ pub enum UiNode {
         on_click: Option<ClickCommand>,
         /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
         on_scroll: Option<ClickCommand>,
+        /// Pointer enter/leave command binding (issue #2411; see `Text`).
+        on_hover: Option<ClickCommand>,
     },
     /// List composition of children.
     List {
+        /// Group anchor resolved by a parent root `Row` (issue #2411).
+        anchor: Option<UiAnchor>,
         /// Child nodes in declared order.
         children: Vec<UiNode>,
         /// Foreground theme token name (e.g. "accent", "surface.2").
@@ -420,6 +560,8 @@ pub enum UiNode {
         on_click: Option<ClickCommand>,
         /// Scroll command binding (CTX-1190, issue #2008; see `Text`).
         on_scroll: Option<ClickCommand>,
+        /// Pointer enter/leave command binding (issue #2411; see `Text`).
+        on_hover: Option<ClickCommand>,
     },
 }
 
@@ -428,12 +570,14 @@ impl UiNode {
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {
+            anchor: None,
             text: text.into(),
             fg: None,
             bg: None,
             bold: None,
             on_click: None,
             on_scroll: None,
+            on_hover: None,
         }
     }
 
@@ -441,12 +585,14 @@ impl UiNode {
     #[must_use]
     pub fn row(children: Vec<UiNode>) -> Self {
         Self::Row {
+            anchor: None,
             children,
             fg: None,
             bg: None,
             bold: None,
             on_click: None,
             on_scroll: None,
+            on_hover: None,
         }
     }
 
@@ -454,12 +600,14 @@ impl UiNode {
     #[must_use]
     pub fn column(children: Vec<UiNode>) -> Self {
         Self::Column {
+            anchor: None,
             children,
             fg: None,
             bg: None,
             bold: None,
             on_click: None,
             on_scroll: None,
+            on_hover: None,
         }
     }
 
@@ -467,12 +615,40 @@ impl UiNode {
     #[must_use]
     pub fn list(children: Vec<UiNode>) -> Self {
         Self::List {
+            anchor: None,
             children,
             fg: None,
             bg: None,
             bold: None,
             on_click: None,
             on_scroll: None,
+            on_hover: None,
+        }
+    }
+
+    /// The declared group anchor, if any (issue #2411).
+    ///
+    /// Only a direct child of a scene's root `Row` may carry one; the parser
+    /// rejects any other placement, so a `Some` value here is always
+    /// resolvable by the band layout.
+    #[must_use]
+    pub fn anchor(&self) -> Option<UiAnchor> {
+        match self {
+            Self::Text { anchor, .. }
+            | Self::Row { anchor, .. }
+            | Self::Column { anchor, .. }
+            | Self::List { anchor, .. } => *anchor,
+        }
+    }
+
+    /// The effective pointer enter/leave binding, if any (issue #2411).
+    #[must_use]
+    pub fn on_hover(&self) -> Option<&ClickCommand> {
+        match self {
+            Self::Text { on_hover, .. }
+            | Self::Row { on_hover, .. }
+            | Self::Column { on_hover, .. }
+            | Self::List { on_hover, .. } => on_hover.as_ref(),
         }
     }
 
@@ -534,10 +710,10 @@ impl UiNode {
     /// Bytes of every retained string in the subtree (`SCN-4` local subset).
     ///
     /// Counts `Text` content, `fg`/`bg` theme tokens, command identifiers, and
-    /// click/scroll argument keys plus string argument values. This is the
-    /// accounting unit for the per-generation 2 MiB aggregate: identifiers are
-    /// retained host-side exactly like text, so charging only text would leave
-    /// a budget hole (CTX-1340).
+    /// click/scroll/hover argument keys plus string argument values. This is
+    /// the accounting unit for the per-generation 2 MiB aggregate: identifiers
+    /// are retained host-side exactly like text, so charging only text would
+    /// leave a budget hole (CTX-1340).
     #[must_use]
     pub fn retained_string_bytes(&self) -> usize {
         match self {
@@ -547,14 +723,16 @@ impl UiNode {
                 bg,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
-            } => text.len() + retained_style_bytes(fg, bg, on_click, on_scroll),
+            } => text.len() + retained_style_bytes(fg, bg, on_click, on_scroll, on_hover),
             Self::Row {
                 children,
                 fg,
                 bg,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             }
             | Self::Column {
@@ -563,6 +741,7 @@ impl UiNode {
                 bg,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             }
             | Self::List {
@@ -571,13 +750,14 @@ impl UiNode {
                 bg,
                 on_click,
                 on_scroll,
+                on_hover,
                 ..
             } => {
                 children
                     .iter()
                     .map(Self::retained_string_bytes)
                     .sum::<usize>()
-                    + retained_style_bytes(fg, bg, on_click, on_scroll)
+                    + retained_style_bytes(fg, bg, on_click, on_scroll, on_hover)
             }
         }
     }
@@ -590,8 +770,23 @@ impl UiNode {
     /// `E_UI_COMPONENT_INVALID` when the value is not a v1 node table, carries
     /// an unknown or excluded kind, nests deeper than [`UI_MAX_DEPTH`], or
     /// exceeds [`UI_MAX_NODES`] / [`UI_MAX_TEXT_BYTES`].
+    ///
+    /// This is the band-scope convenience (anchors resolve); a host validating
+    /// any other surface calls [`Self::from_lua_value_in`] with
+    /// [`UiSceneScope::Unanchored`].
     pub fn from_lua_value(value: &LuaValue) -> Result<Self, BridgeError> {
-        let node = Self::from_value(value, 1)?;
+        Self::from_lua_value_in(value, UiSceneScope::Band)
+    }
+
+    /// Validate an already-marshalled bounded value for one host scope
+    /// (issue #2411).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::from_lua_value`], plus a declared `anchor` on a scene
+    /// validated with [`UiSceneScope::Unanchored`].
+    pub fn from_lua_value_in(value: &LuaValue, scope: UiSceneScope) -> Result<Self, BridgeError> {
+        let node = Self::from_value(value, 1, NodePlacement::Root, scope)?;
         let nodes = node.count_nodes();
         if nodes > UI_MAX_NODES {
             return Err(component_invalid(format!(
@@ -607,7 +802,12 @@ impl UiNode {
         Ok(node)
     }
 
-    fn from_value(value: &LuaValue, depth: usize) -> Result<Self, BridgeError> {
+    fn from_value(
+        value: &LuaValue,
+        depth: usize,
+        placement: NodePlacement,
+        scope: UiSceneScope,
+    ) -> Result<Self, BridgeError> {
         if depth > UI_MAX_DEPTH {
             return Err(component_invalid(format!(
                 "component depth exceeds {UI_MAX_DEPTH}"
@@ -627,11 +827,13 @@ impl UiNode {
         }
 
         // Parse style attributes (CTX-0890).
+        let anchor = extract_anchor(value, placement, scope)?;
         let fg = extract_theme_token(value, "fg")?;
         let bg = extract_theme_token(value, "bg")?;
         let bold = extract_bool_opt(value, "bold")?;
         let on_click = extract_click_command(value)?;
         let on_scroll = extract_scroll_command(value)?;
+        let on_hover = extract_hover_command(value)?;
         // Issue #2248: one span has one region identity. Both bindings may
         // name it (a clickable scroll item), but they must agree; a mismatch
         // fails closed instead of choosing one silently.
@@ -647,12 +849,14 @@ impl UiNode {
         match kind {
             "Text" => match value.get("text") {
                 Some(LuaValue::String(text)) => Ok(Self::Text {
+                    anchor,
                     text: text.clone(),
                     fg,
                     bg,
                     bold,
                     on_click,
                     on_scroll,
+                    on_hover,
                 }),
                 _ => Err(component_invalid(
                     "Text components require a string text field",
@@ -664,31 +868,46 @@ impl UiNode {
                         "{kind} components require a children array"
                     )));
                 };
-                let nodes = Self::children_array(children, depth)?;
+                // Issue #2411: only the scene root Row has a bounded width to
+                // resolve child anchors against. Every deeper node declares
+                // its anchor with no row to resolve it, so the parser refuses
+                // it instead of dropping the placement silently.
+                let child_placement = if placement == NodePlacement::Root && kind == "Row" {
+                    NodePlacement::RootRowChild
+                } else {
+                    NodePlacement::Nested
+                };
+                let nodes = Self::children_array(children, depth, child_placement, scope)?;
                 Ok(match kind {
                     "Row" => Self::Row {
+                        anchor,
                         children: nodes,
                         fg,
                         bg,
                         bold,
                         on_click,
                         on_scroll,
+                        on_hover,
                     },
                     "Column" => Self::Column {
+                        anchor,
                         children: nodes,
                         fg,
                         bg,
                         bold,
                         on_click,
                         on_scroll,
+                        on_hover,
                     },
                     _ => Self::List {
+                        anchor,
                         children: nodes,
                         fg,
                         bg,
                         bold,
                         on_click,
                         on_scroll,
+                        on_hover,
                     },
                 })
             }
@@ -696,7 +915,12 @@ impl UiNode {
         }
     }
 
-    fn children_array(value: &LuaValue, depth: usize) -> Result<Vec<Self>, BridgeError> {
+    fn children_array(
+        value: &LuaValue,
+        depth: usize,
+        placement: NodePlacement,
+        scope: UiSceneScope,
+    ) -> Result<Vec<Self>, BridgeError> {
         let LuaValue::Table(pairs) = value else {
             return Err(component_invalid(
                 "component children must be an array table",
@@ -724,10 +948,23 @@ impl UiNode {
                     "component children must be a dense 1-based array",
                 ));
             }
-            nodes.push(Self::from_value(child, depth + 1)?);
+            nodes.push(Self::from_value(child, depth + 1, placement, scope)?);
         }
         Ok(nodes)
     }
+}
+
+/// Where a node sits in the scene, which decides whether a declared group
+/// anchor can be resolved (issue #2411).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodePlacement {
+    /// The scene root: its own anchor has no parent row.
+    Root,
+    /// A direct child of the scene root `Row`: the band host's bounded width
+    /// resolves its anchor.
+    RootRowChild,
+    /// Any deeper node: no bounded row exists for an anchor.
+    Nested,
 }
 
 /// Bytes of the strings retained by one node's style and bindings (CTX-1340).
@@ -736,6 +973,7 @@ fn retained_style_bytes(
     bg: &Option<String>,
     on_click: &Option<ClickCommand>,
     on_scroll: &Option<ClickCommand>,
+    on_hover: &Option<ClickCommand>,
 ) -> usize {
     fg.as_ref().map_or(0, String::len)
         + bg.as_ref().map_or(0, String::len)
@@ -743,6 +981,9 @@ fn retained_style_bytes(
             .as_ref()
             .map_or(0, ClickCommand::retained_string_bytes)
         + on_scroll
+            .as_ref()
+            .map_or(0, ClickCommand::retained_string_bytes)
+        + on_hover
             .as_ref()
             .map_or(0, ClickCommand::retained_string_bytes)
 }
@@ -814,6 +1055,55 @@ fn extract_click_command(value: &LuaValue) -> Result<Option<ClickCommand>, Bridg
 /// [`UI_CLICK_MAX_ARGS`].
 fn extract_scroll_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
     extract_command_binding(value, "on_scroll", &[UI_SCROLL_DELTA_ARG], false)
+}
+
+/// Extract optional pointer enter/leave binding (issue #2411).
+///
+/// Same [`ClickCommand`] shape as `on_click`, plus two requirements the other
+/// bindings do not have: a `region` identity (the host needs a stable name for
+/// the transition) and the reserved [`UI_HOVER_PHASE_ARG`] slot the host
+/// overwrites at dispatch. A binding without a region fails closed instead of
+/// minting an anonymous hover target.
+fn extract_hover_command(value: &LuaValue) -> Result<Option<ClickCommand>, BridgeError> {
+    let binding = extract_command_binding(value, "on_hover", &[UI_HOVER_PHASE_ARG], false)?;
+    if let Some(binding) = &binding {
+        if binding.region.is_none() {
+            return Err(component_invalid(format!(
+                "on_hover requires a {UI_REGION_ARG} identity"
+            )));
+        }
+    }
+    Ok(binding)
+}
+
+/// Extract the optional group anchor (issue #2411).
+///
+/// Closed spelling set; the placement check is what keeps a declared anchor
+/// from being silently ignored by a row that has no bounded width.
+fn extract_anchor(
+    value: &LuaValue,
+    placement: NodePlacement,
+    scope: UiSceneScope,
+) -> Result<Option<UiAnchor>, BridgeError> {
+    let Some(anchor) = value.get("anchor") else {
+        return Ok(None);
+    };
+    let anchor = match anchor {
+        LuaValue::String(name) => UiAnchor::parse(name)
+            .ok_or_else(|| component_invalid("anchor must be 'left', 'center', or 'right'"))?,
+        _ => return Err(component_invalid("anchor must be a string")),
+    };
+    if scope != UiSceneScope::Band {
+        return Err(component_invalid(
+            "anchor is only valid in a band scene (top/bottom slot)",
+        ));
+    }
+    if placement != NodePlacement::RootRowChild {
+        return Err(component_invalid(
+            "anchor is only valid on a direct child of the scene root Row",
+        ));
+    }
+    Ok(Some(anchor))
 }
 
 /// Extract an optional `{ command, args, region? }` command binding under
@@ -1011,10 +1301,10 @@ pub fn component_invalid(message: impl Into<String>) -> BridgeError {
 /// [`BridgeError`] with class `validation` and code
 /// `E_UI_COMPONENT_INVALID` when the value cannot be marshalled or violates
 /// the v1 scene contract.
-pub fn read_component(value: Value<'_>) -> Result<UiNode, BridgeError> {
+pub fn read_component(value: Value<'_>, scope: UiSceneScope) -> Result<UiNode, BridgeError> {
     let marshalled = LuaValue::from_lua(value, UI_MARSHAL_LIMITS)
         .map_err(|error| component_invalid(error.message))?;
-    UiNode::from_lua_value(&marshalled)
+    UiNode::from_lua_value_in(&marshalled, scope)
 }
 
 #[cfg(test)]
@@ -1822,5 +2112,222 @@ mod tests {
             }
             _ => panic!("expected Text node"),
         }
+    }
+
+    fn anchored(kind: &str, anchor: &str, children: Vec<LuaValue>) -> LuaValue {
+        LuaValue::table([
+            ("kind", LuaValue::String(kind.to_string())),
+            ("anchor", LuaValue::String(anchor.to_string())),
+            ("children", LuaValue::array(children)),
+        ])
+    }
+
+    #[test]
+    fn root_row_children_carry_group_anchors() {
+        // Issue #2411: the band root Row is the one bounded row, so its direct
+        // children resolve anchors; unanchored children stay left groups.
+        let value = row(vec![
+            anchored("Row", "left", vec![text("ws")]),
+            anchored("Row", "center", vec![text("12:34")]),
+            anchored("Row", "right", vec![text("42%")]),
+            text("tail"),
+        ]);
+        let node = UiNode::from_lua_value(&value).expect("anchored band");
+        let UiNode::Row { children, .. } = &node else {
+            panic!("root is a Row");
+        };
+        assert_eq!(
+            children.iter().map(UiNode::anchor).collect::<Vec<_>>(),
+            vec![
+                Some(UiAnchor::Left),
+                Some(UiAnchor::Center),
+                Some(UiAnchor::Right),
+                None,
+            ]
+        );
+        assert_eq!(
+            UiAnchor::ALL.map(UiAnchor::as_str),
+            ["left", "center", "right"]
+        );
+        for anchor in UiAnchor::ALL {
+            assert_eq!(UiAnchor::parse(anchor.as_str()), Some(anchor));
+        }
+        assert_eq!(UiAnchor::parse("Center"), None);
+    }
+
+    #[test]
+    fn anchor_outside_root_row_children_is_rejected() {
+        // A declared anchor with no bounded row would otherwise be ignored;
+        // the parser refuses it instead of dropping the placement.
+        let on_root = LuaValue::table([
+            ("kind", LuaValue::String("Row".to_string())),
+            ("anchor", LuaValue::String("center".to_string())),
+            ("children", LuaValue::array(vec![text("x")])),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&on_root)
+                .expect_err("root anchor has no parent")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+
+        let nested = row(vec![anchored(
+            "Row",
+            "center",
+            vec![anchored("Row", "right", vec![text("x")])],
+        )]);
+        let error = UiNode::from_lua_value(&nested).expect_err("nested anchor");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("direct child of the scene root Row"));
+
+        let under_column = LuaValue::table([
+            ("kind", LuaValue::String("Column".to_string())),
+            (
+                "children",
+                LuaValue::array(vec![anchored("Row", "left", vec![text("x")])]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&under_column)
+                .expect_err("column has no row width")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+
+        let bad_spelling = row(vec![anchored("Row", "middle", vec![text("x")])]);
+        let error = UiNode::from_lua_value(&bad_spelling).expect_err("unknown anchor");
+        assert!(error.message.contains("anchor must be"));
+    }
+
+    fn hover_binding(
+        region: Option<LuaValue>,
+        args: Option<Vec<(LuaValue, LuaValue)>>,
+    ) -> LuaValue {
+        let mut binding = vec![(
+            LuaValue::String("command".to_string()),
+            LuaValue::String("bar.hover".to_string()),
+        )];
+        if let Some(region) = region {
+            binding.push((LuaValue::String("region".to_string()), region));
+        }
+        if let Some(args) = args {
+            binding.push((LuaValue::String("args".to_string()), LuaValue::Table(args)));
+        }
+        LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("clock".to_string())),
+            ("on_hover", LuaValue::Table(binding)),
+        ])
+    }
+
+    #[test]
+    fn hover_binding_requires_a_region_and_reserves_the_phase_slot() {
+        // Issue #2411: hover dispatch carries the stable region id plus the
+        // host-owned phase; an anonymous hover target is refused.
+        let error =
+            UiNode::from_lua_value(&hover_binding(None, None)).expect_err("hover without a region");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("on_hover requires"));
+
+        let node = UiNode::from_lua_value(&hover_binding(
+            Some(region_table("clock", Some("module"))),
+            None,
+        ))
+        .expect("region-bound hover");
+        let UiNode::Text { on_hover, .. } = node else {
+            panic!("expected Text node");
+        };
+        let on_hover = on_hover.expect("on_hover present");
+        assert_eq!(
+            on_hover.region,
+            Some(UiRegion {
+                id: "clock".to_string(),
+                kind: UiRegionKind::Module,
+            })
+        );
+
+        // The host injects `phase` and `region`: a table at the cap without
+        // naming them fails closed, one naming `phase` fits exactly.
+        let full_args: Vec<(LuaValue, LuaValue)> = (0..UI_CLICK_MAX_ARGS)
+            .map(|index| {
+                (
+                    LuaValue::String(format!("arg{index}")),
+                    LuaValue::String("val".to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            UiNode::from_lua_value(&hover_binding(
+                Some(region_table("clock", None)),
+                Some(full_args),
+            ))
+            .expect_err("no room for the host args")
+            .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+        let mut named: Vec<(LuaValue, LuaValue)> = (0..UI_CLICK_MAX_ARGS - 2)
+            .map(|index| {
+                (
+                    LuaValue::String(format!("arg{index}")),
+                    LuaValue::String("val".to_string()),
+                )
+            })
+            .collect();
+        named.push((
+            LuaValue::String(UI_HOVER_PHASE_ARG.to_string()),
+            LuaValue::String("declared".to_string()),
+        ));
+        let node = UiNode::from_lua_value(&hover_binding(
+            Some(region_table("clock", None)),
+            Some(named),
+        ))
+        .expect("phase-named full table fits");
+        let UiNode::Text {
+            on_hover, on_click, ..
+        } = node
+        else {
+            panic!("expected Text node");
+        };
+        assert!(on_click.is_none());
+        assert_eq!(
+            on_hover.expect("on_hover present").args.len(),
+            UI_CLICK_MAX_ARGS - 1
+        );
+    }
+
+    #[test]
+    fn hover_binding_strings_are_charged_to_the_aggregate() {
+        let node = UiNode::from_lua_value(&hover_binding(
+            Some(region_table("clock", None)),
+            Some(vec![(
+                LuaValue::String("label".to_string()),
+                LuaValue::String("detail".to_string()),
+            )]),
+        ))
+        .expect("hover binding");
+        assert_eq!(
+            node.retained_string_bytes(),
+            "clock".len() + "clock".len() + "bar.hover".len() + "label".len() + "detail".len()
+        );
+    }
+
+    #[test]
+    fn anchors_are_band_scope_only() {
+        // Review N2: a scene validated for a host surface with no bounded row
+        // must reject a declared anchor instead of silently ignoring it.
+        let value = row(vec![anchored("Row", "left", vec![text("clock")])]);
+        let band = UiNode::from_lua_value_in(&value, UiSceneScope::Band)
+            .expect("band scene resolves anchors");
+        let UiNode::Row { children, .. } = &band else {
+            panic!("root is a Row");
+        };
+        assert_eq!(children[0].anchor(), Some(UiAnchor::Left));
+
+        let error = UiNode::from_lua_value_in(&value, UiSceneScope::Unanchored)
+            .expect_err("unanchored scene rejects anchors");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("band scene"));
+        assert_eq!(UiSceneScope::Band.as_str(), "band");
+        assert_eq!(UiSceneScope::Unanchored.as_str(), "unanchored");
     }
 }

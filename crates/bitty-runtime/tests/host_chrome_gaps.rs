@@ -48,6 +48,8 @@ fn plain(text: &str) -> UiNode {
         bold: None,
         on_click: None,
         on_scroll: None,
+        anchor: None,
+        on_hover: None,
     }
 }
 
@@ -63,6 +65,8 @@ fn pill(text: &str, id: f64) -> UiNode {
             region: None,
         }),
         on_scroll: None,
+        anchor: None,
+        on_hover: None,
     }
 }
 
@@ -221,6 +225,8 @@ fn overlapping_foreign_claim_is_denied_never_routed() {
                 region: None,
             }),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }]),
     );
     rt.tick();
@@ -465,6 +471,8 @@ fn accent_fg_and_bold_change_the_paint() {
         bold: Some(true),
         on_click: None,
         on_scroll: None,
+        anchor: None,
+        on_hover: None,
     }]);
     let mut rt_styled = minimal_runtime();
     mount_bottom_bar(&mut rt_styled, styled);
@@ -498,6 +506,8 @@ fn unknown_tokens_fall_back_with_a_diagnostic() {
             bold: None,
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }]),
     );
     let stats = rt.tick().expect("unknown tokens still present");
@@ -688,6 +698,8 @@ fn scroll_pill(text: &str) -> UiNode {
             args: vec![("step".to_string(), ClickArg::Number(2.0))],
             region: None,
         }),
+        anchor: None,
+        on_hover: None,
     }
 }
 
@@ -791,6 +803,8 @@ fn band_scroll_with_foreign_command_is_denied() {
                 args: Vec::new(),
                 region: None,
             }),
+            anchor: None,
+            on_hover: None,
         }]),
     );
     rt.tick();
@@ -999,6 +1013,8 @@ fn region_text(text: &str, id: &str, kind: UiRegionKind, command: &str) -> UiNod
             region: Some(region(id, kind)),
         }),
         on_scroll: None,
+        anchor: None,
+        on_hover: None,
     }
 }
 
@@ -1014,6 +1030,8 @@ fn region_scroll_text(text: &str, id: &str) -> UiNode {
             args: vec![("shared".to_string(), ClickArg::Number(7.0))],
             region: Some(region(id, UiRegionKind::Module)),
         }),
+        anchor: None,
+        on_hover: None,
     }
 }
 
@@ -1034,6 +1052,8 @@ fn region_both_text(text: &str, id: &str, kind: UiRegionKind) -> UiNode {
             args: vec![("shared".to_string(), ClickArg::Number(7.0))],
             region: Some(declared),
         }),
+        anchor: None,
+        on_hover: None,
     }
 }
 

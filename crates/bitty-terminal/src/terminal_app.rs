@@ -2028,11 +2028,22 @@ impl TerminalApp {
             }
             return;
         };
-        let owner = plugin_runtime
+        let capture_owner = plugin_runtime
             .overlay_capture()
             .borrow()
             .owner_plugin()
             .map(str::to_string);
+        let hover_region = self.runtime.hovered_band_region();
+        // Issue #2411: with no capture owner, the plugin that owns the live
+        // hovered band region may present its `overlay`-slot block as a
+        // non-modal tooltip. It paints only: no capture, no input routing,
+        // no modal state, and the surface disappears as soon as the hover
+        // leaves the region.
+        let (owner, tooltip) = match (capture_owner, hover_region.as_ref()) {
+            (Some(owner), _) => (Some(owner), false),
+            (None, Some(region)) => (Some(region.plugin_id.clone()), true),
+            (None, None) => (None, false),
+        };
         let Some(owner) = owner else {
             if self.runtime.plugin_overlay().is_some() {
                 self.runtime.set_plugin_overlay(None);
@@ -2054,7 +2065,22 @@ impl TerminalApp {
                 version,
             })
             .next();
+        // Issue #2411: a tooltip anchors to the live hovered band region when
+        // the surface belongs to the same plugin that owns that band; every
+        // other overlay keeps the centered modal placement. The anchor names
+        // the region Core is painting, so a reflow re-resolves the row.
+        let anchor = if tooltip {
+            surface.as_ref().and_then(|surface| {
+                hover_region
+                    .as_ref()
+                    .filter(|region| region.plugin_id == surface.plugin_id)
+                    .map(bitty_runtime::BandOverlayAnchor::from_region)
+            })
+        } else {
+            None
+        };
         self.runtime.set_plugin_overlay(surface);
+        self.runtime.set_plugin_overlay_anchor(anchor);
     }
 
     /// Sync the plugin targeting session's present-time annotation batch
@@ -2208,6 +2234,87 @@ impl TerminalApp {
             }
         }
         true
+    }
+
+    /// Dispatches one Core-routed band hover transition (issue #2411).
+    ///
+    /// Hover is presentation-only: it carries the stable region id plus an
+    /// `enter`/`leave` phase, never pointer coordinates, and it neither takes
+    /// the overlay capture nor sets `modal_active`. An `enter` uses the same
+    /// presented-frame origin fence as clicks
+    /// ([`bitty_runtime::PluginRuntime::dispatch_ui_command`]), so a band that
+    /// was replaced, moved, or reflowed after the transition was queued is
+    /// refused instead of retargeted. A `leave` is deliberately unfenced: it
+    /// only hides/cleans up, so the plugin still hears about the transition
+    /// after a band version bump or removal. Registration, capability, and
+    /// args-schema gates are unchanged.
+    ///
+    /// Results are not surfaced as banners: hover is high-frequency
+    /// presentation, and the plugin's tooltip goes through the overlay
+    /// surface instead.
+    fn dispatch_band_hover(
+        &mut self,
+        hover: bitty_runtime::BandHoverRequest,
+        origin: Option<&bitty_runtime::BandOrigin>,
+    ) -> bool {
+        let id = match bitty_plugin_host::manifest::PluginId::new(&hover.plugin_id) {
+            Ok(id) => id,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band hover from '{}' dropped (invalid plugin id: {error})",
+                        hover.plugin_id
+                    )
+                });
+                return false;
+            }
+        };
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: band hover '{}:{}' dropped (plugin runtime is gone)",
+                    hover.plugin_id, hover.command
+                )
+            });
+            return false;
+        };
+        let args = bitty_runtime::band_hover_args_table(&hover.args, &hover.region, hover.phase);
+        let outcome = match origin {
+            // `enter` keeps the presented-frame fence (same as clicks and
+            // scrolls): a replaced, moved, or reflowed band is refused.
+            Some(origin) => {
+                plugin_runtime.dispatch_ui_command(&id, &hover.command, &[args], origin)
+            }
+            // `leave` is cleanup only; it must arrive even when the band that
+            // produced the enter is gone (issue #2411 review B1).
+            None => plugin_runtime.dispatch_command(&id, &hover.command, &[args]),
+        };
+        let delivered = match outcome {
+            Ok(_) => true,
+            Err(error) if error.is_parked() => true,
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: band hover '{}:{}' refused ({error})",
+                        hover.plugin_id, hover.command
+                    )
+                });
+                if hover.phase == bitty_runtime::BandHoverPhase::Enter {
+                    // The plugin never saw the enter, so no leave is owed and
+                    // the tooltip must not anchor. Abandoning the state also
+                    // prevents a retry every cold phase; the next motion
+                    // starts a fresh hover against the live frame.
+                    self.runtime.abandon_band_hover();
+                }
+                false
+            }
+        };
+        if delivered && hover.phase == bitty_runtime::BandHoverPhase::Enter {
+            // Stops revalidation from re-firing on later content updates and
+            // lets the overlay host anchor the tooltip for this item.
+            self.runtime.confirm_band_hover(&hover.region);
+        }
+        delivered
     }
 
     /// Dispatches one Core-routed plugin band scroll (CTX-1190, issue #2008).
@@ -2445,6 +2552,56 @@ impl TerminalApp {
         // window per plugin; a command that still needs work stays parked for
         // the next tick. New parks created below wait until the next tick.
         let mut attempted = self.pump_parked_plugin_commands();
+        // Issue #2411: hover transitions drain on the same cold phase, ahead
+        // of clicks (the pointer entered before it pressed). The queue is
+        // capped by `BAND_HOVER_QUEUE_MAX`, so this loop is bounded per tick.
+        // Issue #2411: a focusable overlay capture owns the cold phase; hover
+        // transitions stay queued (bounded) instead of entering a plugin VM
+        // under a modal, and dispatch when the capture ends. Core never paints
+        // a hover tooltip while capture holds.
+        if !self.overlay_capture_active() {
+            // Issue #2411: re-derive a deferred/stale hover first, so an item
+            // whose band was newer than the last presented frame enters as
+            // soon as that frame is published (no extra pointer motion).
+            self.runtime.revalidate_band_hover();
+            for hover in self.runtime.drain_band_hovers() {
+                if hover.phase == bitty_runtime::BandHoverPhase::Enter {
+                    let Some(origin) = hover.origin.clone() else {
+                        // Unreachable: the queue defers origin-less enters.
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: band hover '{}:{}' dropped (no presented origin)",
+                                hover.plugin_id, hover.command
+                            )
+                        });
+                        self.runtime.abandon_band_hover();
+                        continue;
+                    };
+                    if !self.runtime.band_origin_is_current(&origin) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: band hover '{}:{}' dropped (origin is stale)",
+                                hover.plugin_id, hover.command
+                            )
+                        });
+                        // Third review: a stale enter must not leave the
+                        // hover state silently unannounced (revalidation would
+                        // see a current origin and do nothing). Abandon it so
+                        // the next motion/revalidation starts a fresh hover.
+                        self.runtime.abandon_band_hover();
+                        continue;
+                    }
+                    if self.dispatch_band_hover(hover, Some(&origin)) {
+                        attempted = attempted.saturating_add(1);
+                    }
+                } else if self.dispatch_band_hover(hover, None) {
+                    // `leave` is never origin-fenced: it hides/cleans up and
+                    // grants no authority, so a version bump or a removed band
+                    // still delivers exactly one leave.
+                    attempted = attempted.saturating_add(1);
+                }
+            }
+        }
         let admissions = self
             .runtime
             .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);

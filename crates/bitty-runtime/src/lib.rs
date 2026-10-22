@@ -246,12 +246,14 @@ pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;
 pub use runtime::band_host::{
-    BAND_ACCENT_ANSI_INDEX, BAND_CLICK_QUEUE_MAX, BAND_MAX_REGIONS, BAND_SCROLL_QUEUE_MAX,
-    BandAdmission, BandButton, BandClickRequest, BandColumnOutcome, BandFrameIdentity, BandHit,
-    BandHostStats, BandItemRegion, BandMount, BandOrigin, BandRegionError, BandRowHit, BandRun,
-    BandScrollOutcome, BandScrollRequest, BandScrollTarget, COLD_ADMISSION_SELECTION_MAX,
-    band_click_args_table, band_is_visible, band_regions_for, band_rows_overlap,
-    band_scroll_args_table, flatten_band_runs, resolve_band_token, resolve_click_in_band,
+    BAND_ACCENT_ANSI_INDEX, BAND_CLICK_QUEUE_MAX, BAND_HOVER_QUEUE_MAX, BAND_MAX_REGIONS,
+    BAND_SCROLL_QUEUE_MAX, BandAdmission, BandButton, BandClickRequest, BandColumnOutcome,
+    BandFrameIdentity, BandHit, BandHostStats, BandHoverOutcome, BandHoverPhase, BandHoverRequest,
+    BandHoverTarget, BandItemRegion, BandMount, BandOrigin, BandOverlayAnchor, BandRegionError,
+    BandRowHit, BandRun, BandScrollOutcome, BandScrollRequest, BandScrollTarget,
+    COLD_ADMISSION_SELECTION_MAX, band_click_args_table, band_hover_args_table, band_is_visible,
+    band_regions_for, band_rows_overlap, band_scroll_args_table, flatten_band_runs,
+    flatten_band_runs_in_width, resolve_band_token, resolve_click_in_band, resolve_hover_in_band,
     resolve_item_region, resolve_scroll_in_band, split_band_command,
 };
 pub use runtime::band_slots::{

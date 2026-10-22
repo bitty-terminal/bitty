@@ -22,7 +22,7 @@ use bitty_lua::runtime_inspect::{
     RUNTIME_INSPECT_CALLS_PER_SECOND, RUNTIME_INSPECT_MAX_WALL_MS, RuntimeInspectSnapshot,
 };
 use bitty_lua::ui::UiSlot;
-use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode};
+use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode, UiSceneScope};
 use bitty_lua::{
     BridgeError, COMPONENT_CLASS_CAPABILITY_DENIED, CommandCatalogEntry, ComponentBridgeRequest,
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
@@ -3788,6 +3788,22 @@ impl HostServices for PluginServices {
             .mount(ui_slot, component.clone())
     }
 
+    /// Scene scope of a mounted block (issue #2411): only a horizontal band
+    /// block has a row width that resolves group anchors.
+    ///
+    /// `None` for a stale or foreign handle: `ui.update` must keep returning
+    /// its documented `Ok(false)` result for those instead of the bridge
+    /// rejecting an anchored replacement tree as malformed.
+    fn ui_scene_scope(&self, handle: i64) -> Option<UiSceneScope> {
+        self.ui_blocks
+            .borrow()
+            .get(handle)
+            .map(|block| match block.ui_slot() {
+                UiSlot::Top | UiSlot::Bottom => UiSceneScope::Band,
+                _ => UiSceneScope::Unanchored,
+            })
+    }
+
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
         if !self.ui_access.borrow().rich {
             return Err(BridgeError::capability_denied("ui.rich"));
@@ -7368,6 +7384,8 @@ mod tests {
                 args: vec![("step".to_string(), ClickArg::Number(1.0))],
                 region: None,
             }),
+            anchor: None,
+            on_hover: None,
         }
     }
 
@@ -7428,6 +7446,8 @@ mod tests {
                 region: None,
             }),
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         };
         UiNode::Row {
             children: (0..(UI_MAX_NODES - 1)).map(|_| child.clone()).collect(),
@@ -7436,6 +7456,8 @@ mod tests {
             bold: None,
             on_click: None,
             on_scroll: None,
+            anchor: None,
+            on_hover: None,
         }
     }
 

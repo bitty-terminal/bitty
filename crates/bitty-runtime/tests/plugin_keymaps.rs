@@ -206,10 +206,6 @@ fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedKeymaps>) {
     let source = Rc::new(FixedKeymaps::default());
     *source.0.borrow_mut() = default_table();
     let mut rt = runtime(root, Some(source.clone()));
-    // The 1024-row/64 KiB cap test is a payload-bound check, not a budget
-    // check: a loaded runner can otherwise park the invocation at the 50 ms
-    // RC-1 wall slice before the capped page is encoded (bitty#2463).
-    rt.set_vm_wall_budget_ms(Some(100 * RC1_WALL_CLOCK_BUDGET_MS));
     activate_all(&mut rt);
     (rt, source)
 }
@@ -326,6 +322,11 @@ fn inspect_never_implies_the_keymap_read() {
 #[test]
 fn addressable_rows_are_capped_at_the_registry_bound() {
     let (mut rt, source) = probe_runtime(&["runtime.keymaps.read"]);
+    // This is a payload-bound check, not a budget check: a loaded runner can
+    // otherwise park the invocation at the 50 ms RC-1 wall slice before the
+    // capped page is encoded (bitty#2463). Scoped to this test only so the
+    // sibling per-generation budget probe keeps the production budget.
+    rt.set_vm_wall_budget_ms(Some(100 * RC1_WALL_CLOCK_BUDGET_MS));
     // Past the 1024 addressable cap: the tail is not reachable and
     // `truncated` reports it.
     *source.0.borrow_mut() = (0..KEYMAP_LIST_MAX_TOTAL + 76)

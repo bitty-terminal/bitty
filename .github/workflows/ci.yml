@@ -41,9 +41,25 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      # The quality shards build the full workspace test graph and then the
+      # debug binary. Default debug info fills the runner disk and rust-lld
+      # dies with SIGBUS during the runtime-deps gate; the gate does not need
+      # DWARF. Keep symbols for backtraces, drop the bulk.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The hosted image ships several multi-GB SDKs this Rust workspace never
+      # uses. Reclaim them before the build so the shards cannot exhaust the
+      # runner disk mid-link (observed as `ld ... signal 7 [Bus error]`).
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
 
       # CTX-0971 R4: scope the sccache GHA namespace to the Cargo.lock hash so
       # dep bumps invalidate stale dep units (mirrors the rust-cache key,

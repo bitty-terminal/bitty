@@ -17,12 +17,13 @@
 //!   normal dependency edge and no Core source identifier; `bitty-storage` is
 //!   the single composition-root mechanics seam, linked only by
 //!   `bitty-terminal` and named only in `storage_backends.rs`.
-//!   `bitty-a11y` is the deliberate accessibility snapshot-model/component
-//!   seam (CTX-1362 / CTX-1466 / #2257 / #2496): linked only by `bitty-ui` and
-//!   named only in `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`).
+//!   `bitty-a11y` is the deliberate accessibility snapshot-model seam
+//!   (CTX-1362 / #2257): linked only by `bitty-ui` and named only in
+//!   `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`).
 //!   `bitty-execution` is the Core-runtime execution mechanic seam
-//!   (CTX-1403 / #2249): linked only by `bitty-runtime` and named only in
-//!   `crates/bitty-runtime/src/execution_jobs.rs` (`SOURCE_SEAM_FILES`).
+//!   (CTX-1403 / #2249, host client #2494): linked only by `bitty-runtime`
+//!   and named only in `execution_jobs.rs`, `execution_component/`, and its
+//!   fixture binary (`SOURCE_SEAM_FILES`).
 //!   Seam crates
 //!   (`bitty-ipc`, `bitty-ipc-api`, `bitty-network-wire`,
 //!   `bitty-network-publication`, `bitty-observability-api`,
@@ -131,11 +132,11 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
     ("bitty-observability-api", &["bitty-terminal"]),
     ("bitty-platform-services", &["bitty-runtime"]),
     ("bitty-url-detector", &["bitty-runtime"]),
-    // CTX-1362 / CTX-1466 / #2257 / #2496: the accepted W-134 snapshot-model
-    // and default-off component protocol seam. Both pins are consumed by
-    // `bitty-ui`'s host module; neither grants a platform backend or action
-    // authority. Unlike the other seams, source naming is restricted to one
-    // file by `SOURCE_SEAM_FILES`.
+    // CTX-1362 / #2257: the accepted W-134 snapshot-model seam. It is a
+    // model/contract crate (zero dependencies, `forbid(unsafe)`, no PTY, GPU,
+    // window, or plugin handle) consumed by `bitty-ui`'s `SnapshotHost`
+    // implementation. Unlike the other seams, source naming is restricted to
+    // one file by `SOURCE_SEAM_FILES`.
     ("bitty-a11y", &["bitty-ui"]),
     // CTX-1403 / #2249: the Core-runtime execution mechanic seam. It is an
     // implementation crate, not a contract/codec seam, but it has the same
@@ -153,34 +154,30 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
 /// point rather than an import site.
 const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
 
-/// Seam crates whose Core source references are restricted to one file.
+/// Seam crates whose Core source references are restricted to explicit files.
 ///
-/// `bitty-a11y` is a model/protocol seam, not a general-purpose contract Core
-/// may name anywhere: exactly `crates/bitty-ui/src/a11y_host.rs` implements
-/// `SnapshotHost` and the default-off component validator, and every other
-/// source imports the role vocabulary through that module's re-export.
-/// `bitty-execution` is likewise confined to the
-/// `bitty-runtime` `execution_jobs.rs` bridge (#2249). `bitty-graphics` has no
-/// dependency edge but is restricted to `GRAPHICS_SOURCE_SEAM`; its
-/// composition-root binding has no separate open task, with `bitty-graphics#17`
-/// as the extension-side gate and #2163 as the Core tracker.
-const SOURCE_SEAM_FILES: &[(&str, &str)] = &[
-    ("bitty-a11y", "crates/bitty-ui/src/a11y_host.rs"),
+/// `bitty-a11y` is a model seam, not a general-purpose contract Core may name
+/// anywhere: exactly `crates/bitty-ui/src/a11y_host.rs` implements
+/// `SnapshotHost`, and every other source imports the role vocabulary through
+/// that module's re-export. `bitty-execution` is confined to the
+/// `bitty-runtime` bridge (`execution_jobs.rs`, #2249), the #2494 host client
+/// (`execution_component/`), and its hermetic fixture binary.
+/// `bitty-graphics` has no dependency edge but is restricted to
+/// `GRAPHICS_SOURCE_SEAM`; its composition-root binding has no separate open
+/// task, with `bitty-graphics#17` as the extension-side gate and #2163 as the
+/// Core tracker.
+const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
+    ("bitty-a11y", &["crates/bitty-ui/src/a11y_host.rs"]),
     (
         "bitty-execution",
-        "crates/bitty-runtime/src/execution_jobs.rs",
+        &[
+            "crates/bitty-runtime/src/execution_jobs.rs",
+            "crates/bitty-runtime/src/execution_component/mod.rs",
+            "crates/bitty-runtime/src/execution_component/host.rs",
+            "crates/bitty-runtime/src/bin/bitty-execution-component-fixture.rs",
+        ],
     ),
-    ("bitty-graphics", GRAPHICS_SOURCE_SEAM),
-];
-
-/// Rust identifiers for source-restricted seam crates. The component client
-/// uses a Cargo alias so its unmerged protocol pin can coexist with the
-/// linked model pin; that alias is fenced just as deliberately as the package
-/// identifier.
-const SOURCE_SEAM_IDENTIFIERS: &[(&str, &[&str])] = &[
-    ("bitty-a11y", &["bitty_a11y", "bitty_a11y_component"]),
-    ("bitty-execution", &["bitty_execution"]),
-    ("bitty-graphics", &["bitty_graphics"]),
+    ("bitty-graphics", &[GRAPHICS_SOURCE_SEAM]),
 ];
 
 /// Crates published from the bitty-terminal org that are intentionally not
@@ -895,30 +892,30 @@ fn a11y_source_naming_is_restricted_to_host_seam() {
         &[
             (
                 "crates/bitty-ui/src/a11y_host.rs",
-                "use bitty_a11y::SnapshotHost;\nuse bitty_a11y_component::component::Message;\n",
+                "use bitty_a11y::SnapshotHost;\n",
             ),
-            (
-                "crates/bitty-ui/src/other.rs",
-                "use bitty_a11y::Role;\nuse bitty_a11y_component::component::Message;\n",
-            ),
+            ("crates/bitty-ui/src/other.rs", "use bitty_a11y::Role;\n"),
         ],
     );
     let violations = extension_source_violations(&root);
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(violations.len(), 2, "both model and alias names are fenced");
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the host seam may name the a11y model: {violations:#?}"
+    );
     assert!(
-        violations
-            .iter()
-            .all(|violation| violation.contains("other.rs"))
+        violations[0].contains("other.rs") && violations[0].contains("bitty_a11y"),
+        "the non-seam source must be the offender: {violations:#?}"
     );
 }
 
 #[test]
 fn execution_source_naming_is_restricted_to_runtime_seam() {
-    // CTX-1403 / #2249: `bitty-execution` is an implementation mechanic, not
-    // a general-purpose contract Core may name anywhere. The
-    // `bitty-runtime` bridge file is legal; any other Core source naming it
-    // is a violation.
+    // CTX-1403 / #2249, extended by #2494: `bitty-execution` is an
+    // implementation mechanic, not a general-purpose contract Core may name
+    // anywhere. The `bitty-runtime` bridge and host-client files are legal;
+    // any other Core source naming it is a violation.
     let root = write_probe_workspace(
         "execution-source",
         &[
@@ -929,6 +926,10 @@ fn execution_source_naming_is_restricted_to_runtime_seam() {
             (
                 "crates/bitty-runtime/src/execution_jobs.rs",
                 "use bitty_execution::JobRegistry;\n",
+            ),
+            (
+                "crates/bitty-runtime/src/execution_component/host.rs",
+                "use bitty_execution::component::protocol::Message;\n",
             ),
             (
                 "crates/bitty-runtime/src/other.rs",
@@ -1246,20 +1247,14 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
         let source_seam = SOURCE_SEAM_FILES
             .iter()
             .find(|(seam, _)| seam == extension)
-            .map(|(_, path)| root.join(path));
+            .map(|(_, paths)| paths.iter().map(|path| root.join(path)).collect::<Vec<_>>());
         if !is_storage
             && source_seam.is_none()
             && SEAM_CRATES.iter().any(|(seam, _)| seam == extension)
         {
             continue;
         }
-        let identifiers: Vec<String> = SOURCE_SEAM_IDENTIFIERS
-            .iter()
-            .find(|(seam, _)| *seam == *extension)
-            .map_or_else(
-                || vec![extension.replace('-', "_")],
-                |(_, ids)| ids.iter().map(|id| (*id).to_owned()).collect(),
-            );
+        let ident = extension.replace('-', "_");
         for member in &members {
             let src = root.join("crates").join(member).join("src");
             if !src.is_dir() {
@@ -1274,14 +1269,15 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
                 if is_storage && file == storage_seam {
                     continue;
                 }
-                if source_seam.as_ref() == Some(&file) {
+                if source_seam
+                    .as_ref()
+                    .is_some_and(|paths| paths.contains(&file))
+                {
                     continue;
                 }
                 let text = std::fs::read_to_string(&file).expect("read rs file");
-                for ident in &identifiers {
-                    if names_crate(&text, ident) {
-                        violations.push(format!("{} names `{ident}`", file.display()));
-                    }
+                if names_crate(&text, &ident) {
+                    violations.push(format!("{} names `{ident}`", file.display()));
                 }
             }
         }

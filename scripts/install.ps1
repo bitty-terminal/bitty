@@ -110,7 +110,14 @@ function Get-BittyTag {
   } catch {
     throw "could not fetch version pointer ${latestUrl}: $($_.Exception.Message)"
   }
-  $tag = "$($response.Content)".Trim() -replace "`r", '' -replace "`n", ''
+  # Windows PowerShell returns a string, PowerShell 7 can return bytes for a
+  # text/plain response; decode before trimming so the version pointer works
+  # on both hosts.
+  $content = $response.Content
+  if ($content -is [byte[]]) {
+    $content = [System.Text.Encoding]::UTF8.GetString($content)
+  }
+  $tag = "$content".Trim() -replace "`r", '' -replace "`n", ''
   $tag = $tag.Trim()
   if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
     throw "version pointer $latestUrl returned unexpected content: $tag"

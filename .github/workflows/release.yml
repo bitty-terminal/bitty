@@ -2113,13 +2113,15 @@ jobs:
             os: macos-latest
             run: |
               brew tap bitty-terminal/homebrew-tap
+              brew trust bitty-terminal/homebrew-tap
               brew install bitty
               bitty --version | grep -F "0.0.26"
           - channel: "Windows install.ps1 (R2)"
             os: windows-latest
             run: |
               irm https://cdn.bitty.run/install/install.ps1 | iex
-              & (Join-Path $env:LocalAppData "bitty\bin\bitty.exe") --version | Select-String -SimpleMatch "0.0.26"
+              $v = & (Join-Path $env:LocalAppData "bitty\bin\bitty.exe") --version
+              if ($v -notmatch '^bitty 0\.0\.26 ') { throw "unexpected bitty version: $v" }
           - channel: "Windows Scoop (R2)"
             os: windows-latest
             run: |
@@ -2127,7 +2129,8 @@ jobs:
               irm get.scoop.sh | iex
               scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
               scoop install bitty
-              bitty --version | Select-String -SimpleMatch "0.0.26"
+              $v = & (scoop which bitty) --version
+              if ($v -notmatch '^bitty 0\.0\.26 ') { throw "unexpected bitty version: $v" }
     steps:
       - name: Test installation from CDN (Unix)
         if: matrix.os != 'windows-latest'

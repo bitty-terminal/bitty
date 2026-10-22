@@ -992,6 +992,7 @@ mod tests {
         for restart in [
             "terminal.scrollback",
             "terminal.shell",
+            "terminal.page_scroll_percent",
             "layout.gaps_in",
             "plugins",
             "close_confirm",

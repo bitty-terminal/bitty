@@ -43,6 +43,17 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 
+/// Default page-scroll distance as a percentage of the focused viewport
+/// (issue #2475: keep one quarter of the previous page visible for context).
+pub const DEFAULT_PAGE_SCROLL_PERCENT: u32 = 75;
+
+/// Minimum accepted `terminal.page_scroll_percent` (issue #2475).
+pub const MIN_PAGE_SCROLL_PERCENT: u32 = 10;
+
+/// Maximum accepted `terminal.page_scroll_percent` (issue #2475): a full
+/// viewport, the pre-#2475 behavior.
+pub const MAX_PAGE_SCROLL_PERCENT: u32 = 100;
+
 /// Default inner panel gap (`layout.gaps_in`), in cells: edge-to-edge.
 pub const DEFAULT_LAYOUT_GAPS_IN: u32 = 0;
 
@@ -2630,6 +2641,10 @@ pub struct TerminalConfig {
     /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16,
     /// one default cell height per notch before the lines multiplier).
     pub scroll_pixels_per_notch: u32,
+    /// Page-scroll distance as a percentage of the focused viewport rows,
+    /// `10..=100` (issue #2475; default 75). Integer math with a one-row
+    /// floor; applied by `scroll_page_up`/`scroll_page_down`.
+    pub page_scroll_percent: u32,
     /// Default cursor rendering shape (CTX-0756, issue #1359
     /// `terminal.cursor_style`; default `default` = renderer block
     /// fallback). Seeds new panes and resolves app `DECSCUSR 0` resets.
@@ -2647,6 +2662,7 @@ impl Default for TerminalConfig {
             shell: None,
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell: DEFAULT_BELL_MODE,
         }
@@ -2672,6 +2688,13 @@ impl TerminalConfig {
             return Err(ConfigError::validation(
                 "terminal.scroll_pixels_per_notch",
                 format!("must be within [1, {MAX_SCROLL_PIXELS_PER_NOTCH}]"),
+            ));
+        }
+        if !(MIN_PAGE_SCROLL_PERCENT..=MAX_PAGE_SCROLL_PERCENT).contains(&self.page_scroll_percent)
+        {
+            return Err(ConfigError::validation(
+                "terminal.page_scroll_percent",
+                format!("must be within [{MIN_PAGE_SCROLL_PERCENT}, {MAX_PAGE_SCROLL_PERCENT}]"),
             ));
         }
         // CTX-0756: closed enums are total, but the explicit calls keep a
@@ -5203,6 +5226,35 @@ mod tests {
             }
             .validate()
             .expect("boundary scroll speed must be valid");
+        }
+    }
+
+    #[test]
+    fn terminal_page_scroll_percent_validates_range_and_default() {
+        // Issue #2475: page scroll defaults to 75% and accepts the closed
+        // 10..=100 range; anything outside fails closed naming the field.
+        assert_eq!(DEFAULT_PAGE_SCROLL_PERCENT, 75);
+        assert_eq!(TerminalConfig::default().page_scroll_percent, 75);
+        for good in [MIN_PAGE_SCROLL_PERCENT, 50, MAX_PAGE_SCROLL_PERCENT] {
+            TerminalConfig {
+                page_scroll_percent: good,
+                ..Default::default()
+            }
+            .validate()
+            .expect("in-range page scroll percent must be valid");
+        }
+        for bad in [MIN_PAGE_SCROLL_PERCENT - 1, MAX_PAGE_SCROLL_PERCENT + 1] {
+            let err = TerminalConfig {
+                page_scroll_percent: bad,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.field(), Some("terminal.page_scroll_percent"));
+            assert!(
+                err.to_string().contains("must be within [10, 100]"),
+                "{err}"
+            );
         }
     }
 

@@ -37,6 +37,20 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 
+/// Default page-scroll distance as a percentage of the focused viewport rows
+/// (issue #2475). Mirrors `bitty-config` `DEFAULT_PAGE_SCROLL_PERCENT` (kept
+/// as a local constant because `bitty-runtime` must not depend on
+/// `bitty-config`; `bitty-terminal` maps the effective value across at startup
+/// and the two defaults must stay equal — covered by a cross-crate test in
+/// `bitty-terminal`).
+pub const DEFAULT_PAGE_SCROLL_PERCENT: u32 = 75;
+
+/// Minimum accepted page-scroll percentage (issue #2475).
+pub const MIN_PAGE_SCROLL_PERCENT: u32 = 10;
+
+/// Maximum accepted page-scroll percentage (issue #2475): one full viewport.
+pub const MAX_PAGE_SCROLL_PERCENT: u32 = 100;
+
 /// Default retained scrollback lines (CTX-0297 `terminal.scrollback`).
 ///
 /// Mirrors `bitty_term_state::SCROLLBACK_DEFAULT_LINES` (kept as a re-export
@@ -838,6 +852,12 @@ pub struct RuntimeConfig {
     pub scroll_lines_per_notch: u32,
     /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16).
     pub scroll_pixels_per_notch: u32,
+    /// Page-scroll distance as a percentage of the focused viewport rows,
+    /// `10..=100` (issue #2475; default 75). `scroll_focused_page` computes
+    /// `max(1, rows * percent / 100)` with integer math and saturating
+    /// arithmetic, then clamps to `[0, scrollback_len]`. Read at keypress
+    /// time; adopted with the rest of the terminal config at startup.
+    pub page_scroll_percent: u32,
     /// Retained scrollback lines captured when terminal state is created
     /// (CTX-0297 `terminal.scrollback`). `0..=MAX_SCROLLBACK_LINES`; default
     /// `DEFAULT_SCROLLBACK_LINES` (`10 000`). `0` disables scrollback
@@ -1111,6 +1131,7 @@ impl Default for RuntimeConfig {
             font_fallback: Vec::new(),
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
             close_confirm: DEFAULT_CLOSE_CONFIRM_MODE,
@@ -1180,6 +1201,12 @@ impl RuntimeConfig {
     /// `font.fallback` post-construction; [`Self::validate`] rejects
     /// overlong lists and blank or overlong entries fail-closed.
     ///
+    /// Issue #2475: `page_scroll_percent` follows the same pattern: it
+    /// defaults to [`DEFAULT_PAGE_SCROLL_PERCENT`] here and the app layer
+    /// assigns the effective `terminal.page_scroll_percent`
+    /// post-construction; [`Self::validate`] rejects values outside
+    /// `[MIN_PAGE_SCROLL_PERCENT, MAX_PAGE_SCROLL_PERCENT]` fail-closed.
+    ///
     /// # Errors
     ///
     /// [`RuntimeError::InvalidConfig`] when any field is outside its
@@ -1215,6 +1242,7 @@ impl RuntimeConfig {
             font_fallback: Vec::new(),
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
+            page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy,
             close_confirm: DEFAULT_CLOSE_CONFIRM_MODE,
@@ -1313,6 +1341,12 @@ impl RuntimeConfig {
         if !(1..=MAX_SCROLL_PIXELS_PER_NOTCH).contains(&self.scroll_pixels_per_notch) {
             return Err(RuntimeError::InvalidConfig(
                 "scroll_pixels_per_notch must be within [1, 256]",
+            ));
+        }
+        if !(MIN_PAGE_SCROLL_PERCENT..=MAX_PAGE_SCROLL_PERCENT).contains(&self.page_scroll_percent)
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "page_scroll_percent must be within [10, 100]",
             ));
         }
         if self.scrollback > MAX_SCROLLBACK_LINES {
@@ -2517,6 +2551,30 @@ mod tests {
         }
         .validate()
         .expect_err("over-max delay must fail closed");
+    }
+
+    #[test]
+    fn page_scroll_percent_defaults_75_and_validates_range() {
+        // Issue #2475: 75% default, closed 10..=100 range, fail-closed
+        // outside it.
+        assert_eq!(DEFAULT_PAGE_SCROLL_PERCENT, 75);
+        assert_eq!(RuntimeConfig::default().page_scroll_percent, 75);
+        for good in [MIN_PAGE_SCROLL_PERCENT, 50, MAX_PAGE_SCROLL_PERCENT] {
+            RuntimeConfig {
+                page_scroll_percent: good,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .expect("in-range page scroll percent must be valid");
+        }
+        for bad in [MIN_PAGE_SCROLL_PERCENT - 1, MAX_PAGE_SCROLL_PERCENT + 1] {
+            RuntimeConfig {
+                page_scroll_percent: bad,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .expect_err("out-of-range page scroll percent must fail closed");
+        }
     }
 
     #[test]

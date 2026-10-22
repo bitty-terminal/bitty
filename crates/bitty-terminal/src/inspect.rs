@@ -741,6 +741,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "terminal.scrollback" => defaults.terminal.scrollback.to_string(),
         "terminal.scroll_lines_per_notch" => defaults.terminal.scroll_lines_per_notch.to_string(),
         "terminal.scroll_pixels_per_notch" => defaults.terminal.scroll_pixels_per_notch.to_string(),
+        // Issue #2475: default page-scroll distance (75% of the viewport).
+        "terminal.page_scroll_percent" => defaults.terminal.page_scroll_percent.to_string(),
         "terminal.shell" => defaults
             .terminal
             .shell
@@ -1283,7 +1285,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.cursor_style, terminal.bell, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.scroll_lines_per_notch, terminal.scroll_pixels_per_notch, terminal.page_scroll_percent, terminal.cursor_style, terminal.bell, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {
@@ -1574,6 +1576,10 @@ mod tests {
         let bell = inspect_config("TERMINAL.BELL").expect("bell key (case-insensitive)");
         assert_eq!(bell.key, "terminal.bell");
         assert_eq!(bell.value, "visual");
+        // Issue #2475: the default page-scroll percentage is inspectable.
+        let page = inspect_config("terminal.page_scroll_percent").expect("page scroll key");
+        assert_eq!(page.key, "terminal.page_scroll_percent");
+        assert_eq!(page.value, "75");
         // CTX-1352: history capture defaults are inspectable and off.
         let transcript =
             inspect_config("history.capture.transcript").expect("history transcript key");

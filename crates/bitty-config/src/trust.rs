@@ -409,7 +409,8 @@ impl TrustStore {
 ///
 /// The allowed subset in this draft: `font`, `window`, `layout`,
 /// `terminal.scrollback`, `terminal.scroll_lines_per_notch`,
-/// `terminal.scroll_pixels_per_notch`, `terminal.cursor_style`,
+/// `terminal.scroll_pixels_per_notch`, `terminal.page_scroll_percent`,
+/// `terminal.cursor_style`,
 /// `terminal.bell` (CTX-0756: presentation-only chrome like scroll speed;
 /// `bell` never grants OSC 9/777 notification permission, which stays
 /// deny-by-default), `selection.auto_copy`,
@@ -687,6 +688,7 @@ mod tests {
             terminal: Some(TerminalConfig {
                 scroll_lines_per_notch: 5,
                 scroll_pixels_per_notch: 24,
+                page_scroll_percent: 50,
                 ..Default::default()
             }),
             ..Default::default()

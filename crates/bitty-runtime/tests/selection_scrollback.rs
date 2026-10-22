@@ -12,7 +12,7 @@
 //! hard-coded pixel, padding, or decoration constants. Headless only.
 
 use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState, ScrollDelta};
-use bitty_runtime::{PresentFrame, Runtime, ViewId};
+use bitty_runtime::{PresentFrame, Runtime, RuntimeConfig, ViewId};
 use bitty_ui::CellPos;
 
 fn make_runtime() -> Runtime {
@@ -206,6 +206,50 @@ fn scroll_while_selecting_tracks_anchor() {
     assert!(
         rt.selection_text().is_some(),
         "tracked drag must yield visible text"
+    );
+}
+
+#[test]
+fn page_scroll_selection_follows_actual_delta() {
+    // Issue #2475: paging at a custom percentage shifts a committed
+    // selection by the actual scroll delta, not the viewport height.
+    let mut rt = Runtime::new(RuntimeConfig {
+        rows: 40,
+        page_scroll_percent: 50,
+        ..RuntimeConfig::default()
+    })
+    .expect("page-scroll runtime must build");
+    rt.force_headless_clipboard();
+    feed_lines(&mut rt, 200);
+    assert_eq!(scroll_offset(&rt), 0, "must start live");
+    let id = view_id(&rt);
+    let rows = usize::from(rt.layout().find_leaf(id).expect("leaf").rows());
+    assert_eq!(rows, 40);
+
+    // Commit a single-row selection in the live viewport.
+    let start = cell_center(&rt, id, 10, 0);
+    let end = cell_center(&rt, id, 10, 4);
+    rt.handle_cursor_moved(start);
+    press(&mut rt);
+    rt.handle_cursor_moved(end);
+    release(&mut rt);
+    let before_offset = scroll_offset(&rt);
+    let before = rt.selection().expect("committed selection");
+
+    assert!(rt.scroll_focused_page(true), "page up must scroll");
+    let actual_delta = scroll_offset(&rt) - before_offset;
+    assert_eq!(actual_delta, rows * 50 / 100, "custom page distance");
+
+    let after = rt.selection().expect("selection survives page scroll");
+    assert_eq!(
+        after.anchor.row,
+        before.anchor.row + actual_delta as u16,
+        "anchor tracks its buffer line by the actual delta"
+    );
+    assert_eq!(
+        after.focus.row,
+        before.focus.row + actual_delta as u16,
+        "focus tracks its buffer line by the actual delta"
     );
 }
 

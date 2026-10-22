@@ -134,8 +134,9 @@ fn tracked_control_state_synthesizes_ctrl_bytes() {
 
 #[test]
 fn scroll_focused_page_moves_viewport_by_page() {
-    // CTX-0178: Alt+U/I pages the focused pane by its viewport height,
-    // clamped to scrollback bounds.
+    // CTX-0178: Alt+U/I pages the focused pane; issue #2475: a page is the
+    // configured percentage of viewport rows (default 75%), clamped to
+    // scrollback bounds.
     let mut rt = make_runtime();
     for i in 0..200 {
         let line = format!("line {i:03}\n");
@@ -152,6 +153,7 @@ fn scroll_focused_page_moves_viewport_by_page() {
         .expect("single leaf")
         .rows();
     assert!(rows > 1, "page must span more than one row");
+    let expected = usize::from(rows) * 75 / 100;
     assert!(rt.scroll_focused_page(true), "page up must find the leaf");
     let offset = rt
         .layout()
@@ -160,8 +162,8 @@ fn scroll_focused_page_moves_viewport_by_page() {
         .scroll_offset();
     assert_eq!(
         offset,
-        usize::from(rows).min(rt.state().scrollback_len()),
-        "one page up moves by viewport rows"
+        expected.min(rt.state().scrollback_len()),
+        "one page up moves by 75% of viewport rows"
     );
     assert!(
         rt.scroll_focused_page(false),
@@ -175,6 +177,115 @@ fn scroll_focused_page_moves_viewport_by_page() {
         0,
         "one page down returns to live"
     );
+}
+
+fn page_runtime(rows: usize, percent: u32) -> Runtime {
+    Runtime::new(RuntimeConfig {
+        rows,
+        page_scroll_percent: percent,
+        ..RuntimeConfig::default()
+    })
+    .expect("page-scroll runtime must build")
+}
+
+fn feed_page_lines(rt: &mut Runtime, count: usize) {
+    for i in 0..count {
+        let line = format!("page line {i:03}\n");
+        rt.handle_pty_bytes(line.as_bytes());
+    }
+}
+
+fn page_view(rt: &Runtime) -> ViewId {
+    rt.focused_view().expect("focused leaf")
+}
+
+fn page_rows(rt: &Runtime) -> usize {
+    usize::from(
+        rt.layout()
+            .find_leaf(page_view(rt))
+            .expect("focused leaf")
+            .rows(),
+    )
+}
+
+fn page_offset(rt: &Runtime) -> usize {
+    rt.layout()
+        .find_leaf(page_view(rt))
+        .expect("focused leaf")
+        .scroll_offset()
+}
+
+#[test]
+fn page_scroll_default_is_75_percent_of_known_rows() {
+    // Issue #2475: a 40-row viewport pages 30 rows by default.
+    let mut rt = page_runtime(40, 75);
+    assert_eq!(page_rows(&rt), 40, "config rows seed the viewport");
+    feed_page_lines(&mut rt, 200);
+    assert!(rt.scroll_focused_page(true));
+    assert_eq!(page_offset(&rt), 30, "75% of 40 rows");
+    assert!(rt.scroll_focused_page(false));
+    assert_eq!(page_offset(&rt), 0);
+}
+
+#[test]
+fn page_scroll_custom_percent_scales_distance() {
+    // Issue #2475: 50% and 100% are accepted and move exactly that share.
+    for (percent, expected) in [(50, 20), (100, 40)] {
+        let mut rt = page_runtime(40, percent);
+        feed_page_lines(&mut rt, 200);
+        assert!(rt.scroll_focused_page(true));
+        assert_eq!(page_offset(&rt), expected, "{percent}% of 40 rows");
+        assert!(rt.scroll_focused_page(false));
+        assert_eq!(page_offset(&rt), 0, "returning to live is exact");
+    }
+}
+
+#[test]
+fn page_scroll_has_one_row_floor() {
+    // Issue #2475: a percentage that rounds down to zero still moves one row.
+    let mut rt = page_runtime(8, 10);
+    assert_eq!(page_rows(&rt), 8);
+    feed_page_lines(&mut rt, 40);
+    assert_eq!(8 * 10 / 100, 0, "the raw share rounds to zero");
+    assert!(rt.scroll_focused_page(true));
+    assert_eq!(page_offset(&rt), 1, "floor keeps paging usable");
+}
+
+#[test]
+fn page_scroll_clamps_at_both_history_ends() {
+    // Issue #2475: clamped to [0, scrollback_len] at both ends.
+    let mut rt = page_runtime(20, 100);
+    feed_page_lines(&mut rt, 100);
+    let max = rt.scrollback_len();
+    assert!(max > 20, "need several pages of history, got {max}");
+    while page_offset(&rt) < max {
+        assert!(rt.scroll_focused_page(true));
+        assert!(page_offset(&rt) <= max);
+    }
+    assert_eq!(page_offset(&rt), max, "history top clamps");
+    assert!(rt.scroll_focused_page(true));
+    assert_eq!(page_offset(&rt), max, "top stays clamped");
+    while page_offset(&rt) > 0 {
+        assert!(rt.scroll_focused_page(false));
+        assert!(page_offset(&rt) <= max);
+    }
+    assert_eq!(page_offset(&rt), 0, "live clamps");
+    assert!(rt.scroll_focused_page(false));
+    assert_eq!(page_offset(&rt), 0, "live stays clamped");
+}
+
+#[test]
+fn page_scroll_is_inert_on_the_alternate_screen() {
+    // Issue #2475 preserves #1338: the alt screen owns no scrollback view.
+    let mut rt = page_runtime(40, 75);
+    feed_page_lines(&mut rt, 200);
+    assert!(!rt.state().alt_screen_active());
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+    assert!(rt.state().alt_screen_active(), "must be on the alt screen");
+    let before = page_offset(&rt);
+    assert!(rt.scroll_focused_page(true), "focused leaf still resolves");
+    assert!(rt.scroll_focused_page(false));
+    assert_eq!(page_offset(&rt), before, "alt-screen paging is a no-op");
 }
 
 #[test]

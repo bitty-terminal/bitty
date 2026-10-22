@@ -10328,6 +10328,197 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
     let _ = std::fs::remove_file(&script);
 }
 
+/// Issue #2443 fixture: a shell that closes every tty fd (forcing reader EOF)
+/// and then blocks on `marker` before exiting. The EOF wake therefore lands
+/// while the child is provably not reapable yet.
+#[cfg(target_os = "linux")]
+fn delayed_exit_after_eof(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let marker = std::env::temp_dir().join(format!(
+        "bitty-ctx2443-{}-{nanos}-{name}.go",
+        std::process::id()
+    ));
+    let body = format!(
+        "#!/bin/sh\nexec 0<&- 1>&- 2>&-\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nexit 0\n",
+        marker.display()
+    );
+    (write_fake_editor(name, &body), marker)
+}
+
+/// Bounded pump until a session's reader reports EOF while its child is
+/// still unreaped (the #2443 race window).
+#[cfg(target_os = "linux")]
+fn wait_for_unreaped_eof_session(app: &mut TerminalApp, deadline: std::time::Instant) {
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        if app.runtime.has_unreaped_eof_session() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("no PTY session reported EOF with an unreaped child within the bound");
+}
+
+/// Drive the app only through the reap wakes it schedules itself.
+///
+/// This mirrors the `AboutToWait` arm: pump + reap, then wait until the
+/// app's own next wake. A missing deadline means the real event loop would
+/// park in `ControlFlow::Wait` with a dead shell on screen — the #2443 hang
+/// signature — so it fails the test instead of silently polling.
+#[cfg(target_os = "linux")]
+fn drive_post_eof_reap_wakes(
+    app: &mut TerminalApp,
+    deadline: std::time::Instant,
+) -> terminal_app::ShellExitOutcome {
+    let mut outcome = app.reap_exited_shells();
+    while outcome == terminal_app::ShellExitOutcome::NoExit {
+        let now = std::time::Instant::now();
+        assert!(
+            now < deadline,
+            "shell exit never observed within the bound (event loop would hang, #2443)"
+        );
+        let Some(next_at) = app.shell_exit_poll_deadline() else {
+            panic!("PTY EOF with an unreaped child must keep a bounded reap wake armed (#2443)");
+        };
+        assert!(
+            next_at <= deadline,
+            "scheduled reap wake {next_at:?} overruns the test bound"
+        );
+        std::thread::sleep(next_at.saturating_duration_since(now));
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+    }
+    outcome
+}
+
+/// Issue #2443: `exit` in the last panel must terminate promptly even when
+/// the PTY hits EOF before the child is reapable.
+#[test]
+#[cfg(target_os = "linux")]
+fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
+    require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    assert_eq!(app.runtime.leaf_count(), 1);
+    app.runtime.set_session_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageSessionBackend::new(),
+    )));
+    let (script, marker) = delayed_exit_after_eof("late-exit-last-2443");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(script_arg.as_str())
+        .expect("spawn primary shell");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let child = app.runtime.pty_pid().expect("child pid");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    wait_for_unreaped_eof_session(&mut app, deadline);
+    assert_eq!(
+        app.reap_exited_shells(),
+        terminal_app::ShellExitOutcome::NoExit,
+        "the fixture must keep the child alive across the EOF wake"
+    );
+
+    // Only now let the child exit; from here the app's own scheduled wake is
+    // the sole event source (no timer, input, or compositor event).
+    std::fs::write(&marker, b"go").expect("release delayed exit");
+    assert_eq!(
+        drive_post_eof_reap_wakes(&mut app, deadline),
+        terminal_app::ShellExitOutcome::AppExiting,
+        "the last panel must close the session after its shell exits"
+    );
+    assert!(
+        app.shell_exit_poll_deadline().is_none(),
+        "the reap schedule must clear once the exit is observed"
+    );
+
+    // #2421 preserved: a shell exit still leaves a populated tiled
+    // workspace, so the exit save is attempted rather than skipped as a
+    // close-to-empty window.
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-ctx2443-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    app.runtime
+        .save_session_to_path(&dir.join("session"))
+        .expect("last-panel exit state must stay encodable");
+
+    app.runtime.shutdown();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    assert!(
+        hosted_grandchild_gone(child),
+        "child {child} must be reaped, never orphaned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&script);
+}
+
+/// Issue #2443: the same late-exit race in a non-last pane must close only
+/// that pane, keep its sibling, and clear the reap schedule.
+#[test]
+#[cfg(target_os = "linux")]
+fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
+    require_pty!();
+    let mut app = editor_test_app();
+    assert_eq!(app.runtime.leaf_count(), 2);
+    let pane_view = ViewId::new(2);
+    let (script, marker) = delayed_exit_after_eof("late-exit-pane-2443");
+    let script_arg = script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, script_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn pane shell");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    wait_for_unreaped_eof_session(&mut app, deadline);
+    assert_eq!(
+        app.reap_exited_shells(),
+        terminal_app::ShellExitOutcome::NoExit,
+        "the fixture must keep the pane child alive across the EOF wake"
+    );
+
+    std::fs::write(&marker, b"go").expect("release delayed exit");
+    assert_eq!(
+        drive_post_eof_reap_wakes(&mut app, deadline),
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "a non-last exit must close only its pane and never exit the app"
+    );
+    assert_eq!(app.runtime.leaf_count(), 1, "sibling pane must survive");
+    assert!(
+        !app.runtime.has_pane_session(&pane_view),
+        "the exited pane session must be dropped"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(ViewId::new(1)),
+        "focus must return to the surviving pane"
+    );
+    assert!(!app.runtime.has_unreaped_eof_session());
+    assert!(
+        app.shell_exit_poll_deadline().is_none(),
+        "no phantom reap schedule after the pane closed"
+    );
+    app.runtime.shutdown();
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&script);
+}
+
 #[test]
 #[cfg(unix)]
 fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {

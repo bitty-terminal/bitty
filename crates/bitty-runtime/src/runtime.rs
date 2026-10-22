@@ -451,6 +451,13 @@ pub struct Runtime {
     pty_forward_handle: Option<std::thread::JoinHandle<()>>,
     /// Readability callback moved (cloned) into the forwarder on promotion.
     pty_waker: Option<PtyWaker>,
+    /// Primary reader terminal-state latch (issue #2443).
+    ///
+    /// Set by the wakeup forwarder (or the direct pump) once the primary
+    /// reader reaches EOF / a terminal I/O failure. The embedder keeps a
+    /// bounded reap wake armed while this is set and the child is still
+    /// unreaped; reset on every primary spawn.
+    primary_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pty_writer: Option<PtyWriter>,
     /// Private shell sessions keyed by split-leaf id (CTX-0176). Empty in
     /// single-pane use, where the primary PTY/state path is unchanged.
@@ -1752,6 +1759,7 @@ impl Runtime {
             pty_forward_rx: None,
             pty_forward_handle: None,
             pty_waker: None,
+            primary_eof: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
             pty_poll_turn: 0,
@@ -2032,6 +2040,7 @@ impl Runtime {
             pty_forward_rx: None,
             pty_forward_handle: None,
             pty_waker: None,
+            primary_eof: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
             pty_poll_turn: 0,

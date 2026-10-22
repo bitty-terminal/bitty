@@ -22,6 +22,11 @@ pub(super) struct PaneSession {
     pub(super) query_overlap: Vec<u8>,
     pub(super) pty: Pty,
     pub(super) reader: Option<PtyReader>,
+    /// Reader terminal-state latch (issue #2443): set on EOF / terminal I/O
+    /// failure by the forwarder or the direct pump, reset on (re)spawn. The
+    /// embedder arms a bounded reap wake while this is set and the child is
+    /// still unreaped.
+    pub(super) reader_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) forward_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     pub(super) forward_handle: Option<std::thread::JoinHandle<()>>,
     pub(super) writer: PtyWriter,
@@ -46,9 +51,13 @@ impl PaneSession {
         }
         match self.reader.as_ref()?.try_recv() {
             bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
-            bitty_pty::PtyRecv::Empty | bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+            bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+                // Issue #2443: same terminal-state latch as the forwarder,
+                // for the unpromoted direct pump path.
+                super::pty::mark_reader_eof(&self.reader_eof);
                 None
             }
+            bitty_pty::PtyRecv::Empty => None,
         }
     }
 }
@@ -171,6 +180,13 @@ impl Runtime {
             let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
         self.pty_reader = Some(reader);
+        // Issue #2443: a respawn replaces the child and its reader, so the
+        // previous session's terminal-state latch must not leak into the new
+        // one (it would arm the exit poll forever on a healthy shell). A
+        // fresh `Arc` is used rather than clearing the old one: a forwarder
+        // that timed out its join is detached and still holds the previous
+        // `Arc`, so clearing in place would let it mark the new session.
+        self.primary_eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.pty_writer = Some(writer);
         // CTX-0359: the primary shell is painted and typed into through the
         // leaf focused at attach time (startup `--focus` included), so pin
@@ -549,6 +565,7 @@ impl Runtime {
                 query_overlap: Vec::new(),
                 pty,
                 reader: Some(reader),
+                reader_eof: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 forward_rx: None,
                 forward_handle: None,
                 writer,
@@ -698,7 +715,8 @@ impl Runtime {
             sess.reader = Some(reader);
             return;
         };
-        match super::pty::spawn_forwarder_default(reader, waker) {
+        let eof = std::sync::Arc::clone(&sess.reader_eof);
+        match super::pty::spawn_forwarder_default(reader, waker, eof) {
             Ok(parts) => {
                 sess.forward_rx = Some(parts.rx);
                 sess.forward_handle = Some(parts.handle);

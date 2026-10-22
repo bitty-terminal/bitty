@@ -366,7 +366,7 @@ fn commit_echo_in_the_next_batch_is_still_absorbed() {
     // handed the echo straight back to the terminal, and the fcitx5 trailing
     // space of #1449 returned on a perfectly ordinary compositor.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -394,7 +394,7 @@ fn commit_echo_stays_absorbed_across_several_ticks() {
     // A busy event loop can dispatch several batches inside the echo window;
     // ageing must not accumulate into an early release.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
@@ -418,7 +418,7 @@ fn presented_and_skipped_frames_alike_do_not_release_the_claim_early() {
     // window skips it. Neither may release a claim that is still inside its
     // echo window.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "n", "n");
     rt.handle_ime_preedit_at(Some("n".to_string()), Some(1), base);

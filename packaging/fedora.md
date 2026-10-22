@@ -1,9 +1,10 @@
 # Fedora and EPEL (Copr)
 
 Fedora and Enterprise Linux (RHEL, Rocky Linux, AlmaLinux, CentOS Stream) use
-RPM packages. Bitty distributes official RPMs through Fedora Copr at:
+RPM packages. When Copr publishing is enabled during release, Bitty distributes
+official RPMs through Fedora Copr at:
 
-```
+```text
 https://copr.fedorainfracloud.org/coprs/xuepoo/bitty-terminal/
 ```
 

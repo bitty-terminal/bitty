@@ -45,10 +45,18 @@ assert_grep "run\.bitty\.Bitty\.metainfo\.xml %\{buildroot\}%\{_datadir\}/metain
 assert_grep "tic -x -o %\{buildroot\}%\{_datadir\}/terminfo" "install must compile terminfo entry"
 
 # Assert files manifest
-assert_grep "%\{_bindir\}/bitty" "%files must contain %{_bindir}/bitty"
-assert_grep "%\{_datadir\}/applications/run\.bitty\.Bitty\.desktop" "%files must contain desktop file"
-assert_grep "%\{_datadir\}/metainfo/run\.bitty\.Bitty\.metainfo\.xml" "%files must contain metainfo file"
-assert_grep "%\{_datadir\}/icons/hicolor/\*/apps/bitty\.\*" "%files must contain icons"
-assert_grep "%\{_datadir\}/terminfo/b/bitty" "%files must contain compiled terminfo"
+FILES_SECTION="$(awk '/^%files/,/^%changelog/' "$SPEC_PATH")"
+assert_files() {
+  local pattern="$1" why="$2"
+  grep -Eq "$pattern" <<<"$FILES_SECTION" || fail "$why"
+}
+
+assert_files "%license %\{_datadir\}/licenses/%\{name\}/LICENSE" "%files must contain %license path"
+assert_files "%doc %\{_docdir\}/%\{name\}/README\.md" "%files must contain %doc README path"
+assert_files "%\{_bindir\}/bitty" "%files must contain %{_bindir}/bitty"
+assert_files "%\{_datadir\}/applications/run\.bitty\.Bitty\.desktop" "%files must contain desktop file"
+assert_files "%\{_datadir\}/metainfo/run\.bitty\.Bitty\.metainfo\.xml" "%files must contain metainfo file"
+assert_files "%\{_datadir\}/icons/hicolor/\*/apps/bitty\.\*" "%files must contain icons"
+assert_files "%\{_datadir\}/terminfo/b/bitty" "%files must contain compiled terminfo"
 
 echo "check-spec: PASS"

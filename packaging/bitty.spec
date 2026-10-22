@@ -63,8 +63,8 @@ install -m 0644 share/icons/hicolor/scalable/apps/bitty.svg \
 tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 
 %files
-%license LICENSE
-%doc README.md CHANGELOG.md
+%license %{_datadir}/licenses/%{name}/LICENSE
+%doc %{_docdir}/%{name}/README.md %{_docdir}/%{name}/CHANGELOG.md
 %{_bindir}/bitty
 %{_datadir}/applications/run.bitty.Bitty.desktop
 %{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml

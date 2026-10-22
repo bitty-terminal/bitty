@@ -1672,6 +1672,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && vars.COPR_PUBLISH != 'false'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download Linux x86_64 artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1689,8 +1691,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${COPR_CONFIG:-}" ]; then
-            echo "COPR_CONFIG not set, skipping Copr publish"
-            exit 0
+            echo "::error::Copr publishing is enabled but COPR_CONFIG is not set" >&2
+            exit 1
           fi
 
           sudo apt-get update -qq
@@ -1708,22 +1710,43 @@ jobs:
           CHROOTS_X64="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-x86_64:/{print $1}' | tr -d ':')"
           CHROOTS_ARM="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-aarch64:/{print $1}' | tr -d ':')"
 
-          if [ -n "$CHROOTS_X64" ] && [ -n "$RPM_X64" ] && [ -f "$RPM_X64" ]; then
+          if [ -z "$CHROOTS_X64" ] && [ -z "$CHROOTS_ARM" ]; then
+            echo "::error::No enabled chroots found for project ${COPR_PROJECT}" >&2
+            exit 1
+          fi
+
+          UPLOADED=0
+          if [ -n "$CHROOTS_X64" ]; then
+            if [ -z "$RPM_X64" ] || [ ! -f "$RPM_X64" ]; then
+              echo "::error::Missing x86_64 RPM artifact for Copr publication" >&2
+              exit 1
+            fi
             ARGS_X64=()
             for chroot in $CHROOTS_X64; do
               ARGS_X64+=(-r "$chroot")
             done
             echo "Uploading $RPM_X64 to x86_64 chroots: $CHROOTS_X64"
             copr-cli uploadrpm "${ARGS_X64[@]}" "$COPR_PROJECT" "$RPM_X64"
+            UPLOADED=$((UPLOADED + 1))
           fi
 
-          if [ -n "$CHROOTS_ARM" ] && [ -n "$RPM_ARM" ] && [ -f "$RPM_ARM" ]; then
+          if [ -n "$CHROOTS_ARM" ]; then
+            if [ -z "$RPM_ARM" ] || [ ! -f "$RPM_ARM" ]; then
+              echo "::error::Missing aarch64 RPM artifact for Copr publication" >&2
+              exit 1
+            fi
             ARGS_ARM=()
             for chroot in $CHROOTS_ARM; do
               ARGS_ARM+=(-r "$chroot")
             done
             echo "Uploading $RPM_ARM to aarch64 chroots: $CHROOTS_ARM"
             copr-cli uploadrpm "${ARGS_ARM[@]}" "$COPR_PROJECT" "$RPM_ARM"
+            UPLOADED=$((UPLOADED + 1))
+          fi
+
+          if [ "$UPLOADED" -eq 0 ]; then
+            echo "::error::No packages published to Copr" >&2
+            exit 1
           fi
 
   # CTX-1413 (#1847): the immutable mirror is the preferred download source

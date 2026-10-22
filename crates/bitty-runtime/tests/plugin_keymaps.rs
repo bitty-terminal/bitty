@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use bitty_config::{Chord, ChromeAction, ResolvedKeymap};
 use bitty_lua::keymaps::{KEYMAP_LIST_MAX_ROWS, KEYMAP_LIST_MAX_TOTAL};
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, KeymapSource, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
@@ -195,6 +195,13 @@ fn default_table() -> Vec<ResolvedKeymap> {
 }
 
 fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedKeymaps>) {
+    probe_runtime_with_budget(capabilities, None)
+}
+
+fn probe_runtime_with_budget(
+    capabilities: &[&str],
+    wall_budget_ms: Option<u64>,
+) -> (PluginRuntime, Rc<FixedKeymaps>) {
     let root = temp_dir("probe");
     write_plugin(
         &root,
@@ -206,6 +213,9 @@ fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedKeymaps>) {
     let source = Rc::new(FixedKeymaps::default());
     *source.0.borrow_mut() = default_table();
     let mut rt = runtime(root, Some(source.clone()));
+    // The budget is read while building the VM during activation; setting it
+    // afterwards is a no-op for an already-activated plugin (bitty#2463).
+    rt.set_vm_wall_budget_ms(wall_budget_ms);
     activate_all(&mut rt);
     (rt, source)
 }
@@ -321,7 +331,14 @@ fn inspect_never_implies_the_keymap_read() {
 
 #[test]
 fn addressable_rows_are_capped_at_the_registry_bound() {
-    let (mut rt, source) = probe_runtime(&["runtime.keymaps.read"]);
+    // This is a payload-bound check, not a budget check: a loaded runner can
+    // otherwise park the invocation at the 50 ms RC-1 wall slice before the
+    // capped page is encoded (bitty#2463). Set before activation, scoped to
+    // this test so the sibling per-generation budget probe keeps production.
+    let (mut rt, source) = probe_runtime_with_budget(
+        &["runtime.keymaps.read"],
+        Some(100 * RC1_WALL_CLOCK_BUDGET_MS),
+    );
     // Past the 1024 addressable cap: the tail is not reachable and
     // `truncated` reports it.
     *source.0.borrow_mut() = (0..KEYMAP_LIST_MAX_TOTAL + 76)

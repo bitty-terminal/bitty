@@ -786,8 +786,8 @@ Extensions are published on their own release track. A Core release tag (for
 example `v0.0.25`) does not imply a `0.0.25` extension payload: only versions
 listed in `catalog.v1` exist, and `latest` selects the highest strict version
 for the host target from that list. Never infer extension availability from
-the Core version; use `cd extensions/<name>/<version>/SHA256SUMS` or the
-catalog.
+the Core version; use the catalog or the release's
+`extensions/<name>/<version>/SHA256SUMS` object.
 
 #### Trust
 

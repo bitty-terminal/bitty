@@ -2038,26 +2038,19 @@ impl Runtime {
             }
         }
         if current_alt_screens != self.kitty_alt_screens_latched {
-            // Delete-wins sequencing (CTX-1110 fix pass, CodeRabbit Major):
-            // bump once when an origin newly enters the alternate screen so
-            // a transmit pending across the enter cycle drops as stale.
-            // Placements are retained across the alt session (#2132):
-            // terminal truth scopes its alt switch to the alt screen, so
-            // main-screen placements (and the decoded images behind them,
-            // which stay inert under the store caps) survive underneath;
-            // the paint path below skips blits while alt is active, and
-            // every display seam suppresses new placements on alt
-            // (`SuppressedAlternateScreen`), so leaving alt repaints the
-            // retained mains with nothing stale to clear. Never bump on
-            // every presented frame: while alt stays active each tick would
-            // advance the epoch past an in-flight transmit's stamp and drop
-            // every alt-screen local transmit silently.
-            let entering: Vec<Option<u64>> = current_alt_screens
-                .difference(&self.kitty_alt_screens_latched)
+            // #2442: kitty keeps separate image planes per screen. Every
+            // transition swaps the origin's live rich layer (main entries
+            // are detached on entry and restored on leave); the sync also
+            // bumps the delete epoch so local mediums queued for the hidden
+            // plane cannot paint across the switch. Idempotent: the PTY
+            // mode-switch hook normally performs the swap first, and this
+            // latch then observes no change.
+            let changed: Vec<Option<u64>> = current_alt_screens
+                .symmetric_difference(&self.kitty_alt_screens_latched)
                 .copied()
                 .collect();
-            for origin in entering {
-                self.bump_kitty_local_delete_epoch(origin);
+            for origin in changed {
+                self.sync_kitty_screen_for(origin);
             }
             self.kitty_alt_screens_latched = current_alt_screens.clone();
             pending_full = true;
@@ -2673,7 +2666,7 @@ impl Runtime {
                     .unwrap_or(snapshot);
                 // Determine viewport snapshot: when view scroll_offset !=0,
                 // visible_cells composites scrollback.
-                let view_snapshot = if let Some(v) = view {
+                let mut view_snapshot = if let Some(v) = view {
                     // #1338 fail-closed: the alternate screen owns no
                     // scrollback view — a stale offset (scrolled on primary,
                     // then entered alt) must not composite primary history
@@ -2703,6 +2696,21 @@ impl Runtime {
                 } else {
                     viewport_snapshot(base_snap, frame.cols, frame.rows)
                 };
+
+                // Kitty Unicode placeholders are image anchors, not text:
+                // the glyph is a private-use scalar with no printable
+                // form, and painting a fallback box would leave a solid
+                // band wherever an image is pending or its prototype was
+                // dropped (issue #2453). Blank the cell for the glyph pass;
+                // the real image is blitted on top by
+                // `paint_kitty_unicode_runs`, and the terminal-truth cell
+                // keeps the placeholder for reflow/deletion.
+                for cell in &mut view_snapshot.cells {
+                    if bitty_term_state::is_kitty_placeholder(cell.glyph) {
+                        cell.glyph = ' ';
+                        cell.zerowidth = bitty_term_state::Zerowidth::new();
+                    }
+                }
 
                 // A re-rendered leaf is redrawn in full, except for the
                 // CTX-1207 scroll fast path: a single scroll-region motion
@@ -4333,7 +4341,10 @@ impl Runtime {
     /// rasterizing and clipped to each pane's content rectangle. Placements are
     /// skipped while a view inspects scrollback. Unfocused panes retain and
     /// display their own Kitty images without disappearing on focus switch.
-    /// Alternate-screen entry clears only the entering origin (`clear_origin`).
+    /// Each origin paints the live plane its grid shows (main or alt,
+    /// swapped by [`Self::sync_kitty_screen_for`]); real images behind
+    /// `U+10EEEE` placeholder runs paint through
+    /// [`Self::paint_kitty_unicode_runs`] (#2442).
     ///
     /// #1849 S7: blits composite above cells, text, and overlay fills, but
     /// below the focused cursor — [`Self::paint_cursor_on_top`] runs after
@@ -4367,7 +4378,8 @@ impl Runtime {
     /// Pause policy (CTX-1090 hidden-pane/scrolled-off question, decided):
     /// an origin advances only while it owns a visible non-alt leaf this
     /// frame. Hidden panes (no allocation), alternate-screen origins, and
-    /// session-less leaves pause — nothing paints for them, so advancing
+    /// session-less leaves pause — alt playback remains a follow-up slice;
+    /// the live alt image plane still paints static frames — so advancing
     /// would only burn raster work and desync the resume point. Scrolled-off
     /// placements keep time (they advance with their origin): only
     /// descriptor math runs for unpainted placements (no raster, no blits),
@@ -4548,7 +4560,7 @@ impl Runtime {
                 continue;
             };
 
-            let (alt_active, cursor_row, rows, scrollback_len) = match pane_origin {
+            let (_alt_active, cursor_row, rows, scrollback_len) = match pane_origin {
                 Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
                     Some(sess) => (
                         sess.state.alt_screen_active(),
@@ -4571,27 +4583,16 @@ impl Runtime {
                 ),
             };
 
-            if alt_active {
-                // #2132: while alt is active this origin paints no image
-                // blits (the fullscreen app owns the pixels), but its
-                // placements are retained: terminal truth scopes the alt
-                // switch to the alt screen, so main-screen placements stay
-                // valid underneath and repaint on leave. New placements
-                // cannot appear here: every display seam suppresses on alt
-                // (`SuppressedAlternateScreen`), and in-flight async
-                // transmits carry a pre-entry epoch stamp that the
-                // entry bump in `collect_tick_basis` already invalidated.
-                continue;
-            }
-
-            if self.kitty_images.placement_for_origin_is_empty(pane_origin) {
-                continue;
-            }
-
             let scroll_offset = view_map
                 .get(&frame.view)
                 .map(|v| v.scroll_offset())
                 .unwrap_or(0);
+
+            if self.kitty_images.placement_for_origin_is_empty(pane_origin)
+                && self.kitty_images.virtual_count_for_origin(pane_origin) == 0
+            {
+                continue;
+            }
 
             let scrollback = (scrollback_len.saturating_sub(scroll_offset))
                 + cursor_follow_window_start(cursor_row, rows, usize::from(frame.rows));
@@ -4606,6 +4607,23 @@ impl Runtime {
                 .filter(|(index, _)| *index > leaf_index)
                 .map(|(_, rect)| *rect)
                 .collect();
+
+            // Real images on top of `U+10EEEE` placeholder runs (kitty
+            // `U=1`): virtual prototypes are never blit placements
+            // themselves, so an origin holding only prototypes must still
+            // reach this paint step (yazi's preview path is exactly that
+            // shape).
+            self.paint_kitty_unicode_runs(
+                pane_origin,
+                frame,
+                rich_metrics,
+                basis.pad_px,
+                scroll_offset,
+                &higher_floats,
+                &mut blits_this_frame,
+                &mut bytes_this_frame,
+                layers,
+            );
 
             for placement in self.kitty_images.placements_in_paint_order_for(pane_origin) {
                 // Dangling placements (image evicted under the store caps)
@@ -4623,23 +4641,30 @@ impl Runtime {
                 else {
                     continue;
                 };
-                // Full (unclamped) extent for true-scale sampling plus the
-                // viewport-clipped window to emit. `None` paints nothing
-                // (scrolled fully off the top or outside the viewport).
-                let Some(full_px) = bitty_rich::KittyImageLayer::placement_full_rect(
+                // Full (unclamped) cell rectangle for the placement, then
+                // the image fitted into it with its aspect ratio preserved
+                // and centered (kitty letterboxes a client-requested
+                // `c`/`r` rect instead of stretching it:
+                // docs/graphics-protocol.rst "Controlling displayed image
+                // layout"). The viewport-clipped window is the visible
+                // crop; `None` paints nothing (scrolled fully off the top
+                // or outside the viewport).
+                let Some(cell_rect) = bitty_rich::KittyImageLayer::placement_full_rect(
                     placement,
                     rich_metrics,
                     scrollback,
                 ) else {
                     continue;
                 };
-                let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
-                    placement,
-                    rich_metrics,
-                    frame.cols,
-                    frame.rows,
-                    scrollback,
-                ) else {
+                let full_px = bitty_rich::fit_aspect_rect(cell_rect, frame_width, frame_height);
+                let viewport =
+                    rich_metrics.extent_for(usize::from(frame.cols), usize::from(frame.rows));
+                let Some(rect_px) = full_px.intersection(&bitty_rich::RectPx::new(
+                    0,
+                    0,
+                    viewport.width,
+                    viewport.height,
+                )) else {
                     continue;
                 };
                 let need = (u64::from(rect_px.width) * u64::from(rect_px.height))
@@ -4725,6 +4750,190 @@ impl Runtime {
         }
         if !layers.combined_images.is_empty() {
             layers.any_needs_draw = true;
+        }
+    }
+
+    /// Paints the real image behind every `U+10EEEE` run of one leaf
+    /// (kitty Unicode placeholders, `U=1`).
+    ///
+    /// A virtual placement is only a prototype (it has no screen position
+    /// and never paints by itself); the visible image is the text run of
+    /// placeholder cells, resolved here into cell tiles. The run's
+    /// `(row, col)` diacritics name the tile inside the prototype's
+    /// `c × r` span; the span is fitted with its aspect ratio preserved
+    /// (letterboxed) exactly like a direct placement, and the run's cells
+    /// become the destination rect of a crop of that fitted image.
+    ///
+    /// Rows resolve in grid space and are translated to viewport space by
+    /// the same cursor-follow window as [`viewport_snapshot`]. Scrolled
+    /// views paint nothing here: placeholder runs decode from the active
+    /// grid only, so a scrollback composition has no run cells to anchor
+    /// them. Alternate-screen origins keep the existing suppression (the
+    /// fullscreen app owns the pixels; virtual prototypes stay inert and
+    /// repaint when the origin returns).
+    ///
+    /// Same bounded budget as direct placements: each run is one blit
+    /// (32 per frame / 64 MiB) and is skipped fail-closed past the caps.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_kitty_unicode_runs(
+        &mut self,
+        origin: Option<u64>,
+        frame: &layout_focus::PresentFrame,
+        metrics: bitty_rich::CellMetrics,
+        pad_px: i32,
+        scroll_offset: usize,
+        higher_floats: &[bitty_render::geometry::RectPx],
+        blits_this_frame: &mut usize,
+        bytes_this_frame: &mut usize,
+        layers: &mut FrameLayers,
+    ) {
+        if self.kitty_images.virtual_count_for_origin(origin) == 0
+            || scroll_offset != 0
+            || frame.rows == 0
+            || frame.cols == 0
+        {
+            return;
+        }
+        let (grid_rows, cursor_row) = match origin {
+            Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                Some(sess) => (
+                    sess.state.height(),
+                    usize::from(sess.state.cursor().position.row),
+                ),
+                None => return,
+            },
+            None => (
+                self.state.height(),
+                usize::from(self.state.cursor().position.row),
+            ),
+        };
+        let window_start =
+            cursor_follow_window_start(cursor_row, grid_rows, usize::from(frame.rows));
+        // Pane content viewport in content space (the blit destination
+        // later adds the leaf origin + window padding).
+        let viewport = bitty_rich::geometry::RectPx::new(
+            0,
+            0,
+            metrics.width.saturating_mul(u32::from(frame.cols)),
+            metrics.height.saturating_mul(u32::from(frame.rows)),
+        );
+        for local_row in 0..usize::from(frame.rows) {
+            let grid_row = window_start.saturating_add(local_row);
+            let runs = match origin {
+                Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                    Some(sess) => sess.state.kitty_unicode_runs_on_row(grid_row),
+                    None => return,
+                },
+                None => self.state.kitty_unicode_runs_on_row(grid_row),
+            };
+            for (cells, key) in runs {
+                let Some(first) = cells.first().copied() else {
+                    continue;
+                };
+                let Some(proto) = self.kitty_images.get_virtual(origin, key.0, key.1) else {
+                    continue;
+                };
+                let Some(image) = proto.image else {
+                    continue;
+                };
+                let Some(stored) = self.kitty_images.get(image) else {
+                    continue;
+                };
+                let run = bitty_term_state::KittyUnicodeRun {
+                    image_id: key.0,
+                    placement_id: key.1,
+                    row: first.id.row,
+                    col: first.id.col,
+                    grid_row: first.grid_row,
+                    grid_col: first.grid_col,
+                    width: cells.len(),
+                };
+                // Live-grid rows are already scrolled truth, so the
+                // scrollback delta is the viewport window start only.
+                let Some(tile) = bitty_rich::unicode_run_rect(
+                    &run,
+                    &cells,
+                    &proto.as_unicode_virtual(),
+                    metrics,
+                    window_start,
+                    0,
+                ) else {
+                    continue;
+                };
+                let Some(visible) = tile.rect.intersection(&tile.full) else {
+                    continue;
+                };
+                let Some(visible) = visible.intersection(&viewport) else {
+                    continue;
+                };
+                let frame_no = self.kitty_current_frame_for(origin, proto.wire_image);
+                let Some((frame_width, frame_height, frame_bytes)) =
+                    self.kitty_images.frame_bytes(image, frame_no)
+                else {
+                    continue;
+                };
+                let need = (u64::from(visible.width) * u64::from(visible.height))
+                    .checked_mul(4)
+                    .filter(|&n| n <= usize::MAX as u64)
+                    .map(|n| n as usize);
+                let Some(need) = need else {
+                    continue;
+                };
+                if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+                    continue;
+                }
+                if bytes_this_frame.saturating_add(need)
+                    > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+                {
+                    continue;
+                }
+                let cache_key =
+                    bitty_rich::KittyRasterKey::for_image(stored, frame_no, tile.full, visible);
+                let rgba = if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
+                    hit
+                } else {
+                    let Some(fresh) = self.kitty_graphics.rasterize_frame(
+                        frame_width,
+                        frame_height,
+                        frame_bytes,
+                        tile.full,
+                        visible,
+                    ) else {
+                        continue;
+                    };
+                    let _ = self.kitty_raster_cache.insert(cache_key, fresh.clone());
+                    fresh
+                };
+                let dest = bitty_render::geometry::RectPx::new(
+                    px_add(px_add(pad_px, frame.content.x), visible.x),
+                    px_add(px_add(pad_px, frame.content.y), visible.y),
+                    visible.width,
+                    visible.height,
+                );
+                let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
+                    continue;
+                };
+                let pieces = if higher_floats.is_empty() {
+                    vec![blit]
+                } else {
+                    clip_blit_around_floats(blit, higher_floats)
+                };
+                for piece in pieces {
+                    if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+                        continue;
+                    }
+                    let piece_need = piece.rgba.len();
+                    if bytes_this_frame.saturating_add(piece_need)
+                        > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+                    {
+                        continue;
+                    }
+                    *blits_this_frame = blits_this_frame.saturating_add(1);
+                    *bytes_this_frame = bytes_this_frame.saturating_add(piece_need);
+                    layers.combined_images.push(piece);
+                    layers.any_needs_draw = true;
+                }
+            }
         }
     }
 

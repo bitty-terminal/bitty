@@ -47,12 +47,12 @@ pub(crate) struct Child {
     inner: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
-fn to_size(cols: u16, rows: u16) -> PtySize {
+fn to_size(cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> PtySize {
     PtySize {
         rows,
         cols,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width,
+        pixel_height,
     }
 }
 
@@ -120,7 +120,12 @@ fn open_pty_and_spawn_once(
     config: &SpawnConfig,
 ) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), (PtyError, bool)> {
     let pair = native_pty_system()
-        .openpty(to_size(config.cols, config.rows))
+        .openpty(to_size(
+            config.cols,
+            config.rows,
+            config.pixel_width,
+            config.pixel_height,
+        ))
         .map_err(|err| (PtyError::flatten_upstream(err), false))?;
 
     let mut argv: Vec<OsString> = Vec::with_capacity(config.args.len() + 1);
@@ -197,10 +202,16 @@ fn open_pty_and_spawn_once(
     ))
 }
 
-pub(crate) fn resize(master: &Master, cols: u16, rows: u16) -> Result<(), PtyError> {
+pub(crate) fn resize(
+    master: &Master,
+    cols: u16,
+    rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+) -> Result<(), PtyError> {
     master
         .inner
-        .resize(to_size(cols, rows))
+        .resize(to_size(cols, rows, pixel_width, pixel_height))
         .map_err(PtyError::flatten_upstream)
 }
 
@@ -210,6 +221,19 @@ pub(crate) fn size(master: &Master) -> Result<(u16, u16), PtyError> {
         .get_size()
         .map_err(PtyError::flatten_upstream)?;
     Ok((measured.cols, measured.rows))
+}
+
+pub(crate) fn size_pixels(master: &Master) -> Result<(u16, u16, u16, u16), PtyError> {
+    let measured = master
+        .inner
+        .get_size()
+        .map_err(PtyError::flatten_upstream)?;
+    Ok((
+        measured.cols,
+        measured.rows,
+        measured.pixel_width,
+        measured.pixel_height,
+    ))
 }
 
 pub(crate) fn tty_name(master: &Master) -> Option<PathBuf> {

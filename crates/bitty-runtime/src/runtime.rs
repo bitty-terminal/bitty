@@ -437,6 +437,22 @@ pub struct TargetAnchorSummary {
     pub rect: Option<(u16, u16, u16, u16)>,
 }
 
+/// One origin's dormant main-screen image layer while its alternate
+/// screen is active (#2442).
+///
+/// Kitty keeps separate image planes per screen: entering the alternate
+/// screen starts with an empty alt plane, and leaving it drops alt images
+/// and restores the main plane. The rich registry holds one live layer,
+/// so the main entries are detached here at the transition and re-attached
+/// on leave. Images (and their wire-id mappings) stay in the shared store
+/// under the normal caps; only the tiny placement/prototype descriptors
+/// move.
+#[derive(Default)]
+struct KittyAltStash {
+    placements: Vec<bitty_rich::KittyPlacement>,
+    virtuals: Vec<bitty_rich::KittyVirtualPrototype>,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -1338,6 +1354,14 @@ pub struct Runtime {
     /// the grid generation is unchanged, so entering alt clears painted images
     /// (and leaving alt repaints the restored grid) instead of idling on a stale frame.
     kitty_alt_screens_latched: std::collections::BTreeSet<Option<u64>>,
+    /// Origins whose alternate-screen image plane is currently live, plus
+    /// the detached main-screen descriptors (#2442). Kept in lockstep with
+    /// each origin's terminal-truth `alt_screen_active()` by
+    /// [`Runtime::sync_kitty_screen`].
+    kitty_alt_layers: std::collections::BTreeSet<Option<u64>>,
+    /// Dormant main-screen descriptors per origin while its alt plane is
+    /// live (see [`KittyAltStash`]).
+    kitty_alt_stash: std::collections::BTreeMap<Option<u64>, KittyAltStash>,
     /// Last wall clock the Kitty animation tick ran at (S1, #1849).
     ///
     /// `None` until the first present: the first tick stamps without
@@ -1920,6 +1944,8 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
+            kitty_alt_layers: std::collections::BTreeSet::new(),
+            kitty_alt_stash: std::collections::BTreeMap::new(),
             kitty_anim_last_tick: None,
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),
@@ -2201,6 +2227,8 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screens_latched: std::collections::BTreeSet::new(),
+            kitty_alt_layers: std::collections::BTreeSet::new(),
+            kitty_alt_stash: std::collections::BTreeMap::new(),
             kitty_anim_last_tick: None,
             backgrounds: bitty_rich::BackgroundStore::deny_all(),
             background_keys: std::collections::HashMap::new(),

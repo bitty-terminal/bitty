@@ -65,8 +65,10 @@ pub(crate) struct Master {
     inner: ConPtyMaster,
     /// Console size cache: the kernel offers no getter and resizes are
     /// synchronous, so this never drifts. `Cell` keeps the shared `resize`
-    /// plumbing (`&Master`) intact.
-    size: Cell<(u16, u16)>,
+    /// plumbing (`&Master`) intact. Pixel fields are retained for
+    /// introspection even though ConPTY exposes no `TIOCGWINSZ` to the
+    /// child.
+    size: Cell<(u16, u16, u16, u16)>,
     writer_taken: bool,
 }
 
@@ -106,7 +108,12 @@ pub(crate) fn open_pty_and_spawn(
     Ok((
         Master {
             inner: master,
-            size: Cell::new((config.cols, config.rows)),
+            size: Cell::new((
+                config.cols,
+                config.rows,
+                config.pixel_width,
+                config.pixel_height,
+            )),
             writer_taken: false,
         },
         Child { inner: child },
@@ -179,13 +186,24 @@ fn keys_equal(left: &OsStr, right: &OsStr) -> bool {
     left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
 }
 
-pub(crate) fn resize(master: &Master, cols: u16, rows: u16) -> Result<(), PtyError> {
+pub(crate) fn resize(
+    master: &Master,
+    cols: u16,
+    rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+) -> Result<(), PtyError> {
     master.inner.resize(cols, rows).map_err(PtyError::Io)?;
-    master.size.set((cols, rows));
+    master.size.set((cols, rows, pixel_width, pixel_height));
     Ok(())
 }
 
 pub(crate) fn size(master: &Master) -> Result<(u16, u16), PtyError> {
+    let (cols, rows, _, _) = master.size.get();
+    Ok((cols, rows))
+}
+
+pub(crate) fn size_pixels(master: &Master) -> Result<(u16, u16, u16, u16), PtyError> {
     Ok(master.size.get())
 }
 

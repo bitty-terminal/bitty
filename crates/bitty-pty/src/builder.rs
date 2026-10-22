@@ -276,6 +276,13 @@ pub(crate) struct SpawnConfig {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
+    /// Pixel width reported by `TIOCGWINSZ` (`ws_xpixel`). `0` means the
+    /// caller has no pixel geometry; programs that probe it (kitty's
+    /// `icat`, several image viewers) then treat the terminal as unable to
+    /// report pixel sizes.
+    pub(crate) pixel_width: u16,
+    /// Pixel height reported by `TIOCGWINSZ` (`ws_ypixel`).
+    pub(crate) pixel_height: u16,
 }
 
 /// Builder for spawning a child process inside a new pseudo terminal.
@@ -292,6 +299,8 @@ pub struct PtyBuilder {
     cwd: Option<PathBuf>,
     cols: u16,
     rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
 }
 
 impl PtyBuilder {
@@ -332,6 +341,8 @@ impl PtyBuilder {
             cwd: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            pixel_width: 0,
+            pixel_height: 0,
         }
     }
 
@@ -396,6 +407,18 @@ impl PtyBuilder {
     pub fn size(mut self, cols: u16, rows: u16) -> Self {
         self.cols = cols;
         self.rows = rows;
+        self
+    }
+
+    /// Sets the initial pixel geometry reported by `TIOCGWINSZ`.
+    ///
+    /// `0` keeps the kernel default (no pixel reporting). Image-aware
+    /// children (`kitty +kitten icat`, yazi/ratatui-image sizing) probe
+    /// this instead of XTWINOPS and fail closed to "no pixel support" when
+    /// either axis is zero.
+    pub fn pixel_size(mut self, pixel_width: u16, pixel_height: u16) -> Self {
+        self.pixel_width = pixel_width;
+        self.pixel_height = pixel_height;
         self
     }
 
@@ -517,6 +540,8 @@ impl PtyBuilder {
             cwd: self.cwd,
             cols: self.cols,
             rows: self.rows,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
         })
     }
 }

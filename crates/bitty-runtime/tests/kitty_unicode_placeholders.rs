@@ -278,7 +278,14 @@ fn virtual_combined_transmit_registers_without_blits_or_cursor_move() {
     let rects = rt.kitty_unicode_run_rects_on_row(0, metrics_9x19());
     assert_eq!(rects.len(), 1);
     let _ = rt.tick();
-    assert_eq!(rt.kitty_last_frame_images(), 0, "zero blits");
+    // The transmit itself placed no blit (asserted above); the printed run
+    // now paints the real image tile: that is the U=1 contract, not a
+    // second placement.
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "placeholder run paints one real image blit"
+    );
     assert!(rt.state().check_invariants().is_ok());
 }
 
@@ -373,10 +380,11 @@ fn virtual_over_cap_evicts_oldest_within_origin() {
 }
 
 #[test]
-fn virtual_alt_screen_suppresses_registration() {
-    // Alternate screen: bodiless `a=p,U=1` registers nothing rich-side,
-    // and combined `a=T,U=1` stores without registering (existing
-    // suppression posture). Back on main, registration works.
+fn virtual_alt_screen_registers_on_the_alt_plane() {
+    // Alternate screen (#2442): bodiless `a=p,U=1` still needs an explicit
+    // span and is refused there, while combined `a=T,U=1` registers on the
+    // origin's alt image plane (yazi's preview shape). Leaving alt drops
+    // the alt prototype and main registration works again.
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"\x1b[?1049h");
     assert!(rt.state().alt_screen_active());
@@ -388,10 +396,15 @@ fn virtual_alt_screen_suppresses_registration() {
     );
     rt.handle_pty_bytes(seq.as_bytes());
     assert_eq!(rt.kitty_image_count(), 1, "alt stores payload");
-    assert_eq!(rt.kitty_virtual_count(), 0, "alt registers nothing");
+    assert_eq!(rt.kitty_virtual_count(), 1, "alt registers its own plane");
     assert_eq!(rt.kitty_placement_count(), 0);
     rt.handle_pty_bytes(b"\x1b[?1049l");
     assert!(!rt.state().alt_screen_active());
+    assert_eq!(
+        rt.kitty_virtual_count(),
+        0,
+        "alt prototype dies with the alt plane"
+    );
     rt.handle_pty_bytes(b"\x1b_Ga=p,U=1,i=42,c=4,r=2\x1b\\");
     assert_eq!(rt.kitty_virtual_count(), 1);
     assert!(rt.state().check_invariants().is_ok());

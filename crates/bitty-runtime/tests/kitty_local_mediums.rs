@@ -169,9 +169,11 @@ fn alt_screen_local_transmit_stores_despite_ticks() {
     );
     assert_eq!(
         rt.kitty_placement_count(),
-        0,
-        "alt-screen display stays suppressed (stored, not placed)"
+        1,
+        "alt-screen display lands on the alt image plane"
     );
+    assert!(rt.tick().is_some(), "alt preview presents");
+    assert_eq!(rt.kitty_last_frame_images(), 1, "alt image paints");
     // `t=f` never deletes: the fixture stays for its owner.
     assert!(file.is_file(), "t=f must not delete the source file");
 

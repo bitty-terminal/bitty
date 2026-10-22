@@ -111,6 +111,32 @@ fn spawn_gated(
     panic!("gated child never produced the marker after a fresh respawn: {diagnosis}");
 }
 
+/// `TIOCGWINSZ` pixel geometry is what `kitty +kitten icat` reads
+/// (`tools/tty.GetSize`); zero on either axis makes it report "Terminal
+/// does not support reporting screen sizes in pixels" (#2442). The spawn
+/// size and every resize must carry the pixel axes.
+#[test]
+fn pty_reports_pixel_geometry_through_winsize() {
+    let pty = PtyBuilder::new("/bin/cat")
+        .size(80, 24)
+        .pixel_size(720, 456)
+        .spawn()
+        .expect("spawn /bin/cat");
+    assert_eq!(
+        pty.size_pixels().expect("initial pixel size"),
+        (80, 24, 720, 456)
+    );
+    pty.resize_pixels(120, 40, 1080, 760)
+        .expect("resize with pixels");
+    assert_eq!(
+        pty.size_pixels().expect("resized pixel size"),
+        (120, 40, 1080, 760)
+    );
+    // The legacy `resize` keeps the cell size and reports no pixels.
+    pty.resize(10, 5).expect("resize without pixels");
+    assert_eq!(pty.size_pixels().expect("shrunk pixel size"), (10, 5, 0, 0));
+}
+
 #[test]
 fn cat_echo_resize_and_graceful_shutdown() {
     let mut pty = PtyBuilder::new("/bin/cat")

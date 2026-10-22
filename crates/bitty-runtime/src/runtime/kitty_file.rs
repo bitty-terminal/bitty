@@ -1406,6 +1406,11 @@ impl Runtime {
                                 super::log_throttle::suppressed_suffix(suppressed)
                             );
                         }
+                        if action_a
+                            .is_none_or(|a| bitty_rich::KittyAction::from_a(Some(a)).displays())
+                        {
+                            self.discard_failed_kitty_display(*wire_image);
+                        }
                     }
                 }
                 Err(err) => {
@@ -1414,6 +1419,10 @@ impl Runtime {
                             "bitty: rejecting kitty local image ({err}): stored nothing{}",
                             super::log_throttle::suppressed_suffix(suppressed)
                         );
+                    }
+                    if action_a.is_none_or(|a| bitty_rich::KittyAction::from_a(Some(a)).displays())
+                    {
+                        self.discard_failed_kitty_display(*wire_image);
                     }
                 }
             },
@@ -1446,6 +1455,7 @@ impl Runtime {
                                 super::log_throttle::suppressed_suffix(suppressed)
                             );
                         }
+                        self.discard_failed_kitty_display(*wire_image);
                     }
                 }
                 Err(err) => {
@@ -1455,6 +1465,7 @@ impl Runtime {
                             super::log_throttle::suppressed_suffix(suppressed)
                         );
                     }
+                    self.discard_failed_kitty_display(*wire_image);
                 }
             },
             KittyLocalOp::Query {

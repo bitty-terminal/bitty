@@ -88,4 +88,33 @@ impl RectPx {
             height,
         }
     }
+
+    /// True when either span is zero (empty rectangles never intersect).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// Intersection by positive-area overlap; `None` when the rectangles
+    /// are disjoint or either is empty (`bitty-render` parity).
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        let x0 = i64::from(self.x).max(i64::from(other.x));
+        let y0 = i64::from(self.y).max(i64::from(other.y));
+        let x1 = (i64::from(self.x) + i64::from(self.width))
+            .min(i64::from(other.x) + i64::from(other.width));
+        let y1 = (i64::from(self.y) + i64::from(self.height))
+            .min(i64::from(other.y) + i64::from(other.height));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let x = i32::try_from(x0).unwrap_or(if x0 < 0 { i32::MIN } else { i32::MAX });
+        let y = i32::try_from(y0).unwrap_or(if y0 < 0 { i32::MIN } else { i32::MAX });
+        Some(Self {
+            x,
+            y,
+            width: u32::try_from(x1 - x0).unwrap_or(u32::MAX),
+            height: u32::try_from(y1 - y0).unwrap_or(u32::MAX),
+        })
+    }
 }

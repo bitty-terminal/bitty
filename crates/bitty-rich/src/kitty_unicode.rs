@@ -24,6 +24,7 @@
 //! style); no allocation occurs here (the caller owns the run slice).
 
 use crate::geometry::{CellMetrics, RectPx};
+use crate::kitty_place::fit_aspect_rect;
 use bitty_term_state::{KittyUnicodeCell, KittyUnicodeRun};
 
 /// Maximum tiles per axis a virtual placement may claim (matches the
@@ -83,8 +84,16 @@ pub struct KittyUnicodeRect {
     pub cols: usize,
     /// Covered rows (always 1: runs are single-row).
     pub rows: usize,
-    /// Pixel rectangle in content space.
+    /// Pixel rectangle in content space covered by the run's cells. This
+    /// is the *destination* rect; it may extend past the fitted image on
+    /// the span's last cell, so callers clip it against [`Self::full`].
     pub rect: RectPx,
+    /// The complete image, fitted into the virtual placement's cell span
+    /// with its aspect ratio preserved and centered (kitty letterboxes the
+    /// span; `docs/graphics-protocol.rst` "the image will eventually be
+    /// fit to the specified rectangle"). Scaled into by the raster step and
+    /// cropped to [`Self::rect`].
+    pub full: RectPx,
 }
 
 /// Resolves `run` (with its decoded `cells`) against `virtual_placement`.
@@ -127,10 +136,34 @@ pub fn unicode_run_rect(
     }
     let scrolled = scrollback_now.saturating_sub(scrollback_base);
     let row = (run.grid_row as u64).checked_sub(scrolled as u64)?;
-    let x = (run.grid_col as u64).saturating_mul(u64::from(metrics.width));
-    let y = row.saturating_mul(u64::from(metrics.height));
-    let w = (cols as u64).saturating_mul(u64::from(metrics.width));
-    let h = u64::from(metrics.height);
+    let cell_w = u64::from(metrics.width);
+    let cell_h = u64::from(metrics.height);
+    let x = (run.grid_col as u64).saturating_mul(cell_w);
+    let y = row.saturating_mul(cell_h);
+    let w = (cols as u64).saturating_mul(cell_w);
+    let h = cell_h;
+    // Span origin in content space. The span can start left of/above the
+    // grid (a scrolled-off top row) and tiles still resolve inside the
+    // span, so this is signed: `(grid_col - tile_col, row - tile_row)`.
+    let span_col = i64::try_from(run.grid_col)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::from(run.col));
+    let span_row = i64::try_from(row)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::from(run.row));
+    let cell_w_i = i64::from(metrics.width);
+    let cell_h_i = i64::from(metrics.height);
+    let span = RectPx::new(
+        saturating_i64(span_col.saturating_mul(cell_w_i)),
+        saturating_i64(span_row.saturating_mul(cell_h_i)),
+        saturating_u32(u64::from(span_cols).saturating_mul(cell_w)),
+        saturating_u32(u64::from(span_rows).saturating_mul(cell_h)),
+    );
+    let full = fit_aspect_rect(
+        span,
+        virtual_placement.image_width,
+        virtual_placement.image_height,
+    );
     Some(KittyUnicodeRect {
         grid_row: run.grid_row,
         grid_col: run.grid_col,
@@ -142,6 +175,7 @@ pub fn unicode_run_rect(
             saturating_u32(w),
             saturating_u32(h),
         ),
+        full,
     })
 }
 
@@ -154,6 +188,16 @@ fn placement_matches(run: Option<u32>, virtual_placement: Option<u32>) -> bool {
         (None, _) => true,
         (Some(a), Some(b)) => a == b,
         (Some(_), None) => false,
+    }
+}
+
+const fn saturating_i64(value: i64) -> i32 {
+    if value > i32::MAX as i64 {
+        i32::MAX
+    } else if value < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        value as i32
     }
 }
 
@@ -294,6 +338,24 @@ mod tests {
             unicode_run_rect(&run, &cells, &virtual_rect(), METRICS, 3, 0).expect("scrolled");
         assert_eq!(rect.rect.y, (5 - 3) * 16);
         assert!(unicode_run_rect(&run, &cells, &virtual_rect(), METRICS, 6, 0).is_none());
+    }
+
+    #[test]
+    fn run_exposes_the_fitted_image_rect() {
+        // Span 4x2 cells = 32x32 px; a 32x32 image fits exactly, so the
+        // full rect is the span and the run's 2-cell crop lies inside it.
+        let (run, cells) = make_run(0, 2, 0);
+        let rect = unicode_run_rect(&run, &cells, &virtual_rect(), METRICS, 0, 0).unwrap();
+        assert_eq!(rect.full, RectPx::new(0, 5 * 16, 32, 32));
+        // A tall 2x4 image in the same span pillarboxes: full height and
+        // centered horizontally (8px inset per side).
+        let tall = KittyUnicodeVirtual {
+            image_width: 2,
+            image_height: 4,
+            ..virtual_rect()
+        };
+        let rect = unicode_run_rect(&run, &cells, &tall, METRICS, 0, 0).unwrap();
+        assert_eq!(rect.full, RectPx::new(8, 5 * 16, 16, 32));
     }
 
     #[test]

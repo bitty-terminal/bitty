@@ -59,7 +59,7 @@
 //! only placements scrolled *fully* off the top paint nothing. The image therefore moves **with** terminal content. Viewport
 //! scrollback inspection (`View::scroll_offset() != 0`) is handled by the
 //! caller (skip painting: live-grid anchors do not map to the history
-//! viewport), as is alternate-screen suppression (see below).
+//! viewport), as is the per-screen plane swap (see below).
 //!
 //! Limitation: scroll regions (`DECSTBM`) and reverse-index moves that do
 //! not grow the scrollback are not tracked, so an image inside a scroll
@@ -68,10 +68,14 @@
 //!
 //! # Alternate screen
 //!
-//! [`KittyImageLayer::clear`] drops every image and placement. The caller
-//! clears when the alternate screen activates and refuses new placements
-//! while it is active (stored, not painted — same fail-closed shape as
-//! [`KittyAction::Transmit`]).
+//! Kitty keeps a separate image plane per screen. The runtime owns the
+//! swap: on alternate-screen entry it detaches this origin's main entries
+//! with [`KittyImageLayer::take_placements_for`] /
+//! [`KittyImageLayer::take_virtuals_for`], alt displays register live, and
+//! on leave it clears the alt entries and re-attaches main with
+//! [`KittyImageLayer::restore_placements`] /
+//! [`KittyImageLayer::restore_virtuals`]. Descriptors are therefore absent
+//! (not painted, not discarded) while their plane is dormant.
 //!
 //! # Origin binding + spoofing posture (CTX-0254)
 //!
@@ -1135,6 +1139,45 @@ fn cell_span(explicit: u16, pixels: u32, cell_px: u32) -> u16 {
     }
     let cells = pixels.div_ceil(cell_px).max(1);
     cells.min(u16::MAX as u32) as u16
+}
+
+/// Fits an image into `outer` preserving aspect ratio, centered on both
+/// axes (kitty `docs/graphics-protocol.rst`: "When both are specified the
+/// image is letterboxed/pillarboxed to prevent distortion").
+///
+/// The returned rectangle keeps `outer`'s origin plus the centered inset,
+/// so callers can scale the whole image into it and crop the visible
+/// window without re-scaling (the `#1334` rule). A zero image axis or an
+/// empty `outer` returns `outer` unchanged (nothing to fit).
+#[must_use]
+pub fn fit_aspect_rect(outer: RectPx, image_width: u32, image_height: u32) -> RectPx {
+    if outer.is_empty() || image_width == 0 || image_height == 0 {
+        return outer;
+    }
+    let ow = u64::from(outer.width);
+    let oh = u64::from(outer.height);
+    let iw = u64::from(image_width);
+    let ih = u64::from(image_height);
+    // Scale by width when the width constraint is tighter, else by height.
+    // Integer math only; the `min` guards the ceil-rounded span edges.
+    let (fw, fh) = if ow.saturating_mul(ih) <= oh.saturating_mul(iw) {
+        (ow, (ih.saturating_mul(ow) / iw).clamp(1, oh))
+    } else {
+        ((iw.saturating_mul(oh) / ih).clamp(1, ow), oh)
+    };
+    let inset_x = u64::from(outer.width).saturating_sub(fw) / 2;
+    let inset_y = u64::from(outer.height).saturating_sub(fh) / 2;
+    let inset_x = i64::try_from(inset_x).unwrap_or(i64::MAX);
+    let inset_y = i64::try_from(inset_y).unwrap_or(i64::MAX);
+    let x = i64::from(outer.x).saturating_add(inset_x);
+    let y = i64::from(outer.y).saturating_add(inset_y);
+    let to_i32 = |v: i64| i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX });
+    RectPx::new(
+        to_i32(x),
+        to_i32(y),
+        u32::try_from(fw).unwrap_or(u32::MAX),
+        u32::try_from(fh).unwrap_or(u32::MAX),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2294,6 +2337,56 @@ impl KittyImageLayer {
     /// Iterates placements oldest first.
     pub fn placements(&self) -> impl Iterator<Item = &KittyPlacement> {
         self.placements.iter()
+    }
+
+    /// Detaches every placement of `origin`, preserving their relative
+    /// order (the alternate-screen stash half, #2442).
+    ///
+    /// The caller owns the returned entries and may re-attach them with
+    /// [`Self::restore_placements`]; images, ids, and next-id counters are
+    /// untouched, so a later main-screen image never collides with a
+    /// stashed one. Bounded by the placement caps.
+    pub fn take_placements_for(&mut self, origin: Option<u64>) -> Vec<KittyPlacement> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.placements.len());
+        while let Some(placement) = self.placements.pop_front() {
+            if placement.origin == origin {
+                taken.push(placement);
+            } else {
+                kept.push_back(placement);
+            }
+        }
+        self.placements = kept;
+        taken
+    }
+
+    /// Re-attaches placements previously detached by
+    /// [`Self::take_placements_for`], preserving their order.
+    pub fn restore_placements(&mut self, placements: Vec<KittyPlacement>) {
+        self.placements.extend(placements);
+    }
+
+    /// Detaches every virtual prototype of `origin` (alternate-screen
+    /// stash half; placement counterpart is
+    /// [`Self::take_placements_for`]).
+    pub fn take_virtuals_for(&mut self, origin: Option<u64>) -> Vec<KittyVirtualPrototype> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.virtual_protos.len());
+        while let Some(proto) = self.virtual_protos.pop_front() {
+            if proto.origin == origin {
+                taken.push(proto);
+            } else {
+                kept.push_back(proto);
+            }
+        }
+        self.virtual_protos = kept;
+        taken
+    }
+
+    /// Re-attaches virtual prototypes previously detached by
+    /// [`Self::take_virtuals_for`], preserving their order.
+    pub fn restore_virtuals(&mut self, protos: Vec<KittyVirtualPrototype>) {
+        self.virtual_protos.extend(protos);
     }
 
     /// Placements in paint order: ascending `z`, stable for equal `z`.
@@ -3753,6 +3846,34 @@ mod tests {
             layer
                 .virtual_run_rect(None, &run, &[], METRICS, 100)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn fit_aspect_rect_letterboxes_and_centers() {
+        // Square into a 90x95 rect: full width, 90 tall, 2px top inset.
+        assert_eq!(
+            fit_aspect_rect(RectPx::new(10, 20, 90, 95), 8, 8),
+            RectPx::new(10, 22, 90, 90)
+        );
+        // 4:1 image into 100x50: full width, 25 tall, 12px top inset.
+        assert_eq!(
+            fit_aspect_rect(RectPx::new(0, 0, 100, 50), 200, 50),
+            RectPx::new(0, 12, 100, 25)
+        );
+        // Tall image into 100x50: full height, 12 wide, 44px left inset.
+        assert_eq!(
+            fit_aspect_rect(RectPx::new(0, 0, 100, 50), 50, 200),
+            RectPx::new(44, 0, 12, 50)
+        );
+        // Exact aspect is a no-op; degenerate inputs fail open to `outer`.
+        assert_eq!(
+            fit_aspect_rect(RectPx::new(5, 6, 40, 20), 4, 2),
+            RectPx::new(5, 6, 40, 20)
+        );
+        assert_eq!(
+            fit_aspect_rect(RectPx::new(5, 6, 40, 20), 0, 2),
+            RectPx::new(5, 6, 40, 20)
         );
     }
 

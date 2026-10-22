@@ -223,14 +223,16 @@ impl Runtime {
         // observations. A grid that already matches the target (for example
         // a shell spawned after the layout synced) must not hide a stale
         // PTY winsize — resync it on its own so every fullscreen/restore
-        // transition delivers SIGWINCH at the painted size.
-        let pty_stale = self
-            .pty
-            .as_ref()
-            .is_some_and(|pty| pty.size().ok() != Some((cols_u16, rows_u16)));
+        // transition delivers SIGWINCH at the painted size. The pixel axes
+        // are part of that contract (#2442): `icat` fails closed when they
+        // are zero, so a cell-size match with stale pixels still resyncs.
+        let (pixel_width, pixel_height) = self.pty_pixel_span(cols_u16, rows_u16);
+        let pty_stale = self.pty.as_ref().is_some_and(|pty| {
+            pty.size_pixels().ok() != Some((cols_u16, rows_u16, pixel_width, pixel_height))
+        });
         if pty_stale {
             if let Some(pty) = self.pty.as_mut() {
-                let _ = pty.resize(cols_u16, rows_u16);
+                let _ = pty.resize_pixels(cols_u16, rows_u16, pixel_width, pixel_height);
             }
         }
     }

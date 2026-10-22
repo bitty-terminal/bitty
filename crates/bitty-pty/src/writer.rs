@@ -21,6 +21,11 @@ const DEFAULT_VEOF: u8 = 0x04;
 /// sits above the PTY boundary), so this mirrors the cap instead of
 /// importing it. The cross-crate regression in `bitty-runtime` builds that
 /// frame with `bitty_rich::host::frame_submit` and fails if the two drift.
+///
+/// Outside tests the only reference is the `const _` invariant below; rustc
+/// before 1.88 does not count a `const _` initializer as a use, so the MSRV
+/// 1.85 leg reports it as dead code (the `-D warnings` gate then fails).
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_PRODUCER_FRAME_BYTES: usize = 64 * 1024 + 13;
 
 /// Maximum bytes buffered in one queued writer (bitty#2446).

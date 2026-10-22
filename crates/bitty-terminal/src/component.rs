@@ -1125,9 +1125,10 @@ pub fn component_help_text() -> String {
      \x20 there is no allow-all fallback and no directory-name guessing. For a\n\
      \x20 *pinned* install, a catalog *transport* failure (offline, 404, 5xx)\n\
      \x20 falls back to the single-release SHA256SUMS path with the same\n\
-     \x20 explicit consent, TOFU pin, and exact-two-member audit; a latest\n\
-     \x20 install cannot fall back (there is no version) and prints a --version\n\
-     \x20 example instead.\n\
+     \x20 explicit consent, TOFU pin, and exact-two-member audit; when that\n\
+     \x20 exact version is already installed and verifies locally, it is\n\
+     \x20 reused with no download. A latest install cannot fall back (there is\n\
+     \x20 no version) and prints a --version example instead.\n\
      \n\
      TOFU pinning:\n\
      \x20 First install of an extension records (pins) the verified CDN\n\

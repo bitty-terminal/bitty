@@ -63,7 +63,7 @@ assert_grep "https://cdn\.bitty\.run/releases/v\\\$\{pkgver\}/\\\$\{_bitty_asset
   "binary source URL must use the R2/CDN release path"
 assert_grep "https://github\.com/bitty-terminal/bitty/releases/download/v\\\$\{pkgver\}/\\\$\{_bitty_asset\}" \
   "GitHub Releases fallback URL must stay documented in the template"
-assert_grep "bitty-x86_64-unknown-linux-gnu" "asset stem must be the x86_64 release dist name"
+assert_grep "bitty-.*x86_64-unknown-linux-gnu" "asset stem must be the x86_64 release dist name"
 assert_grep '"\$\{?pkgdir\}?/usr/bin/bitty"' "package() must install to /usr/bin/bitty"
 
 # The binary source entry (the `_bitty_src::` line) must be the CDN URL; the

@@ -80,6 +80,7 @@ EXPECTED="$(
 			echo "$TOPDIR/share/icons/hicolor/${size}x${size}/apps/bitty.png"
 		done
 		echo "$TOPDIR/share/icons/hicolor/scalable/apps/bitty.svg"
+		echo "$TOPDIR/terminfo/bitty.ti"
 	} | LC_ALL=C sort
 )"
 ACTUAL="$(tar -tf "$OUT" | grep -v '/$' | LC_ALL=C sort)"

@@ -152,6 +152,10 @@ fn list_themes_table_contains_builtin_dark() {
         text.contains("bitty-dark") && text.contains("#1e1e2e"),
         "themes table must carry the built-in dark preset, got {text:?}"
     );
+    assert!(
+        text.contains("PROVENANCE") && !text.contains("https://"),
+        "themes table must label builtin provenance and print no URLs, got {text:?}"
+    );
 }
 
 #[test]

@@ -2193,7 +2193,10 @@ pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> Stri
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n",
-        bold("NAME CATEGORY ALIASES SOURCE BACKGROUND FOREGROUND", color)
+        bold(
+            "NAME CATEGORY ALIASES PROVENANCE BACKGROUND FOREGROUND",
+            color
+        )
     ));
     if themes.is_empty() {
         out.push_str("(no themes)\n");
@@ -2219,7 +2222,7 @@ pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> Stri
             } else {
                 t.aliases.join(",")
             },
-            t.source,
+            "builtin",
             background,
             foreground
         ));

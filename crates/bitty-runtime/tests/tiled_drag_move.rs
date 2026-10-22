@@ -1429,3 +1429,71 @@ fn closing_a_non_source_leaf_cancels_the_drag_without_an_extra_swap() {
     assert!(!rt.has_selection());
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
+
+/// Issue #2521: left full-height column + right top/bottom split. Dragging
+/// the bottom-right pane onto the bottom-left corner of the left column
+/// stacks it inside that column instead of carving a new left column (which
+/// re-homed the left pane into the middle) or swapping contents.
+#[test]
+fn issue_2521_bottom_left_drop_splits_the_left_column() {
+    let mut rt = make_runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        ),
+    ));
+    // Grab the bottom-right pane at its center.
+    rt.handle_cursor_moved(frame_point(&rt, ViewId::new(3), 0.5, 0.5));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.tiled_drag_active());
+    // Drop at the bottom-left corner of the full-height left column.
+    rt.handle_cursor_moved(frame_point(&rt, ViewId::new(1), 0.03, 0.97));
+    assert_eq!(rt.tiled_drag_preview(), Some(ViewId::new(1)));
+    let spec = rt
+        .tiled_drag_drop_spec()
+        .expect("bottom-left must plan an insert");
+    assert_eq!(spec.target, ViewId::new(1));
+    assert_eq!(spec.axis, SplitAxis::Vertical, "stack inside the column");
+    assert!(spec.after, "the dragged pane goes at the pointer edge");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.tiled_drag_active());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(3)));
+    assert_eq!(rt.layout().validate_structure(), Ok(3));
+
+    // Root stays the left/right split; the left column is stacked [1, 3]
+    // and the right survivor keeps the full right column.
+    let LayoutNode::Split {
+        axis: SplitAxis::Horizontal,
+        first,
+        second,
+        ..
+    } = rt.layout()
+    else {
+        panic!("root must remain horizontal: {:?}", rt.layout());
+    };
+    assert_eq!(
+        first.leaf_ids(),
+        vec![ViewId::new(1), ViewId::new(3)],
+        "dragged pane stays in the left column in pointer order"
+    );
+    assert_eq!(second.leaf_ids(), vec![ViewId::new(2)]);
+    let allocs = rt.layout_allocations();
+    let rect = |id: u64| {
+        allocs
+            .iter()
+            .find(|(leaf, _)| *leaf == ViewId::new(id))
+            .map(|(_, rect)| *rect)
+            .expect("allocated")
+    };
+    assert_eq!(rect(1), UiRect::new(0, 0, 40, 12));
+    assert_eq!(rect(3), UiRect::new(0, 12, 40, 12));
+    assert_eq!(rect(2), UiRect::new(40, 0, 40, 24));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+}

@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::plugin_runtime::OverlayKeyChord;
 use bitty_runtime::{
-    FocusDirection, LayoutNode, PanelLayoutMode, PresentationMode, Runtime, SplitAxis, View,
-    ViewCloseRequest, ViewId, WsCloseRequest,
+    FocusDirection, LayoutNode, PresentationMode, Runtime, SplitAxis, View, ViewCloseRequest,
+    ViewId, WsCloseRequest,
 };
 
 use crate::spawn::spawn_pane_shell_in;
@@ -619,17 +619,13 @@ pub(crate) fn close_focused_leaf(layout: &mut LayoutNode, focused: ViewId) -> bo
 
 /// Pick the tiled survivor that should receive focus after closing `focused`.
 ///
-/// The layout's depth-first leaf order is stable across layout shapes. Focus
-/// the predecessor in that order, wrapping to the last surviving leaf when
-/// the first leaf is closed.
-fn previous_leaf_after_close(layout: &LayoutNode, focused: ViewId) -> Option<ViewId> {
-    let leaf_ids = layout.leaf_ids();
-    let position = leaf_ids.iter().position(|id| *id == focused)?;
-    if position > 0 {
-        Some(leaf_ids[position - 1])
-    } else {
-        leaf_ids.into_iter().rev().find(|id| *id != focused)
-    }
+/// Deterministic tree order (not a positional leaf scan): the pane that
+/// expands into the closed slot gets focus. Closing the top/left child
+/// focuses the sibling subtree's first leaf; closing the bottom/right child
+/// focuses its last leaf, so repeated deletes walk the creation tree
+/// instead of jumping to an arbitrary pane.
+fn survivor_after_close(layout: &LayoutNode, focused: ViewId) -> Option<ViewId> {
+    bitty_runtime::survivor_after_close(layout, focused)
 }
 
 /// Record a candidate resize target: path to the deepest split whose axis
@@ -1187,11 +1183,11 @@ impl TerminalApp {
         axis: SplitAxis,
         place_new_first: bool,
         label: &str,
-    ) {
+    ) -> Option<ViewId> {
         self.restore_zoom();
         if self.runtime.focused_view().is_none() {
             eprintln!("warning: keymap {label} has no focused pane — ignoring");
-            return;
+            return None;
         }
         let mut layout = self.runtime.layout().clone();
         // CTX-0378: the id comes from the runtime-wide allocator
@@ -1205,12 +1201,14 @@ impl TerminalApp {
         // closed before the layout commits it.
         if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
             eprintln!("warning: keymap {label} refused: {err}");
-            return;
+            return None;
         }
         if split_focused_leaf(&mut layout, target, axis, new_id, place_new_first) {
             self.commit_new_leaf(layout, new_id, label);
+            Some(new_id)
         } else {
             eprintln!("warning: keymap {label} found no target pane — ignoring");
+            None
         }
     }
 
@@ -1541,22 +1539,19 @@ impl TerminalApp {
                     eprintln!("warning: keymap {label} has no focused pane — ignoring");
                     return false;
                 };
-                self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
+                let _ =
+                    self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
             }
             A::NewPanel => {
-                // CTX-0838 (#1441) / CTX-0881: 4-way spiral panel creation. Axis
-                // follows the focused leaf's cell allocation (wide splits
-                // side-by-side, tall stacks, square ties break side-by-side);
-                // placement follows the spiral cycle (Right -> Down -> Left -> Up)
-                // and focus follows the fresh pane. Explicit `new_split:<dir>` above
-                // keeps its fixed axis for directional splits.
+                // Issue #2521/#2528: the default `Balanced` mode bisects the
+                // physically largest slot with the cell-aspect-aware axis, so
+                // eight consecutive presses keep a usable tree. `Spiral`
+                // rotates Right -> Down -> Left -> Up only along the active
+                // creation chain; `Dwindle` follows focus right/down.
+                // Explicit `new_split:<dir>` above keeps its fixed axis.
                 //
-                // CTX-0964 (#1698, DEC-0099): in `BisectLargest` mode the
-                // split lands on `panel_bisect_target` (largest-area leaf)
-                // with its raw `width >= height` axis instead of the focused
-                // leaf; `Spiral`/`Dwindle` keep the focused leaf. The axis
-                // already comes from `panel_split_axis` (bisect-aware); only
-                // the target needs the same switch here.
+                // CTX-0964 (#1698, DEC-0099): `BisectLargest` splits the
+                // largest-area leaf with its raw `width >= height` axis.
                 let focused = match self.runtime.focused_view() {
                     Some(id) => id,
                     None => {
@@ -1565,7 +1560,7 @@ impl TerminalApp {
                     }
                 };
                 // Review (#1441): restore zoom before measuring — a zoomed
-                // view collapses the live layout to one leaf, so the axis
+                // view collapses the live layout to one leaf, so the plan
                 // must come from the restored layout that `apply_new_leaf`
                 // will split. Idempotent: `apply_new_leaf` restores again.
                 self.restore_zoom();
@@ -1579,14 +1574,21 @@ impl TerminalApp {
                     self.create_panel_on_empty_base(focused);
                     return false;
                 }
-                let axis = self.runtime.panel_split_axis(focused);
-                let place_new_first = self.runtime.panel_split_place_new_first();
-                let target = if self.runtime.panel_layout_mode() == PanelLayoutMode::BisectLargest {
-                    self.runtime.panel_bisect_target().unwrap_or(focused)
-                } else {
-                    focused
+                let Some(plan) = self.runtime.panel_split_plan() else {
+                    eprintln!(
+                        "warning: keymap new_panel has no usable target at the minimum pane size — ignoring"
+                    );
+                    return false;
                 };
-                self.apply_new_leaf(target, axis, place_new_first, "new_panel");
+                if let Some(created) =
+                    self.apply_new_leaf(plan.target, plan.axis, plan.place_new_first, "new_panel")
+                {
+                    // Issue #2528: continue the spiral only while the fresh
+                    // pane stays focused; any other active pane restarts at
+                    // Right (never a stale leaf-count phase).
+                    self.runtime
+                        .note_panel_split_created(created, plan.spiral_phase);
+                }
             }
             A::CloseView => {
                 let focused = match self.runtime.focused_view() {
@@ -1841,9 +1843,7 @@ impl TerminalApp {
                 }
                 let mut layout = self.runtime.layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
-                    if let Some(previous) =
-                        previous_leaf_after_close(self.runtime.layout(), focused)
-                    {
+                    if let Some(previous) = survivor_after_close(self.runtime.layout(), focused) {
                         // Set focus before the closing layout is installed so
                         // primary ownership re-homes to this same survivor.
                         self.runtime.set_focus(previous);
@@ -3136,7 +3136,7 @@ mod tests {
     use crate::spawn::SpawnSpec;
     use crate::terminal_app::TerminalApp;
     use bitty_platform::{PlatformEvent, WindowId};
-    use bitty_runtime::{CloseConfirmMode, Runtime, RuntimeConfig};
+    use bitty_runtime::{CloseConfirmMode, PanelLayoutMode, Runtime, RuntimeConfig};
     // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
     // without the gate the import is unused on Windows.
     #[cfg(unix)]
@@ -4931,37 +4931,61 @@ mod tests {
         let mut app = workspace_test_app();
         app.runtime
             .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
+        // Opt into the 4-way spiral; the default Balanced mode always
+        // places after the bisected slot.
+        app.runtime.set_panel_layout_mode(PanelLayoutMode::Spiral);
 
         let v1 = app.runtime.focused_view().expect("seed focus");
 
-        // Split 1 (1 -> 2): Step 0 -> Horizontal, Right (place_new_first = false).
+        // Split 1 (1 -> 2): phase 0, Right (place_new_first = false).
         app.apply_chrome_action(ChromeAction::NewPanel);
         assert_eq!(app.runtime.leaf_count(), 2);
         let v2 = app.runtime.focused_view().expect("v2 focus");
         assert_ne!(v1, v2);
+        assert_eq!(
+            app.runtime
+                .panel_split_plan()
+                .map(|plan| plan.place_new_first),
+            Some(false),
+            "phase 1 still places right/bottom"
+        );
 
-        // Split 2 (2 -> 3): Step 1 -> Vertical, Bottom (place_new_first = false).
+        // Split 2 (2 -> 3): phase 1, Bottom (place_new_first = false).
         app.apply_chrome_action(ChromeAction::NewPanel);
         assert_eq!(app.runtime.leaf_count(), 3);
         let v3 = app.runtime.focused_view().expect("v3 focus");
         assert_ne!(v2, v3);
+        assert_eq!(
+            app.runtime
+                .panel_split_plan()
+                .map(|plan| plan.place_new_first),
+            Some(true),
+            "phase 2 rotates to left/top"
+        );
 
-        // Split 3 (3 -> 4): Step 2 -> Horizontal, Left (place_new_first = true).
+        // Split 3 (3 -> 4): phase 2, Left (place_new_first = true).
         app.apply_chrome_action(ChromeAction::NewPanel);
         assert_eq!(app.runtime.leaf_count(), 4);
         let v4 = app.runtime.focused_view().expect("v4 focus");
         assert_ne!(v3, v4);
+        assert_eq!(
+            app.runtime
+                .panel_split_plan()
+                .map(|plan| plan.place_new_first),
+            Some(true),
+            "phase 3 stays left/top"
+        );
 
-        // Split 4 (4 -> 5): Step 3 -> Vertical, Top (place_new_first = true).
+        // Split 4 (4 -> 5): phase 3, Top (place_new_first = true).
         app.apply_chrome_action(ChromeAction::NewPanel);
         assert_eq!(app.runtime.leaf_count(), 5);
         let v5 = app.runtime.focused_view().expect("v5 focus");
         assert_ne!(v4, v5);
 
-        // Next split wraps back to Step 0 (Right).
+        // Next split wraps back to phase 0 (Right).
         assert!(
             !app.runtime.panel_split_place_new_first(),
-            "5 -> 6 wraps back to Step 0 (place_new_first = false)"
+            "5 -> 6 wraps back to phase 0 (place_new_first = false)"
         );
     }
 
@@ -5685,6 +5709,104 @@ mod tests {
         assert_eq!(rect_of(largest).width, 60, "largest leaf untouched");
     }
 
+    /// Issues #2521/#2528: eight consecutive default `Mod+N` presses must
+    /// keep a balanced, usable tiling tree (no nested slivers), and closing
+    /// panes must walk the creation tree deterministically.
+    #[test]
+    fn chrome_new_panel_eight_times_stays_balanced_and_closes_in_tree_order() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        for _ in 0..8 {
+            app.apply_chrome_action(ChromeAction::NewPanel);
+            let allocs = app.runtime.layout_allocations();
+            assert_eq!(app.runtime.layout().validate_structure(), Ok(allocs.len()));
+            for (id, rect) in &allocs {
+                assert!(
+                    rect.width >= bitty_runtime::MIN_PANE_COLS
+                        && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+                    "{id:?} fell below the minimum pane size after {allocs:?}"
+                );
+            }
+        }
+        assert_eq!(app.runtime.leaf_count(), 9);
+        let allocs = app.runtime.layout_allocations();
+        let area = |rect: &bitty_runtime::UiRect| u32::from(rect.width) * u32::from(rect.height);
+        let smallest = allocs.iter().map(|(_, r)| area(r)).min().expect("panes");
+        let largest = allocs.iter().map(|(_, r)| area(r)).max().expect("panes");
+        assert!(
+            largest <= smallest * 3,
+            "eight presses must stay balanced: {allocs:?}"
+        );
+
+        // Close every pane but one: focus follows the pane that expands into
+        // the vacated slot, and the tree stays a valid binary tree.
+        while app.runtime.leaf_count() > 1 {
+            let closed = app.runtime.focused_view().expect("focus");
+            app.apply_chrome_action(ChromeAction::CloseView);
+            // The repeat-close arm is headless idle here, so the pane closes
+            // immediately; focus must never dangle on the closed leaf.
+            assert_ne!(app.runtime.focused_view(), Some(closed));
+            assert_eq!(
+                app.runtime.layout().validate_structure(),
+                Ok(app.runtime.leaf_count())
+            );
+        }
+        assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    /// Issue #2528: after a close, `Mod+N` in spiral mode follows the active
+    /// pane at its right/bottom edge instead of reversing to the left from
+    /// the old leaf-count phase.
+    #[test]
+    fn chrome_new_panel_spiral_does_not_reverse_after_close() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        for _ in 0..3 {
+            app.apply_chrome_action(ChromeAction::NewPanel);
+        }
+        // Three consecutive presses continue the spiral; the next plan is
+        // Left/Top (place_new_first) as designed.
+        let plan = app.runtime.panel_split_plan().expect("plan");
+        assert!(plan.place_new_first, "the chain reaches the left/top phase");
+
+        // Close the focused pane; the survivor takes the space.
+        let closed = app.runtime.focused_view().expect("focus");
+        app.apply_chrome_action(ChromeAction::CloseView);
+        let survivor = app.runtime.focused_view().expect("survivor");
+        assert_ne!(survivor, closed);
+        let before = app.runtime.layout_allocations();
+        let survivor_before = before
+            .iter()
+            .find(|(id, _)| *id == survivor)
+            .map(|(_, rect)| *rect)
+            .expect("survivor allocation");
+
+        // The next Mod+N must split the survivor to the right/below, never
+        // to the left from the stale phase.
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        let after = app.runtime.layout_allocations();
+        let survivor_after = after
+            .iter()
+            .find(|(id, _)| *id == survivor)
+            .map(|(_, rect)| *rect)
+            .expect("survivor allocation");
+        let fresh = app.runtime.focused_view().expect("fresh focus");
+        let fresh_rect = after
+            .iter()
+            .find(|(id, _)| *id == fresh)
+            .map(|(_, rect)| *rect)
+            .expect("fresh allocation");
+        // Right (same row, after) or below (same column, after): the fresh
+        // pane never precedes the survivor on both axes.
+        let right = fresh_rect.x >= survivor_after.x + survivor_after.width;
+        let below = fresh_rect.y >= survivor_after.y + survivor_after.height;
+        assert!(
+            right || below,
+            "fresh pane {fresh_rect:?} must land after survivor {survivor_after:?} (was {survivor_before:?})"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn chrome_new_split_after_workspace_new_does_not_clobber_other_shell() {
@@ -5839,7 +5961,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_close_view_wraps_first_leaf_focus_to_last_survivor() {
+    fn chrome_close_view_focuses_the_expanding_sibling() {
         use bitty_config::ChromeAction;
 
         let mut app = workspace_test_app();
@@ -5858,8 +5980,11 @@ mod tests {
             app.runtime.layout().leaf_ids(),
             vec![ViewId::new(2), ViewId::new(3)]
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(3)));
+        // Closing the top/left child focuses the sibling subtree's first
+        // leaf — the pane that expands into the closed slot (issue #2521
+        // follow-up), never a positional jump to the last survivor.
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
     }
 
     // CTX-0257 workspace ops entry (DEC-0034): keys + tabline through the

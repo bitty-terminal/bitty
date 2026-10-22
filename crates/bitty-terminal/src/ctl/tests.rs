@@ -2102,10 +2102,10 @@ fn control_workspace_rename_and_move_panel_headless() {
 #[test]
 fn control_workspace_ids_roundtrip_after_close_and_new() {
     // CTX-0322 (D2): `workspace new` must report the stable sequence id
-    // (`ws{seq}`) that `list` names and `focus`/`close` accept, even after a
-    // close opens a sequence gap. Before the fix, `new` reported the
-    // positional index (`ws:3`) while the slot's name was `ws4`, so the
-    // reported id could not be fed back to `close`/`focus`.
+    // (`ws{seq}`) that `list` names and `focus`/`close` accept. Issue #2532:
+    // a close frees its id, so the next `new` reuses the lowest free one
+    // (`ws:2` here) instead of a monotonic counter; the reported id must
+    // still round-trip through `close`/`focus`.
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     let all = bitty_ipc::ScopeSet::all();
@@ -2127,24 +2127,24 @@ fn control_workspace_ids_roundtrip_after_close_and_new() {
     assert!(done.ok, "close ws:2 must succeed: {done:?}");
     assert!(done.result_json.contains("\"closed\":\"ws:2\""));
 
-    // Next creation takes the next sequence id (ws4), not the freed index.
+    // The freed id is reused (issue #2532), never a monotonic ws4.
     let third = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
-    assert!(third.ok, "new ws4: {third:?}");
+    assert!(third.ok, "recreate ws2: {third:?}");
     assert!(
-        third.result_json.contains("\"created\":\"ws:4\""),
-        "created id must be the stable sequence, got {third:?}"
+        third.result_json.contains("\"created\":\"ws:2\""),
+        "created id must be the reused stable sequence, got {third:?}"
     );
 
     let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
     assert!(list.ok, "list must succeed: {list:?}");
     assert!(
-        list.result_json.contains("ws4"),
+        list.result_json.contains("ws2"),
         "list must name the created workspace: {list:?}"
     );
 
     // The id `new` reported must round-trip through close (the D2 failure
     // was NotFound for this exact id).
-    let close4 = ipc_ctl::params_workspace("ws:4");
+    let close4 = ipc_ctl::params_workspace("ws:2");
     let closed = apply_control_envelope(
         &mut rt,
         ipc_ctl::METHOD_CLOSE_WORKSPACE,
@@ -2202,34 +2202,46 @@ fn control_workspace_list_ids_roundtrip_across_sequence_gap() {
 
     assert!(apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok);
     assert!(apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok);
+    assert!(apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok);
+    // Close ws2 and reuse it (issue #2532), then delete ws3 so the list
+    // carries a real sequence gap.
     let close2 = ipc_ctl::params_workspace("ws:2");
+    assert!(
+        apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_CLOSE_WORKSPACE,
+            Some(&close2),
+            &all
+        )
+        .ok
+    );
+    let third = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(third.result_json.contains("\"created\":\"ws:2\""));
+    let close3 = ipc_ctl::params_workspace("ws:3");
     let closed = apply_control_envelope(
         &mut rt,
         ipc_ctl::METHOD_CLOSE_WORKSPACE,
-        Some(&close2),
+        Some(&close3),
         &all,
     );
-    assert!(closed.ok, "close ws:2 must succeed: {closed:?}");
-    // Next creation takes ws:4, leaving a sequence gap at ws:2.
-    let third = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
-    assert!(third.result_json.contains("\"created\":\"ws:4\""));
+    assert!(closed.ok, "close ws:3 must succeed: {closed:?}");
 
     let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
     assert!(list.ok, "list must succeed: {list:?}");
     let ids = json_string_array(&list.result_json, "workspaces");
     assert_eq!(
         ids,
-        vec!["ws:1", "ws:3", "ws:4"],
+        vec!["ws:1", "ws:2", "ws:4"],
         "list must emit canonical ids, got {list:?}"
     );
     let names = json_string_array(&list.result_json, "names");
     assert_eq!(
         names,
-        vec!["ws1", "ws3", "ws4"],
+        vec!["ws1", "ws2", "ws4"],
         "display labels stay available separately, got {list:?}"
     );
     let active_id = extract_string_from(&list.result_json, "active_id").expect("active_id field");
-    assert_eq!(active_id, "ws:4", "active id must be canonical: {list:?}");
+    assert_eq!(active_id, "ws:2", "active id must be canonical: {list:?}");
 
     // Every id the list named must round-trip through focus then close.
     for id in &ids {

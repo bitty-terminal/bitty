@@ -130,6 +130,20 @@ pub enum LayoutNode {
     },
 }
 
+/// Structural invariant violation reported by
+/// [`LayoutNode::validate_structure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeViolation {
+    /// A split ratio fell outside `[MIN_RATIO, MAX_RATIO]` or was not finite.
+    Ratio,
+    /// An empty `Stack` tombstone survived in a committed tree.
+    EmptyStack,
+    /// An overlay had neither base nor overlay content.
+    EmptyOverlay,
+    /// The tree held no leaf at all.
+    EmptyTree,
+}
+
 impl LayoutNode {
     /// Minimum split ratio (prevents collapsing a pane below ~10% of container).
     pub const MIN_RATIO: f32 = 0.10;
@@ -1027,6 +1041,124 @@ impl LayoutNode {
         }
     }
 
+    /// Returns the split path from the root to leaf `id`.
+    ///
+    /// Each entry is `(axis, child_index)` for one `Split` level: index `0`
+    /// is the left/top child and `1` the right/bottom child. `Stack` and
+    /// `Overlay` nodes are transparent (they do not contribute a level), so
+    /// the path describes the leaf's position in the tiling tree alone.
+    /// Returns `None` when `id` is absent. Pure; allocates one bounded vec.
+    #[must_use]
+    pub fn path_to_leaf(&self, id: ViewId) -> Option<Vec<(SplitAxis, usize)>> {
+        let mut path = Vec::new();
+        fn walk(node: &LayoutNode, id: ViewId, path: &mut Vec<(SplitAxis, usize)>) -> Option<()> {
+            match node {
+                LayoutNode::Leaf(v) => (v.id() == id).then_some(()),
+                LayoutNode::Split {
+                    axis,
+                    first,
+                    second,
+                    ..
+                } => {
+                    path.push((*axis, 0));
+                    if walk(first, id, path).is_some() {
+                        return Some(());
+                    }
+                    path.pop();
+                    path.push((*axis, 1));
+                    if walk(second, id, path).is_some() {
+                        return Some(());
+                    }
+                    path.pop();
+                    None
+                }
+                LayoutNode::Stack(children) => {
+                    for child in children {
+                        if walk(child, id, path).is_some() {
+                            return Some(());
+                        }
+                    }
+                    None
+                }
+                LayoutNode::Overlay { base, overlay, .. } => {
+                    walk(base, id, path).or_else(|| walk(overlay, id, path))
+                }
+            }
+        }
+        walk(self, id, &mut path)?;
+        Some(path)
+    }
+
+    /// Axis of the innermost `Split` on the path to leaf `id`.
+    ///
+    /// The adjacent split is the leaf's tiling slot: a `Horizontal` parent
+    /// means the leaf is a column member (stack to keep the column), a
+    /// `Vertical` parent a row member. `Stack`/`Overlay` wrappers are
+    /// transparent. `None` when `id` is absent or is the root leaf.
+    #[must_use]
+    pub fn leaf_parent_axis(&self, id: ViewId) -> Option<SplitAxis> {
+        self.path_to_leaf(id)
+            .and_then(|path| path.last().map(|(axis, _)| *axis))
+    }
+
+    /// Checks the structural invariants every committed tiling tree holds.
+    ///
+    /// - at least one leaf (a fully drained tree is a tombstone),
+    /// - every split ratio inside `[MIN_RATIO, MAX_RATIO]` (the constructor
+    ///   clamps; a raw tree edit can violate it),
+    /// - no empty `Stack` child (the collapse tombstone must never survive a
+    ///   commit),
+    /// - no overlay whose base and overlay are both empty.
+    ///
+    /// Returns the leaf count on success. Pure, total, O(n).
+    pub fn validate_structure(&self) -> Result<usize, TreeViolation> {
+        let mut leaves = 0;
+        fn walk(node: &LayoutNode, leaves: &mut usize) -> Result<(), TreeViolation> {
+            match node {
+                LayoutNode::Leaf(_) => {
+                    *leaves += 1;
+                    Ok(())
+                }
+                LayoutNode::Split {
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    if !ratio.is_finite()
+                        || *ratio < LayoutNode::MIN_RATIO
+                        || *ratio > LayoutNode::MAX_RATIO
+                    {
+                        return Err(TreeViolation::Ratio);
+                    }
+                    walk(first, leaves)?;
+                    walk(second, leaves)
+                }
+                LayoutNode::Stack(children) => {
+                    if children.is_empty() {
+                        return Err(TreeViolation::EmptyStack);
+                    }
+                    for child in children {
+                        walk(child, leaves)?;
+                    }
+                    Ok(())
+                }
+                LayoutNode::Overlay { base, overlay, .. } => {
+                    if base.leaf_count() == 0 && overlay.leaf_count() == 0 {
+                        return Err(TreeViolation::EmptyOverlay);
+                    }
+                    walk(base, leaves)?;
+                    walk(overlay, leaves)
+                }
+            }
+        }
+        walk(self, &mut leaves)?;
+        if leaves == 0 {
+            return Err(TreeViolation::EmptyTree);
+        }
+        Ok(leaves)
+    }
+
     /// Hit-tests `point` against the current allocations (CW-09).
     ///
     /// Returns the leaf id whose allocation contains the point, or `None`
@@ -1664,6 +1796,111 @@ pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
     let left = a_start.max(b_start);
     let right = a_end.min(b_end);
     right.saturating_sub(left)
+}
+
+/// Minimum usable pane width in cells (issues #2521/#2528).
+///
+/// Adaptive insertion must never carve a pane narrower than this: a
+/// terminal split below it renders unreadable output and a border-only
+/// sliver. The splitter refuses a target whose balanced children would fall
+/// below the bound instead of committing the unusable tree.
+pub const MIN_PANE_COLS: u16 = 10;
+
+/// Minimum usable pane height in cells (issues #2521/#2528).
+///
+/// See [`MIN_PANE_COLS`]; the height bound is smaller because terminal cells
+/// are roughly twice as tall as they are wide.
+pub const MIN_PANE_ROWS: u16 = 4;
+
+/// Whether `rect` can be split at the balanced ratio along `axis` into two
+/// children that both meet the minimum pane size.
+///
+/// `gap_in` is the solver's inner gap: the split reserves one gap band
+/// between the children, so the usable extent is `dimension - gap_in` and the
+/// smaller child is half of that. A 20-cell pane with a 1-cell inner gap
+/// therefore yields a 9-cell child and is **not** splittable (issue #2521
+/// review). Zero-area rects are never splittable. Pure and total.
+#[must_use]
+pub fn splittable_rect(rect: Rect, axis: SplitAxis, gap_in: u16) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    let total = match axis {
+        SplitAxis::Horizontal => u32::from(rect.width),
+        SplitAxis::Vertical => u32::from(rect.height),
+    };
+    // Mirror `split_rect`: the gap is clamped so at least one cell remains.
+    let gap = u32::from(gap_in).min(total.saturating_sub(1));
+    let available = total - gap;
+    let minimum = match axis {
+        SplitAxis::Horizontal => u32::from(MIN_PANE_COLS),
+        SplitAxis::Vertical => u32::from(MIN_PANE_ROWS),
+    };
+    available / 2 >= minimum
+}
+
+/// Balanced axis for `rect` that still meets the minimum pane size.
+///
+/// Returns the [`balanced_split_axis`] when it fits, the perpendicular axis
+/// when only that one fits, and `None` when neither can host two usable
+/// children at the configured inner gap. Adaptive insertion uses this so a
+/// wide-but-short pane stacks instead of producing unreadable columns.
+#[must_use]
+pub fn splittable_axis(rect: Rect, gap_in: u16) -> Option<SplitAxis> {
+    let preferred = balanced_split_axis(rect);
+    if splittable_rect(rect, preferred, gap_in) {
+        return Some(preferred);
+    }
+    let fallback = match preferred {
+        SplitAxis::Horizontal => SplitAxis::Vertical,
+        SplitAxis::Vertical => SplitAxis::Horizontal,
+    };
+    splittable_rect(rect, fallback, gap_in).then_some(fallback)
+}
+
+/// Picks the tiled survivor that should receive focus after `closed` leaves
+/// the tree (deterministic focus order on close).
+///
+/// Returns the leaf of the sibling subtree that expands into the closed
+/// slot: the sibling's first leaf when `closed` was the first child
+/// (left/top), its last leaf when `closed` was the second (right/bottom).
+/// `Stack`/`Overlay` wrappers are transparent. Falls back to the next leaf
+/// in solver order (then the previous) when the closed leaf is not a direct
+/// split child, and returns `None` when `closed` is absent or is the only
+/// leaf. Pure and total; never mutates the tree.
+#[must_use]
+pub fn survivor_after_close(tree: &LayoutNode, closed: ViewId) -> Option<ViewId> {
+    fn sibling_of(node: &LayoutNode, closed: ViewId, out: &mut Option<ViewId>) -> bool {
+        match node {
+            LayoutNode::Leaf(_) => false,
+            LayoutNode::Split { first, second, .. } => {
+                if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == closed) {
+                    *out = second.leaf_ids().first().copied();
+                    return true;
+                }
+                if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == closed) {
+                    *out = first.leaf_ids().last().copied();
+                    return true;
+                }
+                sibling_of(first, closed, out) || sibling_of(second, closed, out)
+            }
+            LayoutNode::Stack(children) => {
+                children.iter().any(|child| sibling_of(child, closed, out))
+            }
+            LayoutNode::Overlay { base, overlay, .. } => {
+                sibling_of(base, closed, out) || sibling_of(overlay, closed, out)
+            }
+        }
+    }
+    let mut survivor = None;
+    if sibling_of(tree, closed, &mut survivor) {
+        return survivor;
+    }
+    let ids = tree.leaf_ids();
+    let position = ids.iter().position(|id| *id == closed)?;
+    ids.get(position + 1)
+        .copied()
+        .or_else(|| position.checked_sub(1).map(|previous| ids[previous]))
 }
 
 /// Removes leaf `id` from `tree`, promoting its sibling.
@@ -3301,5 +3538,262 @@ mod tests {
         );
         let hits = clear.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(40, 12));
         assert_eq!(hits.len(), 1, "uncovered divider still grabs");
+    }
+
+    /// Issue #2521: the survivor after a close is the pane that expands into
+    /// the vacated slot, not a positional DFS neighbor.
+    #[test]
+    fn survivor_after_close_follows_the_expanding_sibling() {
+        // Left full-height 1, right column [2 top, 3 bottom].
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::leaf(view(3, 40, 12)),
+            ),
+        );
+        // Closing the top-right pane focuses the bottom-right (its sibling).
+        assert_eq!(
+            survivor_after_close(&tree, ViewId::new(2)),
+            Some(ViewId::new(3))
+        );
+        // Closing the bottom-right pane focuses the top-right.
+        assert_eq!(
+            survivor_after_close(&tree, ViewId::new(3)),
+            Some(ViewId::new(2))
+        );
+        // Closing the left pane focuses the first leaf of the expanding
+        // right column.
+        assert_eq!(
+            survivor_after_close(&tree, ViewId::new(1)),
+            Some(ViewId::new(2))
+        );
+        // Absent or sole leaves have no survivor.
+        assert_eq!(survivor_after_close(&tree, ViewId::new(404)), None);
+        assert_eq!(
+            survivor_after_close(&LayoutNode::leaf(view(1, 10, 10)), ViewId::new(1)),
+            None
+        );
+
+        // Balanced 8-pane tree: closing the bottom/right child always hands
+        // focus to the last leaf of the expanding subtree.
+        let mut balanced = LayoutNode::leaf(view(1, 80, 24));
+        for next in 2..=9 {
+            let allocations = balanced.layout(Rect::new(0, 0, 80, 24));
+            let (target, rect) = largest_area_leaf(&allocations).expect("a leaf to bisect");
+            let axis = splittable_axis(rect, 0).expect("usable split");
+            let mut node = balanced.clone();
+            fn split(
+                node: &mut LayoutNode,
+                target: ViewId,
+                axis: SplitAxis,
+                new_id: ViewId,
+            ) -> bool {
+                match node {
+                    LayoutNode::Leaf(v) if v.id() == target => {
+                        let old = v.clone();
+                        let fresh =
+                            View::new(new_id, usize::from(old.cols()), usize::from(old.rows()));
+                        *node = LayoutNode::split(
+                            axis,
+                            0.5,
+                            LayoutNode::leaf(old),
+                            LayoutNode::leaf(fresh),
+                        );
+                        true
+                    }
+                    LayoutNode::Split { first, second, .. } => {
+                        split(first, target, axis, new_id) || split(second, target, axis, new_id)
+                    }
+                    LayoutNode::Stack(children) => children
+                        .iter_mut()
+                        .any(|child| split(child, target, axis, new_id)),
+                    LayoutNode::Overlay { base, overlay, .. } => {
+                        split(base, target, axis, new_id) || split(overlay, target, axis, new_id)
+                    }
+                    LayoutNode::Leaf(_) => false,
+                }
+            }
+            assert!(split(&mut node, target, axis, ViewId::new(next)));
+            balanced = node;
+        }
+        assert_eq!(balanced.validate_structure(), Ok(9));
+        for closed in balanced.leaf_ids() {
+            let survivor = survivor_after_close(&balanced, closed).expect("survivor");
+            let mut after = balanced.clone();
+            assert!(remove_leaf(&mut after, closed));
+            assert!(after.leaf_ids().contains(&survivor));
+            assert_eq!(after.leaf_ids().len(), 8);
+        }
+    }
+
+    /// Issue #2521: the structural invariant checker accepts every tree the
+    /// layout constructors produce and rejects raw tampering.
+    #[test]
+    fn validate_structure_accepts_constructors_and_rejects_tampering() {
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::stack(vec![LayoutNode::leaf(view(2, 40, 12))]),
+        );
+        assert_eq!(tree.validate_structure(), Ok(2));
+        // An out-of-range raw ratio is rejected.
+        if let LayoutNode::Split { ratio, .. } = &mut tree {
+            *ratio = 0.01;
+        }
+        assert_eq!(tree.validate_structure(), Err(TreeViolation::Ratio));
+        // An empty stack tombstone is rejected.
+        let empty = LayoutNode::stack(Vec::new());
+        assert_eq!(empty.validate_structure(), Err(TreeViolation::EmptyStack));
+        // A drained overlay is rejected.
+        let overlay = LayoutNode::overlay(
+            LayoutNode::stack(Vec::new()),
+            LayoutNode::stack(Vec::new()),
+            Rect::new(0, 0, 4, 4),
+        );
+        assert_eq!(
+            overlay.validate_structure(),
+            Err(TreeViolation::EmptyOverlay)
+        );
+        // A pure leaf is valid; an empty tree is not.
+        assert_eq!(
+            LayoutNode::leaf(view(1, 10, 10)).validate_structure(),
+            Ok(1)
+        );
+        assert_eq!(
+            LayoutNode::stack(Vec::new()).validate_structure(),
+            Err(TreeViolation::EmptyStack)
+        );
+    }
+
+    #[test]
+    fn splittable_bounds_guard_minimum_pane_size() {
+        // 20x8 splits side-by-side into 10-wide halves (>= 10 cols).
+        assert!(splittable_rect(
+            Rect::new(0, 0, 20, 8),
+            SplitAxis::Horizontal,
+            0
+        ));
+        // 18 wide cannot host two 10-wide halves.
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 18, 8),
+            SplitAxis::Horizontal,
+            0
+        ));
+        // 8 rows stack into two 4-row halves (>= 4 rows); 7 cannot.
+        assert!(splittable_rect(
+            Rect::new(0, 0, 40, 8),
+            SplitAxis::Vertical,
+            0
+        ));
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 40, 7),
+            SplitAxis::Vertical,
+            0
+        ));
+        // Zero-area panes are never splittable.
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 0, 40),
+            SplitAxis::Horizontal,
+            0
+        ));
+        // 40x8 prefers the balanced horizontal axis; a 16x8 pane prefers
+        // vertical (smart aspect) and falls back to horizontal when only the
+        // latter fits.
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 40, 8), 0),
+            Some(SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 16, 8), 0),
+            Some(SplitAxis::Vertical)
+        );
+        assert_eq!(splittable_axis(Rect::new(0, 0, 16, 6), 0), None);
+    }
+
+    /// Issue #2521 review: the inner gap consumes a cell before the balanced
+    /// split, so a 20-wide pane yields 9 + gap + 10 and must be refused.
+    #[test]
+    fn splittable_bounds_account_for_the_inner_gap() {
+        // 20 wide with one inner gap cell: available = 19 -> 9/10.
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 20, 24),
+            SplitAxis::Horizontal,
+            1
+        ));
+        // 21 wide: available = 20 -> 10/10 fits.
+        assert!(splittable_rect(
+            Rect::new(0, 0, 21, 24),
+            SplitAxis::Horizontal,
+            1
+        ));
+        // 9 rows with one gap: available = 8 -> two 4-row halves fit.
+        assert!(splittable_rect(
+            Rect::new(0, 0, 40, 9),
+            SplitAxis::Vertical,
+            1
+        ));
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 40, 8),
+            SplitAxis::Vertical,
+            1
+        ));
+        // A 20x8 pane cannot host two usable panes at gap 1 on either axis:
+        // horizontal gives 9 columns, vertical gives 3 rows.
+        assert_eq!(splittable_axis(Rect::new(0, 0, 20, 8), 1), None);
+        // Without the gap the same pane still splits horizontally.
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 20, 8), 0),
+            Some(SplitAxis::Horizontal)
+        );
+        // A 20x24 pane stacks vertically at gap 1 (11 rows each), so no
+        // 9-column child can be produced.
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 20, 24), 1),
+            Some(SplitAxis::Vertical)
+        );
+    }
+
+    /// Issue #2521: the leaf path and parent axis describe the tiling slot,
+    /// with stack/overlay wrappers transparent.
+    #[test]
+    fn leaf_path_and_parent_axis_describe_the_slot() {
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::stack(vec![LayoutNode::leaf(view(3, 40, 12))]),
+            ),
+        );
+        assert_eq!(
+            tree.path_to_leaf(ViewId::new(1)),
+            Some(vec![(SplitAxis::Horizontal, 0)])
+        );
+        assert_eq!(
+            tree.path_to_leaf(ViewId::new(3)),
+            Some(vec![(SplitAxis::Horizontal, 1), (SplitAxis::Vertical, 1)])
+        );
+        assert_eq!(
+            tree.leaf_parent_axis(ViewId::new(1)),
+            Some(SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            tree.leaf_parent_axis(ViewId::new(3)),
+            Some(SplitAxis::Vertical)
+        );
+        assert_eq!(tree.leaf_parent_axis(ViewId::new(404)), None);
+        assert_eq!(
+            LayoutNode::leaf(view(1, 10, 10)).leaf_parent_axis(ViewId::new(1)),
+            None
+        );
     }
 }

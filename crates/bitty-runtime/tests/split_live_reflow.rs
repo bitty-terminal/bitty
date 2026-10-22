@@ -396,3 +396,44 @@ fn unfocused_blank_is_session_shape_not_reflow() {
         pure_stats.glyphs,
     );
 }
+
+/// Issue #2521 blank-row coverage: moving the primary pane through the
+/// drag-move re-parent funnel must reflow its grid to the new decorated
+/// frame without inserting a blank first row or dropping content.
+#[test]
+fn drag_move_reflow_keeps_primary_rows_and_no_blank_first_line() {
+    let mut rt = make_runtime();
+    rt.tick().expect("first full redraw");
+    rt.handle_pty_bytes(b"ALPHA\r\nBETA\r\n");
+    assert_eq!(nonblank_rows(&rt.snapshot()), 2);
+
+    // 1 | 2 split with primary 1 focused; then move 1 below 2 exactly like
+    // a committed Mod+drag drop (`reparent_leaf` + `set_layout`).
+    let new_id = live_split_focused_right(&mut rt);
+    let primary = ViewId::new(1);
+    assert_eq!(rt.focused_view(), Some(primary));
+    let mut layout = rt.layout().clone();
+    assert!(layout.reparent_leaf(primary, new_id, SplitAxis::Vertical, 0.5, true));
+    rt.set_layout(layout);
+    rt.set_focus(primary);
+
+    let snap = rt.snapshot();
+    assert_eq!(
+        nonblank_rows(&snap),
+        2,
+        "the move must not insert blank rows: {:?}",
+        snapshot_text(&snap)
+    );
+    let text = snapshot_text(&snap);
+    assert!(
+        text.starts_with("ALPHA"),
+        "content must stay at row 0 (no blank first line): {text:?}"
+    );
+    assert!(text.contains("BETA"), "second row survives: {text:?}");
+    let frame = frame_of(&rt, primary);
+    assert_eq!(
+        snap.width,
+        usize::from(frame.cols),
+        "primary grid follows the moved pane's content frame"
+    );
+}

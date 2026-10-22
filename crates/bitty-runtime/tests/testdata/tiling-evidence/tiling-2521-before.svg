@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="296" viewBox="0 0 800 296" font-family="monospace">
+<rect width="800" height="296" fill="#0d1117"/>
+<text x="4" y="14" fill="#e6edf3" font-size="12">#2521 drag move: before (0.0.26)</text>
+<text x="4" y="28" fill="#9aa7b4" font-size="10">bottom-left drop carved a new column; p1 re-homed to the middle</text>
+<rect x="0" y="34" width="200" height="240" fill="#553b1f" stroke="#0b0e11" stroke-width="1"/>
+<text x="4" y="48" fill="#e6edf3" font-size="11">p3</text>
+<text x="4" y="60" fill="#c3ced9" font-size="9">20x24</text>
+<rect x="200" y="34" width="200" height="240" fill="#24492e" stroke="#0b0e11" stroke-width="1"/>
+<text x="204" y="48" fill="#e6edf3" font-size="11">p1</text>
+<text x="204" y="60" fill="#c3ced9" font-size="9">20x24</text>
+<rect x="400" y="34" width="400" height="240" fill="#4a2f52" stroke="#0b0e11" stroke-width="1"/>
+<text x="404" y="48" fill="#e6edf3" font-size="11">p2</text>
+<text x="404" y="60" fill="#c3ced9" font-size="9">40x24</text>
+<circle cx="20" cy="254" r="4" fill="none" stroke="#ff7b72" stroke-width="2"/>
+<text x="27" y="248" fill="#ff7b72" font-size="10">drop</text>
+<text x="4" y="289" fill="#8b949e" font-size="10">tree H[H[3, 1], 2] | leaves [3, 1, 2]</text>
+</svg>

@@ -209,7 +209,6 @@ impl Runtime {
         self.active_workspace = 0;
         self.workspace_mru = VecDeque::from([0]);
         self.pending_ws_close = None;
-        self.next_workspace_seq = 2;
         // CTX-0536 (#923): seed the monotonic id high-water from the initial
         // leaf so the very first allocation can never reuse id 1.
         self.raise_view_id_high_water();
@@ -250,6 +249,21 @@ impl Runtime {
     #[must_use]
     pub fn workspace_index_by_seq(&self, seq: u64) -> Option<usize> {
         self.workspaces.iter().position(|s| s.seq == seq)
+    }
+
+    /// Lowest free workspace id in `1..=MAX_WORKSPACES` (issue #2532).
+    ///
+    /// Workspace ids stay dense across delete/create: closing `ws2` from
+    /// `[1, 2, 3]` and creating again reuses `2` instead of issuing `4`
+    /// (and never the old monotonic `10` after a few delete/create cycles).
+    /// The slot count is below [`MAX_WORKSPACES`] at every call site, so a
+    /// free id always exists; the saturating fallback is unreachable but
+    /// keeps the helper total.
+    #[must_use]
+    pub fn next_free_workspace_seq(&self) -> u64 {
+        (1..=MAX_WORKSPACES as u64)
+            .find(|seq| self.workspace_index_by_seq(*seq).is_none())
+            .unwrap_or(MAX_WORKSPACES as u64 + 1)
     }
 
     /// Plain-data summaries of every workspace in index order (CTX-0889).
@@ -1340,7 +1354,15 @@ impl Runtime {
         // label as `empty` content. Resolve and check before any state
         // mutation; a violating pair fails the `View` creation closed.
         let fresh_id = self.next_view_id_global();
-        let new_label = u8::try_from(self.workspaces.len() + 1)
+        // Issue #2532: reuse the lowest free id; the slot is inserted in id
+        // order, so its 1-based display label is the insertion position.
+        let seq = self.next_free_workspace_seq();
+        let index = self
+            .workspaces
+            .iter()
+            .position(|slot| slot.seq > seq)
+            .unwrap_or(self.workspaces.len());
+        let new_label = u8::try_from(index + 1)
             .unwrap_or(u8::MAX)
             .clamp(1, MAX_WORKSPACES as u8);
         if let Err(err) = self.validate_view_target_at("empty", new_label, fresh_id) {
@@ -1349,8 +1371,6 @@ impl Runtime {
         // CTX-0334: creating/switching workspace is an explicit focus change.
         self.clear_hover_pending();
         self.stash_active_slot();
-        let seq = self.next_workspace_seq;
-        self.next_workspace_seq = seq.wrapping_add(1).max(1);
         let leaf = View::new(fresh_id, self.cols, self.rows);
         let layout = LayoutNode::leaf(leaf);
         let focus = Focus::with_focus(fresh_id);
@@ -1358,14 +1378,27 @@ impl Runtime {
         self.focus = focus.clone();
         // CTX-1147: the fresh workspace starts with no detached floats.
         self.floats = FloatStore::new();
-        self.workspaces.push(WorkspaceSlot {
-            seq,
-            name: format!("ws{seq}"),
-            layout,
-            focus,
-            floats: FloatStore::new(),
-        });
-        let index = self.workspaces.len() - 1;
+        self.workspaces.insert(
+            index,
+            WorkspaceSlot {
+                seq,
+                name: format!("ws{seq}"),
+                layout,
+                focus,
+                floats: FloatStore::new(),
+            },
+        );
+        // Shift every index-keyed side table past the insertion point.
+        for entry in &mut self.workspace_mru {
+            if *entry >= index {
+                *entry += 1;
+            }
+        }
+        if let Some(pending) = self.pending_ws_close.as_mut() {
+            if pending.index >= index {
+                pending.index += 1;
+            }
+        }
         self.active_workspace = index;
         self.mru_front(index);
         // CTX-0536 (#923): record the fresh id so its later retirement can
@@ -1810,8 +1843,7 @@ impl Runtime {
             let leaf = View::new(fresh_id, self.cols, self.rows);
             let layout = LayoutNode::leaf(leaf);
             let focus = Focus::with_focus(fresh_id);
-            let seq = self.next_workspace_seq;
-            self.next_workspace_seq = seq.wrapping_add(1).max(1);
+            let seq = self.next_free_workspace_seq();
             self.workspaces.push(WorkspaceSlot {
                 seq,
                 name: format!("ws{seq}"),
@@ -2471,9 +2503,6 @@ impl Runtime {
             floats: FloatStore::new(),
         };
         self.workspaces.push(new_slot);
-        if one_based >= self.next_workspace_seq {
-            self.next_workspace_seq = one_based.wrapping_add(1).max(1);
-        }
         self.sort_workspaces_by_seq();
         let Some(new_idx) = self.workspace_index_by_seq(one_based) else {
             return Err(String::from("auto-created workspace vanished"));
@@ -2574,9 +2603,6 @@ impl Runtime {
                 self.workspaces[current_idx].name = tgt_default;
             }
             self.workspaces[current_idx].seq = target_num;
-            if target_num >= self.next_workspace_seq {
-                self.next_workspace_seq = target_num.wrapping_add(1).max(1);
-            }
             self.sort_workspaces_by_seq();
             self.pending_full_redraw = true;
             Ok((current_seq, target_num))
@@ -3650,32 +3676,52 @@ mod tests {
         assert_mru_valid(&rt);
         assert_seq_addrs(&rt);
 
-        // A fresh workspace after closes takes a new monotonic seq; retired
-        // seqs (2, 3, 4) are never reissued.
-        let index = rt.workspace_new().expect("ws5");
-        assert_eq!(index, 1);
-        assert_eq!(seqs(&rt), vec![1, 5]);
-        assert_eq!(rt.workspace_index_by_seq(5), Some(1));
-        for retired in [2, 3, 4] {
-            assert_eq!(rt.workspace_index_by_seq(retired), None);
-        }
+        // Issue #2532: ids stay dense and reuse the lowest free value.
+        // Grow back to [1, 2, 3, 4], delete ws3, then create from ws1: the
+        // new workspace is ws3 again, never a monotonic 5/10.
+        assert_eq!(rt.workspace_new().expect("ws2"), 1);
+        assert_eq!(rt.workspace_new().expect("ws3"), 2);
+        assert_eq!(rt.workspace_new().expect("ws4"), 3);
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_eq!(rt.workspace_close_at(2).expect("close inactive ws3"), 0);
+        assert_eq!(seqs(&rt), vec![1, 2, 4]);
+        assert_eq!(rt.workspace_index_by_seq(3), None);
+        assert!(rt.workspace_switch(0));
+        let index = rt.workspace_new().expect("recreate from ws1");
+        assert_eq!(index, 2, "ws3 sorts between ws2 and ws4");
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_eq!(
+            rt.workspace_names(),
+            vec![
+                String::from("ws1"),
+                String::from("ws2"),
+                String::from("ws3"),
+                String::from("ws4")
+            ]
+        );
         assert_mru_valid(&rt);
         assert_seq_addrs(&rt);
 
-        // Draining to the last workspace resets it with a fresh monotonic
-        // seq rather than reusing a retired one.
-        assert_eq!(rt.workspace_close_at(0).expect("close ws1"), 0);
-        assert_eq!(seqs(&rt), vec![5]);
-        assert_eq!(rt.workspace_close_at(0).expect("reset last ws5"), 0);
+        // Repeating delete/create from workspace 1 keeps the dense id set
+        // instead of walking 5, 6, 7, ...
+        for _ in 0..3 {
+            assert_eq!(rt.workspace_close_at(2).expect("close ws3"), 0);
+            assert_eq!(seqs(&rt), vec![1, 2, 4]);
+            assert!(rt.workspace_switch(0));
+            assert_eq!(rt.workspace_new().expect("recreate ws3"), 2);
+            assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        }
+
+        // Draining to the last workspace resets it at the lowest free id
+        // (1), so a fresh window starts dense again.
+        assert_eq!(rt.workspace_close_at(3).expect("close ws4"), 0);
+        assert_eq!(rt.workspace_close_at(2).expect("close ws3"), 0);
+        assert_eq!(rt.workspace_close_at(1).expect("close ws2"), 0);
+        assert_eq!(seqs(&rt), vec![1]);
+        assert_eq!(rt.workspace_close_at(0).expect("reset last ws1"), 0);
         assert_eq!(rt.workspace_count(), 1);
-        let reset = seqs(&rt);
-        assert_eq!(reset.len(), 1);
-        assert!(
-            reset[0] > 5,
-            "reset seq {} must advance past every retired seq",
-            reset[0]
-        );
-        assert_eq!(rt.workspace_names(), vec![format!("ws{}", reset[0])]);
+        assert_eq!(seqs(&rt), vec![1]);
+        assert_eq!(rt.workspace_names(), vec![String::from("ws1")]);
         assert_mru_valid(&rt);
         assert_seq_addrs(&rt);
     }
@@ -3868,11 +3914,11 @@ mod tests {
     fn move_bisects_largest_panel_by_default() {
         // CTX-0964 (#1698) + issue #1804: move-to-workspace defaults to
         // balanced bisect-largest regardless of `panel_layout_mode` (here
-        // the default `Spiral`): the moved pane splits the largest-area
+        // the default `Balanced`): the moved pane splits the largest-area
         // target leaf on its physical aspect (here the 60-wide leaf stays
         // side-by-side) instead of the focused leaf or the whole root.
         let mut rt = fresh();
-        assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Spiral);
+        assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Balanced);
         let source = rt.focused_view().expect("source focus");
         // Build the target (ws2): 0.25 split gives small 20x24 (id 100) and
         // largest 60x24 (id 101, raw-wide -> Horizontal). Focus the small
@@ -4327,21 +4373,22 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
         assert_eq!(rt.workspace_names(), vec![String::from("ws3")]);
 
-        // Create a new workspace, which will get next seq = 4
+        // Issue #2532: creating after the move reuses the lowest free seq
+        // (1), keeping the id set dense instead of issuing a monotonic 4.
         rt.workspace_new().expect("new");
         assert_eq!(
             rt.workspace_names(),
-            vec![String::from("ws3"), String::from("ws4")]
+            vec![String::from("ws1"), String::from("ws3")]
         );
 
-        // With ws4 active, swap with 3
-        let (from, to) = rt.workspace_swap_current_with(3).expect("swap 4 with 3");
-        assert_eq!(from, 4);
+        // With ws1 active, swap with 3
+        let (from, to) = rt.workspace_swap_current_with(3).expect("swap 1 with 3");
+        assert_eq!(from, 1);
         assert_eq!(to, 3);
-        // Active workspace was ws4, now it has seq 3, while previous ws3 has seq 4
+        // Active workspace was ws1, now it has seq 3, while previous ws3 has seq 1
         assert_eq!(
             rt.workspace_names(),
-            vec![String::from("ws3"), String::from("ws4")]
+            vec![String::from("ws1"), String::from("ws3")]
         );
     }
 

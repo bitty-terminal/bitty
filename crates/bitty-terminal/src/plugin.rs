@@ -30,9 +30,15 @@
 //!   (`$XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/`): manifest,
 //!   schema, entry point, module-tree bounds, and `compat` ranges are
 //!   verified before anything is staged, added capabilities need the same
-//!   consent, and the atomic `current.json` pointer is switched last. The
-//!   runtime then discovers and activates the package as a visibly
-//!   unverified third-party (`local-path`) source. `install <git-url>`
+//!   consent, and the atomic `current.json` pointer is switched last (the
+//!   commit point). A failed commit rolls the version tree back; an
+//!   interrupted/partial tree is surfaced by `list` and repaired on the next
+//!   install after a `[y/N]` prompt (`--force` skips it; identical bytes are
+//!   adopted without a prompt). Reinstalling the same manifest version with
+//!   different content replaces the tree after the same prompt, and
+//!   `--force` does it non-interactively. The runtime then discovers and
+//!   activates the package as a visibly unverified third-party
+//!   (`local-path`) source. `install <git-url>`
 //!   clones a `https://<host>/<path>.git`, `git+https://…`, or
 //!   `git@<host>:<path>` source with fixed-argv system `git` into an
 //!   exclusive temp staging dir and then runs the same local-path pipeline
@@ -43,7 +49,8 @@
 //!   diagnostic.
 //! - `remove <id> --force` is destructive: bundled records lose their managed
 //!   entry with `bitty-plugins.toml.bak` kept; installed packages delete their
-//!   store record and staged tree. `enable`/`disable` are idempotent toggles
+//!   store record and staged tree. It also deletes an unindexed orphan tree
+//!   (the copy-paste repair command shown by `list`). `enable`/`disable` are idempotent toggles
 //!   in the managed manifest or the store index respectively; `enable`
 //!   re-checks the hash pin and the grant coverage and fails closed on a
 //!   mismatch. `revoke <id> [--cap <capability>]` drops grants without
@@ -52,10 +59,11 @@
 //!   denial (no silent re-prompt); re-grant goes through `install` consent.
 //! - `list` shows every bundled plugin, every embedded official catalog entry
 //!   (`available`, or `incompatible` when the declared range excludes this
-//!   host), and any recorded or installed extra, with source, state, pin
-//!   status, and granted/requested capability counts. `info` shows one
-//!   plugin's manifest plus the recorded grants and their plain-language
-//!   effect statements.
+//!   host), and any recorded or installed extra, with source, state
+//!   (`enabled`/`disabled`/`available`/`orphaned`/`broken`), pin status,
+//!   granted/requested capability counts, and a repair hint for unhealthy
+//!   rows. `info` shows one plugin's manifest plus the recorded grants and
+//!   their plain-language effect statements.
 //! - `install` and `enable` success prints post-install next steps (CTX-1268,
 //!   issue #2144; issue #2374): the enable command, where the plugin landed,
 //!   the canonical Lua settings path (`<config-root>/plugins/<owner>.<name>.lua`),
@@ -77,6 +85,15 @@
 //!   the write inside the environment-derived config root, and commits
 //!   atomically (temp file with `create_new`; hard-link no-clobber or rename
 //!   with `--force`). `--init` is the issue-shape alias for `scaffold`.
+//! - `doctor [--repair]` diagnoses the package store and the managed ledger
+//!   without creating a VM: corrupt `current.json`, orphaned/incomplete/
+//!   duplicate version dirs, dangling records, stale staging, malformed or
+//!   stale ledger records. `--repair` moves broken/extra trees into
+//!   `<store>/quarantine/` (never deletes them), removes stale staging, moves
+//!   a corrupt index/ledger aside, and rebuilds `current.json` from complete
+//!   package dirs with the index write last and atomic. Rebuilt records keep
+//!   grants only when the manifest hash still matches; otherwise they start
+//!   disabled with no grants and need a fresh `install` consent.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
 //!   code is ever loaded or executed**; safe-mode clean).
 //!
@@ -247,6 +264,8 @@ pub enum PluginVerb {
     Revoke,
     /// `config [show|scaffold] <id>`: inspect or scaffold per-plugin settings.
     Config,
+    /// `doctor [--repair]`: diagnose store/ledger health and optionally repair.
+    Doctor,
 }
 
 /// Which `bitty plugin config` action to run.
@@ -284,6 +303,7 @@ impl PluginVerb {
         ("info", Self::Info),
         ("revoke", Self::Revoke),
         ("config", Self::Config),
+        ("doctor", Self::Doctor),
     ];
 
     /// Parse a verb token.
@@ -307,13 +327,14 @@ impl PluginVerb {
             Self::Info => "info",
             Self::Revoke => "revoke",
             Self::Config => "config",
+            Self::Doctor => "doctor",
         }
     }
 
     /// Whether the verb takes a plugin id operand.
     #[must_use]
     pub fn needs_id(self) -> bool {
-        !matches!(self, Self::List)
+        !matches!(self, Self::List | Self::Doctor)
     }
 }
 
@@ -336,6 +357,8 @@ pub struct PluginRequest {
     pub no_color: bool,
     /// `config` action (`show` default, `scaffold` via the verb or `--init`).
     pub config_action: Option<ConfigAction>,
+    /// `doctor --repair`: quarantine broken trees and rebuild `current.json`.
+    pub repair: bool,
 }
 
 /// Why parsing failed.
@@ -379,6 +402,7 @@ pub fn parse_plugin_request(
     let mut no_color = false;
     let mut config_action: Option<ConfigAction> = None;
     let mut init = false;
+    let mut repair = false;
 
     let mut index = 0usize;
     while index < raw.len() {
@@ -392,6 +416,11 @@ pub fn parse_plugin_request(
             }
             "--force" => {
                 force = true;
+                index += 1;
+                continue;
+            }
+            "--repair" => {
+                repair = true;
                 index += 1;
                 continue;
             }
@@ -487,7 +516,7 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info|revoke|config)"
+                         (want list|install|remove|enable|disable|info|revoke|config|doctor)"
                     )));
                 }
             }
@@ -513,7 +542,7 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke|config)"
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke|config|doctor)"
                 .to_string(),
         )
     })?;
@@ -530,9 +559,10 @@ pub fn parse_plugin_request(
         )));
     }
     if !verb.needs_id() && id.is_some() {
-        return Err(PluginParseError::Usage(
-            "bitty plugin: `list` takes no plugin id".to_string(),
-        ));
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: `{}` takes no plugin id",
+            verb.name()
+        )));
     }
     if yes && verb != PluginVerb::Install {
         return Err(PluginParseError::Usage(format!(
@@ -583,9 +613,14 @@ pub fn parse_plugin_request(
     } else {
         None
     };
-    if force && !matches!(verb, PluginVerb::Remove | PluginVerb::Config) {
+    if force
+        && !matches!(
+            verb,
+            PluginVerb::Install | PluginVerb::Remove | PluginVerb::Config
+        )
+    {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --force only applies to `remove` and `config scaffold` (got `{}`)",
+            "bitty plugin: --force only applies to `install`, `remove`, and `config scaffold` (got `{}`)",
             verb.name()
         )));
     }
@@ -599,6 +634,12 @@ pub fn parse_plugin_request(
             "bitty plugin: --format/--json only apply to `config show`".to_string(),
         ));
     }
+    if repair && verb != PluginVerb::Doctor {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --repair only applies to `doctor` (got `{}`)",
+            verb.name()
+        )));
+    }
 
     Ok(PluginRequest {
         verb,
@@ -609,6 +650,7 @@ pub fn parse_plugin_request(
         cap,
         no_color,
         config_action,
+        repair,
     })
 }
 
@@ -617,10 +659,11 @@ pub fn parse_plugin_request(
 pub fn plugin_usage() -> String {
     "usage: bitty plugin list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin install <id> [--yes]   (bundled id or official catalog id)\n\
-     \x20      bitty plugin install <path> [--yes]   (local directory package)\n\
-     \x20      bitty plugin install <git-url> [--yes]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
-     \x20      bitty plugin install <archive> [--yes]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
+     \x20      bitty plugin install <path> [--yes] [--force]   (local directory package)\n\
+     \x20      bitty plugin install <git-url> [--yes] [--force]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
+     \x20      bitty plugin install <archive> [--yes] [--force]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
      \x20      bitty plugin remove <id> --force\n\
+     \x20      bitty plugin doctor [--repair]\n\
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin revoke <id> [--cap <capability>]\n\
@@ -632,8 +675,10 @@ pub fn plugin_usage() -> String {
      (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
      External packages install into $XDG_DATA_HOME/bitty/plugins (fallback\n\
      ~/.local/share/bitty/plugins). No plugin code runs during any operation.\n\
-     Exit codes: 0 success | 1 aborted/io (consent, helper, clone, unpack) |\n\
-     2 usage | 4 plugin error (id, scheme, validation).\n\
+     Exit codes: 0 success | 1 aborted/io (consent, helper, clone, unpack,\n\
+     repair needed) | 2 usage | 4 plugin error (id, scheme, validation).\n\
+     `bitty plugin doctor` diagnoses orphaned/partial packages and a broken\n\
+     index; `--repair` quarantines broken trees and rebuilds current.json.\n\
      `bitty plugin --help` explains capabilities, consent, and exit codes."
         .to_string()
 }
@@ -665,6 +710,18 @@ pub fn plugin_help_text() -> String {
      \x20                             manifest, entry point, bounds, and compat\n\
      \x20                             ranges are verified before anything is\n\
      \x20                             staged; added capabilities need consent.\n\
+     \x20                             The package tree and current.json are\n\
+     \x20                             committed together: a failed install\n\
+     \x20                             rolls the tree back, so no version dir\n\
+     \x20                             is left without an index entry. Re-running\n\
+     \x20                             an install with the same version but\n\
+     \x20                             different content (a rebuilt checkout)\n\
+     \x20                             replaces the tree after a `[y/N]` prompt,\n\
+     \x20                             or non-interactively with --force. An\n\
+     \x20                             orphaned/partial tree left by an\n\
+     \x20                             interrupted install takes the same path,\n\
+     \x20                             and identical bytes are adopted without a\n\
+     \x20                             prompt.\n\
      \x20 install <git-url> [--yes]  Install from a git source: exactly\n\
      \x20                             https://<host>/<path>.git,\n\
      \x20                             git+https://<host>/<path>.git (the git+\n\
@@ -713,14 +770,33 @@ pub fn plugin_help_text() -> String {
      \x20                             (canonical <owner>.<name>.lua path) from\n\
      \x20                             the manifest [settings] defaults. Refuses\n\
      \x20                             to overwrite without --force.\n\
+     \x20 doctor [--repair]           Diagnose the package store and the\n\
+     \x20                             bitty-plugins.toml ledger. Reports\n\
+     \x20                             orphaned/partial version dirs, dangling\n\
+     \x20                             index records, a corrupt current.json,\n\
+     \x20                             stale staging dirs, and stale ledger\n\
+     \x20                             records. --repair moves broken/extra\n\
+     \x20                             trees to <store>/quarantine/, removes\n\
+     \x20                             stale staging, rebuilds current.json\n\
+     \x20                             from complete trees (index last, atomic),\n\
+     \x20                             and quarantines a malformed ledger.\n\
+     \x20                             Rebuilt records with a changed manifest\n\
+     \x20                             hash start disabled with no grants; re-run\n\
+     \x20                             `install <source> --force` to re-consent.\n\
      \n\
      flags:\n\
      \x20 --format table|json|jsonl   list/info/config show output (default table).\n\
      \x20 --json                      Alias for --format json.\n\
      \x20 --no-color                  Accepted for parity (tables are plain text).\n\
-     \x20 --yes                       install only: approve capability consent.\n\
-     \x20 --force                     remove/config scaffold: confirm overwrite or\n\
-     \x20                             the destructive drop.\n\
+     \x20 --yes                       install only: approve capability consent and\n\
+     \x20                             an orphan/same-version repair prompt.\n\
+     \x20 --force                     install/remove/config scaffold: install\n\
+     \x20                             replaces an orphaned or same-version tree\n\
+     \x20                             without the repair prompt; remove confirms\n\
+     \x20                             the destructive drop; config scaffold\n\
+     \x20                             confirms overwrite.\n\
+     \x20 --repair                    doctor only: quarantine/rebuild the store\n\
+     \x20                             and ledger.\n\
      \x20 --init                      config only: alias for `config scaffold`.\n\
      \x20 --cap <capability>          revoke only: revoke one capability.\n\
      \n\
@@ -747,6 +823,21 @@ pub fn plugin_help_text() -> String {
      \x20 are stored under packages/<id>/<version>/ with an owner-only mode, and\n\
      \x20 load as third-party packages. The official catalog is build-time data:\n\
      \x20 Core never fetches registry metadata at runtime.\n\
+     \n\
+     store recovery (issue #2439):\n\
+     \x20 `bitty plugin list` shows orphaned/partial package directories with\n\
+     \x20 state `orphaned` or `broken` and a repair hint instead of hiding\n\
+     \x20 them. Safe recovery ladder:\n\
+     \x20   bitty plugin doctor                 # diagnose, change nothing\n\
+     \x20   bitty plugin doctor --repair        # quarantine broken trees,\n\
+     \x20                                       # rebuild current.json/ledger\n\
+     \x20   bitty plugin remove <id> --force    # discard one orphaned tree\n\
+     \x20   bitty plugin install <source> --force  # reinstall/replace content\n\
+     \x20 A corrupt current.json is never treated as an empty store: list and\n\
+     \x20 install fail closed with the doctor repair command. `doctor --repair`\n\
+     \x20 moves the old file to <store>/quarantine/ first. Rebuilt records keep\n\
+     \x20 existing grants only when the manifest hash still matches; otherwise\n\
+     \x20 they are disabled with no grants and must be re-approved.\n\
      \n\
      wiring (where things land, what to edit next):\n\
      \x20 The managed manifest lives beside the config file:\n\
@@ -1629,6 +1720,12 @@ pub struct PluginRow {
     /// separately from the per-plugin user file. Empty when no manifest body
     /// is available (a recorded id without a bundled/staged manifest).
     pub settings: Vec<bitty_plugin_host::manifest::SettingDecl>,
+    /// Actionable repair command when the row is orphaned or broken.
+    ///
+    /// `None` for healthy bundled/installed rows. `list` prints these in a
+    /// repair footer and `info` as a `repair:` line so an interrupted install
+    /// is never silently hidden.
+    pub repair: Option<String>,
 }
 
 impl PluginRow {
@@ -1755,6 +1852,7 @@ fn rows_from_state_with_catalog(
                 .collect(),
             manifest_hash,
             settings: manifest.settings.clone(),
+            repair: None,
         });
     }
 
@@ -1785,6 +1883,7 @@ fn rows_from_state_with_catalog(
             commands: Vec::new(),
             manifest_hash: Some(record.manifest_hash.clone()),
             settings: Vec::new(),
+            repair: None,
         });
     }
 
@@ -1795,6 +1894,90 @@ fn rows_from_state_with_catalog(
             }
             seen.insert(record.plugin_id.clone());
             rows.push(store_row(store_root, &record));
+        }
+
+        // Issue #2439: an interrupted/partial install leaves a version
+        // directory with no index record. Never hide it: list it with an
+        // actionable repair command. A plugin that already has a row (record
+        // or bundled) gets the hint attached to that row instead of a
+        // duplicate id.
+        let orphans = package::scan_orphans(store_root).map_err(|error| {
+            PluginFailure::plugin(
+                "StoreInvalid",
+                format!(
+                    "bitty plugin: plugin store '{}' is unreadable: {error}; run \
+                     `bitty plugin doctor --repair` to rebuild the store index",
+                    store_root.display()
+                ),
+            )
+        })?;
+        let mut by_id: BTreeMap<
+            String,
+            Vec<bitty_runtime::plugin_runtime::package::OrphanPackage>,
+        > = BTreeMap::new();
+        for orphan in orphans {
+            by_id
+                .entry(orphan.plugin_id.clone())
+                .or_default()
+                .push(orphan);
+        }
+        for (id, mut orphans) in by_id {
+            orphans.sort_by(|a, b| a.version.cmp(&b.version));
+            let versions = orphans
+                .iter()
+                .map(|orphan| {
+                    format!(
+                        "{} ({})",
+                        orphan.version,
+                        if orphan.complete {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let hint = format!(
+                "bitty plugin doctor --repair   # rebuild the index from complete trees; \
+                 or: bitty plugin remove {id} --force"
+            );
+            if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                if row.state != "broken" {
+                    row.state = "orphaned";
+                }
+                row.repair = Some(hint.clone());
+                let _ = write!(
+                    row.description,
+                    " (unreferenced package directories: {versions})"
+                );
+                continue;
+            }
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.insert(id.clone());
+            rows.push(PluginRow {
+                id: id.clone(),
+                name: id.clone(),
+                version: versions.clone(),
+                description: format!(
+                    "orphaned package directory with no store index record ({versions});                      complete trees can be re-indexed and incomplete ones quarantined by                      `bitty plugin doctor --repair`, or discard them with                      `bitty plugin remove {id} --force` and reinstall"
+                ),
+                bundled: false,
+                source: "unknown".to_string(),
+                state: "orphaned",
+                enabled: false,
+                recorded: false,
+                pin_ok: None,
+                requested: BTreeSet::new(),
+                granted: BTreeSet::new(),
+                denied: BTreeSet::new(),
+                commands: Vec::new(),
+                manifest_hash: None,
+                settings: Vec::new(),
+                repair: Some(hint),
+            });
         }
     }
 
@@ -1844,6 +2027,7 @@ fn rows_from_state_with_catalog(
                 commands: Vec::new(),
                 manifest_hash: Some(entry.manifest_hash.to_string()),
                 settings: Vec::new(),
+                repair: None,
             });
         }
     }
@@ -1876,7 +2060,8 @@ fn load_store_index(
         PluginFailure::plugin(
             "StoreInvalid",
             format!(
-                "bitty plugin: plugin store '{}' is unreadable: {error}",
+                "bitty plugin: plugin store '{}' is unreadable: {error}; run \
+                 `bitty plugin doctor --repair` to rebuild the store index",
                 store_root.display()
             ),
         )
@@ -1889,7 +2074,16 @@ fn load_store_index(
 /// whose body is unreadable still lists, with the recorded grant standing in
 /// for the requested set. Loading re-verifies the hashes and fails closed.
 fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRecord) -> PluginRow {
-    let manifest = read_store_manifest(store_root, record);
+    let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record);
+    let manifest = root.as_deref().and_then(|root| {
+        let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
+        manifest_toml::parse_manifest(&bytes).ok()
+    });
+    let broken = manifest.is_none()
+        || match (root.as_deref(), manifest.as_ref()) {
+            (Some(root), Some(manifest)) => !store_entry_point_exists(root, manifest.id().as_str()),
+            _ => true,
+        };
     let granted: BTreeSet<CapabilityId> = record
         .granted
         .iter()
@@ -1906,13 +2100,22 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
             .map(|manifest| manifest.identity.name.clone())
             .unwrap_or_else(|| record.plugin_id.clone()),
         version: record.version.clone(),
-        description: manifest.as_ref().map_or_else(
-            || format!("installed from a {} source", record.source_class.as_str()),
-            |manifest| manifest.identity.description.clone(),
-        ),
+        description: if broken {
+            format!(
+                "store record points at an unusable package directory ({}); repair:                  bitty plugin doctor --repair",
+                record.root
+            )
+        } else {
+            manifest.as_ref().map_or_else(
+                || format!("installed from a {} source", record.source_class.as_str()),
+                |manifest| manifest.identity.description.clone(),
+            )
+        },
         bundled: false,
         source: record.source_class.as_str().to_string(),
-        state: if record.enabled {
+        state: if broken {
+            "broken"
+        } else if record.enabled {
             "enabled"
         } else {
             "disabled"
@@ -1939,6 +2142,12 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
             .as_ref()
             .map(|manifest| manifest.settings.clone())
             .unwrap_or_default(),
+        repair: broken.then(|| {
+            format!(
+                "bitty plugin doctor --repair   # or: bitty plugin remove {} --force",
+                record.plugin_id
+            )
+        }),
     }
 }
 
@@ -1954,6 +2163,21 @@ fn read_store_manifest(
     let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record)?;
     let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
     manifest_toml::parse_manifest(&bytes).ok()
+}
+
+/// Whether a staged package root carries its Lua entry point.
+///
+/// Mirrors the runtime's `entry_point` rule without exposing it across the
+/// crate boundary: `lua/init.lua`, `lua/<module>/init.lua`, or the same shapes
+/// directly under the package root when there is no `lua/` directory.
+fn store_entry_point_exists(root: &Path, id: &str) -> bool {
+    let module = id.rsplit('.').next().unwrap_or_default();
+    let lua = root.join("lua");
+    if lua.is_dir() {
+        lua.join("init.lua").is_file() || lua.join(module).join("init.lua").is_file()
+    } else {
+        root.join("init.lua").is_file() || root.join(module).join("init.lua").is_file()
+    }
 }
 
 fn row_for_id(
@@ -2018,6 +2242,24 @@ fn format_list_table(rows: &[PluginRow], no_color: bool) -> String {
     if rows.is_empty() {
         out.push_str("(no plugins)\n");
     }
+    // Issue #2439: orphaned/broken entries are shown as rows, and their
+    // actionable repair command is repeated here so it is never truncated by
+    // the table columns.
+    let repairs: Vec<&PluginRow> = rows.iter().filter(|row| row.repair.is_some()).collect();
+    if !repairs.is_empty() {
+        out.push('\n');
+        out.push_str("repair:\n");
+        for row in repairs {
+            let _ = writeln!(
+                out,
+                "  {}: {}",
+                row.id,
+                row.repair
+                    .as_deref()
+                    .unwrap_or("bitty plugin doctor --repair")
+            );
+        }
+    }
     out
 }
 
@@ -2036,6 +2278,9 @@ fn format_info_table(row: &PluginRow, no_color: bool) -> String {
     );
     let _ = writeln!(out, "  pin:          {}", pin_label(row.pin_ok));
     let _ = writeln!(out, "  description:  {}", row.description);
+    if let Some(repair) = &row.repair {
+        let _ = writeln!(out, "  repair:       {repair}");
+    }
     let _ = writeln!(
         out,
         "  commands:     {}",
@@ -2149,6 +2394,14 @@ fn write_plugin_object(out: &mut String, row: &PluginRow, include_manifest: bool
             }
         );
     }
+    let _ = write!(
+        out,
+        ",\"repair\":{}",
+        match &row.repair {
+            Some(repair) => format!("\"{}\"", json_escape(repair)),
+            None => "null".to_string(),
+        }
+    );
     out.push_str(",\"capabilities\":");
     write_capability_array(out, &row.capability_rows());
     out.push_str(",\"commands\":[");
@@ -2911,6 +3164,19 @@ pub fn run_plugin_subcommand(
             return failure.exit;
         }
     };
+    // Resolved once from injected environment values (never process env here).
+    let store_root = crate::plugin_runtime::store_root_for(context.xdg_data_home, context.home);
+    // Doctor must diagnose a malformed ledger instead of failing before it can
+    // report it, so it runs before the strict state load.
+    if request.verb == PluginVerb::Doctor {
+        return run_plugin_doctor(
+            request.repair,
+            &path,
+            store_root.as_deref(),
+            no_color,
+            output,
+        );
+    }
     let mut state = match load_state(&path) {
         Ok(state) => state,
         Err(failure) => {
@@ -2918,8 +3184,6 @@ pub fn run_plugin_subcommand(
             return failure.exit;
         }
     };
-    // Resolved once from injected environment values (never process env here).
-    let store_root = crate::plugin_runtime::store_root_for(context.xdg_data_home, context.home);
     // Config dir for next-steps display (CTX-1268): the parent of the
     // managed manifest, so an explicit `--config`/`BITTY_CONFIG` selects
     // its own `plugins/` directory for the copy-paste path.
@@ -3082,6 +3346,10 @@ pub fn run_plugin_subcommand(
                     failure.exit
                 }
             }
+        }
+        PluginVerb::Doctor => {
+            // Dispatched before the state load; unreachable here.
+            EXIT_OK
         }
         PluginVerb::Config => {
             let id = request.id.as_deref().expect("config requires an id");
@@ -4646,6 +4914,15 @@ fn install_local_path(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
+    // The caller-selected options carry the fresh-install state policy and the
+    // recorded provenance class; explicit `enable` remains the authorization
+    // boundary for first execution. `--force` approves replacing an
+    // orphaned/partial or same-version directory without the repair prompt.
+    // Capability consent is separate.
+    let options = &LocalInstallOptions {
+        force_repair: request.force,
+        ..options.clone()
+    };
     let approve_all = request.yes;
     // Consent is bound to the staged snapshot the installer reviewed: the
     // callback only decides, and the installer commits that same snapshot, so
@@ -4682,7 +4959,9 @@ fn install_local_path(
             EXIT_OK
         }
         Ok(None) => {
-            eprintln!("bitty plugin: capability grant was not approved — nothing changed");
+            eprintln!(
+                "bitty plugin: install was not approved (capability grant or package repair) —                  nothing changed"
+            );
             EXIT_GENERIC
         }
         Err(error) => {
@@ -4712,6 +4991,13 @@ fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Wri
             "ies"
         }
     );
+    if report.content_replaced {
+        let _ = writeln!(
+            output,
+            "bitty plugin: replaced the existing package content in place at {}",
+            report.root
+        );
+    }
     if let Some(previous) = &report.previous_version {
         if previous != &report.version {
             let _ = writeln!(
@@ -4938,6 +5224,383 @@ fn set_store_enabled(
     }
 }
 
+/// Ledger (`bitty-plugins.toml`) health for `bitty plugin doctor`.
+struct LedgerInspection {
+    present: bool,
+    records: usize,
+    error: Option<String>,
+    unknown_ids: Vec<String>,
+    stale_pins: Vec<String>,
+    state: Option<PluginState>,
+}
+
+/// Inspect the managed ledger without failing the doctor on a bad file.
+fn inspect_ledger(path: &Path) -> LedgerInspection {
+    let mut inspection = LedgerInspection {
+        present: false,
+        records: 0,
+        error: None,
+        unknown_ids: Vec::new(),
+        stale_pins: Vec::new(),
+        state: None,
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return inspection,
+        Err(error) => {
+            inspection.error = Some(format!("cannot read '{}': {error}", path.display()));
+            return inspection;
+        }
+    };
+    inspection.present = true;
+    if bytes.len() > MAX_STATE_FILE_BYTES {
+        inspection.error = Some(format!("exceeds {MAX_STATE_FILE_BYTES} bytes"));
+        return inspection;
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            inspection.error = Some(format!("not UTF-8: {error}"));
+            return inspection;
+        }
+    };
+    let state = match PluginState::parse(text) {
+        Ok(state) => state,
+        Err(error) => {
+            inspection.error = Some(error.to_string());
+            return inspection;
+        }
+    };
+    inspection.records = state.ids().count();
+    for id in state.ids() {
+        match bundled_manifest_for(id) {
+            None => inspection.unknown_ids.push(id.clone()),
+            Some(manifest) => {
+                if state
+                    .get(id)
+                    .is_some_and(|record| record.manifest_hash != manifest.manifest_hash())
+                {
+                    inspection.stale_pins.push(id.clone());
+                }
+            }
+        }
+    }
+    inspection.state = Some(state);
+    inspection
+}
+
+/// Whether a store issue is a hard failure (needs repair) rather than a warn.
+fn store_issue_fails(kind: bitty_runtime::plugin_runtime::package::StoreIssueKind) -> bool {
+    use bitty_runtime::plugin_runtime::package::StoreIssueKind;
+    matches!(
+        kind,
+        StoreIssueKind::CorruptIndex | StoreIssueKind::DanglingRecord
+    )
+}
+
+/// `bitty plugin doctor [--repair]`: diagnose store + ledger health.
+///
+/// Read-only by default. `--repair` moves incomplete/unreferenced package
+/// trees into `<store>/quarantine/`, removes stale staging directories,
+/// rebuilds `current.json` from complete package directories, and quarantines
+/// a malformed ledger after moving it aside. It never invents capability
+/// grants: a rebuilt record with a changed manifest hash starts disabled with
+/// an empty grant set, and the report says so.
+fn run_plugin_doctor(
+    repair: bool,
+    state_path: &Path,
+    store_root: Option<&Path>,
+    no_color: bool,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let color = color_enabled(no_color);
+    let _ = writeln!(output, "{}", bold("bitty plugin doctor", color));
+    let mut failures = 0usize;
+    let mut warnings = 0usize;
+
+    match store_root {
+        Some(root) => {
+            let _ = writeln!(output, "  store:  {}", root.display());
+            match package::inspect_store(root) {
+                Ok(inspection) => {
+                    if let Some(error) = &inspection.index_error {
+                        failures += 1;
+                        let _ = writeln!(
+                            output,
+                            "  [fail] store index: current.json is unreadable ({error})"
+                        );
+                        let _ = writeln!(
+                            output,
+                            "         repair keeps the file: bitty plugin doctor --repair"
+                        );
+                    } else if inspection.index_present {
+                        let _ = writeln!(
+                            output,
+                            "  [ok]   store index: current.json ({} record(s))",
+                            inspection.record_count
+                        );
+                    } else {
+                        let _ = writeln!(
+                            output,
+                            "  [ok]   store index: absent (empty store; rebuilt on demand)"
+                        );
+                    }
+                    for issue in &inspection.issues {
+                        let fail = store_issue_fails(issue.kind);
+                        if fail {
+                            failures += 1;
+                        } else {
+                            warnings += 1;
+                        }
+                        let _ = writeln!(
+                            output,
+                            "  [{}] {} {} {}: {}",
+                            if fail { "fail" } else { "warn" },
+                            issue.kind.as_str(),
+                            issue.plugin_id,
+                            issue.version,
+                            issue.detail
+                        );
+                        if issue.kind.repairable() && !repair {
+                            let _ =
+                                writeln!(output, "         repair: bitty plugin doctor --repair");
+                        }
+                    }
+                    // A store record for a bundled id can never be trusted:
+                    // bundled provenance is first-party only.
+                    if let Ok(records) = load_index(root) {
+                        for record in &records {
+                            if bundled_manifest_for(&record.plugin_id).is_some() {
+                                failures += 1;
+                                let _ = writeln!(
+                                    output,
+                                    "  [fail] store/bundled mismatch {}: a store record shadows \
+                                     a bundled plugin id; repair: bitty plugin remove {} --force",
+                                    record.plugin_id, record.plugin_id
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    let _ = writeln!(output, "  [fail] store unreadable: {error}");
+                    let _ = writeln!(
+                        output,
+                        "         check ownership/permissions; repair needs a writable store: \
+                         bitty plugin doctor --repair"
+                    );
+                }
+            }
+        }
+        None => {
+            failures += 1;
+            let _ = writeln!(
+                output,
+                "  [fail] store: no data root ($XDG_DATA_HOME or $HOME unset)"
+            );
+        }
+    }
+
+    let _ = writeln!(output, "  ledger: {}", state_path.display());
+    let mut ledger = inspect_ledger(state_path);
+    if let Some(error) = &ledger.error {
+        failures += 1;
+        let _ = writeln!(output, "  [fail] ledger unreadable: {error}");
+        let _ = writeln!(
+            output,
+            "         repair quarantines the file and starts an empty valid ledger: \
+             bitty plugin doctor --repair"
+        );
+    } else if ledger.present {
+        let _ = writeln!(output, "  [ok]   ledger: {} record(s)", ledger.records);
+    } else {
+        let _ = writeln!(output, "  [ok]   ledger: absent (bundled defaults only)");
+    }
+    for id in &ledger.unknown_ids {
+        warnings += 1;
+        let _ = writeln!(
+            output,
+            "  [warn] ledger-record {id}: no bundled manifest for this id; \
+             repair removes the stale record"
+        );
+    }
+    for id in &ledger.stale_pins {
+        warnings += 1;
+        let _ = writeln!(
+            output,
+            "  [warn] ledger-pin {id}: recorded manifest hash differs from the bundled \
+             catalog; re-run `bitty plugin install {id}` to re-pin and re-consent"
+        );
+    }
+
+    if repair {
+        let mut repair_failures = 0usize;
+        let _ = writeln!(output, "\nrepair:");
+        if let Some(root) = store_root {
+            match package::repair_store(root) {
+                Ok(report) => {
+                    for (from, to) in &report.quarantined {
+                        let _ = writeln!(output, "  quarantined {from} -> {to}");
+                    }
+                    for removed in &report.staging_removed {
+                        let _ = writeln!(output, "  removed staging {removed}");
+                    }
+                    for warning in &report.warnings {
+                        let _ = writeln!(output, "  warning: {warning}");
+                    }
+                    if report.index_rebuilt {
+                        let _ = writeln!(
+                            output,
+                            "  wrote current.json ({} record(s))",
+                            report.records_written
+                        );
+                    }
+                    if report.quarantined.is_empty()
+                        && report.staging_removed.is_empty()
+                        && !report.index_rebuilt
+                    {
+                        let _ = writeln!(output, "  store already consistent");
+                    }
+                }
+                Err(error) => {
+                    repair_failures += 1;
+                    let _ = writeln!(output, "  [fail] store repair failed: {error}");
+                }
+            }
+            // Store records that shadow bundled ids are removed explicitly;
+            // repair_store intentionally keeps them out of the rebuild.
+            if let Ok(records) = load_index(root) {
+                for record in records {
+                    if bundled_manifest_for(&record.plugin_id).is_some() {
+                        match package::uninstall(root, &record.plugin_id) {
+                            Ok(_) => {
+                                let _ = writeln!(
+                                    output,
+                                    "  removed shadowing store record {}",
+                                    record.plugin_id
+                                );
+                            }
+                            Err(error) => {
+                                repair_failures += 1;
+                                let _ = writeln!(
+                                    output,
+                                    "  [fail] cannot remove shadowing record {}: {error}",
+                                    record.plugin_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ledger.error.is_some() {
+            let nonce = doctor_nonce();
+            let quarantined = state_path.with_file_name(format!(
+                "{}.corrupt-{nonce}",
+                state_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "bitty-plugins.toml".to_string())
+            ));
+            match std::fs::rename(state_path, &quarantined) {
+                Ok(()) => {
+                    let _ = writeln!(output, "  quarantined ledger -> {}", quarantined.display());
+                    match save_state(state_path, &PluginState::new()) {
+                        Ok(_) => {
+                            let _ = writeln!(output, "  wrote an empty valid ledger");
+                        }
+                        Err(failure) => {
+                            repair_failures += 1;
+                            let _ = writeln!(
+                                output,
+                                "  [fail] cannot write a fresh ledger: {}",
+                                failure.message
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    repair_failures += 1;
+                    let _ = writeln!(
+                        output,
+                        "  [fail] cannot quarantine '{}': {error} (check ownership/permissions)",
+                        state_path.display()
+                    );
+                }
+            }
+        } else if let Some(mut state) = ledger.state.take() {
+            let unknown = ledger.unknown_ids.clone();
+            if !unknown.is_empty() {
+                for id in &unknown {
+                    state.remove(id);
+                }
+                match save_state(state_path, &state) {
+                    Ok(backup) => {
+                        let _ = writeln!(
+                            output,
+                            "  removed {} stale ledger record(s) ({})",
+                            unknown.len(),
+                            unknown.join(", ")
+                        );
+                        if let Some(backup) = backup {
+                            let _ =
+                                writeln!(output, "  previous ledger kept at {}", backup.display());
+                        }
+                    }
+                    Err(failure) => {
+                        repair_failures += 1;
+                        let _ = writeln!(
+                            output,
+                            "  [fail] cannot rewrite ledger: {}",
+                            failure.message
+                        );
+                    }
+                }
+            } else {
+                let _ = writeln!(output, "  ledger already consistent");
+            }
+        }
+        let _ = writeln!(
+            output,
+            "\nresult: {}",
+            if repair_failures == 0 {
+                format!(
+                    "repair completed ({warnings} finding(s) were addressed); \
+                     re-run `bitty plugin doctor` to confirm"
+                )
+            } else {
+                format!("repair finished with {repair_failures} failure(s)")
+            }
+        );
+        return if repair_failures == 0 {
+            EXIT_OK
+        } else {
+            EXIT_GENERIC
+        };
+    }
+
+    if failures + warnings == 0 {
+        let _ = writeln!(output, "\nresult: healthy");
+        EXIT_OK
+    } else {
+        let _ = writeln!(
+            output,
+            "\nresult: {} failure(s), {warnings} warning(s); run `bitty plugin doctor --repair`",
+            failures
+        );
+        EXIT_GENERIC
+    }
+}
+
+/// Monotonic nonce for ledger quarantine names.
+fn doctor_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
 /// Uninstall one installed store record (destructive; requires `--force`).
 fn uninstall_store(
     store_root: &Option<PathBuf>,
@@ -4958,17 +5621,31 @@ fn uninstall_store(
     };
     match package::uninstall(store_root, id) {
         Ok(report) => {
-            let _ = writeln!(
-                output,
-                "bitty plugin: removed '{}' (version {}, {} package tree)",
-                report.plugin_id,
-                report.version,
-                if report.tree_removed {
-                    "deleted"
-                } else {
-                    "already absent"
-                }
-            );
+            if report.record_removed {
+                let _ = writeln!(
+                    output,
+                    "bitty plugin: removed '{}' (version {}, {} package tree)",
+                    report.plugin_id,
+                    report.version,
+                    if report.tree_removed {
+                        "deleted"
+                    } else {
+                        "already absent"
+                    }
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "bitty plugin: removed orphaned package directory for '{}' (no store \
+                     record; {} package tree) — reinstall from its source to restore it",
+                    report.plugin_id,
+                    if report.tree_removed {
+                        "deleted"
+                    } else {
+                        "already absent"
+                    }
+                );
+            }
             EXIT_OK
         }
         Err(error) => {
@@ -4978,13 +5655,36 @@ fn uninstall_store(
     }
 }
 
-/// Interactive consent for capabilities a local install newly requests.
+/// Interactive consent for package repair and newly requested capabilities.
+///
+/// A repair prompt comes first because replacing an existing version directory
+/// is destructive; declining either prompt commits nothing. `--yes` approves
+/// both non-interactively, while `--force` bypasses only the repair prompt.
 fn ask_source_consent(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     request: &package::ConsentRequest,
     source: &str,
 ) -> Result<bool, PluginFailure> {
+    if let Some(replacement) = &request.replacement {
+        let _ = writeln!(
+            output,
+            "bitty plugin: existing package content for '{}' version {} conflicts with '{source}':",
+            request.plugin_id, request.version
+        );
+        let _ = writeln!(output, "  {}", replacement.detail);
+        let _ = writeln!(output, "  path: {}", replacement.root);
+        if !ask_yes_no(
+            input,
+            output,
+            "Replace it? (or re-run with --force; no plugin code runs) [y/N] ",
+        )? {
+            return Ok(false);
+        }
+    }
+    if request.added.is_empty() {
+        return Ok(true);
+    }
     let _ = writeln!(
         output,
         "bitty plugin: '{}' (version {}, manifest {}) from '{source}' requests new capabilities:",
@@ -4998,10 +5698,21 @@ fn ask_source_consent(
             .unwrap_or_else(|_| "unknown capability".to_string());
         let _ = writeln!(output, "  - {capability} — {effect}");
     }
-    // Bounded read (bitty#1919): same helper as `ask_consent` so a large
-    // piped answer cannot grow memory without bound.
+    ask_yes_no(input, output, "Grant these capabilities? [y/N] ")
+}
+
+/// Bounded yes/no read shared by repair and capability prompts.
+///
+/// Uses [`read_plugin_consent_answer`] so a large piped answer cannot grow
+/// memory without bound (bitty#1919); EOF or too many invalid answers aborts
+/// with nothing changed.
+fn ask_yes_no(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+) -> Result<bool, PluginFailure> {
     for attempt in 1..=MAX_CONSENT_ATTEMPTS {
-        let _ = write!(output, "Grant these capabilities? [y/N] ");
+        let _ = write!(output, "{prompt}");
         let _ = output.flush();
         let Some(answer) = read_plugin_consent_answer(input, output, attempt) else {
             continue;
@@ -5949,6 +6660,23 @@ mod tests {
             parse_error(&["install", "a", "--format", "json"]).contains("only apply to `list`")
         );
         assert!(parse_error(&["remove", "a", "--no-color"]).contains("only apply to `list`"));
+        assert!(parse_error(&["list", "--repair"]).contains("--repair only applies"));
+        assert!(parse_error(&["install", "a", "--repair"]).contains("--repair only applies"));
+    }
+
+    #[test]
+    fn parse_doctor_and_install_force() {
+        let doctor = parse_ok(&["doctor"]);
+        assert_eq!(doctor.verb, PluginVerb::Doctor);
+        assert!(!doctor.repair);
+        let repair = parse_ok(&["doctor", "--repair"]);
+        assert!(repair.repair);
+        let forced = parse_ok(&["install", "./plugin", "--force"]);
+        assert!(forced.force);
+        assert!(
+            parse_error(&["doctor", "extra"]).contains("takes no plugin id"),
+            "doctor takes no operand"
+        );
     }
 
     #[test]

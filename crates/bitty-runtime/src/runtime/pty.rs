@@ -1171,13 +1171,18 @@ impl Runtime {
                 // rich registry. Registration mirrors headless admission
                 // (`State::kitty_place`): virtual children of a parent and
                 // spanless prototypes are refused there, so only
-                // admittable prototypes register here; the alternate
-                // screen suppresses rich registration while terminal truth
-                // keeps its own on-alt scoping. Quota refusals fail closed
-                // and silent (this branch never warns).
+                // admittable prototypes register here. The prototype lands
+                // on the plane the grid currently shows
+                // ([`Self::sync_kitty_screen`]): entering the alternate
+                // screen detaches the main plane first, so an `a=p,U=1`
+                // emitted on alt registers on the alt plane and on leave
+                // it dies with that plane like any other alt entry. Quota
+                // refusals fail closed and silent (this branch never
+                // warns).
                 if let Some((cols, rows, image, placement, has_parent)) = register_bodiless_virtual
                 {
-                    if !has_parent && (cols != 0 || rows != 0) && !self.state.alt_screen_active() {
+                    if !has_parent && (cols != 0 || rows != 0) {
+                        self.sync_kitty_screen();
                         let base = self.state.scrollback_len();
                         let origin = self.kitty_origin;
                         let _ = self.kitty_images.register_virtual_for_origin(

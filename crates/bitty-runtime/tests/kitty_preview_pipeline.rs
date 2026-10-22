@@ -24,12 +24,17 @@ use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId}
 const PRIMARY: ViewId = ViewId::new(1);
 const PANE: ViewId = ViewId::new(2);
 
-/// Kitty row/column diacritics 0..=9 (`rowcolumn-diacritics.txt`), the
-/// prefix yazi 26.x embeds in its KGP driver.
-const DIACRITICS: [char; 10] = [
-    '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
-    '\u{0346}', '\u{034A}',
-];
+/// Diacritic scalar for tile index `index`, resolved through the public
+/// decoder (the frozen `rowcolumn-diacritics` table itself is private):
+/// scan the combining-mark ranges for the table member.
+fn diacritic(index: u8) -> char {
+    (0x0300u32..=0x2DFF)
+        .chain(0xA66F..=0xAAC1)
+        .chain(0xFE20..=0xFE2F)
+        .filter_map(char::from_u32)
+        .find(|c| bitty_term_state::diacritic_index(*c) == Some(index))
+        .expect("diacritic table member")
+}
 
 /// 8x8 opaque red PNG (`crates/bitty-runtime/tests/fixtures`).
 const RED_PNG: &[u8] = include_bytes!("fixtures/kitty-red-8x8.png");
@@ -84,9 +89,22 @@ fn pane_frame(rt: &Runtime) -> (u16, u16, i32, i32) {
     (frame.cols, frame.rows, frame.content.x, frame.content.y)
 }
 
+/// Content origin of the primary leaf in window space.
+fn primary_origin(rt: &Runtime) -> (i32, i32) {
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == PRIMARY)
+        .expect("primary presented");
+    (frame.content.x, frame.content.y)
+}
+
 /// Bounds + count of opaque red pixels in the presented frame.
 fn red_bounds(rt: &Runtime) -> Option<(usize, usize, usize, usize, usize)> {
-    let extent = rt.config().window_extent();
+    // The presented surface follows resizes; the config extent does not.
+    let extent = rt
+        .surface_extent()
+        .unwrap_or_else(|| rt.config().window_extent());
     let width = usize::try_from(extent.width()).ok()?;
     let rgba = rt.headless_rgba()?;
     let mut min_x = usize::MAX;
@@ -125,19 +143,15 @@ fn yazi_shape(id: u32, width: u32, height: u32, at_row: u16, at_col: u16) -> Vec
     // default metrics so the span is exact for these fixture sizes.
     let cols = width.div_ceil(9) as usize;
     let rows = height.div_ceil(19) as usize;
-    assert!(
-        cols <= DIACRITICS.len() && rows <= DIACRITICS.len(),
-        "fixture exceeds the embedded diacritic table"
-    );
-    for (y, row_mark) in DIACRITICS.iter().take(rows).enumerate() {
+    for y in 0..rows {
         out.extend_from_slice(format!("\x1b[{};{}H", at_row + y as u16 + 1, at_col + 1).as_bytes());
-        for col_mark in DIACRITICS.iter().take(cols) {
+        for col in 0..cols {
             let mut buf = [0u8; 4];
             out.extend_from_slice('\u{10EEEE}'.encode_utf8(&mut buf).as_bytes());
             let mut mark = [0u8; 4];
-            out.extend_from_slice(row_mark.encode_utf8(&mut mark).as_bytes());
+            out.extend_from_slice(diacritic(y as u8).encode_utf8(&mut mark).as_bytes());
             let mut mark = [0u8; 4];
-            out.extend_from_slice(col_mark.encode_utf8(&mut mark).as_bytes());
+            out.extend_from_slice(diacritic(col as u8).encode_utf8(&mut mark).as_bytes());
         }
     }
     out
@@ -159,8 +173,8 @@ fn yazi_placeholder_run_paints_a_real_image() {
     assert!(rt.tick().is_some(), "placeholder run forces a present");
     assert_eq!(
         rt.kitty_last_frame_images(),
-        4,
-        "one real image blit per placeholder row"
+        1,
+        "the whole span is one image blit, not one per placeholder row"
     );
     let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("placeholder image painted");
     // Pane content + window padding (8px) is the grid origin; the run
@@ -327,7 +341,11 @@ fn alt_screen_placeholder_preview_paints_and_main_plane_restores() {
     rt.handle_pane_bytes(PANE, &yazi_shape(alt_id, 80, 76, 2, 0));
     rt.tick();
     assert_eq!(rt.kitty_virtual_count(), 1, "alt prototype is live");
-    assert!(rt.kitty_last_frame_images() >= 4, "alt preview paints");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "alt preview paints as one image blit"
+    );
     assert!(red_bounds(&rt).is_some(), "alt placeholder image visible");
 
     rt.handle_pane_bytes(PANE, b"\x1b[?1049l");
@@ -406,4 +424,108 @@ fn missing_local_image_clears_a_previous_placement() {
     );
     assert!(rt.tick().is_some(), "clear forces a present");
     assert!(red_bounds(&rt).is_none(), "no stale pixels remain");
+}
+
+#[test]
+fn tall_placeholder_span_paints_every_row_with_one_blit() {
+    // Review of #2442 (P1): the per-row paint path spent one blit per
+    // placeholder row and hit KITTY_PRESENT_MAX_BLITS_PER_FRAME (32),
+    // truncating any preview taller than 32 rows and starving direct
+    // placements behind it. A 50-row span on a tall grid must paint every
+    // row and cost exactly one blit for the whole image.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    // 736x1536 physical at the 9x19 default cell = 80 columns x 80 rows
+    // (8px window padding is subtracted by the resize math).
+    rt.handle_resize(bitty_platform::PhysicalSize::new(736, 1536))
+        .expect("tall resize");
+    assert!(
+        rt.state().height() >= 55 && rt.state().width() >= 9,
+        "fixture needs a grid taller than the 50-row span, got {}x{}",
+        rt.state().width(),
+        rt.state().height()
+    );
+    // The first tick after a resize still presents the pre-reflow leaf
+    // size; the second one runs at the reflowed extent.
+    rt.tick();
+    rt.tick();
+    let (origin_x, origin_y) = primary_origin(&rt);
+    let id = 0x020304u32;
+    let rows = 50u32;
+    // 80x950 px -> 9 columns x 50 rows at 9x19: taller than the 32-blit cap.
+    rt.handle_pty_bytes(&yazi_shape(id, 80, 19 * rows, 5, 0));
+    assert_eq!(rt.kitty_virtual_count(), 1, "spanless U=1 registers");
+    assert!(rt.tick().is_some(), "placeholder span presents");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "one blit for the whole image, not one per row"
+    );
+    let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("tall preview painted");
+    assert_eq!(x0, usize::try_from(origin_x).unwrap() + 8, "window padding");
+    assert_eq!(
+        y0,
+        usize::try_from(origin_y).unwrap() + 8 + 5 * 19,
+        "grid row 5 below the window padding"
+    );
+    assert_eq!(x1 - x0 + 1, 80);
+    assert_eq!(
+        y1 - y0 + 1,
+        19 * rows as usize,
+        "the full 50-row span is painted, not truncated at 32"
+    );
+    assert_eq!(
+        count,
+        80 * 19 * rows as usize,
+        "every row of the span is painted"
+    );
+}
+
+#[test]
+fn two_step_transmit_then_bodiless_virtual_paints() {
+    // Review of #2442 (P2): the canonical two-step form (`a=t` transmits,
+    // then a bodiless `a=p,U=1` registers the prototype) stored
+    // `image: None`, so the paint path drew nothing. The image resolves
+    // through the origin-scoped wire map at paint time instead.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    let (origin_x, origin_y) = primary_origin(&rt);
+    let id = 55u32;
+    // 18x19 opaque red pixels, transmitted only (no placement).
+    let rgba = [255u8, 0, 0, 255].repeat(18 * 19);
+    let seq = format!(
+        "\x1b_Ga=t,f=32,s=18,v=19,i={id},m=0;{}\x1b\\",
+        base64(&rgba)
+    );
+    rt.handle_pty_bytes(seq.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1, "transmit stores pixels");
+    assert_eq!(rt.kitty_placement_count(), 0, "transmit places nothing");
+    // Bodiless virtual placement naming the transmitted image.
+    rt.handle_pty_bytes(format!("\x1b_Ga=p,U=1,i={id},c=2,r=1\x1b\\").as_bytes());
+    assert_eq!(rt.kitty_virtual_count(), 1, "bodiless prototype registers");
+    assert_eq!(rt.kitty_placement_count(), 0, "still no blit placement");
+    // Two placeholder cells (row 0, columns 0 and 1), id 55 truecolor.
+    let mut run = String::from("\x1b[38;2;0;0;55m");
+    for col in 0..2u8 {
+        let mut buf = [0u8; 4];
+        run.push_str('\u{10EEEE}'.encode_utf8(&mut buf));
+        let mut mark = [0u8; 4];
+        run.push_str(diacritic(0).encode_utf8(&mut mark));
+        let mut mark = [0u8; 4];
+        run.push_str(diacritic(col).encode_utf8(&mut mark));
+    }
+    run.push_str("\x1b[39m");
+    rt.handle_pty_bytes(run.as_bytes());
+    assert!(rt.tick().is_some(), "placeholder run presents");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "the two-step form paints one image blit"
+    );
+    let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("two-step image painted");
+    assert_eq!(x0, usize::try_from(origin_x).unwrap() + 8, "window padding");
+    assert_eq!(y0, usize::try_from(origin_y).unwrap() + 8, "window padding");
+    assert_eq!(x1 - x0 + 1, 18);
+    assert_eq!(y1 - y0 + 1, 19);
+    assert_eq!(count, 18 * 19);
 }

@@ -196,13 +196,18 @@
 //! - Deletion mirrors terminal truth (`bitty-term-state::placement`):
 //!   unpinned `d=i` clears every prototype of the image, pinned deletes
 //!   spare them (any prototype still serves runs), pin `0` names nothing;
-//!   `d=a` and alternate-screen suppression keep them (`clear_origin`
-//!   stays placements-only) while `ED 2`/`ED 22`/`FullReset`
-//!   (`clear_virtual_for_origin`), pane teardown (`retire_origin`), and
-//!   image eviction (linked combined-form prototypes cascade) drop them.
+//!   `d=a` keeps them (`clear_origin` stays placements-only) and the
+//!   alternate-screen plane swap detaches and re-attaches them with the
+//!   plane ([`KittyImageLayer::take_virtuals_for`] /
+//!   [`KittyImageLayer::restore_virtuals`]), while `ED 2`/`ED 22`/
+//!   `FullReset` (`clear_virtual_for_origin`), pane teardown
+//!   (`retire_origin`), and image eviction (linked combined-form
+//!   prototypes cascade) drop them.
 //! - Combined-form prototypes link their stored image (`Some` handle);
 //!   bodiless prototypes carry `None` and explicit spans only (`0` sides
-//!   derive `>= 1` cell, as in [`crate::kitty_unicode`]).
+//!   derive `>= 1` cell, as in [`crate::kitty_unicode`]), and the present
+//!   layer resolves their image through the origin-scoped wire map
+//!   ([`KittyImageLayer::find_root_for_origin`]).
 //!
 //! # Determinism
 //!
@@ -837,7 +842,9 @@ pub struct KittyVirtualPrototype {
     /// never singly addressable).
     pub wire_placement: u32,
     /// Linked stored image for the combined `a=T,U=1` form (`None` for
-    /// bodiless `a=p,U=1`, which carries no pixels).
+    /// bodiless `a=p,U=1`: that form carries no pixels, so the present
+    /// layer resolves the image through the origin-scoped wire map at
+    /// paint time — canonical `a=t` then `a=p,U=1`).
     pub image: Option<KittyImageId>,
     /// Explicit `c=` span columns (`0` derives, see below).
     pub cols: u16,
@@ -2421,10 +2428,12 @@ impl KittyImageLayer {
     /// Drops every placement of `origin`, keeping other origins and all
     /// stored images (CTX-0254).
     ///
-    /// Alternate-screen entry calls this for the entering origin only, so
-    /// one pane's fullscreen app never wipes another pane's images.
-    /// Images left without placements stay inert (never painted) and age
-    /// out under the store caps.
+    /// Alternate-screen plane swaps call this for the swapped origin only:
+    /// entering alt starts the fresh alt plane empty, and leaving alt
+    /// clears the alt plane before main is re-attached, so one pane's
+    /// fullscreen app never wipes another pane's images. Images left
+    /// without placements stay inert (never painted) and age out under the
+    /// store caps.
     pub fn clear_origin(&mut self, origin: Option<u64>) {
         self.placements.retain(|p| p.origin != origin);
     }
@@ -2438,8 +2447,8 @@ impl KittyImageLayer {
     /// images must not keep occupying the shared image/byte caps after
     /// the pane is gone (S5 refuses cross-origin eviction, so leaked
     /// slots would block other origins with
-    /// [`KittyPlacementError::QuotaExceeded`]). Alternate-screen entry,
-    /// protocol deletion, and display-erase clearing keep using
+    /// [`KittyPlacementError::QuotaExceeded`]). Alternate-screen plane
+    /// swaps, protocol deletion, and display-erase clearing keep using
     /// `clear_origin` (placements drop, images stay inert under the
     /// store caps).
     pub fn retire_origin(&mut self, origin: Option<u64>) {
@@ -2480,7 +2489,7 @@ impl KittyImageLayer {
     /// refusal leaves no new image and never discards FIFO-evicted images
     /// (S5, #1849): `store_for_origin` may evict the origin's own oldest
     /// images, which a post-store rollback could not restore. Non-display
-    /// and alternate-screen paths store without placing and skip this.
+    /// paths store without placing and skip this.
     ///
     /// S4 (#1849): the budget is shared with virtual prototypes, so both
     /// deques count; eviction stays same-kind (a blit never evicts a

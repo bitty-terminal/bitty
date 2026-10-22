@@ -14,7 +14,7 @@
 //! [`bitty_rich::kitty_seam`] traits; the graphics extension implements the
 //! same traits on its side, and Core never depends on extension internals.
 //! Placement policy (admission, per-origin quotas, origin
-//! tagging, alternate-screen suppression) is unchanged and unit-tested in
+//! tagging, alternate-screen plane swaps) is unchanged and unit-tested in
 //! `bitty-rich`.
 //!
 //! Stored bytes count against the transmitting stream's origin (S5

@@ -320,7 +320,7 @@ fn maximal_row_placement_bounds_scroll_work() {
     // spec-correct fail-closed result; the bounded-scroll assertions above
     // are the point of this pin.
     assert!(rt.tick().is_some());
-    assert!(rt.kitty_last_frame_images() <= 1);
+    assert_eq!(rt.kitty_last_frame_images(), 0);
 }
 
 #[test]

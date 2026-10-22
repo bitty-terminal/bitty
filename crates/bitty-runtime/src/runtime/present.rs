@@ -609,6 +609,168 @@ fn clip_blit_around_floats(
     pieces
 }
 
+/// One stored image's visible `U+10EEEE` coverage inside one leaf.
+///
+/// Runs of one prototype are gathered across every visible row so the
+/// present layer rasterizes and blits the image once (review of #2442): a
+/// per-row blit truncated previews taller than
+/// [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] and starved direct
+/// placements queued behind them.
+struct KittyUnicodeRunGroup {
+    /// Wire `i=` image id of the prototype (animation frame lookup).
+    wire_image: u32,
+    /// Wire `p=` placement id of the prototype (`0` anonymous).
+    wire_placement: u32,
+    /// Stored image: the prototype's linked handle (combined `a=T,U=1`) or
+    /// the origin-scoped wire-map root (bodiless `a=p,U=1`).
+    image: bitty_rich::KittyImageId,
+    /// The complete image fitted into the prototype's cell span. Every run
+    /// of the group resolves the same span, so this is shared.
+    full: bitty_rich::geometry::RectPx,
+    /// Viewport-clipped crop painted by each run.
+    rects: Vec<bitty_rich::geometry::RectPx>,
+}
+
+/// Bounding box of the visible run rects, in content space.
+///
+/// The present layer scales the image into the group's fitted `full` rect
+/// and emits the union window once; callers mask the raster back to the
+/// exact run coverage when the union holds gaps.
+fn unicode_rect_union(
+    rects: &[bitty_rich::geometry::RectPx],
+) -> Option<bitty_rich::geometry::RectPx> {
+    let first = *rects.first()?;
+    let mut x0 = i64::from(first.x);
+    let mut y0 = i64::from(first.y);
+    let mut x1 = x0.saturating_add(i64::from(first.width));
+    let mut y1 = y0.saturating_add(i64::from(first.height));
+    for rect in &rects[1..] {
+        x0 = x0.min(i64::from(rect.x));
+        y0 = y0.min(i64::from(rect.y));
+        x1 = x1.max(i64::from(rect.x).saturating_add(i64::from(rect.width)));
+        y1 = y1.max(i64::from(rect.y).saturating_add(i64::from(rect.height)));
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let to_i32 =
+        |value: i64| i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX });
+    Some(bitty_rich::geometry::RectPx::new(
+        to_i32(x0),
+        to_i32(y0),
+        u32::try_from(x1 - x0).unwrap_or(u32::MAX),
+        u32::try_from(y1 - y0).unwrap_or(u32::MAX),
+    ))
+}
+
+/// Whether `rects` tile `union` exactly: every rect spans the union's full
+/// width and the rects cover its rows once, without gaps or overlap.
+///
+/// Full-bleed placeholder previews (yazi's one run per image row) hit this
+/// shape, so their union raster is byte-identical to the image and stays
+/// cacheable; sparse runs take the masked path instead.
+fn unicode_rects_cover_union(
+    union: bitty_rich::geometry::RectPx,
+    rects: &[bitty_rich::geometry::RectPx],
+) -> bool {
+    if rects.is_empty() {
+        return false;
+    }
+    let x0 = i64::from(union.x);
+    let x1 = x0.saturating_add(i64::from(union.width));
+    let y0 = i64::from(union.y);
+    let y1 = y0.saturating_add(i64::from(union.height));
+    if rects.iter().any(|rect| {
+        i64::from(rect.x) != x0 || i64::from(rect.x).saturating_add(i64::from(rect.width)) != x1
+    }) {
+        return false;
+    }
+    let mut bands: Vec<(i64, i64)> = rects
+        .iter()
+        .map(|rect| {
+            (
+                i64::from(rect.y),
+                i64::from(rect.y).saturating_add(i64::from(rect.height)),
+            )
+        })
+        .collect();
+    bands.sort_unstable();
+    let mut cursor = y0;
+    for (start, end) in bands {
+        if start != cursor {
+            return false;
+        }
+        cursor = end;
+    }
+    cursor == y1
+}
+
+/// Zeroes the pixels of a union raster that no `U+10EEEE` run covers.
+///
+/// The union blit is one bounding box for the whole image; between runs
+/// (an erased line, a non-placeholder column) the grid text must stay
+/// visible, so uncovered pixels are made transparent (straight alpha) and
+/// composite as a no-op. Coverage is one byte per union pixel, filled from
+/// the disjoint run rects, so the work is bounded by the union area already
+/// admitted to the frame budget.
+fn mask_uncovered_unicode_pixels(
+    rgba: &mut [u8],
+    union: bitty_rich::geometry::RectPx,
+    rects: &[bitty_rich::geometry::RectPx],
+) {
+    let width = union.width as usize;
+    let height = union.height as usize;
+    let Some(area) = width.checked_mul(height) else {
+        return;
+    };
+    if area == 0 || rgba.len() != area.saturating_mul(4) {
+        return;
+    }
+    let mut covered = vec![0u8; area];
+    let union_x0 = i64::from(union.x);
+    let union_y0 = i64::from(union.y);
+    let union_x1 = union_x0.saturating_add(i64::from(union.width));
+    let union_y1 = union_y0.saturating_add(i64::from(union.height));
+    for rect in rects {
+        let x0 = i64::from(rect.x).max(union_x0);
+        let x1 = i64::from(rect.x)
+            .saturating_add(i64::from(rect.width))
+            .min(union_x1);
+        let y0 = i64::from(rect.y).max(union_y0);
+        let y1 = i64::from(rect.y)
+            .saturating_add(i64::from(rect.height))
+            .min(union_y1);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let col_start = usize::try_from(x0 - union_x0).unwrap_or(0);
+        let col_end = usize::try_from(x1 - union_x0).unwrap_or(width);
+        for row in y0..y1 {
+            let Ok(offset) = usize::try_from(row - union_y0) else {
+                continue;
+            };
+            let Some(base) = offset.checked_mul(width) else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (base.checked_add(col_start), base.checked_add(col_end))
+            else {
+                continue;
+            };
+            if let Some(slice) = covered.get_mut(start..end) {
+                slice.fill(1);
+            }
+        }
+    }
+    for (index, flag) in covered.iter().enumerate() {
+        if *flag == 0 {
+            let base = index.saturating_mul(4);
+            if let Some(pixel) = rgba.get_mut(base..base.saturating_add(4)) {
+                pixel.fill(0);
+            }
+        }
+    }
+}
+
 /// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
 /// leaf allocation with erased cells. Cursor/modes/title ride along so the
 /// overlay gates (cursor paints on the focused view only) stay total.
@@ -4764,16 +4926,32 @@ impl Runtime {
     /// (letterboxed) exactly like a direct placement, and the run's cells
     /// become the destination rect of a crop of that fitted image.
     ///
-    /// Rows resolve in grid space and are translated to viewport space by
+    /// A prototype is either linked to a stored image (combined
+    /// `a=T,U=1`) or bodiless (`a=p,U=1`, `image: None`): the bodiless
+    /// form resolves its image through the origin-scoped wire map the
+    /// animation seams use
+    /// ([`bitty_rich::KittyImageLayer::find_root_for_origin`]), so the
+    /// canonical `a=t` then `a=p,U=1` two-step form paints.
+    ///
+    /// Runs resolve in grid space and are translated to viewport space by
     /// the same cursor-follow window as [`viewport_snapshot`]. Scrolled
     /// views paint nothing here: placeholder runs decode from the active
     /// grid only, so a scrollback composition has no run cells to anchor
-    /// them. Alternate-screen origins keep the existing suppression (the
-    /// fullscreen app owns the pixels; virtual prototypes stay inert and
-    /// repaint when the origin returns).
+    /// them. The alternate screen is no exception: the origin paints the
+    /// live plane its grid shows (main or alt, swapped by
+    /// [`Self::sync_kitty_screen_for`]), and the alt plane's own
+    /// prototypes serve its runs.
     ///
-    /// Same bounded budget as direct placements: each run is one blit
-    /// (32 per frame / 64 MiB) and is skipped fail-closed past the caps.
+    /// Every run of one image is gathered first and rasterized once: the
+    /// visible rects are unioned (clipped to the viewport) and the image
+    /// is emitted as one blit, masked back to the exact run coverage when
+    /// the runs leave gaps. A per-row blit truncated spans taller than
+    /// [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] and starved
+    /// direct placements behind them.
+    ///
+    /// Same bounded budget as direct placements (32 blits / 64 MiB per
+    /// frame): past the caps the remaining images are skipped fail-closed
+    /// in paint order.
     #[allow(clippy::too_many_arguments)]
     fn paint_kitty_unicode_runs(
         &mut self,
@@ -4817,6 +4995,10 @@ impl Runtime {
             metrics.width.saturating_mul(u32::from(frame.cols)),
             metrics.height.saturating_mul(u32::from(frame.rows)),
         );
+        // Gather every visible run per image before rasterizing: one image
+        // must cost one blit no matter how many rows its span covers, or a
+        // tall preview truncates at the per-frame cap.
+        let mut groups: Vec<KittyUnicodeRunGroup> = Vec::new();
         for local_row in 0..usize::from(frame.rows) {
             let grid_row = window_start.saturating_add(local_row);
             let runs = match origin {
@@ -4833,10 +5015,15 @@ impl Runtime {
                 let Some(proto) = self.kitty_images.get_virtual(origin, key.0, key.1) else {
                     continue;
                 };
-                let Some(image) = proto.image else {
-                    continue;
-                };
-                let Some(stored) = self.kitty_images.get(image) else {
+                // Bodiless `a=p,U=1` carries no handle: its pixels arrive
+                // in an earlier transmit, so resolve the prototype's image
+                // through the origin-scoped wire map (canonical two-step
+                // form). The combined form keeps its linked handle.
+                let image = proto.image.or_else(|| {
+                    self.kitty_images
+                        .find_root_for_origin(origin, proto.wire_image)
+                });
+                let Some(image) = image else {
                     continue;
                 };
                 let run = bitty_term_state::KittyUnicodeRun {
@@ -4866,73 +5053,118 @@ impl Runtime {
                 let Some(visible) = visible.intersection(&viewport) else {
                     continue;
                 };
-                let frame_no = self.kitty_current_frame_for(origin, proto.wire_image);
-                let Some((frame_width, frame_height, frame_bytes)) =
-                    self.kitty_images.frame_bytes(image, frame_no)
-                else {
-                    continue;
-                };
-                let need = (u64::from(visible.width) * u64::from(visible.height))
-                    .checked_mul(4)
-                    .filter(|&n| n <= usize::MAX as u64)
-                    .map(|n| n as usize);
-                let Some(need) = need else {
-                    continue;
-                };
-                if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
-                    continue;
+                // Group by (wire identity, fitted span): a well-formed
+                // client's rows all name one span, so its whole image is
+                // one group; inconsistent run geometry keeps its own
+                // group instead of painting under the wrong transform.
+                match groups.iter_mut().find(|group| {
+                    group.wire_image == proto.wire_image
+                        && group.wire_placement == proto.wire_placement
+                        && group.full == tile.full
+                }) {
+                    Some(group) => group.rects.push(visible),
+                    None => groups.push(KittyUnicodeRunGroup {
+                        wire_image: proto.wire_image,
+                        wire_placement: proto.wire_placement,
+                        image,
+                        full: tile.full,
+                        rects: vec![visible],
+                    }),
                 }
-                if bytes_this_frame.saturating_add(need)
-                    > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
-                {
-                    continue;
-                }
+            }
+        }
+        for group in groups {
+            let Some(stored) = self.kitty_images.get(group.image) else {
+                continue;
+            };
+            let Some(union) = unicode_rect_union(&group.rects) else {
+                continue;
+            };
+            let frame_no = self.kitty_current_frame_for(origin, group.wire_image);
+            let Some((frame_width, frame_height, frame_bytes)) =
+                self.kitty_images.frame_bytes(group.image, frame_no)
+            else {
+                continue;
+            };
+            let need = (u64::from(union.width) * u64::from(union.height))
+                .checked_mul(4)
+                .filter(|&n| n <= usize::MAX as u64)
+                .map(|n| n as usize);
+            let Some(need) = need else {
+                continue;
+            };
+            if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+                continue;
+            }
+            if bytes_this_frame.saturating_add(need) > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+            {
+                continue;
+            }
+            // Full-bleed rows (one run per image row) cover the union
+            // exactly, so the union raster is byte-identical to the image
+            // and stays cacheable. Sparse runs are masked to their exact
+            // coverage and stay out of the cache: the key names geometry,
+            // not the mask.
+            let dense = unicode_rects_cover_union(union, &group.rects);
+            let rgba = if dense {
                 let cache_key =
-                    bitty_rich::KittyRasterKey::for_image(stored, frame_no, tile.full, visible);
-                let rgba = if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
+                    bitty_rich::KittyRasterKey::for_image(stored, frame_no, group.full, union);
+                if let Some(hit) = self.kitty_raster_cache.get(&cache_key) {
                     hit
                 } else {
                     let Some(fresh) = self.kitty_graphics.rasterize_frame(
                         frame_width,
                         frame_height,
                         frame_bytes,
-                        tile.full,
-                        visible,
+                        group.full,
+                        union,
                     ) else {
                         continue;
                     };
                     let _ = self.kitty_raster_cache.insert(cache_key, fresh.clone());
                     fresh
-                };
-                let dest = bitty_render::geometry::RectPx::new(
-                    px_add(px_add(pad_px, frame.content.x), visible.x),
-                    px_add(px_add(pad_px, frame.content.y), visible.y),
-                    visible.width,
-                    visible.height,
-                );
-                let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
+                }
+            } else {
+                let Some(mut fresh) = self.kitty_graphics.rasterize_frame(
+                    frame_width,
+                    frame_height,
+                    frame_bytes,
+                    group.full,
+                    union,
+                ) else {
                     continue;
                 };
-                let pieces = if higher_floats.is_empty() {
-                    vec![blit]
-                } else {
-                    clip_blit_around_floats(blit, higher_floats)
-                };
-                for piece in pieces {
-                    if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
-                        continue;
-                    }
-                    let piece_need = piece.rgba.len();
-                    if bytes_this_frame.saturating_add(piece_need)
-                        > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
-                    {
-                        continue;
-                    }
-                    *blits_this_frame = blits_this_frame.saturating_add(1);
-                    *bytes_this_frame = bytes_this_frame.saturating_add(piece_need);
-                    layers.combined_images.push(piece);
-                    layers.any_needs_draw = true;
+                mask_uncovered_unicode_pixels(&mut fresh, union, &group.rects);
+                fresh
+            };
+            let dest = bitty_render::geometry::RectPx::new(
+                px_add(px_add(pad_px, frame.content.x), union.x),
+                px_add(px_add(pad_px, frame.content.y), union.y),
+                union.width,
+                union.height,
+            );
+            let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
+                continue;
+            };
+            let pieces = if higher_floats.is_empty() {
+                vec![blit]
+            } else {
+                clip_blit_around_floats(blit, higher_floats)
+            };
+            for piece in pieces {
+                if *blits_this_frame >= bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+                    continue;
                 }
+                let piece_need = piece.rgba.len();
+                if bytes_this_frame.saturating_add(piece_need)
+                    > bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME
+                {
+                    continue;
+                }
+                *blits_this_frame = blits_this_frame.saturating_add(1);
+                *bytes_this_frame = bytes_this_frame.saturating_add(piece_need);
+                layers.combined_images.push(piece);
+                layers.any_needs_draw = true;
             }
         }
     }
@@ -6931,5 +7163,59 @@ mod clip_width_cells_tests {
     #[test]
     fn empty_keeps_unit_floor() {
         assert_eq!(clip_to_width_cells("", 10), (String::new(), 1));
+    }
+}
+
+#[cfg(test)]
+mod unicode_run_union_tests {
+    use super::{mask_uncovered_unicode_pixels, unicode_rect_union, unicode_rects_cover_union};
+    use bitty_rich::geometry::RectPx;
+
+    #[test]
+    fn union_is_the_bounding_box() {
+        let rects = [RectPx::new(0, 0, 10, 10), RectPx::new(5, 8, 10, 10)];
+        assert_eq!(unicode_rect_union(&rects), Some(RectPx::new(0, 0, 15, 18)));
+        assert_eq!(unicode_rect_union(&[]), None);
+    }
+
+    #[test]
+    fn full_width_contiguous_rows_cover_the_union() {
+        let union = RectPx::new(0, 0, 8, 4);
+        assert!(unicode_rects_cover_union(
+            union,
+            &[RectPx::new(0, 0, 8, 2), RectPx::new(0, 2, 8, 2)]
+        ));
+        // A vertical gap leaves the union uncovered.
+        assert!(!unicode_rects_cover_union(
+            union,
+            &[RectPx::new(0, 0, 8, 1), RectPx::new(0, 3, 8, 1)]
+        ));
+        // A narrower row does not span the union.
+        assert!(!unicode_rects_cover_union(
+            union,
+            &[RectPx::new(0, 0, 4, 4)]
+        ));
+        assert!(!unicode_rects_cover_union(union, &[]));
+    }
+
+    #[test]
+    fn mask_zeroes_uncovered_pixels_only() {
+        let union = RectPx::new(0, 0, 4, 2);
+        let mut rgba = vec![255u8; 4 * 2 * 4];
+        mask_uncovered_unicode_pixels(
+            &mut rgba,
+            union,
+            &[RectPx::new(0, 0, 2, 1), RectPx::new(3, 1, 1, 1)],
+        );
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let base = (y * 4 + x) * 4;
+            [rgba[base], rgba[base + 1], rgba[base + 2], rgba[base + 3]]
+        };
+        assert_eq!(pixel(0, 0), [255; 4], "covered pixel untouched");
+        assert_eq!(pixel(1, 0), [255; 4]);
+        assert_eq!(pixel(2, 0), [0; 4], "uncovered column masked");
+        assert_eq!(pixel(3, 0), [0; 4]);
+        assert_eq!(pixel(3, 1), [255; 4], "covered cell on the second row");
+        assert_eq!(pixel(0, 1), [0; 4], "uncovered cell stays text-visible");
     }
 }

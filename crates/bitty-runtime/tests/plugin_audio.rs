@@ -65,7 +65,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: None,
         store_root: None,
@@ -73,8 +73,41 @@ fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
         third_party_roots,
         settings: Rc::new(MapSettings::default()),
         snapshot: Rc::new(StaticSnapshot),
-    })
+    });
+    rt.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    rt
 }
+
+/// RC-1 callback wall budget for this fixture harness (bitty#2432).
+///
+/// The same runner descheduling that makes a host call look slow also charges
+/// the whole stall to the RC-1 callback wall budget, so after the host-call
+/// deadline below is widened the fixture would still fail activation with
+/// `init.lua suspended: WallClockExceeded` (the bitty#2427 class) under the same
+/// contention. Every other load-sensitive runtime harness already widens this
+/// one dimension 10x (`command_invoke`, `plugin_debug`, `plugin_ui`,
+/// `bar_activation_budget`, `plugin_device_audio_native` — bitty#1744/#1727);
+/// instruction and memory stay at RC defaults and production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS`.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * bitty_lua::RC1_WALL_CLOCK_BUDGET_MS;
+
+/// Host-call deadline for this fixture harness (bitty#2432).
+///
+/// Production bounds every `bitty.*` call at
+/// [`bitty_lua::DEFAULT_HOST_DEADLINE_MS`] (the RC-1 50 ms slice) on a raw
+/// wall clock measured inside the call, so a runner that deschedules this
+/// thread mid-call is charged the whole stall: the activation `services.get` /
+/// `state.get` sequence here is a few table reads, yet CI reported
+/// `bar activates: Capture { .. "E_TIMEOUT: host call exceeded its deadline" }`
+/// at ~0.2 s into the test (bitty#2432). The deadline cannot be driven by a
+/// synthetic clock without re-plumbing the real `Instant` expiry every
+/// expiry-aware host service compares against its own `Instant::now()`, so this
+/// harness widens only that one dimension (10x, the bitty#1744/#1727
+/// treatment); [`HARNESS_WALL_BUDGET_MS`] covers the callback wall budget that
+/// the same stall also consumes. Production keeps `DEFAULT_HOST_DEADLINE_MS`;
+/// enforcement is pinned by `bitty-lua/tests/host_bridge.rs`.
+const HARNESS_HOST_CALL_DEADLINE_MS: u64 = 10 * bitty_lua::DEFAULT_HOST_DEADLINE_MS;
 
 /// Write a plugin package under `root/<id>/`.
 ///

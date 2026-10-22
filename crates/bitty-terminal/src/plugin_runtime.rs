@@ -864,6 +864,29 @@ mod tests {
         );
     }
 
+    /// Host-call deadline for the composition-root probes (bitty#2432).
+    ///
+    /// Production bounds every `bitty.*` call at
+    /// [`bitty_lua::DEFAULT_HOST_DEADLINE_MS`] (the RC-1 50 ms slice) on a raw
+    /// wall clock measured inside the call, so a runner that deschedules the
+    /// test thread mid-call is charged the whole stall. `fs.list` here reads two
+    /// seeded files, yet `main` reported
+    /// `list: dispatch failed: Vm("runtime error: E_TIMEOUT: host call exceeded
+    /// its deadline")` on a loaded shard (bitty#2432). A synthetic clock cannot
+    /// drive this deadline: the same value is handed to expiry-aware host
+    /// services as a real `Instant` deadline they compare against their own
+    /// `Instant::now()`. So the probe widens only that one dimension (10x, the
+    /// bitty#1744/#1727 treatment); production keeps
+    /// `DEFAULT_HOST_DEADLINE_MS`, and enforcement stays pinned by
+    /// `bitty-lua/tests/host_bridge.rs`.
+    ///
+    /// The RC-1 callback wall budget is left at production here because this
+    /// probe is the composition root and activation runs inside
+    /// `discover_with_roots`, before any seam could raise it; a stall long
+    /// enough to trip that budget surfaces as
+    /// `init.lua suspended: WallClockExceeded`, the bitty#2427 class.
+    const HARNESS_HOST_CALL_DEADLINE_MS: u64 = 10 * bitty_lua::DEFAULT_HOST_DEADLINE_MS;
+
     fn fs_list_probe_root(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -952,6 +975,10 @@ mod tests {
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
             .expect("dev root must yield a session");
         let mut runtime = session.runtime;
+        // bitty#2432: activation already ran inside `discover_with_roots`, so the
+        // deadline is widened on the live VMs (the bridge shares its deadline
+        // cell with the VM) before the probe dispatches `fs.list`.
+        runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
         let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
         // bitty #2409: `fs.list` reads host paths, so the probe settles an
         // RC-1 park on the cold ticks instead of assuming a synchronous value.

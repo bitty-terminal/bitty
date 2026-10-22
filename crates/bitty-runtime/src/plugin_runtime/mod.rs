@@ -863,6 +863,14 @@ pub struct PluginRuntime {
     /// integration tests (bitty#1744, same treatment as bitty#1727);
     /// production code never sets this.
     vm_wall_budget_ms: Option<u64>,
+    /// Harness override for the per-call host-call deadline (test-only).
+    ///
+    /// `None` keeps the production deadline ([`DEFAULT_HOST_DEADLINE_MS`], the
+    /// RC-1 50 ms slice). `Some(ms)` applies to the VMs of plugins activated
+    /// later and to the VMs already live, because the deadline is shared with
+    /// each installed bridge rather than baked in at install time. See
+    /// [`Self::set_host_call_deadline_ms`]; production code never sets it.
+    host_call_deadline_ms: Option<u64>,
     /// App-dispatched commands parked at the RC-1 wall budget (bitty #2314).
     ///
     /// At most one parked command per plugin and none per non-command
@@ -981,6 +989,7 @@ impl PluginRuntime {
             device_host,
             audio_host,
             vm_wall_budget_ms: None,
+            host_call_deadline_ms: None,
             parked_commands: BTreeMap::new(),
             timer_deadlines: BTreeMap::new(),
             timer_fired: BTreeSet::new(),
@@ -1092,6 +1101,48 @@ impl PluginRuntime {
     /// the bitty#1727 driver treatment); production never calls this.
     pub fn set_vm_wall_budget_ms(&mut self, wall_budget_ms: Option<u64>) {
         self.vm_wall_budget_ms = wall_budget_ms;
+    }
+
+    /// Effective per-call host-call deadline (production: 50 ms).
+    ///
+    /// Every `bitty.*` call is bounded by this deadline; the override exists
+    /// for load-sensitive harnesses only (see
+    /// [`Self::set_host_call_deadline_ms`]).
+    #[must_use]
+    pub fn host_call_deadline_ms(&self) -> u64 {
+        self.host_call_deadline_ms
+            .unwrap_or(DEFAULT_HOST_DEADLINE_MS)
+    }
+
+    /// Override the per-call host-call deadline (test-only).
+    ///
+    /// `None` restores the production deadline ([`DEFAULT_HOST_DEADLINE_MS`],
+    /// the RC-1 50 ms slice). The bridge measures a call on a raw wall clock
+    /// and charges a thread the runner deschedules mid-call the whole stall, so
+    /// a fixture whose provider Lua is microseconds of table work can still
+    /// report `E_TIMEOUT` under sharded CI load (bitty#2432: activation-time
+    /// `E_TIMEOUT` in `plugin_audio` and the `fs.list` probe). The deadline
+    /// cannot be replaced by a synthetic clock from here: the same value is
+    /// handed to every expiry-aware host service as a real
+    /// [`std::time::Instant`] deadline those services compare against their own
+    /// `Instant::now()`, so a synthetic origin would either expire immediately
+    /// or move the timeout into the service instead of removing it. Harnesses
+    /// therefore widen this one dimension (the bitty#1744/#1727 treatment);
+    /// production never calls this and enforcement stays pinned by
+    /// `bitty-lua/tests/host_bridge.rs`.
+    ///
+    /// Applies to plugins activated afterwards *and* to every VM already live,
+    /// because each bridge shares its deadline cell with its VM.
+    pub fn set_host_call_deadline_ms(&mut self, deadline_ms: Option<u64>) {
+        self.host_call_deadline_ms = deadline_ms;
+        let effective = self.host_call_deadline_ms();
+        for entry in self.entries.values() {
+            if let Some(vm) = &entry.vm {
+                // A refusal (zero) keeps the VM's current deadline; the
+                // harness only ever widens.
+                let _ = vm.borrow_mut().set_host_call_deadline_ms(effective);
+            }
+        }
     }
 
     /// Whether safe mode is enabled.
@@ -2713,10 +2764,13 @@ impl PluginRuntime {
             plugin_services.set_ui_epoch(entry.generation);
         }
         let services: Rc<dyn HostServices> = plugin_services.clone();
+        // Production uses `DEFAULT_HOST_DEADLINE_MS`; harnesses may widen this
+        // one dimension via `set_host_call_deadline_ms` (bitty#2432).
+        let host_call_deadline_ms = self.host_call_deadline_ms();
         if let Err(error) = vm.install_host_module(
             services,
             MarshallingLimits::default(),
-            DEFAULT_HOST_DEADLINE_MS,
+            host_call_deadline_ms,
         ) {
             let error = PluginRuntimeError::Vm(error.to_string());
             self.rollback(id, error.to_string());
@@ -4658,6 +4712,62 @@ plugin-api = "^1.0"
         );
         drop(busy);
         assert_eq!(runtime.vm_total_executions(&id), Ok(0));
+    }
+
+    /// The host-call deadline seam (bitty#2432): production keeps the RC-1
+    /// default, and a harness override must reach VMs whose bridge was already
+    /// installed (activation runs inside `discover_with_roots`, before a test
+    /// can call the setter).
+    #[test]
+    fn host_call_deadline_defaults_to_rc1_and_overrides_live_vms() {
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        assert_eq!(runtime.host_call_deadline_ms(), DEFAULT_HOST_DEADLINE_MS);
+        let manifest = manifest_toml::parse_manifest(
+            br#"[plugin]
+id = "xuepoo.host-deadline"
+name = "Host deadline fixture"
+version = "0.0.1"
+description = "Host-call deadline seam"
+[compat]
+plugin-api = "^1.0"
+"#,
+        )
+        .expect("in-memory manifest");
+        let id = manifest.id().clone();
+        runtime.insert_package(
+            id.clone(),
+            PluginPackage {
+                manifest,
+                module_root: PathBuf::new(),
+                source_class: SourceClass::LocalPath,
+                unverified: true,
+                granted: None,
+            },
+        );
+        let vm = Rc::new(RefCell::new(
+            build_plugin_vm(id.as_str(), Some(VmBudgets::default())).expect("bounded pure VM"),
+        ));
+        runtime.entries.get_mut(&id).expect("entry").vm = Some(Rc::clone(&vm));
+        assert_eq!(
+            vm.borrow().host_call_deadline_ms(),
+            DEFAULT_HOST_DEADLINE_MS
+        );
+
+        runtime.set_host_call_deadline_ms(Some(500));
+        assert_eq!(runtime.host_call_deadline_ms(), 500);
+        assert_eq!(
+            vm.borrow().host_call_deadline_ms(),
+            500,
+            "the live bridge must pick the harness deadline up"
+        );
+
+        runtime.set_host_call_deadline_ms(None);
+        assert_eq!(runtime.host_call_deadline_ms(), DEFAULT_HOST_DEADLINE_MS);
+        assert_eq!(
+            vm.borrow().host_call_deadline_ms(),
+            DEFAULT_HOST_DEADLINE_MS,
+            "clearing the override must restore the production deadline"
+        );
     }
 
     #[test]

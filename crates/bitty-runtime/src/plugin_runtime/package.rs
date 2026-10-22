@@ -60,17 +60,34 @@ pub const QUARANTINE_DIR: &str = "quarantine";
 const STAGING_PREFIX: &str = ".tmp-";
 /// Prefix of a superseded version tree kept until the index commit lands.
 ///
-/// Shares the `.tmp-` prefix so the existing stale-staging GC also bounds
-/// crash leftovers from an interrupted replacement.
+/// Shares the `.tmp-` prefix with staging, but is excluded from the install
+/// GC and repaired explicitly: in the crash window after the target is renamed
+/// aside and before the index commit, this tree is the only copy
+/// `current.json` still points at.
 const REPLACED_PREFIX: &str = ".tmp-replaced-";
-/// Maximum plugin directories inspected by one orphan scan.
+/// Maximum plugin directories inspected by one read-only orphan scan.
 ///
 /// The store is user-writable, so a read-only `bitty plugin list` must bound
-/// its work even when the directory tree is hostile; entries beyond the cap
-/// are left unreported rather than failing the command.
+/// its work even when the directory tree is hostile. This cap is diagnostic
+/// only: it never feeds a mutating repair, and a truncated inspection is
+/// reported as such instead of being mistaken for an absent package.
 pub const ORPHAN_SCAN_MAX_PLUGINS: usize = 512;
-/// Maximum version directories inspected per plugin by one orphan scan.
+/// Maximum version directories inspected per plugin by one read-only scan.
+///
+/// Diagnostic only, like [`ORPHAN_SCAN_MAX_PLUGINS`].
 pub const ORPHAN_SCAN_MAX_VERSIONS: usize = 64;
+/// Hard bound for one authoritative `doctor --repair` plugin-directory scan.
+///
+/// Repair must never rebuild `current.json` from a truncated view of the
+/// store: a version or record past a read-only cap would otherwise be
+/// reported missing and dropped. Over this bound repair refuses with
+/// [`PackageOpError::StoreTooLarge`] before changing anything.
+pub const REPAIR_MAX_PLUGINS: usize = 4096;
+/// Hard bound for one authoritative `doctor --repair` version-directory scan.
+///
+/// See [`REPAIR_MAX_PLUGINS`]; over this bound repair refuses before changing
+/// anything instead of quarantining an unseen version.
+pub const REPAIR_MAX_VERSIONS: usize = 1024;
 /// Age after which doctor repair removes a leftover staging directory.
 ///
 /// Shorter than the install-path GC so an interrupted operation can be
@@ -416,6 +433,18 @@ pub enum PackageOpError {
     ConsentAborted(String),
     /// The store could not be read or written safely.
     Store(String),
+    /// An authoritative repair scan exceeded its safe bound.
+    ///
+    /// Repair refuses instead of rebuilding from a partial view: nothing is
+    /// moved, quarantined, or rewritten.
+    StoreTooLarge {
+        /// What was counted (`plugin directories` or `version directories`).
+        scope: &'static str,
+        /// Safe bound for one repair pass.
+        limit: usize,
+        /// Entries observed in the store.
+        observed: usize,
+    },
 }
 
 impl std::fmt::Display for PackageOpError {
@@ -443,6 +472,14 @@ impl std::fmt::Display for PackageOpError {
             ),
             Self::ConsentAborted(detail) => write!(f, "consent aborted: {detail}"),
             Self::Store(detail) => write!(f, "plugin store: {detail}"),
+            Self::StoreTooLarge {
+                scope,
+                limit,
+                observed,
+            } => write!(
+                f,
+                "plugin store: repair refused: {observed} {scope} exceed the safe repair bound of {limit}; nothing was changed"
+            ),
         }
     }
 }
@@ -765,24 +802,36 @@ fn install_local_dir_with_index_writer(
         let _ = std::fs::remove_dir_all(&staging);
     } else if let Err(error) = std::fs::rename(&staging, &target) {
         let _ = std::fs::remove_dir_all(&staging);
-        restore_backup(backup.as_deref(), &target);
-        return Err(PackageOpError::Store(format!(
-            "cannot commit '{}': {error}",
-            target.display()
-        )));
+        return Err(PackageOpError::Store(
+            match restore_backup(backup.as_deref(), &target) {
+                Ok(()) => format!("cannot commit '{}': {error}", target.display()),
+                Err(restore_error) => {
+                    format!(
+                        "cannot commit '{}': {error}; {restore_error}",
+                        target.display()
+                    )
+                }
+            },
+        ));
     } else if let Err(error) = harden_tree(&target) {
         let _ = remove_path(&target);
-        restore_backup(backup.as_deref(), &target);
-        return Err(error);
+        return Err(match restore_backup(backup.as_deref(), &target) {
+            Ok(()) => error,
+            Err(restore_error) => PackageOpError::Store(format!("{error}; {restore_error}")),
+        });
     }
     if let Err(error) = write_index(store_root, &updated_records) {
         if !target_matches {
             let _ = remove_path(&target);
         }
-        restore_backup(backup.as_deref(), &target);
-        return Err(PackageOpError::Store(format!(
-            "plugin index commit failed; install rolled back: {error}"
-        )));
+        return Err(match restore_backup(backup.as_deref(), &target) {
+            Ok(()) => PackageOpError::Store(format!(
+                "plugin index commit failed; install rolled back: {error}"
+            )),
+            Err(restore_error) => PackageOpError::Store(format!(
+                "plugin index commit failed: {error}; {restore_error}"
+            )),
+        });
     }
     // Committed. Cleanup failures are non-fatal and reported as warnings.
     let mut post_commit_warning = gc_warning;
@@ -875,10 +924,26 @@ fn merge_warnings(
 }
 
 /// Restore a superseded tree after a failed commit attempt.
-fn restore_backup(backup: Option<&Path>, target: &Path) {
+///
+/// Returns the true state on failure: the caller must never report a clean
+/// rollback when the previous tree could not be moved back, and the aside path
+/// stays exactly where it is so nothing is silently lost.
+fn restore_backup(backup: Option<&Path>, target: &Path) -> Result<(), String> {
     if let Some(backup) = backup {
-        let _ = std::fs::rename(backup, target);
+        std::fs::rename(backup, target).map_err(|error| {
+            let preserved = if backup.exists() {
+                format!("the previous tree is preserved at '{}'", backup.display())
+            } else {
+                format!("the previous tree is no longer at '{}'", backup.display())
+            };
+            format!(
+                "cannot restore the previous package tree '{}' to '{}': {error}; {preserved}",
+                backup.display(),
+                target.display()
+            )
+        })?;
     }
+    Ok(())
 }
 
 /// Remove a file or directory tree (best effort helper for staged paths).
@@ -993,10 +1058,12 @@ pub fn set_enabled(
 ///
 /// The index is switched first (desired state wins) and the tree is deleted
 /// afterwards; a tree that cannot be deleted is reported by the caller and is
-/// inert because no record points at it. When no index record exists but the
-/// package directory does (the orphan case from an interrupted install), the
-/// directory is still removed: `remove <id> --force` is the documented repair
-/// command, and a second run is a no-op instead of an error.
+/// inert because no record points at it. This is the explicit destructive
+/// operation (`remove <id> --force`), not the repair path: `doctor --repair`
+/// re-indexes complete trees and quarantines incomplete ones without deleting
+/// them. When no index record exists but the package directory does (the
+/// orphan case from an interrupted install), the directory is still removed so
+/// an operator can discard it; a second run is a no-op instead of an error.
 ///
 /// # Errors
 ///
@@ -1144,6 +1211,11 @@ pub enum StoreIssueKind {
     StaleVersion,
     /// A `.tmp-*` staging directory was left by an interrupted operation.
     StaleStaging,
+    /// The read-only diagnostic scan stopped at its bound.
+    ///
+    /// Entries past the bound were not inspected, so they must not be reported
+    /// as missing; `doctor --repair` reads the store under its own safe bound.
+    ScanTruncated,
 }
 
 impl StoreIssueKind {
@@ -1157,6 +1229,7 @@ impl StoreIssueKind {
             Self::DanglingRecord => "dangling-record",
             Self::StaleVersion => "stale-version",
             Self::StaleStaging => "stale-staging",
+            Self::ScanTruncated => "scan-truncated",
         }
     }
 
@@ -1219,7 +1292,14 @@ pub fn inspect_store(store_root: &Path) -> Result<StoreInspection, PackageOpErro
         Ok(records) => (records, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
-    let packages = read_package_dirs(store_root)?;
+    let scan = scan_package_dirs(
+        store_root,
+        ScanBound::Truncate {
+            plugins: ORPHAN_SCAN_MAX_PLUGINS,
+            versions: ORPHAN_SCAN_MAX_VERSIONS,
+        },
+    )?;
+    let packages = &scan.packages;
     let mut issues = Vec::new();
     if let Some(detail) = &index_error {
         issues.push(StoreIssue {
@@ -1230,8 +1310,21 @@ pub fn inspect_store(store_root: &Path) -> Result<StoreInspection, PackageOpErro
             detail: detail.clone(),
         });
     }
+    if scan.truncated {
+        issues.push(StoreIssue {
+            kind: StoreIssueKind::ScanTruncated,
+            plugin_id: "-".to_string(),
+            version: "-".to_string(),
+            root: PACKAGES_DIR.to_string(),
+            detail: format!(
+                "read-only scan stopped at {ORPHAN_SCAN_MAX_PLUGINS} plugin / \
+                 {ORPHAN_SCAN_MAX_VERSIONS} version directories; entries past the bound \
+                 were not inspected (repair reads the full store under its own safe bound)"
+            ),
+        });
+    }
     let mut seen_versions: BTreeSet<(String, String)> = BTreeSet::new();
-    for (plugin_id, dirs) in &packages {
+    for (plugin_id, dirs) in packages {
         let record = records.iter().find(|record| record.plugin_id == *plugin_id);
         let predecessor = load_predecessor(&store_root.join(PACKAGES_DIR).join(plugin_id));
         for dir in dirs {
@@ -1299,16 +1392,21 @@ pub fn inspect_store(store_root: &Path) -> Result<StoreInspection, PackageOpErro
             }
         }
     }
-    for record in &records {
-        if !seen_versions.contains(&(record.plugin_id.clone(), record.version.clone())) {
-            issues.push(StoreIssue {
-                kind: StoreIssueKind::DanglingRecord,
-                plugin_id: record.plugin_id.clone(),
-                version: record.version.clone(),
-                root: record.root.clone(),
-                detail: "current.json record points at a package directory that does not exist"
-                    .to_string(),
-            });
+    // A truncated diagnostic scan proves nothing about entries past the cap:
+    // never report a real package as a dangling record from a partial view
+    // (repair reads the full store).
+    if !scan.truncated {
+        for record in &records {
+            if !seen_versions.contains(&(record.plugin_id.clone(), record.version.clone())) {
+                issues.push(StoreIssue {
+                    kind: StoreIssueKind::DanglingRecord,
+                    plugin_id: record.plugin_id.clone(),
+                    version: record.version.clone(),
+                    root: record.root.clone(),
+                    detail: "current.json record points at a package directory that does not exist"
+                        .to_string(),
+                });
+            }
         }
     }
     for staging in read_staging_dirs(store_root)? {
@@ -1317,9 +1415,15 @@ pub fn inspect_store(store_root: &Path) -> Result<StoreInspection, PackageOpErro
             plugin_id: staging.plugin_id,
             version: "-".to_string(),
             root: staging.relative,
-            detail: "leftover staging directory (interrupted install/uninstall); \
-                     `bitty plugin doctor --repair` removes it"
-                .to_string(),
+            detail: if staging.replaced {
+                "leftover replaced package tree (interrupted commit); \
+                 `bitty plugin doctor --repair` restores it when current.json still \
+                 points at it, else quarantines it"
+            } else {
+                "leftover staging directory (interrupted install/uninstall); \
+                 `bitty plugin doctor --repair` removes it"
+            }
+            .to_string(),
         });
     }
     issues.sort_by(|a, b| {
@@ -1353,6 +1457,8 @@ pub struct StoreRepairReport {
     pub quarantined: Vec<(String, String)>,
     /// Staging directories removed.
     pub staging_removed: Vec<String>,
+    /// Package roots restored from an interrupted-commit `.tmp-replaced-*` aside.
+    pub restored: Vec<String>,
     /// Whether `current.json` was rebuilt from package directories.
     pub index_rebuilt: bool,
     /// Number of records published.
@@ -1366,16 +1472,25 @@ pub struct StoreRepairReport {
 /// The rebuild chooses, per plugin, the indexed version when its tree and
 /// hashes still match, else the highest complete version. Incomplete or
 /// unreferenced directories are moved to `<store>/quarantine/` (never
-/// deleted), stale `.tmp-*` staging is removed, and `current.json` is written
-/// last with an atomic rename. Rebuilt records never invent authority: when
-/// the manifest hash changes, grants are reset and the record is disabled
-/// unless the manifest requests no capabilities.
+/// deleted), a leftover `.tmp-replaced-*` tree from an interrupted commit is
+/// restored when `current.json` still points at it (else quarantined), fresh
+/// staging is left alone and stale regular staging is removed. `current.json`
+/// is written last with an atomic rename. Rebuilt records never invent
+/// authority: when the manifest hash changes, grants are reset and the record
+/// is disabled unless the manifest requests no capabilities.
+///
+/// The authoritative scan is never truncated: over [`REPAIR_MAX_PLUGINS`] /
+/// [`REPAIR_MAX_VERSIONS`] the pass refuses with
+/// [`PackageOpError::StoreTooLarge`] before moving anything. Read-only
+/// diagnostics keep their own smaller caps.
 ///
 /// # Errors
 ///
-/// [`PackageOpError::Store`] when the store cannot be read/written. Moves are
-/// rolled back on failure so a failed repair leaves the previous layout
-/// intact (cleanup after the index commit is warning-only).
+/// [`PackageOpError::Store`] when the store cannot be read/written,
+/// [`PackageOpError::StoreTooLarge`] when the store exceeds the authoritative
+/// repair bound. Moves are rolled back on failure so a failed repair leaves
+/// the previous layout intact (cleanup after the index commit is
+/// warning-only).
 pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpError> {
     let _lock = STORE_MUTEX
         .lock()
@@ -1385,31 +1500,64 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
         Ok(records) => (records, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
-    let packages = read_package_dirs(store_root)?;
     let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut rebuilt: Vec<PluginRecord> = Vec::new();
     let mut predecessor_changes: Vec<(PathBuf, Option<String>)> = Vec::new();
     let mut changed = index_error.is_some();
 
+    // Authoritative preflight before any mutation: an over-bound (or
+    // unreadable) store is refused with a typed error while nothing has moved
+    // yet. Read-only caps are never used here.
+    let mut scan = scan_package_dirs(
+        store_root,
+        ScanBound::Fail {
+            plugins: REPAIR_MAX_PLUGINS,
+            versions: REPAIR_MAX_VERSIONS,
+        },
+    )?;
+
     // Quarantine the corrupt index first so a failed rebuild can restore it.
     if index_error.is_some() {
         let index = store_root.join(resolution::CURRENT_POINTER_FILE);
         if index.exists() {
-            let destination = quarantine_path(store_root, "_index", "current.json", &mut report)?;
-            std::fs::rename(&index, &destination).map_err(|error| {
-                PackageOpError::Store(format!(
-                    "cannot quarantine corrupt '{}': {error}",
-                    index.display()
-                ))
-            })?;
-            moves.push((index, destination));
-            report.quarantined.push((
-                resolution::CURRENT_POINTER_FILE.to_string(),
-                relative_to(store_root, moves.last().expect("pushed").1.as_path()),
-            ));
+            quarantine_move(
+                store_root,
+                "_index",
+                "current.json",
+                &index,
+                &mut moves,
+                &mut report,
+                resolution::CURRENT_POINTER_FILE,
+            )?;
         }
         report.index_rebuilt = true;
     }
+
+    // Crash window: a `.tmp-replaced-*` tree may be the only copy of the
+    // version `current.json` still points at. Recover it before rebuilding
+    // and never delete it as stale staging.
+    let staging = read_staging_dirs(store_root)?;
+    for entry in &staging {
+        if entry.replaced {
+            recover_replaced_aside(store_root, entry, &records, &mut moves, &mut report)?;
+        }
+    }
+    // A restore puts a version directory back in place, so re-read the
+    // authoritative view (and re-check the bound) to rebuild from reality.
+    if !report.restored.is_empty() {
+        scan = match scan_package_dirs(
+            store_root,
+            ScanBound::Fail {
+                plugins: REPAIR_MAX_PLUGINS,
+                versions: REPAIR_MAX_VERSIONS,
+            },
+        ) {
+            Ok(scan) => scan,
+            Err(error) => return Err(rollback_store_repair(error.to_string(), &moves)),
+        };
+    }
+
+    let packages = scan.packages;
 
     for (plugin_id, dirs) in &packages {
         let package_dir = store_root.join(PACKAGES_DIR).join(plugin_id);
@@ -1419,6 +1567,29 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
             .cloned();
         let mut sorted: Vec<&PackageInspection> = dirs.iter().collect();
         sorted.sort_by(|a, b| compare_versions_desc(&a.version, &b.version));
+        // Store records for bundled ids can never be trusted (bundled
+        // provenance is first-party only). Dropping the record is not enough:
+        // quarantine the trees so a mistaken local build is preserved for
+        // inspection instead of being deleted.
+        if bitty_plugin_host::bundled::bundled_manifest_for(plugin_id).is_some() {
+            if old.is_some() {
+                changed = true;
+            }
+            for dir in sorted {
+                let source = store_root.join(&dir.root);
+                quarantine_move(
+                    store_root,
+                    plugin_id,
+                    &dir.version,
+                    &source,
+                    &mut moves,
+                    &mut report,
+                    &dir.root,
+                )?;
+                changed = true;
+            }
+            continue;
+        }
         // Keep the old record only when the exact tree still matches it.
         // The rebuild target is the highest complete version on disk, not
         // necessarily the (possibly stale) indexed version.
@@ -1481,21 +1652,16 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
                 if predecessor.as_deref() == Some(dir.version.as_str()) && dir.complete {
                     continue;
                 }
-                let destination =
-                    quarantine_path(store_root, plugin_id, &dir.version, &mut report)?;
                 let source = store_root.join(&dir.root);
-                if let Err(error) = std::fs::rename(&source, &destination) {
-                    rollback_moves(&moves);
-                    return Err(PackageOpError::Store(format!(
-                        "cannot quarantine '{}': {error}",
-                        source.display()
-                    )));
-                }
-                moves.push((source, destination));
-                report.quarantined.push((
-                    dir.root.clone(),
-                    relative_to(store_root, moves.last().expect("pushed").1.as_path()),
-                ));
+                quarantine_move(
+                    store_root,
+                    plugin_id,
+                    &dir.version,
+                    &source,
+                    &mut moves,
+                    &mut report,
+                    &dir.root,
+                )?;
                 changed = true;
             }
             predecessor_changes.push((package_dir.clone(), predecessor.clone()));
@@ -1505,21 +1671,16 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
                 changed = true;
             }
             for dir in sorted {
-                let destination =
-                    quarantine_path(store_root, plugin_id, &dir.version, &mut report)?;
                 let source = store_root.join(&dir.root);
-                if let Err(error) = std::fs::rename(&source, &destination) {
-                    rollback_moves(&moves);
-                    return Err(PackageOpError::Store(format!(
-                        "cannot quarantine '{}': {error}",
-                        source.display()
-                    )));
-                }
-                moves.push((source, destination));
-                report.quarantined.push((
-                    dir.root.clone(),
-                    relative_to(store_root, moves.last().expect("pushed").1.as_path()),
-                ));
+                quarantine_move(
+                    store_root,
+                    plugin_id,
+                    &dir.version,
+                    &source,
+                    &mut moves,
+                    &mut report,
+                    &dir.root,
+                )?;
                 changed = true;
             }
         }
@@ -1534,10 +1695,10 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
     rebuilt.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
     if changed {
         if let Err(error) = resolution::write_index(store_root, &rebuilt) {
-            rollback_moves(&moves);
-            return Err(PackageOpError::Store(format!(
-                "cannot rewrite current.json; repair rolled back: {error}"
-            )));
+            return Err(rollback_store_repair(
+                format!("cannot rewrite current.json; repair rolled back: {error}"),
+                &moves,
+            ));
         }
         report.index_rebuilt = true;
         report.records_written = rebuilt.len();
@@ -1553,8 +1714,11 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
             }
         }
     }
-    let staging = read_staging_dirs(store_root)?;
     for entry in staging {
+        // Replaced asides were restored or quarantined above; never delete one.
+        if entry.replaced {
+            continue;
+        }
         let path = store_root.join(&entry.relative);
         if !is_stale_staging(&path) {
             report.warnings.push(format!(
@@ -1572,6 +1736,151 @@ pub fn repair_store(store_root: &Path) -> Result<StoreRepairReport, PackageOpErr
         }
     }
     Ok(report)
+}
+
+/// Restore or quarantine one interrupted-commit `.tmp-replaced-*` tree.
+///
+/// The aside is authoritative only when its manifest and module-tree digest
+/// still match the index record for its plugin/version. Then it is moved back
+/// to `packages/<id>/<version>/` (replacing an interrupted new tree, which is
+/// quarantined first). Every other aside is preserved in quarantine; it is
+/// never removed as stale staging.
+fn recover_replaced_aside(
+    store_root: &Path,
+    entry: &StagingEntry,
+    records: &[PluginRecord],
+    moves: &mut Vec<(PathBuf, PathBuf)>,
+    report: &mut StoreRepairReport,
+) -> Result<(), PackageOpError> {
+    let aside = store_root.join(&entry.relative);
+    if !is_stale_staging(&aside) {
+        report.warnings.push(format!(
+            "left '{}' in place: too recent to prove it was not an in-flight install",
+            entry.relative
+        ));
+        return Ok(());
+    }
+    let identity = std::fs::read(aside.join(MANIFEST_FILE_NAME))
+        .ok()
+        .and_then(|bytes| super::manifest_toml::parse_manifest(&bytes).ok())
+        .map(|manifest| {
+            (
+                manifest.identity.id.as_str().to_string(),
+                manifest.identity.version.clone(),
+            )
+        });
+    if let Some((id, version)) = &identity {
+        if let Some(record) = records.iter().find(|record| record.plugin_id == *id) {
+            if *version == record.version
+                && package_matches_staged(
+                    &aside,
+                    id,
+                    version,
+                    &record.manifest_hash,
+                    &record.content_digest,
+                )
+            {
+                let root = format!("{PACKAGES_DIR}/{id}/{version}");
+                let target = store_root.join(PACKAGES_DIR).join(id).join(version);
+                if target.exists()
+                    && package_matches_staged(
+                        &target,
+                        id,
+                        version,
+                        &record.manifest_hash,
+                        &record.content_digest,
+                    )
+                {
+                    // The active tree is already in place; this aside is a
+                    // duplicate. Preserve it in quarantine.
+                    quarantine_move(
+                        store_root,
+                        id,
+                        version,
+                        &aside,
+                        moves,
+                        report,
+                        &entry.relative,
+                    )?;
+                    return Ok(());
+                }
+                if target.exists() {
+                    // Interrupted replacement: the unindexed new tree is not
+                    // authoritative, the recorded tree in the aside is.
+                    quarantine_move(store_root, id, version, &target, moves, report, &root)?;
+                }
+                if let Err(error) = std::fs::rename(&aside, &target) {
+                    return Err(rollback_store_repair(
+                        format!(
+                            "cannot restore '{}' to '{}': {error}",
+                            aside.display(),
+                            target.display()
+                        ),
+                        moves,
+                    ));
+                }
+                // Journal the restore itself so a later failure in this pass
+                // puts the aside and the interrupted tree back exactly as the
+                // crash left them.
+                moves.push((aside.clone(), target));
+                report.restored.push(root);
+                return Ok(());
+            }
+        }
+    }
+    let name = identity
+        .as_ref()
+        .map_or("replaced", |(_, version)| version.as_str());
+    quarantine_move(
+        store_root,
+        &entry.plugin_id,
+        name,
+        &aside,
+        moves,
+        report,
+        &entry.relative,
+    )
+}
+
+/// Move one path into the store quarantine and record it in the rollback
+/// journal.
+///
+/// The destination is reserved before the rename; any failure at either step
+/// rolls the whole pass back, so a later failure never leaves a
+/// half-quarantined store.
+fn quarantine_move(
+    store_root: &Path,
+    plugin_id: &str,
+    name: &str,
+    source: &Path,
+    moves: &mut Vec<(PathBuf, PathBuf)>,
+    report: &mut StoreRepairReport,
+    display_from: &str,
+) -> Result<(), PackageOpError> {
+    let destination = match quarantine_path(store_root, plugin_id, name, report) {
+        Ok(destination) => destination,
+        Err(error) => return Err(rollback_store_repair(error.to_string(), moves)),
+    };
+    if let Err(error) = std::fs::rename(source, &destination) {
+        return Err(rollback_store_repair(
+            format!("cannot quarantine '{}': {error}", source.display()),
+            moves,
+        ));
+    }
+    moves.push((source.to_path_buf(), destination.clone()));
+    report.quarantined.push((
+        display_from.to_string(),
+        relative_to(store_root, &destination),
+    ));
+    Ok(())
+}
+
+/// Roll back every completed move and return the true state.
+fn rollback_store_repair(message: String, moves: &[(PathBuf, PathBuf)]) -> PackageOpError {
+    match rollback_moves(moves) {
+        Some(detail) => PackageOpError::Store(format!("{message}; rollback incomplete: {detail}")),
+        None => PackageOpError::Store(message),
+    }
 }
 
 /// Cheap completeness check for read-only list output.
@@ -1592,6 +1901,7 @@ fn package_looks_complete(version_dir: &Path, plugin_id: &str, version: &str) ->
 }
 
 /// One package directory as inspected for doctor/rebuild purposes.
+#[derive(Debug)]
 struct PackageInspection {
     version: String,
     root: String,
@@ -1602,12 +1912,46 @@ struct PackageInspection {
     detail: String,
 }
 
-/// Read every `packages/<id>/<version>/` directory.
-fn read_package_dirs(
+/// How one package-directory scan treats its bounds.
+#[derive(Debug, Clone, Copy)]
+enum ScanBound {
+    /// Read-only diagnostics: stop at the caps and flag the result truncated.
+    Truncate {
+        /// Maximum plugin directories inspected.
+        plugins: usize,
+        /// Maximum version directories inspected per plugin.
+        versions: usize,
+    },
+    /// Authoritative repair: refuse over the caps instead of reading a subset.
+    Fail {
+        /// Safe plugin-directory bound.
+        plugins: usize,
+        /// Safe version-directory bound per plugin.
+        versions: usize,
+    },
+}
+
+/// One package-directory scan result.
+#[derive(Debug)]
+struct PackageDirScan {
+    /// Inspected version directories grouped by plugin id.
+    packages: BTreeMap<String, Vec<PackageInspection>>,
+    /// Whether a diagnostic cap stopped the scan before the last entry.
+    truncated: bool,
+}
+
+/// Read every `packages/<id>/<version>/` directory under the given bound.
+///
+/// Diagnostic callers truncate and must treat `truncated` as "unverified
+/// entries exist"; repair uses [`ScanBound::Fail`] and changes nothing when the
+/// store exceeds its safe bound.
+fn scan_package_dirs(
     store_root: &Path,
-) -> Result<BTreeMap<String, Vec<PackageInspection>>, PackageOpError> {
+    bound: ScanBound,
+) -> Result<PackageDirScan, PackageOpError> {
     let packages = store_root.join(PACKAGES_DIR);
     let mut out: BTreeMap<String, Vec<PackageInspection>> = BTreeMap::new();
+    let mut truncated = false;
     match std::fs::read_dir(&packages) {
         Ok(listing) => {
             let mut plugin_dirs: Vec<PathBuf> = listing
@@ -1617,12 +1961,43 @@ fn read_package_dirs(
                 .filter(|path| !is_hidden_entry(path))
                 .collect();
             plugin_dirs.sort();
-            for plugin_dir in plugin_dirs.into_iter().take(ORPHAN_SCAN_MAX_PLUGINS) {
+            let plugin_limit = match bound {
+                ScanBound::Truncate { plugins, .. } | ScanBound::Fail { plugins, .. } => plugins,
+            };
+            if plugin_dirs.len() > plugin_limit {
+                if let ScanBound::Fail { .. } = bound {
+                    return Err(PackageOpError::StoreTooLarge {
+                        scope: "plugin directories",
+                        limit: plugin_limit,
+                        observed: plugin_dirs.len(),
+                    });
+                }
+                truncated = true;
+            }
+            let version_limit = match bound {
+                ScanBound::Truncate { versions, .. } | ScanBound::Fail { versions, .. } => versions,
+            };
+            for plugin_dir in plugin_dirs.into_iter().take(plugin_limit) {
                 let Some(plugin_id) = file_name(&plugin_dir) else {
                     continue;
                 };
-                let Ok(listing) = std::fs::read_dir(&plugin_dir) else {
-                    continue;
+                let listing = match std::fs::read_dir(&plugin_dir) {
+                    Ok(listing) => listing,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => match bound {
+                        // Dropping an unreadable plugin directory would let a
+                        // repair delete its index record; refuse instead.
+                        ScanBound::Fail { .. } => {
+                            return Err(PackageOpError::Store(format!(
+                                "cannot read '{}': {error}",
+                                plugin_dir.display()
+                            )));
+                        }
+                        ScanBound::Truncate { .. } => {
+                            truncated = true;
+                            continue;
+                        }
+                    },
                 };
                 let mut version_dirs: Vec<PathBuf> = listing
                     .flatten()
@@ -1631,7 +2006,17 @@ fn read_package_dirs(
                     .filter(|path| !is_hidden_entry(path))
                     .collect();
                 version_dirs.sort();
-                for version_dir in version_dirs.into_iter().take(ORPHAN_SCAN_MAX_VERSIONS) {
+                if version_dirs.len() > version_limit {
+                    if let ScanBound::Fail { .. } = bound {
+                        return Err(PackageOpError::StoreTooLarge {
+                            scope: "version directories",
+                            limit: version_limit,
+                            observed: version_dirs.len(),
+                        });
+                    }
+                    truncated = true;
+                }
+                for version_dir in version_dirs.into_iter().take(version_limit) {
                     let Some(version) = file_name(&version_dir) else {
                         continue;
                     };
@@ -1648,7 +2033,10 @@ fn read_package_dirs(
             )));
         }
     }
-    Ok(out)
+    Ok(PackageDirScan {
+        packages: out,
+        truncated,
+    })
 }
 
 /// Inspect one version directory; unreadable entries are typed as incomplete.
@@ -1771,10 +2159,31 @@ fn quarantine_path(
 }
 
 /// Roll back every completed quarantine move (best effort).
-fn rollback_moves(moves: &[(PathBuf, PathBuf)]) {
+///
+/// Returns a bounded description of moves that could not be undone so callers
+/// report the true state instead of claiming a clean rollback.
+fn rollback_moves(moves: &[(PathBuf, PathBuf)]) -> Option<String> {
+    let mut failures: Vec<String> = Vec::new();
+    let mut failed = 0usize;
     for (original, destination) in moves.iter().rev() {
-        let _ = std::fs::rename(destination, original);
+        if let Err(error) = std::fs::rename(destination, original) {
+            failed += 1;
+            if failures.len() < 3 {
+                failures.push(format!(
+                    "cannot move '{}' back to '{}': {error}",
+                    destination.display(),
+                    original.display()
+                ));
+            }
+        }
     }
+    if failures.is_empty() {
+        return None;
+    }
+    if failed > failures.len() {
+        failures.push(format!("and {} more", failed - failures.len()));
+    }
+    Some(failures.join("; "))
 }
 
 /// Path relative to the store for display, falling back to the full path.
@@ -1788,6 +2197,11 @@ fn relative_to(store_root: &Path, path: &Path) -> String {
 struct StagingEntry {
     plugin_id: String,
     relative: String,
+    /// `.tmp-replaced-*`: a superseded tree kept until the index commit.
+    ///
+    /// Never removed as stale staging: it can be the only copy of the version
+    /// `current.json` still points at.
+    replaced: bool,
 }
 
 /// Collect `.tmp-*` directories under every package directory.
@@ -1817,6 +2231,7 @@ fn read_staging_dirs(store_root: &Path) -> Result<Vec<StagingEntry>, PackageOpEr
             out.push(StagingEntry {
                 plugin_id: plugin_id.clone(),
                 relative: format!("{PACKAGES_DIR}/{plugin_id}/{name}"),
+                replaced: name.starts_with(REPLACED_PREFIX),
             });
         }
     }
@@ -2196,8 +2611,9 @@ fn prune_retained_versions(
 /// (`STALE_TMP_MAX_SCAN`), remove count (`STALE_TMP_MAX_REMOVE`), and bytes
 /// (`STALE_TMP_MAX_BYTES`). Fresh entries (mtime unavailable, in the future,
 /// or younger than the age bound) are skipped so live concurrent staging is
-/// never collected. Failures are collected as a single typed warning instead
-/// of failing the install.
+/// never collected. `.tmp-replaced-*` trees are never collected: they can be
+/// the only copy of the active version (doctor repair owns them). Failures are
+/// collected as a single typed warning instead of failing the install.
 fn gc_stale_staging_dirs(package_dir: &Path) -> (StaleTmpGcStats, Option<PruneWarning>) {
     gc_stale_staging_dirs_with_limits(
         package_dir,
@@ -2227,6 +2643,13 @@ fn gc_stale_staging_dirs_with_limits(
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with(STAGING_PREFIX) {
+            continue;
+        }
+        // A `.tmp-replaced-*` tree is the pre-commit copy of an existing
+        // version. It may be the only copy left in the crash window, so the
+        // install-path GC must never delete it; doctor repair restores or
+        // quarantines it.
+        if name.starts_with(REPLACED_PREFIX) {
             continue;
         }
         stats.scanned += 1;
@@ -2436,6 +2859,19 @@ mod tests {
         })
         .expect("install")
         .expect("approved")
+    }
+
+    /// Recursively copy a package tree (crash-window fixtures).
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("copy root");
+        for entry in std::fs::read_dir(from).expect("copy source").flatten() {
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("entry type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy file");
+            }
+        }
     }
 
     #[test]
@@ -3907,6 +4343,409 @@ mod tests {
         assert!(
             store.join("packages/xuepoo.readonly/1.0.0").is_dir(),
             "failed repair must not delete the package tree"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // -----------------------------------------------------------------------
+    // Review regressions: diagnostic caps must never drive an authoritative
+    // repair, and a crash-window aside must never be deleted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repair_keeps_records_past_the_diagnostic_plugin_cap() {
+        // 512 filler plugin dirs sort before the target, so a read-only scan
+        // capped at ORPHAN_SCAN_MAX_PLUGINS never sees the indexed package.
+        // Doctor must not call that record dangling and repair must not drop
+        // it.
+        let scratch = scratch("cap-plugins");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "zzz.target", "1.0.0", None);
+        install(&store, &source);
+        for index in 0..ORPHAN_SCAN_MAX_PLUGINS {
+            std::fs::create_dir_all(store.join(format!("packages/aaa.bulk{index:04}")))
+                .expect("filler dir");
+        }
+
+        let inspection = inspect_store(&store).expect("inspect");
+        assert!(
+            inspection
+                .issues
+                .iter()
+                .any(|issue| issue.kind == StoreIssueKind::ScanTruncated),
+            "a capped scan must say so: {:?}",
+            inspection.issues
+        );
+        assert!(
+            !inspection.issues.iter().any(|issue| {
+                issue.kind == StoreIssueKind::DanglingRecord && issue.plugin_id == "zzz.target"
+            }),
+            "a record past the diagnostic cap is not dangling: {:?}",
+            inspection.issues
+        );
+
+        repair_store(&store).expect("repair");
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records.len(), 1, "repair dropped a record past the cap");
+        assert_eq!(records[0].plugin_id, "zzz.target");
+        assert!(
+            store.join("packages/zzz.target/1.0.0").is_dir(),
+            "repair must keep the active tree"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_keeps_the_active_version_past_the_diagnostic_version_cap() {
+        // 64 filler version dirs sort before 2.0.0, so a capped read-only scan
+        // misses the active package and would report/downgrade it.
+        let scratch = scratch("cap-versions");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.capversions", "2.0.0", None);
+        install(&store, &source);
+        for index in 1..=ORPHAN_SCAN_MAX_VERSIONS {
+            std::fs::create_dir_all(store.join(format!("packages/xuepoo.capversions/0.0.{index}")))
+                .expect("filler version");
+        }
+
+        let inspection = inspect_store(&store).expect("inspect");
+        assert!(
+            inspection
+                .issues
+                .iter()
+                .any(|issue| issue.kind == StoreIssueKind::ScanTruncated),
+            "{:?}",
+            inspection.issues
+        );
+        assert!(
+            !inspection.issues.iter().any(|issue| {
+                issue.kind == StoreIssueKind::DanglingRecord
+                    && issue.plugin_id == "xuepoo.capversions"
+            }),
+            "{:?}",
+            inspection.issues
+        );
+
+        repair_store(&store).expect("repair");
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].version, "2.0.0",
+            "repair must not downgrade past the diagnostic cap"
+        );
+        assert!(store.join("packages/xuepoo.capversions/2.0.0").is_dir());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_restores_a_replaced_aside_from_the_crash_window() {
+        // Crash after `target -> .tmp-replaced-*` and before the index write:
+        // current.json still points at the version, so the aside is the only
+        // copy. Repair must restore it, never delete it as stale staging.
+        let scratch = scratch("aside-restore");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.aside", "1.0.0", None);
+        install(&store, &source);
+        let package_dir = store.join("packages/xuepoo.aside");
+        let target = package_dir.join("1.0.0");
+        let aside = package_dir.join(format!("{REPLACED_PREFIX}{}-0", std::process::id()));
+        std::fs::rename(&target, &aside).expect("simulate crash window");
+        backdate_staging(&aside);
+        let index_before =
+            std::fs::read(store.join(resolution::CURRENT_POINTER_FILE)).expect("index bytes");
+
+        let inspection = inspect_store(&store).expect("inspect");
+        assert!(
+            inspection
+                .issues
+                .iter()
+                .any(|issue| issue.kind == StoreIssueKind::StaleStaging),
+            "{:?}",
+            inspection.issues
+        );
+
+        let report = repair_store(&store).expect("repair");
+        assert!(
+            report
+                .restored
+                .iter()
+                .any(|root| root == "packages/xuepoo.aside/1.0.0"),
+            "repair must report the restore: {report:?}"
+        );
+        assert!(target.is_dir(), "the only copy is restored, not deleted");
+        assert!(!aside.exists());
+        assert!(
+            report.quarantined.is_empty(),
+            "the active tree is never quarantined: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read(store.join(resolution::CURRENT_POINTER_FILE)).expect("index bytes"),
+            index_before,
+            "the record is unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_quarantines_a_non_authoritative_replaced_aside() {
+        // A complete-looking aside that no longer matches the index record is
+        // a superseded copy: preserve it in quarantine instead of deleting it.
+        let scratch = scratch("aside-quarantine");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.asidecopy", "1.0.0", None);
+        install(&store, &source);
+        let package_dir = store.join("packages/xuepoo.asidecopy");
+        let target = package_dir.join("1.0.0");
+        let aside = package_dir.join(format!("{REPLACED_PREFIX}{}-0", std::process::id()));
+        copy_tree(&target, &aside);
+        std::fs::write(
+            aside.join("lua/init.lua"),
+            b"return { superseded = true }\n",
+        )
+        .expect("stale aside body");
+        backdate_staging(&aside);
+
+        let report = repair_store(&store).expect("repair");
+        assert!(report.restored.is_empty(), "{report:?}");
+        assert!(
+            report.quarantined.iter().any(|(from, _)| from
+                == &format!(
+                    "packages/xuepoo.asidecopy/{REPLACED_PREFIX}{}-0",
+                    std::process::id()
+                )),
+            "{report:?}"
+        );
+        assert!(!aside.exists());
+        assert!(target.is_dir(), "the active tree is untouched");
+        assert_eq!(resolution::load_index(&store).expect("index").len(), 1);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn install_gc_never_deletes_a_replaced_aside() {
+        let scratch = scratch("aside-gc");
+        let package_dir = scratch.join("packages/xuepoo.gcaside");
+        std::fs::create_dir_all(&package_dir).expect("package dir");
+        let aside = package_dir.join(format!("{REPLACED_PREFIX}{}-0", std::process::id()));
+        std::fs::create_dir_all(&aside).expect("aside");
+        std::fs::write(aside.join("bitty-plugin.toml"), b"only copy").expect("body");
+        backdate_staging(&aside);
+
+        // Age 0 marks every past mtime stale; the replaced aside still stays.
+        let (stats, warning) =
+            gc_stale_staging_dirs_with_limits(&package_dir, 0, 64, 32, 64 * 1024 * 1024);
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        assert!(aside.is_dir(), "a replaced aside is never GC'd");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_commit_failure_reports_a_failed_restore_and_keeps_the_aside() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = scratch("restore-fail");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.restorefail", "1.0.0", None);
+        install(&store, &source);
+        let package_dir = store.join("packages/xuepoo.restorefail");
+        let target = package_dir.join("1.0.0");
+        std::fs::write(target.join("lua/init.lua"), b"return { changed = true }\n")
+            .expect("mutate active tree");
+
+        // Block the post-failure rollback: with the package dir read-only the
+        // new tree cannot be removed, so the aside cannot be renamed back.
+        let failing = |root: &Path, _: &[PluginRecord]| {
+            std::fs::set_permissions(
+                root.join("packages/xuepoo.restorefail"),
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .expect("lock package dir");
+            Err(super::super::PluginRuntimeError::Io(
+                "injected index failure".to_string(),
+            ))
+        };
+        let error = install_local_dir_with_index_writer(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+            &failing,
+        )
+        .expect_err("index failure with a failed restore");
+        let text = format!("{error}");
+        assert!(
+            text.contains("cannot restore"),
+            "true state missing: {text}"
+        );
+        assert!(
+            !text.contains("install rolled back"),
+            "must not claim a rollback that did not happen: {text}"
+        );
+
+        // The previous tree survived: it is still in the aside.
+        let aside = std::fs::read_dir(&package_dir)
+            .expect("package dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(REPLACED_PREFIX))
+            })
+            .expect("the superseded tree is preserved");
+        assert_eq!(
+            std::fs::read(aside.join("lua/init.lua")).expect("aside body"),
+            b"return { changed = true }\n"
+        );
+
+        let _ = std::fs::set_permissions(&package_dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_rolls_back_prior_moves_when_a_quarantine_path_fails() {
+        let scratch = scratch("quarantine-rollback");
+        let store = scratch.join("store");
+        let first = store.join("packages/aaa.first/1.0.0");
+        let second = store.join("packages/zzz.second/1.0.0");
+        std::fs::create_dir_all(&first).expect("first dir");
+        std::fs::create_dir_all(&second).expect("second dir");
+        // A file where the second plugin's quarantine directory must go makes
+        // the second reservation fail after the first move already happened.
+        std::fs::create_dir_all(store.join(QUARANTINE_DIR)).expect("quarantine dir");
+        std::fs::write(store.join(QUARANTINE_DIR).join("zzz.second"), b"blocked")
+            .expect("block second quarantine");
+
+        let error = repair_store(&store).expect_err("repair must fail closed");
+        assert!(
+            format!("{error}").contains("writable"),
+            "actionable message, got {error}"
+        );
+        assert!(
+            first.is_dir(),
+            "a failed repair must roll back moves it already made"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_quarantines_a_bundled_shadow_tree_instead_of_deleting_it() {
+        let scratch = scratch("bundled-shadow");
+        let store = scratch.join("store");
+        let bundled = bitty_plugin_host::bundled::bundled_ids_sorted()
+            .into_iter()
+            .next()
+            .expect("bundled catalog");
+        let version_dir = store.join(PACKAGES_DIR).join(&bundled).join("1.0.0");
+        std::fs::create_dir_all(version_dir.join("lua")).expect("tree");
+        std::fs::write(version_dir.join("lua/init.lua"), b"return {}\n").expect("body");
+        std::fs::create_dir_all(&store).expect("store root");
+        resolution::write_index(
+            &store,
+            &[PluginRecord {
+                source_class: SourceClass::LocalPath,
+                plugin_id: bundled.clone(),
+                version: "1.0.0".to_string(),
+                root: format!("{PACKAGES_DIR}/{bundled}/1.0.0"),
+                manifest_hash: "a".repeat(64),
+                content_digest: "b".repeat(64),
+                enabled: true,
+                granted: Vec::new(),
+            }],
+        )
+        .expect("shadowing index");
+
+        let report = repair_store(&store).expect("repair");
+        assert!(
+            report
+                .quarantined
+                .iter()
+                .any(|(from, _)| from == &format!("{PACKAGES_DIR}/{bundled}/1.0.0")),
+            "{report:?}"
+        );
+        assert!(
+            !version_dir.exists(),
+            "the shadow tree leaves packages/ (quarantined, not deleted)"
+        );
+        let preserved = std::fs::read_dir(store.join(QUARANTINE_DIR).join(&bundled))
+            .expect("quarantine entry")
+            .flatten()
+            .any(|entry| entry.path().join("lua/init.lua").is_file());
+        assert!(preserved, "the shadow tree is preserved for inspection");
+        assert!(resolution::load_index(&store).expect("index").is_empty());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_scan_refuses_over_the_safe_bound_without_mutating() {
+        let scratch = scratch("repair-bound");
+        let store = scratch.join("store");
+        for index in 0..3 {
+            std::fs::create_dir_all(store.join(format!("packages/xuepoo.bound{index}/1.0.0")))
+                .expect("plugin dir");
+        }
+        let error = scan_package_dirs(
+            &store,
+            ScanBound::Fail {
+                plugins: 2,
+                versions: 1024,
+            },
+        )
+        .expect_err("a repair scan must refuse to truncate");
+        assert!(
+            matches!(
+                error,
+                PackageOpError::StoreTooLarge {
+                    scope: "plugin directories",
+                    limit: 2,
+                    observed: 3
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            format!("{error}").contains("nothing was changed"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn repair_refuses_over_the_safe_bound_before_quarantining_anything() {
+        let scratch = scratch("repair-bound-store");
+        let store = scratch.join("store");
+        std::fs::create_dir_all(&store).expect("store root");
+        // A corrupt index would be moved first if the bound were checked too
+        // late; it must stay untouched when the preflight refuses.
+        std::fs::write(store.join(resolution::CURRENT_POINTER_FILE), b"{broken")
+            .expect("corrupt index");
+        for index in 0..=REPAIR_MAX_PLUGINS {
+            std::fs::create_dir_all(store.join(format!("packages/xuepoo.bulk{index}/1.0.0")))
+                .expect("plugin dir");
+        }
+
+        let error = repair_store(&store).expect_err("over-bound repair refuses");
+        assert!(
+            matches!(
+                error,
+                PackageOpError::StoreTooLarge {
+                    scope: "plugin directories",
+                    limit: REPAIR_MAX_PLUGINS,
+                    observed
+                } if observed == REPAIR_MAX_PLUGINS + 1
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(store.join(resolution::CURRENT_POINTER_FILE)).expect("index bytes"),
+            b"{broken",
+            "a refused repair changes nothing"
+        );
+        assert!(!store.join(QUARANTINE_DIR).exists(), "nothing was moved");
+        assert!(
+            store
+                .join(format!("packages/xuepoo.bulk{REPAIR_MAX_PLUGINS}/1.0.0"))
+                .is_dir()
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

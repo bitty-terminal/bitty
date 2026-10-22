@@ -3128,7 +3128,7 @@ struct BridgeState {
     services: Rc<dyn HostServices>,
     capture: Rc<RefCell<RegistrationCapture>>,
     limits: MarshallingLimits,
-    deadline_ms: u64,
+    deadline_ms: Rc<Cell<u64>>,
     spawn_deadline_ms: Rc<Cell<u64>>,
     in_call: Rc<Cell<bool>>,
 }
@@ -3181,7 +3181,7 @@ impl BridgeState {
     ) -> Result<T, BridgeError> {
         let _guard = self.enter()?;
         let mark = crate::BudgetMark::now();
-        let deadline = Duration::from_millis(self.deadline_ms);
+        let deadline = Duration::from_millis(self.deadline_ms.get());
         let expiry = mark.start() + deadline;
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
@@ -3253,7 +3253,7 @@ impl BridgeState {
     ) -> Result<T, BridgeError> {
         let _guard = self.enter()?;
         let start = Instant::now();
-        let expiry = start + Duration::from_millis(self.deadline_ms);
+        let expiry = start + Duration::from_millis(self.deadline_ms.get());
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
@@ -3341,13 +3341,13 @@ impl LuaVm {
             return Ok(());
         }
         self.marshalling_limits = limits;
-        self.host_deadline_ms = deadline_ms;
+        self.host_deadline_ms.set(deadline_ms);
 
         let state = Rc::new(BridgeState {
             services,
             capture: self.capture.clone(),
             limits,
-            deadline_ms,
+            deadline_ms: self.host_deadline_ms.clone(),
             spawn_deadline_ms: self.spawn_deadline_ms.clone(),
             in_call: self.in_bridge_call.clone(),
         });

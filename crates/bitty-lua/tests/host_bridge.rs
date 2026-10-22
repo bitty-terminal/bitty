@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
-    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, ServiceRoute,
-    SuspendReason,
+    BoundedExecution, BridgeError, DEFAULT_HOST_DEADLINE_MS, HostServices, LuaValue, LuaVm,
+    MarshallingLimits, ServiceRoute, SuspendReason,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -249,6 +249,54 @@ fn host_call_deadline_returns_typed_timeout() {
             else
                 bitty.store.set("code", err.code)
             end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_TIMEOUT".to_string()))
+    );
+}
+
+/// The host-call deadline is a live cell shared with the installed bridge
+/// (bitty#2432).
+///
+/// Load-sensitive runtime harnesses widen it after a plugin is already active,
+/// which only works if the bridge reads the value per call instead of baking it
+/// in at install time. This pins that seam and, in the same flow, that
+/// enforcement still fires once the deadline is tight.
+#[test]
+fn host_call_deadline_override_applies_to_a_live_bridge() {
+    let services = Rc::new(FakeServices {
+        settings_delay_ms: 30,
+        ..FakeServices::default()
+    });
+    let mut vm = gate_vm("t");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(
+        services_dyn,
+        MarshallingLimits::default(),
+        DEFAULT_HOST_DEADLINE_MS,
+    )
+    .expect("install");
+    assert_eq!(vm.host_call_deadline_ms(), DEFAULT_HOST_DEADLINE_MS);
+    // Zero is refused fail-closed and leaves the installed value untouched.
+    assert!(vm.set_host_call_deadline_ms(0).is_err());
+    assert_eq!(vm.host_call_deadline_ms(), DEFAULT_HOST_DEADLINE_MS);
+
+    // Tighten the already-installed bridge: a 30 ms host read now exceeds the
+    // 1 ms deadline and fails with the typed code.
+    vm.set_host_call_deadline_ms(1).expect("non-zero deadline");
+    assert_eq!(vm.host_call_deadline_ms(), 1);
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.settings.get, "x")
+            bitty.store.set("code", ok and "NONE" or err.code)
         "#,
         )
         .expect("execute");

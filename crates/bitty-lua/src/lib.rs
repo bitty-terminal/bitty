@@ -96,8 +96,8 @@ pub use host::{
     COMPONENT_HEADERS_MAX, COMPONENT_ID_MAX_BYTES, COMPONENT_REQUEST_MAX_BYTES,
     COMPONENT_RESPONSE_MAX_BYTES, COMPONENT_TIMEOUT_DEFAULT_MS, COMPONENT_TIMEOUT_MAX_MS,
     COMPONENT_URL_MAX_BYTES, CommandCatalogEntry, CommandRegistration, ComponentBridgeOutcome,
-    ComponentBridgeRequest, ComponentMethod, E_UI_ALREADY_CAPTURED, E_UI_NOT_OWNER,
-    E_UI_UNAVAILABLE, ENV_KEY_MAX_BYTES, EventSubscription, FS_CONTENT_MAX_BYTES,
+    ComponentBridgeRequest, ComponentMethod, DEFAULT_HOST_DEADLINE_MS, E_UI_ALREADY_CAPTURED,
+    E_UI_NOT_OWNER, E_UI_UNAVAILABLE, ENV_KEY_MAX_BYTES, EventSubscription, FS_CONTENT_MAX_BYTES,
     FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES, FS_PATH_MAX_BYTES, HISTORY_NEEDLE_MAX_BYTES,
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, IMAGE_PATH_MAX_BYTES,
     KeymapSuggestion, LuaValue, MarshallingLimits, OVERLAY_CALL_MAX_BYTES,
@@ -800,8 +800,10 @@ pub struct LuaVm {
     pub(crate) host_installed: bool,
     /// Bounded marshalling limits for this VM.
     pub(crate) marshalling_limits: host::MarshallingLimits,
-    /// Bridge call deadline in milliseconds (reuses RC-1 by default).
-    pub(crate) host_deadline_ms: u64,
+    /// Bridge call deadline in milliseconds (reuses RC-1 by default), shared
+    /// with the installed `BridgeState` via `Rc` so
+    /// [`LuaVm::set_host_call_deadline_ms`] updates live callbacks.
+    pub(crate) host_deadline_ms: Rc<Cell<u64>>,
     /// Spawn bridge deadline in milliseconds, shared with the installed
     /// `BridgeState` via `Rc` so `set_spawn_deadline_ms` updates live
     /// callbacks. Defaults to [`host::SPAWN_TIMEOUT_MS`].
@@ -932,7 +934,7 @@ impl LuaVm {
             module_root: None,
             host_installed: false,
             marshalling_limits: host::MarshallingLimits::default(),
-            host_deadline_ms: host::DEFAULT_HOST_DEADLINE_MS,
+            host_deadline_ms: Rc::new(Cell::new(host::DEFAULT_HOST_DEADLINE_MS)),
             spawn_deadline_ms: Rc::new(Cell::new(host::SPAWN_TIMEOUT_MS)),
             parked: None,
         }
@@ -1117,6 +1119,41 @@ impl LuaVm {
     #[must_use]
     pub fn spawn_deadline_ms(&self) -> u64 {
         self.spawn_deadline_ms.get()
+    }
+
+    /// Host-call deadline in milliseconds.
+    ///
+    /// Defaults to [`host::DEFAULT_HOST_DEADLINE_MS`] (the RC-1 50 ms slice);
+    /// shared with the installed bridge via `Rc` so updates apply to live
+    /// callbacks.
+    #[must_use]
+    pub fn host_call_deadline_ms(&self) -> u64 {
+        self.host_deadline_ms.get()
+    }
+
+    /// Set the per-call host-call deadline (test harness only).
+    ///
+    /// Mirrors [`Self::set_spawn_deadline_ms`]: the deadline cell is shared
+    /// with the installed `bitty` bridge, so a VM whose host module is already
+    /// installed picks the value up on its next call. Production never calls
+    /// this — every `bitty.*` call is deadline-checked against
+    /// [`host::DEFAULT_HOST_DEADLINE_MS`] measured on a raw wall clock, and a
+    /// thread the OS deschedules mid-call is charged the full stall, so
+    /// load-sensitive integration harnesses widen only this dimension
+    /// (bitty#2432, the bitty#1744/#1727 treatment).
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Budget`] when `ms` is zero (a zero deadline would fail every
+    /// call closed).
+    pub fn set_host_call_deadline_ms(&mut self, ms: u64) -> Result<(), VmError> {
+        if ms == 0 {
+            return Err(VmError::Budget(
+                "host call deadline must be non-zero".into(),
+            ));
+        }
+        self.host_deadline_ms.set(ms);
+        Ok(())
     }
 
     /// Set the spawn bridge deadline (`1..=SPAWN_TIMEOUT_MAX_MS`).

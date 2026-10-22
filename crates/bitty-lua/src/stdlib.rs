@@ -12,9 +12,13 @@
 //! read is `os.date`'s default path: it resolves the process timezone
 //! environment (`TZ`) and the host timezone database through `chrono::Local`
 //! to local calendar fields, which intentionally exposes the host timezone to
-//! a plugin with no grant. `os.date("!...")` is deterministic UTC. Nothing
-//! here grants process, filesystem, or network authority, and `os.getenv` /
-//! `os.execute` stay absent.
+//! a plugin with no grant. `os.date("!...")` is deterministic UTC. The
+//! formatter implements the common POSIX conversions, including the English
+//! `%a`/`%A`/`%b`/`%B` names, so a plugin can render locale-independent date
+//! text without depending on a host locale database; zone- and week-number
+//! conversions (`%z`, `%Z`, `%U`, `%V`, `%W`, `%g`, `%G`) stay verbatim.
+//! Nothing here grants process, filesystem, or network authority, and
+//! `os.getenv` / `os.execute` stay absent.
 //!
 //! [Lua Runtime RFC]: https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/lua-runtime-rfc.md
 
@@ -214,13 +218,45 @@ fn format_date(format: &str, fields: &DateFields) -> String {
         }
         match chars.next() {
             Some('Y') => out.push_str(&format!("{:04}", fields.year)),
+            Some('y') => out.push_str(&format!("{:02}", fields.year.rem_euclid(100))),
+            Some('C') => out.push_str(&format!("{:02}", fields.year.div_euclid(100))),
             Some('m') => out.push_str(&format!("{:02}", fields.month)),
             Some('d') => out.push_str(&format!("{:02}", fields.day)),
+            // POSIX `%e`: day of month, blank-padded to two characters.
+            Some('e') => out.push_str(&format!("{:2}", fields.day)),
             Some('H') => out.push_str(&format!("{:02}", fields.hour)),
+            Some('I') => out.push_str(&format!("{:02}", hour12(fields.hour))),
             Some('M') => out.push_str(&format!("{:02}", fields.minute)),
             Some('S') => out.push_str(&format!("{:02}", fields.second)),
             Some('j') => out.push_str(&format!("{:03}", fields.year_day)),
+            Some('p') => out.push_str(if fields.hour < 12 { "AM" } else { "PM" }),
+            // English names: the plugin platform is English-only at the
+            // canonical layer, and a deterministic table keeps the result
+            // independent of the host locale database.
+            Some('a') => out.push_str(WEEKDAY_ABBREV[weekday_index(fields)]),
+            Some('A') => out.push_str(WEEKDAY_FULL[weekday_index(fields)]),
+            Some('b' | 'h') => out.push_str(MONTH_ABBREV[month_index(fields)]),
+            Some('B') => out.push_str(MONTH_FULL[month_index(fields)]),
+            // POSIX weekday numbering: `%u` Monday=1..Sunday=7, `%w` Sunday=0.
+            Some('u') => out.push_str(&format!("{}", (fields.weekday + 5) % 7 + 1)),
+            Some('w') => out.push_str(&format!("{}", fields.weekday - 1)),
+            // Composite conversions expand through the same table walk. They
+            // only contain literal and non-composite specifiers, so the
+            // recursion is one level deep.
+            Some('c') => out.push_str(&format_date("%a %b %e %H:%M:%S %Y", fields)),
+            Some('D' | 'x') => out.push_str(&format_date("%m/%d/%y", fields)),
+            Some('F') => out.push_str(&format_date("%Y-%m-%d", fields)),
+            Some('r') => out.push_str(&format_date("%I:%M:%S %p", fields)),
+            Some('R') => out.push_str(&format_date("%H:%M", fields)),
+            Some('T' | 'X') => out.push_str(&format_date("%H:%M:%S", fields)),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
             Some('%') => out.push('%'),
+            // Unknown, zone-dependent (`%z`/`%Z`), week-number (`%U`/`%V`/
+            // `%W`), ISO week-year (`%g`/`%G`), and epoch (`%s`) conversions
+            // stay verbatim: the host has no locale/zone database to resolve
+            // them deterministically, and reference strftime copies unknown
+            // specifiers through rather than dropping them.
             Some(other) => {
                 out.push('%');
                 out.push(other);
@@ -229,6 +265,60 @@ fn format_date(format: &str, fields: &DateFields) -> String {
         }
     }
     out
+}
+
+/// English full weekday names indexed by Lua `wday` (1 = Sunday).
+const WEEKDAY_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// English abbreviated weekday names indexed by Lua `wday` (1 = Sunday).
+const WEEKDAY_ABBREV: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// English full month names indexed by Lua `month` (1 = January).
+const MONTH_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// English abbreviated month names indexed by Lua `month` (1 = January).
+const MONTH_ABBREV: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Zero-based weekday index from the Lua `wday` field, clamped into range.
+fn weekday_index(fields: &DateFields) -> usize {
+    usize::try_from(fields.weekday.clamp(1, 7) - 1).unwrap_or(0)
+}
+
+/// Zero-based month index from the month field, clamped into range.
+fn month_index(fields: &DateFields) -> usize {
+    usize::try_from(fields.month.clamp(1, 12) - 1).unwrap_or(0)
+}
+
+/// 12-hour clock value (`00` -> `12`, `13` -> `01`).
+fn hour12(hour: i64) -> i64 {
+    let hour = hour.rem_euclid(24);
+    match hour % 12 {
+        0 => 12,
+        value => value,
+    }
 }
 
 fn install_string<'gc>(ctx: Context<'gc>) {
@@ -491,6 +581,38 @@ mod tests {
         assert_eq!(vm.test_global("local_table"), Some(1.0));
     }
 
+    #[test]
+    fn os_date_formats_names_and_common_posix_conversions() {
+        // bitty#2530: the restricted formatter must resolve the name
+        // conversions a plugin reasonably expects from `os.date`; the 0.0.26
+        // host passed `%A`/`%B` through literally. Epoch is a fixed UTC
+        // instant (Thursday 1970-01-01T00:00:00Z), so every expectation is
+        // calendar truth rather than a host-locale read.
+        let mut vm = LuaVm::new("osdate-names");
+        let source = r#"
+            full = os.date("!%A, %d %B %Y %H:%M:%S", 0)
+              == "Thursday, 01 January 1970 00:00:00"
+            abbr = os.date("!%a %b %e %Y", 0) == "Thu Jan  1 1970"
+            clock = os.date("!%I:%M %p", 0) == "12:00 AM"
+              and os.date("!%I:%M %p", 13 * 3600 + 5 * 60) == "01:05 PM"
+            numeric = os.date("!%Y-%m-%d %H:%M:%S", 0) == "1970-01-01 00:00:00"
+            july = os.date("!%A %B", 1782907200) == "Wednesday July"
+            unknown = os.date("!%Q %z %Z", 0) == "%Q %z %Z"
+            percent = os.date("!100%%", 0) == "100%"
+            composite = os.date("!%c|%D|%F|%R|%T|%r", 0)
+              == "Thu Jan  1 00:00:00 1970|01/01/70|1970-01-01|00:00|00:00:00|12:00:00 AM"
+            weekdays = os.date("!%u/%w", 0) == "4/4"
+            ok = full and abbr and clock and numeric and july and unknown
+              and percent and composite and weekdays
+        "#;
+        let outcome = vm.execute(source).expect("execute");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.test_global("ok"), Some(1.0));
+    }
+
     /// Child-process witness for `os.date`'s local/UTC split. The parent
     /// re-executes this test binary with `TZ` pinned so the assertion does not
     /// depend on the developer's or CI runner's timezone (GitHub runners run
@@ -533,7 +655,7 @@ mod tests {
         // (standard time), and the New York spring-forward second pair
         // 2026-03-08T06:59:59Z / 07:00:00Z. Every expectation below was
         // checked against `date(1)` for the same instant.
-        let summer = 1_782_907_200;
+        let summer = 1782907200;
         let winter = 1_768_478_400;
         let before_spring_forward = 1_772_953_199;
         let after_spring_forward = 1_772_953_200;

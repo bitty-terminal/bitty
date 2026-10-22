@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Hover tooltip formatting, centering, and refresh (#2530):** the
+  restricted `os.date` now resolves the common POSIX conversions, including
+  the English `%a`/`%A`/`%b`/`%B` names, so a plugin no longer gets raw
+  placeholders back. Hover-anchored tooltips are centered on the hovered band
+  region and clamped inside the window instead of starting at the region's
+  left edge, and an anchored tooltip re-reads the plugin's `overlay` block on
+  every tick so its detail stays live while the pointer rests on a module.
+
 ## [0.0.26] - 2026-10-22
 
 ### Added

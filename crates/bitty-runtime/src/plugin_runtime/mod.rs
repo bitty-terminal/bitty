@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
+use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::ui::UiNode;
 use bitty_lua::{
     CommandRegistration, HostServices, InvocationOutcome, LuaVm, MarshallingLimits,

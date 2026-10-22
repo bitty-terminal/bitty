@@ -733,8 +733,16 @@ pub struct Runtime {
     /// chrome action, dismissed by `Esc` or the same chord. Never grid
     /// truth; see `runtime::help`.
     help_visible: bool,
-    /// Adaptive panel creation mode (Spiral vs Dwindle).
+    /// Adaptive panel creation mode (Balanced vs Spiral vs Dwindle).
     panel_layout_mode: PanelLayoutMode,
+    /// Spiral continuation (`created leaf`, next phase) for
+    /// [`PanelLayoutMode::Spiral`] (issue #2528).
+    ///
+    /// Continues the clockwise rotation only while the created leaf stays
+    /// focused; a survivor after a close or any other active pane reads
+    /// phase 0 (Right), so the split direction never reverses from a stale
+    /// leaf count.
+    panel_spiral: Option<(ViewId, u8)>,
     /// Declarative panel spawn rules in first-match-wins order (CTX-1080).
     ///
     /// Empty by default; set from the effective `panel_rules` by the app
@@ -756,8 +764,6 @@ pub struct Runtime {
     /// overlays are live; the app's capture predicate reads it through
     /// [`Runtime::overlay_modal_active`].
     overlay_modal_active: bool,
-    /// Next workspace creation sequence (display names `ws{seq}`).
-    next_workspace_seq: u64,
     /// Own IPC socket path for PTY `BITTY_SOCKET` injection (CTX-1117,
     /// issue #1900).
     ///
@@ -1979,10 +1985,10 @@ impl Runtime {
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
+            panel_spiral: None,
             panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
             overlay_modal_active: false,
-            next_workspace_seq: 2,
             ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             // Command targets join every live collection: fold/jump/copy
@@ -2263,10 +2269,10 @@ impl Runtime {
             last_presented_bands: Vec::new(),
             help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
+            panel_spiral: None,
             panel_spawn_rules: Vec::new(),
             help_rows: Vec::new(),
             overlay_modal_active: false,
-            next_workspace_seq: 2,
             ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             // Command targets join every live collection: fold/jump/copy

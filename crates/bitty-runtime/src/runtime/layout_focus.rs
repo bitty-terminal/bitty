@@ -5,7 +5,10 @@
 use super::*;
 use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
-use bitty_ui::{SplitAxis, bisect_choice, largest_area_leaf, smart_split_axis};
+use bitty_ui::{
+    SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, splittable_axis,
+    splittable_rect,
+};
 use core::ops::{Deref, DerefMut};
 
 pub(super) fn default_layout(cols: usize, rows: usize) -> LayoutNode {
@@ -21,6 +24,24 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
 
 /// Bound on the hovered-URL preview text (issue #1759, R-005 anti-spoofing).
 pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
+
+/// One placement decision for an adaptive `NewPanel` split (issues #2521,
+/// #2528).
+///
+/// Produced by [`Runtime::panel_split_plan`] and committed verbatim by the
+/// app layer: the target slot, the balanced axis, the insertion side, and
+/// (in `Spiral` mode) the clockwise phase used for this split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelSplitPlan {
+    /// Leaf whose slot is split.
+    pub target: ViewId,
+    /// Axis of the new split.
+    pub axis: SplitAxis,
+    /// Whether the fresh pane becomes the first child (left/top).
+    pub place_new_first: bool,
+    /// Spiral phase (`0..4`) used by this split; `None` outside `Spiral`.
+    pub spiral_phase: Option<u8>,
+}
 
 /// Pinned-float cascade step in cells per pin depth (issue #1757, CodeRabbit
 /// 1883): stacked pins offset so each stays visible and clickable instead of
@@ -2791,34 +2812,107 @@ impl Runtime {
 
     /// Hyprland-dwindle axis for a new panel at `focused` (CTX-0838 #1441).
     ///
-    /// Pure, total, headless: reads the focused leaf's cell allocation and
-    /// applies the `smart_split_axis` heuristic (wide splits side-by-side,
-    /// tall stacks, square ties break side-by-side, matching Hyprland's
-    /// `splitTop = height * split_width_multiplier > width` at the default
-    /// multiplier `1.0`). Falls back to the container when the leaf has no
-    /// allocation (fail-closed: never panics, never mutates). Explicit
+    /// The axis half of [`Self::panel_split_plan`]. [`PanelLayoutMode::Balanced`]
+    /// and [`PanelLayoutMode::BisectLargest`] ignore `focused` and use the
+    /// physically largest slot; `Spiral`/`Dwindle` use the focused leaf.
+    /// Falls back to the container when the leaf has no allocation
+    /// (fail-closed: never panics, never mutates). Explicit
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
     /// `new_panel` path.
     ///
-    /// CTX-0964 (#1698): in [`PanelLayoutMode::BisectLargest`] this ignores
-    /// `focused` and returns the raw-aspect axis
-    /// ([`bitty_ui::bisect_split_axis`], no 2.0 cell-aspect correction) of
-    /// the largest-area panel (see [`Self::panel_bisect_target`]), so the
-    /// `NewPanel` opt-in and the move/restore default agree on the axis.
+    /// CTX-0964 (#1698): in [`PanelLayoutMode::BisectLargest`] this returns
+    /// the raw-aspect axis ([`bitty_ui::bisect_split_axis`], no 2.0
+    /// cell-aspect correction) of the largest-area panel (see
+    /// [`Self::panel_bisect_target`]).
     #[must_use]
     pub fn panel_split_axis(&self, focused: ViewId) -> SplitAxis {
-        if self.panel_layout_mode == PanelLayoutMode::BisectLargest {
-            let allocations = self.layout_allocations();
-            let (_, axis) = bisect_choice(&allocations, self.container);
-            return axis;
-        }
-        let rect = self
-            .layout_allocations()
-            .into_iter()
+        self.panel_split_plan_for(focused)
+            .map_or_else(|| balanced_split_axis(self.container), |plan| plan.axis)
+    }
+
+    /// Placement plan for one adaptive `NewPanel` split (issues #2521,
+    /// #2528).
+    ///
+    /// Returns the slot to split, the balanced axis, the insertion side, and
+    /// (in `Spiral` mode) the phase used. `None` when no live leaf can host
+    /// two panes at the minimum usable size (or the layout is empty). The
+    /// app layer commits exactly this plan, so the axis and target can never
+    /// disagree with [`Self::panel_split_axis`] /
+    /// [`Self::panel_bisect_target`].
+    #[must_use]
+    pub fn panel_split_plan(&self) -> Option<PanelSplitPlan> {
+        self.panel_split_plan_for(self.focused_view()?)
+    }
+
+    fn panel_split_plan_for(&self, focused: ViewId) -> Option<PanelSplitPlan> {
+        let allocations = self.layout_allocations();
+        let focused_rect = allocations
+            .iter()
             .find(|(id, _)| *id == focused)
-            .map(|(_, r)| r)
+            .map(|(_, rect)| *rect)
             .unwrap_or(self.container);
-        smart_split_axis(rect, 1.0)
+        let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
+            PanelLayoutMode::Balanced => {
+                let (target, rect) = largest_area_leaf(&allocations)?;
+                (target, rect, splittable_axis(rect)?, false, None)
+            }
+            PanelLayoutMode::BisectLargest => {
+                let (target, rect) = largest_area_leaf(&allocations)?;
+                let (_, axis) = bisect_choice(&allocations, self.container);
+                (target, rect, axis, false, None)
+            }
+            PanelLayoutMode::Dwindle => (
+                focused,
+                focused_rect,
+                splittable_axis(focused_rect)?,
+                false,
+                None,
+            ),
+            PanelLayoutMode::Spiral => {
+                let phase = self.panel_spiral_phase(focused);
+                (
+                    focused,
+                    focused_rect,
+                    splittable_axis(focused_rect)?,
+                    phase >= 2,
+                    Some(phase),
+                )
+            }
+        };
+        if !splittable_rect(rect, axis) {
+            return None;
+        }
+        Some(PanelSplitPlan {
+            target,
+            axis,
+            place_new_first,
+            spiral_phase,
+        })
+    }
+
+    /// Spiral phase for the next split when `focused` continues the creation
+    /// chain (issue #2528).
+    ///
+    /// Continues the clockwise rotation only while the pane created by the
+    /// previous `NewPanel` still holds focus; any other active pane (a
+    /// survivor after a close, a click elsewhere) restarts at phase 0
+    /// (Right). The old leaf-count phase flipped to Left after a close and
+    /// reversed the split direction.
+    fn panel_spiral_phase(&self, focused: ViewId) -> u8 {
+        match self.panel_spiral {
+            Some((view, phase)) if view == focused => phase,
+            _ => 0,
+        }
+    }
+
+    /// Records the spiral continuation after a committed `NewPanel` split
+    /// (issue #2528).
+    ///
+    /// `used_phase` is the phase from the committed [`PanelSplitPlan`];
+    /// `created` becomes the only leaf that continues the rotation. Any
+    /// other focus (including a survivor after a close) reads phase 0.
+    pub fn note_panel_split_created(&mut self, created: ViewId, used_phase: Option<u8>) {
+        self.panel_spiral = used_phase.map(|phase| (created, (phase + 1) % 4));
     }
 
     /// Largest-area panel to bisect (CTX-0964, #1698).
@@ -2826,9 +2920,10 @@ impl Runtime {
     /// Pure, total, headless: returns the leaf with the largest
     /// `width * height` allocation (first in solver order on ties), or
     /// `None` for an empty layout. `NewPanel` callers in
-    /// [`PanelLayoutMode::BisectLargest`] split this target (not the
-    /// focused leaf); move-to-workspace uses this target regardless of
-    /// [`PanelLayoutMode`]. The axis for the target comes from
+    /// [`PanelLayoutMode::Balanced`] and [`PanelLayoutMode::BisectLargest`]
+    /// split this target (not the focused leaf); move-to-workspace uses this
+    /// target regardless of [`PanelLayoutMode`]. The axis for the target
+    /// comes from [`bitty_ui::balanced_split_axis`] (balanced) or
     /// [`bitty_ui::bisect_split_axis`] (raw `width >= height`).
     #[must_use]
     pub fn panel_bisect_target(&self) -> Option<ViewId> {
@@ -2836,7 +2931,7 @@ impl Runtime {
         largest_area_leaf(&allocations).map(|(id, _)| id)
     }
 
-    /// Returns the current panel layout mode for adaptive splits (Spiral vs Dwindle vs BisectLargest).
+    /// Returns the current panel layout mode for adaptive splits (Balanced vs Spiral vs Dwindle vs BisectLargest).
     #[must_use]
     pub fn panel_layout_mode(&self) -> PanelLayoutMode {
         self.panel_layout_mode
@@ -2845,6 +2940,8 @@ impl Runtime {
     /// Sets the panel layout mode for adaptive splits.
     pub fn set_panel_layout_mode(&mut self, mode: PanelLayoutMode) {
         self.panel_layout_mode = mode;
+        // Issue #2528: a mode change starts a fresh creation chain.
+        self.panel_spiral = None;
     }
 
     /// Declarative panel spawn rules in first-match-wins order (CTX-1080).
@@ -2971,25 +3068,24 @@ impl Runtime {
     }
 
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):
-    /// - `Spiral` (default): 4-way clockwise rotating spiral (Right, Down, Left, Up):
-    ///   - Step 0 (1 -> 2 leaves): Right (`place_new_first = false`)
-    ///   - Step 1 (2 -> 3 leaves): Bottom (`place_new_first = false`)
-    ///   - Step 2 (3 -> 4 leaves): Left (`place_new_first = true`)
-    ///   - Step 3 (4 -> 5 leaves): Top (`place_new_first = true`)
-    /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom, `place_new_first = false`).
+    /// - `Balanced` (default): always Right or Down (`place_new_first =
+    ///   false`); the fresh pane goes after the bisected largest slot.
+    /// - `Spiral`: 4-way clockwise rotation (Right, Down, Left, Up) that
+    ///   continues only while the pane created by the previous split stays
+    ///   focused; any other active pane restarts at Right (issue #2528).
+    /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom,
+    ///   `place_new_first = false`).
     /// - `BisectLargest` (CTX-0964, #1698): always Right or Down
     ///   (`place_new_first = false`); the fresh pane goes after the bisected
     ///   largest-area panel. Move-to-workspace also uses this placement
     ///   regardless of mode.
+    ///
+    /// The full decision lives in [`Self::panel_split_plan`]; this getter
+    /// stays for callers that only need the side.
     #[must_use]
     pub fn panel_split_place_new_first(&self) -> bool {
-        match self.panel_layout_mode {
-            PanelLayoutMode::Spiral => {
-                let step = (self.layout.leaf_count().saturating_sub(1)) % 4;
-                step >= 2
-            }
-            PanelLayoutMode::Dwindle | PanelLayoutMode::BisectLargest => false,
-        }
+        self.panel_split_plan()
+            .is_some_and(|plan| plan.place_new_first)
     }
 
     /// Leaf count of the current layout.
@@ -3172,6 +3268,163 @@ mod tests {
 
     fn leaf(id: u64) -> LayoutNode {
         LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
+    }
+
+    /// Applies one adaptive `NewPanel` split exactly like the keymap arm:
+    /// plan from the runtime, split the planned target, install, focus the
+    /// fresh leaf, and record the spiral continuation.
+    fn apply_new_panel(rt: &mut Runtime) -> ViewId {
+        let plan = rt.panel_split_plan().expect("plan");
+        let new_id = rt.next_view_id_global();
+        let mut layout = rt.layout().clone();
+        fn split(
+            node: &mut LayoutNode,
+            target: ViewId,
+            axis: SplitAxis,
+            new_id: ViewId,
+            first: bool,
+        ) -> bool {
+            match node {
+                LayoutNode::Leaf(view) if view.id() == target => {
+                    let old = view.clone();
+                    let fresh = View::new(new_id, usize::from(old.cols()), usize::from(old.rows()));
+                    let (a, b) = if first {
+                        (LayoutNode::leaf(fresh), LayoutNode::leaf(old))
+                    } else {
+                        (LayoutNode::leaf(old), LayoutNode::leaf(fresh))
+                    };
+                    *node = LayoutNode::split(axis, 0.5, a, b);
+                    true
+                }
+                LayoutNode::Split {
+                    first: f,
+                    second: s,
+                    ..
+                } => split(f, target, axis, new_id, first) || split(s, target, axis, new_id, first),
+                LayoutNode::Stack(children) => children
+                    .iter_mut()
+                    .any(|child| split(child, target, axis, new_id, first)),
+                LayoutNode::Overlay { base, overlay, .. } => {
+                    split(base, target, axis, new_id, first)
+                        || split(overlay, target, axis, new_id, first)
+                }
+                LayoutNode::Leaf(_) => false,
+            }
+        }
+        assert!(split(
+            &mut layout,
+            plan.target,
+            plan.axis,
+            new_id,
+            plan.place_new_first
+        ));
+        rt.set_layout(layout);
+        rt.set_focus(new_id);
+        rt.note_panel_split_created(new_id, plan.spiral_phase);
+        new_id
+    }
+
+    /// Issues #2521/#2528: eight default `Mod+N` presses must stay balanced
+    /// and above the minimum pane size instead of nesting ever-smaller
+    /// columns.
+    #[test]
+    fn eight_balanced_new_panels_keep_usable_geometry() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        for _ in 0..8 {
+            apply_new_panel(&mut rt);
+        }
+        assert_eq!(rt.leaf_count(), 9);
+        let allocations = rt.layout_allocations();
+        assert_eq!(allocations.len(), 9);
+        assert_eq!(rt.layout().validate_structure(), Ok(9));
+        // Minimum usable pane: every leaf stays at or above the bound.
+        for (id, rect) in &allocations {
+            assert!(
+                rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS,
+                "{id:?} collapsed below the minimum pane size: {rect:?} (all {allocations:?})"
+            );
+        }
+        // Balance: the largest and smallest panes are within 3x of each
+        // other. Repeated focused-pane halving produced 5x1 slivers before.
+        let area = |rect: &UiRect| u32::from(rect.width) * u32::from(rect.height);
+        let smallest = allocations.iter().map(|(_, r)| area(r)).min().unwrap();
+        let largest = allocations.iter().map(|(_, r)| area(r)).max().unwrap();
+        assert!(
+            largest <= smallest * 3,
+            "unbalanced tree: smallest {smallest}, largest {largest}: {allocations:?}"
+        );
+    }
+
+    /// Issue #2528: the spiral phase continues only along the active
+    /// creation chain. Closing a pane hands focus to a survivor, which
+    /// resets the next split to Right instead of the stale Left phase.
+    #[test]
+    fn spiral_phase_resets_to_right_after_close() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        for _ in 0..3 {
+            apply_new_panel(&mut rt);
+        }
+        let focused = rt.focused_view().expect("focus");
+        let plan = rt.panel_split_plan().expect("plan");
+        assert_eq!(plan.target, focused);
+        assert_eq!(
+            plan.spiral_phase,
+            Some(3),
+            "the chain's fourth split rotates to Top"
+        );
+        assert!(plan.place_new_first);
+
+        // Close the focused pane through the shared close funnel; focus
+        // lands on the sibling that takes the space.
+        let survivor = bitty_ui::survivor_after_close(rt.layout(), focused).expect("survivor");
+        let mut layout = rt.layout().clone();
+        assert!(layout.remove_leaf(focused).is_some());
+        rt.set_layout_closing(layout, focused);
+        rt.set_focus(survivor);
+        let plan = rt.panel_split_plan().expect("plan after close");
+        assert_eq!(plan.spiral_phase, Some(0), "a survivor restarts at Right");
+        assert!(!plan.place_new_first, "Mod+n must not reverse to the left");
+    }
+
+    /// Issue #2528: a click to another pane breaks the creation chain too.
+    #[test]
+    fn spiral_phase_resets_when_focus_leaves_the_created_pane() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        let first = rt.focused_view().expect("focus");
+        let second = apply_new_panel(&mut rt);
+        let third = apply_new_panel(&mut rt);
+        assert_eq!(rt.focused_view(), Some(third));
+        assert!(rt.set_focus(first));
+        let plan = rt.panel_split_plan().expect("plan");
+        assert_eq!(plan.spiral_phase, Some(0), "other focus resets to Right");
+        assert!(!plan.place_new_first);
+        // Returning to the created pane resumes its chain: the recorded
+        // continuation still belongs to it.
+        assert!(rt.set_focus(third));
+        let plan = rt.panel_split_plan().expect("plan");
+        assert_eq!(plan.target, third);
+        assert_eq!(plan.spiral_phase, Some(2));
+        assert!(plan.place_new_first);
+        let _ = second;
+    }
+
+    /// Issue #2521: a layout too small to host two usable panes refuses the
+    /// adaptive split instead of committing a sliver.
+    #[test]
+    fn balanced_plan_refuses_below_minimum_pane_size() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let seed = rt.focused_view().expect("focus");
+        let tiny = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(seed, 16, 6)),
+            LayoutNode::leaf(View::new(tiny, 16, 6)),
+        ));
+        rt.set_container(UiRect::new(0, 0, 32, 6));
+        assert_eq!(rt.panel_split_plan(), None);
     }
 
     #[test]
@@ -3367,23 +3620,29 @@ mod tests {
         assert_eq!(rt.panel_bisect_target(), Some(first));
     }
 
-    /// CTX-0964 (#1698): `Spiral` (default) and `Dwindle` keep their
-    /// existing focused-leaf semantics; only `BisectLargest` opts into the
-    /// largest-leaf target.
+    /// CTX-0964 (#1698) / issues #2521, #2528: `Spiral` and `Dwindle` keep
+    /// focused-leaf semantics; `Balanced` (the new default) and
+    /// `BisectLargest` target the largest leaf.
     #[test]
-    fn spiral_and_dwindle_keep_focused_semantics() {
+    fn default_mode_is_balanced_and_modes_keep_their_targets() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
         let focused = rt.focused_view().expect("focus");
-        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Spiral);
+        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Balanced);
         // Single leaf: every mode agrees on the container axis.
         assert_eq!(
             rt.panel_split_axis(focused),
             bitty_ui::smart_split_axis(rt.container(), 1.0)
         );
         assert_eq!(rt.panel_bisect_target(), Some(focused));
+        assert!(!rt.panel_split_place_new_first());
         rt.set_panel_layout_mode(PanelLayoutMode::Dwindle);
         assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Dwindle);
         assert!(!rt.panel_split_place_new_first());
+        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        let plan = rt.panel_split_plan().expect("spiral plan");
+        assert_eq!(plan.target, focused, "spiral keeps the focused target");
+        assert_eq!(plan.spiral_phase, Some(0), "a fresh chain starts at Right");
+        assert!(!plan.place_new_first);
     }
 
     /// CTX-1117 (issue #1900): own IPC socket path for PTY `BITTY_SOCKET`

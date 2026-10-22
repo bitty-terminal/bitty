@@ -243,9 +243,10 @@ pub use label_allocator::{
     MAX_HINT_TARGETS,
 };
 pub use layout::{
-    CELL_ASPECT_RATIO, LayoutNode, OverlayLayer, OverlayTier, balanced_bisect_choice,
-    balanced_split_axis, bisect_choice, bisect_split_axis, clamp_ratio, largest_area_leaf,
-    smart_split_axis, split_rect, split_rect_with_gap,
+    CELL_ASPECT_RATIO, LayoutNode, MIN_PANE_COLS, MIN_PANE_ROWS, OverlayLayer, OverlayTier,
+    TreeViolation, balanced_bisect_choice, balanced_split_axis, bisect_choice, bisect_split_axis,
+    clamp_ratio, largest_area_leaf, smart_split_axis, split_rect, split_rect_with_gap,
+    splittable_axis, splittable_rect, survivor_after_close,
 };
 pub use motion::{
     MAX_MOTION_DURATION_MS, MotionConfig, MotionCurve, MotionError, MotionScope, MotionSpec,

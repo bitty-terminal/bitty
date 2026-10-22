@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::geometry::{Gaps, Rect};
+use crate::geometry::{Gaps, Rect, SplitAxis};
 use crate::layout::LayoutNode;
 use crate::view::ViewId;
 
@@ -206,9 +206,15 @@ impl Focus {
         // Issue #2444: a candidate must lie fully beyond the focused leaf's
         // facing edge. Aligned candidates (perpendicular interval overlaps)
         // rank above disjoint ones; within a tier the nearest facing edge,
-        // then the nearest perpendicular center, then stable leaf order
-        // decide. Center-to-center distance alone picks a taller neighbor
-        // whose center happens to be closer in an L-shaped layout.
+        // then the dwindle tree's directional edge, then the widest
+        // perpendicular overlap, then the nearest perpendicular center, then
+        // stable leaf order decide. Center-to-center distance alone picks a
+        // taller neighbor whose center happens to be closer in an L-shaped
+        // layout.
+        // Issue #2526: under a full-width top pane both bottom panes touch
+        // the facing edge, so tree adjacency outranks center distance; a
+        // wider bottom-right pane must not steal `Mod+j` from the bottom-left
+        // pane by having a closer center.
         let mut aligned: Vec<SpatialCandidate> = Vec::new();
         let mut disjoint: Vec<SpatialCandidate> = Vec::new();
         for (id, rect) in &alloc {
@@ -225,6 +231,8 @@ impl Focus {
                 id: *id,
                 order,
                 distance: placement.edge_distance,
+                overlap: placement.perpendicular_overlap,
+                tree_rank: tree_direction_rank(node, cur, *id, dir).unwrap_or(TreeRank::NONE),
                 perpendicular_distance: placement.perpendicular_distance,
             };
             if placement.perpendicular_overlap > 0 {
@@ -237,6 +245,8 @@ impl Focus {
             group.sort_by(|a, b| {
                 a.distance
                     .cmp(&b.distance)
+                    .then_with(|| a.tree_rank.cmp(&b.tree_rank))
+                    .then_with(|| b.overlap.cmp(&a.overlap))
                     .then_with(|| a.perpendicular_distance.cmp(&b.perpendicular_distance))
                     .then_with(|| a.order.cmp(&b.order))
                     .then_with(|| a.id.cmp(&b.id))
@@ -256,8 +266,96 @@ struct SpatialCandidate {
     order: usize,
     /// Facing-edge distance along the movement axis.
     distance: i64,
+    /// Perpendicular overlap length with the focused leaf.
+    overlap: i64,
+    /// Tree-adjacency rank; [`TreeRank::NONE`] when no ancestor separates
+    /// the panes along the movement axis.
+    tree_rank: TreeRank,
     /// Perpendicular center distance (doubled).
     perpendicular_distance: i64,
+}
+
+/// Directional adjacency of a candidate in the layout tree.
+///
+/// Ordering is derived so `Ord` sorts the best candidate first: shallower
+/// common ancestor first, then the natural edge leaf before a deeper leaf
+/// of the same sibling subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TreeRank {
+    /// Depth of the lowest common ancestor split (0 = root).
+    depth: u32,
+    /// `true` for a non-natural leaf inside the sibling subtree.
+    off_edge: bool,
+}
+
+impl TreeRank {
+    /// Rank for a candidate without a directional tree ancestor; sorts
+    /// after every ranked candidate.
+    const NONE: Self = Self {
+        depth: u32::MAX,
+        off_edge: true,
+    };
+}
+
+/// Tree-adjacency rank for a candidate in `dir` (issue #2526).
+///
+/// Walks the split paths of the focused and candidate leaves, finds their
+/// lowest common ancestor split, and returns `Some` when that split places
+/// the candidate on the far side of `dir` (right/down for index `1`,
+/// left/up for index `0`). The closest such ancestor wins; inside its
+/// sibling subtree the leaf at the movement edge (first leaf for
+/// right/down, last for left/up) is the natural target and outranks the
+/// others. This is the dwindle tie-break: from the top pane of a split
+/// column, `Down` lands on the bottom-left pane, never on a sibling chosen
+/// by center distance or leaf order.
+#[must_use]
+fn tree_direction_rank(
+    node: &LayoutNode,
+    current: ViewId,
+    candidate: ViewId,
+    dir: FocusDirection,
+) -> Option<TreeRank> {
+    if matches!(dir, FocusDirection::Next | FocusDirection::Prev) {
+        return None;
+    }
+    let current_path = node.path_to_leaf(current)?;
+    let candidate_path = node.path_to_leaf(candidate)?;
+    let mut depth = 0;
+    while depth < current_path.len()
+        && depth < candidate_path.len()
+        && current_path[depth] == candidate_path[depth]
+    {
+        depth += 1;
+    }
+    let ((axis, current_index), (_, candidate_index)) =
+        (*current_path.get(depth)?, *candidate_path.get(depth)?);
+    let forward = match dir {
+        FocusDirection::Right => {
+            axis == SplitAxis::Horizontal && current_index == 0 && candidate_index == 1
+        }
+        FocusDirection::Left => {
+            axis == SplitAxis::Horizontal && current_index == 1 && candidate_index == 0
+        }
+        FocusDirection::Down => {
+            axis == SplitAxis::Vertical && current_index == 0 && candidate_index == 1
+        }
+        FocusDirection::Up => {
+            axis == SplitAxis::Vertical && current_index == 1 && candidate_index == 0
+        }
+        FocusDirection::Next | FocusDirection::Prev => false,
+    };
+    if !forward {
+        return None;
+    }
+    let first_on_edge = matches!(dir, FocusDirection::Right | FocusDirection::Down);
+    let edge_index = usize::from(!first_on_edge);
+    let off_edge = candidate_path[depth + 1..]
+        .iter()
+        .any(|(_, index)| *index != edge_index);
+    Some(TreeRank {
+        depth: u32::try_from(depth).unwrap_or(u32::MAX),
+        off_edge,
+    })
 }
 
 /// Placement of a candidate that lies fully beyond the focused leaf.
@@ -597,11 +695,169 @@ mod tests {
             Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Left),
             Some(ViewId::new(1))
         );
-        // Both top panes are above the bottom pane; equal distance ties
-        // resolve to the first in leaf order.
+        // Both top panes are above the bottom pane; equal edge distance and
+        // overlap resolve on the tree's directional edge: the last leaf of
+        // the sibling row (`2`) is the pane at the `Up` edge (issue #2526).
         assert_eq!(
             Focus::with_focus(ViewId::new(3)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2))
+        );
+    }
+
+    /// Issue #2526: 1 + 1 + 2 layout — a full-height left pane, a full-width
+    /// top-right pane, and a bottom row of two panes. `Down` from the top
+    /// pane must land on the bottom-left pane that shares the split's left
+    /// edge, even when the bottom-right pane is wider (closer center) or
+    /// appears first in creation order.
+    #[test]
+    fn focus_spatial_issue_2526_top_right_down_picks_bottom_left() {
+        // Bottom row 60/40: pane 4 is wider, so center distance alone would
+        // pick it over pane 3 on the left.
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(v(1)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(v(2)),
+                LayoutNode::split(
+                    SplitAxis::Horizontal,
+                    0.4,
+                    LayoutNode::leaf(v(3)),
+                    LayoutNode::leaf(v(4)),
+                ),
+            ),
+        );
+        let bounds = Rect::new(0, 0, 80, 40);
+        let alloc = node.layout(bounds);
+        let rect = |id: u64| {
+            alloc
+                .iter()
+                .find(|(leaf, _)| *leaf == ViewId::new(id))
+                .map(|(_, rect)| *rect)
+                .expect("allocated")
+        };
+        // Exact geometry: 1=(0,0,40,40), 2=(40,0,40,20),
+        // 3=(40,20,16,20), 4=(56,20,24,20).
+        assert_eq!(rect(1), Rect::new(0, 0, 40, 40));
+        assert_eq!(rect(2), Rect::new(40, 0, 40, 20));
+        assert_eq!(rect(3), Rect::new(40, 20, 16, 20));
+        assert_eq!(rect(4), Rect::new(56, 20, 24, 20));
+        assert_eq!(
+            Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(3)),
+            "Mod+j from the top-right pane must reach the bottom-left pane"
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(3)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(4)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(3)).advance(&node, bounds, FocusDirection::Left),
             Some(ViewId::new(1))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).advance(&node, bounds, FocusDirection::Right),
+            Some(ViewId::new(2))
+        );
+    }
+
+    /// Issue #2526: creation order must not win over geometry. The spiral
+    /// inserts the newer pane on the left, so the bottom row's DFS order is
+    /// `[4, 3]` while `3` is spatially right of `4`; `Down` from the top
+    /// pane still lands on the pane at the split's left edge (`4`).
+    #[test]
+    fn focus_spatial_issue_2526_reversed_creation_order_uses_geometry() {
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(v(1)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(v(2)),
+                LayoutNode::split(
+                    SplitAxis::Horizontal,
+                    0.5,
+                    LayoutNode::leaf(v(4)),
+                    LayoutNode::leaf(v(3)),
+                ),
+            ),
+        );
+        let bounds = Rect::new(0, 0, 80, 40);
+        assert_eq!(
+            Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(4)),
+            "the bottom-left pane is the tree's directional edge"
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(4)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2))
+        );
+    }
+
+    /// Issue #2526: every directional step in the 1+1+2 layout is
+    /// reciprocal where the panes face each other, so repeated moves cannot
+    /// ping-pong between unrelated panes.
+    #[test]
+    fn focus_spatial_issue_2526_directions_are_reciprocal() {
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(v(1)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(v(2)),
+                LayoutNode::split(
+                    SplitAxis::Horizontal,
+                    0.5,
+                    LayoutNode::leaf(v(3)),
+                    LayoutNode::leaf(v(4)),
+                ),
+            ),
+        );
+        let bounds = Rect::new(0, 0, 80, 40);
+        for (from, dir, back) in [
+            (2, FocusDirection::Down, FocusDirection::Up),
+            (3, FocusDirection::Up, FocusDirection::Down),
+            (4, FocusDirection::Left, FocusDirection::Right),
+            (1, FocusDirection::Right, FocusDirection::Left),
+        ] {
+            let next = Focus::with_focus(ViewId::new(from))
+                .advance(&node, bounds, dir)
+                .expect("focus");
+            assert_ne!(next, ViewId::new(from), "from {from} dir {dir:?}");
+            assert_eq!(
+                Focus::with_focus(next).advance(&node, bounds, back),
+                Some(ViewId::new(from)),
+                "reverse of {from} -> {next:?} must return"
+            );
+        }
+        // The full-height left pane's `Left`/`Right` neighbors are `1` and
+        // the top-row tree edge (`2`); `4` sits under the right half of the
+        // top pane, so its left neighbor is `3`.
+        assert_eq!(
+            Focus::with_focus(ViewId::new(3)).advance(&node, bounds, FocusDirection::Left),
+            Some(ViewId::new(1))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).advance(&node, bounds, FocusDirection::Right),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(4)).advance(&node, bounds, FocusDirection::Left),
+            Some(ViewId::new(3))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(4)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2)),
+            "both bottom panes face the top pane; the tree edge is the top pane"
         );
     }
 

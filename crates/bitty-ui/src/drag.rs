@@ -32,7 +32,7 @@
 #![forbid(unsafe_code)]
 
 use crate::geometry::{Gaps, Point, Rect, SplitAxis};
-use crate::layout::LayoutNode;
+use crate::layout::{LayoutNode, splittable_rect};
 use crate::panel::CommandRegistry;
 use crate::view::ViewId;
 
@@ -364,28 +364,38 @@ fn tiled_drop_target(tree: &LayoutNode, bounds: Rect, gaps: Gaps, point: Point) 
 }
 
 /// Computes the Hyprland-style bounded drop plan for a Mod+drag release
-/// (issue #2337, bounded subset of issue #1694; overlay guard issue #1710).
+/// (issue #2337, bounded subset of issue #1694; overlay guard issue #1710;
+/// corner/column rule issue #2521).
 ///
 /// Hit-tests `point` against `tree` allocations; returns `None` when the
-/// point lands on background, over a floating overlay, or on `source`
-/// itself (self-drop no-op). Otherwise the hovered tile is classified by
-/// its normalized drop position `(fx, fy)` inside the target rect:
+/// point lands on background, over a floating overlay, on `source` itself
+/// (self-drop no-op), or over a target too small to host two usable panes.
+/// Otherwise the hovered tile is classified by its normalized drop position
+/// `(fx, fy)` inside the target rect:
 ///
 /// - **Center zone** — [`DROP_CENTER_FRACTION`] band on both axes:
 ///   [`DropPlan::Swap`]. The two panels exchange places in one mutation;
 ///   split axes and ratios are untouched, so the arrangement is byte-stable
 ///   (Hyprland's tiled swap).
-/// - **Edge zone** — anywhere else: [`DropPlan::Insert`] beside the target.
-///   The nearest normalized edge wins: left/right insert on a horizontal
-///   split, top/bottom on a vertical split, with the dragged panel before
-///   the target for left/top and after it for right/bottom. Every insert is
-///   a balanced [`DROP_INSERT_RATIO`] split, matching dwindle's default on a
-///   mouse drop.
+/// - **Corner zone** — inside [`DROP_CENTER_FRACTION`] of both axes at once
+///   (both normalized edge distances small): [`DropPlan::Insert`] along the
+///   axis perpendicular to the target's parent split, i.e. *inside* the
+///   target's column/row. Dropping the bottom-right pane on the bottom-left
+///   corner of a full-height column therefore stacks it under that column's
+///   pane instead of carving a new column and re-homing the target
+///   (issue #2521). The side follows the pointer half along that axis.
+/// - **Edge zone** — one axis near an edge, the other through the middle:
+///   [`DropPlan::Insert`] beside the target on the nearest edge. Left/right
+///   insert on a horizontal split, top/bottom on a vertical split, with the
+///   dragged panel before the target for left/top and after it for
+///   right/bottom. Every insert is a balanced [`DROP_INSERT_RATIO`] split,
+///   matching dwindle's default on a mouse drop.
 ///
-/// Ties are deterministic: an equal horizontal/vertical distance prefers
-/// the horizontal edge, and an equal left/right (or top/bottom) distance
-/// prefers the first (left/top). Exact center boundaries (`0.25`/`0.75`)
-/// belong to the center zone. Pure, total, headless; never mutates the tree.
+/// Ties are deterministic: an equal horizontal/vertical edge distance
+/// prefers the horizontal edge, and an equal left/right (or top/bottom)
+/// distance prefers the first (left/top). Exact center boundaries
+/// (`0.25`/`0.75`) belong to the center zone. Pure, total, headless; never
+/// mutates the tree.
 #[must_use]
 pub fn drop_plan_for_point(
     tree: &LayoutNode,
@@ -417,21 +427,43 @@ pub fn drop_plan_for_point(
     let dist_bottom = 1.0 - fy;
     let min_h = dist_left.min(dist_right);
     let min_v = dist_top.min(dist_bottom);
-    if min_h <= min_v {
-        Some(DropPlan::Insert(DropSpec::new(
-            target,
-            SplitAxis::Horizontal,
-            DROP_INSERT_RATIO,
-            dist_right < dist_left,
-        )))
+    let in_corner = min_h < DROP_CENTER_FRACTION && min_v < DROP_CENTER_FRACTION;
+    let (axis, after) = if in_corner {
+        // Corner drop: split inside the target's slot instead of carving a
+        // new column/row beside it (issue #2521). A leaf whose parent is a
+        // horizontal split is a column member, so the corner stacks it
+        // vertically, and vice versa.
+        let axis = match tree.leaf_parent_axis(target) {
+            Some(SplitAxis::Horizontal) => SplitAxis::Vertical,
+            Some(SplitAxis::Vertical) => SplitAxis::Horizontal,
+            None => {
+                if min_h <= min_v {
+                    SplitAxis::Horizontal
+                } else {
+                    SplitAxis::Vertical
+                }
+            }
+        };
+        let after = match axis {
+            SplitAxis::Horizontal => dist_right < dist_left,
+            SplitAxis::Vertical => dist_bottom < dist_top,
+        };
+        (axis, after)
+    } else if min_h <= min_v {
+        (SplitAxis::Horizontal, dist_right < dist_left)
     } else {
-        Some(DropPlan::Insert(DropSpec::new(
-            target,
-            SplitAxis::Vertical,
-            DROP_INSERT_RATIO,
-            dist_bottom < dist_top,
-        )))
+        (SplitAxis::Vertical, dist_bottom < dist_top)
+    };
+    // Never commit a split that leaves a child below the usable pane size.
+    if !splittable_rect(rect, axis) {
+        return None;
     }
+    Some(DropPlan::Insert(DropSpec::new(
+        target,
+        axis,
+        DROP_INSERT_RATIO,
+        after,
+    )))
 }
 
 /// Whether fractional drop position `(fx, fy)` inside the target rect falls
@@ -1303,19 +1335,20 @@ mod tests {
     }
 
     #[test]
-    fn drop_plan_corner_uses_nearest_normalized_edge() {
-        // Top-right corner of the right pane: the horizontal distance
-        // (1/40) is smaller than the vertical (1/24), so the horizontal
-        // edge wins deterministically instead of guessing a quadrant.
+    fn drop_plan_corner_preserves_the_parent_column() {
+        // Top-right corner of the right column: the target's parent is a
+        // horizontal split, so a corner drop stacks inside the column
+        // (vertical split) at the nearest vertical edge (top) instead of
+        // carving a new right column (issue #2521).
         let tree = pair();
         let bounds = Rect::new(0, 0, 80, 24);
         assert_eq!(
             drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(79, 1)),
             Some(DropPlan::Insert(DropSpec::new(
                 ViewId::new(2),
-                SplitAxis::Horizontal,
+                SplitAxis::Vertical,
                 DROP_INSERT_RATIO,
-                true
+                false
             )))
         );
     }
@@ -1354,10 +1387,11 @@ mod tests {
     }
 
     #[test]
-    fn drop_plan_exact_diagonal_tie_prefers_horizontal() {
-        // A 24x24 target with equal normalized x/y offsets: the `min_h <=
-        // min_v` tie-break must choose the horizontal edge (left) and must
-        // not silently flip to vertical.
+    fn drop_plan_exact_diagonal_corner_uses_the_column_axis() {
+        // A 24x24 target with equal normalized x/y offsets is a corner
+        // drop: the parent is a horizontal split, so the corner stacks
+        // vertically at the top edge instead of flipping on a diagonal tie
+        // (issue #2521).
         let tree = LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
@@ -1369,11 +1403,11 @@ mod tests {
             drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(26, 2)),
             Some(DropPlan::Insert(DropSpec::new(
                 ViewId::new(2),
-                SplitAxis::Horizontal,
+                SplitAxis::Vertical,
                 DROP_INSERT_RATIO,
                 false
             ))),
-            "exact diagonal tie must prefer the horizontal edge"
+            "exact diagonal corner must split inside the target's column"
         );
     }
 
@@ -1386,6 +1420,136 @@ mod tests {
         assert!(!is_drop_center(0.5, 0.76));
         assert!(!is_drop_center(0.0, 0.0));
         assert!(!is_drop_center(1.0, 1.0));
+    }
+
+    /// Issue #2521: dragging the bottom-right pane onto the bottom-left of
+    /// a full-height left column must stack it *inside* that column, not
+    /// carve a new left column and re-home the target.
+    #[test]
+    fn drop_plan_issue_2521_bottom_left_splits_the_left_column() {
+        // 1 = full-height left column, 2 = top-right, 3 = bottom-right.
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            ),
+        );
+        let bounds = Rect::new(0, 0, 80, 24);
+        let plan =
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(3), Point::new(2, 22));
+        assert_eq!(
+            plan,
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(1),
+                SplitAxis::Vertical,
+                DROP_INSERT_RATIO,
+                true
+            ))),
+            "bottom-left corner must stack under the left column"
+        );
+        // Mid-left stays a horizontal insert: a new column is only carved
+        // when the pointer is halfway down the target's left edge.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(3), Point::new(2, 12)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(1),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                false
+            )))
+        );
+        // Top-left corner stacks above the left column.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(3), Point::new(2, 1)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(1),
+                SplitAxis::Vertical,
+                DROP_INSERT_RATIO,
+                false
+            )))
+        );
+
+        // Commit the bottom-left plan through the shared re-parent path and
+        // pin the resulting tree, ratios, identities, and allocations.
+        let Some(DropPlan::Insert(spec)) = plan else {
+            panic!("expected an insert plan");
+        };
+        let mut next = tree.clone();
+        assert!(next.reparent_leaf(
+            ViewId::new(3),
+            spec.target,
+            spec.axis,
+            spec.ratio,
+            spec.after
+        ));
+        assert_eq!(next.validate_structure(), Ok(3));
+        // Root stays the left/right split; its first child is the stacked
+        // left column [1, 3] and the full-height survivor 2 keeps the right.
+        let LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            first,
+            second,
+            ..
+        } = &next
+        else {
+            panic!("root must remain a horizontal split: {next:?}");
+        };
+        assert!(matches!(
+            first.as_ref(),
+            LayoutNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio,
+                ..
+            } if (*ratio - DROP_INSERT_RATIO).abs() < f32::EPSILON
+        ));
+        assert_eq!(first.leaf_ids(), vec![ViewId::new(1), ViewId::new(3)]);
+        assert_eq!(second.leaf_ids(), vec![ViewId::new(2)]);
+        let alloc = next.layout(bounds);
+        let rect = |id: u64| {
+            alloc
+                .iter()
+                .find(|(leaf, _)| *leaf == ViewId::new(id))
+                .map(|(_, rect)| *rect)
+                .expect("allocated")
+        };
+        assert_eq!(rect(1), Rect::new(0, 0, 40, 12));
+        assert_eq!(rect(3), Rect::new(0, 12, 40, 12));
+        assert_eq!(rect(2), Rect::new(40, 0, 40, 24));
+        assert_eq!(
+            next.leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(3), ViewId::new(2)]
+        );
+    }
+
+    /// Issue #2521: insertion refuses to carve panes below the usable size
+    /// instead of committing a border-only sliver.
+    #[test]
+    fn drop_plan_refuses_unusable_split() {
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 16, 6)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 16, 6)),
+        );
+        let bounds = Rect::new(0, 0, 32, 6);
+        // Right half is 16x6: stacking needs >= 8 rows, side-by-side needs
+        // >= 20 columns, so neither edge insert can produce two usable panes.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(30, 1)),
+            None
+        );
+        // The center swap does not change geometry, so it still applies.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(1), Point::new(24, 3)),
+            Some(DropPlan::Swap {
+                target: ViewId::new(2)
+            })
+        );
     }
 
     #[test]

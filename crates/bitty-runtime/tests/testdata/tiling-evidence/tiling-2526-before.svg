@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="296" viewBox="0 0 800 296" font-family="monospace">
+<rect width="800" height="296" fill="#0d1117"/>
+<text x="4" y="14" fill="#e6edf3" font-size="12">#2526 Mod+j: before (0.0.26)</text>
+<text x="4" y="28" fill="#9aa7b4" font-size="10">down from p2 landed on p4 (nearest centre)</text>
+<rect x="0" y="34" width="400" height="240" fill="#24492e" stroke="#0b0e11" stroke-width="1"/>
+<text x="4" y="48" fill="#e6edf3" font-size="11">p1</text>
+<text x="4" y="60" fill="#c3ced9" font-size="9">40x24</text>
+<rect x="400" y="34" width="400" height="120" fill="#4a2f52" stroke="#0b0e11" stroke-width="1"/>
+<text x="404" y="48" fill="#e6edf3" font-size="11">p2</text>
+<text x="404" y="60" fill="#c3ced9" font-size="9">40x12</text>
+<rect x="400" y="154" width="160" height="120" fill="#553b1f" stroke="#0b0e11" stroke-width="1"/>
+<text x="404" y="168" fill="#e6edf3" font-size="11">p3</text>
+<text x="404" y="180" fill="#c3ced9" font-size="9">16x12</text>
+<rect x="560" y="154" width="240" height="120" fill="#1f4a4a" stroke="#f0c674" stroke-width="3"/>
+<text x="564" y="168" fill="#e6edf3" font-size="11">p4</text>
+<text x="564" y="180" fill="#c3ced9" font-size="9">24x12</text>
+<circle cx="600" cy="154" r="4" fill="none" stroke="#ff7b72" stroke-width="2"/>
+<text x="522" y="148" fill="#ff7b72" font-size="10">Mod+j -&gt; p4</text>
+<text x="4" y="289" fill="#8b949e" font-size="10">tree H[1, V[2, H[3, 4]]] | leaves [1, 2, 3, 4]</text>
+</svg>

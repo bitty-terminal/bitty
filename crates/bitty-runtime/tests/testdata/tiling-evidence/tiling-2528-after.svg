@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="296" viewBox="0 0 800 296" font-family="monospace">
+<rect width="800" height="296" fill="#0d1117"/>
+<text x="4" y="14" fill="#e6edf3" font-size="12">#2521/#2528 eight Mod+N: after (fix)</text>
+<text x="4" y="28" fill="#9aa7b4" font-size="10">balanced bisect-largest keeps every pane usable</text>
+<rect x="0" y="34" width="200" height="60" fill="#24492e" stroke="#0b0e11" stroke-width="1"/>
+<text x="4" y="48" fill="#e6edf3" font-size="11">p1</text>
+<text x="4" y="60" fill="#c3ced9" font-size="9">20x6</text>
+<rect x="0" y="94" width="200" height="60" fill="#553b1f" stroke="#0b0e11" stroke-width="1"/>
+<text x="4" y="108" fill="#e6edf3" font-size="11">p9</text>
+<text x="4" y="120" fill="#c3ced9" font-size="9">20x6</text>
+<rect x="200" y="34" width="200" height="120" fill="#4a1f2e" stroke="#0b0e11" stroke-width="1"/>
+<text x="204" y="48" fill="#e6edf3" font-size="11">p5</text>
+<text x="204" y="60" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="0" y="154" width="200" height="120" fill="#553b1f" stroke="#0b0e11" stroke-width="1"/>
+<text x="4" y="168" fill="#e6edf3" font-size="11">p3</text>
+<text x="4" y="180" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="200" y="154" width="200" height="120" fill="#1f3b57" stroke="#0b0e11" stroke-width="1"/>
+<text x="204" y="168" fill="#e6edf3" font-size="11">p6</text>
+<text x="204" y="180" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="400" y="34" width="200" height="120" fill="#4a2f52" stroke="#0b0e11" stroke-width="1"/>
+<text x="404" y="48" fill="#e6edf3" font-size="11">p2</text>
+<text x="404" y="60" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="600" y="34" width="200" height="120" fill="#24492e" stroke="#0b0e11" stroke-width="1"/>
+<text x="604" y="48" fill="#e6edf3" font-size="11">p7</text>
+<text x="604" y="60" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="400" y="154" width="200" height="120" fill="#1f4a4a" stroke="#0b0e11" stroke-width="1"/>
+<text x="404" y="168" fill="#e6edf3" font-size="11">p4</text>
+<text x="404" y="180" fill="#c3ced9" font-size="9">20x12</text>
+<rect x="600" y="154" width="200" height="120" fill="#4a2f52" stroke="#0b0e11" stroke-width="1"/>
+<text x="604" y="168" fill="#e6edf3" font-size="11">p8</text>
+<text x="604" y="180" fill="#c3ced9" font-size="9">20x12</text>
+<text x="4" y="289" fill="#8b949e" font-size="10">tree H[V[H[V[1, 9], 5], H[3, 6]], V[H[2, 7], H[4, 8]]] | leaves [1, 9, 5, 3, 6, 2, 7, 4, 8]</text>
+</svg>

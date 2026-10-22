@@ -1085,27 +1085,38 @@ pub struct RuntimeConfig {
     pub paste_confirm_timeout: std::time::Duration,
     /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
     ///
-    /// Default [`PanelLayoutMode::Spiral`] (4-way clockwise spiral: Right -> Down -> Left -> Up).
-    /// `PanelLayoutMode::Dwindle` opts into Hyprland-style dwindle (always Right or Down).
-    /// `PanelLayoutMode::BisectLargest` (CTX-0964, #1698) bisects the
-    /// largest-area panel with a raw `width >= height` axis (no
-    /// cell-aspect correction). Move-to-workspace uses this placement
+    /// Default [`PanelLayoutMode::Balanced`]: the fresh pane bisects the
+    /// physically largest slot, so repeated `Mod+N` presses keep a usable,
+    /// balanced tree (issues #2521, #2528). `Spiral` keeps the 4-way
+    /// clockwise rotation adjacent to focus; `Dwindle` always splits the
+    /// focused pane right/down; `BisectLargest` (CTX-0964, #1698) bisects the
+    /// largest-area panel with a raw `width >= height` axis (no cell-aspect
+    /// correction). Move-to-workspace uses bisect-largest placement
     /// regardless of this setting; this field only controls `NewPanel`.
     pub panel_layout_mode: PanelLayoutMode,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
 ///
-/// `Spiral` stays the default for `NewPanel` so existing keymap behavior is
-/// unchanged; `BisectLargest` opts into largest-panel bisection for
-/// `NewPanel`. Move-to-workspace also bisects independently of this setting
-/// (CTX-0964, #1698).
+/// [`Balanced`](Self::Balanced) is the owner-facing default (issues #2521,
+/// #2528): the fresh pane bisects the physically largest slot with the
+/// cell-aspect-aware axis, so eight consecutive `Mod+N` presses keep a
+/// balanced, usable tree instead of nesting ever-smaller columns. `Spiral`
+/// keeps the 4-way clockwise rotation for users who want the newer pane
+/// adjacent to focus; `BisectLargest` opts into largest-panel bisection with
+/// the raw cell axis. Move-to-workspace also bisects independently of this
+/// setting (CTX-0964, #1698).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelLayoutMode {
-    /// 4-way clockwise spiral: Right -> Down -> Left -> Up.
+    /// Balanced bisect-largest: split the physically largest slot with
+    /// [`bitty_ui::balanced_split_axis`] and place the fresh pane after it
+    /// (right/down). Keeps pane sizes usable for long creation runs.
     #[default]
+    Balanced,
+    /// 4-way clockwise spiral: Right -> Down -> Left -> Up, continuing only
+    /// while the pane created by the previous split stays focused.
     Spiral,
-    /// Hyprland-style dwindle: always splits Right or Down.
+    /// Hyprland-style dwindle: always splits the focused pane Right or Down.
     Dwindle,
     /// Bisect the largest-area panel (CTX-0964, #1698): pick the leaf with
     /// the largest `width * height` allocation (first in solver order on
@@ -1187,7 +1198,7 @@ impl Default for RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
-            panel_layout_mode: PanelLayoutMode::Spiral,
+            panel_layout_mode: PanelLayoutMode::default(),
         }
     }
 }

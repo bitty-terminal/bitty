@@ -266,7 +266,9 @@ pub use runtime::bell::{
 };
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
-pub use runtime::layout_focus::{HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PresentFrame};
+pub use runtime::layout_focus::{
+    HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
+};
 pub use runtime::plaintext_url::{HoveredPlaintextUrl, PlaintextUrlSpan};
 pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{
@@ -305,9 +307,11 @@ pub use runtime::{
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{
     DecoratedView, Decoration, DecorationError, DropPlan, DropSpec, FLOATING_CMD_TOGGLE,
-    FloatStore, Focus, FocusDirection, Gaps, LayoutNode, OverlayLayer, OverlayTier, PIN_CMD_TOGGLE,
-    PSEUDO_CMD_TOGGLE, PresentationMode, PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS,
-    ResizeEdge, SCRATCHPAD_CMD_TOGGLE, ScrollbarMode, SplitAxis, View, ViewId, layout::remove_leaf,
+    FloatStore, Focus, FocusDirection, Gaps, LayoutNode, MIN_PANE_COLS, MIN_PANE_ROWS,
+    OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE, PresentationMode,
+    PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS, ResizeEdge, SCRATCHPAD_CMD_TOGGLE,
+    ScrollbarMode, SplitAxis, View, ViewId, drop_plan_for_point, largest_area_leaf,
+    layout::remove_leaf, smart_split_axis, splittable_axis, survivor_after_close,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

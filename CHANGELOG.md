@@ -67,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three-group bar with memory + pulseaudio now mounts inside the RC-1
   activation budget.
 
+- **Extension install is honest about the catalog and its terminology
+  (#2440):** `extensions/catalog.v1` is published for the live artifacts
+  (`graphics 0.0.24`, `net 0.0.1`) and generated only from their
+  `SHA256SUMS` by `scripts/make-extension-catalog.sh`, which re-hashes every
+  artifact, supports a `--check` drift gate, and read-back-verifies
+  `--publish`. A bare install now resolves the newest host release instead
+  of hitting a raw 404; if the catalog is genuinely unavailable, a latest
+  install fails with a typed `--version` hint (no `curl` stderr), while a
+  pinned install falls back to `SHA256SUMS` or reuses an already-installed
+  verified version without any download. User-facing output, help, init
+  prompts, and runtime hints now say "extension"; "component" remains only
+  for the internal seam and the stable JSON envelope.
 - **`runtime.inspect` review follow-up (CTX-2396, #2416):** a granted
   generation whose read-only snapshot backend is not wired now checks
   backend presence before consuming the 16 calls/s budget, so repeated

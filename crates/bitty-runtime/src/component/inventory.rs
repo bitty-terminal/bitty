@@ -237,22 +237,24 @@ pub fn discover_components(
     out
 }
 
-/// Actionable hint for a missing optional component (soft-fail, never a
-/// panic). Names the local-path install command; v1 performs no download.
+/// Actionable hint for a missing optional extension (soft-fail, never a
+/// panic). Names both install paths: the catalog-backed installer and the
+/// offline local-path staging command.
 #[must_use]
 pub fn missing_component_hint(name: &str) -> String {
     format!(
-        "component '{name}' is not installed; install it with `bitty extension add <path>` \
-         (local directory or `bitty-<name>` executable plus `--version <semver>`; v1 has no registry download)"
+        "extension '{name}' is not installed; install it with `bitty extension install {name}` \
+         (latest catalog release for this host) or `bitty extension add <path>` (local directory or \
+         `bitty-<name>` executable plus `--version <semver>`)"
     )
 }
 
-/// Actionable hint for an ABI-incompatible component.
+/// Actionable hint for an ABI-incompatible extension.
 #[must_use]
 pub fn incompatible_component_hint(name: &str, min: u16, max: u16, core: u16) -> String {
     format!(
-        "component '{name}' protocol range [{min}, {max}] excludes core protocol {core}; \
-         install a compatible build with `bitty extension add <path>`"
+        "extension '{name}' protocol range [{min}, {max}] excludes core protocol {core}; \
+         install a compatible build with `bitty extension install {name} --version <X.Y.Z>` or `bitty extension add <path>`"
     )
 }
 

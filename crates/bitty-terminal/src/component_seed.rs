@@ -416,7 +416,7 @@ impl ExtensionCatalog {
             .map(|((_, version, _), _)| version.as_str())
     }
 
-    /// Published component names for `target`, sorted (hint candidates).
+    /// Published extension names for `target`, sorted (hint candidates).
     #[must_use]
     pub fn names_for_target(&self, target: &str) -> Vec<&str> {
         let mut names: Vec<&str> = self
@@ -454,8 +454,43 @@ fn numeric_version_key(version: &str) -> (u64, u64, u64) {
 pub enum CatalogFetch {
     /// Parsed catalog metadata.
     Available(ExtensionCatalog),
-    /// Transport failure (bounded, user-facing reason); fallback allowed.
-    Unavailable(String),
+    /// Transport failure; fallback allowed. The reason is typed so the
+    /// unpublished case (HTTP 404) can name the actionable pin path instead
+    /// of echoing a raw tool diagnostic.
+    Unavailable(CatalogUnavailable),
+}
+
+/// Why the catalog object could not be fetched (transport only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogUnavailable {
+    /// HTTP 404: the object is reserved but not published yet.
+    NotPublished,
+    /// Any other non-success HTTP status.
+    Http {
+        /// Status returned by the CDN.
+        status: u16,
+    },
+    /// Network/DNS/TLS/timeout or another classified transport failure.
+    Transport(String),
+}
+
+impl CatalogUnavailable {
+    /// User-facing reason (never contains raw `curl` output).
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotPublished => {
+                format!("the catalog object is not published yet (HTTP 404 at {SEED_CATALOG_URL})")
+            }
+            Self::Http { status } => {
+                format!("the CDN answered HTTP {status} for {SEED_CATALOG_URL}")
+            }
+            Self::Transport(reason) => reason
+                .strip_prefix("bitty extension: ")
+                .unwrap_or(reason)
+                .to_string(),
+        }
+    }
 }
 
 /// Parse the bounded `extensions/catalog.v1` grammar.
@@ -523,7 +558,7 @@ pub fn parse_catalog(text: &str) -> Result<ExtensionCatalog, SeedError> {
                 }
                 if let Err(error) = validate_component_name(name) {
                     return Err(catalog_refusal(format!(
-                        "line {line_number}: invalid component name ({error})"
+                        "line {line_number}: invalid extension name ({error})"
                     )));
                 }
                 if !valid_seed_version(version) {
@@ -603,7 +638,19 @@ pub fn fetch_catalog(transport: &mut dyn SeedTransport) -> Result<CatalogFetch, 
     let path = stage.path.join("catalog.v1");
     match transport.fetch(SEED_CATALOG_URL, &path, SEED_CATALOG_MAX_BYTES) {
         Ok(()) => {}
-        Err(SeedError::Fetch(reason)) => return Ok(CatalogFetch::Unavailable(reason)),
+        Err(SeedError::FetchHttp { status: 404, .. }) => {
+            return Ok(CatalogFetch::Unavailable(CatalogUnavailable::NotPublished));
+        }
+        Err(SeedError::FetchHttp { status, .. }) => {
+            return Ok(CatalogFetch::Unavailable(CatalogUnavailable::Http {
+                status,
+            }));
+        }
+        Err(SeedError::Fetch(reason)) => {
+            return Ok(CatalogFetch::Unavailable(CatalogUnavailable::Transport(
+                reason,
+            )));
+        }
         Err(error) => return Err(error),
     }
     let bytes = std::fs::read(&path).map_err(|error| {
@@ -625,7 +672,7 @@ pub fn fetch_catalog(transport: &mut dyn SeedTransport) -> Result<CatalogFetch, 
 /// Why the seed refused (all variants carry owned, user-facing context).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedError {
-    /// The component name violates `[a-z][a-z0-9-]{0,31}` (CLI input).
+    /// The extension name violates `[a-z][a-z0-9-]{0,31}` (CLI input).
     InvalidName(String),
     /// The version is not a strict `X.Y.Z` numeric core (CLI input).
     InvalidVersion(String),
@@ -640,7 +687,16 @@ pub enum SeedError {
     ToolMissing(String),
     /// The system `curl` is present but older than [`SEED_CURL_FLOOR`].
     CurlTooOld(String),
-    /// The download failed (URL plus a bounded reason).
+    /// The CDN answered with a non-success HTTP status. Typed (rather than a
+    /// string) so the catalog path can recognize an unpublished object and
+    /// the message never echoes a raw `curl` diagnostic.
+    FetchHttp {
+        /// HTTP status from the CDN.
+        status: u16,
+        /// Requested URL (bounded, already audited by the caller).
+        url: String,
+    },
+    /// The download failed before an HTTP response (network/DNS/TLS/timeout).
     Fetch(String),
     /// The `SHA256SUMS` manifest is missing, malformed, or has no entry.
     Manifest(String),
@@ -671,6 +727,7 @@ impl SeedError {
             | Self::UnsupportedHost(_)
             | Self::ToolMissing(_)
             | Self::CurlTooOld(_)
+            | Self::FetchHttp { .. }
             | Self::Fetch(_)
             | Self::Io(_) => 1,
             Self::Manifest(_)
@@ -687,7 +744,7 @@ impl SeedError {
     pub fn message(&self) -> String {
         match self {
             Self::InvalidName(name) => {
-                format!("invalid component name {name:?} (want [a-z][a-z0-9-]{{0,31}}, e.g. `net`)")
+                format!("invalid extension name {name:?} (want [a-z][a-z0-9-]{{0,31}}, e.g. `net`)")
             }
             Self::InvalidVersion(version) => {
                 format!("invalid version {version:?} (want strict X.Y.Z numeric core, e.g. 0.0.23)")
@@ -701,6 +758,10 @@ impl SeedError {
             Self::UnsupportedHost(detail) => detail.clone(),
             Self::ToolMissing(tool) => tool.clone(),
             Self::CurlTooOld(detail) => detail.clone(),
+            Self::FetchHttp { status, url } => format!(
+                "bitty extension: download failed: HTTP {status} ({}): {url}",
+                http_status_text(*status)
+            ),
             Self::Fetch(detail) => detail.clone(),
             Self::Manifest(detail) => detail.clone(),
             Self::Catalog(detail) => detail.clone(),
@@ -1238,12 +1299,72 @@ impl SystemTransport {
                 "bitty extension: fetched body exceeds {max_bytes} bytes (curl --max-filesize; refusing to read further)"
             )));
         }
-        Err(SeedError::Fetch(format!(
-            "bitty extension: `curl` failed ({}; {tail})",
-            output.status,
-            tail = bounded_stderr_tail(&output.stderr).trim(),
-        )))
+        // The URL is the last fixed-argv element (see `curl_argv`).
+        let url = argv.last().cloned().unwrap_or_default();
+        Err(classify_curl_failure(&output, &url))
     }
+}
+
+/// Human-readable text for a CDN HTTP status (actionable, no tool stderr).
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        400 => "bad request",
+        401 => "authentication required",
+        403 => "access denied",
+        404 => "the object is not published",
+        408 => "request timeout",
+        429 => "rate limited by the CDN",
+        500..=599 => "the CDN or origin failed",
+        _ => "unexpected response",
+    }
+}
+
+/// Classify a failed `curl` fetch into an actionable [`SeedError`].
+///
+/// Raw `curl` stderr is never surfaced: it names the local tool, includes
+/// transport noise, and reads like a leak in install output. HTTP statuses
+/// are typed so the catalog path can distinguish "not published" (404) from
+/// an outage, and transport failures map to a small actionable vocabulary.
+fn classify_curl_failure(output: &std::process::Output, url: &str) -> SeedError {
+    if let Some(status) = http_status_from_curl_stderr(&output.stderr) {
+        return SeedError::FetchHttp {
+            status,
+            url: url.to_owned(),
+        };
+    }
+    SeedError::Fetch(format!(
+        "bitty extension: {}: {url}",
+        curl_exit_reason(output.status.code().unwrap_or(-1))
+    ))
+}
+
+/// Actionable text for a non-HTTP `curl` exit (no tool stderr echoed).
+fn curl_exit_reason(code: i32) -> String {
+    match code {
+        6 => "network unavailable (could not resolve the CDN host)".to_string(),
+        7 => "network unavailable (could not connect to the CDN)".to_string(),
+        28 => "download timed out".to_string(),
+        35 | 60 => "TLS verification failed".to_string(),
+        -1 => "download failed (no exit status)".to_string(),
+        code => format!("download failed (curl exit {code})"),
+    }
+}
+
+/// Extract the HTTP status from `curl --fail` stderr.
+///
+/// `curl` 7.68+ prints `curl: (22) The requested URL returned error: 404`
+/// (the status may be followed by a reason phrase). Anything else returns
+/// `None` and falls through to transport classification.
+fn http_status_from_curl_stderr(stderr: &[u8]) -> Option<u16> {
+    let text = String::from_utf8_lossy(stderr);
+    let marker = "The requested URL returned error:";
+    let rest = text.split(marker).nth(1)?;
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c: &char| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Last [`SEED_FETCH_STDERR_MAX_BYTES`] of a failed tool's stderr, with
@@ -1334,7 +1455,7 @@ impl SeedTransport for SystemTransport {
 /// symlink refusal, atomic publish, `current` last).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedPayload {
-    /// Validated component name.
+    /// Validated extension name.
     pub name: String,
     /// Requested version (must equal the descriptor version).
     pub version: String,
@@ -1595,7 +1716,7 @@ fn audit_extracted(
         })?;
     if entries.len() != 2 {
         return Err(refuse(format!(
-            "unexpected member count {} in component payload (want exactly {descriptor_name} + {executable_name})",
+            "unexpected member count {} in extension payload (want exactly {descriptor_name} + {executable_name})",
             entries.len()
         )));
     }
@@ -1612,7 +1733,7 @@ fn audit_extracted(
         };
         let Some(kind) = expected_kind else {
             return Err(refuse(format!(
-                "unexpected member {name:?} in component payload (want exactly {descriptor_name} + {executable_name})"
+                "unexpected member {name:?} in extension payload (want exactly {descriptor_name} + {executable_name})"
             )));
         };
         let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
@@ -1652,7 +1773,7 @@ fn audit_extracted(
     match (descriptor_bytes, executable_bytes) {
         (Some(descriptor), Some(executable)) => Ok((descriptor, executable)),
         _ => Err(refuse(format!(
-            "component payload is missing {descriptor_name} or {executable_name}"
+            "extension payload is missing {descriptor_name} or {executable_name}"
         ))),
     }
 }
@@ -2330,9 +2451,115 @@ mod tests {
         let CatalogFetch::Unavailable(reason) = fetched else {
             panic!("offline must be unavailable, not malformed: {fetched:?}");
         };
-        assert!(reason.contains("stub fetch failed"), "{reason}");
+        assert!(
+            matches!(reason, CatalogUnavailable::Transport(ref text) if text.contains("stub fetch failed")),
+            "{reason:?}"
+        );
         // The caller can still run the single-release path (fallback test
         // below), but the catalog itself never becomes an empty allow-all.
+    }
+
+    #[test]
+    fn fetch_catalog_types_an_unpublished_404() {
+        let mut stub = StubTransport {
+            fetch_error: Some(SeedError::FetchHttp {
+                status: 404,
+                url: SEED_CATALOG_URL.to_string(),
+            }),
+            ..StubTransport::default()
+        };
+        let fetched = fetch_catalog(&mut stub).expect("404 is a transport outcome");
+        let CatalogFetch::Unavailable(reason) = fetched else {
+            panic!("404 must be unavailable: {fetched:?}");
+        };
+        assert_eq!(reason, CatalogUnavailable::NotPublished);
+        let message = reason.message();
+        assert!(message.contains("not published yet"), "{message}");
+        assert!(message.contains("HTTP 404"), "{message}");
+        assert!(!message.contains("curl"), "{message}");
+    }
+
+    #[test]
+    fn fetch_catalog_types_other_http_failures() {
+        let mut stub = StubTransport {
+            fetch_error: Some(SeedError::FetchHttp {
+                status: 503,
+                url: SEED_CATALOG_URL.to_string(),
+            }),
+            ..StubTransport::default()
+        };
+        let fetched = fetch_catalog(&mut stub).expect("503 is a transport outcome");
+        let CatalogFetch::Unavailable(reason) = fetched else {
+            panic!("503 must be unavailable: {fetched:?}");
+        };
+        assert_eq!(reason, CatalogUnavailable::Http { status: 503 });
+        assert!(reason.message().contains("HTTP 503"), "{reason:?}");
+    }
+
+    #[test]
+    fn catalog_parses_the_publish_fixture() {
+        // The shell publisher test generates this exact file from the
+        // fixture SHA256SUMS; parsing it here keeps publisher and client on
+        // one grammar and one golden document.
+        let text = include_str!("../../../packaging/fixtures/extensions/catalog.v1");
+        let catalog = parse_catalog(text).expect("fixture catalog");
+        assert_eq!(
+            catalog.latest_version_for("graphics", "x86_64-unknown-linux-gnu"),
+            Some("0.0.24")
+        );
+        assert_eq!(
+            catalog.latest_version_for("net", "x86_64-unknown-linux-gnu"),
+            Some("0.0.1")
+        );
+        assert_eq!(
+            catalog.names_for_target("x86_64-unknown-linux-gnu"),
+            vec!["graphics", "net"]
+        );
+        assert!(
+            catalog
+                .digest_for("graphics", "0.0.24", "aarch64-apple-darwin")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn curl_http_status_and_exit_classification_are_actionable() {
+        // Modern curl wording (7.68+ floor).
+        assert_eq!(
+            http_status_from_curl_stderr(
+                b"curl: (22) The requested URL returned error: 404 Not Found\n"
+            ),
+            Some(404)
+        );
+        assert_eq!(
+            http_status_from_curl_stderr(b"curl: (22) The requested URL returned error: 503\n"),
+            Some(503)
+        );
+        assert_eq!(
+            http_status_from_curl_stderr(b"curl: (7) Failed to connect to cdn.bitty.run\n"),
+            None
+        );
+        assert_eq!(
+            curl_exit_reason(7),
+            "network unavailable (could not connect to the CDN)"
+        );
+        assert_eq!(curl_exit_reason(28), "download timed out");
+        assert_eq!(
+            curl_exit_reason(60),
+            "TLS verification failed",
+            "certificate verification keeps an actionable name"
+        );
+        assert_eq!(curl_exit_reason(99), "download failed (curl exit 99)");
+        // The rendered HTTP error never echoes raw curl stderr.
+        let rendered = SeedError::FetchHttp {
+            status: 404,
+            url: "https://cdn.bitty.run/extensions/catalog.v1".to_string(),
+        }
+        .message();
+        assert!(rendered.contains("HTTP 404"), "{rendered}");
+        assert!(rendered.contains("not published"), "{rendered}");
+        assert!(!rendered.contains("curl"), "{rendered}");
+        assert!(!rendered.contains("The requested URL"), "{rendered}");
     }
 
     #[test]

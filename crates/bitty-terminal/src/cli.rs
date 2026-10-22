@@ -2136,8 +2136,8 @@ pub(crate) fn help_text() -> String {
                               --radius PX, --plugins a,b (each validated fail-closed).\n  \
                               Follow-ups (#1913): --plugins selects the first\n  \
                               batch (bundled ids, recorded offline);\n  \
-                              --with-components / --no-with-components offers\n  \
-                              component installs; --print-shell-init /\n  \
+                              --with-components / --no-with-components print\n  \
+                              extension install hints; --print-shell-init /\n  \
                               --no-print-shell-init controls the shell-init\n  \
                               handoff line (default prints); --no-plugins\n  \
                               selects none.\n  \

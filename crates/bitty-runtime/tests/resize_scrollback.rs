@@ -5,7 +5,11 @@
 #![forbid(unsafe_code)]
 
 use bitty_platform::PhysicalSize;
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
+use bitty_runtime::Runtime;
+use bitty_ui::ViewId;
+
+#[cfg(unix)]
+use bitty_runtime::{LayoutNode, SplitAxis, View};
 
 #[test]
 fn runtime_handle_resize_actually_resizes_state_and_is_headless() {

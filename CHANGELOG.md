@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in main-loop stall watchdog (#2483/#2488):** `BITTY_STALL_WATCHDOG=1`
+  arms a monitor that samples the main loop, captures a bounded thread/state
+  report when it stalls, and persists it to the state directory for the next
+  launch. It is off by default, reads only `/proc/self`, never kills a
+  process, and adds no overhead to normal sessions. `scripts/longrun-soak.sh`
+  exercises the path under an isolated Xvfb.
 - **Local theme files with hot reload (#2465):** `appearance.theme = "local:<name>"`
   loads a TOML palette from the themes directory, folds it into the resolved
   theme, and reloads edits without a restart. Bounds are 64 files, 64 KiB per

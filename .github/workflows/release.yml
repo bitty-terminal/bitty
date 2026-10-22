@@ -76,6 +76,9 @@ jobs:
       - name: Validate package-manager manifests (R2/CDN primary)
         run: |
           bash scripts/tests/check-package-manifests.test.sh
+      - name: Validate APT repository generator and deb822 integration
+        run: |
+          bash scripts/tests/check-apt-repo.test.sh
       - name: Validate source PKGBUILD (artifact-install consistency)
         run: |
           bash scripts/check-pkgbuild-source.sh
@@ -1749,6 +1752,92 @@ jobs:
             exit 1
           fi
 
+  apt:
+    name: Publish Debian/Ubuntu APT (R2)
+    environment: release
+    needs: [build, r2-mirror]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: startsWith(github.ref, 'refs/tags/v') && vars.APT_PUBLISH != 'false'
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download Linux x86_64 artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-unknown-linux-gnu
+          path: dist/x86_64
+      - name: Download Linux ARM64 artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-aarch64-unknown-linux-gnu
+          path: dist/aarch64
+      - name: Install Wrangler
+        run: |
+          set -euo pipefail
+          npm install -g "wrangler@${WRANGLER_VERSION}"
+          wrangler --version
+      - name: Generate and sign APT repository
+        run: |
+          set -euo pipefail
+          if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT publishing is enabled but APT_GPG_PRIVATE_KEY is not set" >&2
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Cloudflare credentials not set; cannot upload to R2" >&2
+            exit 1
+          fi
+
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          GPG_KEY="maintainers@bitty-terminal.dev"
+
+          mkdir -p stage/dist apt_repo
+          find dist/x86_64 dist/aarch64 -name '*.deb' -exec cp -t stage/dist {} +
+
+          DEB_COUNT="$(find stage/dist -name '*.deb' | wc -l)"
+          if [ "$DEB_COUNT" -eq 0 ]; then
+            echo "::error::No .deb artifacts found for APT publication" >&2
+            exit 1
+          fi
+
+          python3 scripts/generate-apt-repo.py \
+            --dist-dir stage/dist \
+            --repo-dir apt_repo \
+            --assets-dir packaging/apt \
+            --gpg-key "$GPG_KEY"
+
+          gpg --verify apt_repo/dists/stable/InRelease
+          gpg --verify apt_repo/dists/stable/Release.gpg apt_repo/dists/stable/Release
+
+      - name: Upload APT repository to R2
+        run: |
+          set -euo pipefail
+          cd apt_repo
+          find . -type f | while read -r FILE; do
+            REL_PATH="${FILE#./}"
+            KEY="bitty/apt/${REL_PATH}"
+            if [[ "$REL_PATH" == pool/* ]] || [[ "$REL_PATH" == *.deb ]] || [[ "$REL_PATH" == *.gpg ]]; then
+              CACHE="public, max-age=31536000, immutable"
+            else
+              CACHE="public, max-age=300, must-revalidate"
+            fi
+            echo "Uploading ${REL_PATH} -> ${KEY} (${CACHE})"
+            wrangler r2 object put "$KEY" --file "$REL_PATH" --remote --cache-control "$CACHE"
+          done
+
+      - name: Verify APT repository read-back
+        run: |
+          set -euo pipefail
+          wrangler r2 object get "bitty/apt/dists/stable/Release" --remote --pipe | cmp - apt_repo/dists/stable/Release
+          wrangler r2 object get "bitty/apt/dists/stable/InRelease" --remote --pipe | cmp - apt_repo/dists/stable/InRelease
+          echo "verified R2 APT repository indices (byte-identical)"
+
   # CTX-1413 (#1847): the immutable mirror is the preferred download source
   # for the AUR bitty-bin, Homebrew, and Scoop publishers above. Those jobs
   # wait on this one and verify every artifact against its published .sha256
@@ -2025,7 +2114,7 @@ jobs:
   # they are listed but never counted as success or failure on their own.
   channel-summary:
     name: Summarize package channels
-    needs: [r2-mirror, aur, aur-bin, homebrew, scoop, copr]
+    needs: [r2-mirror, aur, aur-bin, homebrew, scoop, copr, apt]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
@@ -2039,6 +2128,7 @@ jobs:
           HOMEBREW_RESULT: ${{ needs.homebrew.result }}
           SCOOP_RESULT: ${{ needs.scoop.result }}
           COPR_RESULT: ${{ needs.copr.result }}
+          APT_RESULT: ${{ needs.apt.result }}
         run: |
           set -euo pipefail
           LABELS=(
@@ -2048,6 +2138,7 @@ jobs:
             "Homebrew (bitty formula)"
             "Scoop (bitty manifest)"
             "Fedora Copr (bitty rpm)"
+            "Debian/Ubuntu APT (R2)"
           )
           RESULTS=(
             "$R2_RESULT"
@@ -2056,6 +2147,7 @@ jobs:
             "$HOMEBREW_RESULT"
             "$SCOOP_RESULT"
             "$COPR_RESULT"
+            "$APT_RESULT"
           )
           {
             echo "## Package channels for ${TAG}"

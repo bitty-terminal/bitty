@@ -182,14 +182,14 @@ fi
 
 SUMMARY_BLOCK="$(job_block channel-summary)"
 if [[ -n "$SUMMARY_BLOCK" ]] &&
-  grep -qE 'needs: \[r2-mirror, aur, aur-bin, homebrew, scoop, copr\]' <<<"$SUMMARY_BLOCK" &&
+  grep -qE 'needs: \[r2-mirror, aur, aur-bin, homebrew, scoop, copr, apt\]' <<<"$SUMMARY_BLOCK" &&
   grep -qF 'always()' <<<"$SUMMARY_BLOCK" &&
   grep -qF 'GITHUB_STEP_SUMMARY' <<<"$SUMMARY_BLOCK"; then
   pass "release.yml summarizes every package channel even when a job fails"
 else
   fail "release.yml has no always-on package-channel summary"
 fi
-for channel in r2-mirror aur aur-bin homebrew scoop copr; do
+for channel in r2-mirror aur aur-bin homebrew scoop copr apt; do
   if grep -qF "needs.${channel}.result" <<<"$SUMMARY_BLOCK"; then
     pass "channel summary reports ${channel}"
   else

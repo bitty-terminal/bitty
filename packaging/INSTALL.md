@@ -69,6 +69,8 @@ What each script installs:
   `autoupdate` point at the R2-backed CDN with the published sha256 hash; its
   `notes` field documents the GitHub Releases fallback. Windows may still show
   a first-run reputation check. See `packaging/README.md`.
+- **Debian / Ubuntu (APT)**: `curl -fsSL https://cdn.bitty.run/apt/setup.sh | sudo bash && sudo apt install -y bitty`; see `packaging/debian.md`.
+- **Fedora / EPEL (Copr)**: `sudo dnf copr enable -y xuepoo/bitty-terminal && sudo dnf install -y bitty`; see `packaging/fedora.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`

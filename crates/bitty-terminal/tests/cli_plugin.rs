@@ -1813,7 +1813,7 @@ fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
     let calls = transport.calls();
     assert!(calls.contains("fetch"), "{calls}");
     assert!(
-        calls.contains("5dfc2e20607a4d7efdcf1be89195b3edc22b7ca0"),
+        calls.contains("6af2be11ee3df9f2c4fecbd73408e2c2f70a6b8c"),
         "{calls}"
     );
     assert!(

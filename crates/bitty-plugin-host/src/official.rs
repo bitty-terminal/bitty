@@ -171,6 +171,20 @@ mod tests {
     fn dashboard_is_listed_with_its_host_floor() {
         let dashboard = official_plugin_for("bitty-terminal.dashboard")
             .expect("dashboard is part of the official catalog");
-        assert_eq!(dashboard.compat_bitty, Some(">=0.0.26,<0.1"));
+        assert_eq!(dashboard.compat_bitty, Some(">=0.0.26"));
+    }
+
+    #[test]
+    fn official_compat_ranges_have_no_upper_bound() {
+        for entry in official_plugins() {
+            let range = entry
+                .compat_bitty
+                .expect("every official entry declares compat.bitty");
+            assert!(
+                !range.contains('<') && !range.contains(','),
+                "{}: compat.bitty {range:?} must be minimum-only (no upper bound)",
+                entry.id
+            );
+        }
     }
 }

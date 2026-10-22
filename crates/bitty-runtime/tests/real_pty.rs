@@ -129,3 +129,62 @@ fn runtime_backpressure_holds_under_flood() {
     assert!(rt.state().generation() > 0);
     let _ = rt.tick();
 }
+
+/// Issue #2443: a PTY reader's EOF does not imply the child is reapable yet.
+///
+/// The shell below closes every tty fd and only then sleeps, so the
+/// forwarder's single EOF wake necessarily lands while `waitpid(WNOHANG)`
+/// still reports "running" (Linux runs `exit_files` before `exit_notify`).
+/// The runtime must expose that state so the embedder can keep a bounded
+/// reap wake armed instead of parking in `ControlFlow::Wait` forever.
+#[test]
+fn reader_eof_latches_unreaped_child_until_exit_is_observed() {
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(8);
+    let waker: bitty_runtime::PtyWaker = std::sync::Arc::new(move || {
+        let _ = tx.try_send(());
+    });
+    rt.set_pty_waker(waker);
+
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "exec 0<&- 1>&- 2>&-; sleep 2; exit 0"])
+        .expect("spawn delayed-exit shell");
+    assert!(rt.pty_pid().is_some(), "child pid must be owned");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut eof_seen = false;
+    while std::time::Instant::now() < deadline {
+        let _ = rx.recv_timeout(Duration::from_millis(50));
+        let _ = rt.poll_pty();
+        if rt.has_unreaped_eof_session() {
+            eof_seen = true;
+            break;
+        }
+    }
+    assert!(eof_seen, "reader EOF must latch the unreaped session");
+    assert!(
+        rt.primary_exit_status().is_none(),
+        "the child must span the EOF-to-reap gap for this regression"
+    );
+    assert!(
+        rt.has_unreaped_eof_session(),
+        "the latch must stay set while the exit is not observable"
+    );
+
+    // A bounded re-poll observes the exit once the child finishes, and the
+    // latch clears on the same observation.
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(observed) = rt.primary_exit_status() {
+            status = Some(observed);
+            break;
+        }
+        let _ = rt.poll_pty();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(status.is_some(), "bounded re-poll must reap the child");
+    assert!(
+        !rt.has_unreaped_eof_session(),
+        "a reaped session must clear the EOF latch"
+    );
+}

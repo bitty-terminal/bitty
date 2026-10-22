@@ -303,6 +303,22 @@ pub(crate) const TERMINAL_CWD_MAX_BYTES: usize = 4096;
 /// Maximum bytes kept from a config path in a `config.reloaded` payload
 /// (issue #1828).
 pub(crate) const CONFIG_PATH_MAX_BYTES: usize = 1024;
+/// First bounded wake after a PTY session reports EOF while its child is
+/// still unreaped (issue #2443).
+///
+/// The child has already closed every tty slave fd at EOF; on Linux it
+/// normally becomes reapable within microseconds (`exit_files` precedes
+/// `exit_notify`), so the first re-poll almost always settles the session.
+/// Bounded so a shell that closes its tty before exiting still terminates
+/// promptly without depending on an unrelated event-loop wake.
+pub(crate) const SHELL_EXIT_POLL_INITIAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+/// Upper bound for the post-EOF child-reap poll (issue #2443).
+///
+/// A child that closed its tty but lingers (for example a daemonizing
+/// process) is still observed within this bound; the cap keeps the fallback
+/// poll cheap instead of spinning at the initial interval forever.
+pub(crate) const SHELL_EXIT_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(500);
 /// Maximum queued input-originated plugin command invocations (CTX-1324).
 ///
 /// The static keybinding intercept enqueues `InvokeCommand`, `TogglePalette`,
@@ -691,6 +707,10 @@ pub(crate) struct TerminalApp {
     /// by [`Self::deliver_runtime_events`] on the same tick. At most one
     /// per tick; a second reload on the same tick overwrites the first.
     pending_config: Option<PendingConfigReload>,
+    /// Bounded child-reap poll armed after a PTY session reports EOF while
+    /// its child is still unreaped (issue #2443). `None` when every live
+    /// session's exit has been observed or no session has reached EOF.
+    shell_exit_poll: Option<ShellExitPoll>,
     /// Input-originated plugin command invocations awaiting the cold phase
     /// (CTX-1324, P0-AC-015).
     ///
@@ -737,6 +757,16 @@ pub(crate) enum ShellExitOutcome {
     AppExiting,
 }
 
+/// Bounded wake schedule for a child whose PTY closed but whose exit status
+/// is not reapable yet (issue #2443).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShellExitPoll {
+    /// Next permitted reap attempt.
+    next_at: std::time::Instant,
+    /// Current backoff interval (starts at [`SHELL_EXIT_POLL_INITIAL`]).
+    interval: std::time::Duration,
+}
+
 impl TerminalApp {
     /// Theme-aware constructor for real sessions (CTX-0167).
     ///
@@ -776,6 +806,7 @@ impl TerminalApp {
             last_plugin_queue_dropped: 0,
             pending_exits: std::collections::VecDeque::new(),
             pending_config: None,
+            shell_exit_poll: None,
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
         }
@@ -821,6 +852,7 @@ impl TerminalApp {
             last_plugin_queue_dropped: 0,
             pending_exits: std::collections::VecDeque::new(),
             pending_config: None,
+            shell_exit_poll: None,
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
         }
@@ -3294,6 +3326,48 @@ impl TerminalApp {
         }
     }
 
+    /// Next bounded wake deadline for a child whose PTY closed but whose
+    /// exit is not reapable yet (issue #2443).
+    ///
+    /// The PTY forwarder wakes exactly once when its reader reaches EOF. On
+    /// Linux the child closes the tty (`exit_files`) before it becomes a
+    /// zombie (`exit_notify`), so the reap pass that runs on that single
+    /// wake can legitimately observe `try_wait() == None`. Without another
+    /// wake the loop then waits in `ControlFlow::Wait` forever and the last
+    /// panel keeps painting the dead shell's final frame.
+    ///
+    /// While [`Runtime::has_unreaped_eof_session`] holds, this returns the
+    /// next permitted reap time: the first wake lands
+    /// [`SHELL_EXIT_POLL_INITIAL`] after EOF, and later attempts back off to
+    /// [`SHELL_EXIT_POLL_MAX`]. The caller feeds the deadline into the
+    /// event-loop wait, so resolution never depends on an unrelated input or
+    /// compositor event. Returns `None` (and clears the schedule) once no
+    /// session is waiting to be reaped, keeping idle windows on the
+    /// zero-periodic-wakeup path.
+    pub(crate) fn shell_exit_poll_deadline(&mut self) -> Option<std::time::Instant> {
+        if !self.runtime.has_unreaped_eof_session() {
+            self.shell_exit_poll = None;
+            return None;
+        }
+        let now = std::time::Instant::now();
+        match self.shell_exit_poll.as_mut() {
+            Some(poll) if now < poll.next_at => Some(poll.next_at),
+            Some(poll) => {
+                poll.interval = poll.interval.saturating_mul(2).min(SHELL_EXIT_POLL_MAX);
+                poll.next_at = now + poll.interval;
+                Some(poll.next_at)
+            }
+            None => {
+                let next_at = now + SHELL_EXIT_POLL_INITIAL;
+                self.shell_exit_poll = Some(ShellExitPoll {
+                    next_at,
+                    interval: SHELL_EXIT_POLL_INITIAL,
+                });
+                Some(next_at)
+            }
+        }
+    }
+
     /// Applies a sanitized, change-gated title to the OS window (CTX-0382,
     /// handoff seam CTX-0570).
     ///
@@ -3892,6 +3966,11 @@ impl AppHandler for TerminalApp {
                 // resume on the next cold tick; arm an immediate wake so an
                 // otherwise idle window still delivers that tick.
                 let parked = self.parked_command_deadline();
+                // Issue #2443: a PTY that reached EOF wakes once, but the
+                // child may not be reapable on that pass. Keep a bounded
+                // reap wake armed so the last-panel exit never depends on an
+                // unrelated event; `None` once every exit is observed.
+                let shell_exit = self.shell_exit_poll_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -3901,6 +3980,7 @@ impl AppHandler for TerminalApp {
                     coalesced,
                     timers,
                     parked,
+                    shell_exit,
                 ]
                 .into_iter()
                 .flatten()

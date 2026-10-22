@@ -4,6 +4,24 @@
 //! byte-identical logic, only module wiring changed.
 use super::plugin::cold_to_observation;
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Marks a session's reader as terminally drained (EOF or pump I/O failure).
+///
+/// Shared with the wakeup forwarder so the event-loop side can observe that
+/// no more output can ever arrive without consuming the reader. The exit
+/// path uses it to keep a bounded wake armed until the child is reaped
+/// (issue #2443): the forwarder's single EOF wake may land while the child
+/// is still between `exit_files` and `exit_notify`, so a non-blocking
+/// `waitpid` reports "still running" with no further wake queued.
+pub(super) fn mark_reader_eof(eof: &AtomicBool) {
+    eof.store(true, Ordering::Release);
+}
+
+/// Whether the reader behind `eof` has reached its terminal state.
+pub(super) fn reader_eof_hit(eof: &AtomicBool) -> bool {
+    eof.load(Ordering::Acquire)
+}
 
 /// Blocking forwarder: sole consumer of `reader`, pushing into `tx` and
 /// waking once per batch plus once on EOF (CTX-0476 waker merge).
@@ -21,6 +39,7 @@ pub(super) fn pty_forward_loop(
     reader: PtyReader,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     waker: PtyWaker,
+    eof: std::sync::Arc<AtomicBool>,
 ) {
     loop {
         let first = match reader.recv() {
@@ -34,6 +53,13 @@ pub(super) fn pty_forward_loop(
                 // final chunks promptly instead of waiting for an incidental
                 // wakeup. The pump outcome is informational here and is
                 // surfaced by `join` below.
+                //
+                // Issue #2443: publish the terminal state before the wake.
+                // The wake can reach the event loop while the child is still
+                // a hair away from being reapable, and the loop then has no
+                // other reason to run; the shared flag keeps a bounded reap
+                // wake armed until `waitpid` reports the exit.
+                mark_reader_eof(&eof);
                 (waker)();
                 break;
             }
@@ -135,6 +161,7 @@ pub(super) fn spawn_recovering<P: Send + 'static>(
 pub(super) fn spawn_forwarder(
     reader: PtyReader,
     waker: PtyWaker,
+    eof: std::sync::Arc<AtomicBool>,
     spawn: impl FnOnce(
         Box<dyn FnOnce() + Send + 'static>,
     ) -> std::io::Result<std::thread::JoinHandle<()>>,
@@ -142,7 +169,7 @@ pub(super) fn spawn_forwarder(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
     spawn_recovering(
         reader,
-        move |reader| pty_forward_loop(reader, tx, waker),
+        move |reader| pty_forward_loop(reader, tx, waker, eof),
         spawn,
     )
     .map(|handle| ForwarderParts { rx, handle })
@@ -153,8 +180,9 @@ pub(super) fn spawn_forwarder(
 pub(super) fn spawn_forwarder_default(
     reader: PtyReader,
     waker: PtyWaker,
+    eof: std::sync::Arc<AtomicBool>,
 ) -> Result<ForwarderParts, SpawnFailure> {
-    spawn_forwarder(reader, waker, |body| {
+    spawn_forwarder(reader, waker, eof, |body| {
         std::thread::Builder::new()
             .name("bitty-pty-wakeup".to_owned())
             .spawn(body)
@@ -449,7 +477,7 @@ impl Runtime {
             self.pty_reader = Some(reader);
             return;
         };
-        match spawn_forwarder_default(reader, waker) {
+        match spawn_forwarder_default(reader, waker, std::sync::Arc::clone(&self.primary_eof)) {
             Ok(parts) => {
                 self.pty_forward_rx = Some(parts.rx);
                 self.pty_forward_handle = Some(parts.handle);
@@ -543,6 +571,32 @@ impl Runtime {
     /// silently-dropped input.
     pub fn primary_exit_status(&mut self) -> Option<bitty_pty::ExitStatus> {
         self.pty.as_mut().and_then(|p| p.try_wait().ok()?)
+    }
+
+    /// Whether a live session's terminal output has ended (reader EOF or
+    /// pump I/O failure) while its child has not been reaped yet (issue
+    /// #2443).
+    ///
+    /// EOF only proves every tty slave fd closed, not that the child has
+    /// finished exiting: on Linux `exit_files` runs before `exit_notify`,
+    /// so an immediate non-blocking `waitpid` can still report "running".
+    /// The forwarder wakes once on EOF; when that wake loses the race and
+    /// the loop has no other event pending, nothing would ever poll the
+    /// child again. Embedders use this predicate to keep a bounded reap
+    /// wake armed until [`Self::primary_exit_status`] /
+    /// [`Self::pane_try_wait`] observe the exit.
+    ///
+    /// A reaped session is not reported even before its teardown runs, so
+    /// the poll clears on the same pass that consumes the status.
+    #[must_use]
+    pub fn has_unreaped_eof_session(&self) -> bool {
+        let primary = self.pty.as_ref().is_some_and(|pty| !pty.is_reaped())
+            && reader_eof_hit(&self.primary_eof);
+        primary
+            || self
+                .pane_sessions
+                .values()
+                .any(|sess| !sess.pty.is_reaped() && reader_eof_hit(&sess.reader_eof))
     }
 
     /// Current PTY size as known by the kernel, if a PTY is owned.
@@ -681,9 +735,14 @@ impl Runtime {
         }
         match self.pty_reader.as_ref()?.try_recv() {
             bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
-            bitty_pty::PtyRecv::Empty | bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+            bitty_pty::PtyRecv::Eof | bitty_pty::PtyRecv::Error(_) => {
+                // Issue #2443: the unpromoted direct pump sees the same
+                // terminal state the forwarder publishes; record it so the
+                // exit poll still arms (headless/test pumps included).
+                mark_reader_eof(&self.primary_eof);
                 None
             }
+            bitty_pty::PtyRecv::Empty => None,
         }
     }
 
@@ -705,7 +764,15 @@ impl Runtime {
                 };
                 match reader.recv_timeout(timeout) {
                     Ok(Some(chunk)) => Some(chunk),
-                    Ok(None) | Err(_) => None,
+                    // Issue #2443: EOF observed through the blocking twin
+                    // must publish the same terminal-state latch.
+                    Ok(None) => {
+                        mark_reader_eof(&self.primary_eof);
+                        None
+                    }
+                    // Timeout or pump failure: the non-blocking drain reports
+                    // the terminal state on its next pass.
+                    Err(_) => None,
                 }
             }
         };

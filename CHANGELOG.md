@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Local theme files with hot reload (#2465):** `appearance.theme = "local:<name>"`
+  loads a TOML palette from the themes directory, folds it into the resolved
+  theme, and reloads edits without a restart. Bounds are 64 files, 64 KiB per
+  file, regular files only; invalid edits keep the last good palette. The
+  4.5:1 text / 3:1 UI contrast gate applies against the local background.
+- **Official plugin install by ID (#2455/#2456):** the binary embeds a
+  generated catalog of all 11 official plugins (id → repository, immutable
+  pin, manifest hash, compatibility range), so `bitty plugin install
+bitty-terminal.dashboard` and the other official ids resolve without a
+  runtime registry fetch. Pins and hashes are checked before use; an
+  incompatible entry is refused before any network access.
+- **Minimum-only plugin compatibility (#2462):** official manifests declare
+  `>=` floors only; the registry validator rejects upper bounds, exact pins,
+  carets, and tildes so a plugin does not need a manifest edit for every host
+  release.
+- **Kitty image previews on the alternate screen (#2442/#2453/#2458):**
+  spanless `a=T,U=1` prototypes, U+10EEEE placeholder runs, per-origin
+  main/alt image planes, PTY pixel winsize from `TIOCGWINSZ` on spawn/resize,
+  and aspect-fit centered direct placements. yazi/chafa previews render on
+  both screens with one blit per placeholder image.
+- **Configurable page scroll (#2475):** `terminal.page_scroll_percent`
+  (10..=100, default 75) controls how far `scroll_page_up`/`scroll_page_down`
+  move the viewport; selection follows the actual delta and the alternate
+  screen stays inert.
+- **Theme provenance without URLs (#2465):** `bitty list themes` labels each
+  row `builtin` (JSON keeps the machine-readable source) instead of printing
+  a provenance URL that looked like a network fetch.
+
 - **Bounded keymap registry reads for plugins (CTX-2405, #2405):**
   `bitty.keymaps.list({ offset, limit })` returns one bounded page
   (`entries`, `total`, `offset`, `truncated`) of the live resolved bindings
@@ -39,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cold path; payload paths are display strings only.
 - **Waybar-style band groups, hover, and button routing (#2411):** a band
   scene's root `Row` resolves per-group `anchor = "left" | "center" |
-  "right"` against the presented width, so `modules_left`/`modules_center`/
+"right"` against the presented width, so `modules_left`/`modules_center`/
   `modules_right` get true centering and a flush right edge at any width.
   Over-subscribed rows clip deterministically (left, then right, then center)
   without overlapping runs or losing hit targets. `on_hover` bindings
@@ -54,6 +82,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IME first key after a composition (#2485):** the post-commit claim no
+  longer eats the next Space/Enter/Delete. The echo window drops to 25 ms and
+  a Shift release (fcitx5 input-method toggle) clears the claim immediately;
+  a 100 ms pause regression pins the old 250 ms behavior out.
+- **Transactional plugin store and repair (#2439/#2447/#2473):** staging is
+  renamed atomically with the index, interrupted installs and
+  `.tmp-replaced-*` trees are restored or quarantined, `plugin doctor
+--repair` preflights its scan bound, and healthy rows no longer flip to
+  `orphaned`. Same-version different content requires `--force`.
+- **Last-panel exit hang (#2443/#2454):** a reader EOF latches the unreaped
+  child and a bounded reap poll closes the last pane without waiting forever.
+- **Spatial directional focus (#2444/#2451):** L/T/nested layouts move focus
+  to the geometrically adjacent pane, zoom-aware.
+- **Extension latest install (#2440/#2445):** the published
+  `extensions/catalog.v1` resolves `bitty extension install graphics` without
+  `--version`; terminology is consistently "extension".
 - **PTY input writes can no longer freeze the event loop (#2446):** the
   production writer for every session now copies input into a bounded
   128 KiB FIFO (plus a 512-command cap) drained by one named writer thread,
@@ -117,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Shell integration for all five supported shells (#2386):** `bitty
-  shell-init <shell>` now emits the init script and nested Tab completion
+shell-init <shell>` now emits the init script and nested Tab completion
   inline for bash, zsh, fish, PowerShell, and Nushell, generated from the
   parser-owned grammar tables (`config`/`profile`, `ctl` resources,
   `plugin`/`config` actions, `extension`, `dev trace`/`dump`/`overlay`,
@@ -150,7 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UI composition surface, and candidate scene style primitives plus a
   bounded component catalog provide reusable, capped building blocks. These
   are candidate surfaces with no production consumer yet.
- ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
+  ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
 
 ### Changed
 

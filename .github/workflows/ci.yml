@@ -202,6 +202,7 @@ jobs:
         run: |
           bash scripts/check-pkgbuild-source.sh
           bash scripts/check-pkgbuild-bin.sh
+          bash scripts/check-spec.sh
           bash scripts/tests/check-package-manifests.test.sh
           bash scripts/tests/check-aur-bin-render.test.sh
 

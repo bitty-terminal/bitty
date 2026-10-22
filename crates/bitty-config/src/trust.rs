@@ -547,6 +547,18 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
         m.validate().map_err(|e| ConfigError::TrustViolation {
             message: e.to_string(),
         })?;
+        // Issue #2474: mouse buttons share the keymap action vocabulary, so a
+        // project layer must not claim them (same rationale as `keymaps`).
+        // Any declared button fails closed, including an explicit default
+        // (`right = "none"` / `middle = "paste_from_primary"`): project
+        // layers outrank the user layer, so the declaration itself would
+        // override a user binding even when it names a shipped default.
+        // Only an omitted leaf (`None`) stays allowed.
+        if m.right.is_some() || m.middle.is_some() {
+            return Err(ConfigError::TrustViolation {
+                message: "project config must not declare mouse button bindings".into(),
+            });
+        }
     }
     if let Some(a) = &plan.appearance {
         a.validate().map_err(|e| ConfigError::TrustViolation {
@@ -713,15 +725,84 @@ mod tests {
         // CTX-0260/CTX-0334: hover-focus and its dwell delay are
         // presentation-only chrome with no process authority (like
         // auto-copy), so project layers may set them (within the bounds).
-        use crate::types::MouseConfig;
+        use crate::plan::MouseConfigPlan;
         let plan = ConfigPlan {
-            mouse: Some(MouseConfig {
-                focus_follows_mouse: true,
-                focus_follows_mouse_delay_ms: 120,
+            mouse: Some(MouseConfigPlan {
+                focus_follows_mouse: Some(true),
+                focus_follows_mouse_delay_ms: Some(120),
+                ..MouseConfigPlan::default()
             }),
             ..Default::default()
         };
         validate_project_plan(&plan).expect("hover-focus allowed in project");
+    }
+
+    #[test]
+    fn project_plan_rejects_mouse_button_bindings() {
+        // Issue #2474: mouse buttons share the keymap action vocabulary, so a
+        // project layer must not claim them (the same T-08 rationale that
+        // rejects project `keymaps`).
+        use crate::keymap::{ChromeAction, MouseButtonBinding};
+        use crate::plan::MouseConfigPlan;
+        for mouse in [
+            MouseConfigPlan {
+                right: Some(MouseButtonBinding::Action(ChromeAction::PasteFromClipboard)),
+                ..MouseConfigPlan::default()
+            },
+            MouseConfigPlan {
+                middle: Some(MouseButtonBinding::None),
+                ..MouseConfigPlan::default()
+            },
+            // Explicit shipped defaults are still declarations: a project
+            // layer outranks the user layer and would reset a user binding.
+            MouseConfigPlan {
+                right: Some(MouseButtonBinding::None),
+                ..MouseConfigPlan::default()
+            },
+            MouseConfigPlan {
+                middle: Some(crate::types::default_middle_binding()),
+                ..MouseConfigPlan::default()
+            },
+            MouseConfigPlan {
+                right: Some(MouseButtonBinding::None),
+                middle: Some(crate::types::default_middle_binding()),
+                ..MouseConfigPlan::default()
+            },
+        ] {
+            let plan = ConfigPlan {
+                mouse: Some(mouse),
+                ..Default::default()
+            };
+            let err = validate_project_plan(&plan).expect_err("button bindings rejected");
+            assert!(
+                err.to_string().contains("mouse button bindings"),
+                "must name the rejected class: {err}"
+            );
+        }
+        // Parsed explicit defaults fail closed through the same gate.
+        let project_src = ConfigSource::new(LayerKind::TrustedLocal, Some("project.lua"));
+        for table in [
+            r#"return { mouse = { right = "none" } }"#,
+            r#"return { mouse = { middle = "paste_from_primary" } }"#,
+        ] {
+            let plan = crate::file::parse_lua_config(table, &project_src).expect("parses");
+            let err = validate_project_plan(&plan).expect_err("explicit default must be rejected");
+            assert!(
+                err.to_string().contains("mouse button bindings"),
+                "must name the rejected class: {err}"
+            );
+        }
+        // Omitted buttons stay omitted in the plan and are allowed; a
+        // hover-only table does not declare them either.
+        validate_project_plan(&ConfigPlan::default()).expect("defaults allowed");
+        validate_project_plan(&ConfigPlan {
+            mouse: Some(MouseConfigPlan {
+                focus_follows_mouse: Some(true),
+                ..MouseConfigPlan::default()
+            }),
+            ..Default::default()
+        })
+        .expect("hover-only table declares no button");
     }
 
     #[test]

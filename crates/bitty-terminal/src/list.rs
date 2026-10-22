@@ -431,10 +431,13 @@ pub fn list_help_text(invoked_as: &str) -> String {
            \"source\",\"provenance\",\"license\",\"background\",\"foreground\",\"cursor\",\"selection\"}});\n  \
            source is builtin|local and provenance is the optional upstream URL.\n  \
            actions result keys: kind, count (actions plus commands), actions\n  \
-           (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"binding\",\"kind\":\"chrome\"}}),\n  \
+           (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"binding\",\"mouse\",\"kind\":\"chrome\"}}),\n  \
            commands (array of {{\"id\",\"description\",\"class\",\"requires_runtime\",\"binding\",\"kind\",\"scopes\",\"owner\"}}).\n  \
            Binding is the effective chord (user-configured first, default fallback,\n  \
            null only for manual-bind-only chrome actions; always null for core).\n  \
+           Mouse lists the buttons bound to the action (`right`, `middle`), empty\n  \
+           when no button uses it; the shipped matrix is right = none and\n  \
+           middle = paste_from_primary.\n  \
            Action descriptions reuse the canonical ChromeAction::description source\n  \
            (same strings inspect key shows); core descriptions reuse the\n  \
            inspect command registry summaries. Manual-bind-only is derived from\n  \
@@ -635,9 +638,9 @@ pub fn list_plugins_from_manifests(
 /// source (same strings `bitty inspect key` shows — never a parallel copy),
 /// `manual_bind_only` is derived from `DEFAULT_KEYMAPS` absence,
 /// `requires_runtime` marks entries needing live state (all chrome actions
-/// need the live window; `list` itself stays local), and `binding` is the
+/// need the live window; `list` itself stays local), `binding` is the
 /// effective keybinding (user-configured chord first, default fallback, null
-/// only for manual-bind-only).
+/// only for manual-bind-only), and `mouse` lists the bound mouse buttons.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeActionInfo {
     /// Canonical id spelling (e.g. `close_view`, `goto_split:left`).
@@ -650,6 +653,12 @@ pub struct ChromeActionInfo {
     pub requires_runtime: bool,
     /// Effective chord (e.g. `alt+d`) or `None` when manual-bind-only.
     pub binding: Option<String>,
+    /// Mouse buttons bound to this action (`right`, `middle`), sorted.
+    ///
+    /// Issue #2474: mouse buttons share the keymap action vocabulary, so the
+    /// catalog reports them next to the chord binding instead of a parallel
+    /// table.
+    pub mouse: Vec<String>,
 }
 
 /// One core-command row (reuses the `inspect` registry summaries directly).
@@ -700,14 +709,36 @@ pub fn list_chrome_actions() -> Vec<ChromeActionInfo> {
 pub fn list_chrome_actions_with(
     resolved: &[bitty_config::keymap::ResolvedKeymap],
 ) -> Vec<ChromeActionInfo> {
+    list_chrome_actions_with_mouse(resolved, &bitty_config::MouseConfig::default())
+}
+
+/// Enumerate every chrome-action variant with its effective mouse bindings.
+///
+/// Issue #2474: `right`/`middle` bindings are rendered beside the chord so
+/// `bitty list actions` is the single action catalog for both input kinds.
+#[must_use]
+pub fn list_chrome_actions_with_mouse(
+    resolved: &[bitty_config::keymap::ResolvedKeymap],
+    mouse: &bitty_config::MouseConfig,
+) -> Vec<ChromeActionInfo> {
     let mut out: Vec<ChromeActionInfo> = bitty_config::keymap::all_chrome_actions()
         .iter()
-        .map(|action| ChromeActionInfo {
-            id: action.canonical(),
-            description: action.description().to_string(),
-            manual_bind_only: action.is_manual_bind_only(),
-            requires_runtime: action.requires_runtime(),
-            binding: bitty_config::keymap::effective_binding_for_action(resolved, action),
+        .map(|action| {
+            let mut buttons = Vec::new();
+            if mouse.right.action() == Some(action) {
+                buttons.push("right".to_string());
+            }
+            if mouse.middle.action() == Some(action) {
+                buttons.push("middle".to_string());
+            }
+            ChromeActionInfo {
+                id: action.canonical(),
+                description: action.description().to_string(),
+                manual_bind_only: action.is_manual_bind_only(),
+                requires_runtime: action.requires_runtime(),
+                binding: bitty_config::keymap::effective_binding_for_action(resolved, action),
+                mouse: buttons,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1953,7 +1984,7 @@ pub fn format_success_envelope(
 /// Render the success envelope for `bitty list actions` (CTX-1127).
 ///
 /// Stable keys: `kind`, `count` (actions plus commands), `actions` (array of
-/// `{"id","description","manual_bind_only","requires_runtime","binding","kind":"chrome"}`),
+/// `{"id","description","manual_bind_only","requires_runtime","binding","mouse","kind":"chrome"}`),
 /// `commands` (array of
 /// `{"id","description","class","requires_runtime","binding","kind","scopes","owner"}`).
 /// `binding` is the effective chord (user override first, default fallback,
@@ -1981,9 +2012,15 @@ pub fn format_actions_envelope(
             .binding
             .as_deref()
             .map_or_else(|| "null".to_string(), |b| format!("\"{}\"", json_escape(b)));
+        let mouse = a
+            .mouse
+            .iter()
+            .map(|button| format!("\"{}\"", json_escape(button)))
+            .collect::<Vec<_>>()
+            .join(",");
         let _ = write!(
             out,
-            "{{\"id\":\"{}\",\"description\":\"{}\",\"manual_bind_only\":{},\"requires_runtime\":{},\"binding\":{binding},\"kind\":\"chrome\"}}",
+            "{{\"id\":\"{}\",\"description\":\"{}\",\"manual_bind_only\":{},\"requires_runtime\":{},\"binding\":{binding},\"mouse\":[{mouse}],\"kind\":\"chrome\"}}",
             json_escape(&a.id),
             json_escape(&a.description),
             a.manual_bind_only,
@@ -2345,17 +2382,26 @@ pub fn format_actions_table(
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n",
-        bold("KIND ID BINDING DESCRIPTION MANUAL_BIND RUNTIME", color)
+        bold(
+            "KIND ID BINDING MOUSE DESCRIPTION MANUAL_BIND RUNTIME",
+            color
+        )
     ));
     if actions.is_empty() && commands.is_empty() {
         out.push_str("(no actions)\n");
         return out;
     }
     for a in actions {
+        let mouse = if a.mouse.is_empty() {
+            "-".to_string()
+        } else {
+            a.mouse.join(",")
+        };
         out.push_str(&format!(
-            "chrome {} {} {} {} {}\n",
+            "chrome {} {} {} {} {} {}\n",
             a.id,
             a.binding.as_deref().unwrap_or("-"),
+            mouse,
             a.description,
             if a.manual_bind_only { "yes" } else { "no" },
             if a.requires_runtime {
@@ -2367,7 +2413,7 @@ pub fn format_actions_table(
     }
     for c in commands {
         out.push_str(&format!(
-            "command {} - {} - {}\n",
+            "command {} - - {} - {}\n",
             c.id, c.description, c.class
         ));
     }
@@ -2521,7 +2567,7 @@ pub fn run_list_with_effective(
         }
         ListKind::Actions => {
             let resolved = resolved_for_catalog(effective);
-            let actions = list_chrome_actions_with(&resolved);
+            let actions = list_chrome_actions_with_mouse(&resolved, &effective.mouse);
             let commands = list_core_commands();
             match request.format {
                 ListFormat::Table => {
@@ -3296,6 +3342,7 @@ mod tests {
         assert!(env.contains("\"manual_bind_only\":"), "envelope: {env:?}");
         assert!(env.contains("\"requires_runtime\":"), "envelope: {env:?}");
         assert!(env.contains("\"binding\":"), "envelope: {env:?}");
+        assert!(env.contains("\"mouse\":"), "envelope: {env:?}");
         assert!(env.contains("close_view"), "envelope: {env:?}");
         assert!(env.contains("core.terminal.text"), "envelope: {env:?}");
         // Alias spelling propagates to the envelope command field.
@@ -3304,12 +3351,49 @@ mod tests {
     }
 
     #[test]
+    fn actions_catalog_surfaces_mouse_button_bindings() {
+        // Issue #2474: `bitty list actions` reports the shipped mouse matrix
+        // beside the chord, using the same action vocabulary.
+        let rows = list_chrome_actions();
+        let primary = rows
+            .iter()
+            .find(|r| r.id == "paste_from_primary")
+            .expect("paste_from_primary row");
+        assert_eq!(primary.mouse, vec!["middle".to_string()]);
+        assert!(
+            rows.iter().all(|r| !r.mouse.contains(&"right".to_string())),
+            "default right-click is unbound"
+        );
+        // A user binding shows up without a parallel table.
+        let mouse = bitty_config::MouseConfig {
+            right: bitty_config::MouseButtonBinding::Action(
+                bitty_config::ChromeAction::CopyToClipboard,
+            ),
+            ..bitty_config::MouseConfig::default()
+        };
+        let rows = list_chrome_actions_with_mouse(
+            &bitty_config::keymap::shipped_resolved_keymaps(),
+            &mouse,
+        );
+        let copy = rows
+            .iter()
+            .find(|r| r.id == "copy_to_clipboard")
+            .expect("copy row");
+        assert_eq!(copy.mouse, vec!["right".to_string()]);
+        let table = format_actions_table(&rows, &list_core_commands(), true);
+        assert!(
+            table.contains("copy_to_clipboard ctrl+shift+c right"),
+            "table: {table:?}"
+        );
+    }
+
+    #[test]
     fn actions_table_smoke() {
         let chrome = list_chrome_actions();
         let core = list_core_commands();
         let table = format_actions_table(&chrome, &core, true);
         assert!(
-            table.contains("KIND ID BINDING DESCRIPTION"),
+            table.contains("KIND ID BINDING MOUSE DESCRIPTION"),
             "table: {table:?}"
         );
         assert!(table.contains("close_view"), "table: {table:?}");

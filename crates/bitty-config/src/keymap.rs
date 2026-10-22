@@ -714,6 +714,14 @@ pub enum ChromeAction {
     /// `paste_from_clipboard` equivalent). Suspicious text waits on the
     /// pending-paste confirmation path; there is no silent delivery.
     PasteFromClipboard,
+    /// Paste the platform primary selection as terminal input through the
+    /// same suspicious-paste inspection gate. `paste_from_primary` is
+    /// bitty's spelling for the primary/selection paste that kitty and
+    /// ghostty expose as `paste_from_selection`; on Linux this is the
+    /// middle-click selection source, and platforms without a distinct
+    /// primary selection fall back to an empty source (fail-soft, no bytes,
+    /// no panic).
+    PasteFromPrimary,
     /// Scroll the focused pane up by one viewport page (less-like).
     ScrollPageUp,
     /// Scroll the focused pane down by one viewport page (less-like).
@@ -975,6 +983,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::PasteFromClipboard)
             }
+            "paste_from_primary" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::PasteFromPrimary)
+            }
             "scroll_page_up" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ScrollPageUp)
@@ -1114,6 +1126,7 @@ impl ChromeAction {
             Self::FocusId(n) => format!("focus:{n}"),
             Self::CopyToClipboard => "copy_to_clipboard".to_string(),
             Self::PasteFromClipboard => "paste_from_clipboard".to_string(),
+            Self::PasteFromPrimary => "paste_from_primary".to_string(),
             Self::ScrollPageUp => "scroll_page_up".to_string(),
             Self::ScrollPageDown => "scroll_page_down".to_string(),
             Self::IncreaseFontSize => "increase_font_size".to_string(),
@@ -1163,6 +1176,7 @@ impl ChromeAction {
             Self::FocusId(_) => "Focus a pane by numeric view id.",
             Self::CopyToClipboard => "Copy the current selection to the system clipboard.",
             Self::PasteFromClipboard => "Paste the system clipboard through the inspection gate.",
+            Self::PasteFromPrimary => "Paste the primary selection through the inspection gate.",
             Self::ScrollPageUp => "Scroll the focused pane up by one viewport page.",
             Self::ScrollPageDown => "Scroll the focused pane down by one viewport page.",
             Self::IncreaseFontSize => "Increase the per-window font size one step.",
@@ -1246,6 +1260,7 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::FocusId(1),
         ChromeAction::CopyToClipboard,
         ChromeAction::PasteFromClipboard,
+        ChromeAction::PasteFromPrimary,
         ChromeAction::ScrollPageUp,
         ChromeAction::ScrollPageDown,
         ChromeAction::IncreaseFontSize,
@@ -1273,6 +1288,70 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::TogglePinned,
         ChromeAction::InvokeCommand("example.owner:example-command".to_string()),
     ]
+}
+
+/// Binding for one mouse button (issue #2474).
+///
+/// Mouse buttons share the chrome-action vocabulary used by
+/// `keymaps[].action`: `none` disables the button (the default for
+/// right-click), any [`ChromeAction`] spelling runs through the same dispatch
+/// path as a bound chord. Parsing is bounded by
+/// [`MAX_ACTION_LEN`] through [`ChromeAction::parse`] and fails closed with
+/// the owning field path (`mouse.right` / `mouse.middle`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MouseButtonBinding {
+    /// Explicit no-op: the button is consumed as host chrome, emits no PTY
+    /// bytes, and runs no action.
+    #[default]
+    None,
+    /// Run this chrome action on press.
+    Action(ChromeAction),
+}
+
+impl MouseButtonBinding {
+    /// Parse `none` or a chrome-action spelling for `field`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] with `field` when the value is empty,
+    /// over-long, or not in the action vocabulary.
+    pub fn parse(raw: &str, field: &str) -> Result<Self, ConfigError> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("none") {
+            return Ok(Self::None);
+        }
+        match ChromeAction::parse(trimmed) {
+            Ok(action) => Ok(Self::Action(action)),
+            Err(ConfigError::Validation { message, .. }) => {
+                Err(ConfigError::validation(field, message))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Canonical spelling: `none` or the action's canonical id.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        match self {
+            Self::None => "none".to_string(),
+            Self::Action(action) => action.canonical(),
+        }
+    }
+
+    /// Borrow the bound action, if any.
+    #[must_use]
+    pub const fn action(&self) -> Option<&ChromeAction> {
+        match self {
+            Self::None => None,
+            Self::Action(action) => Some(action),
+        }
+    }
+
+    /// Whether this binding is an explicit no-op.
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
 /// Shipped keymap table for introspection (CTX-1127, issue #1934).
@@ -1327,7 +1406,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, command:<owner:command>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -2799,6 +2878,58 @@ mod tests {
         // Unknown head lists the known actions.
         let err = ChromeAction::parse("explode:now").unwrap_err();
         assert!(err.to_string().contains("goto_split"));
+    }
+
+    #[test]
+    fn paste_from_primary_is_in_the_action_vocabulary() {
+        // Issue #2474: middle-click dispatches the same action vocabulary,
+        // so primary paste is a first-class chrome action.
+        assert_eq!(
+            ChromeAction::parse("paste_from_primary").expect("primary paste"),
+            ChromeAction::PasteFromPrimary
+        );
+        assert_eq!(
+            ChromeAction::PasteFromPrimary.canonical(),
+            "paste_from_primary"
+        );
+        assert!(
+            all_chrome_actions().contains(&ChromeAction::PasteFromPrimary),
+            "the actions catalog must list paste_from_primary"
+        );
+    }
+
+    #[test]
+    fn mouse_button_binding_parses_none_and_actions_with_its_own_field() {
+        // `none` is explicit, case-insensitive, and canonicalized.
+        for raw in ["none", " NONE ", "None"] {
+            assert_eq!(
+                MouseButtonBinding::parse(raw, "mouse.right").expect("none"),
+                MouseButtonBinding::None
+            );
+        }
+        assert_eq!(MouseButtonBinding::None.canonical(), "none");
+        assert!(MouseButtonBinding::None.action().is_none());
+        assert!(MouseButtonBinding::None.is_none());
+
+        let paste = MouseButtonBinding::parse("paste_from_clipboard", "mouse.right")
+            .expect("paste binding");
+        assert_eq!(
+            paste,
+            MouseButtonBinding::Action(ChromeAction::PasteFromClipboard)
+        );
+        assert_eq!(paste.canonical(), "paste_from_clipboard");
+        assert_eq!(paste.action(), Some(&ChromeAction::PasteFromClipboard));
+
+        // Unknown actions fail closed naming the mouse field, not keymaps.
+        let err = MouseButtonBinding::parse("explode:now", "mouse.middle").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mouse.middle"), "field path: {msg}");
+        assert!(!msg.contains("keymaps[].action"), "no keymap path: {msg}");
+        assert!(msg.contains("unknown action"), "message: {msg}");
+        // Over-long values stay bounded by the shared action grammar.
+        let long = "x".repeat(super::MAX_ACTION_LEN + 1);
+        let err = MouseButtonBinding::parse(&long, "mouse.right").unwrap_err();
+        assert!(err.to_string().contains("mouse.right"));
     }
 
     #[test]

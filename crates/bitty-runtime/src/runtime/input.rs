@@ -902,7 +902,8 @@ impl Runtime {
     /// - When mouse tracking is enabled (`1000`/`1002`/`1003`) + SGR `1006` and
     ///   not in shift-override, every button event encodes to bounded SGR bytes
     ///   (`ESC[<b;x;yM/m`, ≤32 bytes) and is written to the PTY. Right/middle
-    ///   paste never fires in this path.
+    ///   host bindings never fire in this path: capture wins and the pane
+    ///   receives the protocol bytes.
     /// - Holding Shift bypasses capture unconditionally to force selection
     ///   (accessibility escape).
     /// - Otherwise the event drives presentation selection: left press starts
@@ -917,14 +918,40 @@ impl Runtime {
     ///   when `true` the committed selection copies to the platform clipboard
     ///   (which best-effort syncs the primary selection on Linux, CTX-0160);
     ///   when `false` (default, matching kitty/ghostty) only the explicit
-    ///   `copy_to_clipboard` chord copies. Right press pastes the
-    ///   standard clipboard (Wayland-first backend) and middle press pastes
-    ///   the platform primary selection, both through the suspicious-paste
-    ///   inspection gate. All three stay fail-soft (empty source means no
-    ///   bytes, never a panic or block) but platform failures are recorded
-    ///   for [`Self::last_clipboard_error`] instead of swallowed.
+    ///   `copy_to_clipboard` chord copies. Issue #2474: right/middle presses
+    ///   no longer paste implicitly. Each non-captured press queues the
+    ///   configured `mouse.right` / `mouse.middle` action
+    ///   ([`Self::take_pending_mouse_action`]) for the embedder's shared
+    ///   chrome dispatcher; the shipped defaults are `right = none` (inert)
+    ///   and `middle = paste_from_primary`. A captured pane always reports
+    ///   protocol bytes and queues nothing. Actions stay fail-soft through
+    ///   the dispatcher (empty source means no bytes, never a panic or
+    ///   block); platform failures are recorded for
+    ///   [`Self::last_clipboard_error`] instead of swallowed.
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
         self.handle_mouse_input_at(event, std::time::Instant::now());
+    }
+
+    /// Takes the host chrome action queued by the last non-captured
+    /// right/middle press (issue #2474).
+    ///
+    /// The embedder drains this immediately after routing the event and runs
+    /// the action through the same chrome dispatcher as keymaps. `None` means
+    /// no action is pending: the button is unbound (`mouse.right = "none"`),
+    /// the press was consumed as chrome (band, modal, selection, drag), or a
+    /// mouse-capturing pane reported it as protocol bytes.
+    #[must_use]
+    pub fn take_pending_mouse_action(&mut self) -> Option<bitty_config::ChromeAction> {
+        self.pending_mouse_action.take()
+    }
+
+    /// Queues `binding`'s action for the embedder, if the button is bound.
+    ///
+    /// One binding yields exactly one action per press; `none` queues
+    /// nothing. The slot is a single action because the embedder drains it in
+    /// the same event turn, before another pointer event can arrive.
+    fn queue_mouse_action(&mut self, action: Option<bitty_config::ChromeAction>) {
+        self.pending_mouse_action = action;
     }
 
     /// [`Self::handle_mouse_input`] with an explicit wall clock (CTX-0385).
@@ -995,10 +1022,17 @@ impl Runtime {
         if event.state == PressState::Pressed && self.band_press(event.button) {
             return;
         }
-        // CTX-0804 (#1477): a left press on another pane is a focus choice
-        // first when a mouse-tracking app is involved, so the capture
-        // decision below reads the pane the click landed on.
-        if event.button == MouseButton::Left && event.state == PressState::Pressed {
+        // CTX-0804 (#1477) + issue #2474: a press on another pane is a focus
+        // choice first when a mouse-tracking app is involved, so the capture
+        // decision below reads the pane the click landed on. Right and middle
+        // presses take the same path: without it, a press over an unfocused
+        // tracking pane would run the host mouse action instead of reporting
+        // protocol bytes to that pane.
+        if matches!(
+            event.button,
+            MouseButton::Left | MouseButton::Right | MouseButton::Middle
+        ) && event.state == PressState::Pressed
+        {
             self.focus_pointer_pane_before_capture();
         }
         // Issues #1759/#1760 (R-005/OQ-004): Ctrl/Cmd+Left over a safe
@@ -1347,23 +1381,22 @@ impl Runtime {
                 // Any non-left press breaks a pending multi-click chain
                 // (fail-closed: paste clicks never arm word/line mode).
                 self.click_tracker.reset();
-                // Ghostty `paste` right-click action for the standard
-                // clipboard (Wayland-first via the platform backend,
-                // CTX-0160). Fail-soft: empty clipboards paste nothing and
-                // suspicious text waits on the confirmation gate; a read
-                // failure is recorded for `last_clipboard_error` instead of
-                // swallowed (PR #259 review).
-                match self.paste_from_clipboard() {
-                    Ok(_) => self.clear_clipboard_error(),
-                    Err(err) => self.record_clipboard_error(err),
-                }
+                // Issue #2474: right-click defaults to `none`. A configured
+                // binding queues one chrome action for the embedder; no
+                // clipboard read happens here, so a multi-line clipboard
+                // cannot open the suspicious-paste gate unless the user
+                // explicitly bound `paste_from_clipboard` to this button.
+                let action = self.config.mouse_right.action().cloned();
+                self.queue_mouse_action(action);
             }
             (MouseButton::Middle, PressState::Pressed) => {
                 self.click_tracker.reset();
-                // Ghostty `primary-paste` middle-click action for the
-                // platform primary selection (fail-soft like right-click;
-                // read failures are recorded inside `paste_from_primary`).
-                let _ = self.paste_from_primary();
+                // Issue #2474: middle-click keeps its shipped
+                // `paste_from_primary` default but is configurable (including
+                // `none`). The action runs through the shared dispatcher,
+                // never a parallel paste table.
+                let action = self.config.mouse_middle.action().cloned();
+                self.queue_mouse_action(action);
             }
             _ => {}
         }

@@ -887,6 +887,19 @@ pub struct RuntimeConfig {
     /// hovered pane for at least this long, so a transient pass-through
     /// never steals focus. Bounded by [`MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS`].
     pub focus_follows_mouse_delay: std::time::Duration,
+    /// Right-button host action (issue #2474 `mouse.right`; default `None`).
+    ///
+    /// A non-captured right press queues this action through
+    /// [`Runtime::take_pending_mouse_action`]; the embedder runs it through
+    /// the same chrome-action dispatcher as a bound chord. `None` is an inert
+    /// right-click: no clipboard read, no paste dialog, no PTY bytes. A pane
+    /// that enables mouse reporting receives protocol bytes first and never
+    /// reaches this binding.
+    pub mouse_right: bitty_config::MouseButtonBinding,
+    /// Middle-button host action (issue #2474 `mouse.middle`; default
+    /// `paste_from_primary`). Same routing and capture precedence as
+    /// [`Self::mouse_right`].
+    pub mouse_middle: bitty_config::MouseButtonBinding,
     /// CTX-0979: Core draws no workspace display; no visibility or edge
     /// fields live here. Workspace state is memory-only.
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
@@ -1139,6 +1152,8 @@ impl Default for RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
+            mouse_right: bitty_config::MouseButtonBinding::None,
+            mouse_middle: bitty_config::types::default_middle_binding(),
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -1250,6 +1265,8 @@ impl RuntimeConfig {
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
             )),
+            mouse_right: bitty_config::MouseButtonBinding::None,
+            mouse_middle: bitty_config::types::default_middle_binding(),
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),

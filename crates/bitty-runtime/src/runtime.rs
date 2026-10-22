@@ -963,6 +963,14 @@ pub struct Runtime {
     /// the embedder can surface them. A subsequent successful clipboard
     /// operation clears the slot. Bounded: at most one retained error.
     last_clipboard_error: Option<bitty_platform::PlatformError>,
+    /// Host chrome action queued by a `mouse.right` / `mouse.middle` press
+    /// (issue #2474), awaiting the embedder's chrome-action dispatch.
+    ///
+    /// Only a non-captured press queues here: the mouse-reporting branch
+    /// returns first, so a pane that enabled mouse tracking always receives
+    /// protocol bytes and never runs a host action. `None` is the inert
+    /// default (right-click does nothing).
+    pending_mouse_action: Option<bitty_config::ChromeAction>,
     last_cursor: Option<CursorPosition>,
     /// One-shot swallow for the left release paired with a plugin-band
     /// chrome-consumed press (CTX-0946 C1).
@@ -1834,6 +1842,7 @@ impl Runtime {
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,
+            pending_mouse_action: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
             band_release_swallow: false,
@@ -2117,6 +2126,7 @@ impl Runtime {
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,
+            pending_mouse_action: None,
             paste_truncated_pastes: 0,
             last_cursor: None,
             band_release_swallow: false,

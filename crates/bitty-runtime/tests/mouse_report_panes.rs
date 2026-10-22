@@ -58,7 +58,13 @@ const SGR_ANY_MOTION: &[u8] = b"\x1b[?1003h\x1b[?1006h";
 /// Horizontal split: headless primary grid on the left, a `cat -v` pane on
 /// the right whose app enabled `modes`.
 fn split_with_app_pane(modes: &[u8]) -> Runtime {
-    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    split_with_app_pane_config(modes, RuntimeConfig::default())
+}
+
+/// [`split_with_app_pane`] with an explicit runtime config (issue #2474:
+/// a bound mouse button must never outrun a capturing pane).
+fn split_with_app_pane_config(modes: &[u8], config: RuntimeConfig) -> Runtime {
+    let mut rt = Runtime::new(config).expect("headless build");
     rt.set_layout(LayoutNode::split(
         SplitAxis::Horizontal,
         0.5,
@@ -268,6 +274,55 @@ fn clicking_a_capturing_pane_reaches_its_app() {
         "the app receives the click at its own cell; pane text: {text:?}"
     );
     release(&mut rt, MouseButton::Left);
+}
+
+#[test]
+fn middle_press_over_a_capturing_pane_reports_and_runs_no_host_action() {
+    bitty_test_support::require_pty!();
+    // Issue #2474 review: a middle press over an unfocused mouse-reporting
+    // pane must focus that pane before the capture decision and report the
+    // button, never run the host primary-paste binding.
+    let mut rt = split_with_app_pane_config(
+        SGR_PRESS_TRACKING,
+        RuntimeConfig {
+            // Hover focus off: the press itself must resolve the pointer
+            // pane. With the shipped hover default the pointer move would
+            // focus PANE first and this test would pass even without the
+            // right/middle pre-capture resolution.
+            focus_follows_mouse: false,
+            mouse_middle: bitty_config::MouseButtonBinding::Action(
+                bitty_config::ChromeAction::PasteFromPrimary,
+            ),
+            ..RuntimeConfig::default()
+        },
+    );
+    assert!(rt.set_focus(PRIMARY));
+
+    rt.handle_cursor_moved(cell_center(&rt, PANE, 2, 3));
+    assert_eq!(
+        rt.focused_view(),
+        Some(PRIMARY),
+        "hover must not move focus; only the press resolves the pane"
+    );
+    press(&mut rt, MouseButton::Middle);
+
+    assert_eq!(
+        rt.focused_view(),
+        Some(PANE),
+        "the press focuses the tracking pane it landed on"
+    );
+    assert!(
+        rt.take_pending_mouse_action().is_none(),
+        "capture wins: no host middle action is queued"
+    );
+    // SGR button 1 is the middle button at pane-local cell (2, 3).
+    let expected = sgr(1, 2, 3, true);
+    let text = wait_for_pane_text(&mut rt, &expected);
+    assert!(
+        text.contains(&expected),
+        "the tracking pane receives the middle report; pane text: {text:?}"
+    );
+    release(&mut rt, MouseButton::Middle);
 }
 
 #[test]

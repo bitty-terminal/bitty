@@ -781,6 +781,11 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- max 2000). Alt+drag moves a floating pane where the layout\n\
      \x20\x20-- model permits.\n\
      \x20\x20-- mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 },\n\
+     \x20\x20-- Mouse buttons: \"none\" or any keymap action name. The shipped\n\
+     \x20\x20-- defaults are right = \"none\" (inert) and middle =\n\
+     \x20\x20-- \"paste_from_primary\"; panes that capture mouse reporting\n\
+     \x20\x20-- always receive protocol bytes instead of a host action.\n\
+     \x20\x20-- mouse = { right = \"none\", middle = \"paste_from_primary\" },\n\
      \x20\x20-- Workspace switcher bar (on by default: lists workspaces,\n\
      \x20\x20-- click/keyboard switching). Uncomment to opt out:\n\
      \x20\x20-- workspace = { show_bar = false },\n\
@@ -1512,6 +1517,22 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "mouse.right",
+                        format!("\"{}\"", e.mouse.right.canonical()),
+                        &src("mouse.right")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "mouse.middle",
+                        format!("\"{}\"", e.mouse.middle.canonical()),
+                        &src("mouse.middle")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "mod_key",
                         format!("\"{}\"", e.mod_key.canonical()),
                         &src("mod_key")
@@ -1867,6 +1888,11 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
                 "mouse.focus_follows_mouse_delay_ms",
                 &mut warnings,
             )));
+        // Issue #2474: button bindings flow file -> effective -> runtime the
+        // same way. The runtime queues the configured action and the app runs
+        // it through the shared chrome dispatcher; no paste is implicit.
+        cfg.mouse_right = effective.mouse.right.clone();
+        cfg.mouse_middle = effective.mouse.middle.clone();
         // CTX-0370: the close-confirmation mode rides the validated runtime
         // config (same post-construction pattern as hover-focus).
         cfg.close_confirm = close_confirm;

@@ -44,6 +44,21 @@ fn make_auto_copy_runtime() -> Runtime {
     rt
 }
 
+/// Copy-on-select runtime with an explicit `mouse.right` binding.
+///
+/// Issue #2474: the shipped right button is inert, so tests that exercise a
+/// configured right-click must opt in exactly like a user config would.
+fn make_auto_copy_runtime_with_right(binding: bitty_config::MouseButtonBinding) -> Runtime {
+    let mut rt = Runtime::new(RuntimeConfig {
+        selection_auto_copy: true,
+        mouse_right: binding,
+        ..RuntimeConfig::default()
+    })
+    .expect("headless runtime must build");
+    rt.force_headless_clipboard();
+    rt
+}
+
 fn feed_text(rt: &mut Runtime, text: &str) {
     // Feed raw bytes through parser → terminal state so snapshot reflects text.
     rt.handle_pty_bytes(text.as_bytes());
@@ -397,22 +412,32 @@ fn multiline_mouse_drag_with_wide_chars_keeps_columns() {
 
 #[test]
 fn multiline_selection_pastes_through_repeat_confirm_gate() {
-    let mut rt = make_auto_copy_runtime();
+    let mut rt = make_auto_copy_runtime_with_right(bitty_config::MouseButtonBinding::Action(
+        bitty_config::ChromeAction::PasteFromClipboard,
+    ));
     feed_text(&mut rt, "line1\r\nline2\r\nline3");
     mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 2)]);
     assert_eq!(rt.clipboard().headless_contents(), "line1\nline2\nline3");
-    // Right-click paste of newline text waits on the confirmation gate:
-    // held pending with a visible summary, nothing delivered silently.
+    // Issue #2474: the button only queues the configured action; the app
+    // dispatches it. Here we play the dispatcher role explicitly.
     rt.drain_pending_input();
     rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(bitty_config::ChromeAction::PasteFromClipboard)
+    );
+    assert!(!rt.has_pending_paste(), "no paste before dispatch");
+    // Paste of newline text waits on the confirmation gate: held pending
+    // with a visible summary, nothing delivered silently.
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
     assert!(rt.has_pending_paste());
     assert!(rt.pending_input().is_empty());
     let summary = rt.pending_paste_summary().expect("summary");
     assert!(summary.contains("3 lines"), "summary: {summary}");
-    // Repeat-confirm (identical right-click, unchanged clipboard) delivers
-    // every line with newlines intact.
-    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
+    // Repeat-confirm (identical paste, unchanged clipboard) delivers every
+    // line with newlines intact.
+    assert!(!rt.paste_from_clipboard().unwrap().unwrap());
     assert!(!rt.has_pending_paste());
     assert_eq!(rt.pending_input(), b"line1\nline2\nline3");
 }
@@ -424,10 +449,17 @@ fn multiline_primary_pastes_through_repeat_confirm_gate() {
     mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
     // Auto-copy synced the primary selection (ghostty copy-on-select).
     assert_eq!(rt.primary_contents(), "alpha\nbeta");
-    // Middle-click reads the primary selection through the same gate.
+    // Middle-click queues the shipped primary-paste action; the dispatcher
+    // runs it through the same gate (issue #2474: no implicit runtime paste).
     rt.drain_pending_input();
     rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Middle, PressState::Pressed));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(bitty_config::ChromeAction::PasteFromPrimary)
+    );
+    assert!(!rt.has_pending_paste(), "no paste before dispatch");
+    assert_eq!(rt.paste_from_primary(), Some(true));
     assert!(rt.has_pending_paste(), "newline primary needs confirm");
     assert!(rt.pending_input().is_empty());
     assert!(rt.confirm_pending_paste(true));

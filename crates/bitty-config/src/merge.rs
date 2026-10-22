@@ -123,6 +123,10 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
         | "mouse.focus_follows_mouse_delay_ms"
+        // Issue #2474: the mouse button bindings scalar-replace like the
+        // hover leaves; a declared `none` replaces a lower action.
+        | "mouse.right"
+        | "mouse.middle"
         | "appearance.theme"
         | "appearance.colors"
         // CTX-1159 S0 (DEC-0111 section 1, DEC-0113): the closed
@@ -234,6 +238,63 @@ fn record_attribution(
         });
     }
     attribution.insert(field.to_string(), new_src.clone());
+}
+
+/// Merge one declared mouse leaf (`mouse.*`, issue #2474).
+///
+/// Every mouse leaf is scalar-replace: the higher layer's complete value
+/// replaces the lower value with the same policy/attribution semantics as
+/// [`record_attribution`]. Callers pass `None` when the layer omits the leaf;
+/// an omitted leaf says nothing and never records attribution, a conflict, or
+/// a policy pin, so a hover-only table cannot reset a lower layer's binding
+/// and a policy layer that pins one button does not pin the other.
+fn merge_mouse_leaf<T: Clone>(
+    field: &str,
+    value: Option<&T>,
+    target: &mut T,
+    src: &ConfigSource,
+    is_policy: bool,
+    acc: &mut MergeAccumulators<'_>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if is_policy {
+        acc.policy_fields.insert(field.to_string(), src.clone());
+        target.clone_from(value);
+        let prev = acc.attribution.get(field).cloned();
+        record_attribution(
+            acc.attribution,
+            acc.conflicts,
+            field,
+            prev,
+            src,
+            MergeClass::ScalarReplace,
+        );
+    } else if let Some(policy_src) = acc.policy_fields.get(field) {
+        acc.policy_violations.push(ConfigError::NonOverridable {
+            field: field.to_string(),
+            policy_source: policy_src.describe(),
+            attempted_source: src.describe(),
+        });
+        acc.conflicts.push(MergeConflict {
+            field: field.to_string(),
+            previous_source: policy_src.clone(),
+            new_source: src.clone(),
+            merge_class: MergeClass::ScalarReplace,
+        });
+    } else {
+        let prev = acc.attribution.get(field).cloned();
+        target.clone_from(value);
+        record_attribution(
+            acc.attribution,
+            acc.conflicts,
+            field,
+            prev,
+            src,
+            MergeClass::ScalarReplace,
+        );
+    }
 }
 
 /// Mutable merge accumulators shared with [`merge_animations_overrides`].
@@ -809,6 +870,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "scrollbar",
     "mouse.focus_follows_mouse",
     "mouse.focus_follows_mouse_delay_ms",
+    "mouse.right",
+    "mouse.middle",
     "mouse",
     "appearance.theme",
     "appearance.colors",
@@ -2091,85 +2154,57 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("scrollbar".to_string(), src.clone());
         }
 
-        // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
-        // delay are scalar-replace like `selection.auto_copy`; absent table
-        // means "says nothing".
+        // CTX-0260/CTX-0334/issue #2474: every mouse leaf is scalar-replace
+        // and presence-gated — an omitted leaf says nothing, so only a
+        // declared value merges, pins, or records attribution. Defaults
+        // (`focus_follows_mouse = true`, delay 0, right none, middle
+        // paste_from_primary) are already in `EffectiveConfig::default()`.
         if let Some(mouse) = &plan.mouse {
-            let field = "mouse.focus_follows_mouse";
-            if is_policy {
-                policy_fields.insert(field.to_string(), src.clone());
-                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
-                let prev = attribution.get(field).cloned();
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            } else if let Some(policy_src) = policy_fields.get(field) {
-                policy_violations.push(ConfigError::NonOverridable {
-                    field: field.to_string(),
-                    policy_source: policy_src.describe(),
-                    attempted_source: src.describe(),
-                });
-                conflicts.push(MergeConflict {
-                    field: field.to_string(),
-                    previous_source: policy_src.clone(),
-                    new_source: src.clone(),
-                    merge_class: MergeClass::ScalarReplace,
-                });
-            } else {
-                let prev = attribution.get(field).cloned();
-                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
+            let declared = mouse.focus_follows_mouse.is_some()
+                || mouse.focus_follows_mouse_delay_ms.is_some()
+                || mouse.right.is_some()
+                || mouse.middle.is_some();
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_mouse_leaf(
+                "mouse.focus_follows_mouse",
+                mouse.focus_follows_mouse.as_ref(),
+                &mut effective.mouse.focus_follows_mouse,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.focus_follows_mouse_delay_ms",
+                mouse.focus_follows_mouse_delay_ms.as_ref(),
+                &mut effective.mouse.focus_follows_mouse_delay_ms,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.right",
+                mouse.right.as_ref(),
+                &mut effective.mouse.right,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.middle",
+                mouse.middle.as_ref(),
+                &mut effective.mouse.middle,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            if declared {
+                attribution.insert("mouse".to_string(), src.clone());
             }
-            let field = "mouse.focus_follows_mouse_delay_ms";
-            if is_policy {
-                policy_fields.insert(field.to_string(), src.clone());
-                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
-                let prev = attribution.get(field).cloned();
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            } else if let Some(policy_src) = policy_fields.get(field) {
-                policy_violations.push(ConfigError::NonOverridable {
-                    field: field.to_string(),
-                    policy_source: policy_src.describe(),
-                    attempted_source: src.describe(),
-                });
-                conflicts.push(MergeConflict {
-                    field: field.to_string(),
-                    previous_source: policy_src.clone(),
-                    new_source: src.clone(),
-                    merge_class: MergeClass::ScalarReplace,
-                });
-            } else {
-                let prev = attribution.get(field).cloned();
-                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            }
-            attribution.insert("mouse".to_string(), src.clone());
         }
 
         if let Some(app) = &plan.appearance {
@@ -3636,86 +3671,57 @@ fn merge_layers_allow_policy_violations(
             };
             merge_views(&mut effective, &mut acc, src, is_policy, views);
         }
-        // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
-        // delay are scalar-replace like `selection.auto_copy`; absent table
-        // means "says nothing".
-        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        // CTX-0260/CTX-0334/issue #2474: every mouse leaf is scalar-replace
+        // and presence-gated — an omitted leaf says nothing, so only a
+        // declared value merges, pins, or records attribution. Defaults
+        // (`focus_follows_mouse = true`, delay 0, right none, middle
+        // paste_from_primary) are already in `EffectiveConfig::default()`.
         if let Some(mouse) = &plan.mouse {
-            let field = "mouse.focus_follows_mouse";
-            if is_policy {
-                policy_fields.insert(field.to_string(), src.clone());
-                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
-                let prev = attribution.get(field).cloned();
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            } else if let Some(policy_src) = policy_fields.get(field) {
-                policy_violations.push(ConfigError::NonOverridable {
-                    field: field.to_string(),
-                    policy_source: policy_src.describe(),
-                    attempted_source: src.describe(),
-                });
-                conflicts.push(MergeConflict {
-                    field: field.to_string(),
-                    previous_source: policy_src.clone(),
-                    new_source: src.clone(),
-                    merge_class: MergeClass::ScalarReplace,
-                });
-            } else {
-                let prev = attribution.get(field).cloned();
-                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
+            let declared = mouse.focus_follows_mouse.is_some()
+                || mouse.focus_follows_mouse_delay_ms.is_some()
+                || mouse.right.is_some()
+                || mouse.middle.is_some();
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_mouse_leaf(
+                "mouse.focus_follows_mouse",
+                mouse.focus_follows_mouse.as_ref(),
+                &mut effective.mouse.focus_follows_mouse,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.focus_follows_mouse_delay_ms",
+                mouse.focus_follows_mouse_delay_ms.as_ref(),
+                &mut effective.mouse.focus_follows_mouse_delay_ms,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.right",
+                mouse.right.as_ref(),
+                &mut effective.mouse.right,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            merge_mouse_leaf(
+                "mouse.middle",
+                mouse.middle.as_ref(),
+                &mut effective.mouse.middle,
+                src,
+                is_policy,
+                &mut acc,
+            );
+            if declared {
+                attribution.insert("mouse".to_string(), src.clone());
             }
-            let field = "mouse.focus_follows_mouse_delay_ms";
-            if is_policy {
-                policy_fields.insert(field.to_string(), src.clone());
-                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
-                let prev = attribution.get(field).cloned();
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            } else if let Some(policy_src) = policy_fields.get(field) {
-                policy_violations.push(ConfigError::NonOverridable {
-                    field: field.to_string(),
-                    policy_source: policy_src.describe(),
-                    attempted_source: src.describe(),
-                });
-                conflicts.push(MergeConflict {
-                    field: field.to_string(),
-                    previous_source: policy_src.clone(),
-                    new_source: src.clone(),
-                    merge_class: MergeClass::ScalarReplace,
-                });
-            } else {
-                let prev = attribution.get(field).cloned();
-                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
-                record_attribution(
-                    &mut attribution,
-                    &mut conflicts,
-                    field,
-                    prev,
-                    src,
-                    MergeClass::ScalarReplace,
-                );
-            }
-            attribution.insert("mouse".to_string(), src.clone());
         }
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
@@ -4677,13 +4683,13 @@ mod tests {
     fn mouse_focus_follows_mouse_merges_scalar_replace_with_attribution() {
         // CTX-0260: user opt-out wins with per-field attribution; absent
         // table keeps the core-defaults value (default-on).
-        use crate::types::MouseConfig;
+        use crate::plan::MouseConfigPlan;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
-                mouse: Some(MouseConfig {
-                    focus_follows_mouse: false,
-                    ..MouseConfig::default()
+                mouse: Some(MouseConfigPlan {
+                    focus_follows_mouse: Some(false),
+                    ..MouseConfigPlan::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4709,9 +4715,9 @@ mod tests {
         let cli = LayeredPlan::new(
             ConfigSource::new(LayerKind::Cli, None::<String>),
             ConfigPlan {
-                mouse: Some(MouseConfig {
-                    focus_follows_mouse: false,
-                    ..MouseConfig::default()
+                mouse: Some(MouseConfigPlan {
+                    focus_follows_mouse: Some(false),
+                    ..MouseConfigPlan::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4720,9 +4726,9 @@ mod tests {
         let user2 = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
-                mouse: Some(MouseConfig {
-                    focus_follows_mouse: true,
-                    ..MouseConfig::default()
+                mouse: Some(MouseConfigPlan {
+                    focus_follows_mouse: Some(true),
+                    ..MouseConfigPlan::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4742,13 +4748,14 @@ mod tests {
     fn mouse_focus_follows_mouse_delay_merges_scalar_replace_with_attribution() {
         // CTX-0334: the dwell delay rides the same scalar-replace path as
         // the enable bool, with its own attribution and core default.
-        use crate::types::MouseConfig;
+        use crate::plan::MouseConfigPlan;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
-                mouse: Some(MouseConfig {
-                    focus_follows_mouse: true,
-                    focus_follows_mouse_delay_ms: 250,
+                mouse: Some(MouseConfigPlan {
+                    focus_follows_mouse: Some(true),
+                    focus_follows_mouse_delay_ms: Some(250),
+                    ..MouseConfigPlan::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -4772,6 +4779,187 @@ mod tests {
                 .layer,
             LayerKind::CoreDefaults
         );
+    }
+
+    #[test]
+    fn mouse_button_bindings_merge_scalar_replace_with_attribution() {
+        use crate::keymap::{ChromeAction, MouseButtonBinding};
+        use crate::plan::MouseConfigPlan;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfigPlan {
+                    right: Some(MouseButtonBinding::Action(ChromeAction::CopyToClipboard)),
+                    middle: Some(MouseButtonBinding::None),
+                    ..MouseConfigPlan::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(
+            merged.effective.mouse.right,
+            MouseButtonBinding::Action(ChromeAction::CopyToClipboard)
+        );
+        assert_eq!(merged.effective.mouse.middle, MouseButtonBinding::None);
+        assert_eq!(
+            merged.source_of("mouse.right").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("mouse.middle").unwrap().layer,
+            LayerKind::User
+        );
+        // Defaults preserve the shipped matrix with core attribution.
+        let defaults = merge_layers(vec![]).expect("defaults merge");
+        assert_eq!(defaults.effective.mouse.right, MouseButtonBinding::None);
+        assert_eq!(
+            defaults.effective.mouse.middle,
+            MouseButtonBinding::Action(ChromeAction::PasteFromPrimary)
+        );
+        assert_eq!(
+            defaults.source_of("mouse.right").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+        assert_eq!(
+            defaults.source_of("mouse.middle").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn omitted_mouse_buttons_never_reset_lower_layers() {
+        // Issue #2474 review: a profile that disables middle-click must
+        // survive a higher user layer that only sets hover focus; the
+        // untouched right button keeps its core-default attribution.
+        use crate::keymap::MouseButtonBinding;
+        use crate::plan::MouseConfigPlan;
+        let profile = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Profile, Some("coding.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfigPlan {
+                    middle: Some(MouseButtonBinding::None),
+                    ..MouseConfigPlan::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("init.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfigPlan {
+                    focus_follows_mouse: Some(false),
+                    ..MouseConfigPlan::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, profile]).expect("merge");
+        assert_eq!(merged.effective.mouse.middle, MouseButtonBinding::None);
+        assert_eq!(
+            merged.source_of("mouse.middle").unwrap().layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged.source_of("mouse.right").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+        assert!(!merged.effective.mouse.focus_follows_mouse);
+        assert_eq!(
+            merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn trusted_local_empty_or_focus_only_mouse_table_leaves_buttons_alone() {
+        // Issue #2474 review: trusted-local `mouse = {}` and a focus-only
+        // table declare no button, so they neither reset nor claim the user
+        // layer's binding.
+        use crate::keymap::MouseButtonBinding;
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let project_src = ConfigSource::new(LayerKind::TrustedLocal, Some("project.lua"));
+        for table in [
+            r#"return { mouse = {} }"#,
+            r#"return { mouse = { focus_follows_mouse = true } }"#,
+        ] {
+            let user = LayeredPlan::new(
+                user_src.clone(),
+                crate::file::parse_lua_config(
+                    r#"return { mouse = { middle = "none" } }"#,
+                    &user_src,
+                )
+                .expect("user plan"),
+            );
+            let project = LayeredPlan::new(
+                project_src.clone(),
+                crate::file::parse_lua_config(table, &project_src).expect("project plan"),
+            );
+            let merged = merge_layers(vec![user, project]).expect("merge");
+            assert_eq!(
+                merged.effective.mouse.middle,
+                MouseButtonBinding::None,
+                "{table}"
+            );
+            assert_eq!(
+                merged.source_of("mouse.middle").unwrap().layer,
+                LayerKind::User,
+                "{table}"
+            );
+            assert_eq!(
+                merged.source_of("mouse.right").unwrap().layer,
+                LayerKind::CoreDefaults,
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_pins_only_the_declared_mouse_button() {
+        // Issue #2474 review: pinning `mouse.right` must not pin
+        // `mouse.middle`; the user's middle declaration still applies and
+        // only the pinned button is refused.
+        use crate::keymap::{ChromeAction, MouseButtonBinding};
+        use crate::plan::MouseConfigPlan;
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfigPlan {
+                    right: Some(MouseButtonBinding::Action(ChromeAction::CopyToClipboard)),
+                    ..MouseConfigPlan::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("init.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfigPlan {
+                    right: Some(MouseButtonBinding::Action(ChromeAction::PasteFromClipboard)),
+                    middle: Some(MouseButtonBinding::None),
+                    ..MouseConfigPlan::default()
+                }),
+                ..Default::default()
+            },
+        );
+        // The strict merge fails on a policy violation, so the review
+        // check inspects the tolerant path that reports them.
+        let merged = merge_layers_allow_policy_violations(vec![policy, user]).expect("merge");
+        assert_eq!(
+            merged.effective.mouse.right,
+            MouseButtonBinding::Action(ChromeAction::CopyToClipboard)
+        );
+        assert_eq!(merged.effective.mouse.middle, MouseButtonBinding::None);
+        let pinned: Vec<&str> = merged
+            .policy_violations
+            .iter()
+            .map(|err| match err {
+                ConfigError::NonOverridable { field, .. } => field.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(pinned, vec!["mouse.right"]);
     }
 
     #[test]
@@ -5134,6 +5322,16 @@ mod tests {
         );
         assert_eq!(
             merge_class_for("mouse.focus_follows_mouse_delay_ms"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // Issue #2474: the mouse button bindings join the same scalar-replace
+        // class; a declared `none` replaces a lower action.
+        assert_eq!(
+            merge_class_for("mouse.right"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("mouse.middle"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("mouse"), Some(MergeClass::DeepMerge));

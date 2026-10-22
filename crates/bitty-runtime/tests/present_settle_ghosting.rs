@@ -299,3 +299,50 @@ fn cadence_and_settle_compose_to_the_later_deadline() {
     );
     assert_eq!(rt.present_coalescing_deadline(), None);
 }
+
+#[test]
+fn an_idle_query_burst_does_not_poison_the_next_repaint() {
+    // Review of bitty#2486: PTY output can be consumed without producing
+    // damage (a kitty status query only queues a reply). The idle tick must
+    // close that burst; otherwise its timestamps keep the settle cap in the
+    // past and the next real repaint presents on its first read, exactly the
+    // half-applied frame the gate exists to prevent.
+    let t0 = Instant::now();
+    let mut rt = runtime();
+    rt.set_present_settle(SETTLE);
+    rt.handle_pty_bytes(&full_frame(0));
+    rt.note_present_input_at(t0);
+    assert!(rt.tick_at(t0 + SETTLE).is_some(), "settle the first frame");
+
+    let generation = rt.state().generation();
+    // `a=q` is answered from the store and never mutates the grid or the
+    // generation (no storage, no placement, no damage).
+    rt.handle_pty_bytes(b"\x1b_Gi=31,a=q\x1b\\");
+    assert_eq!(
+        rt.state().generation(),
+        generation,
+        "a status query must not advance the grid generation"
+    );
+    rt.note_present_input_at(t0 + Duration::from_millis(10));
+    assert!(
+        rt.tick_at(t0 + Duration::from_millis(11)).is_none(),
+        "the query-only burst is an idle tick"
+    );
+
+    // Long after the previous burst's 8 ms cap, a new split repaint must
+    // still wait out its own settle window before presenting.
+    let next = t0 + Duration::from_millis(50);
+    let chunks = selector_chunks(2);
+    rt.handle_pty_bytes(&chunks[0]);
+    rt.note_present_input_at(next);
+    assert!(
+        rt.tick_at(next + Duration::from_micros(500)).is_none(),
+        "a fresh burst must defer even though the previous idle burst aged out"
+    );
+    rt.handle_pty_bytes(&chunks[1]);
+    rt.handle_pty_bytes(&chunks[2]);
+    assert!(
+        rt.tick_at(next + SETTLE).is_some(),
+        "the quiet deadline presents the complete repaint"
+    );
+}

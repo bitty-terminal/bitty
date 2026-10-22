@@ -2355,6 +2355,15 @@ impl Runtime {
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).
         if !pending_full && !origins_changed && last != u64::MAX {
+            // bitty#2486 (review): an idle tick still consumed the PTY burst
+            // that produced no damage (a terminal query answered with a reply
+            // only). Nothing is being held, so close the settle window here;
+            // keeping its timestamps would leave the next burst's
+            // `PRESENT_SETTLE_MAX` cap in the past and let that repaint present
+            // on its first read — exactly the half-applied frame this gate
+            // exists to prevent.
+            self.settle_input_at = None;
+            self.settle_burst_at = None;
             return None;
         }
 

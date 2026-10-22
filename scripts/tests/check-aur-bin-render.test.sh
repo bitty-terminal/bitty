@@ -77,7 +77,8 @@ else
   fail "rendered source_x86_64 binary entry drifted from: $EXPECTED_SOURCE_LINE"
 fi
 
-RESOLVED_URL="https://cdn.bitty.run/releases/v${VERSION}/${ASSET}"
+ASSET_RESOLVED="${ASSET//\$\{pkgver\}/${VERSION}}"
+RESOLVED_URL="https://cdn.bitty.run/releases/v${VERSION}/${ASSET_RESOLVED}"
 
 # --- #2417 regression: the pre-fix literal needle cannot match --------------
 # This block is the assertion `release.yml` used before the fix, byte for
@@ -111,7 +112,7 @@ if command -v makepkg >/dev/null 2>&1 && [[ "$EUID" -ne 0 ]]; then
       fail ".SRCINFO does not declare pkgname = bitty-bin"
     srcinfo_has "pkgver = $VERSION" ||
       fail ".SRCINFO pkgver is not $VERSION"
-    srcinfo_has "source_x86_64 = bitty-${VERSION}-x86_64-unknown-linux-gnu::${RESOLVED_URL}" ||
+    srcinfo_has "source_x86_64 = bitty-${VERSION}-x86_64-unknown-linux-gnu.tar.zst::${RESOLVED_URL}" ||
       fail ".SRCINFO binary source is not the resolved R2/CDN URL"
     srcinfo_has "sha256sums_x86_64 = $SHA" ||
       fail ".SRCINFO does not carry the verified binary digest"

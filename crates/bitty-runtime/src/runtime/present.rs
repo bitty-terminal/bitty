@@ -4142,12 +4142,23 @@ impl Runtime {
         }
         let full_w = px_span(frame.cols, live.width);
         // Issue #2411: a hover-anchored tooltip places the row stack just
-        // below a top band / just above a bottom band, starting at the
-        // hovered region's column. The anchor names a live band item, so the
-        // row is resolved now, never baked in at set time. A missing band or
-        // violated geometry falls back to the centered modal placement
-        // instead of painting against stale coordinates.
+        // below a top band / just above a bottom band, horizontally centered
+        // on the hovered region and clamped to the window (issue #2530). The
+        // anchor names a live band item, so the row is resolved now, never
+        // baked in at set time. A missing band or violated geometry falls
+        // back to the centered modal placement instead of painting against
+        // stale coordinates.
         let window = self.window_cells();
+        // Widest row of the stack decides the centering rectangle; anchored
+        // empty rows paint nothing and do not contribute width.
+        let stack_cells = rows
+            .iter()
+            .filter(|row| !row.text.is_empty())
+            .map(|row| {
+                u16::try_from(clip_to_width_cells(&row.text, window.width).1).unwrap_or(u16::MAX)
+            })
+            .max()
+            .unwrap_or(0);
         let anchored = self.plugin_overlay_anchor.and_then(|anchor| {
             if window.width == 0 || window.height == 0 || self.band_geometry_violated() {
                 return None;
@@ -4162,9 +4173,7 @@ impl Runtime {
                 BandEdge::Bottom => (band_row.saturating_sub(count), Some(band_row)),
                 BandEdge::Left | BandEdge::Right => return None,
             };
-            let x = u16::try_from(anchor.start_col)
-                .unwrap_or(u16::MAX)
-                .min(window.width.saturating_sub(1));
+            let x = centered_tooltip_x(anchor.start_col, anchor.end_col, stack_cells, window.width);
             Some(AnchoredOverlayStack {
                 start_row,
                 x,
@@ -5484,7 +5493,7 @@ struct AnchoredOverlayStack {
 /// One overlay row placed against a live band item (issue #2411).
 ///
 /// Window-cell coordinates, not frame-relative: an anchored tooltip belongs to
-/// the band's window row and to the hovered region's column.
+/// the band's window row and is centered on the hovered region (issue #2530).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnchoredOverlayRow {
     /// Window column the row starts at.
@@ -5709,7 +5718,7 @@ mod present_origin_tests {
 
 #[cfg(test)]
 mod plugin_overlay_paint_tests {
-    use super::FrameLayers;
+    use super::{FrameLayers, centered_tooltip_x};
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
     use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
@@ -5802,9 +5811,10 @@ mod plugin_overlay_paint_tests {
 
     #[test]
     fn hover_anchored_surface_paints_below_the_top_band_region() {
-        // Issue #2411: a tooltip overlay anchored to a live top-band region
-        // paints one row below the band, starting at the region's column, in
-        // window cells (never centered on the focused frame).
+        // Issue #2411 / #2530: a tooltip overlay anchored to a live top-band
+        // region paints one row below the band, horizontally centered on the
+        // region, in window cells (never at the region's left edge, never
+        // centered on the focused frame).
         let mut rt = runtime();
         let window = rt.window_cells();
         rt.set_chrome_bands(ChromeBands {
@@ -5826,10 +5836,11 @@ mod plugin_overlay_paint_tests {
         rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
         let (cell_w, cell_h) = rt.live_cell_size();
         let fill = layers.combined_overlay.first().expect("tooltip fill");
+        // Region center is column 15; a six-cell stack starts at 15 - 3 = 12.
         let expected_x =
-            8 + i32::try_from(u32::from(window.x) + 10).unwrap() * i32::try_from(cell_w).unwrap();
+            8 + i32::try_from(u32::from(window.x) + 12).unwrap() * i32::try_from(cell_w).unwrap();
         let expected_y = 8 + i32::try_from(cell_h).unwrap();
-        assert_eq!(fill.rect.x, expected_x, "anchored at the region column");
+        assert_eq!(fill.rect.x, expected_x, "centered on the region center");
         assert_eq!(fill.rect.y, expected_y, "one row below the top band");
         assert_eq!(fill.rect.width, cell_w * 6, "six text cells wide");
 
@@ -5843,9 +5854,82 @@ mod plugin_overlay_paint_tests {
     }
 
     #[test]
+    fn centered_tooltip_clamps_inside_the_window() {
+        // Issue #2530: centering must never push the tooltip past either
+        // window edge; an over-wide stack starts at column 0 and clips.
+        assert_eq!(centered_tooltip_x(10, 20, 6, 80), 12, "plain centering");
+        assert_eq!(
+            centered_tooltip_x(0, 2, 10, 80),
+            0,
+            "left edge saturates at the window start"
+        );
+        assert_eq!(
+            centered_tooltip_x(70, 80, 20, 80),
+            60,
+            "right edge clamps so the stack fits"
+        );
+        assert_eq!(
+            centered_tooltip_x(20, 30, 8, 80),
+            21,
+            "the widest row centers the stack"
+        );
+        assert_eq!(
+            centered_tooltip_x(20, 30, 100, 80),
+            0,
+            "an over-wide stack starts at column 0"
+        );
+        assert_eq!(
+            centered_tooltip_x(79, 80, 0, 80),
+            79,
+            "a zero-width stack keeps the region start"
+        );
+    }
+
+    #[test]
+    fn right_edge_tooltip_paints_fully_inside_the_window() {
+        // Issue #2530: a right-group module's tooltip is centered on the
+        // module and clamped, so it paints the whole text instead of only the
+        // few columns between the module and the window edge.
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        let text = "a long tooltip line";
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![surface_with_rows(&["bar"])],
+            ..Default::default()
+        });
+        rt.tick().expect("tick presents the band");
+        rt.set_plugin_overlay(Some(surface_with_text(text)));
+        let width = window.width;
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Top,
+            visible_index: 0,
+            start_col: usize::from(width.saturating_sub(10)),
+            end_col: usize::from(width),
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        let (cell_w, _) = rt.live_cell_size();
+        let fill = layers.combined_overlay.first().expect("tooltip fill");
+        let text_cells = u32::try_from(text.chars().count()).expect("text cells");
+        assert_eq!(
+            fill.rect.width,
+            cell_w * text_cells,
+            "the whole tooltip text paints"
+        );
+        let cell_w = i32::try_from(cell_w).expect("cell width");
+        let window_start = 8 + i32::from(window.x) * cell_w;
+        let window_end = window_start + i32::from(window.width) * cell_w;
+        assert!(fill.rect.x >= window_start, "starts inside the window");
+        assert!(
+            fill.rect.x + i32::try_from(fill.rect.width).expect("width") <= window_end,
+            "ends inside the window"
+        );
+    }
+
+    #[test]
     fn bottom_band_anchor_paints_above_the_region() {
-        // Review N4: the bottom-edge branch stacks the tooltip rows above the
-        // band (last row at band_row - 1) and clips at the window edge.
+        // Review N4 / #2530: the bottom-edge branch centers the tooltip on the
+        // region and stacks its rows above the band (last row at band_row - 1).
         let mut rt = runtime();
         let window = rt.window_cells();
         rt.set_chrome_bands(ChromeBands {
@@ -5870,9 +5954,10 @@ mod plugin_overlay_paint_tests {
         for (index, fill) in layers.combined_overlay.iter().enumerate() {
             let expected_row = band_row - 2 + u16::try_from(index).unwrap();
             let expected_y = 8 + i32::from(expected_row) * i32::try_from(cell_h).unwrap();
+            // Region center 7 and the six-cell widest row start at 4.
             let expected_x = 8 + i32::try_from(u32::from(window.x) + 4).unwrap()
                 * i32::try_from(cell_w).unwrap();
-            assert_eq!(fill.rect.x, expected_x, "anchored at the region column");
+            assert_eq!(fill.rect.x, expected_x, "centered on the region center");
             assert_eq!(fill.rect.y, expected_y, "stacked above the bottom band");
         }
     }
@@ -7126,6 +7211,30 @@ mod selection_window_clip_tests {
 /// Returns the clipped string plus its display width (minimum 1, matching the
 /// pill-width floor). A wide glyph straddling the limit is dropped whole so a
 /// pill never claims a half cell.
+/// Horizontal start column for a hover-anchored tooltip (issue #2530).
+///
+/// Centers the tooltip row stack on the hovered region's midpoint and clamps
+/// it so the whole stack stays inside the window whenever it fits. A stack
+/// wider than the window starts at column 0 and clips like any other
+/// over-wide overlay row; a zero-width stack keeps the region's own start
+/// column (the caller then paints nothing for empty anchored rows).
+fn centered_tooltip_x(start_col: usize, end_col: usize, stack_cells: u16, width: u16) -> u16 {
+    let width = usize::from(width);
+    if width == 0 {
+        return 0;
+    }
+    let stack = usize::from(stack_cells);
+    if stack == 0 {
+        return u16::try_from(start_col.min(width - 1)).unwrap_or(0);
+    }
+    if stack >= width {
+        return 0;
+    }
+    let center = start_col.saturating_add(end_col) / 2;
+    let left = center.saturating_sub(stack / 2);
+    u16::try_from(left.min(width - stack)).unwrap_or(u16::MAX)
+}
+
 fn clip_to_width_cells(text: &str, cols: u16) -> (String, usize) {
     let mut width = 0usize;
     let mut clipped = String::new();

@@ -1216,6 +1216,19 @@ fn extension_help_and_list_use_extension_terminology() {
     // The internal descriptor file name is a contract, not user prose.
     assert!(help.contains("bitty-component.toml"), "{help}");
 
+    // Issue #2440 review: the full `-v --help` text also carries the init
+    // flags; it must not advertise "component installs".
+    let verbose = run_in(&home, &system, &["-v", "--help"]);
+    let verbose_help = stdout(&verbose);
+    assert!(
+        !verbose_help.contains("component installs"),
+        "verbose help still says component installs:\n{verbose_help}"
+    );
+    assert!(
+        verbose_help.contains("extension install hints"),
+        "verbose help must name extension install hints:\n{verbose_help}"
+    );
+
     let list = stdout(&run_in(&home, &system, &["extension", "list"]));
     assert!(list.contains("(no extensions)"), "{list}");
     assert!(!list.contains("component"), "{list}");

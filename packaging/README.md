@@ -405,15 +405,15 @@ invocations in the release workflow; the key itself is the part after the
 bucket name. Every object address keeps the `bitty/` bucket prefix so the one
 shipped and verified bucket never moves:
 
-| Prefix                                                             | Class                                 | State                                                                                           |
-| ------------------------------------------------------------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job                                                     |
-| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                             |
-| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                        |
-| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                        |
-| `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); published by the extension release CD jobs  |
-| `bitty/extensions/catalog.v1`                                      | Mutable registry metadata             | Reserved; read by `bitty extension install` (#2111); not yet published by the extension CD jobs |
-| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                        |
+| Prefix                                                             | Class                                 | State                                                                                                             |
+| ------------------------------------------------------------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job                                                                       |
+| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                                               |
+| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                          |
+| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                          |
+| `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); published by the extension release CD jobs                    |
+| `bitty/extensions/catalog.v1`                                      | Mutable registry metadata             | Published (schema 1, 2026-10-22); generated and read-back-verified by `scripts/make-extension-catalog.sh` (#2440) |
+| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                                          |
 
 See `bitty-terminal-docs/architecture/directory-semantics.md` for extension directory semantics.
 
@@ -653,16 +653,23 @@ hash verification. `bitty-graphics` publishes `graphics` and `bitty-network`
 publishes `net`; this repository does not upload extension payloads.
 Versioned extension prefixes are immutable once published, like `releases/`.
 
-### Extension catalog (v1, #2111)
+### Extension catalog (v1, #2111, #2440)
 
-The extension registry backend read side is a single bounded metadata object on
-the same bucket and CDN host as the payloads. The object is **not yet
-published** (CD publication remains a follow-up); this section records the key
-and grammar the client consumes once an extension CD job uploads it:
+The extension registry backend is a single bounded metadata object on the same
+bucket and CDN host as the payloads. It is published:
 
 ```text
 R2 key:   bitty/extensions/catalog.v1
 CDN URL:  https://cdn.bitty.run/extensions/catalog.v1
+```
+
+Live object (verified by read-back on 2026-10-22; schema 1):
+
+```text
+# bitty extension catalog v1
+schema 1
+extension graphics 0.0.24 x86_64-unknown-linux-gnu 7e331044e6bbede32909fb04729f563e4645d5c1f1ba8c32d00aeb79a8631a02
+extension net 0.0.1 x86_64-unknown-linux-gnu 1764de2db9eb1a00dd80535dfcf744b28d4d74dae2af12c4a31e01c4156b1615
 ```
 
 It stays on `cdn.bitty.run` rather than the plugin store host because the
@@ -678,9 +685,10 @@ download consent and, when `--version` is omitted, selects the highest strict
 still pins exactly one `(name, version, host target)` key. The catalog is a
 digest index plus a latest selector, not a version solver: prereleases are not
 published by the pack policy, so they never participate. A latest install
-prints the resolved version before the release download; a pinned install
-keeps the offline fallback described below, while a latest install cannot fall
-back (there is no version) and fails closed with a `--version` hint.
+prints the resolved version before the release download. A pinned install
+keeps the offline paths described below (release `SHA256SUMS` fallback and
+verified local reuse); a latest install cannot fall back (there is no version)
+and fails closed with a `--version` hint.
 
 #### Grammar
 
@@ -693,7 +701,7 @@ schema 1
 extension <name> <version> <target> <sha256>
 ```
 
-- `<name>` uses the component grammar `[a-z][a-z0-9-]{0,31}`.
+- `<name>` uses the extension-name grammar `[a-z][a-z0-9-]{0,31}`.
 - `<version>` uses the strict `X.Y.Z` pack policy (no prerelease or build
   metadata).
 - `<target>` uses the lowercase Rust target-triple grammar.
@@ -705,27 +713,21 @@ extension <name> <version> <target> <sha256>
 
 Client bounds: 256 KiB object, 4096 lines, 1024 bytes per line, 1024 entries.
 The installer parses the object only after a successful fetch within those
-bounds. Example records derived from the current published release
-`SHA256SUMS` entries (live CDN, 2026-10-20); `catalog.v1` itself is not yet
-published:
-
-```text
-schema 1
-extension graphics 0.0.24 x86_64-unknown-linux-gnu 7e331044e6bbede32909fb04729f563e4645d5c1f1ba8c32d00aeb79a8631a02
-extension net 0.0.1 x86_64-unknown-linux-gnu 1764de2db9eb1a00dd80535dfcf744b28d4d74dae2af12c4a31e01c4156b1615
-```
+bounds. The live object (2026-10-22) carries the two published artifacts; the
+records are derived from their `SHA256SUMS`, never hand-written.
 
 #### Read path and fail-closed matrix
 
-| Condition                                               | Installer behavior                                                                                                  |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Catalog fetched, entry present, digests agree           | Continue: catalog digest and `SHA256SUMS` both must equal the tarball; the exact-two-member audit still runs        |
-| Catalog fetched, entry absent                           | Fail closed (exit `4`) before the tarball fetch; absence is authoritative, never "fall back and guess"              |
-| Catalog fetched, malformed/oversize/duplicate           | Fail closed (exit `4`) before the tarball fetch                                                                     |
-| Catalog transport failure, pinned `--version`           | Explicit offline fallback: fetch the release `SHA256SUMS` and verify it as before; explicit consent already applied |
-| Catalog transport failure, bare latest                  | Fail closed (exit `4`) with a concrete `--version` example; a version is never guessed                              |
-| Catalog digest differs from `SHA256SUMS` or the tarball | Fail closed (exit `4`) before unpacking or staging                                                                  |
-| `--digest` supplied and differing                       | Fail closed (exit `4`); caller input is an extra constraint, never a replacement for canonical metadata             |
+| Condition                                                                             | Installer behavior                                                                                                            |
+| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Catalog fetched, entry present, digests agree                                         | Continue: catalog digest and `SHA256SUMS` both must equal the tarball; the exact-two-member audit still runs                  |
+| Catalog fetched, entry absent                                                         | Fail closed (exit `4`) before the tarball fetch; absence is authoritative, never "fall back and guess"                        |
+| Catalog fetched, malformed/oversize/duplicate                                         | Fail closed (exit `4`) before the tarball fetch                                                                               |
+| Catalog transport failure, pinned `--version`, version installed and locally verified | Reuse the installed version with no download (offline idempotence); a tampered local copy does not qualify                    |
+| Catalog transport failure, pinned `--version`, otherwise                              | Explicit offline fallback: fetch the release `SHA256SUMS` and verify it as before; explicit consent already applied           |
+| Catalog transport failure, bare latest                                                | Fail closed (exit `4`) with a concrete `--version` example (HTTP 404 is named as "not published"); a version is never guessed |
+| Catalog digest differs from `SHA256SUMS` or the tarball                               | Fail closed (exit `4`) before unpacking or staging                                                                            |
+| `--digest` supplied and differing                                                     | Fail closed (exit `4`); caller input is an extra constraint, never a replacement for canonical metadata                       |
 
 The offline fallback is deliberately narrow: it applies only to a pinned
 install whose catalog transport failed, keeps the original hash-verified
@@ -734,17 +736,58 @@ a silent install. A successful catalog response is authoritative and cannot be
 bypassed. Latest selection is a convenience, not a trust upgrade: the catalog
 stays mutable metadata, so reproducible automation should pin `--version`.
 
-#### Publisher contract (not yet implemented)
+#### Generation and publication (#2440)
 
-CD publication is a follow-up and `catalog.v1` is currently unpublished, so
-installs take the transport fallback. Once an extension CD job exists, it must
-upload payloads first, verify them by read-back, then update `catalog.v1` and
-read it back. The catalog is append-only for published versions: removing an
-entry is a yank and needs an explicit decision, not a silent rewrite. A
-catalog that lags its payloads fails closed (entry absent) rather than
-accepting an unpublished release; a catalog that leads its payloads fails
-closed on digest mismatch. Versioned payload prefixes stay immutable; only
-`catalog.v1` is mutable metadata.
+`scripts/make-extension-catalog.sh` is the only writer of `catalog.v1`. It
+cannot drift from `SHA256SUMS` by construction:
+
+1. Discovery lists `extensions/` through the Cloudflare R2 API (the CDN has no
+   directory listing) and keeps every `<name>/<version>/SHA256SUMS`.
+2. For each manifest it parses every `<target>.tar.gz` line, downloads the
+   artifact, and re-hashes it; a missing or mismatched artifact aborts before
+   any output is written.
+3. Records are emitted in canonical order (name, numeric version, target) with
+   the fixed header, so the same inputs always produce byte-identical output.
+
+```sh
+# Generate locally (stdout or --output); refuses an empty catalog.
+scripts/make-extension-catalog.sh --output /tmp/catalog.v1
+
+# Drift gate: exit 1 and print a diff when the live object differs.
+scripts/make-extension-catalog.sh --check
+
+# Upload, read the object back from R2, then verify the CDN URL (bounded
+# retries for the 5-minute mutable cache). Credentials come from the
+# environment; never commit them.
+scripts/make-extension-catalog.sh --publish
+```
+
+Requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `wrangler`
+(`R2_BUCKET` defaults to `bitty`). Publishing uses
+`public, max-age=300, must-revalidate` and `text/plain; charset=utf-8`.
+`--publish` is append-only for published versions: a live record that no
+longer appears in the generated catalog aborts unless `--allow-yank` is
+passed, because removing an entry is an explicit yank decision. A catalog
+that lags its payloads fails closed (entry absent) rather than accepting an
+unpublished release; a catalog that leads its payloads fails closed on digest
+mismatch. Versioned payload prefixes stay immutable; only `catalog.v1` is
+mutable metadata.
+
+The fixture test (`scripts/tests/make-extension-catalog.test.sh`, also
+`just extension-catalog-test`) pins canonical bytes, numeric ordering, the
+digest chain, and the fail-closed cases (missing/malformed/duplicate
+manifests, tampered artifacts, empty discovery). The Rust client parses the
+same checked-in golden fixture, so the publisher and the installer share one
+grammar and one document.
+
+#### Distribution track (not per Core release)
+
+Extensions are published on their own release track. A Core release tag (for
+example `v0.0.25`) does not imply a `0.0.25` extension payload: only versions
+listed in `catalog.v1` exist, and `latest` selects the highest strict version
+for the host target from that list. Never infer extension availability from
+the Core version; use `cd extensions/<name>/<version>/SHA256SUMS` or the
+catalog.
 
 #### Trust
 
@@ -752,6 +795,6 @@ Unsigned 0.1.0 verifies by hash only, so the catalog is canonical metadata,
 not a signature. HTTPS pins the host and path; the catalog digest and the
 release `SHA256SUMS` are compared, and the first successful install records
 a TOFU pin under `<user>/<name>/tarball.sha256`. A later catalog or payload
-substitution for an installed component fails closed as pin-mismatch until
+substitution for an installed extension fails closed as pin-mismatch until
 an explicit `--force` re-pin. Signatures (Sigstore/cosign or an Ed25519 key
 directory with a rotation story) remain a follow-up, not a silent addition.

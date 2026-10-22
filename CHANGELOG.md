@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cold path; payload paths are display strings only.
 - **Waybar-style band groups, hover, and button routing (#2411):** a band
   scene's root `Row` resolves per-group `anchor = "left" | "center" |
-  "right"` against the presented width, so `modules_left`/`modules_center`/
+"right"` against the presented width, so `modules_left`/`modules_center`/
   `modules_right` get true centering and a flush right edge at any width.
   Over-subscribed rows clip deterministically (left, then right, then center)
   without overlapping runs or losing hit targets. `on_hover` bindings
@@ -67,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three-group bar with memory + pulseaudio now mounts inside the RC-1
   activation budget.
 
+- **Extension install is honest about the catalog and its terminology
+  (#2440):** `extensions/catalog.v1` is published for the live artifacts
+  (`graphics 0.0.24`, `net 0.0.1`) and generated only from their
+  `SHA256SUMS` by `scripts/make-extension-catalog.sh`, which re-hashes every
+  artifact, supports a `--check` drift gate, and read-back-verifies
+  `--publish`. A bare install now resolves the newest host release instead
+  of hitting a raw 404; if the catalog is genuinely unavailable, a latest
+  install fails with a typed `--version` hint (no `curl` stderr), while a
+  pinned install falls back to `SHA256SUMS` or reuses an already-installed
+  verified version without any download. User-facing output, help, init
+  prompts, and runtime hints now say "extension"; "component" remains only
+  for the internal seam and the stable JSON envelope.
 - **`runtime.inspect` review follow-up (CTX-2396, #2416):** a granted
   generation whose read-only snapshot backend is not wired now checks
   backend presence before consuming the 16 calls/s budget, so repeated
@@ -95,7 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Shell integration for all five supported shells (#2386):** `bitty
-  shell-init <shell>` now emits the init script and nested Tab completion
+shell-init <shell>` now emits the init script and nested Tab completion
   inline for bash, zsh, fish, PowerShell, and Nushell, generated from the
   parser-owned grammar tables (`config`/`profile`, `ctl` resources,
   `plugin`/`config` actions, `extension`, `dev trace`/`dump`/`overlay`,
@@ -128,7 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UI composition surface, and candidate scene style primitives plus a
   bounded component catalog provide reusable, capped building blocks. These
   are candidate surfaces with no production consumer yet.
- ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
+  ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
 
 ### Changed
 

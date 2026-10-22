@@ -165,7 +165,7 @@ fn component_list_is_empty_and_local() {
     let output = run_in(&home, &system, &["component", "list"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains("(no components)"),
+        stdout(&output).contains("(no extensions)"),
         "{}",
         stdout(&output)
     );
@@ -708,7 +708,7 @@ fn extension_list_is_empty_and_local() {
     let output = run_in(&home, &system, &["extension", "list"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains("(no components)"),
+        stdout(&output).contains("(no extensions)"),
         "{}",
         stdout(&output)
     );
@@ -1178,5 +1178,56 @@ fn extension_list_prints_state_record_once_on_the_active_version() {
     };
     assert_ne!(column("0.0.1").as_deref(), Some("active"), "{text}");
     assert_eq!(column("0.0.2").as_deref(), Some("active"), "{text}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Terminology golden (issue #2440): the installable artifact is an
+/// "extension" in every user-facing surface. "component" survives only for
+/// the internal seam (descriptor file name, module paths) and the stable
+/// machine envelope, never in help or table prose.
+#[test]
+fn extension_help_and_list_use_extension_terminology() {
+    let home = scratch_dir("terminology");
+    let system = home.join("system-components");
+    std::fs::create_dir_all(&system).expect("system dir");
+
+    let output = run_in(&home, &system, &["extension", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let help = stdout(&output);
+    assert!(
+        help.contains("Show installed extensions across both tiers"),
+        "{help}"
+    );
+    for forbidden in [
+        "installed components",
+        "component name",
+        "component error",
+        "component execution",
+        "optional components",
+        "component code",
+        "user component root",
+        "per component",
+    ] {
+        assert!(
+            !help.contains(forbidden),
+            "help still mixes terminology with {forbidden:?}:\n{help}"
+        );
+    }
+    // The internal descriptor file name is a contract, not user prose.
+    assert!(help.contains("bitty-component.toml"), "{help}");
+
+    let list = stdout(&run_in(&home, &system, &["extension", "list"]));
+    assert!(list.contains("(no extensions)"), "{list}");
+    assert!(!list.contains("component"), "{list}");
+
+    // The JSON envelope keeps its documented stable key names so existing
+    // machine consumers do not break on a prose rename.
+    let json = stdout(&run_in(
+        &home,
+        &system,
+        &["extension", "list", "--format", "json"],
+    ));
+    assert!(json.contains("\"command\":\"component\""), "{json}");
+    assert!(json.contains("\"components\":["), "{json}");
     let _ = std::fs::remove_dir_all(&home);
 }

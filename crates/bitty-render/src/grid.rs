@@ -2744,7 +2744,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         // Face measurement is best-effort: backends without metrics (or a
         // failed measurement) resolve to the legacy fallback, never an error.
         let measured = cache
-            .rasterizer()
+            .rasterizer_mut()
             .font_metrics(font, query.point_size)
             .ok()
             .flatten();
@@ -2830,7 +2830,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let font = self.cache.load_font(&scaled_query)?;
         let measured = self
             .cache
-            .rasterizer()
+            .rasterizer_mut()
             .font_metrics(font, point_size)
             .ok()
             .flatten();

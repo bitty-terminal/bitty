@@ -238,9 +238,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// Pixel extent the combined frame's plan covers: window cells at the
-    /// live (DPI-scaled) cell metrics, plus the window padding inset on
-    /// every side (CTX-0223).
+    /// Pixel extent the combined frame's plan covers: the configured
+    /// surface extent, or the cell-aligned window grid plus the padding
+    /// inset when no surface is configured (CTX-0223, #2520).
     ///
     /// The GPU present path recovers its per-frame NDC factor as
     /// `surface / plan` ([`bitty_render::batch::derive_scale`]), so this
@@ -249,6 +249,17 @@ impl Runtime {
     /// factor to 4x and magnifies the whole frame, the dominant blur behind
     /// #232 alongside the unscaled surface/grid/atlas). Tick translates all
     /// content by the padding origin, so the plan spans the window extent.
+    ///
+    /// The draw list is authored in *physical* window pixels: cell metrics
+    /// and the raster point size already carry the live DPI scale (see
+    /// [`Self::apply_dpi_scale`]). At fractional scales the window is
+    /// almost never an exact multiple of the cell, so the cell-aligned grid
+    /// plan is a few pixels shorter than the surface. Reporting only the
+    /// content plan made the GPU path treat that leftover strip as a scale
+    /// factor (for example 1.01x on a 1496 px window with 32 px cells) and
+    /// bilinearly stretch every glyph — the blurred/damaged text in #2520.
+    /// The leftover strip is background, never content scale, so the plan
+    /// spans the configured surface extent whenever one exists.
     pub fn present_plan_extent(&self) -> bitty_render::geometry::ExtentPx {
         // CTX-0873: the plan spans the whole window grid, chrome band
         // included (the band paints inside the plan, outside the container).
@@ -257,13 +268,25 @@ impl Runtime {
             usize::from(self.window_cells.height),
         );
         let inset = u64::from(self.window_padding_physical()).saturating_mul(2);
-        let width = u64::from(grid.width)
+        let grid_width = u64::from(grid.width)
             .saturating_add(inset)
             .min(u64::from(u32::MAX)) as u32;
-        let height = u64::from(grid.height)
+        let grid_height = u64::from(grid.height)
             .saturating_add(inset)
             .min(u64::from(u32::MAX)) as u32;
-        bitty_render::geometry::ExtentPx::new(width, height)
+        let content = bitty_render::geometry::ExtentPx::new(grid_width, grid_height);
+        match self.surface.extent() {
+            Some(extent) if extent.width() > 0 && extent.height() > 0 => {
+                // `max` keeps the full plan visible if a transient resize
+                // left the surface smaller than the reflowed grid; a real
+                // surface is never smaller in steady state.
+                bitty_render::geometry::ExtentPx::new(
+                    content.width.max(extent.width()),
+                    content.height.max(extent.height()),
+                )
+            }
+            _ => content,
+        }
     }
 
     /// Adopts a DPI scale change (fail-safe, headless-testable, no I/O).
@@ -862,5 +885,63 @@ mod tests {
         let query = rt.base_font_query();
         assert_eq!(query.family, crate::config::font_default_family());
         assert!((query.point_size - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn present_plan_covers_the_surface_for_non_cell_aligned_windows() {
+        // #2520: the plan must be the draw list's physical pixel space. A
+        // cell-aligned grid stops short of a window that is not an exact
+        // multiple of the cell; deriving the present scale from that
+        // remainder bilinearly stretched every glyph.
+        use bitty_platform::PhysicalSize;
+
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.handle_resize(PhysicalSize::new(2505, 1496))
+            .expect("resize reflows");
+        let surface = rt.surface_extent().expect("surface configured");
+        let plan = rt.present_plan_extent();
+
+        assert_eq!(
+            (plan.width, plan.height),
+            (surface.width(), surface.height()),
+            "plan must span the configured surface, not only the cell-aligned grid"
+        );
+        assert_eq!(
+            bitty_render::batch::derive_scale(surface.width(), surface.height(), plan),
+            1.0,
+            "a leftover window strip must never become a content scale factor"
+        );
+    }
+
+    #[test]
+    fn present_plan_keeps_owner_size_11_at_scale_1_6_crisp() {
+        // #2520 reproduction numbers: 11pt at 1.6 DPI has a 14x32 physical
+        // cell. A 2506x1496 window leaves a 12 px horizontal and 30 px
+        // vertical strip past the cell-aligned plan; the old plan made the
+        // GPU stretch all text by ~1.01x (visible vertical smearing).
+        use bitty_platform::PhysicalSize;
+
+        let cfg = RuntimeConfig {
+            font_family: "DejaVu Sans Mono".to_string(),
+            font_size: 11.0,
+            cell_width: 14,
+            cell_height: 32,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = Runtime::new(cfg).expect("runtime builds");
+        rt.handle_resize(PhysicalSize::new(2506, 1496))
+            .expect("resize reflows");
+
+        let surface = rt.surface_extent().expect("surface configured");
+        let plan = rt.present_plan_extent();
+        assert_eq!(
+            (plan.width, plan.height),
+            (surface.width(), surface.height())
+        );
+        let scale = bitty_render::batch::derive_scale(surface.width(), surface.height(), plan);
+        assert!(
+            (scale - 1.0).abs() < f32::EPSILON,
+            "glyph sampling scale must be exactly 1.0, got {scale}"
+        );
     }
 }

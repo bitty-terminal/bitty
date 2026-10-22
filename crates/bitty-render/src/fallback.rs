@@ -446,7 +446,7 @@ impl<R: GlyphRasterizer> GlyphRasterizer for FallbackRasterizer<R> {
     }
 
     fn font_metrics(
-        &self,
+        &mut self,
         font: FontId,
         point_size: f32,
     ) -> Result<Option<crate::glyph::FontMetrics>, RenderError> {

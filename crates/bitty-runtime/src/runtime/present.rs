@@ -1299,6 +1299,12 @@ impl Runtime {
         // it. The atlas-reject path intentionally bypasses this function and
         // keeps a pending deferral armed.
         self.coalesced_pending = false;
+        self.coalesced_deadline = None;
+        // bitty#2486: a commit closes the PTY burst it was waiting on. The
+        // next consumed byte starts a fresh settle window (and a fresh
+        // `PRESENT_SETTLE_MAX` hold budget).
+        self.settle_input_at = None;
+        self.settle_burst_at = None;
     }
 
     /// Minimum interval between presented frames (CTX-1231, #2093).
@@ -1320,60 +1326,125 @@ impl Runtime {
         self.min_present_interval = interval;
     }
 
-    /// Frames dropped by the coalescing gate with damage retained
-    /// (CTX-1231). Monotonic, saturating; idle ticks never count.
+    /// PTY-quiescence settle window for presentation (bitty#2486).
+    ///
+    /// `ZERO` (default) presents on every dirty tick. A non-zero value holds
+    /// a dirty present until PTY output has been quiet for this long, so a
+    /// screen repaint split across several PTY reads is applied whole before
+    /// the frame snapshot is taken. See [`Self::set_present_settle`].
+    #[must_use]
+    pub fn present_settle(&self) -> std::time::Duration {
+        self.present_settle
+    }
+
+    /// Sets the PTY-quiescence settle window (bitty#2486).
+    ///
+    /// The embedder arms this (the real-GUI startup path does) and calls
+    /// [`Self::note_present_input`] whenever it consumed PTY output. `ZERO`
+    /// disables the gate; a pending deferral is released on the next tick
+    /// because the gate reads the live value.
+    pub fn set_present_settle(&mut self, settle: std::time::Duration) {
+        self.present_settle = settle;
+    }
+
+    /// Records that the embedder just consumed PTY output (bitty#2486).
+    ///
+    /// Starts (or extends) the input burst the settle gate waits out. No-op
+    /// while [`Self::present_settle`] is `ZERO`, so headless callers that
+    /// drive `handle_pty_bytes` directly keep deterministic behavior.
+    pub fn note_present_input(&mut self) {
+        self.note_present_input_at(std::time::Instant::now());
+    }
+
+    /// [`Self::note_present_input`] against an explicit clock.
+    ///
+    /// Hidden seam for deterministic tests: the settle gate compares the same
+    /// `Instant` domain the embedder passes to [`Self::tick_at`].
+    #[doc(hidden)]
+    pub fn note_present_input_at(&mut self, now: std::time::Instant) {
+        if self.present_settle.is_zero() {
+            return;
+        }
+        if self.settle_burst_at.is_none() {
+            self.settle_burst_at = Some(now);
+        }
+        self.settle_input_at = Some(now);
+    }
+
+    /// Frames dropped by a present gate with damage retained (CTX-1231
+    /// cadence and the bitty#2486 PTY-quiescence settle). Monotonic,
+    /// saturating; idle ticks never count.
     #[must_use]
     pub fn presents_coalesced(&self) -> u64 {
         self.presents_coalesced
     }
 
-    /// Wake deadline for a deferred coalesced frame, if any (CTX-1231).
+    /// Wake deadline for a deferred frame, if any (CTX-1231, bitty#2486).
     ///
-    /// `Some(last_present + interval)` while a deferred frame holds
-    /// un-presented damage; `None` otherwise (gate off, nothing deferred,
-    /// or already presented). The app arms `set_wait_until` at it so a
-    /// burst followed by quiet still presents the latest frame on time
-    /// instead of holding it until unrelated activity (frame-on-demand
-    /// liveness). `checked_add` fail-closed: an unrepresentable deadline
-    /// reports `None` and the next dirty tick presents immediately.
+    /// `Some(open_at)` while a deferred frame holds un-presented damage:
+    /// `last_present + interval` for the cadence gate, or the PTY-quiescence
+    /// deadline for the settle gate, whichever is later. `None` otherwise
+    /// (no gate, nothing deferred, or already presented). The app arms
+    /// `set_wait_until` at it so a burst followed by quiet still presents the
+    /// latest frame on time instead of holding it until unrelated activity
+    /// (frame-on-demand liveness).
     #[must_use]
     pub fn present_coalescing_deadline(&self) -> Option<std::time::Instant> {
         if !self.coalesced_pending {
             return None;
         }
-        let last = self.last_present_at?;
-        last.checked_add(self.min_present_interval)
+        self.coalesced_deadline
     }
 
-    /// Present-latest coalescing gate (CTX-1231, #2093).
+    /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
+    /// settle (bitty#2486).
     ///
-    /// Returns `true` when this dirty tick must skip its present because
-    /// the last presented frame is younger than `min_present_interval`.
-    /// Damage is retained (the caller returns `None` without marking
-    /// presented), so the next tick past the deadline presents the
-    /// accumulated latest state: intermediate frames are dropped, never
-    /// torn-presented, and the final frame matches an uncoalesced run at
-    /// the same clock (same snapshots, same time-driven animation state;
-    /// only surface commits are skipped). The first frame always presents
-    /// (`last_present_at` is `None`), and a zero interval disables the
-    /// gate entirely.
+    /// Returns `true` when this dirty tick must skip its present. Damage is
+    /// retained (the caller returns `None` without marking presented), so a
+    /// later tick presents the accumulated latest state: intermediate frames
+    /// are dropped, never torn-presented, and the final frame matches an
+    /// uncoalesced run at the same clock.
+    ///
+    /// Two independent holds compose; a present happens only once both are
+    /// open:
+    ///
+    /// - cadence: the last presented frame is younger than
+    ///   `min_present_interval` (`ZERO` disables it; a missing prior present
+    ///   never holds the first frame);
+    /// - settle: PTY output arrived less than `present_settle` ago, capped at
+    ///   [`super::PRESENT_SETTLE_MAX`] since the burst began so a continuous
+    ///   producer still presents (`ZERO` disables it).
+    ///
+    /// Deadlines use `checked_add`; an unrepresentable one fails closed: that
+    /// gate does not defer, so the frame presents immediately instead of
+    /// waiting for a wake that can never fire.
     fn defer_coalesced_present(&mut self, now: std::time::Instant) -> bool {
-        if self.min_present_interval.is_zero() {
-            return false;
-        }
-        let Some(last) = self.last_present_at else {
-            return false;
+        let cadence_open = if self.min_present_interval.is_zero() {
+            None
+        } else {
+            self.last_present_at
+                .and_then(|last| last.checked_add(self.min_present_interval))
         };
-        // CTX-1231 review: an unrepresentable wake deadline must never
-        // defer without a wake — present immediately instead (fail-closed
-        // liveness; only fires for absurd intervals near `Instant::MAX`).
-        if last.checked_add(self.min_present_interval).is_none() {
-            return false;
-        }
-        if now.saturating_duration_since(last) >= self.min_present_interval {
+        let settle_open = if self.present_settle.is_zero() {
+            None
+        } else {
+            self.settle_input_at.and_then(|input| {
+                let quiet = input.checked_add(self.present_settle)?;
+                let burst = self.settle_burst_at.unwrap_or(input);
+                let capped = burst.checked_add(super::PRESENT_SETTLE_MAX)?;
+                Some(quiet.min(capped))
+            })
+        };
+        let open_at = match (cadence_open, settle_open) {
+            (None, None) => return false,
+            (Some(open), None) | (None, Some(open)) => open,
+            (Some(cadence), Some(settle)) => cadence.max(settle),
+        };
+        if now >= open_at {
             return false;
         }
         self.coalesced_pending = true;
+        self.coalesced_deadline = Some(open_at);
         self.presents_coalesced = self.presents_coalesced.saturating_add(1);
         true
     }

@@ -96,6 +96,16 @@ fn dispatch_settled(rt: &mut PluginRuntime, id: &PluginId, command: &str) -> Lua
 /// override is cleared, so a test can never read or write the developer's real
 /// config or plugin store.
 fn run_in(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
+    run_in_with_env(home, args, stdin, &[])
+}
+
+/// [`run_in`] with extra environment variables (test transports, proxies).
+fn run_in_with_env(
+    home: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    envs: &[(&str, String)],
+) -> Output {
     let mut command = Command::new(BITTY_BIN);
     command
         .args(args)
@@ -112,9 +122,11 @@ fn run_in(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
             "ssh -o BatchMode=yes -o ConnectTimeout=2 -p 9",
         )
         .env_remove("BITTY_CONFIG")
-        .env_remove("BITTY_PLUGIN_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("BITTY_PLUGIN_DIR");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     match stdin {
         None => command.stdin(Stdio::null()).output(),
         Some(answer) => {
@@ -1566,4 +1578,388 @@ fn plugin_config_scaffold_refuses_symlinked_target() {
     );
 
     let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// Official catalog install-by-id (bitty-plugins#108): embedded catalog,
+// pinned commit, raw manifest hash, no runtime metadata fetch.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+struct FakeGitTransport {
+    envs: Vec<(&'static str, String)>,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeGitTransport {
+    /// Fake `git`/`curl`/`wget` on PATH. `git` records every invocation,
+    /// serves `fixture` on checkout/clone, and answers `rev-parse` with the
+    /// pin it was asked to fetch. `curl`/`wget` only record (and fail), so a
+    /// runtime metadata fetch cannot pass silently.
+    fn new(home: &Path, fixture: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = home.join("fakebin");
+        std::fs::create_dir_all(&bin).expect("fake bin");
+        let log = home.join("fake-transport.log");
+        let pin_file = home.join("fake-transport.pin");
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\n\
+             set -eu\n\
+             printf '%s\\n' \"git $*\" >> \"$FAKE_TRANSPORT_LOG\"\n\
+             if [ \"$1\" = \"init\" ]; then\n\
+               for last in \"$@\"; do :; done\n\
+               mkdir -p \"$last\"\n\
+               exit 0\n\
+             fi\n\
+             repo=\"\"\n\
+             if [ \"$1\" = \"-C\" ]; then repo=\"$2\"; fi\n\
+             case \"$*\" in\n\
+               *\" rev-parse \"*) cat \"$FAKE_TRANSPORT_PIN\" ;;\n\
+               *\" fetch \"*)\n\
+                 for last in \"$@\"; do :; done\n\
+                 printf '%s\\n' \"$last\" > \"$FAKE_TRANSPORT_PIN\" ;;\n\
+               *\" checkout \"*) cp -R \"$FAKE_TRANSPORT_FIXTURE\"/. \"$repo\"/ ;;\n\
+               *\" clone \"*)\n\
+                 for last in \"$@\"; do :; done\n\
+                 mkdir -p \"$last\"\n\
+                 cp -R \"$FAKE_TRANSPORT_FIXTURE\"/. \"$last\"/ ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+        )
+        .expect("fake git");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))
+            .expect("fake git mode");
+        for tool in ["curl", "wget"] {
+            let path = bin.join(tool);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> \"$FAKE_TRANSPORT_LOG\"\nexit 1\n"
+                ),
+            )
+            .expect("fake fetcher");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("fake fetcher mode");
+        }
+        let path_env = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Self {
+            envs: vec![
+                ("PATH", path_env),
+                ("FAKE_TRANSPORT_LOG", log.display().to_string()),
+                ("FAKE_TRANSPORT_PIN", pin_file.display().to_string()),
+                ("FAKE_TRANSPORT_FIXTURE", fixture.display().to_string()),
+            ],
+            log,
+        }
+    }
+
+    fn envs(&self) -> &[(&'static str, String)] {
+        &self.envs
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+fn official_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/official/bar")
+}
+
+#[test]
+fn plugin_info_resolves_every_official_id_offline() {
+    use bitty_plugin_host::official::official_plugins;
+
+    let home = scratch_dir("official-info");
+    for entry in official_plugins() {
+        let output = run_in(
+            &home,
+            &["plugin", "info", entry.id, "--format", "json"],
+            None,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}: {}",
+            entry.id,
+            stderr(&output)
+        );
+        let text = stdout(&output);
+        assert!(
+            text.contains("\"source\":\"registry\""),
+            "{}: {text}",
+            entry.id
+        );
+        assert!(
+            text.contains(&format!("\"manifest_hash\":\"{}\"", entry.manifest_hash)),
+            "{}: {text}",
+            entry.id
+        );
+    }
+    // Resolution is read-only and never creates a store or a ledger.
+    assert!(!state_file(&home).exists());
+    assert!(!data_store(&home).exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_resolves_every_installable_official_id_through_pinned_transport() {
+    use bitty_plugin_host::official::official_plugins;
+
+    // The fixture path is deliberately absent: the fake transport records the
+    // repository/pin it was asked for, then fails the checkout. That proves
+    // per-id resolution reaches the transport with the catalog's exact pin
+    // without needing a full manifest fixture for all twelve entries.
+    for entry in official_plugins() {
+        if entry.id == "bitty-terminal.statusline" {
+            continue; // listed but incompatible on this host; covered separately
+        }
+        let home = scratch_dir("official-resolve");
+        let missing = home.join("missing-fixture");
+        let transport = FakeGitTransport::new(&home, &missing);
+        let output = run_in_with_env(
+            &home,
+            &["plugin", "install", entry.id, "--yes"],
+            None,
+            transport.envs(),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}: {}",
+            entry.id,
+            stderr(&output)
+        );
+        let calls = transport.calls();
+        assert!(
+            calls.contains(&format!("remote add origin {}", entry.repository)),
+            "{}: {calls}",
+            entry.id
+        );
+        assert!(
+            calls.contains(&format!(
+                "fetch --quiet --depth=1 --no-tags origin {}",
+                entry.pin
+            )),
+            "{}: {calls}",
+            entry.id
+        );
+        assert!(
+            !calls.contains("curl ") && !calls.contains("wget "),
+            "{}: no runtime metadata fetch: {calls}",
+            entry.id
+        );
+        assert!(
+            !calls.contains("bitty-plugins"),
+            "{}: the registry repository is never contacted at runtime: {calls}",
+            entry.id
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_unknown_id_lists_bundled_and_official_ids_without_transport() {
+    let home = scratch_dir("official-unknown");
+    let transport = FakeGitTransport::new(&home, &official_fixture());
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "xuepoo.markdown", "--yes"],
+        None,
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("bundled ids: bitty-terminal.shell-integration"),
+        "{text}"
+    );
+    assert!(text.contains("bitty-featured.activity"), "{text}");
+    assert!(text.contains("bitty-terminal.bar"), "{text}");
+    assert!(
+        text.contains("listed but incompatible with this host"),
+        "{text}"
+    );
+    assert!(text.contains("bitty-terminal.statusline"), "{text}");
+    assert_eq!(transport.calls(), "", "resolution must not fetch");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_statusline_is_listed_but_refused_with_exact_range() {
+    let home = scratch_dir("official-statusline");
+    let transport = FakeGitTransport::new(&home, &official_fixture());
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("bitty-terminal.statusline"), "{text}");
+    assert!(text.contains("incompatible"), "{text}");
+
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "bitty-terminal.statusline", "--yes"],
+        None,
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("compat.bitty = '>=0.1,<1.0'"), "{text}");
+    assert!(text.contains("does not include host version"), "{text}");
+    assert_eq!(transport.calls(), "", "incompatible ids must not fetch");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
+    use bitty_runtime::plugin_runtime::SourceClass;
+
+    let home = scratch_dir("official-bar");
+    let transport = FakeGitTransport::new(&home, &official_fixture());
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "bitty-terminal.bar", "--yes"],
+        None,
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("official 'bitty-terminal.bar'"), "{text}");
+    assert!(text.contains("verified"), "{text}");
+    assert!(text.contains("installed"), "{text}");
+
+    let calls = transport.calls();
+    assert!(calls.contains("fetch"), "{calls}");
+    assert!(
+        calls.contains("ed11fb344407e188a31f353d81de81d790453cee"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("curl "),
+        "no runtime metadata fetch: {calls}"
+    );
+    assert!(
+        !calls.contains("wget "),
+        "no runtime metadata fetch: {calls}"
+    );
+    assert!(
+        !calls.contains("bitty-plugins"),
+        "the registry repository is never contacted at runtime: {calls}"
+    );
+
+    let store = data_store(&home);
+    let records = load_index(&store).expect("store index");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].plugin_id, "bitty-terminal.bar");
+    assert_eq!(records[0].source_class, SourceClass::Registry);
+    assert!(
+        !records[0].enabled,
+        "fresh installs stay staged and disabled"
+    );
+    assert!(
+        store
+            .join("packages/bitty-terminal.bar/0.0.1/lua/bar/init.lua")
+            .is_file(),
+        "the pinned package tree must be staged"
+    );
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("registry"), "{text}");
+    assert!(text.contains("disabled"), "{text}");
+
+    let output = run_in(&home, &["plugin", "enable", "bitty-terminal.bar"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(load_index(&store).expect("store index")[0].enabled);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_by_official_id_rejects_manifest_hash_mismatch_before_store_write() {
+    let home = scratch_dir("official-hash-mismatch");
+    let tampered = home.join("tampered-bar");
+    std::fs::create_dir_all(&tampered).expect("tampered root");
+    copy_dir(&official_fixture(), &tampered);
+    let manifest_path = tampered.join("bitty-plugin.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("manifest");
+    let tampered_manifest = manifest.replacen("version = \"0.0.1\"", "version = \"0.0.2\"", 1);
+    assert_ne!(tampered_manifest, manifest);
+    std::fs::write(&manifest_path, tampered_manifest).expect("tampered manifest");
+
+    let transport = FakeGitTransport::new(&home, &tampered);
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "bitty-terminal.bar", "--yes"],
+        None,
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("manifest hash mismatch"), "{text}");
+    assert!(text.contains("nothing installed"), "{text}");
+    assert!(!data_store(&home).join("current.json").exists());
+    assert!(
+        !data_store(&home)
+            .join("packages/bitty-terminal.bar")
+            .exists()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_install_by_official_id_shows_capabilities_and_honors_decline() {
+    let home = scratch_dir("official-consent");
+    let transport = FakeGitTransport::new(&home, &official_fixture());
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "bitty-terminal.bar"],
+        Some("n\n"),
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("workspace.control"), "{text}");
+    assert!(text.contains("ui.rich"), "{text}");
+    assert!(text.contains("[y/N]"), "{text}");
+    assert!(!data_store(&home).join("current.json").exists());
+
+    let output = run_in_with_env(
+        &home,
+        &["plugin", "install", "bitty-terminal.bar"],
+        Some("y\n"),
+        transport.envs(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(data_store(&home).join("current.json").is_file());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+fn copy_dir(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).expect("read fixture") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture type").is_dir() {
+            std::fs::create_dir_all(&target).expect("fixture dir");
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("fixture copy");
+        }
+    }
 }

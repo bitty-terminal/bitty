@@ -156,6 +156,8 @@ pub mod identity;
 pub mod install;
 pub mod lifecycle;
 pub mod manifest;
+pub mod official;
+mod official_catalog;
 pub mod origin;
 pub mod registry;
 pub mod roles;

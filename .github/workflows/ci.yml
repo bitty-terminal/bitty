@@ -63,8 +63,12 @@ jobs:
           set -a
           . ./validation-pins.env
           set +a
-          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
-          echo "perf-rev=$BITTY_PERF_REV" >> "$GITHUB_OUTPUT"
+          {
+            echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV"
+            echo "perf-rev=$BITTY_PERF_REV"
+            echo "plugins-repo=$BITTY_PLUGINS_REPO"
+            echo "plugins-rev=$BITTY_PLUGINS_REV"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check out pinned bitty-perf suite
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,6 +83,16 @@ jobs:
           repository: bitty-terminal/bitty-compat-lab
           ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
           path: external/bitty-compat-lab
+
+      # Official plugin catalog source (registry/official/*.toml + gitlink
+      # pins). Checked out at the validation pin so the drift gate below is
+      # deterministic; submodules stay uninitialized (only gitlinks are read).
+      - name: Check out pinned bitty-plugins registry
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.validation-pins.outputs.plugins-repo }}
+          ref: ${{ steps.validation-pins.outputs.plugins-rev }}
+          path: external/bitty-plugins
 
       # bitty-render wraps crossfont (ADR-0004), which links the platform
       # font stack on Linux (FreeType + fontconfig) via pkg-config.
@@ -332,6 +346,19 @@ jobs:
       - name: Check compat fixture gate (fixture test)
         if: matrix.shard == 1
         run: bash scripts/tests/check-compat-fixture-freshness.test.sh
+
+      # Core embeds a build-time official plugin catalog. The checked-in
+      # generated file must match the pinned registry source; a registry pin
+      # or entry bump that is not reflected in Core fails here instead of
+      # silently going stale. Read-only, no runtime fetch.
+      - name: Check official plugin catalog freshness
+        if: matrix.shard == 1
+        env:
+          BITTY_PLUGINS_REV: ${{ steps.validation-pins.outputs.plugins-rev }}
+        run: >-
+          python3 scripts/generate-official-catalog.py --check
+          --registry external/bitty-plugins
+          --revision "$BITTY_PLUGINS_REV"
 
       - name: Check status drift gate (OQ/RFC/crate-count/submodule)
         if: matrix.shard == 1

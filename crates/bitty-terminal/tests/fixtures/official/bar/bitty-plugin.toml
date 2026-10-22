@@ -1,0 +1,197 @@
+# Bitty plugin manifest.
+#
+# File name, keys, and limits are the accepted v1 contract in bitty-docs
+# `docs/specifications/plugin-platform-rfc.md` (OQ-012). The plugin manager and
+# the host parse this file independently before any plugin code runs.
+#
+# `just manifest` validates this file with the authoritative `bitty-plugin-lint`
+# from bitty-plugin-sdk (R-SDK-2), pinned by commit in `package.json` and
+# `bun.lock`. Run `just install` once to materialize it.
+
+[plugin]
+id = "bitty-terminal.bar"
+name = "Unified Bar"
+version = "0.0.1"
+description = "Consolidated workspace-bar, tabs, and statusline presentation over generic chrome insets."
+license = "MIT"
+
+[compat]
+# Application and Plugin API ranges. Both are syntax-validated here and
+# resolved by the host at install time. The host validates compatibility
+# before activation and fails closed (disable with a diagnostic, no partial
+# activation) on mismatch.
+# The declared compatibility floor for the 0.0.24 release train is
+# `>=0.0.24,<0.1`. Left-click and wheel routing work on that floor; the
+# right/middle per-region dispatch needs Core #2248 (Bitty 0.0.26). Older
+# hosts ignore the `region` binding key, so the bar degrades to left-only
+# dispatch instead of failing the component; the floor stays 0.0.24 for that
+# graceful degradation.
+bitty = ">=0.0.24,<0.1"
+plugin-api = "^1.0"
+
+[services.required]
+# Broker providers the Phase B modules negotiate with an explicit version
+# requirement plus `optional = true` (fail-closed hide while ungranted).
+# Sensor trio (bitty#2019/#2011/#2016) at the Lua `M.SENSOR_VERSION_REQ`;
+# device octa (bitty#2012/#2017/#2020) at `M.DEVICE_VERSION_REQ`; audio trio
+# (bitty#2009/#2013) at `M.AUDIO_VERSION_REQ`. Quoted dotted keys are single
+# interface names (the linter walks them back to dotted form).
+# `network.control` is deliberately absent: the network right-click radio
+# toggle is a forward-looking stub (no provider ships in 0.0.26 and only the
+# mock harness exercises it), so a real provider must declare its service and
+# capability first.
+"system.cpu" = "^1.0"
+"system.memory" = "^1.0"
+"system.battery" = "^1.0"
+"network.state" = "^1.0"
+"network.essid" = "^1.0"
+"bluetooth.state" = "^1.0"
+"bluetooth.control" = "^1.0"
+"backlight.state" = "^1.0"
+"backlight.control" = "^1.0"
+"idle.state" = "^1.0"
+"idle.control" = "^1.0"
+"audio.state" = ">=1.0"
+"audio.control" = ">=1.0"
+"audio.spectrum" = ">=1.0"
+
+[capabilities]
+# Deny by default; each capability is requested one by one.
+# - ui.rich: mount and update the workspace bar band (`bitty.ui.mount/update`).
+# - ui.overlay: mount the presentation-only `overlay` block the host presents
+#   as a non-modal hover tooltip (Core #2411). No `ui.overlay.focus` is
+#   requested: the plugin never acquires input capture or sets modal state.
+# - workspace.read: `bitty.workspace.list` and the `workspace.*` events.
+# - workspace.control: `bitty.workspace.focus` for pill clicks (read never
+#   implies control, ADR-0014).
+# - platform.notify: the explicit `detail` fallback (`bitty.notify.show`) and
+#   best-effort control-denial notices; hover tooltips never use it.
+# - Phase B sensor heads (`platform.cpu-read`, `platform.memory-read`,
+#   `platform.battery-read`, CTX-1218/bitty#2019/#2011/#2016): read-only
+#   provider backing for the cpu/memory/battery modules (one head per
+#   provider, never high-risk).
+# - Phase B device heads (`platform.network.read`, `platform.essid.read`,
+#   `platform.bluetooth.read/.control`, `platform.backlight.read/.control`,
+#   `platform.idle.read/.control`, CTX-1219/bitty#2012/#2017/#2020): the
+#   separately-granted ESSID sub-interface plus read/control splits (read
+#   never implies control; control heads arm the toggle/step click variants
+#   only, denial degrades to notify, DEC-0115).
+# - Phase B audio heads (`audio.state.read`, `audio.state.control`,
+#   `audio.spectrum`, CTX-1220/bitty#2009/#2013): volume/mute/port snapshot,
+#   bounded control, and the 5 Hz cava-lite meter (read never implies
+#   control). Spellings verified against bitty main
+#   `crates/bitty-plugin-host/src/capability.rs` and the SDK#152 closed set.
+ui.rich = true
+ui.overlay = true
+workspace.read = true
+workspace.control = true
+platform.notify = true
+platform.cpu-read = true
+platform.memory-read = true
+platform.battery-read = true
+platform.network.read = true
+platform.essid.read = true
+platform.bluetooth.read = true
+platform.bluetooth.control = true
+platform.backlight.read = true
+platform.backlight.control = true
+platform.idle.read = true
+platform.idle.control = true
+audio.state.read = true
+audio.state.control = true
+audio.spectrum = true
+
+[settings]
+# Declared settings keys read through `bitty.settings.get` (bitty#2010 /
+# CTX-1195; an undeclared read fails closed with `E_SETTINGS_UNDECLARED`,
+# so every key below must be declared or activation aborts).
+# - Chassis scalars (`show`, `edge`, `show_single`, `name_max_chars`, `label`)
+#   mirror `M.DEFAULTS`; the module-group lists (`modules_left/_center/_right`)
+#   mirror `M.DEFAULT_MODULE_PLAN` (absent groups fall back to the default
+#   plan: workspaces left, clock center, and the network/cpu/memory/battery
+#   system indicators right). Provider modules hide fail closed when their
+#   broker provider is absent or ungranted, so the shipped right group is safe
+#   on hosts without sensors or network state.
+#   `label` is a bounded string enum (`index` | `name` | `both`); v1 settings
+#   have no enum kind, so the shipped default plus the local closed-set check
+#   in `M.read_settings` own the fallback (an unknown value paints `index`
+#   and reports one bounded diagnostic).
+# - Per-module option collections (`workspaces`, `clock`, `network`,
+#   `bluetooth`, `backlight`, `idle`, `pulseaudio`, `microphone`, `spectrum`,
+#   `cpu`, `memory`, `battery`) are read as one table per module name
+#   (`M.module_options`). The v1 settings contract has no table or dot-path
+#   form (host `SettingKind`, SDK closed types, flat file grammar), so each
+#   is declared `string-array` with an empty default: unset reads serve []
+#   (no options, module defaults win) and stored tables mismatch the kind
+#   and likewise read as [], exactly the fail-to-default posture. Per-module
+#   user options stay inert on strict hosts until a table/dot-path settings
+#   follow-up lands host- and SDK-side; no Lua change is needed when it
+#   does (the reads already tolerate absent tables). Types and bounds mirror
+#   the host `SettingDecl::validate` via the SDK#152 linter.
+# - `icons` selects the module icon map: `ascii` (default; byte-identical to
+#   the historical output), `pua` (legacy Font Awesome private-use glyphs),
+#   or `nerd` (Nerd Fonts v3 Material Design glyphs). An unknown value paints
+#   `ascii` and reports one bounded diagnostic. Glyphs stay opt-in because a
+#   terminal without the font paints replacement boxes.
+show = { type = "bool", default = true }
+edge = { type = "string", default = "bottom" }
+show_single = { type = "bool", default = false }
+name_max_chars = { type = "int", default = 32 }
+label = { type = "string", default = "index" }
+icons = { type = "string", default = "ascii" }
+modules_left = { type = "string-array", default = ["workspaces"] }
+modules_center = { type = "string-array", default = ["clock"] }
+modules_right = { type = "string-array", default = ["network", "cpu", "memory", "battery"] }
+workspaces = { type = "string-array", default = [] }
+clock = { type = "string-array", default = [] }
+network = { type = "string-array", default = [] }
+bluetooth = { type = "string-array", default = [] }
+backlight = { type = "string-array", default = [] }
+idle = { type = "string-array", default = [] }
+pulseaudio = { type = "string-array", default = [] }
+microphone = { type = "string-array", default = [] }
+spectrum = { type = "string-array", default = [] }
+cpu = { type = "string-array", default = [] }
+memory = { type = "string-array", default = [] }
+battery = { type = "string-array", default = [] }
+
+[lazy]
+# Static triggers let the host register the plugin without creating a VM.
+# Commands are plugin-qualified: `<plugin-id>:<resource>`. `focus` remains a
+# public command for direct invocation and keymaps; capsules bind
+# `workspace-action` (left focus, wheel cycle, middle/right detail). `hover`
+# is the Core #2411 pointer enter/leave target bound to every module region
+# (it updates the overlay tooltip and never captures input). `detail` is the
+# explicit notification fallback bound to a read-only module's click; the
+# `bluetooth-toggle`, `backlight-step`, and `idle-toggle` commands are the
+# device-module control click targets (each calls exactly one control method
+# on its own control interface, never anything else); `audio-toggle` mutes on
+# left/middle and shows the sink detail on right; `audio-step` steps the
+# volume (pulseaudio wheel, host-computed `delta`); `workspace-action`, `clock-action`,
+# `network-action`, `microphone-action`, and `microphone-step` are the
+# bar#30 per-button region targets. Every pointer target dispatches one of
+# these registered commands with the host-injected `button`/`region`/`delta`
+# arguments; no shell string is accepted.
+commands = [
+  "bitty-terminal.bar:focus",
+  "bitty-terminal.bar:detail",
+  "bitty-terminal.bar:hover",
+  "bitty-terminal.bar:bluetooth-toggle",
+  "bitty-terminal.bar:backlight-step",
+  "bitty-terminal.bar:idle-toggle",
+  "bitty-terminal.bar:audio-toggle",
+  "bitty-terminal.bar:audio-step",
+  "bitty-terminal.bar:workspace-action",
+  "bitty-terminal.bar:clock-action",
+  "bitty-terminal.bar:network-action",
+  "bitty-terminal.bar:microphone-action",
+  "bitty-terminal.bar:microphone-step",
+]
+events = [
+  "workspace.created",
+  "workspace.closed",
+  "workspace.renamed",
+  "workspace.focused",
+  "workspace.changed",
+  "config.reloaded",
+]

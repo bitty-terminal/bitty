@@ -17,7 +17,10 @@ jobs:
   # Test-heavy jobs (quality, linux-x11, linux-wayland, macos, windows) run the
   # full debug suite, measured at 11-15m on 2026-09-06/07 (CTX-0218; precedent
   # CTX-0193 raised soak 90s->120s the same way). Budget is 30m; do not reduce
-  # to 15m. Fast jobs (msrv, supply-chain) stay at 15m.
+  # to 15m. Fast jobs (msrv, supply-chain) stay at 15m. The compat matrix legs
+  # (compat-linux-x11, compat-linux-wayland, #2448) build one pinned product
+  # graph from scratch on a fresh runner, so they get 40m for a cold sccache
+  # namespace.
   # CTX-0971 R4: quality is sharded 2-way via matrix (nextest hash
   # partitions) to cut the 11-15m wall toward total/2 plus setup. The matrix
   # aggregates pass/fail: the job is green only when both shards are green.
@@ -597,6 +600,13 @@ jobs:
         working-directory: external/bitty-perf
         run: cargo test --benches --locked
 
+      # #2448: free the perf graph now that its only consumer (the benches
+      # above) is done, before M1 builds the second external graph
+      # (bitty-compat-lab). The runner was within 5 MB of full at this point;
+      # one external graph on disk at a time is the budget.
+      - name: Reclaim perf build directory
+        run: rm -rf external/bitty-perf/target
+
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
       # being buried in the blanket test run above. The suites are headless
@@ -614,25 +624,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # PERF-11 / CTX-0692: linux-x11 leg of the compat release matrix (14
-      # surfaces x 4 terminals). Runs the release-matrix suites by name so a
-      # per-platform regression is a distinct, reported result instead of
-      # being buried in the blanket test run above, and emits the
-      # deterministic report + matrix JSON artifacts. Headless, no display.
-      - name: Run compat release matrix
-        run: ./scripts/compat-matrix.sh run --platform linux-x11 --out compat-results/linux-x11.tsv
-
-      - name: Upload compat matrix result (linux-x11)
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          # CTX-1439 / #2429: attempt-scoped so a re-run cannot merge a
-          # superseded attempt's TSV into the Tier 1 aggregate.
-          name: compat-results-linux-x11-${{ github.run_attempt }}
-          path: compat-results/linux-x11*
-          if-no-files-found: error
-          retention-days: 7
-
+      # PERF-11 / CTX-0692: the compat release matrix leg for this platform
+      # runs in `compat-linux-x11` (#2448); M1 evidence stays here because the
+      # required Linux lanes must keep proving it.
       # CTX-0971 R4: sccache hit-rate for the expected-savings table.
       - name: Show sccache stats (linux-x11)
         if: always()
@@ -766,6 +760,12 @@ jobs:
         working-directory: external/bitty-perf
         run: cargo test --benches --locked
 
+      # #2448: free the perf graph now that its only consumer (the benches
+      # above) is done, before M1 builds the second external graph
+      # (bitty-compat-lab); see the linux-x11 reclaim step.
+      - name: Reclaim perf build directory
+        run: rm -rf external/bitty-perf/target
+
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
       # workspace still builds and tests on the Wayland path.
@@ -781,8 +781,238 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # PERF-11 / CTX-0692: linux-wayland leg of the compat release matrix.
-      # The suites are display-independent; see the linux-x11 leg above.
+      # CTX-0971 R4: sccache hit-rate for the expected-savings table.
+      - name: Show sccache stats (linux-wayland)
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
+
+  # PERF-11 / CTX-0692 / #2448: each Linux leg of the compat release matrix
+  # (14 surfaces x 4 terminals) runs in its own job instead of inline in
+  # linux-x11/linux-wayland.
+  #
+  # Those jobs already cold-build two independent product graphs on one
+  # runner: the workspace `target/` and the pinned bitty-perf checkout (git
+  # dependency at an exact revision). The compat release matrix adds a third
+  # -- the pinned bitty-compat-lab checkout, also a full product graph from
+  # git -- so a large rust-cache restore left the runner with 5 MB free
+  # and rust-lld's mmap'd output write died with `signal 7 [Bus error]`
+  # (runs 39706484182, 39692561675: `collect2: fatal error: ld terminated
+  # with signal 7`). SIGBUS, not SIGKILL: the failure is the disk budget, not
+  # memory, and not linker concurrency. One graph per runner makes the budget
+  # deterministic, and the required Linux lanes no longer carry the matrix's
+  # build on top of their own.
+  #
+  # Coverage is unchanged: the same eight suites, the same per-suite floors,
+  # the same four Tier 1 legs, and the same aggregate gate below -- which now
+  # requires these jobs instead of the platform test jobs. There is no
+  # `continue-on-error` and no skip list; a compat failure still fails the
+  # run.
+  #
+  # No rust-cache here on purpose: its key would follow the pinned
+  # bitty-compat-lab lockfile (stable across product changes), so it would
+  # pin a multi-GB target in the shared 10 GiB repo cache quota and evict the
+  # product caches. sccache already reuses the pinned graph's objects across
+  # runs once the first one warms the namespace.
+  compat-linux-x11:
+    name: Linux X11 compat matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      DISPLAY: :99
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      # Bound parallel rustc/link jobs. rust-lld is internally parallel and
+      # this is the largest single build on the runner; two jobs keeps the
+      # peak disk and memory footprint predictable on a 4-core runner.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      # The suites assert terminal behavior, not backtrace depth. Full
+      # debuginfo dominated the test-binary footprint; line tables keep
+      # file:line in panic output at a fraction of the size, which is what
+      # makes this build fit one runner.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # W-105: pinned bitty-compat-lab checkout (see the validation-pins step).
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality and
+      # the platform jobs, so the pinned graph's objects are shared.
+      - name: Scope sccache namespace to Cargo.lock hash
+        run: echo "SCCACHE_GHA_VERSION=v1-$(sha256sum Cargo.lock | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
+
+      # The compat-lab graph links against the same font stack / input
+      # libraries as the platform job it was extracted from; without them the
+      # suites fail to link rather than run.
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Install font stack and X11 input libraries
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-0
+          libxkbcommon-dev
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      # #2448: fail with a readable infrastructure signal when the runner
+      # image shrinks, instead of letting rust-lld die on an mmap write.
+      - name: Check runner disk budget
+        run: |
+          set -euo pipefail
+          min_kb=$((6 * 1024 * 1024))
+          avail_kb="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+          df -h "$GITHUB_WORKSPACE"
+          if [ "$avail_kb" -lt "$min_kb" ]; then
+            echo "::error::runner disk budget too small: ${avail_kb} KiB free, ${min_kb} KiB required before the compat build (#2448)"
+            exit 1
+          fi
+
+      - name: Run compat release matrix
+        run: ./scripts/compat-matrix.sh run --platform linux-x11 --out compat-results/linux-x11.tsv
+
+      - name: Upload compat matrix result (linux-x11)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # CTX-1439 / #2429: attempt-scoped so a re-run cannot merge a
+          # superseded attempt's TSV into the Tier 1 aggregate.
+          name: compat-results-linux-x11-${{ github.run_attempt }}
+          path: compat-results/linux-x11*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Show sccache stats (compat-linux-x11)
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Show disk usage (compat-linux-x11)
+        if: always()
+        run: df -h "$GITHUB_WORKSPACE"
+
+  compat-linux-wayland:
+    name: Linux Wayland compat matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      WAYLAND_DISPLAY: wayland-0
+      XDG_SESSION_TYPE: wayland
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # W-105: pinned bitty-compat-lab checkout (see the validation-pins step).
+      BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality and
+      # the platform jobs, so the pinned graph's objects are shared.
+      - name: Scope sccache namespace to Cargo.lock hash
+        run: echo "SCCACHE_GHA_VERSION=v1-$(sha256sum Cargo.lock | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Resolve validation pins
+        id: validation-pins
+        run: |
+          set -a
+          . ./validation-pins.env
+          set +a
+          echo "compat-lab-rev=$BITTY_COMPAT_LAB_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned bitty-compat-lab suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bitty-terminal/bitty-compat-lab
+          ref: ${{ steps.validation-pins.outputs.compat-lab-rev }}
+          path: external/bitty-compat-lab
+
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Install font stack and Wayland libraries
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev libwayland-dev
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      # #2448: fail with a readable infrastructure signal when the runner
+      # image shrinks, instead of letting rust-lld die on an mmap write.
+      - name: Check runner disk budget
+        run: |
+          set -euo pipefail
+          min_kb=$((6 * 1024 * 1024))
+          avail_kb="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+          df -h "$GITHUB_WORKSPACE"
+          if [ "$avail_kb" -lt "$min_kb" ]; then
+            echo "::error::runner disk budget too small: ${avail_kb} KiB free, ${min_kb} KiB required before the compat build (#2448)"
+            exit 1
+          fi
+
       - name: Run compat release matrix
         run: ./scripts/compat-matrix.sh run --platform linux-wayland --out compat-results/linux-wayland.tsv
 
@@ -790,16 +1020,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          # CTX-1439 / #2429: attempt-scoped (see linux-x11 upload).
+          # CTX-1439 / #2429: attempt-scoped (see the compat-linux-x11 upload).
           name: compat-results-linux-wayland-${{ github.run_attempt }}
           path: compat-results/linux-wayland*
           if-no-files-found: error
           retention-days: 7
 
-      # CTX-0971 R4: sccache hit-rate for the expected-savings table.
-      - name: Show sccache stats (linux-wayland)
+      - name: Show sccache stats (compat-linux-wayland)
         if: always()
         run: ${SCCACHE_PATH} --show-stats
+
+      - name: Show disk usage (compat-linux-wayland)
+        if: always()
+        run: df -h "$GITHUB_WORKSPACE"
 
   macos:
     name: macOS ARM64 check and test
@@ -1275,6 +1508,12 @@ jobs:
   # result. That makes a regression on one Tier 1 platform a single visible
   # check instead of four scattered job logs.
   #
+  # #2448: the Linux legs run in their own `compat-linux-x11` /
+  # `compat-linux-wayland` jobs (one product graph per runner) rather than
+  # inline in the platform test jobs, so the `needs`/env mapping below reads
+  # those results. The macOS and Windows legs still run inline in their
+  # platform jobs. Coverage and the gate are unchanged.
+  #
   # CTX-1439 / #2429: the attempt suffix is load-bearing. Artifact names were
   # fixed per platform before, and a re-run appends artifacts instead of
   # replacing them, so `pattern: compat-results-*` with `merge-multiple: true`
@@ -1289,12 +1528,16 @@ jobs:
   compat-matrix:
     name: Compat release matrix (Tier 1 aggregate)
     if: always()
-    needs: [linux-x11, linux-wayland, macos, windows]
+    needs:
+      - compat-linux-x11
+      - compat-linux-wayland
+      - macos
+      - windows
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      COMPAT_JOB_LINUX_X11: ${{ needs['linux-x11'].result }}
-      COMPAT_JOB_LINUX_WAYLAND: ${{ needs['linux-wayland'].result }}
+      COMPAT_JOB_LINUX_X11: ${{ needs.compat-linux-x11.result }}
+      COMPAT_JOB_LINUX_WAYLAND: ${{ needs.compat-linux-wayland.result }}
       COMPAT_JOB_MACOS: ${{ needs.macos.result }}
       COMPAT_JOB_WINDOWS: ${{ needs.windows.result }}
     steps:

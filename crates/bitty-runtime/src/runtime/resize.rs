@@ -539,14 +539,62 @@ impl Runtime {
         // that pane. A selection whose owner is no longer live is dropped by
         // the fail-closed guard.
         if let Some(sel) = self.selection_state {
-            // CTX-1021 (#1807): a scrolled owner addresses the viewport
-            // composite, so reclamp against it (not the live grid) to keep a
-            // scrolled drag inside the visible window after reflow.
-            if self.is_viewport_scrolled(sel.owner) {
+            // Issues #2480/#2470: pointer selections keep their buffer
+            // anchors across a reflow/DPI change. Rows are re-projected
+            // against the new window; a one-cell selection survives even
+            // though its inclusive range is collapsed.
+            if let Some(pers) = sel.buffer {
+                let clamped = self
+                    .selection_window(sel.owner)
+                    .zip(self.live_view_state(sel.owner))
+                    .and_then(|(window, state)| {
+                        let mut clamped = pers.clamped(state);
+                        if window.cols > 0 {
+                            clamped.anchor.col = clamped.anchor.col.min(window.cols - 1);
+                            clamped.focus.col = clamped.focus.col.min(window.cols - 1);
+                        }
+                        clamped.is_valid(state).then_some((window, clamped))
+                    });
+                match clamped {
+                    Some((window, clamped)) => {
+                        let selection = self
+                            .project_persistent(&clamped, sel.owner)
+                            .unwrap_or_else(|| {
+                                let cell = CellPos::new(
+                                    sel.selection.anchor.row.min(window.rows.saturating_sub(1)),
+                                    sel.selection.anchor.col.min(window.cols.saturating_sub(1)),
+                                );
+                                Selection {
+                                    anchor: cell,
+                                    focus: cell,
+                                    kind: clamped.kind,
+                                    active: sel.dragging,
+                                }
+                            });
+                        let pin = sel.anchor_press.map(|pin| {
+                            CellPos::new(
+                                pin.row.min(window.rows.saturating_sub(1)),
+                                pin.col.min(window.cols.saturating_sub(1)),
+                            )
+                        });
+                        self.install_selection(sel.owner, selection, pin, sel.dragging);
+                        self.restore_selection_meta(
+                            sel.press_boundary,
+                            sel.single_cell,
+                            Some(clamped),
+                            sel.press_buffer,
+                        );
+                    }
+                    None => self.drop_selection(),
+                }
+            } else if self.is_viewport_scrolled(sel.owner) {
+                // CTX-1021 (#1807): a scrolled owner addresses the viewport
+                // composite, so reclamp against it (not the live grid) to keep
+                // a scrolled drag inside the visible window after reflow.
                 match self.viewport_snapshot_for(sel.owner) {
                     Some(viewport) => {
                         let clamped = sel.selection.clamped(&viewport).snapped(Some(&viewport));
-                        if clamped.is_empty() {
+                        if clamped.is_empty() && !sel.single_cell {
                             self.drop_selection();
                         } else {
                             let max_row = viewport.height.saturating_sub(1) as u16;
@@ -555,6 +603,12 @@ impl Runtime {
                                 CellPos::new(pin.row.min(max_row), pin.col.min(max_col))
                             });
                             self.install_selection(sel.owner, clamped, pin, sel.dragging);
+                            self.restore_selection_meta(
+                                sel.press_boundary,
+                                sel.single_cell,
+                                None,
+                                None,
+                            );
                         }
                     }
                     None => self.drop_selection(),
@@ -564,7 +618,7 @@ impl Runtime {
                     Some(state) => {
                         let snap = state.snapshot();
                         let clamped = sel.selection.clamped(&snap).snapped(Some(&snap));
-                        if clamped.is_empty() {
+                        if clamped.is_empty() && !sel.single_cell {
                             self.drop_selection();
                         } else {
                             // Keep the drag pin in bounds for future word/line
@@ -575,6 +629,12 @@ impl Runtime {
                                 CellPos::new(pin.row.min(max_row), pin.col.min(max_col))
                             });
                             self.install_selection(sel.owner, clamped, pin, sel.dragging);
+                            self.restore_selection_meta(
+                                sel.press_boundary,
+                                sel.single_cell,
+                                None,
+                                None,
+                            );
                         }
                     }
                     None => self.drop_selection(),

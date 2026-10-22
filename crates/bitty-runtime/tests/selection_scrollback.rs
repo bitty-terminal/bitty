@@ -160,21 +160,26 @@ fn scrolled_viewport_drag_selects_visible_text() {
 }
 
 #[test]
-fn scroll_while_selecting_tracks_anchor() {
+fn scroll_while_dragging_pins_the_press_endpoint_pointer_driven() {
+    // Issue #2470 + #2480 review: a real pointer drag, wheel-scrolled while
+    // held. Only the press-side endpoint moves with the viewport; the
+    // pointer-side endpoint stays under the cursor, and the range keeps
+    // growing from the original anchor.
     let mut rt = make_runtime();
     feed_lines(&mut rt, 60);
     assert_eq!(scroll_offset(&rt), 0, "must start live");
+    let id = view_id(&rt);
 
-    // Press and hold (no release): anchor == focus. This test owns the
-    // scroll-tracking mechanism, so it drives the cell-level selection API
-    // directly; the pointer caret mapping has its own suite
-    // (`pointer_selection_scale.rs`).
-    rt.start_selection(CellPos::new(5, 2));
+    let press_pos = cell_edge(&rt, id, 10, 2);
+    rt.handle_cursor_moved(press_pos);
+    press(&mut rt);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 12, 4));
     assert!(rt.is_selection_dragging(), "press arms a drag");
-    let before = rt.selection().expect("press selects");
+    let before = rt.selection().expect("drag selects").normalized();
     assert_eq!(
-        before.anchor, before.focus,
-        "press without motion is collapsed, got {before:?}"
+        before.end.row,
+        before.start.row + 2,
+        "two rows of pointer travel, before {before:?}"
     );
 
     // Wheel up one notch (3 lines) mid-drag with no cursor motion.
@@ -184,41 +189,97 @@ fn scroll_while_selecting_tracks_anchor() {
         rt.is_selection_dragging(),
         "scrolling must not end the drag"
     );
-    let sel = rt.selection().expect("drag survives scroll");
-    // The anchor stays pinned to its buffer line, so it sits 3 viewport rows
-    // lower; the focus stays at the cursor's frame-local cell.
+    let sel = rt.selection().expect("drag survives scroll").normalized();
+    // The press line is pinned in the buffer, so it sits 3 viewport rows
+    // lower; the pointer line stays at its screen row.
     assert_eq!(
-        sel.anchor.row,
-        before.anchor.row + 3,
-        "anchor tracks its buffer line across the scroll, before {before:?} got {sel:?}"
+        sel.end.row,
+        before.start.row + 3,
+        "press endpoint tracks its buffer line, before {before:?} got {sel:?}"
     );
     assert_eq!(
-        sel.anchor.col, before.anchor.col,
-        "anchor column is unchanged, before {before:?} got {sel:?}"
+        sel.start.row, 12,
+        "pointer endpoint stays on its screen row, before {before:?} got {sel:?}"
     );
-    assert_eq!(
-        sel.focus, before.focus,
-        "focus stays at the cursor while scrolling, before {before:?} got {sel:?}"
-    );
-    // Extend after the scroll, then release: the anchor stays pinned while the
-    // focus follows the new cursor viewport.
-    let tracked_anchor = sel.anchor;
-    rt.update_selection(CellPos::new(6, 4));
-    rt.end_selection(CellPos::new(6, 4));
+
+    // Extend after the scroll, then release: the press endpoint stays pinned
+    // while the pointer endpoint follows the new cursor cell.
+    let press_row = sel.end.row;
+    rt.handle_cursor_moved(cell_edge(&rt, id, 14, 5));
+    release(&mut rt);
     assert!(!rt.is_selection_dragging());
-    let sel = rt.selection().expect("scroll-tracked drag commits");
+    let sel = rt
+        .selection()
+        .expect("scroll-tracked drag commits")
+        .normalized();
     assert_eq!(
-        sel.anchor, tracked_anchor,
-        "anchor stays pinned through the post-scroll motion, got {sel:?}"
+        sel.end.row, press_row,
+        "press anchor stays pinned through the post-scroll motion, got {sel:?}"
     );
     assert_eq!(
-        sel.focus,
-        CellPos::new(6, 4),
-        "focus follows the scrolled viewport cursor, got {sel:?}"
+        sel.start.row, 14,
+        "pointer endpoint follows the scrolled viewport cursor, got {sel:?}"
     );
     assert!(
         rt.selection_text().is_some(),
-        "tracked drag must yield visible text"
+        "tracked drag must yield text across the scroll"
+    );
+}
+
+#[test]
+fn drag_can_span_multiple_scrollback_pages_while_held() {
+    // Issue #2470/#2523: hold a drag, wheel up several notches, then extend
+    // into the revealed page and release. The committed range must contain
+    // more rows than one viewport and copy every line in between.
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 80);
+    let id = view_id(&rt);
+    let rows = usize::from(rt.layout().find_leaf(id).expect("leaf").rows());
+
+    // Press near the bottom of the live viewport.
+    let press_pos = cell_edge(&rt, id, 20, 0);
+    rt.handle_cursor_moved(press_pos);
+    press(&mut rt);
+    let press_row = rt.selection().expect("press").anchor.row;
+    // Scroll up two notches (6 lines) with the button still held.
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 2.0));
+    assert_eq!(scroll_offset(&rt), 6);
+    assert!(rt.is_selection_dragging());
+    // Extend to the top visible row, now in history.
+    rt.handle_cursor_moved(cell_edge(&rt, id, 0, 0));
+    release(&mut rt);
+
+    let sel = rt.selection().expect("multi-page drag commits");
+    assert!(!rt.is_selection_dragging());
+    assert_eq!(
+        sel.normalized().start.row,
+        0,
+        "pointer endpoint is the visible top row"
+    );
+    assert_eq!(
+        sel.normalized().end.row,
+        (press_row + 6).min(rows as u16 - 1),
+        "press endpoint stays pinned to its buffer line"
+    );
+    let text = rt.selection_text().expect("multi-page selection text");
+    assert!(
+        text.lines().count() > rows,
+        "selection must span more than one viewport page, got {} lines for {rows} rows",
+        text.lines().count()
+    );
+    assert!(
+        text.starts_with("srow"),
+        "history text must be the lines under the drag, got {:?}",
+        text.chars().take(8).collect::<String>()
+    );
+
+    // Scrolling further after the commit keeps the copied text stable.
+    let before = text;
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 3.0));
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some(before.as_str()),
+        "buffer-anchored text survives later scrolling"
     );
 }
 

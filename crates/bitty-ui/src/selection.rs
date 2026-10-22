@@ -945,45 +945,10 @@ impl PersistentSelection {
     /// holds the same id (prune shift) the selection is considered pruned.
     #[must_use]
     pub fn text(&self, state: &bitty_term_state::State) -> Option<String> {
-        if !self.is_valid(state) {
-            return None;
+        if self.kind == SelectionKind::Block {
+            return self.block_text(state);
         }
-        // Defensive id-located resolve for scrollback endpoints: is_valid already
-        // guarantees scrollback_line(buffer_row).id == stored id, but double-check
-        // here and locate by id to guard against stale buffer_row after pruning.
-        let resolve = |bp: BufferPos, line_id: Option<u64>| -> Option<BufferPos> {
-            if let Some(id) = line_id {
-                let line = state.scrollback_line(bp.buffer_row)?;
-                if line.id != id {
-                    return None;
-                }
-                // Also verify via id search that the line is still at the stored row
-                // (handles prune shift where id moved to a different index).
-                let mut found_idx = None;
-                for (idx, l) in state.scrollback().enumerate() {
-                    if l.id == id {
-                        found_idx = Some(idx);
-                        break;
-                    }
-                }
-                match found_idx {
-                    Some(idx) if idx == bp.buffer_row => Some(bp),
-                    _ => None,
-                }
-            } else {
-                Some(bp)
-            }
-        };
-        let eff_anchor = resolve(self.anchor, self.anchor_line_id)?;
-        let eff_focus = resolve(self.focus, self.focus_line_id)?;
-        // Order endpoints
-        let (start_bp, end_bp) = if eff_anchor.buffer_row < eff_focus.buffer_row
-            || (eff_anchor.buffer_row == eff_focus.buffer_row && eff_anchor.col <= eff_focus.col)
-        {
-            (eff_anchor, eff_focus)
-        } else {
-            (eff_focus, eff_anchor)
-        };
+        let (start_bp, end_bp) = self.ordered_buffer_endpoints(state)?;
         let sb_len = state.scrollback_len();
         let mut out = String::new();
         for buffer_row in start_bp.buffer_row..=end_bp.buffer_row {
@@ -1042,6 +1007,125 @@ impl PersistentSelection {
             if runs_to_edge {
                 let trimmed = line.trim_end_matches(' ').len();
                 line.truncate(trimmed);
+            }
+            out.push_str(&line);
+            if buffer_row != end_bp.buffer_row {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    /// Resolves the stored endpoints by line id and returns them in buffer
+    /// order (oldest row first, then lowest column).
+    ///
+    /// `None` when either endpoint was pruned or its stored scrollback line id
+    /// no longer sits at the stored buffer row.
+    fn ordered_buffer_endpoints(
+        &self,
+        state: &bitty_term_state::State,
+    ) -> Option<(BufferPos, BufferPos)> {
+        if !self.is_valid(state) {
+            return None;
+        }
+        // Defensive id-located resolve for scrollback endpoints: is_valid already
+        // guarantees scrollback_line(buffer_row).id == stored id, but double-check
+        // here and locate by id to guard against stale buffer_row after pruning.
+        let resolve = |bp: BufferPos, line_id: Option<u64>| -> Option<BufferPos> {
+            if let Some(id) = line_id {
+                let line = state.scrollback_line(bp.buffer_row)?;
+                if line.id != id {
+                    return None;
+                }
+                // Also verify via id search that the line is still at the stored row
+                // (handles prune shift where id moved to a different index).
+                let mut found_idx = None;
+                for (idx, l) in state.scrollback().enumerate() {
+                    if l.id == id {
+                        found_idx = Some(idx);
+                        break;
+                    }
+                }
+                match found_idx {
+                    Some(idx) if idx == bp.buffer_row => Some(bp),
+                    _ => None,
+                }
+            } else {
+                Some(bp)
+            }
+        };
+        let eff_anchor = resolve(self.anchor, self.anchor_line_id)?;
+        let eff_focus = resolve(self.focus, self.focus_line_id)?;
+        if eff_anchor.buffer_row < eff_focus.buffer_row
+            || (eff_anchor.buffer_row == eff_focus.buffer_row && eff_anchor.col <= eff_focus.col)
+        {
+            Some((eff_anchor, eff_focus))
+        } else {
+            Some((eff_focus, eff_anchor))
+        }
+    }
+
+    /// Produces rectangular text for a buffer-anchored block selection.
+    ///
+    /// Every buffer row contributes exactly the column window
+    /// `[min(anchor.col, focus.col), max(anchor.col, focus.col)]`, with wide
+    /// leaders emitted once and spacers skipped. Unlike [`Self::text`] for
+    /// the other kinds, no edge trimming applies: the rectangle is preserved
+    /// verbatim so columnar pastes realign. Rows still in the live grid are
+    /// read from the current snapshot; history rows come from scrollback.
+    #[must_use]
+    pub fn block_text(&self, state: &bitty_term_state::State) -> Option<String> {
+        let (start_bp, end_bp) = self.ordered_buffer_endpoints(state)?;
+        let (col_min, col_max) = if start_bp.col <= end_bp.col {
+            (start_bp.col, end_bp.col)
+        } else {
+            (end_bp.col, start_bp.col)
+        };
+        let sb_len = state.scrollback_len();
+        let mut out = String::new();
+        for buffer_row in start_bp.buffer_row..=end_bp.buffer_row {
+            let (cells, width) = if buffer_row < sb_len {
+                if let Some(line) = state.scrollback_line(buffer_row) {
+                    (line.cells.clone(), line.cells.len())
+                } else {
+                    continue;
+                }
+            } else {
+                let snap = state.snapshot();
+                let grid_row = buffer_row - sb_len;
+                if grid_row >= snap.height {
+                    continue;
+                }
+                let start = grid_row * snap.width;
+                let end = start + snap.width;
+                if end > snap.cells.len() {
+                    continue;
+                }
+                (
+                    snap.cells[start..end].to_vec().into_boxed_slice(),
+                    snap.width,
+                )
+            };
+            let mut line = String::new();
+            let mut col = col_min as usize;
+            let col_end = col_max as usize;
+            while col <= col_end && col < width {
+                if let Some(cell) = cells.get(col) {
+                    if cell.spacer {
+                        col += 1;
+                        continue;
+                    }
+                    if cell.is_blank() {
+                        line.push(' ');
+                    } else {
+                        cell.push_text_into(&mut line);
+                    }
+                    if cell.width == 2 {
+                        col += 2;
+                        continue;
+                    }
+                }
+                col += 1;
             }
             out.push_str(&line);
             if buffer_row != end_bp.buffer_row {

@@ -277,6 +277,152 @@ fn vertical_block_drag_keeps_one_column() {
 }
 
 #[test]
+fn centre_press_uses_the_kitty_half_cell_caret_anchor() {
+    // Documented press-in-right-half semantics (issue #2480 review): the
+    // press caret is the nearest cell edge, exactly like kitty's
+    // `in_left_half_of_cell` selection boundaries. A press at the cell
+    // centre rounds to the trailing edge, so one cell of rightward travel
+    // selects the *next* cell while still selecting exactly one cell. A
+    // press on the leading edge selects the pressed cell instead. This is
+    // the deliberate half-open interval, not an off-by-one.
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let start = center_in_row(&rt, &frame, 1, 0);
+    let end = center_in_row(&rt, &frame, 2, 0);
+    drag(&mut rt, start, &[end]);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("c"),
+        "a centre press uses the trailing caret and selects the next cell"
+    );
+
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let start = left_edge(&rt, &frame, 1, 0);
+    let end = left_edge(&rt, &frame, 2, 0);
+    drag(&mut rt, start, &[end]);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("b"),
+        "a leading-edge press keeps the pressed cell"
+    );
+}
+
+#[test]
+fn single_cell_selection_survives_a_dpi_change() {
+    // Issue #2480 review: the collapsed inclusive range must not be dropped
+    // as empty by the geometry clamp that runs on DPI/resize.
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let start = left_edge(&rt, &frame, 1, 0);
+    let end = center_in_row(&rt, &frame, 1, 0);
+    drag(&mut rt, start, &[end]);
+    assert!(rt.selection_is_single_cell());
+    rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
+    assert!(
+        rt.has_selection(),
+        "a one-cell selection survives the DPI clamp"
+    );
+    assert!(
+        rt.selection_is_single_cell(),
+        "the deliberate one-cell flag survives the DPI clamp"
+    );
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("b"),
+        "the same character stays selected after scaling"
+    );
+    let stats = rt.tick().expect("the surviving selection must repaint");
+    assert!(stats.fills > 0);
+}
+
+#[test]
+fn one_cell_selection_survives_leaving_the_window_mid_drag() {
+    // Issue #2480 review: the cursor-left fallback ends the drag in place
+    // and must keep the deliberate one-cell selection, not drop it as a
+    // collapsed range.
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let start = left_edge(&rt, &frame, 1, 0);
+    let end = center_in_row(&rt, &frame, 1, 0);
+    rt.handle_platform_event(window_event(WindowEventKind::CursorMoved(start)));
+    rt.handle_platform_event(window_event(WindowEventKind::MouseInput(MouseEvent::new(
+        MouseButton::Left,
+        PressState::Pressed,
+    ))));
+    rt.handle_platform_event(window_event(WindowEventKind::CursorMoved(end)));
+    rt.handle_platform_event(window_event(WindowEventKind::CursorLeft));
+    assert!(!rt.is_selection_dragging(), "leaving ends the drag");
+    assert!(
+        rt.has_selection(),
+        "the one-cell selection stays after ending in place"
+    );
+    assert!(rt.selection_is_single_cell());
+    assert_eq!(rt.selection_text().as_deref(), Some("b"));
+}
+
+#[test]
+fn reverse_block_drag_keeps_both_endpoint_columns() {
+    // A leftward block drag keeps the pressed cell as the right edge, so the
+    // rectangle is symmetric with a rightward drag (issue #2523 reverse
+    // drags).
+    let mut rt = runtime_with_text(1.0, b"abcd\r\nefgh\r\nijkl");
+    let frame = primary_frame(&rt);
+    rt.handle_platform_event(window_event(WindowEventKind::ModifiersChanged(
+        bitty_platform::ModifiersState {
+            shift: false,
+            control: false,
+            alt: true,
+            super_pressed: false,
+        },
+    )));
+    let start = left_edge(&rt, &frame, 3, 0);
+    let end = left_edge(&rt, &frame, 1, 2);
+    drag(&mut rt, start, &[end]);
+    assert_eq!(rt.selection_text().as_deref(), Some("bcd\nfgh\njkl"));
+}
+
+#[test]
+fn plain_press_without_motion_is_not_a_selection() {
+    // Issue #2480 review: the press arms a collapsed buffer range so the
+    // drag can extend, but a click must not paint or copy a character before
+    // the pointer moves.
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let pos = left_edge(&rt, &frame, 1, 0);
+    rt.handle_platform_event(window_event(WindowEventKind::CursorMoved(pos)));
+    rt.handle_platform_event(window_event(WindowEventKind::MouseInput(MouseEvent::new(
+        MouseButton::Left,
+        PressState::Pressed,
+    ))));
+    assert!(rt.is_selection_dragging(), "the press arms the drag");
+    assert!(!rt.has_selection(), "a press alone is not a selection");
+    assert!(
+        rt.selection_text().is_none(),
+        "a press alone must not copy the cell under the pointer"
+    );
+}
+
+#[test]
+fn press_then_cursor_left_leaves_no_selection_text() {
+    let mut rt = runtime_at(1.0);
+    let frame = primary_frame(&rt);
+    let pos = left_edge(&rt, &frame, 1, 0);
+    rt.handle_platform_event(window_event(WindowEventKind::CursorMoved(pos)));
+    rt.handle_platform_event(window_event(WindowEventKind::MouseInput(MouseEvent::new(
+        MouseButton::Left,
+        PressState::Pressed,
+    ))));
+    rt.handle_platform_event(window_event(WindowEventKind::CursorLeft));
+    assert!(!rt.is_selection_dragging());
+    assert!(!rt.has_selection());
+    assert!(
+        rt.selection_text().is_none(),
+        "ending a click in place must not leave selectable text"
+    );
+}
+
+#[test]
 fn plain_click_still_clears_the_selection() {
     let mut rt = runtime_at(2.0);
     let frame = primary_frame(&rt);

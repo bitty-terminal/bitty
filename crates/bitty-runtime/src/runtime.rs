@@ -103,7 +103,7 @@ use bitty_render::{
     grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
-use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
+use bitty_term_state::{Cell, Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
     CellPos, FloatStore, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
     PinnedStore, Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View,

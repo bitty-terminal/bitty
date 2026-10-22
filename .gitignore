@@ -8,3 +8,14 @@ recording/
 # W-105: pinned validation-suite checkouts materialized by CI thin gates
 # (and local runs) at external/<suite>; never committed.
 /external/
+
+# Local tool caches and transient state (never tracked).
+/.targets/
+.carryctx/state.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+.DS_Store
+Thumbs.db

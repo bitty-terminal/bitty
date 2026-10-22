@@ -1815,37 +1815,47 @@ pub const MIN_PANE_ROWS: u16 = 4;
 /// Whether `rect` can be split at the balanced ratio along `axis` into two
 /// children that both meet the minimum pane size.
 ///
-/// The solver splits integer allocations, so the test is against the
-/// halved dimension (`width / 2 >= MIN_PANE_COLS`, `height / 2 >=
-/// MIN_PANE_ROWS`). Zero-area rects are never splittable. Pure and total.
+/// `gap_in` is the solver's inner gap: the split reserves one gap band
+/// between the children, so the usable extent is `dimension - gap_in` and the
+/// smaller child is half of that. A 20-cell pane with a 1-cell inner gap
+/// therefore yields a 9-cell child and is **not** splittable (issue #2521
+/// review). Zero-area rects are never splittable. Pure and total.
 #[must_use]
-pub fn splittable_rect(rect: Rect, axis: SplitAxis) -> bool {
+pub fn splittable_rect(rect: Rect, axis: SplitAxis, gap_in: u16) -> bool {
     if rect.width == 0 || rect.height == 0 {
         return false;
     }
-    match axis {
-        SplitAxis::Horizontal => rect.width / 2 >= MIN_PANE_COLS,
-        SplitAxis::Vertical => rect.height / 2 >= MIN_PANE_ROWS,
-    }
+    let total = match axis {
+        SplitAxis::Horizontal => u32::from(rect.width),
+        SplitAxis::Vertical => u32::from(rect.height),
+    };
+    // Mirror `split_rect`: the gap is clamped so at least one cell remains.
+    let gap = u32::from(gap_in).min(total.saturating_sub(1));
+    let available = total - gap;
+    let minimum = match axis {
+        SplitAxis::Horizontal => u32::from(MIN_PANE_COLS),
+        SplitAxis::Vertical => u32::from(MIN_PANE_ROWS),
+    };
+    available / 2 >= minimum
 }
 
 /// Balanced axis for `rect` that still meets the minimum pane size.
 ///
 /// Returns the [`balanced_split_axis`] when it fits, the perpendicular axis
 /// when only that one fits, and `None` when neither can host two usable
-/// children. Adaptive insertion uses this so a wide-but-short pane stacks
-/// instead of producing unreadable columns.
+/// children at the configured inner gap. Adaptive insertion uses this so a
+/// wide-but-short pane stacks instead of producing unreadable columns.
 #[must_use]
-pub fn splittable_axis(rect: Rect) -> Option<SplitAxis> {
+pub fn splittable_axis(rect: Rect, gap_in: u16) -> Option<SplitAxis> {
     let preferred = balanced_split_axis(rect);
-    if splittable_rect(rect, preferred) {
+    if splittable_rect(rect, preferred, gap_in) {
         return Some(preferred);
     }
     let fallback = match preferred {
         SplitAxis::Horizontal => SplitAxis::Vertical,
         SplitAxis::Vertical => SplitAxis::Horizontal,
     };
-    splittable_rect(rect, fallback).then_some(fallback)
+    splittable_rect(rect, fallback, gap_in).then_some(fallback)
 }
 
 /// Picks the tiled survivor that should receive focus after `closed` leaves
@@ -3575,7 +3585,7 @@ mod tests {
         for next in 2..=9 {
             let allocations = balanced.layout(Rect::new(0, 0, 80, 24));
             let (target, rect) = largest_area_leaf(&allocations).expect("a leaf to bisect");
-            let axis = splittable_axis(rect).expect("usable split");
+            let axis = splittable_axis(rect, 0).expect("usable split");
             let mut node = balanced.clone();
             fn split(
                 node: &mut LayoutNode,
@@ -3666,36 +3676,87 @@ mod tests {
         // 20x8 splits side-by-side into 10-wide halves (>= 10 cols).
         assert!(splittable_rect(
             Rect::new(0, 0, 20, 8),
-            SplitAxis::Horizontal
+            SplitAxis::Horizontal,
+            0
         ));
         // 18 wide cannot host two 10-wide halves.
         assert!(!splittable_rect(
             Rect::new(0, 0, 18, 8),
-            SplitAxis::Horizontal
+            SplitAxis::Horizontal,
+            0
         ));
         // 8 rows stack into two 4-row halves (>= 4 rows); 7 cannot.
-        assert!(splittable_rect(Rect::new(0, 0, 40, 8), SplitAxis::Vertical));
+        assert!(splittable_rect(
+            Rect::new(0, 0, 40, 8),
+            SplitAxis::Vertical,
+            0
+        ));
         assert!(!splittable_rect(
             Rect::new(0, 0, 40, 7),
-            SplitAxis::Vertical
+            SplitAxis::Vertical,
+            0
         ));
         // Zero-area panes are never splittable.
         assert!(!splittable_rect(
             Rect::new(0, 0, 0, 40),
-            SplitAxis::Horizontal
+            SplitAxis::Horizontal,
+            0
         ));
         // 40x8 prefers the balanced horizontal axis; a 16x8 pane prefers
         // vertical (smart aspect) and falls back to horizontal when only the
         // latter fits.
         assert_eq!(
-            splittable_axis(Rect::new(0, 0, 40, 8)),
+            splittable_axis(Rect::new(0, 0, 40, 8), 0),
             Some(SplitAxis::Horizontal)
         );
         assert_eq!(
-            splittable_axis(Rect::new(0, 0, 16, 8)),
+            splittable_axis(Rect::new(0, 0, 16, 8), 0),
             Some(SplitAxis::Vertical)
         );
-        assert_eq!(splittable_axis(Rect::new(0, 0, 16, 6)), None);
+        assert_eq!(splittable_axis(Rect::new(0, 0, 16, 6), 0), None);
+    }
+
+    /// Issue #2521 review: the inner gap consumes a cell before the balanced
+    /// split, so a 20-wide pane yields 9 + gap + 10 and must be refused.
+    #[test]
+    fn splittable_bounds_account_for_the_inner_gap() {
+        // 20 wide with one inner gap cell: available = 19 -> 9/10.
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 20, 24),
+            SplitAxis::Horizontal,
+            1
+        ));
+        // 21 wide: available = 20 -> 10/10 fits.
+        assert!(splittable_rect(
+            Rect::new(0, 0, 21, 24),
+            SplitAxis::Horizontal,
+            1
+        ));
+        // 9 rows with one gap: available = 8 -> two 4-row halves fit.
+        assert!(splittable_rect(
+            Rect::new(0, 0, 40, 9),
+            SplitAxis::Vertical,
+            1
+        ));
+        assert!(!splittable_rect(
+            Rect::new(0, 0, 40, 8),
+            SplitAxis::Vertical,
+            1
+        ));
+        // A 20x8 pane cannot host two usable panes at gap 1 on either axis:
+        // horizontal gives 9 columns, vertical gives 3 rows.
+        assert_eq!(splittable_axis(Rect::new(0, 0, 20, 8), 1), None);
+        // Without the gap the same pane still splits horizontally.
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 20, 8), 0),
+            Some(SplitAxis::Horizontal)
+        );
+        // A 20x24 pane stacks vertically at gap 1 (11 rows each), so no
+        // 9-column child can be produced.
+        assert_eq!(
+            splittable_axis(Rect::new(0, 0, 20, 24), 1),
+            Some(SplitAxis::Vertical)
+        );
     }
 
     /// Issue #2521: the leaf path and parent axis describe the tiling slot,

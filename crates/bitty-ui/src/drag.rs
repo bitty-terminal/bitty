@@ -455,7 +455,7 @@ pub fn drop_plan_for_point(
         (SplitAxis::Vertical, dist_bottom < dist_top)
     };
     // Never commit a split that leaves a child below the usable pane size.
-    if !splittable_rect(rect, axis) {
+    if !splittable_rect(rect, axis, gaps.inner) {
         return None;
     }
     Some(DropPlan::Insert(DropSpec::new(
@@ -1523,6 +1523,42 @@ mod tests {
         assert_eq!(
             next.leaf_ids(),
             vec![ViewId::new(1), ViewId::new(3), ViewId::new(2)]
+        );
+    }
+
+    /// Issue #2521 review: the minimum-size guard accounts for `gaps_in`.
+    /// A 20-wide pane at gap 1 would produce a 9-column child, so the plan
+    /// refuses instead of committing it.
+    #[test]
+    fn drop_plan_refuses_gap_reduced_split() {
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 20, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 20, 24)),
+        );
+        let bounds = Rect::new(0, 0, 40, 24);
+        // Without gaps the left edge of p1 splits into 10+10.
+        assert_eq!(
+            drop_plan_for_point(&tree, bounds, Gaps::ZERO, ViewId::new(2), Point::new(1, 12)),
+            Some(DropPlan::Insert(DropSpec::new(
+                ViewId::new(1),
+                SplitAxis::Horizontal,
+                DROP_INSERT_RATIO,
+                false
+            )))
+        );
+        // With a 1-cell inner gap the target is 19 wide: 9 + gap + 10.
+        assert_eq!(
+            drop_plan_for_point(
+                &tree,
+                bounds,
+                Gaps::new(1, 0),
+                ViewId::new(2),
+                Point::new(1, 12)
+            ),
+            None,
+            "a 9-column child must never be committed"
         );
     }
 

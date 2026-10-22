@@ -2402,6 +2402,23 @@ impl Runtime {
         // the new tree. The close's own layout change remains; only the drop
         // is abandoned.
         self.cancel_tiled_drag();
+        // Issue #2528 review: any close ends the active creation chain, even
+        // when the closed pane was not focused. Otherwise a stale Left/Top
+        // spiral phase would still steer the next Mod+N.
+        if closed.is_some() {
+            self.panel_spiral = None;
+        }
+        // Issue #2521 review: when the closed pane held focus, the survivor
+        // must come from the *outgoing* tree's sibling rule (the pane that
+        // expands into the vacated slot). Shell exit, editor teardown, and
+        // workspace close all install the new tree through this funnel
+        // without pre-setting focus; falling back to the incoming tree's
+        // first leaf here felt random and bypassed the keymap rule.
+        let closed_survivor = closed.and_then(|closed_view| {
+            (self.focus.focused() == Some(closed_view))
+                .then(|| bitty_ui::survivor_after_close(&self.layout, closed_view))
+                .flatten()
+        });
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
@@ -2426,7 +2443,14 @@ impl Runtime {
             self.focus.clear();
         } else if let Some(focused) = self.focus.focused() {
             if !leaf_ids.contains(&focused) {
-                self.focus.set(leaf_ids[0]);
+                // Issue #2521 review: prefer the outgoing tree's sibling
+                // survivor when the closed pane held focus; only fall back
+                // to the incoming tree's first leaf when it is absent (for
+                // example a caller that closed a non-focused pane).
+                let survivor = closed_survivor
+                    .filter(|id| leaf_ids.contains(id))
+                    .unwrap_or(leaf_ids[0]);
+                self.focus.set(survivor);
             }
         } else {
             self.focus.set(leaf_ids[0]);
@@ -2845,6 +2869,7 @@ impl Runtime {
     }
 
     fn panel_split_plan_for(&self, focused: ViewId) -> Option<PanelSplitPlan> {
+        let gap_in = self.gaps().inner;
         let allocations = self.layout_allocations();
         let focused_rect = allocations
             .iter()
@@ -2854,7 +2879,7 @@ impl Runtime {
         let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
             PanelLayoutMode::Balanced => {
                 let (target, rect) = largest_area_leaf(&allocations)?;
-                (target, rect, splittable_axis(rect)?, false, None)
+                (target, rect, splittable_axis(rect, gap_in)?, false, None)
             }
             PanelLayoutMode::BisectLargest => {
                 let (target, rect) = largest_area_leaf(&allocations)?;
@@ -2864,7 +2889,7 @@ impl Runtime {
             PanelLayoutMode::Dwindle => (
                 focused,
                 focused_rect,
-                splittable_axis(focused_rect)?,
+                splittable_axis(focused_rect, gap_in)?,
                 false,
                 None,
             ),
@@ -2873,13 +2898,13 @@ impl Runtime {
                 (
                     focused,
                     focused_rect,
-                    splittable_axis(focused_rect)?,
+                    splittable_axis(focused_rect, gap_in)?,
                     phase >= 2,
                     Some(phase),
                 )
             }
         };
-        if !splittable_rect(rect, axis) {
+        if !splittable_rect(rect, axis, gap_in) {
             return None;
         }
         Some(PanelSplitPlan {
@@ -3425,6 +3450,156 @@ mod tests {
         ));
         rt.set_container(UiRect::new(0, 0, 32, 6));
         assert_eq!(rt.panel_split_plan(), None);
+    }
+
+    /// Issue #2521 review: the adaptive plan honours `gaps_in` when it
+    /// decides whether two usable children fit. A 20-wide pane at gap 1
+    /// would give 9 + gap + 10, so no plan may produce that 9-column child.
+    #[test]
+    fn balanced_plan_accounts_for_inner_gaps() {
+        let config = RuntimeConfig {
+            gaps_in: 1,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = Runtime::new(config).expect("runtime");
+        let focused = rt.focused_view().expect("focus");
+        rt.set_container(UiRect::new(0, 0, 20, 8));
+        rt.set_layout(LayoutNode::leaf(View::new(focused, 20, 8)));
+        assert_eq!(
+            rt.panel_split_plan(),
+            None,
+            "20 wide at gap 1 yields a 9-column child"
+        );
+
+        // One extra column makes the split usable (10 + gap + 10).
+        let config = RuntimeConfig {
+            gaps_in: 1,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = Runtime::new(config).expect("runtime");
+        let focused = rt.focused_view().expect("focus");
+        rt.set_container(UiRect::new(0, 0, 21, 8));
+        rt.set_layout(LayoutNode::leaf(View::new(focused, 21, 8)));
+        let plan = rt.panel_split_plan().expect("21 wide fits");
+        assert_eq!(plan.axis, SplitAxis::Horizontal);
+        assert!(!plan.place_new_first);
+
+        // A 20x24 pane still stacks vertically at gap 1 (11 rows each), so
+        // the horizontal 9-column child is never chosen.
+        let config = RuntimeConfig {
+            gaps_in: 1,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = Runtime::new(config).expect("runtime");
+        let focused = rt.focused_view().expect("focus");
+        rt.set_container(UiRect::new(0, 0, 20, 24));
+        rt.set_layout(LayoutNode::leaf(View::new(focused, 20, 24)));
+        let plan = rt.panel_split_plan().expect("20x24 stacks");
+        assert_eq!(plan.axis, SplitAxis::Vertical);
+        assert!(!plan.place_new_first);
+    }
+
+    /// Issue #2521 review: shell exit, editor teardown, and workspace close
+    /// install the tree through `set_layout_closing` without pre-setting
+    /// focus. When the closed pane held focus the runtime must pick the
+    /// outgoing tree's expanding sibling, and the primary owner must
+    /// re-home to that survivor.
+    #[test]
+    fn closing_the_focused_pane_focuses_the_expanding_sibling() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        // 1 = full-height left, 2 = top-right, 3 = bottom-right.
+        let first = ViewId::new(1);
+        let second = ViewId::new(2);
+        let third = ViewId::new(3);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(first, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(second, 40, 12)),
+                LayoutNode::leaf(View::new(third, 40, 12)),
+            ),
+        ));
+        assert!(rt.set_focus(second));
+        rt.primary_view = Some(second);
+
+        // Close the focused top-right pane exactly like the reap/editor
+        // funnels: remove it from the tree, install through the close
+        // funnel, and do NOT set focus first.
+        let mut after = rt.layout().clone();
+        assert!(after.remove_leaf(second).is_some());
+        rt.set_layout_closing(after, second);
+
+        assert_eq!(
+            rt.focused_view(),
+            Some(third),
+            "the sibling that expands into the slot takes focus"
+        );
+        assert_eq!(rt.primary_view, Some(third), "primary re-homes to it");
+        assert!(rt.paints_primary_grid(&third));
+        assert!(!rt.paints_primary_grid(&second));
+
+        // Closing a non-focused pane must not move focus or ownership.
+        assert!(rt.set_focus(third));
+        let mut after = rt.layout().clone();
+        assert!(after.remove_leaf(first).is_some());
+        rt.set_layout_closing(after, first);
+        assert_eq!(rt.focused_view(), Some(third));
+        assert_eq!(rt.primary_view, Some(third));
+    }
+
+    /// Issue #2528 review: closing any neighbor (left/right/top/bottom)
+    /// ends the creation chain even when the created pane keeps focus, so
+    /// the next Mod+N starts again at Right instead of a stale Left/Top
+    /// phase.
+    #[test]
+    fn spiral_phase_clears_on_a_non_focused_close() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        // 1 = left, 2 = top-right, 3 = bottom-left, 4 = bottom-right.
+        let layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::split(
+                    SplitAxis::Horizontal,
+                    0.5,
+                    LayoutNode::leaf(View::new(ViewId::new(3), 20, 12)),
+                    LayoutNode::leaf(View::new(ViewId::new(4), 20, 12)),
+                ),
+            ),
+        );
+        rt.set_layout(layout);
+        let created = ViewId::new(3);
+        assert!(rt.set_focus(created));
+        // Prime a left/top phase for the created pane.
+        rt.note_panel_split_created(created, Some(2));
+        let plan = rt.panel_split_plan().expect("plan");
+        assert_eq!(plan.spiral_phase, Some(3));
+        assert!(plan.place_new_first, "stale chain would split left/top");
+
+        // Close each neighboring pane while focus stays on `created`.
+        for neighbor in [ViewId::new(1), ViewId::new(2), ViewId::new(4)] {
+            let mut after = rt.layout().clone();
+            assert!(after.remove_leaf(neighbor).is_some());
+            rt.set_layout_closing(after, neighbor);
+            assert_eq!(rt.focused_view(), Some(created), "focus is untouched");
+            let plan = rt.panel_split_plan().expect("plan after close");
+            assert_eq!(
+                plan.spiral_phase,
+                Some(0),
+                "close of {neighbor:?} must reset the chain"
+            );
+            assert!(!plan.place_new_first, "next split goes right/down");
+            // Re-prime for the next neighbor in the loop.
+            rt.note_panel_split_created(created, Some(2));
+        }
     }
 
     #[test]

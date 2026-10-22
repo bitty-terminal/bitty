@@ -437,7 +437,7 @@ fn balanced_eight_panels() -> LayoutNode {
     for next in 2..=9u64 {
         let allocations = tree.layout(CONTAINER);
         let (target, rect) = largest_area_leaf(&allocations).expect("a leaf");
-        let axis = splittable_axis(rect).expect("usable split");
+        let axis = splittable_axis(rect, 0).expect("usable split");
         assert!(split(&mut tree, target, axis, ViewId::new(next), false));
     }
     tree
@@ -518,7 +518,7 @@ fn runtime_plan_matches_balanced_evidence_builder() {
         let allocations = tree.layout(CONTAINER);
         let (target, rect) = largest_area_leaf(&allocations).expect("a leaf");
         assert_eq!(plan.target, target);
-        assert_eq!(plan.axis, splittable_axis(rect).expect("usable"));
+        assert_eq!(plan.axis, splittable_axis(rect, 0).expect("usable"));
         assert!(split(
             &mut tree,
             plan.target,

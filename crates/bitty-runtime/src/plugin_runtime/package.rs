@@ -23,7 +23,9 @@
 //! immutable: a digest mismatch is a store integrity failure and fails closed.
 //!
 //! `git` and registry sources remain with the package-manager follow-up; the
-//! CLI rejects them explicitly instead of pretending to resolve them.
+//! CLI rejects them explicitly instead of pretending to resolve them. The
+//! official-catalog path stages a pinned git checkout through the same
+//! pipeline and records [`SourceClass::Registry`] provenance.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -91,6 +93,14 @@ pub struct LocalInstallOptions {
     /// (PLUG-REG-009). When `Some(state)`, explicitly forces the record's
     /// `enabled` state to `state`.
     pub explicit_override: Option<bool>,
+
+    /// Provenance class recorded for the staged package.
+    ///
+    /// Defaults to [`SourceClass::LocalPath`] for CLI directory/git/archive
+    /// installs. The official-catalog install path sets
+    /// [`SourceClass::Registry`] after verifying the registry's pinned
+    /// revision and manifest hash; the store transaction itself is identical.
+    pub source_class: SourceClass,
 }
 
 impl Default for LocalInstallOptions {
@@ -98,6 +108,7 @@ impl Default for LocalInstallOptions {
         Self {
             enable: true,
             explicit_override: None,
+            source_class: SourceClass::LocalPath,
         }
     }
 }
@@ -111,6 +122,7 @@ impl LocalInstallOptions {
         Self {
             enable: false,
             explicit_override: None,
+            source_class: SourceClass::LocalPath,
         }
     }
 }
@@ -563,7 +575,7 @@ pub fn install_local_dir(
     let mut updated_records = current_records;
     updated_records.retain(|record| record.plugin_id != plugin_id);
     updated_records.push(PluginRecord {
-        source_class: SourceClass::LocalPath,
+        source_class: options.source_class,
         plugin_id: plugin_id.clone(),
         version: version.clone(),
         root: root.clone(),
@@ -623,7 +635,7 @@ pub fn install_local_dir(
     Ok(Some(InstallReport {
         plugin_id,
         version,
-        source_class: SourceClass::LocalPath,
+        source_class: options.source_class,
         manifest_hash,
         content_digest,
         root,
@@ -715,6 +727,23 @@ pub fn uninstall(store_root: &Path, plugin_id: &str) -> Result<UninstallReport, 
 /// Verify `compat.bitty` and `compat.plugin-api` include this host.
 fn check_compat(manifest: &PluginManifest) -> Result<(), PackageOpError> {
     check_compat_with_hosts(manifest, host_bitty_version(), bitty_lua::host::API_VERSION)
+}
+
+/// Evaluate declared compatibility ranges against the running host.
+///
+/// Public entry point for callers that resolve compatibility *before* a
+/// package body exists (the embedded official catalog). It uses the same
+/// closed requirement grammar and the same host versions as install and
+/// activation, so a catalog pre-check can never disagree with the package
+/// pipeline. The returned error is [`PackageOpError::Incompatible`] with the
+/// exact declared range and evaluated host version.
+pub fn check_declared_compat(
+    plugin: &str,
+    bitty_req: Option<&str>,
+    api_req: Option<&str>,
+) -> Result<(), PackageOpError> {
+    evaluate_compat(bitty_req, api_req, host_bitty_version(), host_api_version())
+        .map_err(|failure| compat_failure_to_op(plugin, failure))
 }
 
 /// Running host Bitty version used for compat evaluation.
@@ -811,24 +840,27 @@ pub(crate) fn check_compat_with_hosts(
         host_bitty,
         host_api,
     )
-    .map_err(|failure| {
-        let plugin = manifest.identity.id.as_str().to_string();
-        match failure {
-            CompatFailure::Invalid { field: _, detail } => {
-                PackageOpError::Manifest { plugin, detail }
-            }
-            CompatFailure::Incompatible {
-                field,
-                requested,
-                host,
-            } => PackageOpError::Incompatible {
-                plugin,
-                field,
-                requested,
-                host,
-            },
-        }
-    })
+    .map_err(|failure| compat_failure_to_op(manifest.identity.id.as_str(), failure))
+}
+
+/// Map a structured compat failure to the installer's error type.
+fn compat_failure_to_op(plugin: &str, failure: CompatFailure) -> PackageOpError {
+    match failure {
+        CompatFailure::Invalid { field: _, detail } => PackageOpError::Manifest {
+            plugin: plugin.to_string(),
+            detail,
+        },
+        CompatFailure::Incompatible {
+            field,
+            requested,
+            host,
+        } => PackageOpError::Incompatible {
+            plugin: plugin.to_string(),
+            field,
+            requested,
+            host,
+        },
+    }
 }
 
 /// Pad partial comparator operands to `X.Y.Z`.
@@ -1703,6 +1735,7 @@ mod tests {
         let opts_force_enable = LocalInstallOptions {
             enable: false,
             explicit_override: Some(true),
+            ..LocalInstallOptions::default()
         };
         install_local_dir(&store, &source_v2, &opts_force_enable, &mut |_| Ok(true))
             .expect("update")
@@ -1719,6 +1752,7 @@ mod tests {
         let opts_force_disable = LocalInstallOptions {
             enable: true,
             explicit_override: Some(false),
+            ..LocalInstallOptions::default()
         };
         install_local_dir(&store, &source_v2, &opts_force_disable, &mut |_| Ok(true))
             .expect("reinstall")

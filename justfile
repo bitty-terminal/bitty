@@ -211,6 +211,21 @@ compat-freshness:
 compat-freshness-test:
     ./scripts/tests/check-compat-fixture-freshness.test.sh
 
+# Regenerate the embedded official plugin catalog from bitty-plugins
+# (registry/official/*.toml + plugins/* gitlinks). Resolution order:
+# --registry DIR, BITTY_PLUGINS_DIR, $BITTY_WORKSPACE/bitty-plugins, then
+# ../bitty-plugins; the source revision is --revision, BITTY_PLUGINS_REV
+# (validation-pins.env), or HEAD. Commit the generated file; Core never
+# fetches registry metadata at runtime.
+catalog-generate *args:
+    python3 scripts/generate-official-catalog.py {{ args }}
+
+# Fail when the checked-in official catalog differs from the pinned
+# bitty-plugins revision. CI checks out the validation pin under
+# external/bitty-plugins and runs this read-only gate.
+catalog-check *args:
+    python3 scripts/generate-official-catalog.py --check {{ args }}
+
 scratch-paths:
     ./scripts/check-scratch-paths.sh
 
@@ -417,7 +432,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-check
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

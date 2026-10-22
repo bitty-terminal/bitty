@@ -12,12 +12,19 @@
 //! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info|config`
 //!   with `list`/`info`/`config show` accepting `--format table|json|jsonl`
 //!   (default table) and `--no-color` (accepted; tables are plain text).
-//! - `install <id>` resolves a **bundled** plugin manifest, pins its
-//!   `PluginManifest::manifest_hash()`, and grants the requested capability
-//!   set only after explicit consent (`--yes`, or an interactive `[y/N]`
-//!   prompt that fails closed on EOF). A capability increase on an existing
-//!   record blocks until approved; unchanged or narrowed sets carry forward
-//!   silently (the P0-AC-030 pattern over `bitty-plugin-host` grants).
+//! - `install <id>` resolves an exact id against the **bundled** catalog or
+//!   the build-time **official** catalog embedded from bitty-plugins
+//!   (`bitty_plugin_host::official`). Bundled ids pin
+//!   `PluginManifest::manifest_hash()`; official ids carry the registry
+//!   repository, pinned commit, raw `bitty-plugin.toml` `sha256`, and declared
+//!   compatibility, so resolution needs no network metadata request. An
+//!   official entry that excludes this host is refused with the exact range
+//!   before any fetch; an installable one fetches exactly the pinned commit,
+//!   verifies the raw manifest hash, then runs the package pipeline with
+//!   `registry` provenance and the same capability consent. A capability
+//!   increase on an existing record blocks until approved; unchanged or
+//!   narrowed sets carry forward silently (the P0-AC-030 pattern over
+//!   `bitty-plugin-host` grants).
 //! - `install <path>` installs (or updates) an **external** package from a
 //!   local directory into the XDG data store
 //!   (`$XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/`): manifest,
@@ -43,10 +50,12 @@
 //!   dropping the record: a full revoke clears the granted set and disables,
 //!   a `--cap` revoke drops one capability and remembers it as an explicit
 //!   denial (no silent re-prompt); re-grant goes through `install` consent.
-//! - `list` shows every bundled plugin plus any recorded or installed extra,
-//!   with source, state (`enabled`/`disabled`/`available`), pin status, and
-//!   granted/requested capability counts. `info` shows one plugin's manifest
-//!   plus the recorded grants and their plain-language effect statements.
+//! - `list` shows every bundled plugin, every embedded official catalog entry
+//!   (`available`, or `incompatible` when the declared range excludes this
+//!   host), and any recorded or installed extra, with source, state, pin
+//!   status, and granted/requested capability counts. `info` shows one
+//!   plugin's manifest plus the recorded grants and their plain-language
+//!   effect statements.
 //! - `install` and `enable` success prints post-install next steps (CTX-1268,
 //!   issue #2144; issue #2374): the enable command, where the plugin landed,
 //!   the canonical Lua settings path (`<config-root>/plugins/<owner>.<name>.lua`),
@@ -122,16 +131,17 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use bitty_config::plugin_file::PLUGINS_DIR_NAME;
-use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_manifest_for};
+use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
 use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
 use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl, SettingDefault};
+use bitty_plugin_host::official::{OfficialPlugin, official_plugin_for, official_plugins};
 use bitty_runtime::plugin_runtime::plugin_settings::{
     self, LoadedPluginSettings, PluginConfigKind, PluginConfigPaths, SelectedPluginFile,
     SettingLayer,
 };
 use bitty_runtime::plugin_runtime::{
-    load_index, manifest_toml,
+    PLUGIN_MANIFEST_MAX_BYTES, SourceClass, load_index, manifest_toml,
     package::{self, LocalInstallOptions, PackageOpError},
 };
 
@@ -606,7 +616,7 @@ pub fn parse_plugin_request(
 #[must_use]
 pub fn plugin_usage() -> String {
     "usage: bitty plugin list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty plugin install <id> [--yes]\n\
+     \x20      bitty plugin install <id> [--yes]   (bundled id or official catalog id)\n\
      \x20      bitty plugin install <path> [--yes]   (local directory package)\n\
      \x20      bitty plugin install <git-url> [--yes]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
      \x20      bitty plugin install <archive> [--yes]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
@@ -636,13 +646,19 @@ pub fn plugin_help_text() -> String {
      usage: bitty plugin <verb> [args] [flags]\n\
      \n\
      verbs:\n\
-     \x20 list                        Show bundled + installed plugins: source,\n\
-     \x20                             state, pin status, granted/requested\n\
-     \x20                             capabilities.\n\
-     \x20 install <id> [--yes]        Resolve a bundled manifest, pin its hash,\n\
-     \x20                             and grant requested capabilities after\n\
-     \x20                             explicit consent. --yes approves without a\n\
-     \x20                             prompt.\n\
+     \x20 list                        Show bundled, official-catalog, and installed\n\
+     \x20                             plugins: source, state, pin status,\n\
+     \x20                             granted/requested capabilities.\n\
+     \x20 install <id> [--yes]        Resolve an exact id against the bundled\n\
+     \x20                             catalog or the build-time official catalog.\n\
+     \x20                             Official ids come from a pinned, hash-\n\
+     \x20                             verified catalog generated from bitty-\n\
+     \x20                             plugins (no runtime metadata fetch), and\n\
+     \x20                             are installed from the pinned commit.\n\
+     \x20                             Incompatible entries are refused with the\n\
+     \x20                             exact declared range before any fetch.\n\
+     \x20                             Capabilities need explicit consent; --yes\n\
+     \x20                             approves without a prompt.\n\
      \x20 install <path> [--yes]      Install or update an external package from\n\
      \x20                             a local directory containing\n\
      \x20                             bitty-plugin.toml (lua/ module root). The\n\
@@ -725,10 +741,12 @@ pub fn plugin_help_text() -> String {
      \x20 capability is granted only when the manifest requests it and consent\n\
      \x20 is explicit; grants are bound to the exact manifest hash, so a later\n\
      \x20 manifest that adds a capability blocks until re-approved. Installed\n\
-     \x20 packages come from local directories, git checkouts, or local\n\
-     \x20 archives (source class `local-path`), are stored under\n\
-     \x20 packages/<id>/<version>/ with an owner-only mode, and load as\n\
-     \x20 visibly unverified third-party packages.\n\
+     \x20 packages come from local directories, git checkouts, local archives\n\
+     \x20 (source class `local-path`), or the embedded official catalog\n\
+     \x20 (source class `registry`, pinned commit + raw manifest hash verified),\n\
+     \x20 are stored under packages/<id>/<version>/ with an owner-only mode, and\n\
+     \x20 load as third-party packages. The official catalog is build-time data:\n\
+     \x20 Core never fetches registry metadata at runtime.\n\
      \n\
      wiring (where things land, what to edit next):\n\
      \x20 The managed manifest lives beside the config file:\n\
@@ -778,6 +796,7 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
+     \x20 bitty plugin install bitty-terminal.bar --yes   (official catalog id)\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
      \x20 bitty plugin install git+https://example.com/my-plugin.git --yes\n\
@@ -1662,6 +1681,20 @@ fn rows_from_state(
     state: &PluginState,
     store_root: Option<&Path>,
 ) -> Result<Vec<PluginRow>, PluginFailure> {
+    rows_from_state_with_catalog(state, store_root, true)
+}
+
+/// Build plugin rows, optionally appending the embedded official catalog.
+///
+/// `bitty plugin list`/`info` include not-yet-installed official entries;
+/// read-only runtime inspection keeps its existing bundled + recorded +
+/// installed contract and never advertises catalog entries a plugin panel
+/// cannot install.
+fn rows_from_state_with_catalog(
+    state: &PluginState,
+    store_root: Option<&Path>,
+    include_official: bool,
+) -> Result<Vec<PluginRow>, PluginFailure> {
     let mut rows: Vec<PluginRow> = Vec::new();
     let mut manifests = all_bundled_manifests();
     manifests.sort_by_key(|manifest| manifest.id().as_str().to_string());
@@ -1765,6 +1798,56 @@ fn rows_from_state(
         }
     }
 
+    // Official catalog entries that are neither installed nor recorded are
+    // listed as available (or incompatible) so `plugin list` and `info` show
+    // the installable set without a network metadata fetch. The catalog is
+    // compiled-in data; compatibility is evaluated against the running host.
+    if include_official {
+        for entry in official_plugins() {
+            if seen.contains(entry.id) {
+                continue;
+            }
+            seen.insert(entry.id.to_string());
+            let compatible = package::check_declared_compat(
+                entry.id,
+                entry.compat_bitty,
+                entry.compat_plugin_api,
+            )
+            .is_ok();
+            let description = if compatible {
+                entry.description.to_string()
+            } else {
+                format!(
+                    "{} [not installable on this host: compat.bitty '{}']",
+                    entry.description,
+                    entry.compat_bitty.unwrap_or("-")
+                )
+            };
+            rows.push(PluginRow {
+                id: entry.id.to_string(),
+                name: entry.name.to_string(),
+                version: "-".to_string(),
+                description,
+                bundled: false,
+                source: "registry".to_string(),
+                state: if compatible {
+                    "available"
+                } else {
+                    "incompatible"
+                },
+                enabled: false,
+                recorded: false,
+                pin_ok: None,
+                requested: BTreeSet::new(),
+                granted: BTreeSet::new(),
+                denied: BTreeSet::new(),
+                commands: Vec::new(),
+                manifest_hash: Some(entry.manifest_hash.to_string()),
+                settings: Vec::new(),
+            });
+        }
+    }
+
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(rows)
 }
@@ -1782,7 +1865,7 @@ pub(crate) fn rows_for_inspect(
     state: &PluginState,
     store_root: Option<&Path>,
 ) -> Result<Vec<PluginRow>, String> {
-    rows_from_state(state, store_root).map_err(|failure| failure.message)
+    rows_from_state_with_catalog(state, store_root, false).map_err(|failure| failure.message)
 }
 
 /// Read the store index, mapping any failure to a read-only plugin error.
@@ -1915,7 +1998,7 @@ fn format_list_table(rows: &[PluginRow], no_color: bool) -> String {
     let color = color_enabled(no_color);
     let mut out = String::new();
     let header = format!(
-        "{:<32} {:<10} {:<11} {:<6} {:>8}  {}",
+        "{:<32} {:<10} {:<12} {:<6} {:>8}  {}",
         "ID", "SOURCE", "STATE", "PIN", "GRANTED", "VERSION"
     );
     let _ = writeln!(out, "{}", bold(&header, color));
@@ -1923,7 +2006,7 @@ fn format_list_table(rows: &[PluginRow], no_color: bool) -> String {
         let granted = format!("{}/{}", row.granted.len(), row.requested.len());
         let _ = writeln!(
             out,
-            "{:<32} {:<10} {:<11} {:<6} {:>8}  {}",
+            "{:<32} {:<10} {:<12} {:<6} {:>8}  {}",
             row.id,
             row.source,
             row.state,
@@ -2880,6 +2963,19 @@ pub fn run_plugin_subcommand(
         }
         PluginVerb::Install => {
             let operand = request.id.as_deref().expect("install requires an operand");
+            // Exact catalog ids win over path heuristics so a same-named
+            // directory in the cwd cannot shadow an official id; a local
+            // package with that name is still reachable as `./<name>`.
+            if let Some(entry) = official_plugin_for(operand) {
+                return install_official(
+                    &request,
+                    entry,
+                    store_root.as_deref(),
+                    config_dir.as_deref(),
+                    input,
+                    output,
+                );
+            }
             if is_source_operand(operand) {
                 return install_source(
                     &request,
@@ -3519,6 +3615,91 @@ fn run_git_clone(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Run one fixed-argv git command with repository-location scrubbing.
+fn run_git_checked(argv: &[String], what: &str) -> Result<std::process::Output, String> {
+    let output = run_fetch_tool_full("git", argv, &[("GIT_TERMINAL_PROMPT", "0")], true)?;
+    if !output.status.success() {
+        let tail = fetch_stderr_tail(&output.stderr);
+        return Err(format!(
+            "bitty plugin: {what} failed ({}; {tail})",
+            output.status
+        ));
+    }
+    Ok(output)
+}
+
+/// Prepare `dest` as a shallow checkout of exactly `pin` from `url`.
+///
+/// `git init` + `remote add` + `fetch --depth=1 origin <pin>` + detached
+/// `checkout` avoids cloning unrelated branch history while still accepting
+/// a pin that is older than the default-branch tip. Every argv element is
+/// inert data; the URL already passed the CLI allowlist and the pin is the
+/// catalog's 40-hex gitlink. The caller re-reads `HEAD` and compares it to
+/// `pin` before reading any manifest bytes.
+fn run_git_fetch_pinned(url: &str, pin: &str, dest: &Path) -> Result<(), String> {
+    let dest_arg = dest.to_string_lossy().into_owned();
+    run_git_checked(
+        &[
+            "init".to_string(),
+            "--quiet".to_string(),
+            "--".to_string(),
+            dest_arg.clone(),
+        ],
+        "`git init`",
+    )?;
+    run_git_checked(
+        &[
+            "-C".to_string(),
+            dest_arg.clone(),
+            "remote".to_string(),
+            "add".to_string(),
+            "origin".to_string(),
+            url.to_string(),
+        ],
+        "`git remote add`",
+    )?;
+    run_git_checked(
+        &[
+            "-C".to_string(),
+            dest_arg.clone(),
+            "fetch".to_string(),
+            "--quiet".to_string(),
+            "--depth=1".to_string(),
+            "--no-tags".to_string(),
+            "origin".to_string(),
+            pin.to_string(),
+        ],
+        "`git fetch` of the pinned commit",
+    )?;
+    run_git_checked(
+        &[
+            "-C".to_string(),
+            dest_arg,
+            "-c".to_string(),
+            "advice.detachedHead=false".to_string(),
+            "checkout".to_string(),
+            "--quiet".to_string(),
+            "--detach".to_string(),
+            pin.to_string(),
+        ],
+        "`git checkout` of the pinned commit",
+    )?;
+    Ok(())
+}
+
+/// Read `HEAD` from a prepared checkout (`git rev-parse --verify HEAD`).
+fn run_git_head(checkout: &Path) -> Result<String, String> {
+    let argv = vec![
+        "-C".to_string(),
+        checkout.to_string_lossy().into_owned(),
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "HEAD".to_string(),
+    ];
+    let output = run_git_checked(&argv, "`git rev-parse`")?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// List tar members (names only, never extracted here).
 fn list_tar_members(archive: &Path, kind: ArchiveKind) -> Result<Vec<String>, String> {
     let archive_arg = archive.to_string_lossy().into_owned();
@@ -4090,6 +4271,7 @@ fn install_source(
         request,
         source,
         Path::new(source),
+        &LocalInstallOptions::staged_and_disabled(),
         store_root,
         config_dir,
         input,
@@ -4151,6 +4333,167 @@ fn reject_fetch_scheme(source: &str) -> i32 {
     EXIT_PLUGIN
 }
 
+/// Install one official plugin by exact catalog id.
+///
+/// Resolution is fully local: the embedded catalog supplies the repository,
+/// pinned commit, registry manifest hash, and declared compatibility. The
+/// flow is:
+///
+/// 1. evaluate `compat.bitty` / `compatibility.sdk` against this host before
+///    any fetch and refuse with the exact declared range;
+/// 2. fetch exactly the pinned commit into exclusive staging (no branch
+///    drift);
+/// 3. re-read `HEAD` and fail closed on a pin mismatch;
+/// 4. hash the raw `bitty-plugin.toml` bytes and fail closed on a registry
+///    manifest-hash mismatch;
+/// 5. run the existing package pipeline (manifest/schema/entry-point bounds,
+///    compat re-check, capability consent, atomic store transaction) with
+///    [`SourceClass::Registry`] provenance.
+///
+/// No plugin code runs and no store/ledger byte is written before the hash,
+/// pin, compat, and consent gates pass.
+fn install_official(
+    request: &PluginRequest,
+    entry: &'static OfficialPlugin,
+    store_root: Option<&Path>,
+    config_dir: Option<&Path>,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let Some(store_root) = store_root else {
+        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        return EXIT_USAGE;
+    };
+    // Catalog compatibility is known before any network access: an entry
+    // that excludes this host (statusline on 0.0.26) must be refused with the
+    // exact declared range, not a fetch or a manifest-parse diagnostic.
+    if let Err(error) =
+        package::check_declared_compat(entry.id, entry.compat_bitty, entry.compat_plugin_api)
+    {
+        eprintln!("bitty plugin: {error}");
+        return EXIT_PLUGIN;
+    }
+    // The catalog is compiled in, but treat its strings as untrusted input:
+    // the repository must pass the CLI git allowlist and the pin must be a
+    // 40-hex commit before either reaches an argv.
+    if !is_valid_https_git_url(entry.repository) {
+        eprintln!(
+            "bitty plugin: official catalog entry '{}' has an invalid repository URL; nothing installed",
+            entry.id
+        );
+        return EXIT_PLUGIN;
+    }
+    if !is_lower_hex(entry.pin, 40) {
+        eprintln!(
+            "bitty plugin: official catalog entry '{}' has an invalid pin; nothing installed",
+            entry.id
+        );
+        return EXIT_PLUGIN;
+    }
+    let staging = match ScopedFetchDir::create("official") {
+        Ok(staging) => staging,
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_GENERIC;
+        }
+    };
+    let checkout = staging.path.join("src");
+    if let Err(message) = run_git_fetch_pinned(entry.repository, entry.pin, &checkout) {
+        eprintln!("{message}");
+        return EXIT_GENERIC;
+    }
+    match run_git_head(&checkout) {
+        Ok(head) if head == entry.pin => {}
+        Ok(head) => {
+            eprintln!(
+                "bitty plugin: official catalog pin mismatch for '{}': catalog {}, checkout {}; nothing installed",
+                entry.id,
+                short_hash(entry.pin),
+                short_hash(&head)
+            );
+            return EXIT_PLUGIN;
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_GENERIC;
+        }
+    }
+    let manifest_path = checkout.join(package::MANIFEST_FILE_NAME);
+    match std::fs::metadata(&manifest_path) {
+        Ok(metadata) if metadata.len() as usize <= PLUGIN_MANIFEST_MAX_BYTES => {}
+        Ok(metadata) => {
+            eprintln!(
+                "bitty plugin: official '{}' manifest is {} bytes (limit {PLUGIN_MANIFEST_MAX_BYTES}); nothing installed",
+                entry.id,
+                metadata.len()
+            );
+            return EXIT_PLUGIN;
+        }
+        Err(error) => {
+            eprintln!(
+                "bitty plugin: official '{}' has no readable {}: {error}; nothing installed",
+                entry.id,
+                package::MANIFEST_FILE_NAME
+            );
+            return EXIT_PLUGIN;
+        }
+    }
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "bitty plugin: official '{}' cannot read {}: {error}; nothing installed",
+                entry.id,
+                package::MANIFEST_FILE_NAME
+            );
+            return EXIT_PLUGIN;
+        }
+    };
+    let actual = bitty_package::integrity::sha256_hex(&bytes);
+    if actual != entry.manifest_sha256() {
+        eprintln!(
+            "bitty plugin: official catalog manifest hash mismatch for '{}': registry sha256:{}, fetched sha256:{}; nothing installed",
+            entry.id,
+            entry.manifest_sha256(),
+            actual
+        );
+        return EXIT_PLUGIN;
+    }
+    match manifest_toml::parse_manifest(&bytes) {
+        Ok(manifest) if manifest.id().as_str() == entry.id => {}
+        Ok(manifest) => {
+            eprintln!(
+                "bitty plugin: official '{}' checkout carries manifest id '{}'; nothing installed",
+                entry.id,
+                manifest.id().as_str()
+            );
+            return EXIT_PLUGIN;
+        }
+        Err(detail) => {
+            eprintln!(
+                "bitty plugin: official '{}' manifest is invalid: {detail}; nothing installed",
+                entry.id
+            );
+            return EXIT_PLUGIN;
+        }
+    }
+    let _ = writeln!(
+        output,
+        "bitty plugin: official '{}' from {} at {} (manifest sha256:{} verified)",
+        entry.id,
+        entry.repository,
+        short_hash(entry.pin),
+        short_hash(entry.manifest_sha256())
+    );
+    let options = LocalInstallOptions {
+        source_class: SourceClass::Registry,
+        ..LocalInstallOptions::staged_and_disabled()
+    };
+    install_local_path(
+        request, entry.id, &checkout, &options, store_root, config_dir, input, output,
+    )
+}
+
 /// Install from a git URL: clone into exclusive temp staging, then the
 /// existing local-path pipeline unchanged (manifest/schema/compat, hash pin,
 /// consent, atomic `current.json`). No plugin code runs at any step.
@@ -4176,7 +4519,14 @@ fn install_git_source(
         return EXIT_GENERIC;
     }
     install_local_path(
-        request, display, &checkout, store_root, config_dir, input, output,
+        request,
+        display,
+        &checkout,
+        &LocalInstallOptions::staged_and_disabled(),
+        store_root,
+        config_dir,
+        input,
+        output,
     )
 }
 
@@ -4269,27 +4619,33 @@ fn install_archive_source(
     }
     let root = find_plugin_root(&extract_dir);
     install_local_path(
-        request, display, &root, store_root, config_dir, input, output,
+        request,
+        display,
+        &root,
+        &LocalInstallOptions::staged_and_disabled(),
+        store_root,
+        config_dir,
+        input,
+        output,
     )
 }
 
 /// Shared local-path pipeline tail: consent bound to the staged snapshot,
 /// then `package::install_local_dir` (manifest, entry point, bounds, compat,
 /// hash pin, atomic `current.json`). The `source` argument selects the input
-/// dir; `display` names the original operand in consent prompts.
+/// dir; `display` names the original operand in consent prompts; `options`
+/// carries the fresh-install state policy and the recorded provenance class.
+#[allow(clippy::too_many_arguments)] // one call site per source shape; bundling would hide the flow
 fn install_local_path(
     request: &PluginRequest,
     display: &str,
     source: &Path,
+    options: &LocalInstallOptions,
     store_root: &Path,
     config_dir: Option<&Path>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> i32 {
-    // Installation stages and records the package, but explicit `enable` is
-    // the authorization boundary for first execution. Keep the public
-    // library default unchanged for existing developer/runtime callers.
-    let options = LocalInstallOptions::staged_and_disabled();
     let approve_all = request.yes;
     // Consent is bound to the staged snapshot the installer reviewed: the
     // callback only decides, and the installer commits that same snapshot, so
@@ -4305,7 +4661,7 @@ fn install_local_path(
                     Err(failure) => Err(PackageOpError::ConsentAborted(failure.message)),
                 }
             };
-        package::install_local_dir(store_root, source, &options, &mut consent)
+        package::install_local_dir(store_root, source, options, &mut consent)
     };
     match outcome {
         Ok(Some(report)) => {
@@ -4749,10 +5105,11 @@ fn bundled_manifest(id: &str) -> Result<PluginManifest, PluginFailure> {
         PluginFailure::plugin(
             "UnknownPlugin",
             format!(
-                "bitty plugin: '{id}' is not a bundled plugin; install an external package \
+                "bitty plugin: unknown plugin '{id}' ({}); install an external package \
                  from a local directory (`bitty plugin install <path>`), a git URL \
                  (`https://<host>/<path>.git`, `git+https://...`, `git@<host>:<path>`), \
-                 or a local archive (`.tar.gz`/`.tgz`/`.tar.zst`/`.zip`)"
+                 or a local archive (`.tar.gz`/`.tgz`/`.tar.zst`/`.zip`)",
+                installable_ids_hint()
             ),
         )
     })?;
@@ -4763,6 +5120,44 @@ fn bundled_manifest(id: &str) -> Result<PluginManifest, PluginFailure> {
         )
     })?;
     Ok(manifest)
+}
+
+/// Bundled + installable official ids, with listed-but-incompatible entries
+/// named separately (unknown-id diagnostics must never imply a network lookup
+/// or hide a catalog entry).
+fn installable_ids_hint() -> String {
+    let bundled = bundled_ids_sorted();
+    let mut official_installable: Vec<&str> = Vec::new();
+    let mut incompatible: Vec<String> = Vec::new();
+    for entry in official_plugins() {
+        match package::check_declared_compat(entry.id, entry.compat_bitty, entry.compat_plugin_api)
+        {
+            Ok(()) => official_installable.push(entry.id),
+            Err(_) => incompatible.push(format!(
+                "{} (compat.bitty '{}', host {})",
+                entry.id,
+                entry.compat_bitty.unwrap_or("-"),
+                env!("CARGO_PKG_VERSION")
+            )),
+        }
+    }
+    let bundled_text = if bundled.is_empty() {
+        "none".to_string()
+    } else {
+        bundled.join(", ")
+    };
+    let official_text = if official_installable.is_empty() {
+        "none".to_string()
+    } else {
+        official_installable.join(", ")
+    };
+    let mut hint =
+        format!("bundled ids: {bundled_text}; official installable ids: {official_text}");
+    if !incompatible.is_empty() {
+        hint.push_str("; listed but incompatible with this host: ");
+        hint.push_str(&incompatible.join(", "));
+    }
+    hint
 }
 
 fn requested_capabilities(

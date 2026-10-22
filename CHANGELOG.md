@@ -142,6 +142,17 @@ bitty-terminal.dashboard` and the other official ids resolve without a
   pinned by literal tests (64 KiB, 128/256/64/64 rows, 240/96 bytes,
   16 calls/s, 10 ms) and every cold-path section builder is covered with
   over-cap inputs and serialized `truncated = true`.
+- **Right-click is inert by default and mouse buttons bind like keymaps
+  (#2474):** a default right-click no longer pastes, so a multi-line
+  clipboard can no longer trap the user behind the suspicious-paste
+  confirmation gate. `mouse.right` and `mouse.middle` accept `none` or any
+  chrome-action spelling; right defaults to `none`, middle keeps
+  `paste_from_primary` and stays configurable. A non-captured press queues
+  exactly one action that runs through the same `ChromeAction` dispatcher as
+  a bound chord, while a mouse-reporting pane still receives SGR protocol
+  bytes and no host action. `bitty list actions` reports the bound buttons
+  beside each chord, `bitty inspect config` reports the shipped default, and
+  `bitty config check` reports the effective value and source.
 
 ### Changed
 

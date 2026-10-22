@@ -51,7 +51,7 @@
 //!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
-//!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
+//!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0, right = "none", middle = "paste_from_primary" }, -- hover focus (CTX-0260/CTX-0334) plus button actions from the keymap vocabulary; right defaults to none (issue #2474)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout in ms, 100..=60000 (default 1000; CTX-0715)
@@ -171,10 +171,15 @@
 //!   defaults (`auto` mode, width `8`), unknown `mode` strings and
 //!   out-of-range `width` fail closed with the field path.
 //!   `mouse` follows it as well: absent means "says nothing"; when present,
-//!   omitted `focus_follows_mouse` defaults to `false` (click-to-focus,
-//!   CTX-0260), so existing configs without `mouse` keep working unchanged.
-//!   Partial tables fail closed rather than
-//!   silently filling defaults (which would corrupt attribution).
+//!   every leaf is independent — an omitted `focus_follows_mouse`, delay, or
+//!   button says nothing and keeps the lower-precedence value (the shipped
+//!   defaults apply only when no layer declares the leaf). Issue #2474 adds
+//!   `mouse.right` and `mouse.middle`: each accepts `"none"` or any
+//!   [`ChromeAction`](crate::keymap::ChromeAction) spelling. `right` defaults
+//!   to `"none"` (an inert right-click: no paste, no dialog, no PTY bytes);
+//!   `middle` defaults to `"paste_from_primary"`. A pane that enables mouse
+//!   reporting still receives the protocol bytes and never runs a host
+//!   action.
 //! - `plugins` is a fully-optional top-level array with the same
 //!   absent-means-silent contract (#1325): absent (or empty) means "this
 //!   layer says nothing". Each entry is `{ id, enabled? }`: `id` is the
@@ -228,19 +233,18 @@ use std::path::{Path, PathBuf};
 use bitty_lua::config::ConfigEval;
 
 use crate::error::ConfigError;
-use crate::keymap::ModKey;
+use crate::keymap::{ModKey, MouseButtonBinding};
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{
     ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
-    ProfileSelector,
+    MouseConfigPlan, ProfileSelector,
 };
 use crate::types::{
     AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
     LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
     MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
-    MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig,
-    SessionConfig, StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector,
-    WindowConfig,
+    OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig, SessionConfig,
+    StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -2233,20 +2237,19 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
 
     // CTX-0260: `mouse` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.mouse None so merge keeps
-    // the lower-precedence value). When the table is present but
-    // `focus_follows_mouse` is omitted, default to `false` (click-to-focus
-    // preserved) so `mouse = {}` keeps working unchanged. Wrong types
-    // already failed closed as `ShapeError` in `bitty-lua` (never coerced).
-    // CTX-0334: `focus_follows_mouse_delay_ms` follows the same optional
-    // scalar pattern; omitted defaults to `0` (immediate entry activation).
-    // The value is range-checked here and again by `MouseConfig::validate`
-    // via `plan.validate()` (fail-closed).
+    // the lower-precedence value). Issue #2474 makes every leaf independent:
+    // an omitted `focus_follows_mouse`, delay, or button stays `None` in the
+    // plan, so a hover-only or empty table never resets a lower layer's
+    // value or claims its attribution; the shipped defaults apply only to
+    // the final effective configuration. Wrong types already failed closed
+    // as `ShapeError` in `bitty-lua` (never coerced). The delay is
+    // range-checked here and again by `MouseConfigPlan::validate` via
+    // `plan.validate()` (fail-closed).
     let mouse = match data.mouse {
         None => None,
         Some(m) => {
-            let defaults = MouseConfig::default();
             let delay = match m.focus_follows_mouse_delay_ms {
-                None => defaults.focus_follows_mouse_delay_ms,
+                None => None,
                 Some(v) => {
                     if !(0..=crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS as i64)
                         .contains(&v)
@@ -2259,14 +2262,28 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                             ),
                         ));
                     }
-                    v as u32
+                    Some(v as u32)
                 }
             };
-            Some(MouseConfig {
-                focus_follows_mouse: m
-                    .focus_follows_mouse
-                    .unwrap_or(defaults.focus_follows_mouse),
+            // Issue #2474: button bindings share the chrome-action
+            // vocabulary used by `keymaps[].action`. `none` is the explicit no-op; an omitted leaf stays
+            // `None` in the plan (says nothing, keeps the lower-precedence
+            // value) and the shipped defaults are applied only to the final
+            // effective configuration. Unknown actions fail closed with the
+            // owning field path, bounded by the shared action grammar.
+            let right = match m.right.as_deref() {
+                None => None,
+                Some(raw) => Some(MouseButtonBinding::parse(raw, "mouse.right")?),
+            };
+            let middle = match m.middle.as_deref() {
+                None => None,
+                Some(raw) => Some(MouseButtonBinding::parse(raw, "mouse.middle")?),
+            };
+            Some(MouseConfigPlan {
+                focus_follows_mouse: m.focus_follows_mouse,
                 focus_follows_mouse_delay_ms: delay,
+                right,
+                middle,
             })
         }
     };
@@ -3928,23 +3945,33 @@ mod tests {
     fn lua_mouse_focus_follows_mouse_parses_and_validates() {
         // CTX-0260: explicit opt-in parses; absent table means "says
         // nothing" (plan.mouse None so merge keeps lower precedence);
-        // present-but-empty defaults to off (click-to-focus preserved);
+        // present-but-empty declares no leaf either (presence semantics);
         // wrong types and unknown keys fail closed naming the field.
         let plan = parse_lua_config(
             r#"return { mouse = { focus_follows_mouse = true } }"#,
             &test_source(),
         )
         .expect("mouse parses");
-        assert!(plan.mouse.expect("mouse present").focus_follows_mouse);
+        assert_eq!(
+            plan.mouse.expect("mouse present").focus_follows_mouse,
+            Some(true)
+        );
         let plan = parse_lua_config(
             r#"return { mouse = { focus_follows_mouse = false } }"#,
             &test_source(),
         )
         .expect("explicit off parses");
-        assert!(!plan.mouse.expect("mouse present").focus_follows_mouse);
+        assert_eq!(
+            plan.mouse.expect("mouse present").focus_follows_mouse,
+            Some(false)
+        );
         let plan = parse_lua_config(r#"return { mouse = {} }"#, &test_source())
-            .expect("empty mouse defaults on");
-        assert!(plan.mouse.expect("mouse present").focus_follows_mouse);
+            .expect("empty mouse says nothing");
+        assert_eq!(
+            plan.mouse.expect("mouse present").focus_follows_mouse,
+            None,
+            "an empty table must not resolve the shipped default at parse time"
+        );
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,
             &test_source(),
@@ -3962,7 +3989,7 @@ mod tests {
             plan.mouse
                 .expect("mouse present")
                 .focus_follows_mouse_delay_ms,
-            250
+            Some(250)
         );
         let err = parse_lua_config(
             r#"return { mouse = { focus_follows_mouse_delay_ms = 5000 } }"#,
@@ -3985,6 +4012,75 @@ mod tests {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("mouse"), "must name the field: {bad} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn lua_mouse_button_bindings_parse_default_and_validate() {
+        // Issue #2474: an empty table declares no leaf, so it touches no
+        // lower layer; the shipped matrix is applied at merge time.
+        let plan = parse_lua_config(r#"return { mouse = {} }"#, &test_source())
+            .expect("empty mouse table");
+        let mouse = plan.mouse.expect("mouse present");
+        assert_eq!(mouse.right, None);
+        assert_eq!(mouse.middle, None);
+        assert_eq!(mouse.focus_follows_mouse, None);
+        assert_eq!(mouse.focus_follows_mouse_delay_ms, None);
+        // A focus-only table still says nothing about the buttons.
+        let plan = parse_lua_config(
+            r#"return { mouse = { focus_follows_mouse = true } }"#,
+            &test_source(),
+        )
+        .expect("hover-only table");
+        let mouse = plan.mouse.expect("mouse present");
+        assert_eq!(mouse.focus_follows_mouse, Some(true));
+        assert_eq!(mouse.right, None);
+        assert_eq!(mouse.middle, None);
+        // Explicit `none` and arbitrary actions parse, canonicalized.
+        let plan = parse_lua_config(
+            r#"return { mouse = { right = "paste_from_clipboard", middle = "none" } }"#,
+            &test_source(),
+        )
+        .expect("button bindings parse");
+        let mouse = plan.mouse.expect("mouse present");
+        assert_eq!(
+            mouse.right,
+            Some(MouseButtonBinding::Action(
+                crate::keymap::ChromeAction::PasteFromClipboard
+            ))
+        );
+        assert_eq!(mouse.middle, Some(MouseButtonBinding::None));
+        assert_eq!(mouse.middle.expect("declared middle").canonical(), "none");
+        // Unknown action names fail closed with the mouse field path.
+        for (src, field) in [
+            (
+                r#"return { mouse = { right = "explode:now" } }"#,
+                "mouse.right",
+            ),
+            (
+                r#"return { mouse = { middle = "not_an_action" } }"#,
+                "mouse.middle",
+            ),
+            (r#"return { mouse = { right = "" } }"#, "mouse.right"),
+        ] {
+            let err = parse_lua_config(src, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "must name {field}: {src} -> {msg}");
+            assert!(
+                !msg.contains("keymaps[].action"),
+                "mouse errors must not borrow the keymap path: {msg}"
+            );
+        }
+        // Non-string values fail closed at the Lua shape boundary.
+        for bad in [
+            r#"return { mouse = { right = 1 } }"#,
+            r#"return { mouse = { middle = true } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            assert!(
+                err.to_string().contains("mouse."),
+                "must name the mouse field: {bad} -> {err}"
+            );
         }
     }
 

@@ -847,6 +847,46 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
     None
 }
 
+/// Whether a bound chrome action may run under the live modal gates
+/// (issue #2474).
+///
+/// Shared by [`resolve_priority_for`] (key chords) and
+/// [`TerminalApp::dispatch_pending_mouse_action`] (bound mouse buttons), so a
+/// button obeys exactly the same capture rules as a chord: a capturing
+/// confirm/panel modal swallows every action except its own confirmation
+/// gesture. A pending paste alone never captures (issue #1336), and
+/// copy/search modes or a transient overlay capture consume their input
+/// before either dispatcher runs.
+#[allow(clippy::too_many_arguments)]
+fn action_passes_modal_gate(
+    action: &bitty_config::ChromeAction,
+    paste_pending: bool,
+    ws_close_pending: bool,
+    close_confirm_pending: bool,
+    close_confirm_view: bool,
+    panel_modal_active: bool,
+    close_confirm_window: bool,
+    is_last_pane: bool,
+) -> bool {
+    use bitty_config::ChromeAction as A;
+    let capturing = ws_close_pending || close_confirm_pending || panel_modal_active;
+    if !capturing {
+        return true;
+    }
+    let confirms_paste =
+        paste_pending && matches!(action, A::PasteFromClipboard | A::PasteFromPrimary);
+    let confirms_ws = ws_close_pending && matches!(action, A::WorkspaceClose);
+    // CTX-0370: repeating the pane-close chord confirms the pane arm.
+    // Issue #1783: the last-pane `close_view` is the window-close gesture, so
+    // it also confirms a window arm — but only on the last pane (elsewhere a
+    // window arm stays captured; the repeated OS close request is its confirm
+    // gesture, handled by the runtime).
+    let confirms_view_close = close_confirm_view && matches!(action, A::CloseView);
+    let confirms_window_close =
+        close_confirm_window && is_last_pane && matches!(action, A::CloseView);
+    confirms_paste || confirms_ws || confirms_view_close || confirms_window_close
+}
+
 /// Pure dispatch classifier over one matchable keypress (CTX-0275).
 ///
 /// Inputs are plain data so the priority table is headless-testable without
@@ -900,7 +940,7 @@ fn resolve_priority_for(
     close_confirm_window: bool,
     is_last_pane: bool,
 ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
-    use bitty_config::{ChromeAction as A, KeyName};
+    use bitty_config::KeyName;
     let confirm_modal_active = paste_pending || ws_close_pending || close_confirm_pending;
     let modal_active = confirm_modal_active || panel_modal_active;
     // Issue #1336: the paste banner is informational, never capturing. While
@@ -925,18 +965,16 @@ fn resolve_priority_for(
     }
     match matched {
         Some(action) if capturing => {
-            let confirms_paste = paste_pending && matches!(action, A::PasteFromClipboard);
-            let confirms_ws = ws_close_pending && matches!(action, A::WorkspaceClose);
-            // CTX-0370: repeating the pane-close chord confirms the pane
-            // arm. Issue #1783: the last-pane `close_view` is the window-close
-            // gesture, so it also confirms a window arm — but only on the
-            // last pane (elsewhere a window arm stays captured; the repeated
-            // OS close request is its confirm gesture, handled by the
-            // runtime).
-            let confirms_view_close = close_confirm_view && matches!(action, A::CloseView);
-            let confirms_window_close =
-                close_confirm_window && is_last_pane && matches!(action, A::CloseView);
-            if confirms_paste || confirms_ws || confirms_view_close || confirms_window_close {
+            if action_passes_modal_gate(
+                &action,
+                paste_pending,
+                ws_close_pending,
+                close_confirm_pending,
+                close_confirm_view,
+                panel_modal_active,
+                close_confirm_window,
+                is_last_pane,
+            ) {
                 // The modal's own confirm gesture reuses the normal user
                 // action path (repeat Alt+W kills; a paste-again confirm
                 // behind a close/panel modal delivers through the same
@@ -1279,7 +1317,7 @@ impl TerminalApp {
     /// The cold pump re-runs the original [`Self::apply_chrome_action`], so
     /// live composer ownership, plugin lifecycle, registration, schema, and
     /// host-capability gates are evaluated at delivery time, not at input.
-    fn apply_input_chrome_action(&mut self, action: bitty_config::ChromeAction) -> bool {
+    pub(crate) fn apply_input_chrome_action(&mut self, action: bitty_config::ChromeAction) -> bool {
         use bitty_config::ChromeAction as A;
         let scratchpad = matches!(
             &action,
@@ -1936,15 +1974,41 @@ impl TerminalApp {
                             .runtime
                             .pending_paste_summary()
                             .unwrap_or_else(|| "pending confirmation".to_string());
-                        eprintln!("bitty: keymap paste_from_clipboard -> {summary}");
+                        eprintln!("bitty: paste_from_clipboard -> {summary}");
                     }
-                    Ok(Some(false)) => eprintln!("bitty: keymap paste_from_clipboard delivered"),
+                    Ok(Some(false)) => eprintln!("bitty: paste_from_clipboard delivered"),
                     Ok(None) => {
-                        eprintln!("warning: keymap paste_from_clipboard clipboard empty — ignoring")
+                        eprintln!("warning: paste_from_clipboard clipboard empty — ignoring")
                     }
                     Err(err) => eprintln!(
-                        "warning: keymap paste_from_clipboard clipboard error ({err}) — ignoring"
+                        "warning: paste_from_clipboard clipboard error ({err}) — ignoring"
                     ),
+                }
+            }
+            A::PasteFromPrimary => {
+                // Issue #2474: the middle-click default is now an ordinary
+                // chrome action, so it dispatches through this same match.
+                // `paste_from_primary` reads the platform primary selection
+                // and submits it to the identical suspicious-paste gate;
+                // empty sources are a loud-but-harmless no-op and read
+                // failures are recorded for `last_clipboard_error`.
+                match self.runtime.paste_from_primary() {
+                    Some(true) => {
+                        let summary = self
+                            .runtime
+                            .pending_paste_summary()
+                            .unwrap_or_else(|| "pending confirmation".to_string());
+                        eprintln!("bitty: paste_from_primary -> {summary}");
+                    }
+                    Some(false) => eprintln!("bitty: paste_from_primary delivered"),
+                    None => match self.runtime.last_clipboard_error() {
+                        Some(err) => eprintln!(
+                            "warning: paste_from_primary clipboard error ({err}) — ignoring"
+                        ),
+                        None => {
+                            eprintln!("warning: paste_from_primary primary empty — ignoring")
+                        }
+                    },
                 }
             }
             A::WorkspaceNew => {
@@ -2335,9 +2399,6 @@ impl TerminalApp {
         keyref: bitty_config::KeyRef,
         matched: Option<bitty_config::ChromeAction>,
     ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
-        // Single capture predicate first (the panel-overlay bit feeds
-        // `modal_capture_active` itself); the per-gate reads below only
-        // pick the confirm gesture.
         let (
             paste_pending,
             ws_close_pending,
@@ -2346,7 +2407,32 @@ impl TerminalApp {
             panel_modal_active,
             close_confirm_window,
             is_last_pane,
-        ) = if self.modal_capture_active() {
+        ) = self.modal_gates();
+        resolve_priority_for(
+            keyref,
+            matched,
+            paste_pending,
+            ws_close_pending,
+            close_confirm_pending,
+            close_confirm_view,
+            panel_modal_active,
+            close_confirm_window,
+            is_last_pane,
+        )
+    }
+
+    /// Live modal gates shared by the keyboard table and the mouse-action
+    /// dispatcher (issue #2474).
+    ///
+    /// The tuple is `(paste_pending, ws_close_pending,
+    /// close_confirm_pending, close_confirm_view, panel_modal_active,
+    /// close_confirm_window, is_last_pane)`, read exactly once from the
+    /// runtime. Single capture predicate first (the panel-overlay bit feeds
+    /// `modal_capture_active` itself); the per-gate reads pick the confirm
+    /// gesture.
+    #[allow(clippy::type_complexity)]
+    fn modal_gates(&self) -> (bool, bool, bool, bool, bool, bool, bool) {
+        if self.modal_capture_active() {
             // Issue #1783: a zoomed view collapses the live layout to one
             // leaf, so consult the backup before deciding whether this is
             // the last-pane window-close gesture. CTX-1039 (#1843): the
@@ -2369,10 +2455,27 @@ impl TerminalApp {
             )
         } else {
             (false, false, false, false, false, false, false)
-        };
-        resolve_priority_for(
-            keyref,
-            matched,
+        }
+    }
+
+    /// Whether a queued mouse action may run now (issue #2474 review).
+    ///
+    /// Applies the same modal priority/capture rules as a bound chord
+    /// ([`action_passes_modal_gate`]): a capturing close/workspace/panel
+    /// modal swallows non-confirm actions, while its own confirmation
+    /// gesture still dispatches. A pending paste alone never captures.
+    pub(crate) fn modal_allows_mouse_action(&self, action: &bitty_config::ChromeAction) -> bool {
+        let (
+            paste_pending,
+            ws_close_pending,
+            close_confirm_pending,
+            close_confirm_view,
+            panel_modal_active,
+            close_confirm_window,
+            is_last_pane,
+        ) = self.modal_gates();
+        action_passes_modal_gate(
+            action,
             paste_pending,
             ws_close_pending,
             close_confirm_pending,
@@ -6814,6 +6917,102 @@ claims = []
                 "plugin layer must stay deny-by-default"
             );
         }
+    }
+
+    #[test]
+    fn mouse_action_gate_matches_the_chord_modal_rules() {
+        use bitty_config::ChromeAction as A;
+        // No capturing modal: every bound action passes, and a pending paste
+        // banner alone never captures (issue #1336).
+        for action in [
+            A::ToggleHelp,
+            A::PasteFromClipboard,
+            A::PasteFromPrimary,
+            A::CloseView,
+        ] {
+            assert!(
+                action_passes_modal_gate(&action, false, false, false, false, false, false, false),
+                "{action:?} must pass with no modal"
+            );
+            assert!(
+                action_passes_modal_gate(&action, true, false, false, false, false, false, false),
+                "{action:?} must pass behind a paste banner"
+            );
+        }
+        // A capturing close arm swallows an unrelated bound action...
+        assert!(!action_passes_modal_gate(
+            &A::ToggleHelp,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!action_passes_modal_gate(
+            &A::PasteFromPrimary,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false
+        ));
+        // ...while each modal keeps its own confirmation gesture.
+        assert!(action_passes_modal_gate(
+            &A::CloseView,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(action_passes_modal_gate(
+            &A::WorkspaceClose,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(action_passes_modal_gate(
+            &A::CloseView,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            true
+        ));
+        // A paste action confirms only while a paste actually pends.
+        assert!(action_passes_modal_gate(
+            &A::PasteFromClipboard,
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false
+        ));
+        // The panel modal captures every non-confirm action.
+        assert!(!action_passes_modal_gate(
+            &A::ToggleHelp,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false
+        ));
     }
 
     #[test]

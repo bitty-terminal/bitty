@@ -2656,7 +2656,7 @@ ui.overlay.focus = true
     assert!(
         !app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
             MouseButton::Left,
-            PressState::Released,
+            bitty_platform::PressState::Released,
         ))),
         "releases must route, never queue, even over a URL"
     );
@@ -4506,6 +4506,218 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
     assert!(!merged3.effective.mouse.focus_follows_mouse);
     let cfg3 = runtime_config_from_effective(&merged3.effective).expect("builds");
     assert!(!cfg3.focus_follows_mouse);
+
+    // Issue #2474: button bindings flow file -> effective -> runtime. The
+    // defaults stay the documented matrix; explicit values win.
+    assert_eq!(cfg2.mouse_right, bitty_config::MouseButtonBinding::None);
+    assert_eq!(
+        cfg2.mouse_middle,
+        bitty_config::MouseButtonBinding::Action(bitty_config::ChromeAction::PasteFromPrimary)
+    );
+    let src4 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan4 = parse_lua_config(
+        r#"return { mouse = { right = "paste_from_clipboard", middle = "none" } }"#,
+        &src4,
+    )
+    .expect("button bindings parse");
+    let merged4 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src4, plan4)),
+        None,
+    )
+    .expect("merge");
+    let cfg4 = runtime_config_from_effective(&merged4.effective).expect("builds");
+    assert_eq!(
+        cfg4.mouse_right,
+        bitty_config::MouseButtonBinding::Action(bitty_config::ChromeAction::PasteFromClipboard)
+    );
+    assert_eq!(cfg4.mouse_middle, bitty_config::MouseButtonBinding::None);
+}
+
+/// Route one mouse event through the runtime and then drain the queued host
+/// action through the app's shared chrome dispatcher (the production order).
+fn app_mouse_event(
+    app: &mut TerminalApp,
+    button: bitty_platform::MouseButton,
+    state: bitty_platform::PressState,
+) {
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id: bitty_platform::WindowId::from_raw_public(1),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(button, state)),
+    });
+    let _ = app.dispatch_pending_mouse_action();
+}
+
+fn headless_app_with_runtime_config(config: bitty_runtime::RuntimeConfig) -> TerminalApp {
+    let rt = Runtime::new(config).expect("headless runtime must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "mouse-bindings",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    app.runtime.force_headless_clipboard();
+    app.set_session_persistence(false);
+    app
+}
+
+fn headless_app_with_mouse_right(binding: bitty_config::MouseButtonBinding) -> TerminalApp {
+    headless_app_with_runtime_config(bitty_runtime::RuntimeConfig {
+        mouse_right: binding,
+        ..bitty_runtime::RuntimeConfig::default()
+    })
+}
+
+#[test]
+fn default_right_click_is_inert_through_the_app_dispatch() {
+    // Issue #2474: default `mouse.right = "none"` must not paste, must not
+    // open the suspicious-paste dialog, and must emit no PTY bytes.
+    let mut app = headless_app_with_mouse_right(bitty_config::MouseButtonBinding::None);
+    app.runtime
+        .clipboard_mut()
+        .set_text("first line\nsecond line\nthird line".to_string())
+        .expect("headless clipboard");
+    app.runtime.drain_pending_input();
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert!(!app.runtime.has_pending_paste(), "no suspicious-paste trap");
+    assert_eq!(app.runtime.pending_input_len(), 0, "no PTY bytes");
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Released,
+    );
+    assert!(!app.runtime.has_pending_paste());
+    assert_eq!(app.runtime.pending_input_len(), 0);
+}
+
+#[test]
+fn configured_right_click_runs_the_action_exactly_once_through_chrome_dispatch() {
+    // Issue #2474: an explicit `mouse.right = "paste_from_clipboard"` runs
+    // through the same `ChromeAction` dispatcher as a keymap, once per press.
+    let mut app = headless_app_with_mouse_right(bitty_config::MouseButtonBinding::Action(
+        bitty_config::ChromeAction::PasteFromClipboard,
+    ));
+    app.runtime
+        .clipboard_mut()
+        .set_text("hi".to_string())
+        .expect("headless clipboard");
+    app.runtime.drain_pending_input();
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert_eq!(
+        app.runtime.pending_input(),
+        b"hi",
+        "the clipboard action dispatches once"
+    );
+    assert!(
+        !app.runtime.has_pending_paste(),
+        "clean paste needs no dialog"
+    );
+    // The paired release must not dispatch a second action.
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Released,
+    );
+    assert_eq!(app.runtime.pending_input(), b"hi");
+}
+
+#[test]
+fn two_configured_right_presses_confirm_a_multiline_paste_through_the_app() {
+    // Issue #2474 review: an explicit paste binding still passes the
+    // CTX-0186 gate. The first press holds the multi-line text with no bytes;
+    // repeating the identical press confirms and delivers every line intact.
+    let mut app = headless_app_with_mouse_right(bitty_config::MouseButtonBinding::Action(
+        bitty_config::ChromeAction::PasteFromClipboard,
+    ));
+    app.runtime
+        .clipboard_mut()
+        .set_text("one\ntwo".to_string())
+        .expect("headless clipboard");
+    app.runtime.drain_pending_input();
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert!(
+        app.runtime.has_pending_paste(),
+        "multi-line paste must gate"
+    );
+    assert_eq!(app.runtime.pending_input_len(), 0, "no silent delivery");
+    // The second identical press confirms through the same dispatcher.
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert!(!app.runtime.has_pending_paste(), "repeat press confirms");
+    assert_eq!(app.runtime.pending_input(), b"one\ntwo");
+}
+
+#[test]
+fn mouse_action_is_captured_by_a_pending_close_confirmation() {
+    // Issue #2474 review: a bound mouse action obeys the same modal
+    // priority/capture rules as a bound chord. While a close modal is armed,
+    // a non-confirm action is consumed and the modal stays armed.
+    let mut app = headless_app_with_runtime_config(bitty_runtime::RuntimeConfig {
+        mouse_right: bitty_config::MouseButtonBinding::Action(
+            bitty_config::ChromeAction::ToggleHelp,
+        ),
+        close_confirm: bitty_runtime::CloseConfirmMode::Always,
+        ..bitty_runtime::RuntimeConfig::default()
+    });
+    let view = app.runtime.focused_view().expect("focused view");
+    assert!(matches!(
+        app.runtime.view_close_request(view),
+        bitty_runtime::ViewCloseRequest::Pending { .. }
+    ));
+    assert!(app.runtime.has_pending_close_confirm());
+    assert!(!app.runtime.help_visible());
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert!(
+        !app.runtime.help_visible(),
+        "the armed close modal captures the non-confirm mouse action"
+    );
+    assert!(
+        app.runtime.has_pending_close_confirm(),
+        "the modal stays armed for its own confirmation gesture"
+    );
+}
+
+#[test]
+fn mouse_capture_wins_over_host_binding_through_the_app_dispatch() {
+    // Issue #2474 precedence: a pane that enabled mouse reporting receives
+    // the button as protocol bytes; no host mouse action runs.
+    let mut app = headless_app_with_mouse_right(bitty_config::MouseButtonBinding::Action(
+        bitty_config::ChromeAction::PasteFromClipboard,
+    ));
+    app.runtime
+        .clipboard_mut()
+        .set_text("clip".to_string())
+        .expect("headless clipboard");
+    app.runtime.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    app.runtime.drain_pending_input();
+    app.runtime
+        .handle_cursor_moved(bitty_platform::CursorPosition { x: 0.0, y: 0.0 });
+    app_mouse_event(
+        &mut app,
+        bitty_platform::MouseButton::Right,
+        bitty_platform::PressState::Pressed,
+    );
+    assert_eq!(app.runtime.pending_input(), b"\x1b[<2;1;1M");
+    assert!(!app.runtime.has_pending_paste());
 }
 
 #[test]
@@ -12345,7 +12557,7 @@ claims = []
     assert!(
         app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
             MouseButton::Left,
-            PressState::Pressed,
+            bitty_platform::PressState::Pressed,
         )))
     );
     assert_eq!(queued_len(&app), 3);
@@ -12357,7 +12569,7 @@ claims = []
     assert!(
         !app.capture_fallthrough_input(&WindowEventKind::MouseInput(MouseEvent::new(
             MouseButton::Left,
-            PressState::Released,
+            bitty_platform::PressState::Released,
         ))),
         "releases must route, never queue"
     );

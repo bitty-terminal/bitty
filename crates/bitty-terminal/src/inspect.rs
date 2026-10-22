@@ -819,6 +819,10 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "mouse.focus_follows_mouse_delay_ms" => {
             defaults.mouse.focus_follows_mouse_delay_ms.to_string()
         }
+        // Issue #2474: button bindings default to inert right-click and a
+        // configurable primary-selection middle-click.
+        "mouse.right" => defaults.mouse.right.canonical(),
+        "mouse.middle" => defaults.mouse.middle.canonical(),
         // CTX-0236: leader/mod for the shipped chrome map (default Alt).
         "mod_key" => defaults.mod_key.canonical().to_string(),
         // CTX-0370: view/window close confirmation (default when_busy).
@@ -1285,7 +1289,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.scroll_lines_per_notch, terminal.scroll_pixels_per_notch, terminal.page_scroll_percent, terminal.cursor_style, terminal.bell, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.scroll_lines_per_notch, terminal.scroll_pixels_per_notch, terminal.page_scroll_percent, terminal.cursor_style, terminal.bell, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, mouse.right, mouse.middle, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {
@@ -1568,6 +1572,13 @@ mod tests {
             inspect_config("mouse.focus_follows_mouse_delay_ms").expect("mouse delay key");
         assert_eq!(hover_delay.key, "mouse.focus_follows_mouse_delay_ms");
         assert_eq!(hover_delay.value, "0");
+        // Issue #2474: the shipped button matrix is inspectable.
+        let right = inspect_config("mouse.right").expect("mouse.right");
+        assert_eq!(right.key, "mouse.right");
+        assert_eq!(right.value, "none");
+        let middle = inspect_config("mouse.middle").expect("mouse.middle");
+        assert_eq!(middle.key, "mouse.middle");
+        assert_eq!(middle.value, "paste_from_primary");
         // CTX-0756 (issue #1359): cursor shape and bell defaults are
         // inspectable like every scalar.
         let cursor_style = inspect_config("terminal.cursor_style").expect("cursor key");

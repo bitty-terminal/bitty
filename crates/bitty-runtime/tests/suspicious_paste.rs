@@ -538,7 +538,9 @@ fn ctx0186_multiline_chord_paste_is_visible_and_repeat_confirms() {
 }
 
 #[test]
-fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
+fn default_right_click_never_opens_a_multiline_paste_gate() {
+    // Issue #2474: an accidental right-click with a multi-line clipboard
+    // must not paste, gate, or trap the user behind a confirmation dialog.
     use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
     let mut rt = make_runtime();
     rt.clipboard_mut()
@@ -547,9 +549,45 @@ fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
     rt.drain_pending_input();
     // CTX-0223: (8, 8) is grid cell (0, 0) under the default 8px padding.
     rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
-    // Same entry the right-click mouse path uses.
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
-    assert!(rt.has_pending_paste(), "3-line right-click must gate");
+    assert!(
+        !rt.has_pending_paste(),
+        "default right-click must not open the suspicious-paste gate"
+    );
+    assert_eq!(
+        rt.pending_input(),
+        b"",
+        "default right-click emits no bytes"
+    );
+    assert!(rt.take_pending_mouse_action().is_none());
+    assert!(rt.last_clipboard_error().is_none());
+}
+
+#[test]
+fn configured_multiline_right_paste_is_visible_and_repeat_confirms() {
+    // A user who explicitly binds `mouse.right = "paste_from_clipboard"`
+    // opts back into the mouse paste path; the gate still makes it visible
+    // and a repeat confirms.
+    use bitty_config::{ChromeAction, MouseButtonBinding};
+    use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
+    let mut rt = Runtime::new(bitty_runtime::RuntimeConfig {
+        mouse_right: MouseButtonBinding::Action(ChromeAction::PasteFromClipboard),
+        ..bitty_runtime::RuntimeConfig::default()
+    })
+    .expect("configured runtime must build");
+    rt.force_headless_clipboard();
+    rt.clipboard_mut()
+        .set_text("aaa\nbbb\nccc".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromClipboard)
+    );
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste(), "3-line paste must gate");
     assert_eq!(rt.pending_input(), b"", "no silent delivery before confirm");
     let summary = rt
         .pending_paste_summary()
@@ -558,9 +596,8 @@ fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
         summary.contains("3 lines"),
         "summary must name line count: {summary:?}"
     );
-    // Second identical right-click confirms and delivers both lines.
-    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
-    assert!(!rt.has_pending_paste());
+    // Repeating the identical paste confirms and delivers all lines.
+    assert!(!rt.paste_from_clipboard().unwrap().unwrap());
     assert_eq!(rt.pending_input(), b"aaa\nbbb\nccc");
 }
 

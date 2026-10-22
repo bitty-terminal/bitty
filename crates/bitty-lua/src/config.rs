@@ -38,7 +38,7 @@
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified gaps + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
-//!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
+//!     mouse = { focus_follows_mouse = true, right = "none", middle = "paste_from_primary" }, -- hover focus (CTX-0260) plus button actions from the keymap vocabulary (issue #2474)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
 //!     leader_timeout_ms = 1500, -- leader fail-open timeout override in ms, 100..=60000 (default 1000; CTX-0715)
@@ -484,11 +484,14 @@ pub struct ScrollbarData {
 /// Mouse overrides, plain data (CTX-0260/CTX-0334; see [`FontData`] for
 /// `Option` semantics).
 ///
-/// `focus_follows_mouse` opts into hover moving keyboard focus
-/// (default-off preserves click-to-focus). `focus_follows_mouse_delay_ms`
-/// optionally delays activation by that many milliseconds. Wrong types fail
-/// closed as `ShapeError` downstream (never coerced); the delay range is
-/// checked in `bitty-config` (fail-closed).
+/// `focus_follows_mouse` opts into hover moving keyboard focus; an explicit
+/// `false` preserves click-to-focus. `focus_follows_mouse_delay_ms`
+/// optionally delays activation by that many milliseconds. `right` and
+/// `middle` carry button bindings as action strings (`"none"` or a chrome
+/// action spelling); grammar validation stays in `bitty-config`, so an
+/// unknown action fails closed with the `mouse.right` / `mouse.middle` path.
+/// Wrong types fail closed as `ShapeError` downstream (never coerced); the
+/// delay range is checked in `bitty-config` (fail-closed).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MouseData {
     /// Hover-focus opt-in (present only when the key is set).
@@ -496,6 +499,10 @@ pub struct MouseData {
     /// Dwell time in milliseconds before hover activation (present only
     /// when the key is set).
     pub focus_follows_mouse_delay_ms: Option<i64>,
+    /// Right-button binding (`"none"` or a chrome-action spelling).
+    pub right: Option<String>,
+    /// Middle-button binding (`"none"` or a chrome-action spelling).
+    pub middle: Option<String>,
 }
 
 /// Panel-animation overrides, plain data (RFC-0002, CTX-0341; see [`FontData`]
@@ -2185,14 +2192,19 @@ impl ConfigData {
                     // CTX-0260/CTX-0334: `mouse = { focus_follows_mouse =
                     // true, focus_follows_mouse_delay_ms = 0 }` opts into
                     // hover activation; absent table/key means "says
-                    // nothing" (default-off click-to-focus preserved).
+                    // nothing" (the lower layer keeps its value).
                     // Booleans and integers only (never coerced); the
                     // delay range is validated downstream in `bitty-config`.
                     let nested = expect_table(key, val)?;
                     check_nested_keys(
                         key,
                         nested,
-                        &["focus_follows_mouse", "focus_follows_mouse_delay_ms"],
+                        &[
+                            "focus_follows_mouse",
+                            "focus_follows_mouse_delay_ms",
+                            "right",
+                            "middle",
+                        ],
                     )?;
                     let focus_follows_mouse = match get_field(nested, "focus_follows_mouse") {
                         Some(v) => Some(expect_bool("mouse.focus_follows_mouse", v)?),
@@ -2205,9 +2217,19 @@ impl ConfigData {
                             }
                             None => None,
                         };
+                    let right = match get_field(nested, "right") {
+                        Some(v) => Some(expect_string("mouse.right", v)?),
+                        None => None,
+                    };
+                    let middle = match get_field(nested, "middle") {
+                        Some(v) => Some(expect_string("mouse.middle", v)?),
+                        None => None,
+                    };
                     out.mouse = Some(MouseData {
                         focus_follows_mouse,
                         focus_follows_mouse_delay_ms,
+                        right,
+                        middle,
                     });
                 }
                 "keymaps" => {
@@ -3764,7 +3786,7 @@ mod tests {
     fn mouse_focus_follows_mouse_extracts_and_absent_means_no_override() {
         // CTX-0260/CTX-0334: explicit opt-in and dwell delay parse; absent
         // table/key is `None` so merge keeps the lower-precedence value
-        // (false/0 when no layer sets it, preserving click-to-focus).
+        // (the shipped defaults apply only when no layer sets the leaf).
         let data = eval_ok(r#"return { mouse = { focus_follows_mouse = true } }"#);
         assert_eq!(data.mouse.unwrap().focus_follows_mouse, Some(true));
         let data = eval_ok(r#"return { mouse = { focus_follows_mouse = false } }"#);
@@ -3779,6 +3801,15 @@ mod tests {
         let mouse = data.mouse.unwrap();
         assert_eq!(mouse.focus_follows_mouse, None);
         assert_eq!(mouse.focus_follows_mouse_delay_ms, None);
+        assert_eq!(mouse.right, None);
+        assert_eq!(mouse.middle, None);
+        // Issue #2474: button bindings are strings here; the action grammar
+        // (`none` or a ChromeAction spelling) is validated downstream.
+        let data =
+            eval_ok(r#"return { mouse = { right = "none", middle = "paste_from_primary" } }"#);
+        let mouse = data.mouse.unwrap();
+        assert_eq!(mouse.right.as_deref(), Some("none"));
+        assert_eq!(mouse.middle.as_deref(), Some("paste_from_primary"));
     }
 
     #[test]
@@ -3793,6 +3824,9 @@ mod tests {
             r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
             r#"return { mouse = { focus_follows_mouse_delay_ms = "250" } }"#,
             r#"return { mouse = { focus_follows_mouse_delay_ms = 1.5 } }"#,
+            r#"return { mouse = { right = 1 } }"#,
+            r#"return { mouse = { right = true } }"#,
+            r#"return { mouse = { middle = 1 } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

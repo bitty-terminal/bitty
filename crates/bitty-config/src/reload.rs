@@ -162,6 +162,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `scrollbar.width`         | RestartRequired    |
 /// | `mouse.focus_follows_mouse` | RestartRequired  |
 /// | `mouse.focus_follows_mouse_delay_ms` | RestartRequired |
+/// | `mouse.right`             | RestartRequired    |
+/// | `mouse.middle`            | RestartRequired    |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -312,6 +314,8 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "scrollbar.width",
     "mouse.focus_follows_mouse",
     "mouse.focus_follows_mouse_delay_ms",
+    "mouse.right",
+    "mouse.middle",
     "plugins",
 ];
 
@@ -738,6 +742,18 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "mouse.focus_follows_mouse_delay_ms",
         old.mouse.focus_follows_mouse_delay_ms.to_string(),
         new.mouse.focus_follows_mouse_delay_ms.to_string(),
+    );
+    // Issue #2474: button bindings are adopted at startup like the hover
+    // leaves, so changes are restart-required.
+    push_if_changed(
+        "mouse.right",
+        old.mouse.right.canonical(),
+        new.mouse.right.canonical(),
+    );
+    push_if_changed(
+        "mouse.middle",
+        old.mouse.middle.canonical(),
+        new.mouse.middle.canonical(),
     );
     push_if_changed(
         "appearance.theme",

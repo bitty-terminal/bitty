@@ -892,6 +892,31 @@ impl TerminalApp {
         std::mem::take(&mut self.chrome_close_exit_requested)
     }
 
+    /// Runs the chrome action queued by a non-captured right/middle press
+    /// (issue #2474) through the same dispatcher and modal rules as a bound
+    /// keymap.
+    ///
+    /// A capturing close/workspace/panel modal consumes a non-confirm action
+    /// exactly like a bound chord (no action, no PTY bytes), while its own
+    /// confirmation gesture still dispatches; a pending paste never captures.
+    /// Returns `true` only when the action confirms a whole-window close; the
+    /// event loop owns the save + shutdown + exit, matching the key path.
+    /// No queued action is a no-op (default `mouse.right = "none"`).
+    pub(crate) fn dispatch_pending_mouse_action(&mut self) -> bool {
+        match self.runtime.take_pending_mouse_action() {
+            Some(action) => {
+                if !self.modal_allows_mouse_action(&action) {
+                    crate::logging::info(|| {
+                        "bitty: mouse action captured by an active modal".to_string()
+                    });
+                    return false;
+                }
+                self.apply_input_chrome_action(action)
+            }
+            None => false,
+        }
+    }
+
     /// Best-effort session save for exit paths (CTX-0393): one bounded
     /// capture plus one atomic write, no retries. Loud one-line outcome on
     /// stderr (counts only, never session contents); failures never block
@@ -3697,6 +3722,19 @@ impl AppHandler for TerminalApp {
         if should_exit {
             crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
             self.save_session_best_effort("exit");
+            self.runtime.shutdown();
+            ctx.exit();
+            return;
+        }
+        // Issue #2474: a non-captured right/middle press queues the configured
+        // `mouse.right` / `mouse.middle` action in the runtime. Run it through
+        // the same chrome dispatcher as a bound keymap (single action
+        // vocabulary, no parallel mouse table). Defaults are inert for right
+        // and primary-paste for middle; a mouse-capturing pane returned
+        // protocol bytes from `handle_platform_event` and queued nothing.
+        if self.dispatch_pending_mouse_action() {
+            crate::logging::info(|| "bitty: exit requested (mouse chrome action)".to_string());
+            self.save_session_best_effort("mouse-action");
             self.runtime.shutdown();
             ctx.exit();
             return;

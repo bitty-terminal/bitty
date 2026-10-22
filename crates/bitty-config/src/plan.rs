@@ -13,12 +13,12 @@
 //! move with the RFC.
 
 use crate::error::ConfigError;
-use crate::keymap::ModKey;
+use crate::keymap::{ModKey, MouseButtonBinding};
 use crate::panel_rules::PanelSpawnRule;
 use crate::types::{
     AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, HistoryConfig,
-    KeymapEntry, LayoutConfig, MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig,
-    SessionConfig, TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
+    KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig,
+    TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -35,6 +35,52 @@ pub use crate::migration::CURRENT_SCHEMA_VERSION;
 pub struct ProfileSelector {
     /// Selected profile name (already validated by `validate_profile_name`).
     pub profile: String,
+}
+
+/// Per-layer mouse declaration (CTX-0260 hover focus; issue #2474 buttons).
+///
+/// Every leaf stays `Option` through the plan and merge, like
+/// [`HistoryConfigPlan`]: an omitted leaf says nothing and keeps the
+/// lower-precedence value, so a hover-only `mouse` table (or an empty
+/// trusted-local `mouse = {}`) can never reset a profile's binding or claim
+/// its attribution. Defaults (`focus_follows_mouse = true`, delay `0`,
+/// `right = none`, `middle = paste_from_primary`) are applied only to the
+/// final effective configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MouseConfigPlan {
+    /// `mouse.focus_follows_mouse`; `None` means this layer omits the leaf.
+    pub focus_follows_mouse: Option<bool>,
+    /// `mouse.focus_follows_mouse_delay_ms`; `None` means this layer omits
+    /// the leaf.
+    pub focus_follows_mouse_delay_ms: Option<u32>,
+    /// `mouse.right`; `None` means this layer omits the leaf.
+    pub right: Option<MouseButtonBinding>,
+    /// `mouse.middle`; `None` means this layer omits the leaf.
+    pub middle: Option<MouseButtonBinding>,
+}
+
+impl MouseConfigPlan {
+    /// Validate the declared hover delay; button values and the boolean are
+    /// validated at parse time.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when the delay exceeds
+    /// [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`](crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(delay) = self.focus_follows_mouse_delay_ms {
+            if delay > crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS {
+                return Err(ConfigError::validation(
+                    "mouse.focus_follows_mouse_delay_ms",
+                    format!(
+                        "must be within [0, {}] (found {delay})",
+                        crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The declarative plan returned from a configuration module.
@@ -85,8 +131,9 @@ pub struct ConfigPlan {
     pub views: Option<Vec<ViewOverride>>,
     /// Scrollbar configuration (CTX-0181 `scrollbar.mode`/`scrollbar.width`).
     pub scrollbar: Option<ScrollbarConfig>,
-    /// Mouse configuration (CTX-0260 `mouse.focus_follows_mouse`).
-    pub mouse: Option<MouseConfig>,
+    /// Mouse configuration (CTX-0260 `mouse.focus_follows_mouse`; issue
+    /// #2474 `mouse.right`/`mouse.middle`).
+    pub mouse: Option<MouseConfigPlan>,
     /// Appearance configuration.
     pub appearance: Option<AppearanceConfig>,
     /// Leader/Mod key for the shipped chrome map (CTX-0236; scalar-replace).
@@ -247,9 +294,9 @@ impl ConfigPlan {
         self
     }
 
-    /// Convenience builder: set mouse.
+    /// Convenience builder: set mouse (plan form, presence semantics).
     #[must_use]
-    pub fn with_mouse(mut self, mouse: MouseConfig) -> Self {
+    pub fn with_mouse(mut self, mouse: MouseConfigPlan) -> Self {
         self.mouse = Some(mouse);
         self
     }

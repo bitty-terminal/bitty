@@ -4,6 +4,7 @@
 //! the CTX-0232 pure-move split. Adaptations are wiring only:
 //! `super::*` became explicit imports and the private `layout` field
 //! reads became the public `layout()` getter (identical semantics).
+use bitty_config::{ChromeAction, MouseButtonBinding};
 use bitty_platform::{
     CursorPosition, KeyEvent, MouseButton, PlatformEvent, PressState, WindowEventKind,
 };
@@ -426,39 +427,67 @@ fn left_release_without_drag_copies_nothing() {
 }
 
 #[test]
-fn right_click_pastes_clipboard_bytes() {
+fn right_click_default_is_inert() {
+    // Issue #2474: the shipped `mouse.right = "none"` binding must not read
+    // either clipboard, deliver bytes, or open the confirmation gate.
     let mut rt = mouse_headless_runtime("hello world");
+    rt.clipboard_mut()
+        .set_text("hi".to_string())
+        .expect("headless set");
+    rt.set_primary_text("prim".to_string());
+    rt.drain_pending_input();
+    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    rt.handle_mouse_input(mouse_press(MouseButton::Right));
+    assert_eq!(rt.pending_input(), b"");
+    assert!(!rt.has_pending_paste());
+    assert!(rt.take_pending_mouse_action().is_none());
+    assert!(rt.last_clipboard_error().is_none());
+    // Release stays a no-op.
+    rt.handle_mouse_input(mouse_release(MouseButton::Right));
+    assert_eq!(rt.pending_input(), b"");
+    assert!(!rt.has_pending_paste());
+    assert!(rt.take_pending_mouse_action().is_none());
+}
+
+#[test]
+fn configured_right_click_queues_one_action_without_pasting() {
+    // A configured right-click queues exactly one chrome action for the
+    // embedder; the runtime itself performs no clipboard work (the app runs
+    // the action through the shared dispatcher).
+    let mut rt = Runtime::new(RuntimeConfig {
+        mouse_right: MouseButtonBinding::Action(ChromeAction::PasteFromClipboard),
+        ..RuntimeConfig::default()
+    })
+    .expect("configured runtime must build");
+    rt.force_headless_clipboard();
+    rt.handle_pty_bytes(b"hello world");
     rt.clipboard_mut()
         .set_text("hi".to_string())
         .expect("headless set");
     rt.drain_pending_input();
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Right));
-    assert!(!rt.has_pending_paste(), "clean paste needs no confirm");
-    assert_eq!(rt.pending_input(), b"hi");
-    // A successful read leaves no recorded clipboard failure.
-    assert!(rt.last_clipboard_error().is_none());
-    // Release is a no-op: exactly one paste per click.
-    rt.handle_mouse_input(mouse_release(MouseButton::Right));
-    assert_eq!(rt.pending_input(), b"hi");
-}
-
-#[test]
-fn right_click_with_empty_clipboard_pastes_nothing_without_error() {
-    let mut rt = mouse_headless_runtime("hello world");
-    assert!(rt.last_clipboard_error().is_none());
-    rt.drain_pending_input();
-    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
-    rt.handle_mouse_input(mouse_press(MouseButton::Right));
-    assert!(rt.pending_input().is_empty());
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromClipboard)
+    );
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        None,
+        "one press queues the action exactly once"
+    );
+    assert_eq!(rt.pending_input(), b"", "dispatch owns the paste");
     assert!(!rt.has_pending_paste());
+    // The same action the app would run: delivered once through the gate.
+    assert_eq!(rt.paste_from_clipboard(), Ok(Some(false)));
+    assert_eq!(rt.pending_input(), b"hi");
     assert!(rt.last_clipboard_error().is_none());
 }
 
 #[test]
-fn middle_click_pastes_primary_bytes() {
+fn middle_click_default_queues_primary_paste() {
     let mut rt = mouse_headless_runtime("hello world");
-    // Standard clipboard holds something else: middle must read primary.
+    // Standard clipboard holds something else: the default binds primary.
     // Order matters: the platform `set_text` best-effort syncs the
     // primary selection (CTX-0160 ghostty copy-on-select), so stage the
     // standard clipboard first and the primary second.
@@ -471,16 +500,19 @@ fn middle_click_pastes_primary_bytes() {
     rt.drain_pending_input();
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromPrimary)
+    );
+    assert_eq!(rt.pending_input(), b"");
     assert!(!rt.has_pending_paste());
+    rt.handle_mouse_input(mouse_release(MouseButton::Middle));
+    assert_eq!(rt.take_pending_mouse_action(), None);
+    // The shared dispatcher's action reads primary, not the standard
+    // clipboard.
+    assert_eq!(rt.paste_from_primary(), Some(false));
     assert_eq!(rt.pending_input(), b"pq");
     assert!(rt.last_clipboard_error().is_none());
-    rt.handle_mouse_input(mouse_release(MouseButton::Middle));
-    assert_eq!(rt.pending_input(), b"pq");
-    // Right-click still reads the standard clipboard, not primary.
-    rt.drain_pending_input();
-    rt.handle_mouse_input(mouse_press(MouseButton::Right));
-    assert!(!rt.has_pending_paste());
-    assert_eq!(rt.pending_input(), b"zz");
 }
 
 #[test]
@@ -496,6 +528,12 @@ fn clipboard_copy_syncs_primary_like_ghostty() {
     rt.drain_pending_input();
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromPrimary)
+    );
+    // The dispatcher's action resolves the synced primary.
+    assert_eq!(rt.paste_from_primary(), Some(false));
     assert_eq!(rt.pending_input(), b"synced");
 }
 
@@ -508,20 +546,38 @@ fn middle_click_with_empty_primary_pastes_nothing() {
     rt.drain_pending_input();
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromPrimary)
+    );
+    assert_eq!(rt.paste_from_primary(), None);
     assert!(rt.pending_input().is_empty());
     assert!(!rt.has_pending_paste());
     assert!(rt.last_clipboard_error().is_none());
 }
 
 #[test]
-fn suspicious_right_paste_waits_for_confirmation() {
-    let mut rt = mouse_headless_runtime("hello world");
+fn configured_right_paste_waits_for_confirmation() {
+    // Explicitly binding the button to the paste action keeps the
+    // suspicious-paste gate: multi-line text never delivers silently.
+    let mut rt = Runtime::new(RuntimeConfig {
+        mouse_right: MouseButtonBinding::Action(ChromeAction::PasteFromClipboard),
+        ..RuntimeConfig::default()
+    })
+    .expect("configured runtime must build");
+    rt.force_headless_clipboard();
+    rt.handle_pty_bytes(b"hello world");
     rt.clipboard_mut()
         .set_text("a\nb".to_string())
         .expect("headless set");
     rt.drain_pending_input();
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Right));
+    assert_eq!(
+        rt.take_pending_mouse_action(),
+        Some(ChromeAction::PasteFromClipboard)
+    );
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
     assert!(rt.has_pending_paste(), "newline paste needs confirm");
     assert!(rt.pending_input().is_empty(), "no silent delivery");
     assert!(rt.confirm_pending_paste(true));
@@ -543,11 +599,19 @@ fn capture_mode_reports_sgr_and_never_pastes() {
     rt.handle_mouse_input(mouse_press(MouseButton::Right));
     assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M");
     assert!(!rt.has_pending_paste());
+    assert!(
+        rt.take_pending_mouse_action().is_none(),
+        "capture always wins over a host right binding"
+    );
     assert!(!rt.has_selection(), "capture must not select");
     // Middle press likewise reports its own button code.
     rt.handle_mouse_input(mouse_press(MouseButton::Middle));
     assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M\x1b[<1;1;1M");
     assert!(!rt.has_pending_paste());
+    assert!(
+        rt.take_pending_mouse_action().is_none(),
+        "capture always wins over a host middle binding"
+    );
     // Left release in capture reports SGR and never auto-copies.
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M\x1b[<1;1;1M\x1b[<0;1;1m");

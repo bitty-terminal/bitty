@@ -103,8 +103,8 @@ pub use keymap::{
     Chord, ChromeAction, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
     LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN,
     LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll, LeaderState, ModKey,
-    PREFIX_KEYWORD, PrefixBinding, ResolvedKeymap, ResolvedLeader, SplitDir, default_keymaps,
-    default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
+    MouseButtonBinding, PREFIX_KEYWORD, PrefixBinding, ResolvedKeymap, ResolvedLeader, SplitDir,
+    default_keymaps, default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
     parse_prefix_entry, parse_prefix_second, resolve_hint_config, resolve_keymaps, resolve_leader,
     resolve_leader_for, resolve_prefix_bindings, split_prefix_chord, validate_leader_timeout_ms,
 };
@@ -126,7 +126,7 @@ pub use panel_rules::{
 };
 pub use plan::{
     ConfigPlan, ConfigSource, HistoryCaptureConfigPlan, HistoryConfigPlan, LayerKind, LayeredPlan,
-    ProfileSelector,
+    MouseConfigPlan, ProfileSelector,
 };
 pub use project_schema::{
     MAX_ENTRY_NAME_BYTES, MAX_ENTRY_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,

@@ -13,7 +13,7 @@
 //! table.
 
 use crate::error::ConfigError;
-use crate::keymap::{Chord, ModKey};
+use crate::keymap::{Chord, ModKey, MouseButtonBinding};
 use crate::panel_rules::PanelSpawnRule;
 
 /// Upper bounds that keep every structure bounded against untrusted input
@@ -3587,14 +3587,15 @@ impl ScrollbarConfig {
     }
 }
 
-/// Mouse behavior configuration (CTX-0260).
+/// Mouse behavior configuration (CTX-0260; issue #2474 button bindings).
 ///
 /// `focus_follows_mouse` controls Hyprland-like hover activation: `false`
-/// (default) preserves click-to-focus (hover never moves keyboard focus);
-/// `true` moves keyboard focus to the hovered pane. Set via `init.lua`
-/// `mouse = { focus_follows_mouse = true }` (key optional, defaulting to
-/// `false` when the table is present but omits it, so `mouse = {}` keeps
-/// click-to-focus).
+/// preserves click-to-focus (hover never moves keyboard focus); `true` moves
+/// keyboard focus to the hovered pane. Set via `init.lua`
+/// `mouse = { focus_follows_mouse = false }`. The leaf is presence-gated:
+/// omitting it (or writing `mouse = {}`) says nothing and keeps the
+/// lower-precedence value; the shipped default applies only when no layer
+/// declares it.
 ///
 /// `focus_follows_mouse_delay_ms` (CTX-0334) optionally makes activation
 /// wait for the pointer to dwell in the hovered pane: `0` (default)
@@ -3602,12 +3603,24 @@ impl ScrollbarConfig {
 /// milliseconds so a transient pass-through never steals focus. Values are
 /// bounded by [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`] and validated
 /// fail-closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Issue #2474: `right` and `middle` bind the two chrome mouse buttons to
+/// the same action vocabulary as keymaps. `right` defaults to `none`
+/// (right-click is inert: no paste, no dialog, no PTY bytes); `middle`
+/// defaults to `paste_from_primary` (the documented Linux middle-click
+/// selection paste) and stays fully configurable. A pane that enables mouse
+/// reporting still receives the protocol bytes and never runs a host
+/// action.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MouseConfig {
     /// Whether hover moves keyboard focus to the hovered pane.
     pub focus_follows_mouse: bool,
     /// Dwell time in milliseconds before hover activation moves focus.
     pub focus_follows_mouse_delay_ms: u32,
+    /// Right-button binding (`mouse.right`; default `none`).
+    pub right: MouseButtonBinding,
+    /// Middle-button binding (`mouse.middle`; default `paste_from_primary`).
+    pub middle: MouseButtonBinding,
 }
 
 impl Default for MouseConfig {
@@ -3615,8 +3628,19 @@ impl Default for MouseConfig {
         Self {
             focus_follows_mouse: DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE,
             focus_follows_mouse_delay_ms: DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+            right: MouseButtonBinding::None,
+            middle: default_middle_binding(),
         }
     }
+}
+
+/// Shipped middle-click binding: Linux primary-selection paste.
+///
+/// Kept as a function so the bitty-config default, the project-trust gate,
+/// and the docs all name the same value without duplicating a literal.
+#[must_use]
+pub const fn default_middle_binding() -> MouseButtonBinding {
+    MouseButtonBinding::Action(crate::keymap::ChromeAction::PasteFromPrimary)
 }
 
 impl MouseConfig {
@@ -3626,7 +3650,8 @@ impl MouseConfig {
     ///
     /// [`ConfigError::validation`] when
     /// `focus_follows_mouse_delay_ms` exceeds
-    /// [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`] (fail-closed).
+    /// [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`] (fail-closed). Button
+    /// actions are already bounded and validated at parse time.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.focus_follows_mouse_delay_ms > MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS {
             return Err(ConfigError::validation(
@@ -5509,6 +5534,7 @@ mod tests {
             MouseConfig {
                 focus_follows_mouse: true,
                 focus_follows_mouse_delay_ms: good,
+                ..MouseConfig::default()
             }
             .validate()
             .expect("boundary delay must be valid");
@@ -5516,6 +5542,7 @@ mod tests {
         MouseConfig {
             focus_follows_mouse: true,
             focus_follows_mouse_delay_ms: MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS + 1,
+            ..MouseConfig::default()
         }
         .validate()
         .expect_err("over-max delay must fail closed");

@@ -194,6 +194,7 @@ discover_source() {
 
 discover_live() {
   need_curl
+  command -v jq >/dev/null 2>&1 || die "jq is required for live discovery"
   [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || die "CLOUDFLARE_API_TOKEN is required for live discovery"
   [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || die "CLOUDFLARE_ACCOUNT_ID is required for live discovery"
   local listing="$SCRATCH/objects.txt" cursor="" page

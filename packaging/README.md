@@ -589,19 +589,19 @@ and read-back-verifies it. `install.sh` and `install.ps1` uploads join
 `r2-stable` when CTX-1047 Phase 2 lands the scripts; their keys and cache
 policy are reserved here so Phase 2 changes no convention.
 
-### Component dist layout (CTX-1063, #1792)
+### Extension dist layout (CTX-1063, #1792)
 
-Prebuilt component distribution for machines without cargo and without a Rust
-network stack in `bitty` (the `component install <name>` fetch side is a
-follow-up owned by the plugin-manager two-fleet work; the minimal install
-seed that bootstraps the manager is #1791, not this task). This section ships
-the artifact side only: pack mechanics, manifest generation, and the upload
-contract. It uploads nothing.
+Prebuilt extension distribution for machines without cargo and without a Rust
+network stack in `bitty`. The client side is implemented: `bitty extension
+install <name>` reads this layout through the catalog and verifies the
+`SHA256SUMS` digest before staging (the minimal seed that bootstraps the
+manager is #1791). This section ships the artifact side only: pack mechanics,
+manifest generation, and the upload contract. Core uploads nothing.
 
-`VERSION` is the strict `X.Y.Z` component version from `bitty-component.toml`;
-pack policy takes only the `X.Y.Z` core (no leading zeros, no prerelease or
-build metadata), intentionally narrower than the full semver the installed
-component parser accepts. `TARGET` is the Rust target triple the binary was
+`VERSION` is the strict `X.Y.Z` extension version from `bitty-component.toml`
+(the internal descriptor file name); pack policy takes only the `X.Y.Z` core
+(no leading zeros, no prerelease or build metadata), intentionally narrower
+than the full semver the installed descriptor parser accepts. `TARGET` is the Rust target triple the binary was
 built for. Both segments below are literal; only `NAME`, `VERSION`, and
 `TARGET` vary:
 

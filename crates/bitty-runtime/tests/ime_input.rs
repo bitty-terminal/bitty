@@ -661,7 +661,7 @@ fn empty_commit_restamps_the_claim_it_keeps() {
     // which is still well inside every window here, so the assertion is about
     // whether ageing dropped the claim at that tick.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now();
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
 
     feed_typing_key(&mut rt, "nihao", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -676,6 +676,23 @@ fn empty_commit_restamps_the_claim_it_keeps() {
         "the commit re-stamped the claim, so the echo is still the IME's"
     );
     assert_eq!(rt.drain_pending_input(), b"");
+}
+
+#[test]
+fn first_key_after_a_100ms_pause_is_not_eaten() {
+    // Pins the 250 ms -> 25 ms change: a deliberate next key 100 ms after the
+    // commit used to be swallowed as a phantom echo. The old window would fail
+    // this test; the current window must let the key through.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let base = std::time::Instant::now() - std::time::Duration::from_millis(100);
+    rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+    rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+    rt.drain_pending_input();
+    assert!(
+        rt.handle_key_event(char_key(" ")).is_some(),
+        "a key 100 ms after the commit is real input"
+    );
+    assert_eq!(rt.drain_pending_input(), b" ");
 }
 
 #[test]

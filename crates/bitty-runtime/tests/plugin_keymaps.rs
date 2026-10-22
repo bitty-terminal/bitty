@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use bitty_config::{Chord, ChromeAction, ResolvedKeymap};
 use bitty_lua::keymaps::{KEYMAP_LIST_MAX_ROWS, KEYMAP_LIST_MAX_TOTAL};
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, KeymapSource, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
@@ -206,6 +206,10 @@ fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedKeymaps>) {
     let source = Rc::new(FixedKeymaps::default());
     *source.0.borrow_mut() = default_table();
     let mut rt = runtime(root, Some(source.clone()));
+    // The 1024-row/64 KiB cap test is a payload-bound check, not a budget
+    // check: a loaded runner can otherwise park the invocation at the 50 ms
+    // RC-1 wall slice before the capped page is encoded (bitty#2463).
+    rt.set_vm_wall_budget_ms(Some(100 * RC1_WALL_CLOCK_BUDGET_MS));
     activate_all(&mut rt);
     (rt, source)
 }

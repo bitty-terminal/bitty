@@ -52,7 +52,7 @@ const POLL_ATTEMPTS: usize = 400;
 /// the `big` fixture at 130 ms on an otherwise green commit (the same
 /// scheduler-stall shape as bitty#2259 / #1727 / #1744). Widen only the
 /// harness wall dimension; instruction and memory stay at RC defaults.
-const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
+const HARNESS_WALL_BUDGET_MS: u64 = 100 * RC1_WALL_CLOCK_BUDGET_MS;
 const RELOAD_PLUGIN: &str = "acme.reload";
 const RELOAD_V2_URL: &str = "https://api.example.com/v2/reloaded";
 

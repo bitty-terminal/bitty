@@ -287,8 +287,10 @@ fn golden_scrollback_viewport() {
     }
     let _ = rt.tick().expect("grid present");
     assert!(rt.scroll_focused_page(true), "scroll up pages the view");
+    // Page scroll defaults to 75% of the viewport (issue #2475), so this
+    // digest is the 18-of-24-row default, not a full page.
     let scrolled = rt.tick().expect("scrolled present");
-    assert_digest("scrollback", &rt, &scrolled, 0xbb4b_d8ce_82cc_6723);
+    assert_digest("scrollback", &rt, &scrolled, 0x4dfd_9752_ab9b_c0ee);
 }
 
 #[test]

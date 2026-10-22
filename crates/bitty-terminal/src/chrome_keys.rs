@@ -3840,6 +3840,52 @@ mod tests {
     }
 
     #[test]
+    fn zoomed_goto_split_down_restores_zoom_and_lands_below_issue_2444() {
+        // Issue #2444: while zoomed, `Mod+j` first restores the real tree,
+        // then moves focus spatially. From the top-right pane of the
+        // L-shaped layout it must land on the pane directly below, not the
+        // full-height left pane.
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        let l_shape = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            ),
+        );
+        app.runtime.set_layout(l_shape);
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert_eq!(app.runtime.leaf_count(), 1, "zoom proxy installed");
+        app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Down));
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "focus movement restores the real tree"
+        );
+        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(3)),
+            "down from the zoomed top-right pane lands below"
+        );
+    }
+
+    #[test]
     fn chrome_split_close_resize_zoom_round_trip() {
         use bitty_config::{ChromeAction, SplitDir};
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())

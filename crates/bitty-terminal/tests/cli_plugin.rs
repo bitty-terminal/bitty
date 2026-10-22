@@ -1941,11 +1941,13 @@ fn backdate_staging(path: &Path) {
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt as _;
-        // FILE_FLAG_BACKUP_SEMANTICS: required to open a directory handle.
+        // A directory handle needs FILE_FLAG_BACKUP_SEMANTICS (custom flags,
+        // not the access mask) plus FILE_WRITE_ATTRIBUTES for `set_times`.
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
         std::fs::OpenOptions::new()
-            .read(true)
-            .access_mode(FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .expect("open staging dir")
     };

@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use bitty_plugin_host::manifest::PluginId;
-use bitty_runtime::plugin_runtime::{LuaValue, PluginRuntime, PluginRuntimeConfig, load_index};
+use bitty_runtime::plugin_runtime::{
+    LuaValue, PluginRecord, PluginRuntime, PluginRuntimeConfig, SourceClass, load_index,
+    write_index,
+};
 
 /// Binary under test.
 const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
@@ -1983,8 +1986,8 @@ fn plugin_install_recovers_owner_orphan_repro() {
     assert!(text.contains("orphaned"), "{text}");
     assert!(text.contains("bitty plugin doctor --repair"), "{text}");
     assert!(
-        text.contains("bitty plugin remove xuepoo.external --force"),
-        "{text}"
+        !text.contains("bitty plugin remove xuepoo.external --force"),
+        "repair hints stay non-destructive: {text}"
     );
 
     // --yes approves the repair prompt (non-interactive).
@@ -2330,6 +2333,175 @@ fn plugin_doctor_detects_and_drops_a_dangling_record() {
         !stdout(&output).contains("xuepoo.external"),
         "{}",
         stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// Review regressions: authoritative repair, crash-window asides, hints.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plugin_doctor_repair_restores_a_crash_window_replaced_aside() {
+    // Crash after the active version was renamed to `.tmp-replaced-*` and
+    // before the index write: `current.json` still points at it, so repair
+    // must restore the tree instead of deleting it as stale staging.
+    let home = scratch_dir("aside-restore");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(&home, &["plugin", "enable", "xuepoo.external"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let package_dir = store.join("packages/xuepoo.external");
+    let target = package_dir.join("1.0.0");
+    let aside = package_dir.join(format!(".tmp-replaced-{}-0", std::process::id()));
+    std::fs::rename(&target, &aside).expect("simulate crash window");
+    backdate_staging(&aside);
+    let index_before = std::fs::read(store.join("current.json")).expect("index bytes");
+
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("stale-staging"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("restored packages/xuepoo.external/1.0.0"),
+        "the restore is reported: {text}"
+    );
+    assert!(target.is_dir(), "the only copy is restored, not deleted");
+    assert!(!aside.exists(), "{text}");
+    assert_eq!(
+        std::fs::read(store.join("current.json")).expect("index bytes"),
+        index_before,
+        "the active record is unchanged"
+    );
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("enabled"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("orphaned"), "{}", stdout(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_repair_quarantines_a_bundled_shadow_tree() {
+    // A store record for a bundled id is invalid provenance. Repair drops the
+    // record but must preserve the tree in quarantine, never delete it.
+    let home = scratch_dir("bundled-shadow");
+    let store = data_store(&home);
+    let version_dir = store.join("packages").join(PLUGIN).join("1.0.0");
+    std::fs::create_dir_all(version_dir.join("lua")).expect("shadow tree");
+    std::fs::write(version_dir.join("lua/init.lua"), b"return {}\n").expect("body");
+    write_index(
+        &store,
+        &[PluginRecord {
+            source_class: SourceClass::LocalPath,
+            plugin_id: PLUGIN.to_string(),
+            version: "1.0.0".to_string(),
+            root: format!("packages/{PLUGIN}/1.0.0"),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        }],
+    )
+    .expect("shadowing index");
+
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("store/bundled mismatch"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("quarantined packages/{PLUGIN}/1.0.0")),
+        "{text}"
+    );
+    assert!(
+        !version_dir.exists(),
+        "the shadow tree is moved, not deleted"
+    );
+    let preserved = std::fs::read_dir(store.join("quarantine").join(PLUGIN))
+        .expect("quarantine entry")
+        .flatten()
+        .any(|entry| entry.path().join("lua/init.lua").is_file());
+    assert!(preserved, "the shadow tree is preserved for inspection");
+    assert!(load_index(&store).expect("index").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_list_keeps_a_healthy_row_state_with_extra_version_dirs() {
+    // An extra unindexed version dir must not flip an enabled row to
+    // `orphaned`, and the hint must not suggest the destructive remove.
+    let home = scratch_dir("healthy-extra");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(&home, &["plugin", "enable", "xuepoo.external"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    std::fs::create_dir_all(store.join("packages/xuepoo.external/9.9.9")).expect("extra dir");
+
+    let output = run_in(&home, &["plugin", "list", "--format", "json"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("\"state\":\"enabled\""), "{text}");
+    assert!(text.contains("\"enabled\":true"), "{text}");
+    assert!(
+        text.contains("bitty plugin doctor --repair"),
+        "the repair hint stays available: {text}"
+    );
+    assert!(
+        !text.contains("bitty plugin remove xuepoo.external --force"),
+        "no destructive hint: {text}"
+    );
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("enabled"), "{text}");
+    assert!(!text.contains("orphaned"), "{text}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_accepts_no_color() {
+    let home = scratch_dir("doctor-no-color");
+    let output = run_in(&home, &["plugin", "doctor", "--no-color"], None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--no-color must be accepted: {}",
+        stderr(&output)
+    );
+    assert!(!stdout(&output).contains('\u{1b}'), "{}", stdout(&output));
+    let output = run_in(&home, &["plugin", "doctor", "--repair", "--no-color"], None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--repair --no-color must be accepted: {}",
+        stderr(&output)
     );
     let _ = std::fs::remove_dir_all(&home);
 }

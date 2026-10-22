@@ -11,7 +11,7 @@
 //!
 //! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info|config`
 //!   with `list`/`info`/`config show` accepting `--format table|json|jsonl`
-//!   (default table) and `--no-color` (accepted; tables are plain text).
+//!   (default table) and `--no-color`; `doctor` also accepts `--no-color`.
 //! - `install <id>` resolves an exact id against the **bundled** catalog or
 //!   the build-time **official** catalog embedded from bitty-plugins
 //!   (`bitty_plugin_host::official`). Bundled ids pin
@@ -50,7 +50,9 @@
 //! - `remove <id> --force` is destructive: bundled records lose their managed
 //!   entry with `bitty-plugins.toml.bak` kept; installed packages delete their
 //!   store record and staged tree. It also deletes an unindexed orphan tree
-//!   (the copy-paste repair command shown by `list`). `enable`/`disable` are idempotent toggles
+//!   when an operator explicitly chooses to discard it; the repair hint shown
+//!   by `list` is the non-destructive `doctor --repair` path.
+//!   `enable`/`disable` are idempotent toggles
 //!   in the managed manifest or the store index respectively; `enable`
 //!   re-checks the hash pin and the grant coverage and fails closed on a
 //!   mismatch. `revoke <id> [--cap <capability>]` drops grants without
@@ -85,15 +87,18 @@
 //!   the write inside the environment-derived config root, and commits
 //!   atomically (temp file with `create_new`; hard-link no-clobber or rename
 //!   with `--force`). `--init` is the issue-shape alias for `scaffold`.
-//! - `doctor [--repair]` diagnoses the package store and the managed ledger
-//!   without creating a VM: corrupt `current.json`, orphaned/incomplete/
-//!   duplicate version dirs, dangling records, stale staging, malformed or
-//!   stale ledger records. `--repair` moves broken/extra trees into
-//!   `<store>/quarantine/` (never deletes them), removes stale staging, moves
-//!   a corrupt index/ledger aside, and rebuilds `current.json` from complete
-//!   package dirs with the index write last and atomic. Rebuilt records keep
-//!   grants only when the manifest hash still matches; otherwise they start
-//!   disabled with no grants and need a fresh `install` consent.
+//! - `doctor [--repair] [--no-color]` diagnoses the package store and the
+//!   managed ledger without creating a VM: corrupt `current.json`,
+//!   orphaned/incomplete/duplicate version dirs, dangling records, stale
+//!   staging, malformed or stale ledger records. `--repair` moves broken/extra
+//!   trees into `<store>/quarantine/` (never deletes them), restores or
+//!   quarantines a `.tmp-replaced-*` tree left by an interrupted commit,
+//!   removes stale staging, moves a corrupt index/ledger aside, and rebuilds
+//!   `current.json` from complete package dirs with the index write last and
+//!   atomic. The authoritative rebuild is never truncated: over the safe
+//!   repair bound it refuses with a typed error and changes nothing. Rebuilt
+//!   records keep grants only when the manifest hash still matches; otherwise
+//!   they start disabled with no grants and need a fresh `install` consent.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
 //!   code is ever loaded or executed**; safe-mode clean).
 //!
@@ -576,14 +581,25 @@ pub fn parse_plugin_request(
             verb.name()
         )));
     }
-    if (format != PluginFormat::Table || no_color)
+    if format != PluginFormat::Table
         && !matches!(
             verb,
             PluginVerb::List | PluginVerb::Info | PluginVerb::Config
         )
     {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --format/--no-color only apply to `list`, `info`, and `config` (got `{}`)",
+            "bitty plugin: --format/--json only apply to `list`, `info`, and `config` (got `{}`)",
+            verb.name()
+        )));
+    }
+    if no_color
+        && !matches!(
+            verb,
+            PluginVerb::List | PluginVerb::Info | PluginVerb::Config | PluginVerb::Doctor
+        )
+    {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --no-color only applies to `list`, `info`, `config`, and `doctor` (got `{}`)",
             verb.name()
         )));
     }
@@ -663,7 +679,7 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin install <git-url> [--yes] [--force]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
      \x20      bitty plugin install <archive> [--yes] [--force]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
      \x20      bitty plugin remove <id> --force\n\
-     \x20      bitty plugin doctor [--repair]\n\
+     \x20      bitty plugin doctor [--repair] [--no-color]\n\
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin revoke <id> [--cap <capability>]\n\
@@ -770,7 +786,8 @@ pub fn plugin_help_text() -> String {
      \x20                             (canonical <owner>.<name>.lua path) from\n\
      \x20                             the manifest [settings] defaults. Refuses\n\
      \x20                             to overwrite without --force.\n\
-     \x20 doctor [--repair]           Diagnose the package store and the\n\
+     \x20 doctor [--repair] [--no-color]\n\
+     \x20                             Diagnose the package store and the\n\
      \x20                             bitty-plugins.toml ledger. Reports\n\
      \x20                             orphaned/partial version dirs, dangling\n\
      \x20                             index records, a corrupt current.json,\n\
@@ -787,7 +804,8 @@ pub fn plugin_help_text() -> String {
      flags:\n\
      \x20 --format table|json|jsonl   list/info/config show output (default table).\n\
      \x20 --json                      Alias for --format json.\n\
-     \x20 --no-color                  Accepted for parity (tables are plain text).\n\
+     \x20 --no-color                  list/info/config/doctor output (tables are\n\
+     \x20                             plain text; this also honors NO_COLOR).\n\
      \x20 --yes                       install only: approve capability consent and\n\
      \x20                             an orphan/same-version repair prompt.\n\
      \x20 --force                     install/remove/config scaffold: install\n\
@@ -1938,15 +1956,18 @@ fn rows_from_state_with_catalog(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let hint = format!(
-                "bitty plugin doctor --repair   # rebuild the index from complete trees; \
-                 or: bitty plugin remove {id} --force"
-            );
+            // Non-destructive repair path only: `remove --force` deletes the
+            // staged tree (including a working version), so it is never a
+            // suggested repair for an extra directory.
+            let hint = "bitty plugin doctor --repair   # rebuild the index from complete \
+                        trees and quarantine incomplete ones"
+                .to_string();
             if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                if row.state != "broken" {
-                    row.state = "orphaned";
-                }
-                row.repair = Some(hint.clone());
+                // The index record (or bundled/recorded state) stays
+                // authoritative. Extra unreferenced directories are reported
+                // in the description without flipping a healthy row to
+                // `orphaned` while it is still enabled.
+                row.repair = Some(hint);
                 let _ = write!(
                     row.description,
                     " (unreferenced package directories: {versions})"
@@ -1962,7 +1983,9 @@ fn rows_from_state_with_catalog(
                 name: id.clone(),
                 version: versions.clone(),
                 description: format!(
-                    "orphaned package directory with no store index record ({versions});                      complete trees can be re-indexed and incomplete ones quarantined by                      `bitty plugin doctor --repair`, or discard them with                      `bitty plugin remove {id} --force` and reinstall"
+                    "orphaned package directory with no store index record ({versions}); \
+                     complete trees can be re-indexed and incomplete ones quarantined by \
+                     `bitty plugin doctor --repair`"
                 ),
                 bundled: false,
                 source: "unknown".to_string(),
@@ -2102,7 +2125,8 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
         version: record.version.clone(),
         description: if broken {
             format!(
-                "store record points at an unusable package directory ({}); repair:                  bitty plugin doctor --repair",
+                "store record points at an unusable package directory ({}); \
+                 repair: bitty plugin doctor --repair",
                 record.root
             )
         } else {
@@ -2142,12 +2166,7 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
             .as_ref()
             .map(|manifest| manifest.settings.clone())
             .unwrap_or_default(),
-        repair: broken.then(|| {
-            format!(
-                "bitty plugin doctor --repair   # or: bitty plugin remove {} --force",
-                record.plugin_id
-            )
-        }),
+        repair: broken.then(|| "bitty plugin doctor --repair".to_string()),
     }
 }
 
@@ -4960,7 +4979,8 @@ fn install_local_path(
         }
         Ok(None) => {
             eprintln!(
-                "bitty plugin: install was not approved (capability grant or package repair) —                  nothing changed"
+                "bitty plugin: install was not approved (capability grant or package repair) \
+                 — nothing changed"
             );
             EXIT_GENERIC
         }
@@ -5367,7 +5387,8 @@ fn run_plugin_doctor(
                         }
                     }
                     // A store record for a bundled id can never be trusted:
-                    // bundled provenance is first-party only.
+                    // bundled provenance is first-party only. Repair
+                    // quarantines the shadowing tree (never deletes it).
                     if let Ok(records) = load_index(root) {
                         for record in &records {
                             if bundled_manifest_for(&record.plugin_id).is_some() {
@@ -5375,8 +5396,9 @@ fn run_plugin_doctor(
                                 let _ = writeln!(
                                     output,
                                     "  [fail] store/bundled mismatch {}: a store record shadows \
-                                     a bundled plugin id; repair: bitty plugin remove {} --force",
-                                    record.plugin_id, record.plugin_id
+                                     a bundled plugin id; repair: bitty plugin doctor --repair \
+                                     (quarantines the store tree)",
+                                    record.plugin_id
                                 );
                             }
                         }
@@ -5440,6 +5462,9 @@ fn run_plugin_doctor(
         if let Some(root) = store_root {
             match package::repair_store(root) {
                 Ok(report) => {
+                    for restored in &report.restored {
+                        let _ = writeln!(output, "  restored {restored}");
+                    }
                     for (from, to) in &report.quarantined {
                         let _ = writeln!(output, "  quarantined {from} -> {to}");
                     }
@@ -5457,6 +5482,7 @@ fn run_plugin_doctor(
                         );
                     }
                     if report.quarantined.is_empty()
+                        && report.restored.is_empty()
                         && report.staging_removed.is_empty()
                         && !report.index_rebuilt
                     {
@@ -5466,31 +5492,6 @@ fn run_plugin_doctor(
                 Err(error) => {
                     repair_failures += 1;
                     let _ = writeln!(output, "  [fail] store repair failed: {error}");
-                }
-            }
-            // Store records that shadow bundled ids are removed explicitly;
-            // repair_store intentionally keeps them out of the rebuild.
-            if let Ok(records) = load_index(root) {
-                for record in records {
-                    if bundled_manifest_for(&record.plugin_id).is_some() {
-                        match package::uninstall(root, &record.plugin_id) {
-                            Ok(_) => {
-                                let _ = writeln!(
-                                    output,
-                                    "  removed shadowing store record {}",
-                                    record.plugin_id
-                                );
-                            }
-                            Err(error) => {
-                                repair_failures += 1;
-                                let _ = writeln!(
-                                    output,
-                                    "  [fail] cannot remove shadowing record {}: {error}",
-                                    record.plugin_id
-                                );
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -5746,7 +5747,8 @@ fn package_failure_exit(error: &PackageOpError) -> i32 {
         | PackageOpError::Incompatible { .. } => EXIT_PLUGIN,
         PackageOpError::InvalidSource(_)
         | PackageOpError::ConsentAborted(_)
-        | PackageOpError::Store(_) => EXIT_GENERIC,
+        | PackageOpError::Store(_)
+        | PackageOpError::StoreTooLarge { .. } => EXIT_GENERIC,
     }
 }
 
@@ -6659,7 +6661,7 @@ mod tests {
         assert!(
             parse_error(&["install", "a", "--format", "json"]).contains("only apply to `list`")
         );
-        assert!(parse_error(&["remove", "a", "--no-color"]).contains("only apply to `list`"));
+        assert!(parse_error(&["remove", "a", "--no-color"]).contains("--no-color only applies"));
         assert!(parse_error(&["list", "--repair"]).contains("--repair only applies"));
         assert!(parse_error(&["install", "a", "--repair"]).contains("--repair only applies"));
     }
@@ -6671,6 +6673,8 @@ mod tests {
         assert!(!doctor.repair);
         let repair = parse_ok(&["doctor", "--repair"]);
         assert!(repair.repair);
+        let plain = parse_ok(&["doctor", "--no-color"]);
+        assert!(plain.no_color, "doctor accepts --no-color");
         let forced = parse_ok(&["install", "./plugin", "--force"]);
         assert!(forced.force);
         assert!(

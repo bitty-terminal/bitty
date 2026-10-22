@@ -2567,59 +2567,107 @@ impl Runtime {
         Some(ids[index])
     }
 
-    /// Selects a directional panel from all presented frames. Anchored floats
-    /// are not layout leaves, so the generic layout adjacency cannot see them;
-    /// frame-center distance supplies deterministic spatial intent. Detached
-    /// floats and pins use the cycle ring as a fail-soft edge when every
-    /// presented panel overlaps; tiled leaves retain their layout-edge stop.
+    /// Selects a directional panel from all presented frames.
+    ///
+    /// Ranking is spatial, not center-to-center distance (issue #2444): a
+    /// pane counts only when it lies fully beyond the focused pane's facing
+    /// edge on the movement axis. Among those, panes whose perpendicular
+    /// interval overlaps the focused pane win over disjoint ones; within a
+    /// tier the nearest facing edge, then the nearest perpendicular center,
+    /// then stable focus order decide. This makes `Mod+j` in an L-shaped
+    /// layout pick the pane directly below instead of a taller neighbor
+    /// whose center happens to be closer.
+    ///
+    /// Overlay panels need a fallback because anchored floats and pins are
+    /// centered over the layout and therefore overlap every tile: when no
+    /// separated pane wins, an overlay is chosen by center intent relative
+    /// to the focused pane (and from an overlay every panel is reachable).
+    /// Two overlapping tiled leaves never move focus, so the layout-edge
+    /// stop is preserved. Detached floats and pins additionally keep the
+    /// cycle-ring fail-soft edge when nothing lies in the direction. The
+    /// zoom/fullscreen proxy is a single leaf, so it has no spatial
+    /// neighbor; the chrome layer restores zoom before moving focus.
     fn focus_spatial_neighbor(&self, ids: &[ViewId], dir: FocusDirection) -> Option<ViewId> {
         let current = self.focused_view()?;
         let frames = self.present_frames();
         let current_frame = frames.iter().find(|frame| frame.view == current)?;
-        let current_center = (
-            current_frame.frame.x + current_frame.frame.width as i32 / 2,
-            current_frame.frame.y + current_frame.frame.height as i32 / 2,
-        );
-        let mut candidates: Vec<(ViewId, i64, i64)> = frames
-            .iter()
-            .filter(|frame| frame.view != current && ids.contains(&frame.view))
-            .filter_map(|frame| {
-                let center = (
-                    frame.frame.x + frame.frame.width as i32 / 2,
-                    frame.frame.y + frame.frame.height as i32 / 2,
-                );
-                let (primary, secondary) = match dir {
-                    FocusDirection::Up => (
-                        current_center.1 - center.1,
-                        (center.0 - current_center.0).abs(),
-                    ),
-                    FocusDirection::Down => (
-                        center.1 - current_center.1,
-                        (center.0 - current_center.0).abs(),
-                    ),
-                    FocusDirection::Left => (
-                        current_center.0 - center.0,
-                        (center.1 - current_center.1).abs(),
-                    ),
-                    FocusDirection::Right => (
-                        center.0 - current_center.0,
-                        (center.1 - current_center.1).abs(),
-                    ),
-                    FocusDirection::Next | FocusDirection::Prev => return None,
-                };
-                (primary > 0).then_some((frame.view, i64::from(primary), i64::from(secondary)))
-            })
-            .collect();
-        candidates.sort_by_key(|(_, primary, secondary)| (*primary, *secondary));
-        candidates.first().map(|(id, _, _)| *id).or_else(|| {
-            // Preserve the pre-overlay behavior for tiled leaves: reaching a
-            // layout edge directionally does not jump around the focus ring.
-            // Detached floats and pins have no layout adjacency, so retain
-            // their cycle fallback when spatial intent has no candidate.
-            (!self.layout.leaf_ids().contains(&current))
-                .then(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
-                .flatten()
-        })
+        // A zero-area frame has no visual neighborhood: directional focus
+        // must not teleport onto (or out of) a pane that paints nothing.
+        // The cycle ring still reaches such panes for recovery.
+        if current_frame.frame.width == 0 || current_frame.frame.height == 0 {
+            return None;
+        }
+        let tiled = self.layout.leaf_ids();
+        let current_is_tiled = tiled.contains(&current);
+
+        let mut aligned: Vec<SpatialCandidate> = Vec::new();
+        let mut disjoint: Vec<SpatialCandidate> = Vec::new();
+        let mut overlapping: Vec<SpatialCandidate> = Vec::new();
+        for frame in &frames {
+            if frame.view == current {
+                continue;
+            }
+            if frame.frame.width == 0 || frame.frame.height == 0 {
+                continue;
+            }
+            let Some(order) = ids.iter().position(|id| *id == frame.view) else {
+                continue;
+            };
+            match spatial_relation(frame.frame, current_frame.frame, dir) {
+                Some(SpatialRelation::Separated {
+                    edge_distance,
+                    perpendicular_overlap,
+                    perpendicular_distance,
+                }) => {
+                    let candidate = SpatialCandidate {
+                        view: frame.view,
+                        order,
+                        distance: edge_distance,
+                        perpendicular_distance,
+                    };
+                    if perpendicular_overlap > 0 {
+                        aligned.push(candidate);
+                    } else {
+                        disjoint.push(candidate);
+                    }
+                }
+                Some(SpatialRelation::Overlapping {
+                    center_distance,
+                    perpendicular_distance,
+                }) => {
+                    // Overlapping tiled panes are not directional targets:
+                    // keep the layout-edge stop. Overlays stay reachable
+                    // because their frames overlap every tile by design.
+                    if current_is_tiled && tiled.contains(&frame.view) {
+                        continue;
+                    }
+                    overlapping.push(SpatialCandidate {
+                        view: frame.view,
+                        order,
+                        distance: center_distance,
+                        perpendicular_distance,
+                    });
+                }
+                None => {}
+            }
+        }
+
+        for group in [&mut aligned, &mut disjoint, &mut overlapping] {
+            sort_spatial(group);
+        }
+        for group in [&aligned, &disjoint, &overlapping] {
+            if let Some(candidate) = group.first() {
+                return Some(candidate.view);
+            }
+        }
+
+        // Preserve the pre-overlay behavior for tiled leaves: reaching a
+        // layout edge directionally does not jump around the focus ring.
+        // Detached floats and pins have no layout adjacency, so retain
+        // their cycle fallback when spatial intent has no candidate.
+        (!current_is_tiled)
+            .then(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
+            .flatten()
     }
 
     /// Container rect (cell coordinates) that the layout is reflowed into.
@@ -2966,12 +3014,280 @@ impl Runtime {
     }
 }
 
+/// One directional-focus candidate with its precomputed ranking keys.
+struct SpatialCandidate {
+    view: ViewId,
+    /// Stable focus-cycle order (layout order, then floats, then pins).
+    order: usize,
+    /// Facing-edge distance along the movement axis (or center distance for
+    /// the overlay overlap fallback).
+    distance: i64,
+    /// Perpendicular center distance; breaks equal edge distances.
+    perpendicular_distance: i64,
+}
+
+/// How a presented frame relates to the focused frame for one direction.
+enum SpatialRelation {
+    /// The frame lies fully beyond the focused frame's facing edge.
+    Separated {
+        /// Gap between the two facing edges (0 when they touch).
+        edge_distance: i64,
+        /// Length of the shared perpendicular interval (0 = disjoint).
+        perpendicular_overlap: i64,
+        /// Perpendicular center distance (doubled).
+        perpendicular_distance: i64,
+    },
+    /// The frame overlaps the focused frame on the movement axis but its
+    /// center lies in the requested direction.
+    Overlapping {
+        /// Center distance along the movement axis (doubled).
+        center_distance: i64,
+        /// Perpendicular center distance (doubled).
+        perpendicular_distance: i64,
+    },
+}
+
+/// Classifies `candidate` against `current` for directional focus (issue
+/// #2444).
+///
+/// Separated candidates are the normal spatial targets: the full extent of
+/// the frame is beyond the focused pane's facing edge, so a tall neighbor
+/// can never outrank a pane that actually sits in the requested direction.
+/// Overlapping candidates cover centered overlays, whose frames necessarily
+/// cover the tiled layout; they are only consulted when no separated pane
+/// exists.
+fn spatial_relation(
+    candidate: bitty_render::geometry::RectPx,
+    current: bitty_render::geometry::RectPx,
+    dir: FocusDirection,
+) -> Option<SpatialRelation> {
+    let cx0 = i64::from(candidate.x);
+    let cy0 = i64::from(candidate.y);
+    let cx1 = cx0 + i64::from(candidate.width);
+    let cy1 = cy0 + i64::from(candidate.height);
+    let cur_x0 = i64::from(current.x);
+    let cur_y0 = i64::from(current.y);
+    let cur_x1 = cur_x0 + i64::from(current.width);
+    let cur_y1 = cur_y0 + i64::from(current.height);
+
+    // Doubled centers keep the comparison exact without a lossy division.
+    let center_dx = (cx0 + cx1) - (cur_x0 + cur_x1);
+    let center_dy = (cy0 + cy1) - (cur_y0 + cur_y1);
+    let perpendicular_x = center_dx.abs();
+    let perpendicular_y = center_dy.abs();
+    let overlap_x = overlap_1d(cx0, cx1, cur_x0, cur_x1);
+    let overlap_y = overlap_1d(cy0, cy1, cur_y0, cur_y1);
+
+    match dir {
+        FocusDirection::Up => {
+            if cy1 <= cur_y0 {
+                Some(SpatialRelation::Separated {
+                    edge_distance: cur_y0 - cy1,
+                    perpendicular_overlap: overlap_x,
+                    perpendicular_distance: perpendicular_x,
+                })
+            } else if center_dy < 0 {
+                Some(SpatialRelation::Overlapping {
+                    center_distance: -center_dy,
+                    perpendicular_distance: perpendicular_x,
+                })
+            } else {
+                None
+            }
+        }
+        FocusDirection::Down => {
+            if cy0 >= cur_y1 {
+                Some(SpatialRelation::Separated {
+                    edge_distance: cy0 - cur_y1,
+                    perpendicular_overlap: overlap_x,
+                    perpendicular_distance: perpendicular_x,
+                })
+            } else if center_dy > 0 {
+                Some(SpatialRelation::Overlapping {
+                    center_distance: center_dy,
+                    perpendicular_distance: perpendicular_x,
+                })
+            } else {
+                None
+            }
+        }
+        FocusDirection::Left => {
+            if cx1 <= cur_x0 {
+                Some(SpatialRelation::Separated {
+                    edge_distance: cur_x0 - cx1,
+                    perpendicular_overlap: overlap_y,
+                    perpendicular_distance: perpendicular_y,
+                })
+            } else if center_dx < 0 {
+                Some(SpatialRelation::Overlapping {
+                    center_distance: -center_dx,
+                    perpendicular_distance: perpendicular_y,
+                })
+            } else {
+                None
+            }
+        }
+        FocusDirection::Right => {
+            if cx0 >= cur_x1 {
+                Some(SpatialRelation::Separated {
+                    edge_distance: cx0 - cur_x1,
+                    perpendicular_overlap: overlap_y,
+                    perpendicular_distance: perpendicular_y,
+                })
+            } else if center_dx > 0 {
+                Some(SpatialRelation::Overlapping {
+                    center_distance: center_dx,
+                    perpendicular_distance: perpendicular_y,
+                })
+            } else {
+                None
+            }
+        }
+        FocusDirection::Next | FocusDirection::Prev => None,
+    }
+}
+
+/// Length of the intersection of two half-open intervals, clamped at 0.
+fn overlap_1d(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
+    a1.min(b1).saturating_sub(a0.max(b0)).max(0)
+}
+
+/// Deterministic spatial ranking: nearest facing edge, then nearest
+/// perpendicular center, then stable focus order, then `ViewId`.
+fn sort_spatial(candidates: &mut [SpatialCandidate]) {
+    candidates.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| a.perpendicular_distance.cmp(&b.perpendicular_distance))
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.view.cmp(&b.view))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn leaf(id: u64) -> LayoutNode {
         LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
+    }
+
+    #[test]
+    fn spatial_relation_prefers_aligned_pane_over_tall_neighbor_issue_2444() {
+        // L-shape: left full-height, right split into top/bottom. From the
+        // top-right pane, `down` must see only the bottom-right pane as a
+        // separated candidate; the tall left pane starts above the current
+        // pane and therefore overlaps the movement axis.
+        let left = bitty_render::geometry::RectPx::new(0, 0, 100, 200);
+        let top_right = bitty_render::geometry::RectPx::new(100, 0, 100, 100);
+        let bottom_right = bitty_render::geometry::RectPx::new(100, 100, 100, 100);
+        let current = top_right;
+        assert!(matches!(
+            spatial_relation(bottom_right, current, FocusDirection::Down),
+            Some(SpatialRelation::Separated {
+                edge_distance: 0,
+                perpendicular_overlap: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            spatial_relation(left, current, FocusDirection::Down),
+            Some(SpatialRelation::Overlapping { .. })
+        ));
+        // Up from the bottom-right pane sees the top-right pane; the left
+        // pane overlaps the movement axis and is not a separated target.
+        assert!(matches!(
+            spatial_relation(top_right, bottom_right, FocusDirection::Up),
+            Some(SpatialRelation::Separated {
+                edge_distance: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            spatial_relation(left, bottom_right, FocusDirection::Up),
+            Some(SpatialRelation::Overlapping { .. })
+        ));
+        // Equal-distance symmetric right column: both right panes are
+        // separated and overlap the left pane's vertical extent.
+        assert!(matches!(
+            spatial_relation(top_right, left, FocusDirection::Right),
+            Some(SpatialRelation::Separated {
+                perpendicular_overlap: 100,
+                perpendicular_distance: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            spatial_relation(bottom_right, left, FocusDirection::Right),
+            Some(SpatialRelation::Separated {
+                perpendicular_overlap: 100,
+                perpendicular_distance: 100,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn spatial_relation_keeps_disjoint_candidates_as_fallback() {
+        // A pane strictly below but horizontally disjoint is still
+        // directional; the caller ranks it after aligned panes.
+        let current = bitty_render::geometry::RectPx::new(0, 0, 40, 20);
+        let disjoint = bitty_render::geometry::RectPx::new(80, 20, 20, 20);
+        assert!(matches!(
+            spatial_relation(disjoint, current, FocusDirection::Down),
+            Some(SpatialRelation::Separated {
+                edge_distance: 0,
+                perpendicular_overlap: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn spatial_candidates_rank_by_edge_then_center_then_order_issue_2444() {
+        // Edge distance dominates a closer perpendicular center.
+        let mut candidates = [
+            SpatialCandidate {
+                view: ViewId::new(9),
+                order: 0,
+                distance: 10,
+                perpendicular_distance: 0,
+            },
+            SpatialCandidate {
+                view: ViewId::new(3),
+                order: 1,
+                distance: 0,
+                perpendicular_distance: 500,
+            },
+        ];
+        sort_spatial(&mut candidates);
+        assert_eq!(candidates[0].view, ViewId::new(3));
+
+        // Equal distance: nearest perpendicular center, then stable order.
+        let mut candidates = [
+            SpatialCandidate {
+                view: ViewId::new(9),
+                order: 2,
+                distance: 0,
+                perpendicular_distance: 10,
+            },
+            SpatialCandidate {
+                view: ViewId::new(3),
+                order: 1,
+                distance: 0,
+                perpendicular_distance: 10,
+            },
+            SpatialCandidate {
+                view: ViewId::new(5),
+                order: 0,
+                distance: 0,
+                perpendicular_distance: 4,
+            },
+        ];
+        sort_spatial(&mut candidates);
+        assert_eq!(candidates[0].view, ViewId::new(5));
+        assert_eq!(candidates[1].view, ViewId::new(3));
+        assert_eq!(candidates[2].view, ViewId::new(9));
     }
 
     /// CTX-0603 (#1165): two whole-tree writes inside one `layout_mut`

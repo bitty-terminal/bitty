@@ -2,7 +2,9 @@
 //!
 //! Focus is owned (no platform handle) and moves deterministically given the
 //! same tree and bounds. Linear next/prev traverse depth-first order; spatial
-//! up/down/left/right use rect adjacency with deterministic tie-breaking.
+//! up/down/left/right select panes beyond the focused pane's facing edge,
+//! preferring perpendicular overlap, with deterministic edge/center/order
+//! tie-breaking.
 
 #![forbid(unsafe_code)]
 
@@ -95,9 +97,8 @@ impl Focus {
     /// used to compute the rect allocation. The allocation is deterministic
     /// given the same node and container.
     ///
-    /// Gapless: allocations tile edge-to-edge so adjacency is exact edge
-    /// equality. Use [`Self::advance_with_gaps`] when the tree is laid out
-    /// with gaps.
+    /// Gapless: allocations tile edge-to-edge so facing edges meet exactly.
+    /// Use [`Self::advance_with_gaps`] when the tree is laid out with gaps.
     #[must_use]
     pub fn advance(
         &self,
@@ -111,9 +112,9 @@ impl Focus {
     /// Gap-aware focus advance (CTX-0177).
     ///
     /// Like [`Self::advance`] but computes allocations with
-    /// `LayoutNode::layout_with_gaps` and tolerates the gap band in spatial
-    /// adjacency: neighbor edges may be up to `gaps.inner` cells apart along
-    /// the movement axis. With [`Gaps::ZERO`] this is identical to
+    /// `LayoutNode::layout_with_gaps`; sibling gap bands simply increase the
+    /// facing-edge distance, so spatial selection crosses them without a
+    /// separate tolerance. With [`Gaps::ZERO`] this is identical to
     /// [`Self::advance`].
     #[must_use]
     pub fn advance_with_gaps(
@@ -196,98 +197,120 @@ impl Focus {
         };
         let alloc = node.layout_with_gaps(container, gaps);
         let cur_rect = alloc.iter().find(|(id, _)| *id == cur).map(|(_, r)| *r)?;
-        // Gap tolerance along the movement axis: adjacent leaves laid out
-        // with gaps are separated by up to `gaps.inner` cells instead of
-        // sharing an edge. Zero gaps reduce to exact edge equality.
-        let tol = u32::from(gaps.inner);
-        // Returns true when `edge` (the neighbor's facing edge) sits at or
-        // just before `target` (our edge), within the gap tolerance.
-        let adjacent = |edge: u32, target: u32| edge <= target && target - edge <= tol;
-        // Build candidates: leaves adjacent in requested direction.
-        let mut candidates: Vec<(ViewId, Rect, u32)> = Vec::new();
-        for (id, rect) in &alloc {
-            if *id == cur {
-                continue;
-            }
-            let is_candidate = match dir {
-                FocusDirection::Up => {
-                    adjacent(rect.y as u32 + rect.height as u32, cur_rect.y as u32)
-                        && overlap(
-                            rect.x as u32,
-                            rect.width as u32,
-                            cur_rect.x as u32,
-                            cur_rect.width as u32,
-                        ) > 0
-                }
-                FocusDirection::Down => {
-                    adjacent(cur_rect.y as u32 + cur_rect.height as u32, rect.y as u32)
-                        && overlap(
-                            rect.x as u32,
-                            rect.width as u32,
-                            cur_rect.x as u32,
-                            cur_rect.width as u32,
-                        ) > 0
-                }
-                FocusDirection::Left => {
-                    adjacent(rect.x as u32 + rect.width as u32, cur_rect.x as u32)
-                        && overlap(
-                            rect.y as u32,
-                            rect.height as u32,
-                            cur_rect.y as u32,
-                            cur_rect.height as u32,
-                        ) > 0
-                }
-                FocusDirection::Right => {
-                    adjacent(cur_rect.x as u32 + cur_rect.width as u32, rect.x as u32)
-                        && overlap(
-                            rect.y as u32,
-                            rect.height as u32,
-                            cur_rect.y as u32,
-                            cur_rect.height as u32,
-                        ) > 0
-                }
-                _ => false,
-            };
-            if is_candidate {
-                let ov = match dir {
-                    FocusDirection::Up | FocusDirection::Down => overlap(
-                        rect.x as u32,
-                        rect.width as u32,
-                        cur_rect.x as u32,
-                        cur_rect.width as u32,
-                    ),
-                    FocusDirection::Left | FocusDirection::Right => overlap(
-                        rect.y as u32,
-                        rect.height as u32,
-                        cur_rect.y as u32,
-                        cur_rect.height as u32,
-                    ),
-                    _ => 0,
-                };
-                candidates.push((*id, *rect, ov));
-            }
-        }
-        if candidates.is_empty() {
+        // A zero-area focused leaf has no visual neighborhood; directional
+        // focus stays put instead of teleporting through invisible geometry.
+        if cur_rect.width == 0 || cur_rect.height == 0 {
             return Some(cur);
         }
-        // Deterministic pick: maximal overlap, then smallest ViewId.
-        candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        Some(candidates[0].0)
+        let order = node.leaf_ids();
+        // Issue #2444: a candidate must lie fully beyond the focused leaf's
+        // facing edge. Aligned candidates (perpendicular interval overlaps)
+        // rank above disjoint ones; within a tier the nearest facing edge,
+        // then the nearest perpendicular center, then stable leaf order
+        // decide. Center-to-center distance alone picks a taller neighbor
+        // whose center happens to be closer in an L-shaped layout.
+        let mut aligned: Vec<SpatialCandidate> = Vec::new();
+        let mut disjoint: Vec<SpatialCandidate> = Vec::new();
+        for (id, rect) in &alloc {
+            if *id == cur || rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            let Some(order) = order.iter().position(|candidate| candidate == id) else {
+                continue;
+            };
+            let Some(placement) = separated_placement(*rect, cur_rect, dir) else {
+                continue;
+            };
+            let candidate = SpatialCandidate {
+                id: *id,
+                order,
+                distance: placement.edge_distance,
+                perpendicular_distance: placement.perpendicular_distance,
+            };
+            if placement.perpendicular_overlap > 0 {
+                aligned.push(candidate);
+            } else {
+                disjoint.push(candidate);
+            }
+        }
+        for group in [&mut aligned, &mut disjoint] {
+            group.sort_by(|a, b| {
+                a.distance
+                    .cmp(&b.distance)
+                    .then_with(|| a.perpendicular_distance.cmp(&b.perpendicular_distance))
+                    .then_with(|| a.order.cmp(&b.order))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
+        aligned
+            .first()
+            .or_else(|| disjoint.first())
+            .map_or(Some(cur), |candidate| Some(candidate.id))
     }
+}
+
+/// One ranked directional-focus candidate over layout allocations.
+struct SpatialCandidate {
+    id: ViewId,
+    /// Stable leaf order (depth-first solver order).
+    order: usize,
+    /// Facing-edge distance along the movement axis.
+    distance: i64,
+    /// Perpendicular center distance (doubled).
+    perpendicular_distance: i64,
+}
+
+/// Placement of a candidate that lies fully beyond the focused leaf.
+struct SeparatedPlacement {
+    edge_distance: i64,
+    perpendicular_overlap: i64,
+    perpendicular_distance: i64,
+}
+
+/// Classifies a candidate as separated in `dir`, returning its edge gap,
+/// perpendicular overlap, and perpendicular center distance. Candidates
+/// that overlap the focused leaf on the movement axis are not directional
+/// targets for the plain layout tree.
+fn separated_placement(
+    candidate: Rect,
+    current: Rect,
+    dir: FocusDirection,
+) -> Option<SeparatedPlacement> {
+    let cx0 = i64::from(candidate.x);
+    let cy0 = i64::from(candidate.y);
+    let cx1 = cx0 + i64::from(candidate.width);
+    let cy1 = cy0 + i64::from(candidate.height);
+    let cur_x0 = i64::from(current.x);
+    let cur_y0 = i64::from(current.y);
+    let cur_x1 = cur_x0 + i64::from(current.width);
+    let cur_y1 = cur_y0 + i64::from(current.height);
+    let center_dx = (cx0 + cx1) - (cur_x0 + cur_x1);
+    let center_dy = (cy0 + cy1) - (cur_y0 + cur_y1);
+    let overlap_x = overlap_1d(cx0, cx1, cur_x0, cur_x1);
+    let overlap_y = overlap_1d(cy0, cy1, cur_y0, cur_y1);
+    let (edge_distance, perpendicular_overlap, perpendicular_distance) = match dir {
+        FocusDirection::Up if cy1 <= cur_y0 => (cur_y0 - cy1, overlap_x, center_dx.abs()),
+        FocusDirection::Down if cy0 >= cur_y1 => (cy0 - cur_y1, overlap_x, center_dx.abs()),
+        FocusDirection::Left if cx1 <= cur_x0 => (cur_x0 - cx1, overlap_y, center_dy.abs()),
+        FocusDirection::Right if cx0 >= cur_x1 => (cx0 - cur_x1, overlap_y, center_dy.abs()),
+        _ => return None,
+    };
+    Some(SeparatedPlacement {
+        edge_distance,
+        perpendicular_overlap,
+        perpendicular_distance,
+    })
+}
+
+/// Length of the intersection of two half-open intervals, clamped at 0.
+fn overlap_1d(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
+    a1.min(b1).saturating_sub(a0.max(b0)).max(0)
 }
 
 impl Default for Focus {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn overlap(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
-    let a_end = a_start + a_len;
-    let b_end = b_start + b_len;
-    let left = a_start.max(b_start);
-    let right = a_end.min(b_end);
-    right.saturating_sub(left)
 }
 
 #[cfg(test)]
@@ -493,6 +516,118 @@ mod tests {
         assert_eq!(
             f1.advance_with_gaps(&node, bounds, gaps, FocusDirection::Right),
             Some(ViewId::new(3))
+        );
+    }
+
+    #[test]
+    fn focus_spatial_l_shape_picks_the_aligned_pane_issue_2444() {
+        // Left full-height pane plus a stacked right column.
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(v(1)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(v(2)),
+                LayoutNode::leaf(v(3)),
+            ),
+        );
+        let bounds = Rect::new(0, 0, 80, 40);
+        let f2 = Focus::with_focus(ViewId::new(2));
+        assert_eq!(
+            f2.advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(3)),
+            "down from the top-right pane must not pick the tall left pane"
+        );
+        let f3 = Focus::with_focus(ViewId::new(3));
+        assert_eq!(
+            f3.advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            f3.advance(&node, bounds, FocusDirection::Left),
+            Some(ViewId::new(1))
+        );
+        assert_eq!(
+            f3.advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(3)),
+            "bottom edge stays put"
+        );
+        // Symmetric right column: equal distance resolves by leaf order.
+        let f1 = Focus::with_focus(ViewId::new(1));
+        assert_eq!(
+            f1.advance(&node, bounds, FocusDirection::Right),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            f1.advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(1))
+        );
+    }
+
+    #[test]
+    fn focus_spatial_t_shape_uses_the_aligned_column() {
+        // Top row [1, 2], bottom full-width pane 3.
+        let node = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(v(1)),
+                LayoutNode::leaf(v(2)),
+            ),
+            LayoutNode::leaf(v(3)),
+        );
+        let bounds = Rect::new(0, 0, 80, 40);
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(3))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Down),
+            Some(ViewId::new(3))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).advance(&node, bounds, FocusDirection::Right),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Left),
+            Some(ViewId::new(1))
+        );
+        // Both top panes are above the bottom pane; equal distance ties
+        // resolve to the first in leaf order.
+        assert_eq!(
+            Focus::with_focus(ViewId::new(3)).advance(&node, bounds, FocusDirection::Up),
+            Some(ViewId::new(1))
+        );
+    }
+
+    #[test]
+    fn focus_spatial_ignores_zero_area_panes() {
+        // A one-cell container split 50/50 leaves leaf 2 with zero width: it
+        // is not a visual directional target (the cycle ring still reaches
+        // it).
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(v(1)),
+            LayoutNode::leaf(v(2)),
+        );
+        let bounds = Rect::new(0, 0, 1, 40);
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).advance(&node, bounds, FocusDirection::Right),
+            Some(ViewId::new(1))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(2)).advance(&node, bounds, FocusDirection::Left),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            Focus::with_focus(ViewId::new(1)).next(&node),
+            Some(ViewId::new(2))
         );
     }
 }

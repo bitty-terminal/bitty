@@ -363,6 +363,13 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/tests/check-compat-fixture-freshness.test.sh
 
+      # The generator's environment boundary is a regression surface: Git hooks
+      # export GIT_DIR/GIT_INDEX_FILE, and the catalog gate must still read the
+      # pinned registry checkout. Hermetic fixtures; no network.
+      - name: Test official plugin catalog generator
+        if: matrix.shard == 1
+        run: python3 scripts/tests/test_generate_official_catalog.py
+
       # Core embeds a build-time official plugin catalog. The checked-in
       # generated file must match the pinned registry source; a registry pin
       # or entry bump that is not reflected in Core fails here instead of

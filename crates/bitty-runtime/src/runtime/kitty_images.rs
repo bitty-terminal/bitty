@@ -14,7 +14,7 @@
 //! [`bitty_rich::kitty_seam`] traits; the graphics extension implements the
 //! same traits on its side, and Core never depends on extension internals.
 //! Placement policy (admission, per-origin quotas, origin
-//! tagging, alternate-screen suppression) is unchanged and unit-tested in
+//! tagging, alternate-screen plane swaps) is unchanged and unit-tested in
 //! `bitty-rich`.
 //!
 //! Stored bytes count against the transmitting stream's origin (S5
@@ -27,8 +27,10 @@
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with
 //! content; see [`bitty_rich::kitty_place`]). The placement keeps the
 //! stream's origin token so the present layer confines it to its own leaf
-//! (CTX-0254). While the alternate screen is active, transmissions decode
-//! and store but never place (fail closed, same shape as transmit-only).
+//! (CTX-0254). Each origin keeps separate main/alt image planes (#2442):
+//! entering the alternate screen detaches the main plane, alt displays and
+//! `U=1` registrations land on the alt plane, and leaving clears alt and
+//! restores main.
 //!
 //! Cell reservation (issue #1802, second bug): a successful display
 //! advances the cursor past the placement span (unless `C=1`), so
@@ -73,8 +75,10 @@
 //! grid's `State::scrollback_len()` as the scroll base (images scroll with
 //! content; see [`bitty_rich::kitty_place`]). The placement keeps the
 //! stream's origin token so the present layer confines it to its own leaf
-//! (CTX-0254). While the alternate screen is active, transmissions decode
-//! and store but never place (fail closed, same shape as transmit-only).
+//! (CTX-0254). Each origin keeps separate main/alt image planes (#2442):
+//! entering the alternate screen detaches the main plane, alt displays and
+//! `U=1` registrations land on the alt plane, and leaving clears alt and
+//! restores main.
 //!
 //! Unicode placeholders (CTX-0821, issue #1400) resolve at print time in
 //! [`bitty_term_state::State`]: `U+10EEEE` cells carry the pen colors and
@@ -153,11 +157,6 @@ pub enum KittyDisplayOutcome {
         /// Handle of the stored image.
         image: bitty_rich::KittyImageId,
     },
-    /// Alternate screen active: decoded and stored, never placed.
-    SuppressedAlternateScreen {
-        /// Handle of the stored image.
-        image: bitty_rich::KittyImageId,
-    },
     /// Virtual prototype (`U=1`): decoded, stored, and registered in the
     /// rich prototype registry — never placed as a blit, cursor unmoved.
     /// The image paints via grid `U+10EEEE` runs (double-paint rule).
@@ -175,16 +174,29 @@ impl Runtime {
     }
 
     /// Number of retained Kitty placements (headless-observable).
+    ///
+    /// Includes the dormant main-screen entries while an origin's
+    /// alternate screen is active: they are retained, just not painted.
     #[must_use]
     pub fn kitty_placement_count(&self) -> usize {
         self.kitty_images.placement_len()
+            + self
+                .kitty_alt_stash
+                .values()
+                .map(|stash| stash.placements.len())
+                .sum::<usize>()
     }
 
     /// Number of registered `U=1` virtual prototypes (S4, #1849,
-    /// headless-observable).
+    /// headless-observable), including dormant main-screen entries.
     #[must_use]
     pub fn kitty_virtual_count(&self) -> usize {
         self.kitty_images.virtual_len()
+            + self
+                .kitty_alt_stash
+                .values()
+                .map(|stash| stash.virtuals.len())
+                .sum::<usize>()
     }
 
     /// Image blits composited on the last presented frame (CTX-0252 F2).
@@ -380,12 +392,13 @@ impl Runtime {
     /// in by `handle_pane_bytes`), and the cursor/scrollback base come
     /// from that same swapped-in grid — so a pane's image anchors to the
     /// pane's cursor and paints only on the pane's leaf (CTX-0254
-    /// cross-pane spoof prevention). Alternate-screen suppression likewise
-    /// reads the drained grid.
+    /// cross-pane spoof prevention). Alternate-screen placement reads the
+    /// drained grid too: each origin keeps separate main/alt image planes
+    /// ([`Self::sync_kitty_screen_for`]), so a fullscreen TUI's preview
+    /// paints on the alt plane and the main plane returns on leave (#2442).
     ///
     /// A successful display forces a full redraw so the next tick paints
-    /// the new placement. Alternate-screen display stores without placing
-    /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
+    /// the new placement.
     ///
     /// Per Kitty spec: after placing an image, cursor moves right by the
     /// number of columns and down by the number of rows in the placement
@@ -446,14 +459,14 @@ impl Runtime {
         wire_placement: u32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
         let action = bitty_rich::KittyAction::from_a(action_a);
-        let alt_active = self.state.alt_screen_active();
-        if action.displays() && !alt_active {
+        // #2442: display into the plane the grid is showing. Entering alt
+        // detaches the main plane; leaving alt drops alt and restores main.
+        self.sync_kitty_screen();
+        if action.displays() {
             // Atomic transmit-and-display (S5, #1849): preflight placement
             // admission before decoding/storing, so a placement-quota
             // refusal stores nothing and never discards FIFO-evicted
             // images (a post-store rollback could not restore evictions).
-            // Transmit-only, unsupported actions, and alternate-screen
-            // display keep storing without placing.
             self.kitty_images
                 .check_placement_quota_for_origin(self.kitty_origin)
                 .map_err(KittyImageError::Placement)?;
@@ -465,9 +478,6 @@ impl Runtime {
         // `a=f`/`a=c` commands resolve this image as their animation
         // target (no-op for anonymous transmits).
         self.kitty_images.set_wire_image(image, wire_image);
-        if alt_active {
-            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
-        }
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -669,14 +679,13 @@ impl Runtime {
         wire_placement: u32,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
         let action = bitty_rich::KittyAction::from_a(action_a);
-        let alt_active = self.state.alt_screen_active();
-        if action.displays() && !alt_active {
+        // #2442: target the screen the grid currently shows.
+        self.sync_kitty_screen();
+        if action.displays() {
             // Atomic transmit-and-display (S5, #1849): preflight placement
             // admission before decoding/storing, so a placement-quota
             // refusal stores nothing and never discards FIFO-evicted
             // images (a post-store rollback could not restore evictions).
-            // Transmit-only, unsupported actions, and alternate-screen
-            // display keep storing without placing.
             self.kitty_images
                 .check_placement_quota_for_origin(self.kitty_origin)
                 .map_err(KittyImageError::Placement)?;
@@ -687,9 +696,6 @@ impl Runtime {
         // S1 (#1849): tag the stored root with its wire `i=` id (see the
         // borrowed seam above).
         self.kitty_images.set_wire_image(image, wire_image);
-        if alt_active {
-            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
-        }
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -767,8 +773,8 @@ impl Runtime {
         scrollback_base: usize,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
         let action = bitty_rich::KittyAction::from_a(action_a);
-        let alt_active = self.state.alt_screen_active();
-        if action.displays() && !alt_active {
+        self.sync_kitty_screen();
+        if action.displays() {
             self.kitty_images
                 .check_placement_quota_for_origin(self.kitty_origin)
                 .map_err(KittyImageError::Placement)?;
@@ -777,9 +783,6 @@ impl Runtime {
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
         self.kitty_images.set_wire_image(image, wire_image);
-        if alt_active {
-            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
-        }
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -836,13 +839,15 @@ impl Runtime {
     /// placement — the image paints via grid `U+10EEEE` runs, never as a
     /// blit (double-paint rule), and the cursor never advances (terminal
     /// truth moves no cursor for virtual prototypes either). Alternate
-    /// screen stores without registering
-    /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
+    /// screen registration targets that origin's alt image plane; leaving
+    /// the alternate screen drops it with the plane.
     ///
-    /// Prototype registration mirrors terminal-truth admission
-    /// (`bitty-term-state` `kitty_place`): a virtual prototype cannot hang
-    /// off a parent, and headless sizing needs an explicit span. Refused
-    /// prototypes still store their bytes (inert under the store quotas,
+    /// A span (`c=`/`r=`) is optional: yazi's KGP driver omits both and
+    /// lets the terminal derive the cell span from the decoded pixels
+    /// (`ceil(pixels / cell)`). Prototype registration mirrors
+    /// terminal-truth admission (`bitty-term-state` `kitty_place`): a
+    /// virtual prototype cannot hang off a parent. Refused prototypes
+    /// still store their bytes (inert under the store quotas,
     /// as documented at the headless seam) and report
     /// [`KittyDisplayOutcome::Stored`].
     ///
@@ -869,6 +874,8 @@ impl Runtime {
         wire_placement: u32,
         has_parent: bool,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        // #2442: register into the plane the grid currently shows.
+        self.sync_kitty_screen();
         // Atomic virtual transmit (S5, #1849): preflight prototype
         // admission before decoding/storing, so a quota refusal stores
         // nothing and never discards FIFO-evicted images (a post-store
@@ -883,10 +890,12 @@ impl Runtime {
         // `a=f` frames ingest through the identical path as blit roots
         // (painting stays grid-run-only per the S4 double-paint rule).
         self.kitty_images.set_wire_image(image, wire_image);
-        if self.state.alt_screen_active() {
-            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
-        }
-        if has_parent || (cols_c == 0 && rows_r == 0) {
+        // A virtual placement without `c=`/`r=` is valid: kitty derives the
+        // cell span from the decoded pixels at the client's cell size.
+        // Yazi's KGP driver sends exactly this shape (`a=T,U=1,C=1,f=..,
+        // s=..,v=..,i=..` with no span) and then writes one `U+10EEEE`
+        // per cell of its `ceil(pixels/cell)` area.
+        if has_parent {
             return Ok(KittyDisplayOutcome::Stored { image });
         }
         let origin = self.kitty_origin;
@@ -937,6 +946,7 @@ impl Runtime {
         has_parent: bool,
         scrollback_base: usize,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
+        self.sync_kitty_screen();
         self.kitty_images
             .check_virtual_quota_for_origin(self.kitty_origin)
             .map_err(KittyImageError::Placement)?;
@@ -944,10 +954,9 @@ impl Runtime {
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
         self.kitty_images.set_wire_image(image, wire_image);
-        if self.state.alt_screen_active() {
-            return Ok(KittyDisplayOutcome::SuppressedAlternateScreen { image });
-        }
-        if has_parent || (cols_c == 0 && rows_r == 0) {
+        // Spanless virtual placements derive their cell span from the
+        // decoded pixels (see the sibling above).
+        if has_parent {
             return Ok(KittyDisplayOutcome::Stored { image });
         }
         let origin = self.kitty_origin;
@@ -1575,6 +1584,7 @@ impl Runtime {
         image_id: u32,
         placement_id: Option<u32>,
     ) -> usize {
+        self.sync_kitty_screen();
         // Delete-wins sequencing (CTX-1110 fix pass): advance the origin's
         // delete generation even when nothing is stored yet (removed 0) —
         // a transmit pending on a hung filesystem completes after this
@@ -1591,6 +1601,110 @@ impl Runtime {
             self.invalidate_kitty_raster_cache();
         }
         removed
+    }
+
+    /// Whether the origin's terminal grid is currently on the alternate
+    /// screen.
+    fn kitty_screen_is_alt(&self, origin: Option<u64>) -> bool {
+        // During a pane drain `handle_pane_bytes` swaps the pane's grid
+        // into `self.state` and the session slot temporarily holds the
+        // primary grid, so the draining origin must be read from the live
+        // state. Outside a drain the session slot is authoritative.
+        if origin == self.kitty_origin {
+            return self.state.alt_screen_active();
+        }
+        match origin {
+            Some(token) => self
+                .pane_sessions
+                .get(&ViewId::new(token))
+                .is_some_and(|sess| sess.state.alt_screen_active()),
+            None => self.state.alt_screen_active(),
+        }
+    }
+
+    /// Keeps the origin's live rich image layer on the screen its grid is
+    /// actually showing (#2442).
+    ///
+    /// Kitty keeps a separate image plane per screen: entering the
+    /// alternate screen starts with an empty alt plane, and leaving it
+    /// drops alt images and restores the main plane. The rich registry has
+    /// one live layer, so a transition detaches the main descriptors into
+    /// [`KittyAltStash`] (entry) or drops the alt descriptors and
+    /// re-attaches main (leave). Idempotent, and called before every rich
+    /// mutation and once per visible origin during present, so a
+    /// `?1049h`/`a=T` pair in one PTY batch cannot mix planes.
+    pub(super) fn sync_kitty_screen_for(&mut self, origin: Option<u64>) {
+        let alt = self.kitty_screen_is_alt(origin);
+        let alt_layer = self.kitty_alt_layers.contains(&origin);
+        if alt == alt_layer {
+            return;
+        }
+        // Delete-wins across the screen swap: a local medium queued for the
+        // plane being hidden must not land on the other plane when its
+        // worker finishes.
+        self.bump_kitty_local_delete_epoch(origin);
+        if alt {
+            let stash = KittyAltStash {
+                placements: self.kitty_images.take_placements_for(origin),
+                virtuals: self.kitty_images.take_virtuals_for(origin),
+            };
+            // Defensive: a fresh alt plane owns no entries of its own.
+            self.kitty_images.clear_origin(origin);
+            self.kitty_images.clear_virtual_for_origin(origin);
+            self.kitty_alt_stash.insert(origin, stash);
+            self.kitty_alt_layers.insert(origin);
+        } else {
+            self.kitty_images.clear_origin(origin);
+            self.kitty_images.clear_virtual_for_origin(origin);
+            if let Some(stash) = self.kitty_alt_stash.remove(&origin) {
+                self.kitty_images.restore_placements(stash.placements);
+                self.kitty_images.restore_virtuals(stash.virtuals);
+            }
+            self.kitty_alt_layers.remove(&origin);
+        }
+        self.pending_full_redraw = true;
+        self.invalidate_kitty_raster_cache();
+    }
+
+    /// [`Self::sync_kitty_screen_for`] for the origin currently draining.
+    pub(super) fn sync_kitty_screen(&mut self) {
+        let origin = self.kitty_origin;
+        self.sync_kitty_screen_for(origin);
+    }
+
+    /// Retires every rich layer entry for a dead origin token, including a
+    /// dormant main-screen stash (pane teardown/respawn).
+    pub(super) fn retire_kitty_origin(&mut self, origin: Option<u64>) {
+        self.kitty_images.retire_origin(origin);
+        self.kitty_alt_layers.remove(&origin);
+        self.kitty_alt_stash.remove(&origin);
+        self.invalidate_kitty_raster_cache();
+    }
+
+    /// Drops rendered output a failed display command would have replaced
+    /// (issue #2453).
+    ///
+    /// A `a=T`/display command naming `i=` is a *replacement*: when decode
+    /// or parameter admission fails, leaving the previous placement (or a
+    /// stale virtual prototype) on screen paints content the client
+    /// believes it just replaced — the observed black rectangle after a
+    /// failed image load. Removing the old rendered layer is fail-closed:
+    /// the grid text (including placeholder cells) is untouched, so a
+    /// later successful transmit with the same id repaints normally.
+    ///
+    /// Anonymous commands (`i=0`) name nothing and clear nothing.
+    pub(super) fn discard_failed_kitty_display(&mut self, wire_image: u32) {
+        if wire_image == 0 {
+            return;
+        }
+        self.sync_kitty_screen();
+        let removed = self
+            .kitty_images
+            .delete_by_wire(self.kitty_origin, wire_image, None);
+        if removed > 0 {
+            self.pending_full_redraw = true;
+            self.invalidate_kitty_raster_cache();
+        }
     }
 
     /// Answers one Kitty `a=q` query with at most one bounded reply (S2, #1849).

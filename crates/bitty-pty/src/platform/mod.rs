@@ -84,13 +84,24 @@ impl Session {
 
     /// Resizes the terminal; the kernel delivers SIGWINCH to the foreground
     /// process group where applicable.
-    pub(crate) fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        imp::resize(&self.master, cols, rows)
+    pub(crate) fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<(), PtyError> {
+        imp::resize(&self.master, cols, rows, pixel_width, pixel_height)
     }
 
     /// Queries the current terminal size as known by the kernel.
     pub(crate) fn size(&self) -> Result<(u16, u16), PtyError> {
         imp::size(&self.master)
+    }
+
+    /// Queries the current terminal size including pixel geometry.
+    pub(crate) fn size_pixels(&self) -> Result<(u16, u16, u16, u16), PtyError> {
+        imp::size_pixels(&self.master)
     }
 
     /// Terminal device name, when the platform exposes one.

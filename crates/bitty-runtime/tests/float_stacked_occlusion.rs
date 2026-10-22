@@ -508,16 +508,38 @@ fn float_occludes_kitty_image_behind() {
     let (fx0, fy0, fx1, fy1) = win_frame(&rt, ViewId::new(2));
     let (cell_w, cell_h) = rt.live_cell_size();
     assert!(cell_w > 0 && cell_h > 0, "cell metrics must be live");
-    let (ix1, iy1) = (
-        tx0.saturating_add(48u32.saturating_mul(cell_w)),
-        ty0.saturating_add(16u32.saturating_mul(cell_h)),
+    // The 4x4 source is letterboxed inside the requested 48x16 cell rect:
+    // kitty preserves the aspect ratio and centers it, so the painted
+    // image is the fitted rect (304x304), not the full cell rectangle.
+    let fitted = bitty_rich::fit_aspect_rect(
+        bitty_rich::RectPx::new(
+            i32::try_from(tx0).expect("content x fits"),
+            i32::try_from(ty0).expect("content y fits"),
+            48u32.saturating_mul(cell_w),
+            16u32.saturating_mul(cell_h),
+        ),
+        4,
+        4,
     );
-    let (ox0, oy0, ox1, oy1) = (tx0.max(fx0), ty0.max(fy0), ix1.min(fx1), iy1.min(fy1));
+    let (ix0, iy0, ix1, iy1) = (
+        u32::try_from(fitted.x).expect("fitted x fits"),
+        u32::try_from(fitted.y).expect("fitted y fits"),
+        u32::try_from(fitted.x + i32::try_from(fitted.width).expect("width fits"))
+            .expect("fitted right fits"),
+        u32::try_from(fitted.y + i32::try_from(fitted.height).expect("height fits"))
+            .expect("fitted bottom fits"),
+    );
+    let (ox0, oy0, ox1, oy1) = (ix0.max(fx0), iy0.max(fy0), ix1.min(fx1), iy1.min(fy1));
     assert!(
         ox1 > ox0 && oy1 > oy0,
         "float must cover the behind image for the probe"
     );
-    let probe = (tx0, ty0, tx0.saturating_add(20), ty0.saturating_add(20));
+    let probe = (
+        ix0,
+        iy0,
+        ix0.saturating_add(20).min(ix1),
+        iy0.saturating_add(20).min(iy1),
+    );
     assert!(
         probe.2 <= fx0 || probe.3 <= fy0,
         "behind-only probe must sit outside the float frame"

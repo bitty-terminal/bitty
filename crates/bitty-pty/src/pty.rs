@@ -94,20 +94,44 @@ impl Pty {
         }
     }
 
-    /// Resizes the terminal to `cols` x `rows`.
+    /// Resizes the terminal to `cols` x `rows` with no pixel geometry.
+    ///
+    /// Kept for callers that have no cell metrics (tests, embedders); the
+    /// runtime uses [`Pty::resize_pixels`] so `TIOCGWINSZ` reports real
+    /// pixel dimensions.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
+        self.resize_pixels(cols, rows, 0, 0)
+    }
+
+    /// Resizes the terminal to `cols` x `rows` and reports
+    /// `pixel_width` x `pixel_height` through `TIOCGWINSZ`.
     ///
     /// The kernel updates the window size and delivers SIGWINCH to the
-    /// child's foreground process group where applicable.
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
+    /// child's foreground process group where applicable. Image-aware
+    /// children read the pixel fields with `ioctl(TIOCGWINSZ)` (kitty's
+    /// `icat` is the canonical one); zero means "not reported".
+    pub fn resize_pixels(
+        &self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<(), PtyError> {
         if cols == 0 || rows == 0 {
             return Err(PtyError::InvalidSize { cols, rows });
         }
-        self.session.resize(cols, rows)
+        self.session.resize(cols, rows, pixel_width, pixel_height)
     }
 
     /// Queries the current terminal size from the kernel.
     pub fn size(&self) -> Result<(u16, u16), PtyError> {
         self.session.size()
+    }
+
+    /// Queries the current terminal size including `TIOCGWINSZ` pixel
+    /// fields (`cols, rows, pixel_width, pixel_height`).
+    pub fn size_pixels(&self) -> Result<(u16, u16, u16, u16), PtyError> {
+        self.session.size_pixels()
     }
 
     /// Terminal device name, when the platform exposes one (always `None`

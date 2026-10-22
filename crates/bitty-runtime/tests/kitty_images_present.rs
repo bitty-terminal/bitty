@@ -315,9 +315,12 @@ fn maximal_row_placement_bounds_scroll_work() {
         viewport_rows.saturating_sub(1),
         "cursor must clamp to the bottom row"
     );
-    // The viewport-clamped placement still paints one blit.
+    // The fitted 1x1 source is centered inside the maximal 1 x u16::MAX
+    // cell rect and lands far outside the viewport, so zero blits is the
+    // spec-correct fail-closed result; the bounded-scroll assertions above
+    // are the point of this pin.
     assert!(rt.tick().is_some());
-    assert_eq!(rt.kitty_last_frame_images(), 1);
+    assert_eq!(rt.kitty_last_frame_images(), 0);
 }
 
 #[test]

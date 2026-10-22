@@ -604,6 +604,15 @@ impl Runtime {
         self.pty.as_ref().and_then(|p| p.size().ok())
     }
 
+    /// Primary PTY winsize including pixel geometry
+    /// (`cols, rows, pixel_width, pixel_height`).
+    ///
+    /// Introspection for fullscreen/restore resync tests (#2373, #2442).
+    #[must_use]
+    pub fn pty_pixel_size(&self) -> Option<(u16, u16, u16, u16)> {
+        self.pty.as_ref().and_then(|p| p.size_pixels().ok())
+    }
+
     /// Takes exclusive ownership of the bounded PTY output reader, if present.
     ///
     /// Only available before [`set_pty_waker`](Self::set_pty_waker) promotes
@@ -1140,6 +1149,7 @@ impl Runtime {
                     // even when nothing is placed yet (sync order stores
                     // then deletes and yields absent).
                     self.bump_kitty_local_delete_epoch(self.kitty_origin);
+                    self.sync_kitty_screen();
                     if !self
                         .kitty_images
                         .placement_for_origin_is_empty(self.kitty_origin)
@@ -1161,13 +1171,18 @@ impl Runtime {
                 // rich registry. Registration mirrors headless admission
                 // (`State::kitty_place`): virtual children of a parent and
                 // spanless prototypes are refused there, so only
-                // admittable prototypes register here; the alternate
-                // screen suppresses rich registration while terminal truth
-                // keeps its own on-alt scoping. Quota refusals fail closed
-                // and silent (this branch never warns).
+                // admittable prototypes register here. The prototype lands
+                // on the plane the grid currently shows
+                // ([`Self::sync_kitty_screen`]): entering the alternate
+                // screen detaches the main plane first, so an `a=p,U=1`
+                // emitted on alt registers on the alt plane and on leave
+                // it dies with that plane like any other alt entry. Quota
+                // refusals fail closed and silent (this branch never
+                // warns).
                 if let Some((cols, rows, image, placement, has_parent)) = register_bodiless_virtual
                 {
-                    if !has_parent && (cols != 0 || rows != 0) && !self.state.alt_screen_active() {
+                    if !has_parent && (cols != 0 || rows != 0) {
+                        self.sync_kitty_screen();
                         let base = self.state.scrollback_len();
                         let origin = self.kitty_origin;
                         let _ = self.kitty_images.register_virtual_for_origin(
@@ -1465,6 +1480,9 @@ impl Runtime {
                                 log_throttle::suppressed_suffix(suppressed)
                             );
                         }
+                        // A failed replacement must not leave the previous
+                        // placement/prototype painting (#2453).
+                        self.discard_failed_kitty_display(control.image_id);
                     }
                     continue;
                 }
@@ -1491,6 +1509,12 @@ impl Runtime {
                             log_throttle::suppressed_suffix(suppressed)
                         );
                     }
+                    // Failed replacement: drop the previous rendered image
+                    // for this wire id so no stale rectangle survives (#2453).
+                    if action_a.is_none_or(|a| bitty_rich::KittyAction::from_a(Some(a)).displays())
+                    {
+                        self.discard_failed_kitty_display(wire_image);
+                    }
                 }
                 // The state-owned `a=p`/`a=d`/`a=a` commands were applied
                 // above. This branch consumes the remaining KittyGraphics
@@ -1499,6 +1523,20 @@ impl Runtime {
                 continue;
             }
             let damage = self.state.apply(&action);
+            // #2442: swap the origin's image plane at the mode transition
+            // itself (not only on the next tick), so a `?1049h`/`a=T` pair
+            // in one PTY batch lands on the alt plane and a leave restores
+            // main before any later kitty command observes it.
+            if matches!(
+                &action,
+                TerminalAction::SetMode {
+                    mode: bitty_vt::Mode::AlternateScreen
+                        | bitty_vt::Mode::AlternateScreenClearAndRestore,
+                    ..
+                }
+            ) {
+                self.sync_kitty_screen();
+            }
             // OSC 22 pointer shapes (issue #1762): presentation-only per-pane
             // stacks, never terminal truth (state stays inert above). The
             // emitting pane is the fed grid; a hidden primary grid (re-homed,
@@ -1571,6 +1609,7 @@ impl Runtime {
                 // S6 (#1849): placements are gone, so their cached blits
                 // are dead budget; drop them (images stay inert).
                 self.bump_kitty_local_delete_epoch(self.kitty_origin);
+                self.sync_kitty_screen();
                 self.kitty_images.clear_origin(self.kitty_origin);
                 self.invalidate_kitty_raster_cache();
                 // S4 (#1849): full clears drop virtual prototypes too
@@ -1691,8 +1730,14 @@ impl Runtime {
     /// without rounding error.
     fn xtwinops_text_area(&self) -> (u16, u16, u32, u32) {
         let frames = self.present_frames();
+        // Answer for the grid being drained: a pane's own XTWINOPS probe
+        // must report that pane's geometry, not whichever leaf happens to
+        // be focused (#2442). Outside a pane drain (`fed_grid_view()`
+        // resolves to the primary owner or `None`) this keeps the historic
+        // focused-leaf/first-frame behavior.
         let (cols, rows) = self
-            .focused_view()
+            .fed_grid_view()
+            .or_else(|| self.focused_view())
             .and_then(|fid| frames.iter().find(|frame| frame.view == fid))
             .or_else(|| frames.first())
             .map(|frame| (frame.cols, frame.rows))

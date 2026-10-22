@@ -142,7 +142,10 @@ impl Runtime {
                 rows = h;
             }
         }
-        let mut builder = PtyBuilder::new(program).size(cols, rows);
+        let (pixel_width, pixel_height) = self.pty_pixel_span(cols, rows);
+        let mut builder = PtyBuilder::new(program)
+            .size(cols, rows)
+            .pixel_size(pixel_width, pixel_height);
         // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` so in-terminal
         // `bitty ctl` targets its own instance. Explicit override, inherit
         // wins when an outer value is present (never override).
@@ -500,7 +503,10 @@ impl Runtime {
                 rows = h;
             }
         }
-        let mut builder = PtyBuilder::new(program).size(cols, rows);
+        let (pixel_width, pixel_height) = self.pty_pixel_span(cols, rows);
+        let mut builder = PtyBuilder::new(program)
+            .size(cols, rows)
+            .pixel_size(pixel_width, pixel_height);
         // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` so in-terminal
         // `bitty ctl` targets its own instance. Explicit override, inherit
         // wins when an outer value is present (never override). Explicit
@@ -579,7 +585,7 @@ impl Runtime {
         // Stored images retire too: the token is dead, so its bytes must not
         // keep occupying the shared image/byte caps (S5 refuses cross-origin
         // eviction, so leaked slots would block other origins).
-        self.kitty_images.retire_origin(Some(view.0));
+        self.retire_kitty_origin(Some(view.0));
         // Delete-wins sequencing (CTX-1110 fix pass): a respawn reuses the
         // same `ViewId`, so pending completions stamped before the retire
         // must drop instead of landing on the fresh session's grid.
@@ -835,6 +841,19 @@ impl Runtime {
             .and_then(|sess| sess.pty.size().ok())
     }
 
+    /// Current kernel winsize including pixel geometry
+    /// (`cols, rows, pixel_width, pixel_height`).
+    ///
+    /// `TIOCGWINSZ` on the child side reports the same four values; image
+    /// probes that read them directly (kitty `icat`) fail closed when the
+    /// pixel axes are zero (#2442).
+    #[must_use]
+    pub fn pane_pty_pixel_size(&self, view: &ViewId) -> Option<(u16, u16, u16, u16)> {
+        self.pane_sessions
+            .get(view)
+            .and_then(|sess| sess.pty.size_pixels().ok())
+    }
+
     /// Read-only snapshot of the leaf's private grid, when it owns a
     /// session. Leaves without a session share the primary
     /// [`snapshot`](Self::snapshot) only while they are the primary owner
@@ -871,7 +890,7 @@ impl Runtime {
         // a later leaf reusing the numeric id can never inherit stale
         // image pixels (origin tokens are `ViewId.0` values) and the dead
         // session's stored images stop occupying the shared caps.
-        self.kitty_images.retire_origin(Some(view.0));
+        self.retire_kitty_origin(Some(view.0));
         // Delete-wins sequencing (CTX-1110 fix pass): the generation
         // survives the retire (never pruned), so a later leaf reusing this
         // numeric id cannot accept a completion stamped before the close.
@@ -933,6 +952,7 @@ impl Runtime {
                 Some(size) => (size.width.max(1), size.height.max(1)),
                 None => (frame.cols.max(1), frame.rows.max(1)),
             };
+            let (pixel_width, pixel_height) = self.pty_pixel_span(cols, rows);
             if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {
                 if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
                     // CTX-0312: a single resize preserves visible content;
@@ -943,9 +963,14 @@ impl Runtime {
                 }
                 // Issue #2373: keep the winsize honest even when the grid
                 // already matches (spawn after a layout sync, or a lost
-                // SIGWINCH), mirroring the primary-owner path.
-                if sess.pty.size().ok() != Some((cols, rows)) {
-                    let _ = sess.pty.resize(cols, rows);
+                // SIGWINCH), mirroring the primary-owner path. The pixel
+                // fields are part of the contract: `icat` fails when either
+                // is zero, so a matching cell size with stale zero pixels
+                // still triggers a resize.
+                if sess.pty.size_pixels().ok() != Some((cols, rows, pixel_width, pixel_height)) {
+                    let _ = sess
+                        .pty
+                        .resize_pixels(cols, rows, pixel_width, pixel_height);
                 }
             }
         }
@@ -1033,6 +1058,19 @@ impl Runtime {
     /// already calls this per drained pane; embedders also call it after
     /// `tick` (like the primary post-tick flush) so replies queued outside
     /// the pump still reach the pane's shell promptly.
+    /// Drains one pane's queued terminal replies without performing I/O.
+    ///
+    /// Headless counterpart to [`Self::write_pane_replies`] (same bounded
+    /// queue): tests and embedders observe the exact bytes the pane's
+    /// child would receive for DA/DECRQM/XTWINOPS queries. Callers that
+    /// drain here own the write.
+    pub fn take_pane_replies(&mut self, view: ViewId) -> Vec<Box<[u8]>> {
+        self.pane_sessions
+            .get_mut(&view)
+            .map(|sess| sess.state.take_replies())
+            .unwrap_or_default()
+    }
+
     pub fn write_pane_replies(&mut self, view: ViewId) -> usize {
         use std::io::Write as _;
         let Some(sess) = self.pane_sessions.get_mut(&view) else {

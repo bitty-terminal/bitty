@@ -180,6 +180,13 @@ fn fullscreen_owner_pty_winsize_follows_full_frame_2373() {
     let _ = rt.tick().expect("baseline full redraw");
     rt.spawn_shell("/bin/sh").expect("primary shell spawns");
     let full = full_frame_reference();
+    let (cell_w, cell_h) = rt.live_cell_size();
+    let pixels = |cols: u16, rows: u16| {
+        (
+            u16::try_from(u64::from(cols) * u64::from(cell_w)).unwrap_or(u16::MAX),
+            u16::try_from(u64::from(rows) * u64::from(cell_h)).unwrap_or(u16::MAX),
+        )
+    };
 
     for ratio in [0.2_f32, 0.7] {
         rt.set_layout(two_pane(ratio));
@@ -189,12 +196,24 @@ fn fullscreen_owner_pty_winsize_follows_full_frame_2373() {
             Some((tiled.cols, tiled.rows)),
             "ratio {ratio}: primary winsize tracks the tiled frame"
         );
+        let (pixel_w, pixel_h) = pixels(tiled.cols, tiled.rows);
+        assert_eq!(
+            rt.pty_pixel_size(),
+            Some((tiled.cols, tiled.rows, pixel_w, pixel_h)),
+            "ratio {ratio}: tiled pixel winsize tracks the frame"
+        );
 
         zoom_to(&mut rt, OWNER);
         assert_eq!(
             rt.pty_size(),
             Some((full.cols, full.rows)),
             "ratio {ratio}: fullscreen must deliver SIGWINCH at the full frame size"
+        );
+        let (pixel_w, pixel_h) = pixels(full.cols, full.rows);
+        assert_eq!(
+            rt.pty_pixel_size(),
+            Some((full.cols, full.rows, pixel_w, pixel_h)),
+            "ratio {ratio}: fullscreen keeps the pixel winsize"
         );
         let _ = rt.tick().expect("fullscreen presents");
         assert_eq!(

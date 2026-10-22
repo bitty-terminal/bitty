@@ -588,12 +588,30 @@ impl Runtime {
         }
     }
 
+    /// Pixel geometry a PTY of `cols` x `rows` reports through
+    /// `TIOCGWINSZ` at the live cell metrics, saturating to `u16`.
+    ///
+    /// Image-aware children (kitty `icat`, ratatui-image sizing) read these
+    /// fields directly; zero makes them treat the terminal as unable to
+    /// report pixel sizes (#2442).
+    pub(super) fn pty_pixel_span(&self, cols: u16, rows: u16) -> (u16, u16) {
+        let cell = self.live_cell_metrics();
+        let width = u64::from(cell.width).saturating_mul(u64::from(cols));
+        let height = u64::from(cell.height).saturating_mul(u64::from(rows));
+        (
+            u16::try_from(width.min(u64::from(u16::MAX))).unwrap_or(u16::MAX),
+            u16::try_from(height.min(u64::from(u16::MAX))).unwrap_or(u16::MAX),
+        )
+    }
+
     /// Resizes the primary PTY winsize to the primary grid (`cols`/`rows`).
     pub(super) fn resize_primary_pty(&mut self) -> Result<(), RuntimeError> {
+        let pty_cols = self.cols.min(u16::MAX as usize) as u16;
+        let pty_rows = self.rows.min(u16::MAX as usize) as u16;
+        let (pixel_width, pixel_height) = self.pty_pixel_span(pty_cols, pty_rows);
         if let Some(pty) = self.pty.as_mut() {
-            let pty_cols = self.cols.min(u16::MAX as usize) as u16;
-            let pty_rows = self.rows.min(u16::MAX as usize) as u16;
-            pty.resize(pty_cols, pty_rows).map_err(RuntimeError::from)?;
+            pty.resize_pixels(pty_cols, pty_rows, pixel_width, pixel_height)
+                .map_err(RuntimeError::from)?;
         }
         Ok(())
     }

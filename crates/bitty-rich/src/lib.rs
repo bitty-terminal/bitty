@@ -164,8 +164,8 @@ pub use kitty_place::{
     KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS, KITTY_PRESENT_MAX_BLITS_PER_FRAME,
     KITTY_PRESENT_MAX_BYTES_PER_FRAME, KITTY_VIRTUAL_MAX_ITEMS, KittyAction, KittyFrame,
     KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
-    KittyPlacementId, KittyPrecheckError, KittyVirtualPrototype, placement_full_rect_for,
-    placement_rect_for, precheck_declared_image, viewport_extent,
+    KittyPlacementId, KittyPrecheckError, KittyVirtualPrototype, fit_aspect_rect,
+    placement_full_rect_for, placement_rect_for, precheck_declared_image, viewport_extent,
 };
 pub use kitty_raster::{
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyRasterCache, KittyRasterKey,

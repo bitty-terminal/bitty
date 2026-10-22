@@ -2069,6 +2069,7 @@ fn official_row(entry: &OfficialPlugin) -> PluginRow {
         commands: Vec::new(),
         manifest_hash: Some(entry.manifest_hash.to_string()),
         settings: Vec::new(),
+        repair: None,
     }
 }
 

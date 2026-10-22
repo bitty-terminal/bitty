@@ -4009,7 +4009,7 @@ pub(crate) fn init_usage() -> String {
      \x20           shipped keymap defaults)\n\
      \x20 --force   overwrite existing generated files (collision-free .bak backups)\n\
      \x20 --profile NAME  create/refresh only profiles/NAME.lua; no selector\n\
-     \x20           change, no plugin/component/shell follow-up\n\
+     \x20           change, no plugin/extension/shell follow-up\n\
      \x20 --profile minimal  smallest seed: one theme key, shipped defaults elsewhere\n\
      \x20 --profile dark     generated defaults with the dark theme family\n\
      \x20 --profile light    generated defaults with the github-light palette\n\

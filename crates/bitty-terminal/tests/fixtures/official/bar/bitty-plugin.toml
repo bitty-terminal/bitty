@@ -20,13 +20,12 @@ license = "MIT"
 # resolved by the host at install time. The host validates compatibility
 # before activation and fails closed (disable with a diagnostic, no partial
 # activation) on mismatch.
-# The declared compatibility floor for the 0.0.24 release train is
-# `>=0.0.24,<0.1`. Left-click and wheel routing work on that floor; the
-# right/middle per-region dispatch needs Core #2248 (Bitty 0.0.26). Older
-# hosts ignore the `region` binding key, so the bar degrades to left-only
-# dispatch instead of failing the component; the floor stays 0.0.24 for that
-# graceful degradation.
-bitty = ">=0.0.24,<0.1"
+# The declared compatibility floor is `>=0.0.24` with no upper bound, so later
+# host releases stay eligible without a manifest edit. Left-click and wheel
+# routing work on that floor; the right/middle per-region dispatch needs Core
+# #2248 (Bitty 0.0.26). Older hosts ignore the `region` binding key, so the bar
+# degrades to left-only dispatch instead of failing the component.
+bitty = ">=0.0.24"
 plugin-api = "^1.0"
 
 [services.required]

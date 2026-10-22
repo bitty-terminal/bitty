@@ -874,6 +874,51 @@ impl PlacementStore {
         self.cascade_orphans();
     }
 
+    /// Clears anchored placements on every screen while retaining virtual
+    /// prototypes (and their image data).
+    ///
+    /// Width reflow rebuilds every primary row and reassigns scrollback ids
+    /// (#2529), so a cell anchor no longer names the content it was placed
+    /// on. Placeholder runs are represented by grid cells (not anchors) and
+    /// their `U=1` prototypes therefore stay valid.
+    pub fn clear_anchored(&mut self) {
+        self.placements.retain(|entry| entry.virtual_proto);
+        self.cascade_orphans();
+    }
+
+    /// Repositions anchored placements for a height-only viewport change.
+    ///
+    /// `shift` is the content delta: negative when rows moved up (shrink
+    /// pushed the oldest rows into history), positive when rows moved down
+    /// (grow re-entered history above). Entries that leave the new grid are
+    /// clipped, matching the scroll rule. Virtual prototypes never move;
+    /// the other screen's placements are only clipped to the new height.
+    pub fn resize_height(&mut self, new_rows: u32, shift: i32, on_alt: bool) {
+        self.placements.retain_mut(|entry| {
+            if entry.virtual_proto {
+                return true;
+            }
+            if entry.on_alt_screen != on_alt {
+                // Hidden screen: its anchors only need to fit the new bound.
+                return entry
+                    .anchor_row
+                    .saturating_add(u32::from(entry.rows.max(1)))
+                    <= new_rows;
+            }
+            let anchor = i64::from(entry.anchor_row) + i64::from(shift);
+            if anchor < 0 || anchor > i64::from(new_rows.saturating_sub(1)) {
+                return false;
+            }
+            let anchor = anchor as u32;
+            if anchor.saturating_add(u32::from(entry.rows.max(1))) > new_rows {
+                return false;
+            }
+            entry.anchor_row = anchor;
+            true
+        });
+        self.cascade_orphans();
+    }
+
     /// Clears placements on one screen (`ED` full-clear, alt switches).
     pub fn clear_screen(&mut self, on_alt: bool) {
         self.placements

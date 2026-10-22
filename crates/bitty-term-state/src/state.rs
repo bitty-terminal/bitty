@@ -418,14 +418,16 @@ impl State {
     /// fullscreen application owns its layout): it truncates/pads with
     /// wide-pair orphan repair and clears all wrap flags.
     ///
-    /// Height-only resizes keep the old truncate/pad path for both grids
-    /// (no width change, no logical rewrapping). Scroll region resets to
-    /// full screen and the cursor is stepped off spacers (RFC invariants
-    /// 1-6). This is the environment-declared resize path (RFC "Environment
-    /// declaration") and the only mutation of retained scrollback outside
-    /// `push`/`clear`. Returns full-grid plus scrollback-reflow damage
-    /// tagged with the new generation. Headless: pure in-memory, no I/O,
-    /// deterministic.
+    /// Height-only resizes keep every logical row: the primary viewport moves
+    /// the oldest rows into scrollback on shrink and re-enters the newest
+    /// history rows on grow (bottom-anchored when the cursor is on the last
+    /// row), so a width-preserving shrink/grow round-trip restores content
+    /// (#2529). The alternate grid keeps the application-owned truncate/pad
+    /// path. Scroll region resets to full screen and the cursor is stepped
+    /// off spacers (RFC invariants 1-6). This is the environment-declared
+    /// resize path (RFC "Environment declaration"). Returns full-grid plus
+    /// scrollback-reflow damage tagged with the new generation. Headless:
+    /// pure in-memory, no I/O, deterministic.
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) -> Damage {
         let cols = new_cols.clamp(1, MAX_GRID_DIM);
         let rows = new_rows.clamp(1, MAX_GRID_DIM);
@@ -483,10 +485,10 @@ impl State {
             None
         };
         let (reflow_counts, cursor_cells): (Vec<usize>, Option<Vec<Cell>>) = if cols == old_cols {
-            // Height-only: no logical rewrapping. Truncate/pad both grids;
-            // scrollback widths already match.
-            self.screens.main.resize(rows, cols, &erase);
-            self.screens.alt.resize(rows, cols, &erase);
+            // Height-only: keep the logical rows intact and move lines
+            // between the viewport and scrollback instead of truncating the
+            // newest rows (#2529). Alt keeps the xterm truncate/pad policy.
+            self.resize_height_only(rows, &erase);
             (Vec::new(), None)
         } else {
             // Width change: reflow primary (main + scrollback), truncate alt.
@@ -508,6 +510,11 @@ impl State {
                 &erase,
             );
             self.screens.alt.resize(rows, cols, &erase);
+            // A width reflow rewraps every primary row and rebuilds the
+            // scrollback; existing cell anchors no longer name their content.
+            // Drop anchored placements (both screens) but keep placeholders'
+            // virtual prototypes and image data (#2529).
+            self.kitty_placements.clear_anchored();
             (counts, cursor_cells)
         };
         // Resize tab lattice: preserve stops that still fit, default for new columns.
@@ -630,6 +637,137 @@ impl State {
         damage
     }
 
+    /// Height-only resize of the primary screen (#2529).
+    ///
+    /// The viewport never drops the newest rows. Shrinking absorbs unused
+    /// blank rows below the cursor first (CTX-0312), then moves the remaining
+    /// oldest rows into scrollback and shifts the grid up. When the viewport
+    /// is bottom-full and history exists, growing re-enters the newest
+    /// history rows at the top (blank filler above them when history runs
+    /// out), so a shrink/grow round-trip restores the original content.
+    /// Otherwise growth pads blanks at the bottom and the cursor keeps its
+    /// row, matching how a top-aligned screen grows.
+    ///
+    /// Wrap flags travel with every moved row, so logical lines and their
+    /// soft-wrap continuations stay coherent across scrollback and grid.
+    /// The alternate grid keeps the application-owned truncate/pad policy.
+    /// Kitty placements follow the primary content shift and are clipped
+    /// when they no longer fit; alt-screen placements are only clipped.
+    fn resize_height_only(&mut self, new_rows: usize, erase: &Style) {
+        let old_rows = self.height;
+        let cols = self.width;
+        let alt_active = self.alt_screen != AltScreen::Off;
+        let main_cursor_row = usize::from(if alt_active {
+            self.primary_save
+                .as_ref()
+                .map_or(0, |save| save.cursor_position.row)
+        } else {
+            self.cursor.position.row
+        });
+        // Positive = content moved down (grow), negative = content moved up.
+        let mut primary_shift: i32 = 0;
+        if new_rows < old_rows {
+            let shrink = old_rows - new_rows;
+            // Rows below the used content (including the cursor row) are
+            // pure padding: absorb the height reduction there first so
+            // top-aligned output keeps its position (CTX-0312, tmux-style
+            // used-height accounting).
+            let used = Self::used_rows(&self.screens.main, main_cursor_row, old_rows);
+            let absorb = shrink.min(old_rows - used);
+            if absorb > 0 {
+                self.screens.main.truncate_bottom(absorb);
+            }
+            let push = shrink - absorb;
+            if push > 0 {
+                let removed = self.screens.main.remove_top_rows(push);
+                for (cells, wrapped) in removed {
+                    // Capacity pruning is the scrollback buffer's job; the
+                    // newest rows are retained when the cap is smaller.
+                    let _ = self.scrollback.push_with_wrap(cells, wrapped);
+                }
+                primary_shift = -(push as i32);
+            }
+        } else if new_rows > old_rows {
+            let grow = new_rows - old_rows;
+            // The viewport is bottom-full when content (or the cursor)
+            // reaches the last row: growing then reveals the newest history
+            // above and keeps the bottom line anchored. With no history (or
+            // unused space below the cursor) the viewport grows downward and
+            // the cursor keeps its row.
+            let used = Self::used_rows(&self.screens.main, main_cursor_row, old_rows);
+            if used >= old_rows && !self.scrollback.is_empty() {
+                let pull = grow.min(self.scrollback.len());
+                let mut inserted: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(grow);
+                for _ in 0..(grow - pull) {
+                    inserted.push((vec![Cell::erased(*erase); cols], false));
+                }
+                if pull > 0 {
+                    let mut pulled: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(pull);
+                    for _ in 0..pull {
+                        let line = self.scrollback.pop_back_line().expect("scrollback len");
+                        pulled.push((Vec::from(line.cells), line.wrapped));
+                    }
+                    pulled.reverse();
+                    inserted.extend(pulled);
+                    if grow > pull {
+                        // Blank filler sits above the pulled block, so the
+                        // line before it no longer continues into a pulled
+                        // row; break the stale soft-wrap chain.
+                        self.scrollback.clear_last_wrap();
+                    }
+                }
+                self.screens.main.prepend_rows(inserted);
+                primary_shift = grow as i32;
+            } else {
+                // Unused space below the cursor stays below: grow downward.
+                self.screens.main.resize(new_rows, cols, erase);
+            }
+        }
+        self.screens.alt.resize(new_rows, cols, erase);
+        // Move the primary cursor with its content. The live cursor belongs
+        // to the alt screen while it is active; the saved primary cursor is
+        // the one that must follow the primary rows.
+        let max_row = (new_rows - 1) as u16;
+        if alt_active {
+            if let Some(save) = self.primary_save.as_mut() {
+                save.cursor_position.row = (i32::from(save.cursor_position.row) + primary_shift)
+                    .clamp(0, i32::from(max_row)) as u16;
+            }
+        } else {
+            self.cursor.position.row = (i32::from(self.cursor.position.row) + primary_shift)
+                .clamp(0, i32::from(max_row)) as u16;
+        }
+        if let Some(saved) = self.saved_cursors[0].as_mut() {
+            saved.position.row =
+                (i32::from(saved.position.row) + primary_shift).clamp(0, i32::from(max_row)) as u16;
+        }
+        // Images ride their rows: shift the primary plane with the content,
+        // clip the alt plane to the new bounds, and never leave an anchor
+        // pointing at a row the grid no longer has.
+        let new_rows_u32 = u32::try_from(new_rows).unwrap_or(u32::MAX);
+        self.kitty_placements
+            .resize_height(new_rows_u32, primary_shift, false);
+        self.kitty_placements.resize_height(new_rows_u32, 0, true);
+    }
+
+    /// Number of rows the primary grid actually uses: from the top through
+    /// the lowest non-blank row, soft-wrap continuation, or the cursor.
+    ///
+    /// Rows below this are viewport padding and may be dropped without
+    /// moving content (tmux-style used-height accounting, #2529).
+    fn used_rows(grid: &Grid, cursor_row: usize, rows: usize) -> usize {
+        let mut last = cursor_row.min(rows.saturating_sub(1));
+        for (row, cells) in grid.rows_iter().enumerate() {
+            if cells.iter().any(|cell| !cell.is_blank()) {
+                last = last.max(row);
+            }
+            if row + 1 < rows && grid.wrapped(row) {
+                last = last.max(row + 1);
+            }
+        }
+        (last + 1).min(rows)
+    }
+
     /// Takes combined (scrollback + grid) physical rows into logical lines by
     /// unwrapping via soft-wrap flags, oldest first. Called once by
     /// [`State::resize`] and consumed by [`State::reflow_primary`], so a
@@ -655,10 +793,18 @@ impl State {
         scrollback: &mut Scrollback,
         old_rows: usize,
     ) -> (Vec<Vec<Cell>>, Vec<(usize, usize)>) {
-        fn trim_owned(cells: &mut Vec<Cell>) {
+        /// Drops wide spacers from a physical segment. `trim_trailing` is
+        /// false for soft-wrapped segments: spaces at a wrap boundary are
+        /// real content (they separate the words on the continuation row),
+        /// so trimming them would merge words when the line is unwrapped
+        /// again on a wider grid (#2529). Only a logical line's final
+        /// segment may drop its trailing padding.
+        fn trim_owned(cells: &mut Vec<Cell>, trim_trailing: bool) {
             cells.retain(|cell| !cell.spacer);
-            while cells.last().is_some_and(Cell::is_blank) {
-                cells.pop();
+            if trim_trailing {
+                while cells.last().is_some_and(Cell::is_blank) {
+                    cells.pop();
+                }
             }
         }
         let sb_len = scrollback.len();
@@ -682,7 +828,7 @@ impl State {
                 };
                 (row_cells, w)
             };
-            trim_owned(&mut segment);
+            trim_owned(&mut segment, !wrapped);
             row_map.push((logicals.len(), cur.len()));
             cur.append(&mut segment);
             if !wrapped {
@@ -833,6 +979,17 @@ impl State {
     #[must_use]
     pub fn scrollback_line(&self, index: usize) -> Option<&ScrollbackLine> {
         self.scrollback.line(index)
+    }
+
+    /// Whether live grid row `row` soft-wraps onto the next row.
+    ///
+    /// Wrap flags are the terminal's logical-line continuation bits: they
+    /// let inspections, accessibility runs, and tests join physical rows
+    /// into the logical line the application printed. Out-of-range rows
+    /// report `false`.
+    #[must_use]
+    pub fn row_soft_wrapped(&self, row: usize) -> bool {
+        self.screens_active().wrapped(row)
     }
 
     /// Iterates retained scrollback lines oldest first.

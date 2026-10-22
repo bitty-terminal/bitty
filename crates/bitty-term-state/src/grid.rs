@@ -406,9 +406,12 @@ impl Grid {
     /// and repairing wide-character pairs that would otherwise straddle the new
     /// boundary (RFC invariant 2). New area is filled with `erase_style`.
     /// This is the truncate/pad primitive for the alternate screen (xterm:
-    /// the application owns alt content, so no rewrapping) and for
-    /// height-only primary resizes. Primary width changes use the reflow path
-    /// in `State::resize` instead. Deterministic on all platforms.
+    /// the application owns alt content, so no rewrapping) and for a primary
+    /// height grow that pads unused space below the cursor. Height-only
+    /// primary shrink/grow move rows through scrollback via
+    /// [`Self::remove_top_rows`], [`Self::truncate_bottom`], and
+    /// [`Self::prepend_rows`] instead. Primary width changes use the reflow
+    /// path in `State::resize`. Deterministic on all platforms.
     pub(crate) fn resize(&mut self, new_rows: usize, new_cols: usize, erase_style: &Style) {
         let new_rows = new_rows.max(1);
         let new_cols = new_cols.max(1);
@@ -469,6 +472,67 @@ impl Grid {
         } else {
             // Truncation breaks all continuations (no rewrapping here).
             self.wraps = vec![false; new_rows];
+        }
+    }
+
+    /// Removes the top `count` rows and returns them oldest-first, shifting
+    /// the remaining rows up. Wrap flags travel with their rows; the new last
+    /// row can never continue onward.
+    ///
+    /// Height-only primary shrink primitive (#2529): the caller captures the
+    /// returned rows into scrollback instead of dropping their content.
+    pub(crate) fn remove_top_rows(&mut self, count: usize) -> Vec<(Vec<Cell>, bool)> {
+        let count = count.min(self.rows);
+        let removed: Vec<(Vec<Cell>, bool)> = (0..count)
+            .map(|row| (self.snapshot_row(row), self.wrapped(row)))
+            .collect();
+        self.cells.drain(0..count * self.cols);
+        self.wraps.drain(0..count);
+        self.rows -= count;
+        if let Some(last) = self.wraps.last_mut() {
+            *last = false;
+        }
+        removed
+    }
+
+    /// Drops the bottom `count` rows (height-only shrink filler). The new
+    /// last row can never continue onward.
+    pub(crate) fn truncate_bottom(&mut self, count: usize) {
+        let count = count.min(self.rows);
+        self.rows -= count;
+        self.cells.truncate(self.rows * self.cols);
+        self.wraps.truncate(self.rows);
+        if let Some(last) = self.wraps.last_mut() {
+            *last = false;
+        }
+    }
+
+    /// Inserts `rows` above the current grid, oldest-first. Every row must be
+    /// exactly `cols` wide. Wrap flags are preserved (the inserted tail may
+    /// continue into the old first row); the old last row's hard break is
+    /// kept.
+    ///
+    /// Height-only primary grow primitive (#2529): rows pulled back from
+    /// scrollback re-enter the viewport at the top.
+    pub(crate) fn prepend_rows(&mut self, rows: Vec<(Vec<Cell>, bool)>) {
+        if rows.is_empty() {
+            return;
+        }
+        let extra = rows.len();
+        let mut cells = Vec::with_capacity((self.rows + extra) * self.cols);
+        let mut wraps = Vec::with_capacity(self.rows + extra);
+        for (row, wrapped) in rows {
+            debug_assert_eq!(row.len(), self.cols);
+            cells.extend(row);
+            wraps.push(wrapped);
+        }
+        cells.extend_from_slice(&self.cells);
+        wraps.extend_from_slice(&self.wraps);
+        self.rows += extra;
+        self.cells = cells;
+        self.wraps = wraps;
+        if let Some(last) = self.wraps.last_mut() {
+            *last = false;
         }
     }
 }

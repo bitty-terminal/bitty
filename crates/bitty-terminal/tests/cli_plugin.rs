@@ -1930,3 +1930,406 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2439: transactional store installs, orphan recovery, doctor --repair.
+// ---------------------------------------------------------------------------
+
+/// Backdate a staging directory past the doctor's age gate.
+fn backdate_staging(path: &Path) {
+    use std::time::{Duration, SystemTime};
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // A directory handle needs FILE_FLAG_BACKUP_SEMANTICS (custom flags,
+        // not the access mask) plus FILE_WRITE_ATTRIBUTES for `set_times`.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("open staging dir")
+    };
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path).expect("open staging dir");
+    let when = SystemTime::now() - Duration::from_secs(3600);
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .expect("backdate staging");
+}
+
+#[test]
+fn plugin_install_recovers_owner_orphan_repro() {
+    // Exact owner repro: manifest-only version dir + empty lua/, no
+    // current.json. list surfaces it; install --yes repairs it.
+    let home = scratch_dir("orphan-repro");
+    let source = write_external_fixture(&home, "source", "0.0.1", "hello");
+    let source_arg = source.display().to_string();
+    let store = data_store(&home);
+    let version = store.join("packages/xuepoo.external/0.0.1");
+
+    let output = run_in(&home, &["plugin", "install", &source_arg, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(version.join("lua/init.lua").is_file());
+
+    // Interrupted/partial install: manifest stays, lua body is gone, index gone.
+    std::fs::remove_file(version.join("lua/init.lua")).expect("truncate lua");
+    std::fs::remove_file(store.join("current.json")).expect("drop index");
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("xuepoo.external"), "{text}");
+    assert!(text.contains("orphaned"), "{text}");
+    assert!(text.contains("bitty plugin doctor --repair"), "{text}");
+    assert!(
+        text.contains("bitty plugin remove xuepoo.external --force"),
+        "{text}"
+    );
+
+    // --yes approves the repair prompt (non-interactive).
+    let output = run_in(&home, &["plugin", "install", &source_arg, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("replaced the existing package content"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        version.join("lua/init.lua").is_file(),
+        "complete tree restored"
+    );
+    let records = load_index(&store).expect("index");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].version, "0.0.1");
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert!(!stdout(&output).contains("orphaned"), "{}", stdout(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_same_version_content_change_prompts_and_honors_force() {
+    let home = scratch_dir("same-version");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello v1");
+    let source_arg = source.display().to_string();
+    let store = data_store(&home);
+    let index = store.join("current.json");
+
+    let output = run_in(&home, &["plugin", "install", &source_arg, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let before = std::fs::read_to_string(&index).expect("index");
+    let digest_before = load_index(&store).expect("index")[0].content_digest.clone();
+
+    // Same manifest version, new Lua body.
+    std::fs::write(
+        source.join("lua/init.lua"),
+        "bitty.commands.register({ id = \"greet\", title = \"Greet\", run = function() return \"hello v2\" end })\nreturn {}\n",
+    )
+    .expect("rewrite init");
+
+    // Decline the repair prompt: nothing changes.
+    let output = run_in(&home, &["plugin", "install", &source_arg], Some("n\n"));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("install was not approved"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(std::fs::read_to_string(&index).expect("index"), before);
+
+    // Approve interactively.
+    let output = run_in(&home, &["plugin", "install", &source_arg], Some("y\n"));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let records = load_index(&store).expect("index");
+    assert_ne!(records[0].content_digest, digest_before);
+
+    // `--force` replaces without a prompt.
+    std::fs::write(
+        source.join("lua/init.lua"),
+        "bitty.commands.register({ id = \"greet\", title = \"Greet\", run = function() return \"hello v3\" end })\nreturn {}\n",
+    )
+    .expect("rewrite init again");
+    let output = run_in(&home, &["plugin", "install", &source_arg, "--force"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("replaced the existing package content"),
+        "{}",
+        stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_rebuilds_corrupt_index_and_never_lists_it_as_empty() {
+    let home = scratch_dir("doctor-corrupt");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    std::fs::write(store.join("current.json"), b"{truncated").expect("corrupt index");
+
+    // list fails closed with the repair command, never an empty store.
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("bitty plugin doctor --repair"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("corrupt-index"), "{text}");
+    assert!(text.contains("bitty plugin doctor --repair"), "{text}");
+
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("quarantined current.json"), "{text}");
+    assert!(text.contains("wrote current.json"), "{text}");
+    let records = load_index(&store).expect("rebuilt index");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].plugin_id, "xuepoo.external");
+    assert!(records[0].granted.is_empty(), "repair never invents grants");
+    assert!(
+        store.join("quarantine").is_dir(),
+        "the broken index is preserved for inspection"
+    );
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("xuepoo.external"));
+    assert!(stdout(&output).contains("broken") || stdout(&output).contains("disabled"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_repairs_orphans_and_stale_staging() {
+    let home = scratch_dir("doctor-orphan");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let version = store.join("packages/xuepoo.external/1.0.0");
+    std::fs::remove_file(version.join("lua/init.lua")).expect("truncate");
+    std::fs::remove_file(store.join("current.json")).expect("drop index");
+    let staging = store.join("packages/xuepoo.external/.tmp-crashed");
+    std::fs::create_dir_all(&staging).expect("staging");
+    std::fs::write(staging.join("bitty-plugin.toml"), b"partial").expect("partial");
+    backdate_staging(&staging);
+
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("incomplete-package"), "{text}");
+    assert!(text.contains("stale-staging"), "{text}");
+
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("quarantined packages/xuepoo.external/1.0.0"),
+        "{text}"
+    );
+    assert!(text.contains("removed staging"), "{text}");
+    assert!(
+        !version.exists(),
+        "incomplete tree is quarantined, not listed"
+    );
+    assert!(!staging.exists());
+    assert!(load_index(&store).expect("index").is_empty());
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        !stdout(&output).contains("xuepoo.external"),
+        "{}",
+        stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_quarantines_a_malformed_ledger_and_removes_unknown_records() {
+    let home = scratch_dir("doctor-ledger");
+    let state = state_file(&home);
+
+    // Unknown but well-formed record: warn, then repair removes only it.
+    std::fs::create_dir_all(home.join("bitty")).expect("config dir");
+    std::fs::write(
+        &state,
+        "state_version = 1\n\n[plugins.\"xuepoo.ghost\"]\nsource = \"bundled\"\nmanifest_hash = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nenabled = true\ngranted = []\ndenied = []\n",
+    )
+    .expect("ledger");
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("xuepoo.ghost"),
+        "{}",
+        stdout(&output)
+    );
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = std::fs::read_to_string(&state).expect("ledger rewritten");
+    assert!(!text.contains("xuepoo.ghost"), "{text}");
+    assert!(text.contains("state_version = 1"), "{text}");
+
+    // Malformed ledger: doctor still diagnoses, repair quarantines + resets.
+    std::fs::write(&state, "state_version = 1\n[plugins.\"broken\"\n").expect("break ledger");
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("ledger unreadable"),
+        "{}",
+        stdout(&output)
+    );
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("quarantined ledger"),
+        "{}",
+        stdout(&output)
+    );
+    let text = std::fs::read_to_string(&state).expect("fresh ledger");
+    assert!(text.contains("state_version = 1"), "{text}");
+    let corrupt = std::fs::read_dir(home.join("bitty"))
+        .expect("config dir")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("bitty-plugins.toml.corrupt-")
+        });
+    assert!(
+        corrupt,
+        "the broken ledger is preserved, not silently dropped"
+    );
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_list_shows_partial_indexed_package_as_broken() {
+    let home = scratch_dir("broken-row");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    std::fs::remove_dir_all(store.join("packages/xuepoo.external/1.0.0/lua"))
+        .expect("truncate tree");
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("xuepoo.external"), "{text}");
+    assert!(text.contains("broken"), "{text}");
+    assert!(text.contains("bitty plugin doctor --repair"), "{text}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_remove_force_cleans_orphan_and_allows_reinstall() {
+    let home = scratch_dir("remove-orphan");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    std::fs::remove_file(store.join("current.json")).expect("drop index");
+
+    let output = run_in(
+        &home,
+        &["plugin", "remove", "xuepoo.external", "--force"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("orphaned package directory"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!store.join("packages/xuepoo.external").exists());
+
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(load_index(&store).expect("index").len(), 1);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_healthy_store_and_missing_ledger_exit_zero() {
+    let home = scratch_dir("doctor-healthy");
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("absent (empty store"), "{text}");
+    assert!(
+        text.contains("ledger:") && text.contains("absent"),
+        "{text}"
+    );
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!state_file(&home).exists(), "no ledger is invented");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_detects_and_drops_a_dangling_record() {
+    let home = scratch_dir("doctor-dangling");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let store = data_store(&home);
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    std::fs::remove_dir_all(store.join("packages/xuepoo.external")).expect("drop tree");
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("xuepoo.external"), "{text}");
+    assert!(text.contains("broken"), "{text}");
+
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("dangling-record"),
+        "{}",
+        stdout(&output)
+    );
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(load_index(&store).expect("index").is_empty());
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert!(
+        !stdout(&output).contains("xuepoo.external"),
+        "{}",
+        stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

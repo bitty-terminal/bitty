@@ -1756,6 +1756,47 @@ impl Runtime {
             + self.inactive_workspaces_leaf_count()
     }
 
+    /// Slot index that owns `view` as a live panel, active slot first.
+    ///
+    /// Issue #2525: the shell-exit reap path must know which workspace a
+    /// dead panel belonged to before deciding whether to close the leaf
+    /// (multi-panel workspace) or prune the emptied workspace (last panel).
+    /// The active slot is read from the live layout/floats because its
+    /// stashed copy is refreshed only on switch-away; every inactive slot is
+    /// authoritative as stashed. Pins and the scratchpad are window-global
+    /// and own no slot, so they never match here. Time O(w + l) over `w`
+    /// workspaces and `l` leaves in the active layout; space O(1).
+    #[must_use]
+    pub fn workspace_index_of_view(&self, view: &ViewId) -> Option<usize> {
+        if self.layout.leaf_ids().contains(view) || self.floats.ids().contains(view) {
+            return Some(self.active_workspace);
+        }
+        self.workspaces
+            .iter()
+            .enumerate()
+            .find(|(index, slot)| {
+                *index != self.active_workspace
+                    && (slot.layout.leaf_ids().contains(view) || slot.floats.ids().contains(view))
+            })
+            .map(|(index, _)| index)
+    }
+
+    /// Live panel count (tiled leaves plus detached floats) of one slot.
+    ///
+    /// The active slot uses the live layout/floats; inactive slots use their
+    /// stashed copy. Pins and the scratchpad are window-global and excluded,
+    /// matching [`Self::workspace_index_of_view`]. Returns `None` for an
+    /// out-of-range index. Time O(l) for the active slot, O(1) otherwise.
+    #[must_use]
+    pub fn workspace_panel_count(&self, index: usize) -> Option<usize> {
+        if index == self.active_workspace {
+            return Some(self.layout.leaf_ids().len() + self.floats.len());
+        }
+        self.workspaces
+            .get(index)
+            .map(|slot| slot.layout.leaf_ids().len() + slot.floats.len())
+    }
+
     /// Kill every pane session owned by workspace `index`'s leaves.
     /// Returns the number torn down.
     ///

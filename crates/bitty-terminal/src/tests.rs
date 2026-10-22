@@ -10779,12 +10779,13 @@ fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
 
 #[test]
 #[cfg(unix)]
-fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
+fn reap_exited_last_leaf_of_workspace_prunes_the_workspace() {
     require_pty!();
-    // CTX-1044: the reap session-less branch. With two single-panel
-    // workspaces, the active leaf exiting must close the pane session and
-    // leave its tile session-less, never exit the app. The emptied
-    // workspace stays selected and presents safe (erased tile).
+    // Issue #2525 (CTX-1044 residual): a shell exiting in the last panel of
+    // a workspace is a panel close, exactly like the close-view gesture
+    // (CTX-1297). With two single-panel workspaces the emptied workspace is
+    // pruned and focus follows the survivor; keeping a session-less tile
+    // stranded focus on a dead panel that silently dropped input.
     let maps =
         bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
@@ -10801,6 +10802,17 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
     assert_eq!(app.runtime.active_workspace_index(), 1);
     assert_eq!(app.runtime.leaf_count(), 1);
     assert_eq!(app.effective_window_leaf_count(), 2);
+
+    // Keep a live shell on the surviving workspace so the prune leaves a
+    // usable window with a real input path behind the survivor.
+    assert!(app.runtime.workspace_switch(0));
+    let survivor_view = app.runtime.focused_view().expect("survivor leaf");
+    let survivor_script = write_fake_editor("sleep-survivor-2525", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor_view, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn survivor shell");
+    assert!(app.runtime.workspace_switch(1));
     let active_view = app.runtime.focused_view().expect("active leaf focused");
 
     let script = write_fake_editor("exit-ws-last", "#!/bin/sh\nexit 0\n");
@@ -10824,44 +10836,127 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
     assert_eq!(
         outcome,
         terminal_app::ShellExitOutcome::PaneClosed,
-        "exiting last leaf with panels elsewhere must close the pane, never the app"
+        "exiting the last leaf must close the pane, never the app"
     );
-    assert_eq!(app.runtime.workspace_count(), 2, "emptied workspace stays");
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "emptied workspace is pruned like the close-view gesture"
+    );
     assert_eq!(
         app.runtime.active_workspace_index(),
-        1,
-        "emptied workspace stays selected"
+        0,
+        "focus follows the surviving workspace"
     );
-    assert_eq!(app.runtime.leaf_count(), 1, "workspace keeps its tile");
+    assert_eq!(app.runtime.leaf_count(), 1, "survivor keeps its panel");
     assert_eq!(
         app.effective_window_leaf_count(),
-        2,
-        "no panel lost window-wide"
+        1,
+        "the surviving workspace owns the remaining panel"
     );
     assert!(
         !app.runtime.has_pane_session(&active_view),
-        "exited tile must be session-less"
+        "exited pane session must be torn down"
+    );
+    let survivor = app.runtime.focused_view().expect("survivor leaf focused");
+    assert_eq!(
+        survivor, survivor_view,
+        "focus must leave the pruned dead tile for the live survivor"
+    );
+    assert!(
+        app.runtime.has_pane_session(&survivor_view),
+        "the live survivor keeps its shell"
+    );
+
+    // The surviving workspace still presents and stays usable.
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.workspace_count(), 1);
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    app.runtime.close_pane_session(&survivor_view);
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&survivor_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_last_leaf_of_workspace_prunes_workspace() {
+    require_pty!();
+    // Issue #2525: the primary shell is the sole panel of its workspace
+    // while a split pane stays live on another. On exit the singleton
+    // layout refuses `close_focused_leaf`, which used to strand the dead
+    // primary tile. The emptied workspace must be pruned instead.
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    let pane_view = app.runtime.focused_view().expect("active leaf focused");
+
+    // Keep a live pane on the surviving workspace.
+    let pane_script = write_fake_editor("sleep-pane-2525", "#!/bin/sh\nsleep 10\n");
+    let pane_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, pane_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn live pane shell");
+    assert!(app.runtime.has_pane_session(&pane_view));
+
+    // Attach the exiting primary to workspace 1's sole leaf (the primary
+    // owner is chosen from the focused leaf at attach time).
+    assert!(app.runtime.workspace_switch(0), "switch to workspace 1");
+    let primary_view = app.runtime.focused_view().expect("primary leaf focused");
+    assert_eq!(primary_view, ViewId::new(1));
+    let primary_script = write_fake_editor("exit-primary-2525", "#!/bin/sh\nexit 0\n");
+    let primary_arg = primary_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(primary_arg.as_str())
+        .expect("spawn primary shell");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the emptied primary workspace is pruned"
     );
     assert_eq!(
-        app.runtime.focused_view(),
-        Some(active_view),
-        "focus stays in the emptied workspace"
+        app.runtime.active_workspace_index(),
+        0,
+        "the surviving workspace keeps focus"
     );
-
-    // Present path stays safe on the session-less tile (erased, no panic).
+    assert!(
+        app.runtime.has_pane_session(&pane_view),
+        "the live pane survives the prune"
+    );
+    assert_ne!(
+        app.runtime.primary_view(),
+        Some(primary_view),
+        "the dead primary owner must be replaced"
+    );
+    assert_eq!(app.runtime.focused_view(), Some(pane_view));
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.leaf_count(), 1);
 
-    // The other workspace still holds its panel: switching back proves no
-    // unrelated workspace (or its bookkeeping) died on the reap path.
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.leaf_count(), 1);
-    assert!(app.runtime.focused_view().is_some());
-    assert!(app.runtime.workspace_switch(1));
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    assert_eq!(app.runtime.focused_view(), Some(active_view));
-    let _ = std::fs::remove_file(&script);
+    app.runtime.close_pane_session(&pane_view);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&primary_script);
 }
 
 #[test]

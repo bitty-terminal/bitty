@@ -49,6 +49,17 @@ pub const QUEUED_WRITE_MAX_BYTES: usize = 128 * 1024;
 // submit reported as accepted would be dropped instead of written.
 const _: () = assert!(QUEUED_WRITE_MAX_BYTES > MAX_PRODUCER_FRAME_BYTES);
 
+/// Stack reservation for one queued-writer thread.
+///
+/// The writer loop is non-recursive: it parks on a condition variable, drains
+/// one command, and calls `write`/`flush` on the PTY sink. The default Rust
+/// thread stack (2 MiB) is therefore pure virtual-address overhead multiplied
+/// by the live pane count (one writer per pane since bitty#2446). 128 KiB is
+/// two orders of magnitude above the observed frame (a few KiB of syscall
+/// frames) and keeps the worst-case burst path bounded without changing the
+/// queue byte/command caps.
+pub const WRITER_THREAD_STACK_BYTES: usize = 128 * 1024;
+
 /// Maximum queued commands (data chunks plus flush/shutdown markers).
 ///
 /// Each command carries at most the caller's buffer, so this bound only
@@ -278,6 +289,7 @@ impl PtyWriter {
         let thread_queue = Arc::clone(&queue);
         let spawned = std::thread::Builder::new()
             .name("bitty-pty-writer".to_owned())
+            .stack_size(WRITER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let inner = thread_slot
                     .lock()
@@ -381,6 +393,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn writer_thread_stack_stays_bounded() {
+        // Issue #2524: the queued writer is non-recursive I/O, so its stack is
+        // pure per-pane virtual-address overhead once the panes are live. Pin
+        // the literal so a default-stack regression cannot slip back in.
+        assert_eq!(WRITER_THREAD_STACK_BYTES, 128 * 1024);
+    }
 
     /// `io::Write` sink that records every byte written into shared state.
     #[derive(Clone)]

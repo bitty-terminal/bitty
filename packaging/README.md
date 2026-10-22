@@ -20,7 +20,7 @@ and is labeled as such below.
 | apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`) |
 | archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated            |
 
-OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
+Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
 
 ## Install smoke
 

@@ -5,8 +5,9 @@ Part of: bitty-terminal/bitty#1847 | Task: CTX-1097 | Milestone: v0.1.0
 Every supported install channel in one page. Supported means
 release-matrix-verified: a CI-built binary is not support evidence (see
 `packaging/README.md` `Support evidence`). All channels verify downloads
-before installing and fail closed on mismatch; there are no signatures in
-0.1.0 (verification is hash-only, Windows signing deferred past 0.2.0).
+before installing and fail closed on mismatch; the Debian/Ubuntu APT channel
+verifies cryptographic GPG signatures on repository metadata (`InRelease`),
+while other channels remain hash-only (Windows binary signing deferred past 0.2.0).
 
 ## One-line installers (recommended)
 
@@ -69,6 +70,8 @@ What each script installs:
   `autoupdate` point at the R2-backed CDN with the published sha256 hash; its
   `notes` field documents the GitHub Releases fallback. Windows may still show
   a first-run reputation check. See `packaging/README.md`.
+- **Debian / Ubuntu (APT)**: `curl -fsSL https://cdn.bitty.run/apt/setup.sh | sudo bash && sudo apt install -y bitty`; see `packaging/debian.md`.
+- **Fedora / EPEL (Copr)**: `sudo dnf copr enable -y xuepoo/bitty-terminal && sudo dnf install -y bitty`; see `packaging/fedora.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`

@@ -121,6 +121,9 @@ def resolve_registry(explicit: str | None) -> Path:
     if os.environ.get("BITTY_WORKSPACE"):
         candidates.append(Path(os.environ["BITTY_WORKSPACE"]) / "bitty-plugins")
     candidates.append(REPO_ROOT.parent / "bitty-plugins")
+    # CI checks out the pinned registry here for `just check`; a normal
+    # checkout can provision the same sibling path.
+    candidates.append(REPO_ROOT / "external" / "bitty-plugins")
     # Worktrees live at <main-checkout>/.worktrees/<task>; the workspace
     # checkout is three levels up from the worktree root.
     candidates.append(REPO_ROOT.parent.parent.parent / "bitty-plugins")
@@ -153,10 +156,16 @@ def source_repository(registry: Path, explicit: str | None) -> str:
     return value
 
 
+def reject_controls(value: str, key: str, path: Path) -> str:
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in value):
+        raise CatalogError(f"{path}: `{key}` must not contain control characters")
+    return value
+
+
 def repository_url(value: object, path: Path) -> str:
     if not isinstance(value, str) or not value.startswith("https://"):
         raise CatalogError(f"{path}: `repository` must be an https:// URL")
-    url = value.strip().rstrip("/")
+    url = reject_controls(value.strip(), "repository", path).rstrip("/")
     if not url.endswith(".git"):
         url += ".git"
     return url
@@ -166,7 +175,7 @@ def required_string(entry: dict[str, object], key: str, path: Path) -> str:
     value = entry.get(key)
     if not isinstance(value, str) or not value.strip():
         raise CatalogError(f"{path}: `{key}` must be a non-empty string")
-    return value.strip()
+    return reject_controls(value.strip(), key, path)
 
 
 def optional_string(entry: dict[str, object], key: str, path: Path) -> str | None:
@@ -175,7 +184,7 @@ def optional_string(entry: dict[str, object], key: str, path: Path) -> str | Non
         return None
     if not isinstance(value, str) or not value.strip():
         raise CatalogError(f"{path}: `{key}` must be a non-empty string when set")
-    return value.strip()
+    return reject_controls(value.strip(), key, path)
 
 
 def gitmodules_url(registry: Path, revision: str, path: str) -> str:

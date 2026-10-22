@@ -1976,6 +1976,33 @@ fn verified_installed_version(user: &Path, name: &str, version: &str) -> Option<
     Some(dir)
 }
 
+/// Refresh the `current` pointer for an already-installed version.
+///
+/// The offline cache-hit path bypasses `install_staged`, so it must apply the
+/// same symlink guard before writing: `current` is read by the resolver and a
+/// pre-existing symlink would escape the install directory. The write is
+/// atomic (temp sibling + rename) like every other publish.
+fn refresh_current_pointer(user: &Path, name: &str, version: &str) -> Result<(), ComponentFailure> {
+    let path = user.join(name).join("current");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: refusing symlink install path '{}'",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: cannot inspect '{}': {error}",
+                path.display()
+            )));
+        }
+    }
+    publish_bytes_atomic(&path, format!("{version}\n").as_bytes(), None)
+}
+
 /// Locally installed versions for `name` in the user tier, newest first.
 fn local_installed_versions(user: Option<&Path>, name: &str) -> Vec<String> {
     let Some(user) = user else {
@@ -2251,6 +2278,7 @@ fn op_install(
     // constraint) deliberately keep the full fetch path.
     if catalog_outage && version_flag.is_some() && digest_flag.is_none() && !force {
         if let Some(path) = verified_installed_version(user, name, &version) {
+            refresh_current_pointer(user, name, &version)?;
             let _ = writeln!(
                 output,
                 "bitty extension: catalog unreachable; reusing the verified local install of '{name}' {version} at {}",
@@ -5423,6 +5451,10 @@ mod tests {
         let version_dir = user.join("net").join("0.0.23");
         assert!(version_dir.is_dir(), "first install must stage the version");
 
+        // Remove `current` so the offline path must restore the active
+        // pointer through the guarded atomic write.
+        std::fs::remove_file(user.join("net").join("current")).expect("drop current");
+
         // Offline re-install: the catalog attempt fails, then the verified
         // local copy short-circuits before the manifest/tarball fetches.
         stub.catalog_unavailable = true;
@@ -5455,10 +5487,16 @@ mod tests {
             note.contains("reusing the verified local install"),
             "{note}"
         );
+        assert_eq!(
+            std::fs::read_to_string(user.join("net").join("current")).expect("current restored"),
+            "0.0.23\n",
+            "offline reuse must restore the active pointer"
+        );
 
         // A tampered executable no longer qualifies: the verified fetch runs
         // and repairs the install instead of trusting local bytes.
-        std::fs::write(version_dir.join("bitty-net"), b"tampered").expect("tamper");
+        let executable = version_dir.join(executable_file_name("bitty-net"));
+        std::fs::write(&executable, b"tampered").expect("tamper");
         stub.fetch_calls = 0;
         let mut out = Vec::new();
         let mut input = std::io::BufReader::new(&b""[..]);
@@ -5476,7 +5514,7 @@ mod tests {
         .expect("tampered cache falls back to the verified fetch");
         assert!(summary.contains("installed"), "{summary}");
         assert_eq!(stub.fetch_calls, 3, "catalog + manifest + tarball");
-        let repaired = std::fs::read(version_dir.join("bitty-net")).expect("repaired exe");
+        let repaired = std::fs::read(&executable).expect("repaired exe");
         assert_eq!(repaired, b"seed-net-bytes");
         let _ = std::fs::remove_dir_all(&base);
     }

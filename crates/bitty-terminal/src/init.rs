@@ -4033,7 +4033,7 @@ pub(crate) fn init_usage() -> String {
      \x20 --no-plugins         select no plugins (wins over --plugins)\n\
      \n\
      follow-ups (#1913, offline-safe, no network/secrets without opt-in):\n\
-     \x20 --with-components / --no-with-components  offer extension installs\n\
+     \x20 --with-components / --no-with-components  print extension install hints\n\
      \x20 --print-shell-init / --no-print-shell-init  print the shell-init handoff line\n\
      \n\
      target: --config PATH wins, else BITTY_CONFIG, else\n\
@@ -4573,7 +4573,7 @@ pub(crate) fn run_init_subcommand_with_io(
         match init_prompt_yes_no(
             input,
             output,
-            "Install missing native extensions for selected plugins? [y/N]:",
+            "Print install hints for missing native extensions of selected plugins? [y/N]:",
             &mut followup_history,
         ) {
             Ok(approved) => approved,
@@ -4859,7 +4859,7 @@ pub(crate) fn run_init_subcommand_with_io(
             if declared.is_empty() {
                 let _ = writeln!(
                     output,
-                    "bitty init: no selected plugin declares native extensions; nothing to install"
+                    "bitty init: no selected plugin declares native extensions; no hints to print"
                 );
             } else {
                 for component in &declared {

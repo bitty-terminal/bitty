@@ -37,6 +37,7 @@ sha256_file() {
   fi
 }
 
+mkdir -p "${TMPDIR:-/tmp}/bitty"
 TMP_BASE="$(mktemp -d "${TMPDIR:-/tmp}/bitty/make-extension-catalog-test.XXXXXX")"
 cleanup() {
   rm -rf "$TMP_BASE"
@@ -190,11 +191,20 @@ else
   fail "--output mode exited non-zero"
 fi
 
-# --- usage guard: --check/--publish reject --output ---
+# --- usage guards ---
 if "$SCRIPT" --check --output "$TMP_BASE/x" >/dev/null 2>&1; then
   fail "--check accepted --output"
 else
   pass "--check rejects --output"
+fi
+if "$SCRIPT" --source-dir "$FIXTURE" --publish >/dev/null 2>"$TMP_BASE/publish.err"; then
+  fail "--publish accepted --source-dir"
+else
+  if grep -q 'live bucket' "$TMP_BASE/publish.err"; then
+    pass "--publish refuses a local source directory"
+  else
+    fail "--publish source-dir error is not actionable: $(cat "$TMP_BASE/publish.err")"
+  fi
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

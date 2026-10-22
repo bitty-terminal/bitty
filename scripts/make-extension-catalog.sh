@@ -126,6 +126,8 @@ done
 
 [[ "$MODE" == "generate" || -z "$OUTPUT" ]] || die "--output is only valid in generate mode"
 [[ "$MODE" == "publish" || "$ALLOW_YANK" == "0" ]] || die "--allow-yank is only valid with --publish"
+[[ "$MODE" != "publish" || -z "$SOURCE_DIR" ]] ||
+  die "--publish runs against the live bucket; --source-dir is for local generation only"
 
 valid_name() {
   [[ "$1" =~ ^[a-z][a-z0-9-]{0,31}$ ]]
@@ -163,9 +165,16 @@ fetch() { # URL DEST
 
 fetch_api() { # URL DEST
   local url="$1" dest="$2" status
-  if ! status="$(curl -sS --proto '=https' --tlsv1.2 -L \
-    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-    -o "$dest" -w '%{http_code}' "$url")"; then
+  # The token never enters argv (visible in /proc): curl reads the header from
+  # a stdin config. Validate the shape first so a hostile value cannot inject
+  # another config directive.
+  [[ "$CLOUDFLARE_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]] ||
+    die "CLOUDFLARE_API_TOKEN has an unexpected shape"
+  if ! status="$(
+    printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" |
+      curl --config - -sS --proto '=https' --tlsv1.2 -L \
+        -o "$dest" -w '%{http_code}' "$url"
+  )"; then
     die "cannot reach the Cloudflare API (transport failure)"
   fi
   [[ "$status" == "200" ]] || die "Cloudflare API returned HTTP $status"

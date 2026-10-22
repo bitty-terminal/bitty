@@ -364,7 +364,7 @@ fn validate_instance_value(value: &str) -> Result<(), String> {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn list_usage() -> String {
-    "usage: bitty list <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)\n  services   registered extension interfaces, no VM (local, safe-mode clean)"
+    "usage: bitty list <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in presets plus local theme files (no network)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)\n  services   registered extension interfaces, no VM (local, safe-mode clean)"
         .to_string()
 }
 
@@ -378,8 +378,10 @@ pub fn list_help_text(invoked_as: &str) -> String {
          \n\
          Kinds:\n  \
            themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
-                      tokyo-night, github-dark, catppuccin-mocha; aliases like dark).\n  \
-                      Local class: no instance, no file I/O, safe-mode clean.\n  \
+                      tokyo-night, github-dark, catppuccin-mocha; aliases like dark) plus\n  \
+                      accepted local files from <config>/bitty/themes (*.toml), selectable\n  \
+                      as local:<name>. Local class: no instance, no network; reads local\n  \
+                      theme files unless --safe keeps the catalog built-in-only.\n  \
            plugins    Static bundled plugin catalog (bitty-terminal.*), staged disabled by default.\n  \
                       Local class: manifest metadata only, no plugin VM loaded, safe-mode clean.\n  \
             instances  Live instance discovery (instance, socket, live). Runtime class:\n  \
@@ -425,6 +427,9 @@ pub fn list_help_text(invoked_as: &str) -> String {
            envelope {{\"v\":1,\"command\":\"{invoked_as}\",\"ok\":true,\"result\":{{\"kind\":...}}}}.\n  \
            Usage errors (exit 2) go to stderr with no stdout envelope. Runtime\n  \
            failures for `instances` emit ok:false envelopes (exit 6/7).\n  \
+           themes result keys: kind, count, themes (array of {{\"name\",\"aliases\",\"category\",\n  \
+           \"source\",\"provenance\",\"license\",\"background\",\"foreground\",\"cursor\",\"selection\"}});\n  \
+           source is builtin|local and provenance is the optional upstream URL.\n  \
            actions result keys: kind, count (actions plus commands), actions\n  \
            (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"binding\",\"kind\":\"chrome\"}}),\n  \
            commands (array of {{\"id\",\"description\",\"class\",\"requires_runtime\",\"binding\",\"kind\",\"scopes\",\"owner\"}}).\n  \
@@ -477,8 +482,11 @@ pub struct ThemeInfo {
     pub category: String,
     /// Accepted aliases (e.g. `dark`).
     pub aliases: Vec<String>,
-    /// Upstream project URL that owns the palette.
+    /// Row origin: `builtin` or `local` (never a URL).
     pub source: String,
+    /// Upstream project URL for a built-in preset, or the optional local
+    /// file `source` value (empty when the file omits it).
+    pub provenance: String,
     /// Upstream license identifier.
     pub license: String,
     /// Background as `#rrggbb`.
@@ -501,7 +509,8 @@ pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
 ///
 /// Pure, no I/O: the single source of truth is
 /// `bitty-config::theme::ALL_PRESETS`. Callers must handle empty
-/// (defensive) as an empty table, not an error.
+/// (defensive) as an empty table, not an error. `bitty list themes` adds
+/// local files through [`list_themes_with_local`].
 #[must_use]
 pub fn list_themes() -> Vec<ThemeInfo> {
     bitty_config::theme::list_presets()
@@ -510,7 +519,8 @@ pub fn list_themes() -> Vec<ThemeInfo> {
             name: theme.name.to_string(),
             category: theme.category.as_str().to_string(),
             aliases: theme.aliases.iter().map(|a| (*a).to_string()).collect(),
-            source: theme.source.to_string(),
+            source: String::from("builtin"),
+            provenance: theme.source.to_string(),
             license: theme.license.to_string(),
             background: rgb_to_hex(theme.background),
             foreground: rgb_to_hex(theme.foreground),
@@ -518,6 +528,39 @@ pub fn list_themes() -> Vec<ThemeInfo> {
             selection: rgb_to_hex(theme.selection),
         })
         .collect()
+}
+
+/// Enumerate built-ins plus accepted local theme files.
+///
+/// Local rows carry the explicit selectable name `local:<name>` and
+/// `source = "local"`; their optional upstream URL travels in `provenance`,
+/// never in the table's origin column. Rejected files are returned as
+/// per-file diagnostics so the caller can print them without hiding the
+/// catalog. The built-in prefix of the result is byte-identical to
+/// [`list_themes`], and the whole function is filesystem-only (no network).
+#[must_use]
+pub fn list_themes_with_local() -> (Vec<ThemeInfo>, Vec<bitty_config::LocalThemeDiagnostic>) {
+    let catalog = bitty_config::local_theme::load_local_themes();
+    let mut rows = list_themes();
+    for theme in &catalog.themes {
+        rows.push(ThemeInfo {
+            name: format!("{}{}", bitty_config::theme::LOCAL_THEME_PREFIX, theme.name),
+            category: theme.category.as_str().to_string(),
+            aliases: theme
+                .aliases
+                .iter()
+                .map(|alias| format!("{}{}", bitty_config::theme::LOCAL_THEME_PREFIX, alias))
+                .collect(),
+            source: String::from("local"),
+            provenance: theme.provenance.clone(),
+            license: theme.license.clone(),
+            background: rgb_to_hex(theme.palette.background),
+            foreground: rgb_to_hex(theme.palette.foreground),
+            cursor: rgb_to_hex(theme.palette.cursor),
+            selection: rgb_to_hex(theme.palette.selection),
+        });
+    }
+    (rows, catalog.diagnostics)
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,9 +1866,10 @@ pub fn format_success_envelope(
                 }
                 let _ = write!(
                     out,
-                    "],\"category\":\"{}\",\"source\":\"{}\",\"license\":\"{}\",\"background\":\"{}\",\"foreground\":\"{}\",\"cursor\":\"{}\",\"selection\":\"{}\"}}",
+                    "],\"category\":\"{}\",\"source\":\"{}\",\"provenance\":\"{}\",\"license\":\"{}\",\"background\":\"{}\",\"foreground\":\"{}\",\"cursor\":\"{}\",\"selection\":\"{}\"}}",
                     json_escape(&t.category),
                     json_escape(&t.source),
+                    json_escape(&t.provenance),
                     json_escape(&t.license),
                     json_escape(&t.background),
                     json_escape(&t.foreground),
@@ -2222,7 +2266,7 @@ pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> Stri
             } else {
                 t.aliases.join(",")
             },
-            "builtin",
+            t.source,
             background,
             foreground
         ));
@@ -2378,8 +2422,9 @@ pub fn run_list(request: &ListRequest) -> i32 {
 ///
 /// Shared resolver (no fork): both `Actions` bindings and `Keymaps` rows come
 /// from the same [`resolved_for_catalog`] table (config overrides + defaults).
-/// `safe_mode` mirrors startup for the `services` catalog only (`--safe`
-/// skips third-party sources); every other kind ignores it.
+/// `safe_mode` mirrors startup for the `themes` and `services` catalogs
+/// (`--safe` skips local theme files and third-party sources); every other
+/// kind ignores it.
 pub fn run_list_with_effective(
     request: &ListRequest,
     effective: &bitty_config::EffectiveConfig,
@@ -2387,7 +2432,20 @@ pub fn run_list_with_effective(
 ) -> i32 {
     match request.kind {
         ListKind::Themes => {
-            let themes = list_themes();
+            // CTX-2464: normal listing includes accepted local files; `--safe`
+            // keeps the catalog built-in-only (no external config reads), so
+            // the safe-mode path stays byte-identical to the shipped catalog.
+            let (themes, diagnostics) = if safe_mode {
+                (list_themes(), Vec::new())
+            } else {
+                list_themes_with_local()
+            };
+            for diagnostic in &diagnostics {
+                eprintln!(
+                    "bitty list themes: {}: {}",
+                    diagnostic.file, diagnostic.message
+                );
+            }
             match request.format {
                 ListFormat::Table => {
                     print!("{}", format_themes_table(&themes, request.no_color));
@@ -2570,6 +2628,15 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
     // config-free (safe-mode clean, no file I/O). Services threads the
     // startup safe flag through so `--safe` skips third-party sources.
     match request.kind {
+        ListKind::Themes => {
+            // The theme catalog needs no effective config, but `--safe` must
+            // still keep the listing built-in-only and read no local files.
+            run_list_with_effective(
+                &request,
+                &bitty_config::EffectiveConfig::default(),
+                args.safe,
+            )
+        }
         ListKind::Actions | ListKind::Keymaps => {
             let effective = effective_for_catalog(args);
             run_list_with_effective(&request, &effective, args.safe)
@@ -2619,7 +2686,11 @@ mod tests {
         assert_eq!(themes[0].name, "bitty-dark");
         assert_eq!(themes[0].category, "dark");
         assert!(themes[0].aliases.contains(&"dark".to_string()));
-        assert_eq!(themes[0].source, "https://github.com/bitty-terminal/bitty");
+        assert_eq!(themes[0].source, "builtin");
+        assert_eq!(
+            themes[0].provenance,
+            "https://github.com/bitty-terminal/bitty"
+        );
         assert_eq!(themes[0].background, "#1e1e2e");
         assert_eq!(themes[0].foreground, "#cdd6f4");
         // Both categories are represented.
@@ -2632,7 +2703,8 @@ mod tests {
             for a in &t.aliases {
                 assert!(keys.insert(a.clone()), "duplicate alias {a}");
             }
-            assert!(t.source.starts_with("https://"));
+            assert_eq!(t.source, "builtin");
+            assert!(t.provenance.starts_with("https://"));
             assert!(!t.license.is_empty());
         }
     }

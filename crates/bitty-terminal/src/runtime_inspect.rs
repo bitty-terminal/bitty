@@ -242,7 +242,7 @@ impl RuntimeInspectContext {
             extension_state_root,
             profile,
             profile_source,
-            theme: app.theme.name.to_string(),
+            theme: app.theme_name.clone(),
             theme_source,
             font_family: app.effective.font.family.clone(),
             font_size: app.effective.font.size,
@@ -645,7 +645,7 @@ mod tests {
             file_path: None,
             profile_name: None,
             profile_path: None,
-            theme: bitty_config::theme::default_theme(),
+            theme_name: String::from(bitty_config::theme::DEFAULT_THEME_NAME),
             resolution: bitty_config::theme::ThemeResolution::Default,
             source: "default",
         }

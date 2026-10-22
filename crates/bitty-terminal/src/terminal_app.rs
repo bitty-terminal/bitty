@@ -1183,7 +1183,7 @@ impl TerminalApp {
                 handle.request_redraw();
             }
         }
-        self.refresh_theme_title(adoption.theme_name);
+        self.refresh_theme_title(&adoption.theme_name);
     }
 
     /// Rebuilds the base window title for a live theme change (CTX-0898).

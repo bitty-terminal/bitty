@@ -11968,7 +11968,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         hints_enabled: false,
         resize_step: edited.layout.resize_step,
         window_opacity: 0.6,
-        theme_name: bitty_config::theme::DEFAULT_THEME_NAME,
+        theme_name: bitty_config::theme::DEFAULT_THEME_NAME.to_string(),
     });
     assert_eq!(app.chrome.keymaps, keymaps);
     assert_ne!(app.chrome.keymaps, maps, "mod_key rebound the table");
@@ -11998,7 +11998,9 @@ fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_rel
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,
-        theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref()).name,
+        theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref())
+            .name
+            .to_string(),
     }
 }
 

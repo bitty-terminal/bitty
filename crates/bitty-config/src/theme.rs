@@ -2125,6 +2125,83 @@ pub fn is_known_theme_name(raw: &str) -> bool {
     find_preset(&normalized).is_some()
 }
 
+/// Explicit namespace prefix for a user-authored local theme file (OQ-047).
+///
+/// A local theme is selected only through this prefix
+/// (`appearance.theme = "local:sunset"`), so a file can never change the
+/// meaning of a built-in preset name and the default/built-in path stays
+/// zero-I/O. The prefix is part of the accepted selection grammar and is
+/// checked structurally by [`AppearanceConfig::validate`](crate::types::AppearanceConfig::validate);
+/// whether the file exists is resolved by [`crate::local_theme`] on the load
+/// path, which owns filesystem access.
+pub const LOCAL_THEME_PREFIX: &str = "local:";
+
+/// Neutral registry-style name used for an applied local theme.
+///
+/// The built-in catalog's contrast exemptions are keyed by preset name; a
+/// local file must never inherit one, so its effective [`Theme`] carries this
+/// non-catalog name.
+pub const LOCAL_THEME_BASE_NAME: &str = "local-theme";
+
+/// Maximum bytes of the name after [`LOCAL_THEME_PREFIX`].
+///
+/// Leaves room for the prefix inside [`crate::types::MAX_THEME_LEN`] and
+/// bounds diagnostics and directory lookups.
+pub const MAX_LOCAL_THEME_NAME_BYTES: usize =
+    crate::types::MAX_THEME_LEN - LOCAL_THEME_PREFIX.len();
+
+/// Whether `name` is a canonical local-theme slug: lowercase ASCII letters,
+/// digits, `-`, or `_`, starting with a letter or digit, at most
+/// [`MAX_LOCAL_THEME_NAME_BYTES`] bytes.
+#[must_use]
+pub fn is_valid_local_theme_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_LOCAL_THEME_NAME_BYTES {
+        return false;
+    }
+    let mut bytes = name.bytes();
+    let starts_well = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    starts_well
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Parses a `local:<name>` selection into its validated slug.
+///
+/// Returns `None` for any other spelling (including a built-in name, an
+/// empty body, an overlong body, or a malformed slug). The caller owns the
+/// filesystem lookup; this function is pure.
+#[must_use]
+pub fn parse_local_theme_reference(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix(LOCAL_THEME_PREFIX)
+        .or_else(|| trimmed.strip_prefix("Local:"))?;
+    is_valid_local_theme_name(body).then_some(body)
+}
+
+/// Whether `raw` is a syntactically valid local-theme selection.
+///
+/// Structural only: an existing `themes/<name>.toml` is not required here.
+#[must_use]
+pub fn is_local_theme_reference(raw: &str) -> bool {
+    parse_local_theme_reference(raw).is_some()
+}
+
+/// Whether a parsed `appearance.theme` value (single or dual) references at
+/// least one `local:<name>` selection.
+///
+/// Structural only; the load path owns file existence and parsing.
+#[must_use]
+pub fn is_local_theme_selection(raw: &str) -> bool {
+    parse_theme_selection(raw).ok().is_some_and(|selection| {
+        selection
+            .names()
+            .iter()
+            .any(|name| is_local_theme_reference(name))
+    })
+}
+
 /// Fail-closed diagnostic for an unknown preset name: names the offender
 /// and the full valid set in registry order, plus the dual-shape syntax.
 #[must_use]
@@ -2137,7 +2214,7 @@ pub fn unknown_theme_diagnostic(raw: &str) -> String {
         names.push_str(preset.name);
     }
     format!(
-        "unknown theme '{}'; expected one of: {names} (or 'light:<name>,dark:<name>' for OS auto-switching; run 'bitty list themes' for the catalog)",
+        "unknown theme '{}'; expected one of: {names} (or 'local:<name>' for a user theme file; or 'light:<name>,dark:<name>' for OS auto-switching; run 'bitty list themes' for the catalog)",
         raw.trim()
     )
 }
@@ -2208,18 +2285,23 @@ pub fn resolve_selection_with_status(
 
 /// Bounded user-supplied palette (CTX-0392, issue #648).
 ///
-/// OQ-047 conformance: OQ-047 stays `Open` (custom and third-party theme
-/// files are unsupported; the reserved XDG `themes/` directory is inert and
-/// no theme-file schema exists). This type therefore covers only the inline
-/// `appearance.colors` table evaluated from the already-trusted user config
-/// file (`init.lua`/`config.lua` via the `bitty-lua` sandbox). No new file
-/// path, no theme-file loading, and no path-trust widening: the accepted
-/// model is unchanged.
+/// Two accepted sources share this shape:
+///
+/// - the inline `appearance.colors` table evaluated from the already-trusted
+///   user config file (`init.lua`/`config.lua` via the `bitty-lua` sandbox);
+/// - a bounded local theme file under
+///   `$XDG_CONFIG_HOME/bitty/themes/*.toml` (CTX-2464, OQ-047), read by
+///   [`crate::local_theme`] and selected explicitly as `local:<name>`.
+///
+/// The inline table never supplies outline tokens; a local theme file may
+/// supply `border_focused`/`border_idle` explicitly. Both optional tokens
+/// default to `None` (the selected built-in base's outline pair), so the
+/// existing preset derivation is unchanged for inline palettes.
 ///
 /// Shape (fail-closed, fixed, no growth):
 /// `background`, `foreground`, `cursor`, `selection` plus exactly 16 ANSI
-/// entries (`ansi[16]`). Every leaf is a canonical `#RRGGBB` hex string in
-/// config; this struct stores the parsed `sRGB` bytes. `#RGB`, `#RRGGBBAA`,
+/// entries (`ansi[16]`). Every color leaf is a canonical `#RRGGBB` hex string
+/// in config; this struct stores the parsed `sRGB` bytes. `#RGB`, `#RRGGBBAA`,
 /// named colors, `rgb()` syntax, and any other spelling are rejected by
 /// [`Self::parse_hex_rgb`] (never coerced, never clamped). Missing leaves
 /// or a short/long `ansi` array reject the whole reload fail-closed, so a
@@ -2241,6 +2323,16 @@ pub struct CustomPalette {
     pub selection: [u8; 3],
     /// The 16 ANSI colors, indices 0-15.
     pub ansi: [[u8; 3]; 16],
+    /// Optional focused outline token (local theme files only).
+    pub border_focused: Option<OutlineColor>,
+    /// Optional idle outline token (local theme files only).
+    pub border_idle: Option<OutlineColor>,
+    /// Optional dark/light classification for a local theme file.
+    ///
+    /// Inline `appearance.colors` and plugin palettes leave this `None` and
+    /// keep the selected preset's category; a local theme file carries its own
+    /// category so the readability policy classifies ANSI 7/15 correctly.
+    pub category: Option<ThemeCategory>,
 }
 
 /// Expected ANSI entry count for [`CustomPalette`].
@@ -2407,6 +2499,9 @@ impl CustomPalette {
             cursor: role("appearance.colors.cursor", cursor)?,
             selection: role("appearance.colors.selection", selection)?,
             ansi: parsed,
+            border_focused: None,
+            border_idle: None,
+            category: None,
         })
     }
 
@@ -2479,6 +2574,45 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == theme.name)
             .map(|(_, reason)| *reason)
+    }
+
+    #[test]
+    fn local_theme_reference_is_structural_and_explicit() {
+        assert_eq!(parse_local_theme_reference("local:sunset"), Some("sunset"));
+        assert_eq!(
+            parse_local_theme_reference(" local:dark_mint "),
+            Some("dark_mint")
+        );
+        assert_eq!(parse_local_theme_reference("Local:sunset"), Some("sunset"));
+        for bad in [
+            "",
+            "sunset",
+            "local:",
+            "local:Sunset",
+            "local:-sunset",
+            "local:../escape",
+            "light:local:sunset,dark:dracula",
+        ] {
+            assert_eq!(parse_local_theme_reference(bad), None, "{bad:?}");
+        }
+        assert!(is_local_theme_reference("local:sunset"));
+        assert!(!is_local_theme_reference("local:../escape"));
+
+        let mut appearance = crate::types::AppearanceConfig {
+            theme: Some(String::from("local:sunset")),
+            ..crate::types::AppearanceConfig::default()
+        };
+        appearance.validate().expect("structural local selection");
+        appearance.theme = Some(String::from("local:../escape"));
+        assert!(
+            appearance.validate().is_err(),
+            "malformed slug fails closed"
+        );
+        appearance.theme = Some(String::from("not-a-theme"));
+        assert!(
+            appearance.validate().is_err(),
+            "unknown built-in fails closed"
+        );
     }
 
     #[test]

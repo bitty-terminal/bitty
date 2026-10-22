@@ -855,7 +855,7 @@ fn main() {
     logging::info(|| {
         format!(
             "bitty: theme '{}' (resolution={:?} source={})",
-            app_config.theme.name, app_config.resolution, app_config.source
+            app_config.theme_name, app_config.resolution, app_config.source
         )
     });
     // CTX-0153: resolve the keymap table (shipped defaults + user overrides).
@@ -1190,7 +1190,7 @@ fn main() {
         // we also keep synthetic smoke proof.
         println!(
             "bitty headless: theme '{}' source={} file={} profile={} profile_file={}",
-            app_config.theme.name,
+            app_config.theme_name,
             app_config.source,
             app_config
                 .file_path
@@ -1233,7 +1233,7 @@ fn main() {
     }
     let mut app = TerminalApp::with_theme(
         runtime,
-        app_config.theme.name,
+        &app_config.theme_name,
         app_config.source,
         keymaps,
         spawn_spec.clone(),
@@ -1279,7 +1279,7 @@ fn main() {
     // logs one explicit warning instead of silently pumping.
     let demo_pump_requested = demo_pump_enabled_from_env();
     if observability::demo_pump_allowed(args.safe, demo_pump_requested) {
-        app.attach_demo_pump(app_config.theme.name, app_config.source);
+        app.attach_demo_pump(&app_config.theme_name, app_config.source);
     } else if demo_pump_requested {
         // Implies `args.safe` (the only way an enabled request is refused).
         logging::warn(|| String::from("bitty: demo pump suppressed in --safe (safe-mode clean)"));

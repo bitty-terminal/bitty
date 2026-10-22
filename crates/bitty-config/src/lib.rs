@@ -84,6 +84,7 @@
 pub mod error;
 pub mod file;
 pub mod keymap;
+pub mod local_theme;
 pub mod merge;
 pub mod migration;
 pub mod panel_rules;
@@ -106,6 +107,13 @@ pub use keymap::{
     default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
     parse_prefix_entry, parse_prefix_second, resolve_hint_config, resolve_keymaps, resolve_leader,
     resolve_leader_for, resolve_prefix_bindings, split_prefix_chord, validate_leader_timeout_ms,
+};
+pub use local_theme::{
+    ActiveLocalTheme, LOCAL_THEME_DIR_NAME, LOCAL_THEME_EXTENSION, LocalTheme, LocalThemeCatalog,
+    LocalThemeDiagnostic, LocalThemeError, MAX_LOCAL_THEME_ALIASES, MAX_LOCAL_THEME_BYTES,
+    MAX_LOCAL_THEME_DIR_ENTRIES, MAX_LOCAL_THEME_FILES, apply_selection, apply_selection_from_dir,
+    load_local_themes, load_local_themes_from_dir, local_themes_dir,
+    local_themes_dir_with_platform_env, parse_local_theme,
 };
 pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,
@@ -133,10 +141,12 @@ pub use reload::{
 };
 pub use theme::{
     ALL_PRESETS, BITTY_DARK, CUSTOM_PALETTE_ANSI_COUNT, CustomPalette, CustomPaletteError,
-    DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeCategory, ThemeResolution, ThemeSelection,
-    ThemeSelectionError, default_theme, is_known_theme_name, list_presets, normalize_theme_name,
-    parse_theme_selection, resolve_selection, resolve_selection_with_status, resolve_theme,
-    resolve_theme_with_status, unknown_theme_diagnostic,
+    DARK_THEME_ALIAS, DEFAULT_THEME_NAME, LOCAL_THEME_PREFIX, MAX_LOCAL_THEME_NAME_BYTES, Theme,
+    ThemeCategory, ThemeResolution, ThemeSelection, ThemeSelectionError, default_theme,
+    is_known_theme_name, is_local_theme_reference, is_valid_local_theme_name, list_presets,
+    normalize_theme_name, parse_local_theme_reference, parse_theme_selection, resolve_selection,
+    resolve_selection_with_status, resolve_theme, resolve_theme_with_status,
+    unknown_theme_diagnostic,
 };
 pub use trust::{
     TrustDecision, TrustRecord, TrustStore, admit_project_layer, check_trust, validate_project_plan,

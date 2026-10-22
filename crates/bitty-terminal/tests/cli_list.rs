@@ -205,7 +205,23 @@ fn list_themes_jsonl_is_single_line_envelope() {
 
 #[test]
 fn list_themes_catalog_exposes_30_and_categories() {
-    let output = run_bitty(&["list", "themes", "--format", "json"], &[]);
+    // Pin an empty config root so a developer's local theme files cannot
+    // change the built-in catalog count.
+    let root = std::env::temp_dir().join(format!(
+        "bitty-list-builtin-only-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let root_str = root.to_string_lossy().to_string();
+    let output = run_bitty(
+        &["list", "themes", "--format", "json"],
+        &[("XDG_CONFIG_HOME", &root_str)],
+    );
+    let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -477,6 +493,162 @@ fn list_themes_term_dumb_strips_swatches() {
         "TERM=dumb must strip swatches, got {text:?}"
     );
     assert!(text.contains("#1e1e2e"));
+}
+
+// ---------------------------------------------------------------------------
+// Local theme files (CTX-2464, OQ-047)
+// ---------------------------------------------------------------------------
+
+fn local_theme_fixture(background: &str) -> String {
+    let ansi = [
+        "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
+        "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#cdd6f4",
+    ]
+    .iter()
+    .map(|value| format!("\"{value}\""))
+    .collect::<Vec<_>>()
+    .join(", ");
+    format!(
+        "name = \"sunset\"\ncategory = \"dark\"\n\
+         source = \"https://example.invalid/sunset\"\nlicense = \"MIT\"\n\
+         background = \"{background}\"\nforeground = \"#cdd6f4\"\n\
+         cursor = \"#f5e0dc\"\nselection = \"#313244\"\nansi = [{ansi}]\n"
+    )
+}
+
+fn themed_xdg_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "bitty-list-local-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let themes = root.join("bitty").join("themes");
+    std::fs::create_dir_all(&themes).expect("themes dir");
+    std::fs::write(themes.join("sunset.toml"), local_theme_fixture("#1e1e2e"))
+        .expect("write local theme");
+    root
+}
+
+#[test]
+fn list_themes_includes_local_files_without_network_provenance_in_table() {
+    let root = themed_xdg_root("table");
+    let root_str = root.to_string_lossy().to_string();
+    let output = run_bitty(&["list", "themes"], &[("XDG_CONFIG_HOME", &root_str)]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("PROVENANCE"), "table header: {text:?}");
+    assert!(
+        text.lines().any(|line| {
+            let columns: Vec<_> = line.split_whitespace().collect();
+            columns.len() >= 4
+                && columns[0] == "local:sunset"
+                && columns[1] == "dark"
+                && columns[3] == "local"
+        }),
+        "local row must carry origin local, got {text:?}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            let columns: Vec<_> = line.split_whitespace().collect();
+            columns.len() >= 4 && columns[0] == "bitty-dark" && columns[3] == "builtin"
+        }),
+        "builtin row must carry origin builtin, got {text:?}"
+    );
+    assert!(
+        !text.contains("https://"),
+        "the human table must not look like it fetches upstream URLs: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_themes_json_marks_local_source_and_keeps_url_as_provenance() {
+    let root = themed_xdg_root("json");
+    let root_str = root.to_string_lossy().to_string();
+    let output = run_bitty(
+        &["list", "themes", "--format", "json"],
+        &[("XDG_CONFIG_HOME", &root_str)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(
+        doc.contains("\"name\":\"local:sunset\"") && doc.contains("\"source\":\"local\""),
+        "{:?}",
+        doc.text()
+    );
+    assert!(
+        doc.contains("\"provenance\":\"https://example.invalid/sunset\""),
+        "{:?}",
+        doc.text()
+    );
+    assert!(
+        doc.contains("\"source\":\"builtin\""),
+        "builtin rows keep a stable origin: {:?}",
+        doc.text()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn safe_list_themes_reads_no_local_files() {
+    let root = themed_xdg_root("safe");
+    let root_str = root.to_string_lossy().to_string();
+    let output = run_bitty(
+        &["--safe", "list", "themes", "--format", "json"],
+        &[("XDG_CONFIG_HOME", &root_str)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(
+        doc.contains("\"count\":30") && !doc.contains("local:sunset"),
+        "--safe must keep the catalog built-in-only: {:?}",
+        doc.text()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_themes_reports_a_rejected_local_file_and_stays_successful() {
+    let root = themed_xdg_root("bad");
+    std::fs::write(
+        root.join("bitty").join("themes").join("broken.toml"),
+        "name = \"broken\"\nbackground = \"#123456\"\n",
+    )
+    .expect("write broken theme");
+    let root_str = root.to_string_lossy().to_string();
+    let output = run_bitty(&["list", "themes"], &[("XDG_CONFIG_HOME", &root_str)]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("broken.toml"), "diagnostic: {err:?}");
+    assert!(
+        err.contains("missing required field"),
+        "diagnostic: {err:?}"
+    );
+    assert!(stdout(&output).contains("local:sunset"));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------------

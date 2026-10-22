@@ -21,9 +21,11 @@ pub(crate) struct AppConfig {
     pub(crate) profile_name: Option<String>,
     /// Profile file path that was used, if any.
     pub(crate) profile_path: Option<std::path::PathBuf>,
-    /// Resolved theme preset (static registry entry).
-    pub(crate) theme: &'static bitty_config::theme::Theme,
-    /// How the theme resolved (Default/Named/FallbackUnknown).
+    /// User-facing theme identity for titles, inspection, and logs
+    /// (`bitty-dark`, `local:sunset`).
+    pub(crate) theme_name: String,
+    /// How the theme resolved (Default/Named/FallbackUnknown). A local
+    /// selection reports `Named`.
     pub(crate) resolution: bitty_config::theme::ThemeResolution,
     /// `"cli"` / `"file"` / `"profile"` / `"default"`: which layer won the theme.
     pub(crate) source: &'static str,
@@ -403,6 +405,16 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
                 ));
             }
         };
+    let mut merged = merged;
+    // CTX-2464 (OQ-047): a `local:<name>` selection is resolved here, on the
+    // one load path shared by startup, `config check`, doctor, and reload.
+    // The built-in path performs no filesystem access. A missing, malformed,
+    // unreadable, or readability-failing file is a recoverable first-start
+    // failure like any other unusable external user layer; a reload keeps
+    // the last good effective config (the engine never adopts the error).
+    if let Err(error) = bitty_config::local_theme::apply_selection(&mut merged.effective) {
+        return Err(LoadFailure::broken(format!("bitty: {error}")));
+    }
     Ok(LoadedConfig {
         merged,
         probed,
@@ -466,10 +478,33 @@ fn resolve_app_config(args: &Args) -> Result<AppConfig, LoadFailure> {
     // Unknown). Single names keep the existing status path; unknown halves
     // stay FallbackUnknown observers (validation already failed closed).
     let prefer_light = startup_prefer_light();
-    let (theme, resolution) = bitty_config::theme::resolve_selection_with_status(
-        effective.appearance.theme.as_deref(),
-        prefer_light,
-    );
+    // CTX-2464: a local selection was already folded into
+    // `appearance.colors` by `resolve_merged_config`. It has no static
+    // registry entry, so the title identity is the normalized
+    // `local:<name>` reference and the base preset is the designed default;
+    // the custom palette supplies every rendered color role.
+    let local_reference = effective
+        .appearance
+        .theme
+        .as_deref()
+        .and_then(|raw| bitty_config::theme::parse_theme_selection(raw).ok())
+        .and_then(|selection| match selection {
+            bitty_config::theme::ThemeSelection::Single(name)
+                if bitty_config::theme::is_local_theme_reference(&name) =>
+            {
+                Some(name)
+            }
+            _ => None,
+        });
+    let (resolution, theme_name) = if let Some(local) = local_reference {
+        (bitty_config::theme::ThemeResolution::Named, local)
+    } else {
+        let (theme, resolution) = bitty_config::theme::resolve_selection_with_status(
+            effective.appearance.theme.as_deref(),
+            prefer_light,
+        );
+        (resolution, theme.name.to_string())
+    };
     // Log unknown-theme fallbacks (the pure resolver stays silent for tests).
     if resolution == bitty_config::theme::ThemeResolution::FallbackUnknown {
         let raw = effective.appearance.theme.as_deref().unwrap_or_default();
@@ -501,7 +536,7 @@ fn resolve_app_config(args: &Args) -> Result<AppConfig, LoadFailure> {
         file_path,
         profile_name: profile_request,
         profile_path,
-        theme,
+        theme_name,
         resolution,
         source,
     })
@@ -599,7 +634,7 @@ fn builtin_app_config() -> Result<AppConfig, String> {
         file_path: None,
         profile_name: None,
         profile_path: None,
-        theme,
+        theme_name: theme.name.to_string(),
         resolution,
         source: "default",
     })
@@ -2128,7 +2163,7 @@ mod startup_tests {
             file_path: None,
             profile_name: None,
             profile_path: None,
-            theme,
+            theme_name: theme.name.to_string(),
             resolution,
             source: "default",
         }

@@ -3831,7 +3831,16 @@ impl AppearanceConfig {
                 }
                 Ok(selection) => {
                     for name in selection.names() {
-                        if !crate::theme::is_known_theme_name(name) {
+                        // CTX-2464 (OQ-047): a `local:<name>` selection is a
+                        // structural opt-in to a user theme file. Validation
+                        // stays pure (no I/O): the load path
+                        // (`crate::local_theme`) verifies the file exists,
+                        // parses it, and applies its palette. Built-in names
+                        // stay zero-I/O and never resolve through the file
+                        // directory.
+                        if !crate::theme::is_known_theme_name(name)
+                            && !crate::theme::is_local_theme_reference(name)
+                        {
                             return Err(ConfigError::validation(
                                 "appearance.theme",
                                 crate::theme::unknown_theme_diagnostic(name),
@@ -4082,20 +4091,60 @@ impl EffectiveConfig {
     /// half matching the OS appearance (`true` = light). The caller maps
     /// its OS appearance signal; unknown appearances must pass `false`
     /// (dark-first default). Single selections ignore the flag.
+    ///
+    /// CTX-2464: a `local:<name>` selection has no static registry entry.
+    /// The load path has already folded its file palette into
+    /// `appearance.colors`, so resolution deliberately stays silent and
+    /// falls back to the designed default preset for the base metadata;
+    /// the custom palette supplies every color role, including the optional
+    /// outline tokens. Unknown built-in names that bypassed validation also
+    /// fall back here without logging; startup logs its own resolution.
     #[must_use]
     pub fn effective_theme_for(&self, prefer_light: bool) -> crate::theme::Theme {
-        let base = *crate::theme::resolve_selection(self.appearance.theme.as_deref(), prefer_light);
+        let local_selection = self
+            .appearance
+            .theme
+            .as_deref()
+            .is_some_and(crate::theme::is_local_theme_selection);
+        let base = if self.appearance.colors.is_some() || local_selection {
+            // Custom palettes (inline or a selected local file) own every
+            // color role; a local namespace has no registry entry, so stay
+            // silent instead of logging a fallback for an accepted selection.
+            // The same silent path covers the pre-apply validation call.
+            let (base, _) = crate::theme::resolve_selection_with_status(
+                self.appearance.theme.as_deref(),
+                prefer_light,
+            );
+            base
+        } else {
+            crate::theme::resolve_selection(self.appearance.theme.as_deref(), prefer_light)
+        };
         if let Some(custom) = &self.appearance.colors {
+            let local = custom.category.is_some();
             crate::theme::Theme {
                 background: custom.background,
                 foreground: custom.foreground,
                 cursor: custom.cursor,
                 selection: custom.selection,
                 ansi: custom.ansi,
-                ..base
+                border_focused: custom.border_focused.unwrap_or(base.border_focused),
+                border_idle: custom.border_idle.unwrap_or(base.border_idle),
+                // A local file carries its own dark/light category and must
+                // not inherit a built-in preset's identity or contrast
+                // exemptions. Inline palettes keep the selected preset's
+                // category and name, preserving the shipped behavior.
+                name: if local {
+                    crate::theme::LOCAL_THEME_BASE_NAME
+                } else {
+                    base.name
+                },
+                category: custom.category.unwrap_or(base.category),
+                aliases: if local { &[] } else { base.aliases },
+                source: if local { "local" } else { base.source },
+                license: if local { "" } else { base.license },
             }
         } else {
-            base
+            *base
         }
     }
 
@@ -4152,15 +4201,31 @@ impl EffectiveConfig {
         // pair against the selected theme's background (AC-3 stays advisory).
         // CTX-0392: the background is the custom palette background when
         // `appearance.colors` is present (same floors, custom ground).
-        let theme = self.effective_theme();
-        self.decoration.validate_outline_contract(&theme)?;
-        // CTX-0343: a violating `views.*` override that is resolvable now
-        // (`*` or a content-type selector) rejects the WHOLE reload with a
-        // source-attributed `views[<selector>].<field>` diagnostic. The
-        // `ws:`/`view:` tiers are still inert at merge time; the runtime
-        // first-match path (View creation/bind/move) validates those pairs
-        // fail-closed before they are committed.
-        self.validate_view_targets(&theme, &RESOLVABLE_VIEW_TARGETS)?;
+        //
+        // CTX-2464: a `local:<name>` selection is validated in two phases.
+        // `merge_layers` validates the merged config before the local file is
+        // read, so the palette is still absent and the only resolvable base is
+        // the dark default. Defer the outline/background contract until
+        // `local_theme::apply_selection` folds the file in and re-runs this
+        // method; otherwise a valid light local theme is rejected against the
+        // wrong (dark) background and a local name logs a false fallback.
+        let local_pending = self.appearance.colors.is_none()
+            && self
+                .appearance
+                .theme
+                .as_deref()
+                .is_some_and(crate::theme::is_local_theme_selection);
+        if !local_pending {
+            let theme = self.effective_theme();
+            self.decoration.validate_outline_contract(&theme)?;
+            // CTX-0343: a violating `views.*` override that is resolvable now
+            // (`*` or a content-type selector) rejects the WHOLE reload with a
+            // source-attributed `views[<selector>].<field>` diagnostic. The
+            // `ws:`/`view:` tiers are still inert at merge time; the runtime
+            // first-match path (View creation/bind/move) validates those pairs
+            // fail-closed before they are committed.
+            self.validate_view_targets(&theme, &RESOLVABLE_VIEW_TARGETS)?;
+        }
         self.scrollbar.validate()?;
         self.mouse.validate()?;
         self.appearance.validate()?;

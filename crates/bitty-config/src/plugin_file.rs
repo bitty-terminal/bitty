@@ -547,7 +547,7 @@ fn parse_quoted(raw: &str) -> Result<String, String> {
 }
 
 /// Parse a double-quoted string with a byte bound (fail-closed).
-fn parse_quoted_bounded(raw: &str, max_bytes: usize) -> Result<String, String> {
+pub(crate) fn parse_quoted_bounded(raw: &str, max_bytes: usize) -> Result<String, String> {
     // Bound the raw token first so an absurd literal fails fast.
     if raw.len() > max_bytes + 2 {
         return Err("string too long".to_string());
@@ -564,7 +564,7 @@ fn parse_quoted_bounded(raw: &str, max_bytes: usize) -> Result<String, String> {
 /// Items must be double-quoted strings of `<= MAX_PLUGIN_ARRAY_ITEM_BYTES`
 /// bytes with no NUL; at most [`MAX_PLUGIN_ARRAY_ITEMS`] items. Anything
 /// else fails the key (never the file).
-fn parse_string_array(raw: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_string_array(raw: &str) -> Result<Vec<String>, String> {
     let value = raw.trim();
     if !(value.starts_with('[') && value.ends_with(']')) {
         return Err("unterminated array".to_string());
@@ -638,7 +638,7 @@ fn push_array_item(items: &mut Vec<String>, item: String) -> Result<(), String> 
 
 /// Strip a `#` comment, respecting double-quoted strings (with `\`
 /// escapes). Mirrors the manifest-subset reader.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_string = false;
     let mut escaped = false;

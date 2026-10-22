@@ -253,10 +253,11 @@ pub(crate) struct AppAdoption {
     pub(crate) resize_step: f32,
     /// Effective `window.opacity` for the platform transparency hint.
     pub(crate) window_opacity: f32,
-    /// Resolved theme preset name for the window title (CTX-0898). The
+    /// Resolved theme identity for the window title (CTX-0898): a built-in
+    /// preset name or a normalized `local:<name>` reference (CTX-2464). The
     /// title's source-layer suffix is the one from launch: the reload engine
     /// sees only the merged effective config, not layer attribution.
-    pub(crate) theme_name: &'static str,
+    pub(crate) theme_name: String,
 }
 
 thread_local! {
@@ -328,6 +329,27 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
     let prefix_bindings = bitty_config::resolve_prefix_bindings(&effective.keymaps)
         .map_err(|err| format!("keymaps: {err}"))?;
     let prefer_light = reload_prefer_light();
+    // CTX-2464: a local selection has no static registry name. The title must
+    // show the same explicit `local:<name>` reference the config carries, not
+    // the silent built-in base used for color resolution.
+    let local_reference = effective
+        .appearance
+        .theme
+        .as_deref()
+        .and_then(|raw| bitty_config::theme::parse_theme_selection(raw).ok())
+        .and_then(|selection| match selection {
+            bitty_config::theme::ThemeSelection::Single(name)
+                if bitty_config::theme::is_local_theme_reference(&name) =>
+            {
+                Some(name)
+            }
+            _ => None,
+        });
+    let theme_name = local_reference.unwrap_or_else(|| {
+        bitty_config::theme::resolve_selection(effective.appearance.theme.as_deref(), prefer_light)
+            .name
+            .to_string()
+    });
     Ok(AppAdoption {
         keymaps,
         leader,
@@ -335,11 +357,7 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
         window_opacity: effective.window.opacity,
-        theme_name: bitty_config::theme::resolve_selection(
-            effective.appearance.theme.as_deref(),
-            prefer_light,
-        )
-        .name,
+        theme_name,
     })
 }
 
@@ -470,28 +488,59 @@ struct Stamp {
 /// path. Half a second keeps an edit visible almost immediately.
 pub(crate) const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Dependency-free poll watcher over one config path.
+/// One bounded stat row for a `.toml` candidate in the themes directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemeStamp {
+    name: String,
+    mtime: Option<SystemTime>,
+    len: u64,
+    /// Symlink target (never followed by the loader; included so retargeting
+    /// the link is observed as a change).
+    target: Option<PathBuf>,
+}
+
+/// Dependency-free poll watcher over the config file and local themes directory.
 ///
-/// Stat-ing the path (rather than holding an open handle) means an
-/// atomic-rename or symlink-retarget rewrite is observed as a change, and the
-/// watcher needs no event subscription. The cost is one `stat` per
+/// Stat-ing paths (rather than holding an open handle) means an atomic-rename
+/// rewrite is observed as a change, and the watcher needs no event
+/// subscription. The cost is one config `stat` plus one bounded themes scan
+/// (at most [`bitty_config::MAX_LOCAL_THEME_DIR_ENTRIES`] entries, with stats
+/// for at most [`bitty_config::MAX_LOCAL_THEME_FILES`] `.toml` candidates) per
 /// [`CONFIG_POLL_INTERVAL`]. An edit that keeps both the length and the
 /// filesystem's mtime granularity unchanged is not observed until the next
 /// differing write; `bitty ctl config reload` is the explicit path.
+///
+/// CTX-2464: the themes directory is watched even when a built-in preset is
+/// active, so creating the first local file is observable; edits inside an
+/// existing file are observed through its `(mtime, len)` row. The reload
+/// re-resolves the whole effective config, so the local palette is adopted
+/// atomically by the existing engine and a rejected edit keeps the last good
+/// palette.
 #[derive(Debug)]
 pub(crate) struct ConfigFileWatcher {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    theme_dir: Option<PathBuf>,
     last: Option<Stamp>,
+    last_themes: Option<Vec<ThemeStamp>>,
     next_check: Instant,
 }
 
 impl ConfigFileWatcher {
-    /// Start watching `path`, seeding the baseline from its current state.
+    /// Start watching one config path (no themes directory).
+    #[cfg(test)]
     pub(crate) fn new(path: PathBuf) -> Self {
-        let last = Self::stamp(&path);
+        Self::new_with_theme_dir(Some(path), None)
+    }
+
+    /// Start watching a config path and/or the local themes directory.
+    pub(crate) fn new_with_theme_dir(path: Option<PathBuf>, theme_dir: Option<PathBuf>) -> Self {
+        let last = path.as_deref().and_then(Self::stamp);
+        let last_themes = theme_dir.as_deref().and_then(Self::theme_stamp);
         Self {
             path,
+            theme_dir,
             last,
+            last_themes,
             next_check: Instant::now(),
         }
     }
@@ -505,19 +554,81 @@ impl ConfigFileWatcher {
         })
     }
 
-    /// True when the file changed since the previous check. Creating,
-    /// removing, or rewriting the file all count; the baseline seeded by
-    /// [`Self::new`] means an unchanged file reports `false` on the first
-    /// check. Checks are throttled to [`CONFIG_POLL_INTERVAL`]: a call before
-    /// the next check time reports `false` without touching the filesystem.
+    /// Bounded `.toml` candidate signature, sorted by file name.
+    fn theme_stamp(dir: &std::path::Path) -> Option<Vec<ThemeStamp>> {
+        // Never traverse a symlinked themes directory (the loader rejects it
+        // too); an empty signature still lets creation/replacement be seen.
+        let metadata = std::fs::symlink_metadata(dir).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Some(Vec::new());
+        }
+        let read_dir = std::fs::read_dir(dir).ok()?;
+        let mut rows = Vec::new();
+        let mut candidate_count = 0usize;
+        // Bound the directory walk itself, then count every `.toml`
+        // candidate so an add/remove across the 64-file cap still changes
+        // the signature even when only the first 64 rows are stat-ed.
+        for entry in read_dir
+            .flatten()
+            .take(bitty_config::MAX_LOCAL_THEME_DIR_ENTRIES)
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.to_ascii_lowercase().ends_with(".toml") {
+                continue;
+            }
+            candidate_count += 1;
+            if candidate_count > bitty_config::MAX_LOCAL_THEME_FILES {
+                continue;
+            }
+            // `symlink_metadata` never follows a link; the loader rejects
+            // symlinked candidates, so the watcher must not traverse them.
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                // An entry that disappears between `read_dir` and `metadata`
+                // is a change; keep a deterministic absent row.
+                rows.push(ThemeStamp {
+                    name,
+                    mtime: None,
+                    len: u64::MAX,
+                    target: None,
+                });
+                continue;
+            };
+            rows.push(ThemeStamp {
+                name,
+                mtime: meta.modified().ok(),
+                len: meta.len(),
+                target: std::fs::read_link(entry.path()).ok(),
+            });
+        }
+        if candidate_count > bitty_config::MAX_LOCAL_THEME_FILES {
+            rows.push(ThemeStamp {
+                name: String::from("\u{0}overflow"),
+                mtime: None,
+                len: candidate_count as u64,
+                target: None,
+            });
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(rows)
+    }
+
+    /// True when the config file or the local themes directory changed since
+    /// the previous check. Creating, removing, or rewriting either kind of
+    /// file all count; the baseline seeded by
+    /// [`Self::new_with_theme_dir`] means an unchanged state reports `false`
+    /// on the first check. Checks are throttled to [`CONFIG_POLL_INTERVAL`]: a
+    /// call before the next check time reports `false` without touching the
+    /// filesystem.
     pub(crate) fn poll_at(&mut self, at: Instant) -> bool {
         if at < self.next_check {
             return false;
         }
         self.next_check = at + CONFIG_POLL_INTERVAL;
-        let now = Self::stamp(&self.path);
-        let changed = now != self.last;
+        let now = self.path.as_deref().and_then(Self::stamp);
+        let themes_now = self.theme_dir.as_deref().and_then(Self::theme_stamp);
+        let changed = now != self.last || themes_now != self.last_themes;
         self.last = now;
+        self.last_themes = themes_now;
         changed
     }
 }
@@ -556,7 +667,15 @@ pub(crate) fn install(
         || String::from("(defaults; no file)"),
         |path| path.display().to_string(),
     );
-    let watcher = file_path.map(ConfigFileWatcher::new);
+    // CTX-2464: the local themes directory is watched even without a config
+    // file, because `--theme local:<name>` can select a file directly and a
+    // directory that does not exist yet becomes observable on creation.
+    let theme_dir = bitty_config::local_themes_dir();
+    let watcher = if file_path.is_some() || theme_dir.is_some() {
+        Some(ConfigFileWatcher::new_with_theme_dir(file_path, theme_dir))
+    } else {
+        None
+    };
     let resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>> =
         Box::new(move || crate::config_cli::load_app_config(&args).map(|app| app.effective));
     CONTEXT.with(|slot| {
@@ -585,11 +704,27 @@ pub(crate) fn install_with(
     resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
     watch: Option<PathBuf>,
 ) {
+    install_with_theme_dir(effective, resolve, watch, None);
+}
+
+/// Install a context with an injected resolver and an explicit themes
+/// directory (tests only).
+#[cfg(test)]
+pub(crate) fn install_with_theme_dir(
+    effective: EffectiveConfig,
+    resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
+    watch: Option<PathBuf>,
+    theme_dir: Option<PathBuf>,
+) {
     let path_label = watch.as_ref().map_or_else(
         || String::from("(defaults; no file)"),
         |path| path.display().to_string(),
     );
-    let watcher = watch.map(ConfigFileWatcher::new);
+    let watcher = if watch.is_some() || theme_dir.is_some() {
+        Some(ConfigFileWatcher::new_with_theme_dir(watch, theme_dir))
+    } else {
+        None
+    };
     CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ReloadContext {
             launched: effective.clone(),
@@ -644,9 +779,16 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
             return None;
         }
         let info = ctx.reload_into(runtime);
+        // A load/admin error is user-actionable: the rejected edit (including
+        // a rejected local theme) leaves the last good palette live, so the
+        // diagnostic must not be hidden behind the info gate.
+        if let Some(message) = &info.message {
+            let message = message.clone();
+            crate::logging::warn(move || format!("bitty: config/theme reload failed: {message}"));
+        }
         crate::logging::info(|| {
             format!(
-                "bitty: config file changed -> reload {} (applied={})",
+                "bitty: config/theme source changed -> reload {} (applied={})",
                 info.kind, info.applied
             )
         });
@@ -1033,6 +1175,9 @@ mod tests {
             cursor: [0xFF, 0x2E, 0x88],
             selection: [0x24, 0x30, 0x4A],
             ansi,
+            border_focused: None,
+            border_idle: None,
+            category: None,
         };
         custom.appearance.colors = Some(palette);
         apply_live(&mut runtime, &custom).expect("adopt colors");
@@ -1635,5 +1780,100 @@ mod tests {
         effective.appearance.theme = Some(String::from("light:github-light,dark:dracula"));
         let adoption = resolve_app_adoption(&effective).expect("adoption");
         assert_eq!(adoption.theme_name, "dracula");
+    }
+    fn write_local_theme(path: &std::path::Path, background: &str, marker: &str) {
+        let ansi = [
+            "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
+            "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#cdd6f4",
+        ]
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+        std::fs::write(
+            path,
+            format!(
+                "name = \"sunset\"\ncategory = \"dark\"\n\
+                 background = \"{background}\"\nforeground = \"#cdd6f4\"\n\
+                 cursor = \"#f5e0dc\"\nselection = \"#313244\"\nansi = [{ansi}]\n{marker}"
+            ),
+        )
+        .expect("write local theme");
+    }
+
+    #[test]
+    fn local_theme_file_edit_reloads_and_invalid_edit_keeps_last_good_palette() {
+        let dir = temp_dir("local-theme");
+        let theme_dir = dir.join("themes");
+        std::fs::create_dir_all(&theme_dir).expect("themes dir");
+        let path = theme_dir.join("sunset.toml");
+        write_local_theme(&path, "#1e1e2e", "");
+
+        let mut baseline = bitty_config::fallback_builtin();
+        baseline.appearance.theme = Some(String::from("local:sunset"));
+        bitty_config::local_theme::apply_selection_from_dir(&mut baseline, &theme_dir)
+            .expect("baseline local palette")
+            .expect("local selection");
+
+        let resolver_dir = theme_dir.clone();
+        let resolver = Box::new(move || {
+            let mut config = bitty_config::fallback_builtin();
+            config.appearance.theme = Some(String::from("local:sunset"));
+            bitty_config::local_theme::apply_selection_from_dir(&mut config, &resolver_dir)?;
+            Ok(config)
+        });
+        clear();
+        install_with_theme_dir(baseline.clone(), resolver, None, Some(theme_dir.clone()));
+        let mut runtime = deterministic_runtime(&baseline);
+        let start = Instant::now();
+        assert!(
+            poll_file_at(&mut runtime, start).is_none(),
+            "unchanged theme file -> no reload"
+        );
+
+        // A valid edit is reparsed and adopted through the existing theme
+        // palette setter on the next config tick.
+        write_local_theme(&path, "#101018", "\n# first edit\n");
+        let info = poll_file_at(&mut runtime, start + CONFIG_POLL_INTERVAL)
+            .expect("valid local edit observed");
+        assert_eq!(info.kind, "applied");
+        assert_eq!(runtime.config().theme.background, [0x10, 0x10, 0x18, 0xFF]);
+
+        // An invalid edit is rejected; the last good palette stays live and
+        // the reload reports a diagnostic instead of committing a partial
+        // palette.
+        std::fs::write(&path, "name = \"sunset\"\n").expect("break theme");
+        let info = poll_file_at(&mut runtime, start + CONFIG_POLL_INTERVAL * 2)
+            .expect("invalid local edit observed");
+        assert_eq!(info.kind, "load-error");
+        assert!(
+            info.message
+                .as_deref()
+                .is_some_and(|message| message.contains("missing required field")),
+            "{info:?}"
+        );
+        assert_eq!(
+            runtime.config().theme.background,
+            [0x10, 0x10, 0x18, 0xFF],
+            "last good palette retained"
+        );
+
+        // Removal is a directory change too: the selected file is now
+        // missing, so the reload fails closed and keeps the last good palette.
+        std::fs::remove_file(&path).expect("remove theme");
+        let info = poll_file_at(&mut runtime, start + CONFIG_POLL_INTERVAL * 3)
+            .expect("theme removal observed");
+        assert_eq!(info.kind, "load-error");
+        assert_eq!(runtime.config().theme.background, [0x10, 0x10, 0x18, 0xFF]);
+
+        // Re-creating the file with a valid palette is adopted on the next
+        // tick, proving a directory gain also triggers a reload.
+        write_local_theme(&path, "#0a0a12", "\n# recreated\n");
+        let info = poll_file_at(&mut runtime, start + CONFIG_POLL_INTERVAL * 4)
+            .expect("theme creation observed");
+        assert_eq!(info.kind, "applied");
+        assert_eq!(runtime.config().theme.background, [0x0A, 0x0A, 0x12, 0xFF]);
+        clear();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

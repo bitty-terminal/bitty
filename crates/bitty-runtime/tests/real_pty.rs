@@ -137,6 +137,7 @@ fn runtime_backpressure_holds_under_flood() {
 /// still reports "running" (Linux runs `exit_files` before `exit_notify`).
 /// The runtime must expose that state so the embedder can keep a bounded
 /// reap wake armed instead of parking in `ControlFlow::Wait` forever.
+#[cfg(target_os = "linux")]
 #[test]
 fn reader_eof_latches_unreaped_child_until_exit_is_observed() {
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");

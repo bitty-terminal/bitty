@@ -10331,7 +10331,7 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
 /// Issue #2443 fixture: a shell that closes every tty fd (forcing reader EOF)
 /// and then blocks on `marker` before exiting. The EOF wake therefore lands
 /// while the child is provably not reapable yet.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn delayed_exit_after_eof(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10350,7 +10350,7 @@ fn delayed_exit_after_eof(name: &str) -> (std::path::PathBuf, std::path::PathBuf
 
 /// Bounded pump until a session's reader reports EOF while its child is
 /// still unreaped (the #2443 race window).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn wait_for_unreaped_eof_session(app: &mut TerminalApp, deadline: std::time::Instant) {
     while std::time::Instant::now() < deadline {
         let _ = app.poll_pty_pump();
@@ -10368,7 +10368,7 @@ fn wait_for_unreaped_eof_session(app: &mut TerminalApp, deadline: std::time::Ins
 /// app's own next wake. A missing deadline means the real event loop would
 /// park in `ControlFlow::Wait` with a dead shell on screen — the #2443 hang
 /// signature — so it fails the test instead of silently polling.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drive_post_eof_reap_wakes(
     app: &mut TerminalApp,
     deadline: std::time::Instant,
@@ -10397,7 +10397,7 @@ fn drive_post_eof_reap_wakes(
 /// Issue #2443: `exit` in the last panel must terminate promptly even when
 /// the PTY hits EOF before the child is reapable.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
     require_pty!();
     let maps =
@@ -10473,7 +10473,7 @@ fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
 /// Issue #2443: the same late-exit race in a non-last pane must close only
 /// that pane, keep its sibling, and clear the reap schedule.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
     require_pty!();
     let mut app = editor_test_app();

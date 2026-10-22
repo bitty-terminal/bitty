@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "bba86e57b0526e6744179992d781b2705f2e0e4a";
+pub const SOURCE_REVISION: &str = "ce90559ebbc7fe144de935415fd905db4e0bf495";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -33,8 +33,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-featured.devtools",
         name: "Bitty DevTools",
         repository: "https://github.com/bitty-terminal/devtools.git",
-        pin: "cd91add838268fad332978cc51421eb258d930eb",
-        manifest_hash: "sha256:d21742394bc7b52dd53bb5305a3f5e626f7371e8ea5dc1215b42e7d067682fc0",
+        pin: "3f5369ec6cda352090b912d8a3fbfda860308376",
+        manifest_hash: "sha256:babf1de7ea38088d0b229514fac7053b7dc8b63306ab2a7f99d83407f1f5e9af",
         compat_bitty: Some(">=0.0.21,<1.0"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only inspection and event tracing of the Bitty plugin runtime.",
@@ -44,7 +44,7 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.bar",
         name: "Unified Bar",
         repository: "https://github.com/bitty-terminal/bar.git",
-        pin: "ed11fb344407e188a31f353d81de81d790453cee",
+        pin: "5dfc2e20607a4d7efdcf1be89195b3edc22b7ca0",
         manifest_hash: "sha256:fb91eecff14294563b815c5e195c2d76d85b042aeb572914fdf8f0333ff1d77c",
         compat_bitty: Some(">=0.0.24,<0.1"),
         compat_plugin_api: Some("^1.0"),
@@ -66,7 +66,7 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.copy-mode",
         name: "Copy mode",
         repository: "https://github.com/bitty-terminal/copy-mode.git",
-        pin: "869d6aa91cfefe645a715988b60d1e1e2c61aea1",
+        pin: "2d28ac709f38ed7977c1e7aba6c9bfc8f14afdc0",
         manifest_hash: "sha256:d1b4bfc522b827e2312188c1dffbc1334a1907b90af29b578eb42ab8f77e7c64",
         compat_bitty: Some(">=0.0.24,<0.1"),
         compat_plugin_api: Some("^1.0"),
@@ -88,22 +88,22 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.file-manager",
         name: "File Manager",
         repository: "https://github.com/bitty-terminal/file-manager.git",
-        pin: "e21e8bb7c778dc08191305f463b258ae824e8ccc",
-        manifest_hash: "sha256:ad29971a060a145e15c0799be806274cb58b5b1cf2f27809052254fdfdcb629f",
+        pin: "92630b4400d395df1e79ba2b37cd820f49376691",
+        manifest_hash: "sha256:561801482d1d48cceab736d88936c5584cc57ae26ea8efc7809fbaa7581d459a",
         compat_bitty: Some(">=0.0.24,<0.1"),
         compat_plugin_api: Some("^1.0"),
-        description: "Bounded read-only directory listing, navigation, and preview over the observed cwd.",
+        description: "Bounded read-only directory listing, navigation, and preview for a caller-chosen root.",
         license: Some("MIT"),
     },
     OfficialPlugin {
         id: "bitty-terminal.git-panel",
         name: "Git Panel",
         repository: "https://github.com/bitty-terminal/git-panel.git",
-        pin: "baf716252fadc6b14374866e9e689ac1b23deee3",
-        manifest_hash: "sha256:3c54e6e9f21c2b2882eee7784fda2734ef61af6242c064940403713d0d248f8c",
+        pin: "54fc557fd5b24e70a426ff056f14457f57ffacf4",
+        manifest_hash: "sha256:0ecd711c566742305ff6b6d24bb28838270c6bda307f2f741fb525f76c1b78e7",
         compat_bitty: Some(">=0.0.24,<0.1"),
         compat_plugin_api: Some("^1.0"),
-        description: "Tiled Panel git branch/status/diff/log via process.spawn:git allowlisted [tools.git] bounded 8KiB/32/64 PR-1..12.",
+        description: "Read-only branch, status, diff, and log panel for the Git repository behind the focused pane.",
         license: Some("MIT"),
     },
     OfficialPlugin {
@@ -132,22 +132,11 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.search",
         name: "Search",
         repository: "https://github.com/bitty-terminal/search.git",
-        pin: "3ecc51f79682e96457f619d89fb5456a686ba387",
+        pin: "f3016ef2431ba08f042745501c198070ae52f2d2",
         manifest_hash: "sha256:0e9203fcd2371db170199173515d07ee7a3aa22f1c805d4d2f213abb73e25a09",
         compat_bitty: Some(">=0.0.24,<0.1"),
         compat_plugin_api: Some("^1.0"),
         description: "Scrollback search policy over the public history snapshot API: bounded scoped transcript queries with typed denials, untrusted labels, result navigation, and grant-gated export.",
-        license: Some("MIT"),
-    },
-    OfficialPlugin {
-        id: "bitty-terminal.statusline",
-        name: "Statusline",
-        repository: "https://github.com/bitty-terminal/statusline.git",
-        pin: "2b9973c7569398437ba632b41cce1fa37577563c",
-        manifest_hash: "sha256:affe52a608efd42d1694be5c76a83e5c73070196a7a2cdca5405cdc6c36b7598",
-        compat_bitty: Some(">=0.1,<1.0"),
-        compat_plugin_api: Some("^1.0"),
-        description: "Cwd, mode, Git, and task presentation composed from declarative statusline fragments.",
         license: Some("MIT"),
     },
 ];

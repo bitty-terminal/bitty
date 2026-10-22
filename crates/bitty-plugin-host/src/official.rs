@@ -168,9 +168,9 @@ mod tests {
     }
 
     #[test]
-    fn statusline_is_listed_with_its_host_floor() {
-        let statusline = official_plugin_for("bitty-terminal.statusline")
-            .expect("statusline is listed even on hosts it excludes");
-        assert_eq!(statusline.compat_bitty, Some(">=0.1,<1.0"));
+    fn dashboard_is_listed_with_its_host_floor() {
+        let dashboard = official_plugin_for("bitty-terminal.dashboard")
+            .expect("dashboard is part of the official catalog");
+        assert_eq!(dashboard.compat_bitty, Some(">=0.0.26,<0.1"));
     }
 }

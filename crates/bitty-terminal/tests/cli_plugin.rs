@@ -1718,11 +1718,8 @@ fn plugin_install_resolves_every_installable_official_id_through_pinned_transpor
     // The fixture path is deliberately absent: the fake transport records the
     // repository/pin it was asked for, then fails the checkout. That proves
     // per-id resolution reaches the transport with the catalog's exact pin
-    // without needing a full manifest fixture for all twelve entries.
+    // without needing a full manifest fixture for all eleven entries.
     for entry in official_plugins() {
-        if entry.id == "bitty-terminal.statusline" {
-            continue; // listed but incompatible on this host; covered separately
-        }
         let home = scratch_dir("official-resolve");
         let missing = home.join("missing-fixture");
         let transport = FakeGitTransport::new(&home, &missing);
@@ -1786,38 +1783,8 @@ fn plugin_install_unknown_id_lists_bundled_and_official_ids_without_transport() 
     );
     assert!(text.contains("bitty-featured.activity"), "{text}");
     assert!(text.contains("bitty-terminal.bar"), "{text}");
-    assert!(
-        text.contains("listed but incompatible with this host"),
-        "{text}"
-    );
-    assert!(text.contains("bitty-terminal.statusline"), "{text}");
+    assert!(text.contains("bitty-terminal.dashboard"), "{text}");
     assert_eq!(transport.calls(), "", "resolution must not fetch");
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[cfg(unix)]
-#[test]
-fn plugin_install_statusline_is_listed_but_refused_with_exact_range() {
-    let home = scratch_dir("official-statusline");
-    let transport = FakeGitTransport::new(&home, &official_fixture());
-
-    let output = run_in(&home, &["plugin", "list"], None);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("bitty-terminal.statusline"), "{text}");
-    assert!(text.contains("incompatible"), "{text}");
-
-    let output = run_in_with_env(
-        &home,
-        &["plugin", "install", "bitty-terminal.statusline", "--yes"],
-        None,
-        transport.envs(),
-    );
-    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
-    let text = stderr(&output);
-    assert!(text.contains("compat.bitty = '>=0.1,<1.0'"), "{text}");
-    assert!(text.contains("does not include host version"), "{text}");
-    assert_eq!(transport.calls(), "", "incompatible ids must not fetch");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -1843,7 +1810,7 @@ fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
     let calls = transport.calls();
     assert!(calls.contains("fetch"), "{calls}");
     assert!(
-        calls.contains("ed11fb344407e188a31f353d81de81d790453cee"),
+        calls.contains("5dfc2e20607a4d7efdcf1be89195b3edc22b7ca0"),
         "{calls}"
     );
     assert!(

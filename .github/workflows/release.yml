@@ -1759,10 +1759,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v') && vars.APT_PUBLISH != 'false'
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1783,19 +1779,17 @@ jobs:
           npm install -g "wrangler@${WRANGLER_VERSION}"
           wrangler --version
       - name: Generate and sign APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
             echo "::error::APT publishing is enabled but APT_GPG_PRIVATE_KEY is not set" >&2
             exit 1
           fi
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::Cloudflare credentials not set; cannot upload to R2" >&2
-            exit 1
-          fi
 
           echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
-          GPG_KEY="maintainers@bitty-terminal.dev"
+          GPG_KEY="BCB87D7B489A64168080D900DF4751B6EA711CB8"
 
           mkdir -p stage/dist apt_repo
           find dist/x86_64 dist/aarch64 -name '*.deb' -exec cp -t stage/dist {} +
@@ -1812,17 +1806,30 @@ jobs:
             --assets-dir packaging/apt \
             --gpg-key "$GPG_KEY"
 
-          gpg --verify apt_repo/dists/stable/InRelease
-          gpg --verify apt_repo/dists/stable/Release.gpg apt_repo/dists/stable/Release
+          KEYRING="$PWD/packaging/apt/bitty-archive-keyring.gpg"
+          gpgv --keyring "$KEYRING" apt_repo/dists/stable/InRelease
+          gpgv --keyring "$KEYRING" apt_repo/dists/stable/Release.gpg apt_repo/dists/stable/Release
 
       - name: Upload APT repository to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Cloudflare credentials not set; cannot upload to R2" >&2
+            exit 1
+          fi
+
           cd apt_repo
-          find . -type f | while read -r FILE; do
+          {
+            find . -type f -not -path './dists/*'
+            find . -type f -path './dists/*' ! -name Release ! -name Release.gpg ! -name InRelease
+            find . -type f -path './dists/*' \( -name Release -o -name Release.gpg -o -name InRelease \)
+          } | while IFS= read -r FILE; do
             REL_PATH="${FILE#./}"
             KEY="bitty/apt/${REL_PATH}"
-            if [[ "$REL_PATH" == pool/* ]] || [[ "$REL_PATH" == *.deb ]] || [[ "$REL_PATH" == *.gpg ]]; then
+            if [[ "$REL_PATH" == pool/* ]]; then
               CACHE="public, max-age=31536000, immutable"
             else
               CACHE="public, max-age=300, must-revalidate"
@@ -1832,6 +1839,9 @@ jobs:
           done
 
       - name: Verify APT repository read-back
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           wrangler r2 object get "bitty/apt/dists/stable/Release" --remote --pipe | cmp - apt_repo/dists/stable/Release

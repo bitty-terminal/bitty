@@ -172,11 +172,23 @@ expect_contains "$RELEASE" "Components: main" "Release lists Components"
 PKG_SHA256="$(sha256sum "$PACKAGES" | cut -d' ' -f1)"
 expect_contains "$RELEASE" "$PKG_SHA256" "Release lists correct SHA256 for Packages"
 
+# Fail-closed check: generator must fail on corrupted .deb
+CORRUPT_DIR="$TMP/corrupt_dist"
+mkdir -p "$CORRUPT_DIR"
+echo "corrupt deb data" >"$CORRUPT_DIR/bitty-corrupt.deb"
+if "$GEN_SH" --dist-dir "$CORRUPT_DIR" --repo-dir "$TMP/corrupt_repo" >/dev/null 2>&1; then
+  fail "generate-apt-repo.sh accepted corrupted deb"
+else
+  pass "generate-apt-repo.sh fails closed on corrupted deb"
+fi
+
 # --- 3. Workflow assertions -------------------------------------------------
 expect_contains "$WORKFLOW" "apt:" "release.yml defines apt job"
 expect_contains "$WORKFLOW" "environment: release" "release.yml apt job runs in release environment"
 expect_contains "$WORKFLOW" "APT_GPG_PRIVATE_KEY" "release.yml binds APT_GPG_PRIVATE_KEY secret"
 expect_contains "$WORKFLOW" "bitty/apt/" "release.yml uploads to R2 bitty/apt/ prefix"
+expect_contains "$WORKFLOW" "gpgv --keyring" "release.yml verifies signatures with gpgv against committed keyring"
+expect_contains "$WORKFLOW" '"$REL_PATH" == pool/*' "release.yml scopes immutable cache to pool/* only"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "check-apt-repo.test: FAIL" >&2

@@ -20,7 +20,6 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tarfile
 
 
@@ -137,7 +136,9 @@ def determine_deb_arch(fields: dict[str, str], filename: str) -> str:
         return "amd64"
     if "aarch64" in filename or "arm64" in filename:
         return "arm64"
-    return "amd64"
+    raise ValueError(
+        f"Unrecognized Debian architecture for package '{filename}' (Architecture: '{arch}')"
+    )
 
 
 def format_package_stanza(
@@ -230,11 +231,9 @@ def generate_repo(
         try:
             control_text = extract_control_file(deb_file)
         except (ValueError, OSError, tarfile.TarError) as exc:
-            print(
-                f"Warning: Failed to extract control from {deb_file}: {exc}",
-                file=sys.stderr,
-            )
-            continue
+            raise ValueError(
+                f"Failed to extract control from package '{deb_file}': {exc}"
+            ) from exc
 
         fields = parse_control_fields(control_text)
         pkg_name = fields.get("Package", "bitty")

@@ -9,9 +9,9 @@ https://cdn.bitty.run/apt/
 ```
 
 - **Supported Architectures**: `amd64` (x86_64) and `arm64` (AArch64)
-- **Supported Releases**: Debian 11 (Bullseye), Debian 12 (Bookworm), Debian 13 (Trixie),
-  Ubuntu 20.04 (Focal), Ubuntu 22.04 (Jammy), Ubuntu 24.04 (Noble), Ubuntu 24.10 (Oracular),
-  and all derivatives.
+- **Supported Releases**: Ubuntu 24.04 (Noble, verified via release `verify-install` leg).
+  Other Debian and Ubuntu derivatives (Debian 12, Ubuntu 22.04, Linux Mint, Kali,
+  Pop!_OS) remain best-effort depending on glibc runtime compatibility.
 
 ## User Installation
 

@@ -10,11 +10,24 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
+
+/// Activation wall budget for this harness.
+///
+/// These fixtures activate in a few milliseconds, but RC-1 (50 ms) is
+/// calibrated for release builds: a sharded CI runner has been measured
+/// suspending a fixture `init.lua` at 79 ms
+/// (`WallClockExceeded { elapsed_ms: 79, budget_ms: 50 }`, bitty#2427). Timer
+/// semantics, not runner speed, are under test here, so only the wall
+/// dimension is widened (the bitty#1744/#1727 treatment). Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS`; activation-budget enforcement stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs`, `load_gate.rs`, and
+/// `bar_activation_budget.rs`.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 #[derive(Default)]
 struct MapSettings(std::collections::BTreeMap<String, LuaValue>);
@@ -52,7 +65,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
         store_root: None,
@@ -63,7 +76,10 @@ fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
             ("version", LuaValue::Integer(1)),
             ("terminal_id", LuaValue::Integer(1)),
         ]))),
-    })
+    });
+    // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    rt
 }
 
 fn write_plugin(root: &Path, id: &str, init_src: &str) {

@@ -1099,6 +1099,11 @@ impl PluginRuntime {
     /// memory stay at RC defaults. Load-sensitive integration tests use this
     /// to absorb scheduler stalls under sharded CI load (bitty#1744 mirrors
     /// the bitty#1727 driver treatment); production never calls this.
+    ///
+    /// The budget is one dimension, not two: each VM's per-call host deadline
+    /// is the same slice (see the activation install below), so a single host
+    /// call cannot be held to the production 50 ms while the callback that
+    /// issued it runs on a widened slice (bitty#2432).
     pub fn set_vm_wall_budget_ms(&mut self, wall_budget_ms: Option<u64>) {
         self.vm_wall_budget_ms = wall_budget_ms;
     }
@@ -2764,14 +2769,20 @@ impl PluginRuntime {
             plugin_services.set_ui_epoch(entry.generation);
         }
         let services: Rc<dyn HostServices> = plugin_services.clone();
-        // Production uses `DEFAULT_HOST_DEADLINE_MS`; harnesses may widen this
-        // one dimension via `set_host_call_deadline_ms` (bitty#2432).
-        let host_call_deadline_ms = self.host_call_deadline_ms();
-        if let Err(error) = vm.install_host_module(
-            services,
-            MarshallingLimits::default(),
-            host_call_deadline_ms,
-        ) {
+        // One budget dimension: the per-call host deadline follows this VM's
+        // RC-1 wall slice (bitty#2432), which is `DEFAULT_HOST_DEADLINE_MS` in
+        // production. An explicit harness override wins when set; otherwise a
+        // widened `set_vm_wall_budget_ms` slice carries the host deadline with
+        // it, so a scheduler stall during activation cannot trip the narrower
+        // 50 ms deadline before the wider wall applies (bitty#2432,
+        // plugin_audio). Instruction and memory budgets are untouched and stay
+        // at RC defaults.
+        let host_deadline_ms = self
+            .host_call_deadline_ms
+            .unwrap_or_else(|| vm.wall_budget_ms());
+        if let Err(error) =
+            vm.install_host_module(services, MarshallingLimits::default(), host_deadline_ms)
+        {
             let error = PluginRuntimeError::Vm(error.to_string());
             self.rollback(id, error.to_string());
             return Err(error);

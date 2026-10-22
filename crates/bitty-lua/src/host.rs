@@ -199,6 +199,13 @@ pub enum WorkspaceRequest {
 }
 
 /// Default host-call deadline in milliseconds (reuses `RC-1`).
+///
+/// A VM runs on one wall slice: callers that install the host module on a
+/// non-default slice pass that slice here instead. The plugin runtime uses
+/// [`LuaVm::wall_budget_ms`](crate::LuaVm::wall_budget_ms), so production is
+/// exactly this constant and a widened harness slice carries the host-call
+/// deadline with it rather than leaving a second, narrower 50 ms wall in
+/// place (bitty#2432).
 pub const DEFAULT_HOST_DEADLINE_MS: u64 = crate::RC1_WALL_CLOCK_BUDGET_MS;
 
 /// Default `process.spawn` bridge deadline in milliseconds (`5 s`).

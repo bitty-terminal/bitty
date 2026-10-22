@@ -3221,6 +3221,27 @@ impl TerminalApp {
         }
     }
 
+    /// Real panel count for workspace `index`, with the app-side zoom backup
+    /// substituted for a stashed zoom proxy (issue #2525 review).
+    ///
+    /// While a workspace is zoomed its layout is a single-leaf proxy and the
+    /// real tree lives in `ChromeState::zoom` keyed by workspace sequence.
+    /// An inactive zoomed workspace therefore reports one panel from
+    /// [`Runtime::workspace_panel_counts`] even when a hidden live pane
+    /// exists in the backup. Prune decisions must read the backup, or a
+    /// screen switch followed by the zoomed pane's shell exit would close a
+    /// workspace that still owns a live pane. Floats are stored per slot and
+    /// are unaffected by zoom, so they are added unchanged.
+    pub(crate) fn workspace_real_panel_count(&self, index: usize) -> Option<usize> {
+        let (stashed_tiled, floats) = self.runtime.workspace_panel_counts(index)?;
+        let tiled = self
+            .runtime
+            .workspace_seq_at(index)
+            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .map_or(stashed_tiled, |ids| ids.len());
+        Some(tiled + floats)
+    }
+
     /// Checks for exited shell processes across both split pane sessions and
     /// the primary session, reaping exited children and closing their panels.
     ///
@@ -3322,7 +3343,7 @@ impl TerminalApp {
                 // (CTX-1336), so both keep the existing leaf handling.
                 self.restore_zoom();
                 if let Some(workspace) = self.runtime.workspace_index_of_view(&view) {
-                    let sole_panel = self.runtime.workspace_panel_count(workspace) == Some(1);
+                    let sole_panel = self.workspace_real_panel_count(workspace) == Some(1);
                     if sole_panel
                         && self.runtime.workspace_count() > 1
                         && self.runtime.floated_count() == 0
@@ -3449,7 +3470,7 @@ impl TerminalApp {
                     .runtime
                     .workspace_index_of_view(&primary_view)
                     .filter(|workspace| {
-                        self.runtime.workspace_panel_count(*workspace) == Some(1)
+                        self.workspace_real_panel_count(*workspace) == Some(1)
                             && self.runtime.workspace_count() > 1
                             && self.runtime.floated_count() == 0
                             && self.runtime.pinned_count() == 0

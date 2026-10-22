@@ -985,7 +985,9 @@ pub fn component_help_text() -> String {
      \x20                             catalog with no entry for this name/target\n\
      \x20                             fails closed; an unavailable catalog fails a\n\
      \x20                             latest install with a --version hint (a\n\
-     \x20                             pinned install falls back to SHA256SUMS-only).\n\
+     \x20                             pinned install falls back to SHA256SUMS-only,\n\
+     \x20                             or reuses an already-installed locally\n\
+     \x20                             verified version with no download).\n\
      \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
      \x20                             user version when none is named. Removing\n\
      \x20                             the active version also drops `current`.\n\

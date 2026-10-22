@@ -75,6 +75,10 @@ const STALL_REPORT_PREFIX: &str = "bitty: main-loop stall detected";
 /// Maximum reports for one continuous stall (bounded log growth).
 const MAX_REPORTS_PER_STALL: u32 = 5;
 /// Maximum thread rows included in one report.
+///
+/// Linux-only: the sampler reads `/proc/self/task`; other targets render an
+/// empty thread list, so the row cap has no use there.
+#[cfg(target_os = "linux")]
 const MAX_THREAD_ROWS: usize = 64;
 /// Maximum bytes in one report (hard cap after rendering).
 const MAX_REPORT_BYTES: usize = 8 * 1024;

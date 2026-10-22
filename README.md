@@ -83,6 +83,23 @@ documentation live in
 See [`CHANGELOG.md`](CHANGELOG.md) for release history and
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidance.
 
+## Inspiration
+
+Bitty is shaped by the tools its authors use every day:
+
+- [Neovim](https://neovim.io/) for a keyboard-first workspace, Lua
+  configuration, and an extension model that keeps the core small.
+- [Hyprland](https://hyprland.org/) for tiling window management, workspaces,
+  and the idea that a terminal workspace can be visually deliberate.
+- [Kitty](https://sw.kovidgoyal.net/kitty/),
+  [WezTerm](https://wezfurlong.org/wezterm/),
+  [Alacritty](https://alacritty.org/), and
+  [Foot](https://codeberg.org/dnkl/foot) for GPU rendering, terminal protocol
+  coverage, performance discipline, and configuration ergonomics.
+
+Bitty does not share code with these projects; the inspiration is in the
+product ideas and the standards they helped define.
+
 ## Development
 
 Prerequisites and the pinned development tools are documented in

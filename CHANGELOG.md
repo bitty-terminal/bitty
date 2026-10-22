@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cold path; payload paths are display strings only.
 - **Waybar-style band groups, hover, and button routing (#2411):** a band
   scene's root `Row` resolves per-group `anchor = "left" | "center" |
-  "right"` against the presented width, so `modules_left`/`modules_center`/
+"right"` against the presented width, so `modules_left`/`modules_center`/
   `modules_right` get true centering and a flush right edge at any width.
   Over-subscribed rows clip deterministically (left, then right, then center)
   without overlapping runs or losing hit targets. `on_hover` bindings
@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   icon maps remain plugin data with no new protocol.
 
 ### Fixed
+
+- **PTY input writes can no longer freeze the event loop (#2446):** the
+  production writer for every session now copies input into a bounded
+  64 KiB FIFO drained by one named writer thread, so a child that stops
+  reading its stdin (a previewing `yazi`, a stopped job, a shell blocked on
+  its own output) cannot park the terminal thread in `write(2)`. Overflow
+  fails closed with `WouldBlock` and is reported through the existing
+  input/reply loss counters. Query replies, focus reports, and keyboard input
+  share the same ordered queue; the synchronous writer remains available for
+  tests that assert immediate child-side effects.
 
 - **Closing to an empty tiled base no longer reports a corrupt session
   (#2415, #2421):** when the last close leaves no tiled pane and no pinned
@@ -107,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Shell integration for all five supported shells (#2386):** `bitty
-  shell-init <shell>` now emits the init script and nested Tab completion
+shell-init <shell>` now emits the init script and nested Tab completion
   inline for bash, zsh, fish, PowerShell, and Nushell, generated from the
   parser-owned grammar tables (`config`/`profile`, `ctl` resources,
   `plugin`/`config` actions, `extension`, `dev trace`/`dump`/`overlay`,
@@ -140,7 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UI composition surface, and candidate scene style primitives plus a
   bounded component catalog provide reusable, capped building blocks. These
   are candidate surfaces with no production consumer yet.
- ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
+  ([CTX-2396] feat(plugin): add read-only runtime.inspect snapshot)
 
 ### Changed
 

@@ -189,3 +189,78 @@ fn reader_eof_latches_unreaped_child_until_exit_is_observed() {
         "a reaped session must clear the EOF latch"
     );
 }
+
+/// bitty#2446: writing input must never park the terminal event loop.
+///
+/// The owner-visible freeze shape is a TUI whose preview stops draining
+/// stdin for a while; the next key/reply write then blocked the main thread
+/// in `write(2)` until the child resumed, freezing every panel. This spawns
+/// a child that switches its tty to raw mode and then ignores stdin, fills
+/// more than one kernel input queue in 4 KiB writes, and bounds the total
+/// call time. The watchdog kills only the child this test spawned so a
+/// regression fails the bound instead of hanging the suite.
+#[test]
+fn runtime_input_write_never_blocks_on_a_nonreading_child_issue_2446() {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.spawn_shell_with_args(
+        "/bin/sh",
+        &[
+            "-c",
+            "stty raw -echo || exit 1; printf __RAW_READY__; exec sleep 60",
+        ],
+    )
+    .expect("spawn raw-mode sleeper");
+
+    // Wait for the child to confirm raw mode before the burst: canonical
+    // mode discards overflow instead of applying backpressure, which would
+    // make this test pass vacuously. Bounded by the suite TIMEOUT.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut raw_ready = false;
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty_timeout(Duration::from_millis(200));
+        let text: String = rt.snapshot().cells.iter().map(|c| c.glyph).collect();
+        if text.contains("__RAW_READY__") {
+            raw_ready = true;
+            break;
+        }
+    }
+    assert!(raw_ready, "raw-mode sleeper never reported readiness");
+    assert!(
+        rt.primary_exit_status().is_none(),
+        "raw-mode sleeper exited before the write burst"
+    );
+
+    let child = rt.pty_pid().expect("live child pid");
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            // Bounded cleanup for the red path: kill only our own child.
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(child.to_string())
+                .status();
+        }
+    });
+
+    let start = Instant::now();
+    for _ in 0..32 {
+        rt.write_input(&vec![b'x'; 4096]);
+    }
+    let elapsed = start.elapsed();
+    let _ = done_tx.send(());
+    watchdog.join().expect("watchdog thread");
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "blocking PTY write froze the event loop for {elapsed:?}"
+    );
+    // The runtime remains usable after the overflow: the excess was
+    // accounted as dropped input, never parked in the event loop.
+    assert!(
+        rt.input_write_dropped_bytes() > 0,
+        "queue overflow must be reported through the existing loss counters"
+    );
+}

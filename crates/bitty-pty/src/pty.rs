@@ -212,9 +212,27 @@ impl Pty {
     ///
     /// Dropping the returned [`PtyWriter`] signals end-of-transmission to the
     /// child (see its type docs). May be called only once per PTY.
+    ///
+    /// This keeps the historical synchronous sink: each `write` reaches the
+    /// child before it returns. Embedders that own an event loop must use
+    /// [`Self::take_writer_async`] instead.
     pub fn take_writer(&mut self) -> Result<PtyWriter, PtyError> {
         let inner = self.session.take_writer()?;
         Ok(PtyWriter::new(inner))
+    }
+
+    /// Takes exclusive ownership of the input side with a bounded queue.
+    ///
+    /// Writes are copied into the bounded queue
+    /// (`QUEUED_WRITE_MAX_BYTES`) and drained by one named
+    /// writer thread, so the caller never blocks in
+    /// `write(2)` when the child stops reading its stdin (bitty#2446). This
+    /// is the production path for the terminal event loop; overflow fails
+    /// closed with [`std::io::ErrorKind::WouldBlock`]. May be called only
+    /// once per PTY.
+    pub fn take_writer_async(&mut self) -> Result<PtyWriter, PtyError> {
+        let inner = self.session.take_writer()?;
+        Ok(PtyWriter::new_queued(inner))
     }
 
     /// Terminates the child immediately (SIGKILL on Unix,

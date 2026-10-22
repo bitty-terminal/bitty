@@ -1766,7 +1766,10 @@ impl Runtime {
     /// parsing and state apply) never blocks; this method is the only
     /// producer into the PTY master for replies and is best-effort, never
     /// panics, never interpolates through a shell, and never grows without
-    /// bound. No shell interpolation, no unbounded buffering.
+    /// bound. The production writer is the bounded queued sink (bitty#2446),
+    /// so this call copies into the FIFO and returns; queue overflow fails
+    /// closed and is counted, never parked in `write(2)`. No shell
+    /// interpolation, no unbounded buffering.
     ///
     /// When no live `PtyWriter` is owned (headless CI), the replies remain
     /// queued for `take_replies` observation and no I/O is performed (0

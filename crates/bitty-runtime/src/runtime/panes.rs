@@ -168,7 +168,7 @@ impl Runtime {
         }
         let mut pty = builder.spawn().map_err(RuntimeError::from)?;
         let reader = pty.take_reader().map_err(RuntimeError::from)?;
-        let writer = pty.take_writer().map_err(RuntimeError::from)?;
+        let writer = pty.take_writer_async().map_err(RuntimeError::from)?;
         // Replace any previously spawned child (drop kills old). A prior
         // wakeup forwarder (if any) is joined with a bound (CTX-0472):
         // drop its receiver so `send` fails fast, drop the old `Pty`
@@ -539,7 +539,7 @@ impl Runtime {
         }
         let mut pty = builder.spawn().map_err(RuntimeError::from)?;
         let reader = pty.take_reader().map_err(RuntimeError::from)?;
-        let writer = pty.take_writer().map_err(RuntimeError::from)?;
+        let writer = pty.take_writer_async().map_err(RuntimeError::from)?;
         // All fallible steps done: publish the session. A replaced session's
         // old `Pty` drops here, killing + reaping its child (no zombie).
         // Its forwarder is joined with a bound (CTX-0472) instead of
@@ -1057,7 +1057,9 @@ impl Runtime {
     /// empty. Returns bytes written. [`poll_pty`](Self::poll_pty)
     /// already calls this per drained pane; embedders also call it after
     /// `tick` (like the primary post-tick flush) so replies queued outside
-    /// the pump still reach the pane's shell promptly.
+    /// the pump still reach the pane's shell promptly. The pane writer is
+    /// the bounded queued sink (bitty#2446), so this call never blocks in
+    /// `write(2)`; overflow is counted and dropped.
     /// Drains one pane's queued terminal replies without performing I/O.
     ///
     /// Headless counterpart to [`Self::write_pane_replies`] (same bounded

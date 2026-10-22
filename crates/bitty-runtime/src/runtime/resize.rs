@@ -723,7 +723,7 @@ impl Runtime {
                     // `last_cursor`, whose selection-path meaning is kept).
                     // A painted thumb needs one repaint to clear.
                     // CTX-0260: leaving also ends an Alt+drag move.
-                    self.scrollbar_cursor_left = true;
+                    self.cursor_left_window = true;
                     self.scrollbar_release();
                     self.end_alt_drag();
                     // CTX-1150: leaving the window also ends a float

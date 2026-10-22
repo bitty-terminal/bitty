@@ -49,6 +49,21 @@ fn frame_of(rt: &Runtime, view: ViewId) -> PresentFrame {
         .unwrap_or_else(|| panic!("{view:?} must be presented"))
 }
 
+/// Physical cursor position at a vertical cell edge, row centre.
+///
+/// Issue #2480: pointer drags are caret-to-caret horizontally, so tests that
+/// mean "select this exact cell range" press on the leading edge and release
+/// on the trailing edge instead of relying on inclusive cell rounding.
+fn cell_edge(rt: &Runtime, view: ViewId, row: u16, col_edge: u16) -> CursorPosition {
+    let frame = frame_of(rt, view);
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.content.x) + f64::from(col_edge) * f64::from(cw),
+        y: pad + f64::from(frame.content.y) + f64::from(row) * f64::from(ch) + f64::from(ch) / 2.0,
+    }
+}
+
 /// Physical cursor position at the centre of frame-local cell `(row, col)`.
 fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition {
     let frame = frame_of(rt, view);
@@ -90,9 +105,10 @@ fn scrolled_viewport_drag_selects_visible_text() {
     let id = view_id(&rt);
     let visible = visible_rows(&rt);
     assert!(!visible.is_empty(), "viewport must show history");
-    // Drag the first five columns of the top visible row.
-    let start = cell_center(&rt, id, 0, 0);
-    let end = cell_center(&rt, id, 0, 4);
+    // Drag the first five columns of the top visible row: leading edge of
+    // column 0 through the trailing edge of column 4.
+    let start = cell_edge(&rt, id, 0, 0);
+    let end = cell_edge(&rt, id, 0, 5);
     rt.handle_cursor_moved(start);
     press(&mut rt);
     rt.handle_cursor_moved(end);
@@ -147,15 +163,13 @@ fn scrolled_viewport_drag_selects_visible_text() {
 fn scroll_while_selecting_tracks_anchor() {
     let mut rt = make_runtime();
     feed_lines(&mut rt, 60);
-    let id = view_id(&rt);
     assert_eq!(scroll_offset(&rt), 0, "must start live");
 
-    // Press at frame-local (5, 2) and hold (no release): anchor == focus.
-    // (Live-grid rows include the cursor-follow window offset, so record the
-    // actual press cell instead of assuming frame-local == grid.)
-    let at = cell_center(&rt, id, 5, 2);
-    rt.handle_cursor_moved(at);
-    press(&mut rt);
+    // Press and hold (no release): anchor == focus. This test owns the
+    // scroll-tracking mechanism, so it drives the cell-level selection API
+    // directly; the pointer caret mapping has its own suite
+    // (`pointer_selection_scale.rs`).
+    rt.start_selection(CellPos::new(5, 2));
     assert!(rt.is_selection_dragging(), "press arms a drag");
     let before = rt.selection().expect("press selects");
     assert_eq!(
@@ -189,9 +203,8 @@ fn scroll_while_selecting_tracks_anchor() {
     // Extend after the scroll, then release: the anchor stays pinned while the
     // focus follows the new cursor viewport.
     let tracked_anchor = sel.anchor;
-    let to = cell_center(&rt, id, 6, 4);
-    rt.handle_cursor_moved(to);
-    release(&mut rt);
+    rt.update_selection(CellPos::new(6, 4));
+    rt.end_selection(CellPos::new(6, 4));
     assert!(!rt.is_selection_dragging());
     let sel = rt.selection().expect("scroll-tracked drag commits");
     assert_eq!(

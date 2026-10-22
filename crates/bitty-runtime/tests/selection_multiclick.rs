@@ -118,8 +118,8 @@ fn single_click_drag_stays_simple_no_regression() {
     feed_text(&mut rt, "hello world");
     let base = Instant::now();
     press_at(&mut rt, 0, 0, base);
-    move_at(&mut rt, 4, 0, base + Duration::from_millis(30));
-    release_at(&mut rt, 4, 0, base + Duration::from_millis(60));
+    move_at(&mut rt, 5, 0, base + Duration::from_millis(30));
+    release_at(&mut rt, 5, 0, base + Duration::from_millis(60));
     assert_eq!(rt.last_click_count(), 1);
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Simple));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
@@ -289,8 +289,8 @@ fn alt_press_starts_block_selection() {
     let base = Instant::now();
     press_at(&mut rt, 1, 0, base);
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Block));
-    move_at(&mut rt, 2, 2, base + Duration::from_millis(40));
-    release_at(&mut rt, 2, 2, base + Duration::from_millis(80));
+    move_at(&mut rt, 3, 2, base + Duration::from_millis(40));
+    release_at(&mut rt, 3, 2, base + Duration::from_millis(80));
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Block));
     assert_eq!(rt.selection_text().as_deref(), Some("bc\nfg\njk"));
     // The block rectangle normalizes independent of drag direction.

@@ -872,12 +872,14 @@ pub struct Runtime {
     /// the window. Presentation-only: never grid truth.
     scrollbar_drag: Option<ScrollbarDrag>,
     /// Whether the cursor has left the window since the last motion event
-    /// (CTX-0181 `auto` disengagement).
+    /// (CTX-0181 `auto` disengagement; issue #2480 pointer shape).
     ///
     /// Set on `CursorLeft`, cleared on the next `CursorMoved`. Tracked
     /// separately from the shared `last_cursor` so the selection/mouse path
-    /// keeps its meaning while the auto-hide thumb provably disengages.
-    scrollbar_cursor_left: bool,
+    /// keeps its meaning while the auto-hide thumb provably disengages and
+    /// the pointer shape can fall back to the platform arrow outside the
+    /// window. Read through [`Runtime::cursor_inside_window`].
+    cursor_left_window: bool,
     /// Whether the scrollbar painted on the last present (CTX-0181).
     ///
     /// Compared on cursor moves so `auto` hover/proximity transitions
@@ -1836,7 +1838,7 @@ impl Runtime {
             search_view: None,
             search_result_generation: 0,
             scrollbar_drag: None,
-            scrollbar_cursor_left: false,
+            cursor_left_window: false,
             scrollbar_visible: false,
             alt_drag: None,
             tiled_drag: None,
@@ -2120,7 +2122,7 @@ impl Runtime {
             search_view: None,
             search_result_generation: 0,
             scrollbar_drag: None,
-            scrollbar_cursor_left: false,
+            cursor_left_window: false,
             scrollbar_visible: false,
             alt_drag: None,
             tiled_drag: None,

@@ -3356,7 +3356,9 @@ impl Runtime {
         let Some(sel) = self.selection() else {
             return;
         };
-        if sel.is_empty() {
+        // Issue #2480: a caret drag over exactly one cell is a real
+        // selection even though the inclusive range is collapsed.
+        if sel.is_empty() && !self.selection_is_single_cell() {
             return;
         }
         let scrolled = view_map

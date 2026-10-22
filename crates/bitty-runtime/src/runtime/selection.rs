@@ -44,8 +44,155 @@ pub(crate) struct SelectionState {
     /// range). `None` once the drag is committed. Viewport coordinates when
     /// scrolled, live-grid coordinates when live (same space as `selection`).
     pub(crate) anchor_press: Option<CellPos>,
+    /// Caret boundary of the press for a pointer `Simple`/`Block` drag
+    /// (issue #2480).
+    ///
+    /// Pointer drags are caret-to-caret: a press and the live pointer each
+    /// map to a cell **edge**, and the selected cells lie between them. That
+    /// makes one cell of pointer travel select exactly one cell (instead of
+    /// the two-cell inclusive-cell jump) and lets a single character be
+    /// selected. Word/line drags keep the cell-based anchor and leave this
+    /// `None`; direct cell APIs ([`Runtime::start_selection`] and friends)
+    /// do the same.
+    pub(crate) press_boundary: Option<SelectionBoundary>,
     /// Whether a pointer drag is currently extending `selection`.
     pub(crate) dragging: bool,
+    /// Whether `selection` is a deliberately selected single cell
+    /// (issue #2480).
+    ///
+    /// [`Selection`] stores an inclusive range, so `anchor == focus` also
+    /// describes a collapsed press. A caret drag that covers exactly one cell
+    /// is a real selection, not a collapsed one; this flag distinguishes the
+    /// two for [`Runtime::has_selection`] and the highlight paint without
+    /// changing the public [`Selection`] shape.
+    pub(crate) single_cell: bool,
+}
+
+/// Horizontal caret position in a `View`'s grid (issue #2480).
+///
+/// `col` counts **cell edges**, not cells: `col == width` is the right edge
+/// of the last cell. Pointer drags are caret-to-caret horizontally so the
+/// selected column count equals pointer travel in columns; rows stay
+/// inclusive (line-based terminal drags) and the stored [`Selection`]
+/// remains the inclusive cell range between the two carets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectionBoundary {
+    pub(crate) col: u16,
+}
+
+impl SelectionBoundary {
+    pub(crate) const fn new(col: u16) -> Self {
+        Self { col }
+    }
+}
+
+/// Inclusive cell span between two horizontal carets (issue #2480).
+///
+/// `anchor` and `focus` are the floor cells under the press and the live
+/// pointer (rows stay inclusive, matching line-based terminal drags); the
+/// column arguments are their caret edges. Columns are caret-to-caret, so
+/// one column of pointer travel selects exactly one column. `None` when no
+/// column lies between the edges on a single row.
+pub(crate) fn boundary_span(
+    anchor: CellPos,
+    anchor_col: u16,
+    focus: CellPos,
+    focus_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(CellPos, CellPos)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let anchor_row = anchor.row.min(height - 1);
+    let focus_row = focus.row.min(height - 1);
+    let (start_row, end_row) = if anchor_row <= focus_row {
+        (anchor_row, focus_row)
+    } else {
+        (focus_row, anchor_row)
+    };
+    let (start_col, end_col) = if anchor_row == focus_row {
+        let left = anchor_col.min(focus_col);
+        let right = anchor_col.max(focus_col);
+        if left == right {
+            return None;
+        }
+        (left, right - 1)
+    } else if anchor_row < focus_row {
+        // Dragging down: start at the press caret, end through the cell
+        // before the pointer caret. A zero pointer edge still includes the
+        // end row's first cell (rows stay inclusive).
+        (anchor_col, focus_col.saturating_sub(1))
+    } else {
+        // Dragging up: start at the pointer caret, end through the cell
+        // before the press caret.
+        (focus_col, anchor_col.saturating_sub(1))
+    };
+    // A press caret at the right edge contributes nothing on its row; a
+    // multi-row downward drag starts on the following row instead.
+    let (start_row, start_col) = if start_col >= width {
+        if start_row >= end_row {
+            return None;
+        }
+        (start_row.saturating_add(1), 0)
+    } else {
+        (start_row, start_col)
+    };
+    if start_row > end_row {
+        return None;
+    }
+    Some((
+        CellPos::new(start_row, start_col.min(width - 1)),
+        CellPos::new(end_row, end_col.min(width - 1)),
+    ))
+}
+
+/// Inclusive cell rectangle between two horizontal carets (block selection).
+///
+/// Rows stay inclusive between the press and live cells; columns are
+/// caret-to-caret like [`boundary_span`]. `None` when either axis has no
+/// cell between the edges.
+pub(crate) fn block_boundary_span(
+    anchor: CellPos,
+    anchor_col: u16,
+    focus: CellPos,
+    focus_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(CellPos, CellPos)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let col0 = anchor_col.min(focus_col);
+    let col1 = anchor_col.max(focus_col);
+    if col0 >= width {
+        return None;
+    }
+    let row0 = anchor.row.min(focus.row).min(height - 1);
+    let row1 = anchor.row.max(focus.row).min(height - 1);
+    if col0 == col1 {
+        // A purely vertical block drag keeps the pressed column as a
+        // one-column block; a click (same row too) stays collapsed.
+        if row0 == row1 {
+            return None;
+        }
+        return Some((
+            CellPos::new(row0, col0.min(width - 1)),
+            CellPos::new(row1, col0.min(width - 1)),
+        ));
+    }
+    Some((
+        CellPos::new(row0, col0.min(width - 1)),
+        CellPos::new(row1, (col1 - 1).min(width - 1)),
+    ))
+}
+
+/// Nearest cell at or before a caret, clamped into the grid.
+pub(crate) fn boundary_cell(cell: CellPos, width: u16, height: u16) -> CellPos {
+    CellPos::new(
+        cell.row.min(height.saturating_sub(1)),
+        cell.col.min(width.saturating_sub(1)),
+    )
 }
 
 /// Grid backing `view` from disjoint field borrows (CTX-0805).
@@ -158,7 +305,9 @@ impl Runtime {
             owner,
             selection,
             anchor_press,
+            press_boundary: None,
             dragging,
+            single_cell: false,
         });
         self.pending_full_redraw = true;
     }
@@ -206,6 +355,7 @@ impl Runtime {
             let next = row as i32 + delta_rows as i32;
             next.clamp(0, u16::MAX as i32) as u16
         };
+        let press_boundary = sel.press_boundary;
         if sel.dragging {
             match sel.selection.kind {
                 SelectionKind::Simple | SelectionKind::Block => {
@@ -215,8 +365,10 @@ impl Runtime {
                         row: shift_row(pin.row),
                         col: pin.col,
                     });
+                    let single_cell = sel.single_cell && next.anchor == next.focus;
                     // Focus stays at the cursor: do not shift it.
                     self.install_selection(sel.owner, next, pin.or(sel.anchor_press), true);
+                    self.restore_selection_meta(press_boundary, single_cell);
                 }
                 SelectionKind::Word | SelectionKind::Line => {
                     // Shift the press pin, then re-expand in the new viewport
@@ -240,6 +392,7 @@ impl Runtime {
                             _ => Selection::line_drag(&snap, shifted, current),
                         };
                         self.install_selection(sel.owner, next, Some(shifted), true);
+                        self.restore_selection_meta(press_boundary, false);
                         return;
                     };
                     let press = sel.anchor_press.unwrap_or(sel.selection.anchor);
@@ -259,6 +412,7 @@ impl Runtime {
                         _ => Selection::line_drag(&viewport, shifted, current),
                     };
                     self.install_selection(sel.owner, next, Some(shifted), true);
+                    self.restore_selection_meta(press_boundary, false);
                 }
             }
         } else {
@@ -269,7 +423,22 @@ impl Runtime {
                 row: shift_row(pin.row),
                 col: pin.col,
             });
+            let single_cell = sel.single_cell && next.anchor == next.focus;
             self.install_selection(sel.owner, next, pin, false);
+            self.restore_selection_meta(press_boundary, single_cell);
+        }
+    }
+
+    /// Restores the caret-drag metadata after [`Self::install_selection`]
+    /// (issue #2480).
+    fn restore_selection_meta(
+        &mut self,
+        press_boundary: Option<SelectionBoundary>,
+        single_cell: bool,
+    ) {
+        if let Some(state) = self.selection_state.as_mut() {
+            state.press_boundary = press_boundary;
+            state.single_cell = single_cell;
         }
     }
 
@@ -400,9 +569,22 @@ impl Runtime {
     }
 
     /// Whether a selection currently exists and is non-empty.
+    ///
+    /// A caret drag that covers exactly one cell reports `true` even though
+    /// its inclusive [`Selection`] has `anchor == focus` (issue #2480): the
+    /// dedicated single-cell flag distinguishes it from a collapsed click.
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.selection().is_some_and(|s| !s.is_empty())
+        self.selection_owner_state()
+            .is_some_and(|(state, _)| !state.selection.is_empty() || state.single_cell)
+    }
+
+    /// Whether the live selection deliberately covers exactly one cell
+    /// (issue #2480, highlight-paint seam).
+    #[must_use]
+    pub fn selection_is_single_cell(&self) -> bool {
+        self.selection_owner_state()
+            .is_some_and(|(state, _)| state.single_cell)
     }
 
     /// Clears the current selection.
@@ -593,6 +775,198 @@ impl Runtime {
             }
         };
         self.install_selection(owner, selection, Some(snapped), true);
+    }
+
+    /// Starts a pointer `Simple`/`Block` selection with a caret boundary
+    /// (issue #2480).
+    ///
+    /// The cell-based [`Self::start_view_selection`] press behavior is kept
+    /// (click focus, wide-char snap, word/line expansion). `Simple` and
+    /// `Block` additionally remember the press caret so drag updates can
+    /// translate caret-to-caret: one cell of pointer travel selects exactly
+    /// one cell instead of two.
+    pub(super) fn start_view_selection_from_pointer(
+        &mut self,
+        owner: ViewId,
+        kind: SelectionKind,
+        cell: CellPos,
+        boundary: SelectionBoundary,
+    ) {
+        self.start_view_selection(owner, kind, cell);
+        if matches!(kind, SelectionKind::Simple | SelectionKind::Block) {
+            if let Some(state) = self.selection_state.as_mut() {
+                state.press_boundary = Some(boundary);
+            }
+        }
+    }
+
+    /// Grid extent the live selection addresses (issue #2480).
+    ///
+    /// The owner's live grid when unscrolled, the visible composite when
+    /// scrolled. `None` when the owner lost its grid (fail closed).
+    pub(super) fn selection_extent(&self, owner: ViewId) -> Option<(u16, u16)> {
+        let (width, height) = if self.is_viewport_scrolled(owner) {
+            let viewport = self.viewport_snapshot_for(owner)?;
+            (viewport.width, viewport.height)
+        } else {
+            let state = self.live_view_state(owner)?;
+            (state.width(), state.height())
+        };
+        Some((
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+        ))
+    }
+
+    /// Updates a pointer caret drag (issue #2480).
+    ///
+    /// Only `Simple` and `Block` drags carry a press boundary; word/line
+    /// drags keep the cell-based [`Self::update_selection`] path. A caret
+    /// span that covers no cell installs a collapsed selection so the drag
+    /// state survives until release (where a plain click still clears).
+    pub(super) fn update_boundary_selection(
+        &mut self,
+        focus: CellPos,
+        boundary: SelectionBoundary,
+    ) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let Some(press) = sel.press_boundary else {
+            return;
+        };
+        let Some((width, height)) = self.selection_extent(sel.owner) else {
+            self.drop_selection();
+            return;
+        };
+        let Some(snap) = self.selection_snapshot(sel.owner) else {
+            self.drop_selection();
+            return;
+        };
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+        let span = match sel.selection.kind {
+            SelectionKind::Simple => {
+                boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Block => {
+                block_boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Word | SelectionKind::Line => return,
+        }
+        .map(|(anchor, focus)| {
+            (
+                bitty_ui::snap_to_leading(&snap, anchor),
+                bitty_ui::snap_to_leading(&snap, focus),
+            )
+        });
+        // A caret span that covers no cell keeps the drag alive as a
+        // collapsed selection; a release then decides click vs selection.
+        let (next, single_cell) = match span {
+            Some((anchor, focus)) => (
+                Selection {
+                    anchor,
+                    focus,
+                    kind: sel.selection.kind,
+                    active: true,
+                },
+                anchor == focus,
+            ),
+            None => {
+                let cell = boundary_cell(focus, width, height);
+                (
+                    Selection {
+                        anchor: cell,
+                        focus: cell,
+                        kind: sel.selection.kind,
+                        active: true,
+                    },
+                    false,
+                )
+            }
+        };
+        self.install_selection(sel.owner, next, sel.anchor_press, true);
+        if let Some(state) = self.selection_state.as_mut() {
+            state.press_boundary = Some(press);
+            state.single_cell = single_cell;
+        }
+    }
+
+    /// Snapshot the owner's selection space reads (issue #2480).
+    ///
+    /// The visible composite when scrolled, the live grid otherwise. `None`
+    /// fails closed when the owner lost its grid.
+    fn selection_snapshot(&self, owner: ViewId) -> Option<Snapshot> {
+        if self.is_viewport_scrolled(owner) {
+            self.viewport_snapshot_for(owner)
+        } else {
+            self.live_view_state(owner).map(State::snapshot)
+        }
+    }
+
+    /// Commits a pointer caret drag at `boundary` (issue #2480).
+    ///
+    /// A span that covers exactly one cell is kept as a real single-cell
+    /// selection ([`Self::selection_is_single_cell`]); a collapsed span
+    /// (press and release at the same caret) is a click and clears, matching
+    /// the previous release semantics.
+    pub(super) fn end_boundary_selection(&mut self, focus: CellPos, boundary: SelectionBoundary) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let Some(press) = sel.press_boundary else {
+            return;
+        };
+        let Some((width, height)) = self.selection_extent(sel.owner) else {
+            self.drop_selection();
+            self.click_tracker.reset();
+            return;
+        };
+        let Some(snap) = self.selection_snapshot(sel.owner) else {
+            self.drop_selection();
+            self.click_tracker.reset();
+            return;
+        };
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+        let span = match sel.selection.kind {
+            SelectionKind::Simple => {
+                boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Block => {
+                block_boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Word | SelectionKind::Line => return,
+        }
+        .map(|(anchor, focus)| {
+            (
+                bitty_ui::snap_to_leading(&snap, anchor),
+                bitty_ui::snap_to_leading(&snap, focus),
+            )
+        });
+        let Some((anchor, focus)) = span else {
+            self.drop_selection();
+            return;
+        };
+        let was_drag = super::click::cell_distance(sel.anchor_press.unwrap_or(anchor), focus)
+            > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+        let finished = Selection {
+            anchor,
+            focus,
+            kind: sel.selection.kind,
+            active: false,
+        };
+        self.install_selection(sel.owner, finished, None, false);
+        if let Some(state) = self.selection_state.as_mut() {
+            state.single_cell = anchor == focus;
+        }
+        if was_drag {
+            self.click_tracker.reset();
+        }
     }
 
     /// Updates the current selection's focus to `pos` (mouse drag).

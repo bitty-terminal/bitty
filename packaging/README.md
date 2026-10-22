@@ -765,8 +765,11 @@ scripts/make-extension-catalog.sh --publish
 ```
 
 Requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `wrangler`
-(`R2_BUCKET` defaults to `bitty`). Publishing uses
-`public, max-age=300, must-revalidate` and `text/plain; charset=utf-8`.
+(`R2_BUCKET` defaults to `bitty`). The token is fed to `curl` through a stdin
+config, never argv. Publishing uses `public, max-age=300, must-revalidate`
+and `text/plain; charset=utf-8`; an edge that cached the old unpublished 404
+may serve it until that TTL expires, so retry or purge before calling a
+failed read-back a publication failure.
 `--publish` is append-only for published versions: a live record that no
 longer appears in the generated catalog aborts unless `--allow-yank` is
 passed, because removing an entry is an explicit yank decision. A catalog

@@ -17,12 +17,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bitty_lua::{BridgeError, HostServices, LuaValue};
+use bitty_plugin_host::AudioError;
 use bitty_plugin_host::manifest::PluginId;
-use bitty_runtime::plugin_runtime::audio::AudioHost;
+use bitty_runtime::plugin_runtime::audio::{AudioHost, SampledSpawnFn};
 use bitty_runtime::plugin_runtime::device_providers::host::DeviceHost;
 use bitty_runtime::plugin_runtime::system_sensors::SensorHost;
 use bitty_runtime::plugin_runtime::{
-    PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
+    LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
 
 #[derive(Default)]
@@ -357,13 +358,227 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf, PathBuf, PathBuf) {
         &["xuepoo.nog:probe"],
         NOG_INIT,
     );
-    let rt = runtime(vec![third]);
+    let mut rt = runtime(vec![third]);
+    // bitty#2425: this fixture bar activates with ~2 ms of real work, but the
+    // RC-1 wall dimension is load-sensitive: under sharded CI the same chunk
+    // measured 53 ms against the 50 ms production budget and suspended two
+    // tests in this binary. Widen only the wall dimension for this harness
+    // (10x headroom, the bitty#1744/#1727 treatment). Production keeps
+    // `RC1_WALL_CLOCK_BUDGET_MS`; budget enforcement stays pinned by
+    // `bitty-lua/tests/measurement_lua.rs` and `load_gate.rs`, and the
+    // activation regression below runs on the production budget.
+    rt.set_vm_wall_budget_ms(Some(10 * bitty_lua::RC1_WALL_CLOCK_BUDGET_MS));
     let (sensor, sensor_root) = fixture_sensor_host(&format!("{tag}-sensor"));
     *rt.sensor_host().borrow_mut() = sensor;
     let (device, device_root) = fixture_device_host(&format!("{tag}-device"));
     *rt.device_host().borrow_mut() = device;
     *rt.audio_host().borrow_mut() = fixture_audio_host();
     (rt, root, sensor_root, device_root)
+}
+
+const SLOW_AUDIO_MANIFEST: &str = r#"[services.required]
+"audio.state" = ">=1.0"
+"#;
+
+const SLOW_AUDIO_GRANT: &str = "audio.state.read = true";
+
+/// Polls the audio provider at activation and records whether the first read
+/// was hidden. A live monitor lands its sample off-thread, so the first read
+/// must hide and activation must stay cheap.
+const SLOW_AUDIO_INIT: &str = r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local audio = bitty.services.get("audio.state")
+local ok, snap = pcall(audio.get, {})
+bitty.store.set("first_hidden", not ok)
+if ok then
+  bitty.store.set("vol", snap.volume_pct)
+end
+-- bitty#2425 review: `pcall` swallows a suspension raised inside the call,
+-- so a read that consumed the slice would go unnoticed here. Run bounded
+-- plugin work AFTER the protected call: the next slice check lands outside
+-- `pcall` and suspends the chunk if the read was charged to it.
+local acc = 0
+for i = 1, 20000 do
+  acc = (acc + i) % 1000003
+end
+bitty.store.set("post_loop", acc >= 0)
+return {}
+"#;
+
+#[test]
+fn bar_activation_never_blocks_on_a_slow_audio_monitor() {
+    // bitty#2425: the live provider read is three blocking `pactl` spawns
+    // (92 ms cold on the reference host). A plugin that polls
+    // `audio.state.get()` during `init.lua` used to spend that time inside
+    // the RC-1 50 ms slice and fail activation (`smoke-bar-heavy`: 159/172
+    // ms). The sampled monitor moves the read off the executor thread, so
+    // activation completes on the production budget while the reader is
+    // still running.
+    //
+    // This is the production-slice guard: the fixture polls audio through
+    // `pcall` and then runs bounded plugin work outside it, so a read that
+    // is charged to the slice suspends at the next non-`pcall` boundary
+    // instead of being swallowed. It runs on the default RC-1 budget (no
+    // `set_vm_wall_budget_ms`) with a 1.5 s composed reader, and the Rust
+    // elapsed assertion below bounds the activation far below that.
+    let root = temp_dir("slow-audio");
+    let third = root.join("third");
+    write_plugin(
+        &third,
+        "xuepoo.slow",
+        SLOW_AUDIO_MANIFEST,
+        SLOW_AUDIO_GRANT,
+        &["xuepoo.slow:probe"],
+        SLOW_AUDIO_INIT,
+    );
+    let mut rt = runtime(vec![third]);
+    let spawn: SampledSpawnFn = std::sync::Arc::new(|argv: &[String]| {
+        // Three composed spawns per read: 1.5 s total, thirty times the
+        // production 50 ms slice.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let text = argv.join(" ");
+        if text.contains("get-sink-volume") {
+            Ok(VOLUME_FIXTURE.to_string())
+        } else if text.contains("get-sink-mute") {
+            Ok(MUTE_FIXTURE.to_string())
+        } else if text.contains("list") {
+            Ok(SINKS_FIXTURE.to_string())
+        } else {
+            Err(AudioError::unavailable("unexpected argv in fixture"))
+        }
+    });
+    *rt.audio_host().borrow_mut() = AudioHost::sampled_for_test(spawn, 0);
+    let id = PluginId::new("xuepoo.slow").expect("id");
+    rt.discover();
+    // Production RC-1: an inline read of the 1.5 s reader would suspend the
+    // activation chunk (and a suspension swallowed by `pcall` would still
+    // land on the post-loop slice check).
+    let started = std::time::Instant::now();
+    let report = rt.activate(&id).expect("activation stays inside the slice");
+    let elapsed = started.elapsed();
+    assert_eq!(report.state, LifecycleState::Active);
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "activation observed the reader latency: {elapsed:?} (five production slices)"
+    );
+    assert_eq!(
+        store_bool(&rt, &id, "first_hidden"),
+        Some(true),
+        "the first read hides instead of blocking activation"
+    );
+    assert_eq!(
+        store_bool(&rt, &id, "post_loop"),
+        Some(true),
+        "the post-pcall work ran, so no latent suspension was left behind"
+    );
+    // The off-thread read lands and serves through the same gate.
+    let mut served = None;
+    for _ in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Ok(value) =
+            rt.audio_host()
+                .borrow_mut()
+                .call("audio.state", "get", &LuaValue::Nil, true)
+        {
+            served = Some(value);
+            break;
+        }
+    }
+    let served = served.expect("the sampled read lands");
+    assert_eq!(served.get("volume_pct"), Some(&LuaValue::Integer(50)));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+const POLL_LOOP_INIT: &str = r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+local audio = bitty.services.get("audio.state")
+local served = 0
+for _ = 1, 500 do
+  local ok = pcall(audio.get, {})
+  if ok then served = served + 1 end
+end
+bitty.store.set("served", served)
+return {}
+"#;
+
+#[test]
+fn repeated_audio_polls_never_extend_the_slice_with_host_work() {
+    // bitty#2425 security half: a plugin that hammers `audio.state.get()`
+    // cannot convert the call into unbounded host work. Every call is a
+    // cache/hide answer; exactly one composed read (three spawns) runs per
+    // 0.5 Hz window, off-thread, and the plugin's own loop stays bounded by
+    // the RC-1 instruction budget. 500 calls complete inside the production
+    // 50 ms slice even on a loaded debug-build CI runner.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = temp_dir("poll-loop");
+    let third = root.join("third");
+    write_plugin(
+        &third,
+        "xuepoo.loop",
+        SLOW_AUDIO_MANIFEST,
+        SLOW_AUDIO_GRANT,
+        &["xuepoo.loop:probe"],
+        POLL_LOOP_INIT,
+    );
+    let mut rt = runtime(vec![third]);
+    let spawns = std::sync::Arc::new(AtomicUsize::new(0));
+    let probed = std::sync::Arc::clone(&spawns);
+    let spawn: SampledSpawnFn = std::sync::Arc::new(move |argv: &[String]| {
+        probed.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let text = argv.join(" ");
+        if text.contains("get-sink-volume") {
+            Ok(VOLUME_FIXTURE.to_string())
+        } else if text.contains("get-sink-mute") {
+            Ok(MUTE_FIXTURE.to_string())
+        } else if text.contains("list") {
+            Ok(SINKS_FIXTURE.to_string())
+        } else {
+            Err(AudioError::unavailable("unexpected argv in fixture"))
+        }
+    });
+    *rt.audio_host().borrow_mut() = AudioHost::sampled_for_test(spawn, 0);
+    let id = PluginId::new("xuepoo.loop").expect("id");
+    rt.discover();
+    let report = rt
+        .activate(&id)
+        .expect("500 polls stay inside the production slice");
+    assert_eq!(report.state, LifecycleState::Active);
+    assert_eq!(
+        store_number(&rt, &id, "served"),
+        Some(0.0),
+        "every poll before the first sample hides, none blocks"
+    );
+    // Wait for the single composed read to finish (three spawns), then
+    // assert the poll loop never started another: 500 calls must not
+    // multiply monitor work. Waiting here makes the bound an exact value
+    // instead of racing an in-flight read.
+    let mut waited_ms = 0_u32;
+    while spawns.load(Ordering::SeqCst) < 3 && waited_ms < 2_000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited_ms += 10;
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        3,
+        "the poll loop must produce exactly one composed read (three spawns)"
+    );
+    // Give a wrongly spawned second read time to appear, then re-check.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        3,
+        "poll loop multiplied monitor work after the first read"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

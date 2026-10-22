@@ -21,7 +21,13 @@
 //!   [`list_sinks_argv`](bitty_plugin_host::list_sinks_argv) — composed by
 //!   [`live_read`] and parsed by the bounded contract parsers. The default
 //!   sink name parse exists in the contract but carries no `get()` field,
-//!   so it is not spawned here.
+//!   so it is not spawned here. The live monitor runs that read on a
+//!   short-lived sampler thread ([`SampledReads`], bitty#2425): a fresh
+//!   read blocks for 15-92 ms (three spawns, 5 ms `try_wait` cadence), which
+//!   is the whole RC-1 50 ms slice of a plugin that polls
+//!   `audio.state.get()` during `init.lua`, so the executor thread only ever
+//!   observes a landed attempt or serves last-good. Injected (fixture)
+//!   monitors keep the synchronous reader.
 //! - Source (microphone) `source_volume_pct` / `source_muted`: no scoped
 //!   argv shape covers `@DEFAULT_SOURCE@` in this revision, so the live
 //!   reader serves `None` (documented; a source argv addition is a
@@ -83,6 +89,7 @@
 //! Bar rendering lives in bitty-plugins#86 (out of scope).
 
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue};
@@ -92,9 +99,10 @@ use bitty_plugin_host::{
     CONTROL_METHOD_TOGGLE_MUTE, CONTROL_VERSION, ControlGate, MONITOR_OUTPUT_MAX_BYTES,
     SPECTRUM_HEAD, SPECTRUM_IFACE, SPECTRUM_MAX_BUCKETS, SPECTRUM_MAX_RESPONSE_BYTES,
     SPECTRUM_METHOD, SPECTRUM_VERSION, STATE_CONTROL_HEAD, STATE_IFACE, STATE_METHOD_GET,
-    STATE_READ_HEAD, STATE_VERSION, SpectrumGate, SpectrumPoll, StateGate, VolumeTarget,
-    argv_bytes, check_argv, list_sinks_argv, parse_active_port, parse_sink_mute, parse_sink_volume,
-    read_mute_argv, read_volume_argv, set_volume_argv, spectrum_response_bytes, toggle_mute_argv,
+    STATE_MIN_INTERVAL_MS, STATE_READ_HEAD, STATE_VERSION, SpectrumGate, SpectrumPoll, StateGate,
+    VolumeTarget, argv_bytes, check_argv, list_sinks_argv, parse_active_port, parse_sink_mute,
+    parse_sink_volume, read_mute_argv, read_volume_argv, set_volume_argv, spectrum_response_bytes,
+    toggle_mute_argv,
 };
 
 /// Native audio provider id (mirrors `SENSOR_PROVIDER` for batch A).
@@ -140,6 +148,12 @@ const _: () = {
 /// production member. Fail-closed: every failure is a typed [`AudioError`],
 /// never a panic, never shell text.
 pub type SpawnFn = Rc<dyn Fn(&[String]) -> Result<String, AudioError>>;
+
+/// Thread-safe spawner seam for the off-thread state sampler (bitty#2425).
+///
+/// The inline [`SpawnFn`] is `Rc`-based and confined to the executor thread;
+/// the sampler thread needs the `Arc + Send + Sync` shape.
+pub type SampledSpawnFn = Arc<dyn Fn(&[String]) -> Result<String, AudioError> + Send + Sync>;
 
 /// Monotonic milliseconds since `start` (production clock for gate ticks).
 #[must_use]
@@ -265,6 +279,9 @@ pub fn live_spawn(argv: &[String]) -> Result<String, AudioError> {
 /// validated [`AudioState`]. Source fields serve `None`: no scoped source
 /// argv exists in this revision. Any spawn or parse failure propagates as
 /// the typed contract error so the gate stales-then-hides.
+///
+/// The live monitor calls this from the [`SampledReads`] thread, never from
+/// the executor thread (bitty#2425).
 pub fn live_read(spawn: &SpawnFn) -> Result<AudioState, AudioError> {
     let volume_argv = read_volume_argv();
     let mute_argv = read_mute_argv();
@@ -458,6 +475,127 @@ fn truncate_io_error(message: &str) -> String {
     out.replace(['\n', '\r'], " ")
 }
 
+/// Shared sampling slot between the executor thread and one sampler thread.
+#[derive(Default)]
+struct SampleSlot {
+    /// Completed attempt the next `get()` has not observed yet, with the
+    /// host-clock instant (milliseconds) at which the reader finished.
+    ///
+    /// The landing instant travels with the sample so the gate's
+    /// `stale_age_ms` and 10 s hide grace are measured from the read, not
+    /// from whichever tick happens to observe it (bitty#2425 review).
+    ready: Option<(Result<AudioState, AudioError>, u64)>,
+    /// Executor-clock time of the last admitted request (`None` before the
+    /// first attempt), so retries stay at the 0.5 Hz ceiling.
+    request_ms: Option<u64>,
+    /// Whether a sampling thread is running (at most one at a time).
+    in_flight: bool,
+}
+
+/// Off-thread live `audio.state` sampler (bitty#2425).
+///
+/// A fresh live read spawns `pactl` three times (sink volume, mute, sink
+/// list) and each spawn polls `try_wait` on a 5 ms cadence, so the read
+/// blocks the calling thread for 15-92 ms (92 ms measured on a cold process
+/// on the reference host, 15 ms warm). Charged to the executor thread that
+/// is the entire RC-1 50 ms activation slice: a bar mounting a `pulseaudio`
+/// module could not activate (bitty#2425, matrix `smoke-bar-heavy`).
+///
+/// The sampler runs that read on a short-lived named thread, at most one at
+/// a time and at most once per [`STATE_MIN_INTERVAL_MS`], and hands the
+/// completed attempt plus its landing instant to [`AudioMonitor::get`].
+/// `get()` therefore never spawns, waits, or sleeps: it either observes a
+/// landed attempt or serves the last-good snapshot through
+/// [`StateGate::serve_cached`]. The executor thread stays bounded by the
+/// plugin's own work; the sampler's own bounds are unchanged
+/// (`AUDIO_SPAWN_TIMEOUT_MS` per spawn, three spawns, one thread).
+///
+/// A read still in flight when the host is dropped keeps only the slot, the
+/// spawner, and its own stack alive: it is read-only, at most one thread,
+/// and bounded by three `AUDIO_SPAWN_TIMEOUT_MS` spawns (~3 s). Nothing
+/// joins it, so host teardown never waits on a monitor.
+struct SampledReads {
+    spawn: SampledSpawnFn,
+    slot: Arc<Mutex<SampleSlot>>,
+}
+
+impl SampledReads {
+    fn new(spawn: SampledSpawnFn) -> Self {
+        Self {
+            spawn,
+            slot: Arc::new(Mutex::new(SampleSlot::default())),
+        }
+    }
+
+    /// Take the next landed attempt, asking for a new one when due.
+    ///
+    /// Returns `Some` exactly once per completed attempt. Never blocks: the
+    /// request either starts one short-lived thread (when none is in flight
+    /// and the ceiling allows) or is dropped. A landed sample is also the
+    /// moment the next read becomes useful, so serving one re-checks the
+    /// 0.5 Hz window and keeps a steady cadence instead of waiting for a
+    /// second tick.
+    fn take(&self, now_ms: u64) -> Option<(Result<AudioState, AudioError>, u64)> {
+        let ready = lock_slot(&self.slot).ready.take();
+        self.request(now_ms);
+        ready
+    }
+
+    /// Ask for one sample when none is in flight and the ceiling allows.
+    fn request(&self, now_ms: u64) {
+        let mut slot = lock_slot(&self.slot);
+        if slot.in_flight {
+            return;
+        }
+        if let Some(last) = slot.request_ms {
+            if now_ms.saturating_sub(last) < STATE_MIN_INTERVAL_MS {
+                return;
+            }
+        }
+        slot.in_flight = true;
+        slot.request_ms = Some(now_ms);
+        // Captured before the spawn so the landing instant includes thread
+        // startup, not just the reader itself.
+        let started = Instant::now();
+        let slot_arc = Arc::clone(&self.slot);
+        let spawn = Arc::clone(&self.spawn);
+        let spawned = std::thread::Builder::new()
+            .name("bitty-audio-sample".to_string())
+            .spawn(move || {
+                // Reset `in_flight` on every exit path, including a panic in
+                // the reader, so one failed thread cannot wedge the sampler.
+                let _flight = FlightGuard(Arc::clone(&slot_arc));
+                let inline: SpawnFn = Rc::new(move |argv: &[String]| spawn(argv));
+                let outcome = live_read(&inline);
+                let landed_ms = now_ms.saturating_add(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                lock_slot(&slot_arc).ready = Some((outcome, landed_ms));
+            });
+        if spawned.is_err() {
+            slot.in_flight = false;
+        }
+    }
+}
+
+/// Releases the in-flight marker when the sampling thread exits.
+struct FlightGuard(Arc<Mutex<SampleSlot>>);
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        lock_slot(&self.0).in_flight = false;
+    }
+}
+
+/// Lock the sampler slot, recovering from a poisoned mutex.
+///
+/// The slot holds no invariant that a panic could leave half-updated; a
+/// poisoning thread must not wedge every later `get()`.
+fn lock_slot(slot: &Mutex<SampleSlot>) -> std::sync::MutexGuard<'_, SampleSlot> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Gate-holding live audio monitor: spectrum/state/control behind the
 /// contract gates with one injected spawner.
 ///
@@ -465,11 +603,20 @@ fn truncate_io_error(message: &str) -> String {
 /// fails with the broker-indistinguishable code). Ticks are explicit
 /// `now_ms`. The default spawner is [`live_spawn`]; tests inject counting
 /// fixtures.
+///
+/// The live constructor ([`Self::live`]) also installs an off-thread state
+/// sampler ([`SampledReads`], bitty#2425): a fresh `audio.state.get()` would
+/// otherwise block the executor thread for the three `pactl` spawns, which
+/// is the whole RC-1 activation slice of a plugin that mounts a `pulseaudio`
+/// module. Injected monitors keep the synchronous reader, so fixtures stay
+/// deterministic.
 pub struct AudioMonitor {
     spectrum_gate: SpectrumGate,
     state_gate: StateGate,
     control_gate: ControlGate,
     spawn: SpawnFn,
+    /// Off-thread state sampler; `None` for the synchronous injected path.
+    sampled: Option<SampledReads>,
 }
 
 impl AudioMonitor {
@@ -480,12 +627,48 @@ impl AudioMonitor {
             state_gate: StateGate::new(),
             control_gate: ControlGate::new(),
             spawn,
+            sampled: None,
+        }
+    }
+
+    /// Monitor whose state reads are sampled off the executor thread.
+    ///
+    /// The sampled spawner runs on the sampler thread, so it must be
+    /// `Send + Sync`; `inline` is the executor-thread spawner (control verbs
+    /// and any future inline path). Test-only: production enters through
+    /// [`Self::live`]. Tests pass the same slow reader for both so a
+    /// regression that moves the state read back onto the executor thread
+    /// blocks instead of silently succeeding.
+    fn sampled(spawn: SampledSpawnFn, inline: SpawnFn) -> Self {
+        Self {
+            spectrum_gate: SpectrumGate::new(),
+            state_gate: StateGate::new(),
+            control_gate: ControlGate::new(),
+            spawn: inline,
+            sampled: Some(SampledReads::new(spawn)),
         }
     }
 
     /// Production monitor spawning live `pactl`.
+    ///
+    /// State reads run on the off-thread sampler; spectrum stays the
+    /// fail-closed no-I/O sampler and control stays a bounded one-spawn call.
     pub fn live() -> Self {
-        Self::with_spawn(Rc::new(live_spawn))
+        Self {
+            sampled: Some(SampledReads::new(Arc::new(live_spawn))),
+            ..Self::with_spawn(Rc::new(live_spawn))
+        }
+    }
+
+    /// Whether state reads are sampled off the executor thread (tests).
+    ///
+    /// Pins the [`Self::live`] wiring: a regression that reverts the
+    /// production monitor to the synchronous reader fails
+    /// `live_monitor_samples_state_reads_off_thread`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn state_is_sampled(&self) -> bool {
+        self.sampled.is_some()
     }
 
     /// Serve `spectrum({ buckets })` with the 5 Hz / 32-bucket / 1 KiB gate.
@@ -554,6 +737,15 @@ impl AudioMonitor {
     }
 
     /// Serve `get()` with the 2 s read ceiling.
+    ///
+    /// On the live monitor the read itself happens off the executor thread
+    /// ([`SampledReads`]): this call never spawns or waits. The first poll
+    /// before a sample lands hides (a served snapshot is never fabricated),
+    /// a poll with an attempt in flight or not yet due serves last-good
+    /// through [`StateGate::serve_cached`], and a landed attempt is observed
+    /// through [`StateGate::observe`] under the same freshness, grace, and
+    /// hide rules as the synchronous reader. Injected (fixture) monitors
+    /// keep the synchronous path below.
     pub fn get(&mut self, now_ms: u64, granted: bool) -> Result<LuaValue, BridgeError> {
         if !granted {
             return Err(BridgeError::new(
@@ -561,6 +753,14 @@ impl AudioMonitor {
                 "E_SERVICE_RESOLUTION",
                 "audio.state is unavailable",
             ));
+        }
+        if let Some(sampled) = self.sampled.as_ref() {
+            let poll = match sampled.take(now_ms) {
+                Some((sample, landed_ms)) => self.state_gate.observe(now_ms, landed_ms, sample),
+                None => self.state_gate.serve_cached(now_ms),
+            }
+            .map_err(audio_error_to_gone)?;
+            return Ok(audio_state_to_lua(poll.state()));
         }
         let spawn = Rc::clone(&self.spawn);
         let poll = self
@@ -695,6 +895,25 @@ impl AudioHost {
     pub fn for_test(spawn: SpawnFn, initial_now_ms: u64) -> Self {
         Self {
             monitor: AudioMonitor::with_spawn(spawn),
+            start: Instant::now(),
+            manual_now_ms: Some(initial_now_ms),
+        }
+    }
+
+    /// Test host whose state reads are sampled off the caller's thread.
+    ///
+    /// Same off-thread shape as [`Self::live`] with an injected spawner, so
+    /// a test can prove a slow reader never blocks the plugin callback
+    /// (bitty#2425) without touching a real `pactl`.
+    #[must_use]
+    pub fn sampled_for_test(spawn: SampledSpawnFn, initial_now_ms: u64) -> Self {
+        // Mirror the reader into the inline slot: if a regression moves the
+        // state read back onto the executor thread, the injected latency is
+        // paid there and the activation budget catches it.
+        let inline_source = std::sync::Arc::clone(&spawn);
+        let inline: SpawnFn = Rc::new(move |argv: &[String]| inline_source(argv));
+        Self {
+            monitor: AudioMonitor::sampled(spawn, inline),
             start: Instant::now(),
             manual_now_ms: Some(initial_now_ms),
         }
@@ -878,6 +1097,16 @@ mod tests {
     }
 
     #[test]
+    fn live_monitor_samples_state_reads_off_thread() {
+        // bitty#2425 wiring pin: production must not run the blocking
+        // `pactl` read on the executor thread. A revert to `with_spawn`
+        // makes this false even though the sampled constructor still
+        // exists for tests.
+        assert!(AudioMonitor::live().state_is_sampled());
+        assert!(!AudioMonitor::with_spawn(absent_spawn()).state_is_sampled());
+    }
+
+    #[test]
     fn get_enforces_two_second_ceiling_on_live_path() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut monitor = AudioMonitor::with_spawn(fixture_spawn(Rc::clone(&log)));
@@ -895,6 +1124,124 @@ mod tests {
         // Past the ceiling: fresh read runs again.
         monitor.get(4000, true).expect("window reads");
         assert_eq!(log.borrow().len(), 6);
+    }
+
+    #[test]
+    fn sampled_get_never_blocks_and_serves_the_landed_sample() {
+        // bitty#2425 regression: a slow reader (three pactl spawns, 90 ms
+        // cold on the reference host) must never run on the caller's
+        // thread. The first get can only hide; if it had run the reader
+        // inline the sample would already be ready and it would serve.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let probed = std::sync::Arc::clone(&reads);
+        let spawn: SampledSpawnFn = std::sync::Arc::new(move |argv: &[String]| {
+            probed.fetch_add(1, Ordering::SeqCst);
+            // 100 ms per spawn: the composed read is 300 ms, six times the
+            // production RC-1 slice.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let text = argv.join(" ");
+            if text.contains("get-sink-volume") {
+                Ok(VOLUME_FIXTURE.to_string())
+            } else if text.contains("get-sink-mute") {
+                Ok(MUTE_FIXTURE.to_string())
+            } else if text.contains("list") {
+                Ok(SINKS_FIXTURE.to_string())
+            } else {
+                Err(AudioError::unavailable("unexpected argv in fixture"))
+            }
+        });
+        let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
+        let started = std::time::Instant::now();
+        let first = monitor.get(0, true);
+        assert!(
+            first.is_err(),
+            "the first get cannot serve before the off-thread read lands"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "get blocked for {:?} on a reader that takes 300 ms",
+            started.elapsed()
+        );
+        // The sampler lands within its bounded spawn budget; observe it
+        // through the same gate (volume fixture is 50%).
+        let mut served = None;
+        for tick in 0..200_u64 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Ok(value) = monitor.get(tick.saturating_mul(100), true) {
+                served = Some(value);
+                break;
+            }
+        }
+        let served = served.expect("the off-thread sample lands");
+        assert_eq!(served.get("volume_pct"), Some(&LuaValue::Integer(50)));
+        assert_eq!(
+            served.get("port"),
+            Some(&LuaValue::String("analog-output-headphones".to_string()))
+        );
+        assert!(
+            reads.load(Ordering::SeqCst) >= 3,
+            "one read is three spawns"
+        );
+    }
+
+    #[test]
+    fn sampled_get_runs_at_most_one_read_per_ceiling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let spawns = std::sync::Arc::new(AtomicUsize::new(0));
+        let probed = std::sync::Arc::clone(&spawns);
+        let spawn: SampledSpawnFn = std::sync::Arc::new(move |argv: &[String]| {
+            probed.fetch_add(1, Ordering::SeqCst);
+            let text = argv.join(" ");
+            if text.contains("get-sink-volume") {
+                Ok(VOLUME_FIXTURE.to_string())
+            } else if text.contains("get-sink-mute") {
+                Ok(MUTE_FIXTURE.to_string())
+            } else if text.contains("list") {
+                Ok(SINKS_FIXTURE.to_string())
+            } else {
+                Err(AudioError::unavailable("unexpected argv in fixture"))
+            }
+        });
+        let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
+        // First poll requests one read (three spawns) and hides.
+        let _ = monitor.get(1000, true);
+        // Bounded wait: a fixed sleep assumes the sampler thread is scheduled
+        // and runs three spawns within it, which a loaded shard does not
+        // guarantee. Poll with a deadline instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while spawns.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut served = None;
+        while served.is_none() && std::time::Instant::now() < deadline {
+            if let Ok(value) = monitor.get(2000, true) {
+                served = Some(value);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let served = served.expect("the landed sample serves");
+        assert_eq!(served.get("volume_pct"), Some(&LuaValue::Integer(50)));
+        let after_first = spawns.load(Ordering::SeqCst);
+        assert_eq!(after_first, 3, "one composed read");
+        // Over-poll inside the 2 s ceiling never touches the spawner, no
+        // matter how many calls a plugin makes.
+        for tick in 0..50_u64 {
+            let _ = monitor.get(2000 + tick, true);
+        }
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            3,
+            "over-poll performs no monitor work"
+        );
+        // Past the ceiling exactly one more read is requested.
+        let _ = monitor.get(2000 + STATE_MIN_INTERVAL_MS, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while spawns.load(Ordering::SeqCst) < 6 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 6, "one read per window");
     }
 
     #[test]

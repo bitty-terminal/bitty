@@ -147,6 +147,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.shell`          | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
+/// | `terminal.page_scroll_percent` | RestartRequired |
 /// | `terminal.cursor_style`         | RestartRequired    |
 /// | `terminal.bell`                 | RestartRequired    |
 /// | `selection.auto_copy`     | RestartRequired    |
@@ -297,6 +298,7 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "terminal.shell",
     "terminal.scroll_lines_per_notch",
     "terminal.scroll_pixels_per_notch",
+    "terminal.page_scroll_percent",
     "terminal.cursor_style",
     "terminal.bell",
     "selection.auto_copy",
@@ -612,6 +614,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.scroll_pixels_per_notch",
         old.terminal.scroll_pixels_per_notch.to_string(),
         new.terminal.scroll_pixels_per_notch.to_string(),
+    );
+    // Issue #2475: page-scroll distance is adopted with the runtime config at
+    // startup, like the scroll-speed leaves above.
+    push_if_changed(
+        "terminal.page_scroll_percent",
+        old.terminal.page_scroll_percent.to_string(),
+        new.terminal.page_scroll_percent.to_string(),
     );
     // CTX-0756 (issue #1359): cursor shape and bell behavior are adopted at
     // startup (RuntimeConfig is built once from the effective config and
@@ -1354,6 +1363,12 @@ mod tests {
             classify_field("terminal.scroll_pixels_per_notch"),
             ReloadClass::RestartRequired
         );
+        // Issue #2475: page-scroll distance is adopted from RuntimeConfig at
+        // startup, so it is restart-required like its sibling scroll leaves.
+        assert_eq!(
+            classify_field("terminal.page_scroll_percent"),
+            ReloadClass::RestartRequired
+        );
         // CTX-0756 (issue #1359): cursor shape and bell behavior are
         // adopted at startup (RuntimeConfig built once, terminals created
         // once), so changes are restart-required, not live.
@@ -1566,6 +1581,16 @@ mod tests {
             r2.diffs
                 .iter()
                 .any(|d| d.field == "terminal.scroll_pixels_per_notch")
+        );
+        // Issue #2475: the page-scroll percent diffs the same way.
+        let mut new3 = old.clone();
+        new3.terminal.page_scroll_percent = 50;
+        let r3 = diff(&old, &new3);
+        assert_eq!(r3.overall, ReloadClass::RestartRequired);
+        assert!(
+            r3.diffs
+                .iter()
+                .any(|d| d.field == "terminal.page_scroll_percent")
         );
     }
 

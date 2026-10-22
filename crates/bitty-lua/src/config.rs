@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
@@ -304,6 +304,10 @@ pub struct TerminalData {
     pub scroll_lines_per_notch: Option<i64>,
     /// Smooth-scroll pixels per wheel notch (present only when the key is set).
     pub scroll_pixels_per_notch: Option<i64>,
+    /// Page-scroll distance as a percentage of viewport rows (issue #2475;
+    /// present only when the key is set, raw integer bounds-checked downstream
+    /// in `bitty-config`).
+    pub page_scroll_percent: Option<i64>,
     /// Default cursor shape string (CTX-0756, issue #1359
     /// `terminal.cursor_style`; present only when the key is set, raw
     /// spelling validated downstream in `bitty-config`).
@@ -1677,6 +1681,7 @@ impl ConfigData {
                             "shell",
                             "scroll_lines_per_notch",
                             "scroll_pixels_per_notch",
+                            "page_scroll_percent",
                             "cursor_style",
                             "bell",
                         ],
@@ -1698,6 +1703,10 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("terminal.scroll_pixels_per_notch", v)?),
                         None => None,
                     };
+                    let page_scroll_percent = match get_field(nested, "page_scroll_percent") {
+                        Some(v) => Some(expect_integer("terminal.page_scroll_percent", v)?),
+                        None => None,
+                    };
                     let cursor_style = match get_field(nested, "cursor_style") {
                         Some(v) => Some(expect_string("terminal.cursor_style", v)?),
                         None => None,
@@ -1711,6 +1720,7 @@ impl ConfigData {
                         shell,
                         scroll_lines_per_notch,
                         scroll_pixels_per_notch,
+                        page_scroll_percent,
                         cursor_style,
                         bell,
                     });
@@ -2692,7 +2702,7 @@ mod tests {
                 appearance = { theme = "bitty-dark" },
                 font = { family = "JetBrains Mono", size = 13.0 },
                 window = { opacity = 0.95, padding = 8 },
-                terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
+                terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 60 },
             }"#,
         );
         assert_eq!(data.appearance_theme.as_deref(), Some("bitty-dark"));
@@ -2709,6 +2719,7 @@ mod tests {
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
         assert_eq!(term.scroll_lines_per_notch, Some(3));
         assert_eq!(term.scroll_pixels_per_notch, Some(16));
+        assert_eq!(term.page_scroll_percent, Some(60));
     }
 
     #[test]
@@ -2745,10 +2756,25 @@ mod tests {
         assert_eq!(term.shell, None);
         assert_eq!(term.scroll_lines_per_notch, None);
         assert_eq!(term.scroll_pixels_per_notch, None);
+        // Issue #2475: page-scroll percent is an optional extra too.
+        assert_eq!(term.page_scroll_percent, None);
         // CTX-0756 (issue #1359): cursor/bell leaves are optional extras
         // with the same absent-means-silent contract.
         assert_eq!(term.cursor_style, None);
         assert_eq!(term.bell, None);
+    }
+
+    #[test]
+    fn terminal_page_scroll_percent_extracts_and_rejects_non_integer() {
+        // Issue #2475: the raw integer rides through the Lua extractor;
+        // non-integers are shape errors naming the field (range validation
+        // lives downstream in `bitty-config`).
+        let data =
+            eval_ok(r#"return { terminal = { scrollback = 10000, page_scroll_percent = 50 } }"#);
+        assert_eq!(data.terminal.unwrap().page_scroll_percent, Some(50));
+        let err =
+            eval_err(r#"return { terminal = { scrollback = 10000, page_scroll_percent = 50.5 } }"#);
+        assert!(err.contains("terminal.page_scroll_percent"), "{err}");
     }
 
     #[test]

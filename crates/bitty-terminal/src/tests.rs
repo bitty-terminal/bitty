@@ -4108,6 +4108,52 @@ fn runtime_config_inherits_file_scroll_speed() {
 }
 
 #[test]
+fn runtime_config_inherits_file_page_scroll_percent() {
+    // Issue #2475: `terminal.page_scroll_percent` flows file -> effective ->
+    // runtime; the crate defaults stay equal (bitty-runtime must not depend
+    // on bitty-config, so the pairing is pinned here).
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_PAGE_SCROLL_PERCENT,
+        bitty_config::types::DEFAULT_PAGE_SCROLL_PERCENT
+    );
+    assert_eq!(
+        bitty_runtime::config::MIN_PAGE_SCROLL_PERCENT,
+        bitty_config::types::MIN_PAGE_SCROLL_PERCENT
+    );
+    assert_eq!(
+        bitty_runtime::config::MAX_PAGE_SCROLL_PERCENT,
+        bitty_config::types::MAX_PAGE_SCROLL_PERCENT
+    );
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { terminal = { scrollback = 10000, page_scroll_percent = 50 } }"#,
+        &src,
+    )
+    .expect("page scroll percent parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(merged.effective.terminal.page_scroll_percent, 50);
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.page_scroll_percent, 50);
+    // Absent key rides the default end to end.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+        .expect("minimal terminal parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert_eq!(
+        cfg2.page_scroll_percent,
+        bitty_runtime::config::DEFAULT_PAGE_SCROLL_PERCENT
+    );
+}
+
+#[test]
 fn runtime_config_inherits_file_scrollback() {
     // CTX-0297: `terminal.scrollback` flows file -> effective -> runtime
     // and bounds retained history at terminal creation. The runtime

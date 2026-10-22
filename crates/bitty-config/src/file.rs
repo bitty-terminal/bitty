@@ -45,7 +45,7 @@
 //!     -- missing/unreadable files fail closed. `blur_radius` is recognized
 //!     -- only as 0 (OQ-038: background blur has no accepted design); a
 //!     -- positive value fails closed instead of being a silent no-op.
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, cursor_style = "steady_bar", bell = "visual" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
@@ -137,7 +137,8 @@
 //!   `blur_radius` is schema-present but OQ-038 accepts only 0),
 //!   `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
-//!   `scroll_pixels_per_notch`, `cursor_style`, `bell` optional, defaulting to
+//!   `scroll_pixels_per_notch`, `page_scroll_percent`, `cursor_style`,
+//!   `bell` optional, defaulting to
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent:
 //!   `cursor_style` is one of `"default"` (renderer block fallback) |
 //!   `"blinking_block"` | `"steady_block"` | `"blinking_underline"` |
@@ -1650,6 +1651,29 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         v as u32
                     }
                 };
+                // Issue #2475: page-scroll distance is an optional extra like
+                // the scroll-speed leaves above; absent inherits the type
+                // default, present values are range-checked fail-closed and
+                // again by `TerminalConfig::validate`.
+                let page_scroll_percent = match t.page_scroll_percent {
+                    None => defaults.page_scroll_percent,
+                    Some(v) => {
+                        if !((crate::types::MIN_PAGE_SCROLL_PERCENT as i64)
+                            ..=(crate::types::MAX_PAGE_SCROLL_PERCENT as i64))
+                            .contains(&v)
+                        {
+                            return Err(ConfigError::validation(
+                                "terminal.page_scroll_percent",
+                                format!(
+                                    "must be within [{}, {}] (found {v})",
+                                    crate::types::MIN_PAGE_SCROLL_PERCENT,
+                                    crate::types::MAX_PAGE_SCROLL_PERCENT
+                                ),
+                            ));
+                        }
+                        v as u32
+                    }
+                };
                 // CTX-0756 (issue #1359): cursor shape and bell behavior are
                 // optional closed-enum leaves following the table-present
                 // convention of the scroll-speed leaves above: absent
@@ -1688,6 +1712,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     shell: t.shell,
                     scroll_lines_per_notch,
                     scroll_pixels_per_notch,
+                    page_scroll_percent,
                     cursor_style,
                     bell,
                 })
@@ -3045,6 +3070,11 @@ mod tests {
             term.scroll_pixels_per_notch,
             crate::types::DEFAULT_SCROLL_PIXELS_PER_NOTCH
         );
+        // Issue #2475: page scroll percent absent -> default 75.
+        assert_eq!(
+            term.page_scroll_percent,
+            crate::types::DEFAULT_PAGE_SCROLL_PERCENT
+        );
         let maps = plan.keymaps.unwrap();
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].chord, "alt+h");
@@ -3136,24 +3166,31 @@ mod tests {
     fn lua_terminal_scroll_speed_parses_and_validates() {
         // CTX-0185: explicit scroll keys parse; out-of-range fails closed
         // with the field path (never the value beyond the offending line).
+        // Issue #2475: page scroll percent follows the same optional extra
+        // shape with a 10..=100 range.
         let plan = parse_lua_config(
-            r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 5, scroll_pixels_per_notch = 24 } }"#,
+            r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 5, scroll_pixels_per_notch = 24, page_scroll_percent = 50 } }"#,
             &test_source(),
         )
         .expect("scroll keys parse");
         let term = plan.terminal.unwrap();
         assert_eq!(term.scroll_lines_per_notch, 5);
         assert_eq!(term.scroll_pixels_per_notch, 24);
+        assert_eq!(term.page_scroll_percent, 50);
         for bad in [
             r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 0 } }"#,
             r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 33 } }"#,
             r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 0 } }"#,
             r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 257 } }"#,
+            r#"return { terminal = { scrollback = 10000, page_scroll_percent = 9 } }"#,
+            r#"return { terminal = { scrollback = 10000, page_scroll_percent = 101 } }"#,
         ] {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("scroll_lines_per_notch") || msg.contains("scroll_pixels_per_notch"),
+                msg.contains("scroll_lines_per_notch")
+                    || msg.contains("scroll_pixels_per_notch")
+                    || msg.contains("page_scroll_percent"),
                 "must name the field: {msg}"
             );
         }
@@ -5647,6 +5684,36 @@ mod tests {
                 r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 257 } }"#
                     .to_string(),
                 Some("terminal.scroll_pixels_per_notch"),
+            ),
+            (
+                "page_scroll low",
+                r#"return { terminal = { scrollback = 10000, page_scroll_percent = 9 } }"#
+                    .to_string(),
+                Some("terminal.page_scroll_percent"),
+            ),
+            (
+                "page_scroll min",
+                r#"return { terminal = { scrollback = 10000, page_scroll_percent = 10 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "page_scroll default",
+                r#"return { terminal = { scrollback = 10000, page_scroll_percent = 75 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "page_scroll max",
+                r#"return { terminal = { scrollback = 10000, page_scroll_percent = 100 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "page_scroll high",
+                r#"return { terminal = { scrollback = 10000, page_scroll_percent = 101 } }"#
+                    .to_string(),
+                Some("terminal.page_scroll_percent"),
             ),
             (
                 "gaps_in low",

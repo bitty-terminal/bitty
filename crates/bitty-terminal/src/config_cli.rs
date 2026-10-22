@@ -705,8 +705,12 @@ pub(crate) fn starter_init_lua() -> &'static str {
      --\n\
      -- Mouse select auto-copies to the clipboard by default (ghostty-class\n\
      -- copy-on-select, syncs primary on Linux). Uncomment to opt out: the\n\
-     -- highlight stays and only Ctrl+Shift+C copies.\n\
+     \x20\x20-- Highlight stays and only Ctrl+Shift+C copies.\n\
      -- selection = { auto_copy = false },\n\
+     \x20\x20-- Page scroll (Alt+u / Alt+i) moves 75% of the viewport by\n\
+     \x20\x20-- default so context stays visible; 10..=100 keeps more or\n\
+     \x20\x20-- pages a full screen. `terminal` also needs `scrollback`.\n\
+     \x20\x20-- terminal = { scrollback = 10000, page_scroll_percent = 75 },\n\
      return {\n\
      \x20\x20theme = \"dark\",\n\
      \x20\x20-- Hyprland-like panel gaps in cells (0 = edge-to-edge tiling).\n\
@@ -997,6 +1001,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "terminal.scroll_pixels_per_notch",
                         format!("{}", e.terminal.scroll_pixels_per_notch),
                         &src("terminal.scroll_pixels_per_notch")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "terminal.page_scroll_percent",
+                        format!("{}", e.terminal.page_scroll_percent),
+                        &src("terminal.page_scroll_percent")
                     )
                 );
                 println!(
@@ -1823,6 +1835,11 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         // CTX-0370: the close-confirmation mode rides the validated runtime
         // config (same post-construction pattern as hover-focus).
         cfg.close_confirm = close_confirm;
+        // Issue #2475: `terminal.page_scroll_percent` rides the validated
+        // runtime config (same post-construction pattern as hover-focus);
+        // `bitty-config` and `RuntimeConfig::validate` both enforce
+        // `10..=100`.
+        cfg.page_scroll_percent = effective.terminal.page_scroll_percent;
         // CTX-0292: Core-owned workspace decoration is carried onto the
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).

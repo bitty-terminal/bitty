@@ -89,6 +89,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
+        | "terminal.page_scroll_percent"
         | "terminal.cursor_style"
         | "terminal.bell"
         | "selection.auto_copy"
@@ -766,6 +767,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "terminal.shell",
     "terminal.scroll_lines_per_notch",
     "terminal.scroll_pixels_per_notch",
+    "terminal.page_scroll_percent",
     "terminal.cursor_style",
     "terminal.bell",
     "terminal",
@@ -1228,6 +1230,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 "terminal.shell",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
+                "terminal.page_scroll_percent",
                 "terminal.cursor_style",
                 "terminal.bell",
             ] {
@@ -1256,6 +1259,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     }
                     "terminal.scroll_pixels_per_notch" => {
                         effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
+                    "terminal.page_scroll_percent" => {
+                        effective.terminal.page_scroll_percent = term.page_scroll_percent;
                     }
                     "terminal.cursor_style" => {
                         effective.terminal.cursor_style = term.cursor_style;
@@ -2870,6 +2876,7 @@ fn merge_layers_allow_policy_violations(
                 "terminal.shell",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
+                "terminal.page_scroll_percent",
                 "terminal.cursor_style",
                 "terminal.bell",
             ] {
@@ -2898,6 +2905,9 @@ fn merge_layers_allow_policy_violations(
                     }
                     "terminal.scroll_pixels_per_notch" => {
                         effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
+                    "terminal.page_scroll_percent" => {
+                        effective.terminal.page_scroll_percent = term.page_scroll_percent;
                     }
                     "terminal.cursor_style" => {
                         effective.terminal.cursor_style = term.cursor_style;
@@ -5073,6 +5083,12 @@ mod tests {
             merge_class_for("terminal.scroll_pixels_per_notch"),
             Some(MergeClass::ScalarReplace)
         );
+        // Issue #2475: page-scroll percent joins the terminal scalar-replace
+        // leaves.
+        assert_eq!(
+            merge_class_for("terminal.page_scroll_percent"),
+            Some(MergeClass::ScalarReplace)
+        );
         // CTX-0756 (issue #1359): cursor shape and bell behavior are
         // scalar-replace leaves under `terminal`, like the scroll-speed keys.
         assert_eq!(
@@ -5136,6 +5152,7 @@ mod tests {
                     shell: None,
                     scroll_lines_per_notch: 5,
                     scroll_pixels_per_notch: 24,
+                    page_scroll_percent: 50,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -5149,6 +5166,7 @@ mod tests {
                     shell: None,
                     scroll_lines_per_notch: 2,
                     scroll_pixels_per_notch: 8,
+                    page_scroll_percent: 100,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -5157,6 +5175,7 @@ mod tests {
         let merged = merge_layers(vec![user, cli]).expect("merge");
         assert_eq!(merged.effective.terminal.scroll_lines_per_notch, 2);
         assert_eq!(merged.effective.terminal.scroll_pixels_per_notch, 8);
+        assert_eq!(merged.effective.terminal.page_scroll_percent, 100);
         assert_eq!(
             merged
                 .source_of("terminal.scroll_lines_per_notch")

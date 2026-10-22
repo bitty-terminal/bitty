@@ -1749,14 +1749,17 @@ impl Runtime {
         }
     }
 
-    /// Scrolls the focused pane by one viewport page (its row count): up
-    /// into scrollback history or down toward live (CTX-0178 Alt+U/I,
-    /// less-like paging behind the `scroll_page_up`/`scroll_page_down`
-    /// chrome actions). Clamped to `[0, scrollback_len]`; bounded to one
-    /// leaf mutation plus a redraw flag. Returns false only when no leaf
-    /// holds the focused id (empty or stale layout). #1338: inert on the
-    /// alternate screen (no scrollback view there), and clamped to the
-    /// focused pane's own backing store under splits.
+    /// Scrolls the focused pane by one viewport page, where a page is
+    /// `terminal.page_scroll_percent` of its row count (default 75%, issue
+    /// #2475): up into scrollback history or down toward live (CTX-0178
+    /// Alt+U/I, less-like paging behind the `scroll_page_up`/
+    /// `scroll_page_down` chrome actions). The distance is
+    /// `max(1, rows * percent / 100)` with integer math (saturating), then
+    /// clamped to `[0, scrollback_len]`; bounded to one leaf mutation plus a
+    /// redraw flag. Returns false only when no leaf holds the focused id
+    /// (empty or stale layout). #1338: inert on the alternate screen (no
+    /// scrollback view there), and clamped to the focused pane's own backing
+    /// store under splits.
     pub fn scroll_focused_page(&mut self, up: bool) -> bool {
         // #1338 fail-closed: zero bound on the alternate screen, so paging
         // is a no-op there; focused-aware bound under splits.
@@ -1772,9 +1775,16 @@ impl Runtime {
         let old_offset = self
             .find_view(target)
             .map_or(0, |view| view.scroll_offset());
+        // Issue #2475: 75% by default keeps context on screen; a tiny
+        // viewport still pages at least one row.
+        let percent = self.config.page_scroll_percent as usize;
         let scrolled = match self.find_view_mut(target) {
             Some(view) => {
-                let page = usize::from(view.rows()).max(1) as isize;
+                let page = usize::from(view.rows())
+                    .saturating_mul(percent)
+                    .saturating_div(100)
+                    .max(1);
+                let page = isize::try_from(page).unwrap_or(isize::MAX);
                 view.scroll_by(if up { page } else { -page }, max);
                 true
             }

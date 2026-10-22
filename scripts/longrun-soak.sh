@@ -79,6 +79,7 @@ APP_PID=""
 APP_PGID=""
 SOCK=""
 TERMINAL_ID=""
+SHELL_PID=""
 SAMPLES=0
 STALL_REPORTS=0
 LIVENESS_TIMEOUTS=0
@@ -366,6 +367,9 @@ focus_primary() {
   TERMINAL_ID="$(printf '%s' "$terminals" |
     jq -r --arg v "$view" '(.result // .) | .diagnostics[]? | select(.view_id == $v) | .terminal_id' 2>/dev/null |
     head -n1 || true)"
+  SHELL_PID="$(printf '%s' "$terminals" |
+    jq -r --arg v "$view" '(.result // .) | .diagnostics[]? | select(.view_id == $v) | .child_pid' 2>/dev/null |
+    head -n1 || true)"
   if [ -z "$TERMINAL_ID" ]; then
     printf 'view=%s\nterminals=%s\n' "$view" "$terminals" >"$OUT_DIR/focus-debug.txt"
     return 1
@@ -374,7 +378,11 @@ focus_primary() {
 
 send_text() {
   [ -n "$TERMINAL_ID" ] || return 1
-  ctl terminal send "$TERMINAL_ID" "$1" >/dev/null 2>&1
+  local out
+  if ! out="$(ctl terminal send "$TERMINAL_ID" "$1" 2>&1)"; then
+    printf 'send failed term=%s: %s\n' "$TERMINAL_ID" "$out" >>"$OUT_DIR/send-errors.txt"
+    return 1
+  fi
 }
 
 burst_output() {
@@ -457,14 +465,43 @@ capture_stall_evidence() {
 
 stall_probe() {
   echo "stall-probe: starting a raw-mode child that stops reading stdin"
+  {
+    echo "view=$(ctl --format json view list 2>&1 || true)"
+    echo "term=$(ctl --format json terminal list 2>&1 || true)"
+    echo "text_before=$(ctl terminal text "$TERMINAL_ID" 2>&1 | tail -3 || true)"
+  } >"$OUT_DIR/probe-debug.txt"
   # Settle any pending prompt input, then run the child with a raw line
   # discipline: canonical mode buffers far past the probe payload on this
   # kernel, raw mode is the bounded queue the owner's freeze reports.
   send_text $'\x03' || true
   send_text $'\r' || true
   sleep 1
-  send_text $'sh -c \'stty raw -echo; sleep 900\'\r' || true
-  sleep 1
+  send_text "sh -c 'stty raw -echo; exec sleep 900'"$'\r' || true
+  # Do not burst until the child proves it is running with a raw line
+  # discipline; a burst into a still-cooked prompt would silently pass.
+  # The process table is the reliable signal here: grid text extraction is
+  # presentation-dependent, and a no-WM Xvfb session may not present.
+  local ready=0 attempt=0
+  while [ "$attempt" -lt 40 ]; do
+    if [ -n "$SHELL_PID" ] && ps --ppid "$SHELL_PID" -o args= 2>/dev/null | grep -qF 'sleep 900'; then
+      ready=1
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+  if [ "$ready" -ne 1 ]; then
+    PROBE_RESULT="inconclusive"
+    {
+      echo "term=$TERMINAL_ID shell=$SHELL_PID"
+      echo "--- terminal text tail ---"
+      ctl terminal text "$TERMINAL_ID" 2>&1 | tail -20 || true
+      echo "--- bitty log tail ---"
+      tail -12 "$OUT_DIR/bitty.log"
+    } >>"$OUT_DIR/probe-debug.txt"
+    echo "stall-probe: INCONCLUSIVE (non-reading child never started)"
+    return
+  fi
   local i rc start_ms end_ms blocked=0
   for i in $(seq 1 "$PROBE_WRITES"); do
     start_ms="$(now_ms)"
@@ -568,17 +605,24 @@ run_live() {
     status=1
   fi
   if [ "$STALL_PROBE" -eq 1 ]; then
-    if [ "$EXPECT_STALL" -eq 1 ]; then
-      [ "$PROBE_RESULT" = "blocked" ] || {
-        echo "longrun-soak: FAIL expected a captured stall, probe=$PROBE_RESULT" >&2
-        status=1
-      }
-    else
-      [ "$PROBE_RESULT" = "pass" ] || {
+    case "$PROBE_RESULT" in
+    blocked)
+      if [ "$EXPECT_STALL" -ne 1 ]; then
         echo "longrun-soak: FAIL stall probe blocked (issue #2457 class)" >&2
         status=1
-      }
-    fi
+      fi
+      ;;
+    pass)
+      if [ "$EXPECT_STALL" -eq 1 ]; then
+        echo "longrun-soak: FAIL expected a captured stall, probe=pass" >&2
+        status=1
+      fi
+      ;;
+    *)
+      echo "longrun-soak: FAIL stall probe inconclusive (child never started)" >&2
+      status=1
+      ;;
+    esac
   fi
   {
     echo "samples=$SAMPLES"

@@ -807,6 +807,37 @@ fn modifier_chords_are_never_absorbed_by_the_claim() {
 }
 
 #[test]
+fn unrelated_modifier_release_does_not_spend_the_claim() {
+    // Only Shift is the fcitx5 input-method toggle. A Ctrl/Alt release around
+    // a normal composition commit must not clear the claim before the raw
+    // committing key echo arrives.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+    rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+    rt.drain_pending_input();
+    for state in [PressState::Pressed, PressState::Released] {
+        let event = KeyEvent {
+            logical_key: LogicalKey::Named(NamedKey::Control),
+            text: None,
+            location: KeyLocation::Left,
+            state,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert!(rt.handle_key_event(event).is_none());
+    }
+    assert!(
+        rt.handle_key_event(char_key("a")).is_none(),
+        "a Ctrl release must not spend a non-modifier commit claim"
+    );
+    assert!(
+        rt.handle_key_event(char_key("b")).is_some(),
+        "claim is one-shot"
+    );
+}
+
+#[test]
 fn non_ime_typing_is_untouched_across_frames() {
     // No IME event at all: every key is real input, spaces included, and a
     // frame between keys changes nothing.

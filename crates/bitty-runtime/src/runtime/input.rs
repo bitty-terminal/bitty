@@ -209,8 +209,15 @@ impl Runtime {
             // copy may still be in flight (see the existing chord contract).
             if is_modifier
                 && event.state == PressState::Released
+                && matches!(
+                    event.logical_key,
+                    bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Shift)
+                )
                 && matches!(self.ime_key_claim, ImeKeyClaim::CommitKey { .. })
             {
+                // fcitx5 toggles the input method on Shift; a Ctrl/Alt
+                // release around a normal commit must not clear the claim
+                // before that commit's raw echo lands.
                 self.ime_key_claim = ImeKeyClaim::Free;
             }
             return false;

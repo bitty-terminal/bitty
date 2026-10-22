@@ -1207,7 +1207,10 @@ fn zero_duration_trigger_does_not_evict_a_live_bounds_tween() {
             start
         ));
     }
-    let now = Instant::now();
+    // Use the same logical instant as the armed tween: taking a fresh
+    // wall-clock sample here made the assertion fail when CI spent >120 ms
+    // in the loop (Linux Wayland flake on 39795616503).
+    let now = start;
     assert!(
         !rt.trigger_animation(AnimationKind::Focus, Some(ViewId::new(999)), now),
         "zero-duration focus never arms"

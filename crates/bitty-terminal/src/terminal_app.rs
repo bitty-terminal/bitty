@@ -15,6 +15,7 @@ use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
 use crate::spawn::SpawnSpec;
+use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
 
 /// Window title carrying the resolved theme preset and its source layer.
 ///
@@ -616,6 +617,13 @@ pub(crate) struct TerminalApp {
     pub(crate) _pty_thread: Option<JoinHandle<()>>,
     /// Count of `tick` calls that presented a frame.
     pub(crate) presented_frames: u64,
+    /// Opt-in main-loop stall watchdog (issue #2483).
+    ///
+    /// `None` unless `BITTY_STALL_WATCHDOG` opted in, so CI, headless smoke
+    /// runs, and normal sessions spawn no monitor thread and emit nothing.
+    /// Phase marks are observability only: they never alter routing, timing,
+    /// or runtime state.
+    pub(crate) stall_watchdog: Option<StallWatchdog>,
     /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
     pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -788,6 +796,7 @@ impl TerminalApp {
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
+            stall_watchdog: StallWatchdog::from_env(),
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -834,6 +843,7 @@ impl TerminalApp {
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
+            stall_watchdog: StallWatchdog::from_env(),
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -935,6 +945,74 @@ impl TerminalApp {
             SessionSaveLogClass::Info => crate::logging::info(|| line),
             SessionSaveLogClass::Warn => crate::logging::warn(|| line),
         }
+    }
+
+    /// Mark the active main-loop phase for the opt-in stall watchdog.
+    ///
+    /// One relaxed store plus a timestamp when enabled; a leaked null check
+    /// when disabled. Never changes control flow.
+    fn watchdog_phase(&self, phase: Phase) {
+        if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.enter(phase);
+        }
+    }
+
+    /// Tell the watchdog the loop is parked in `ControlFlow::Wait`, so a quiet
+    /// window is not a stall.
+    fn watchdog_idle(&self) {
+        if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.idle();
+        }
+    }
+
+    /// Publish the identifiers a stall report should name.
+    ///
+    /// Throttled cold-path sample (at most once per 500 ms): reads committed
+    /// runtime state and the bounded discovery/band lists, so the monitor
+    /// thread never touches a live `Runtime` or plugin VM.
+    fn refresh_watchdog_context(&self) {
+        let Some(watchdog) = self.stall_watchdog.as_ref() else {
+            return;
+        };
+        // Sampling allocates the bounded id lists, so the watchdog throttles
+        // it: at most one sample per 500 ms, and never when disabled.
+        if !watchdog.context_due() {
+            return;
+        }
+        let discovered = self
+            .plugin_runtime
+            .as_ref()
+            .map(|runtime| runtime.discovered_ids())
+            .unwrap_or_default();
+        let plugin_count = discovered.len();
+        let plugin_ids = discovered
+            .into_iter()
+            .take(8)
+            .map(|id| id.as_str().to_string())
+            .collect();
+        let bands = self.runtime.chrome_bands();
+        let band_count =
+            bands.top.len() + bands.bottom.len() + bands.left.len() + bands.right.len();
+        let band_plugin_ids = bands
+            .top
+            .iter()
+            .chain(bands.bottom.iter())
+            .chain(bands.left.iter())
+            .chain(bands.right.iter())
+            .take(8)
+            .map(|band| band.plugin_id.clone())
+            .collect();
+        watchdog.update_context(WatchdogContext {
+            focused_view: self.runtime.focused_view().map(|view| view.0),
+            leaf_count: self.runtime.leaf_count(),
+            pane_count: self.runtime.pane_session_ids().len(),
+            scrollback_lines: self.runtime.scrollback_len(),
+            plugin_count,
+            plugin_ids,
+            band_count,
+            band_plugin_ids,
+            presented_frames: self.presented_frames,
+        });
     }
 
     /// Sets the window opacity applied at creation and GPU attach
@@ -1386,6 +1464,10 @@ impl TerminalApp {
     }
 
     pub(crate) fn drive_tick(&mut self) -> Option<bitty_runtime::PresentStats> {
+        // Issue #2483: phase marks are watchdog-only observability. They cost
+        // one relaxed store when opted in and nothing when disabled.
+        self.watchdog_phase(Phase::CtlDrain);
+        self.refresh_watchdog_context();
         // CTX-0171: drain IPC runtime-control queue before present so
         // `bitty ctl` mutations (send/split/focus/close/spawn/reload) apply
         // on the main thread — the sole `Runtime` owner — with server-side
@@ -1415,6 +1497,7 @@ impl TerminalApp {
         // Issue #1828: an applied reload also stages a coalesced
         // `config.reloaded` edge for the plugin trace path below (at most
         // one per tick; only `applied` reloads emit).
+        self.watchdog_phase(Phase::ConfigPoll);
         if let Some(info) = crate::config_reload::poll_file(&mut self.runtime) {
             if info.applied && info.kind == "applied" {
                 self.pending_config = Some(PendingConfigReload {
@@ -1439,6 +1522,7 @@ impl TerminalApp {
                 });
             }
         }
+        self.watchdog_phase(Phase::PluginWorkspace);
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();
@@ -1464,6 +1548,7 @@ impl TerminalApp {
         // path does bounded bookkeeping (one broker poll per tick) and no VM
         // work on the input hot path.
         self.pump_component_requests();
+        self.watchdog_phase(Phase::PluginTimers);
         // CTX-1244 (issue #2107): fire due one-shot plugin timers before
         // present, so a timer callback's `bitty.ui.update` lands in
         // `update_chrome_bands` on this same tick and presents while idle.
@@ -1475,14 +1560,18 @@ impl TerminalApp {
         // pump runs only from the `AboutToWait` arm after this tick returns
         // (see `pump_cold_commands`), so redraw, PTY-readable, resize, and
         // appearance arms never enter an owning plugin VM.
+        self.watchdog_phase(Phase::ChromeBands);
         // CTX-0911 (issue #1570): read mounted UiBlocks from plugin runtime,
         // convert to ChromeBands, and push into Runtime before present so
         // bands render on this frame.
         self.update_chrome_bands();
+        self.refresh_watchdog_context();
+        self.watchdog_phase(Phase::PluginNotifications);
         // CTX-1033 (issue #1827): drain grant-gated plugin notifications
         // into the bounded banner surface before present, so a
         // `bitty.notify.show` from this tick's window paints on this frame.
         self.drain_plugin_notifications();
+        self.watchdog_phase(Phase::Overlays);
         // CTX-0943 (W-28 follow-up): enforce the 30s transient timeout, then
         // sync the overlay surface to the (possibly revoked) owner before
         // present so a timed-out session clears on this frame. Both are
@@ -1510,6 +1599,7 @@ impl TerminalApp {
         // revalidate and skips hover paints while suppressed.
         self.runtime
             .set_hover_suppressed_by_overlay(self.overlay_capture_active());
+        self.watchdog_phase(Phase::ColdEvents);
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -1517,8 +1607,12 @@ impl TerminalApp {
         // is sanitized and change-gated; the other events stay telemetry.
         self.apply_cold_events();
         // Ensure replies that were queued before tick are flushed before present:
-        // the runtime's tick consumes snapshot+damage and composites.
+        // the runtime's tick consumes snapshot+damage and composites. Issue
+        // #2483 deliberately leaves this whole call under one phase: a stall
+        // inside compose/present reports as `runtime-tick`, the ANR shape.
+        self.watchdog_phase(Phase::RuntimeTick);
         let stats = self.runtime.tick();
+        self.watchdog_phase(Phase::SnapshotPublish);
         // CTX-0481 (#762): after the tick commits, publish the live plugin
         // snapshot so plugins observe the committed generation instead of a
         // frozen generation-1 view. Monotonic: a regression is refused by
@@ -1526,12 +1620,14 @@ impl TerminalApp {
         if let Some(snapshot) = self.live_snapshot.as_ref() {
             snapshot.publish(&self.runtime);
         }
+        self.watchdog_phase(Phase::HistoryCapture);
         // CTX-1352: sample newly completed scrollback lines into the bounded,
         // already-redacted transcript ring. Sampling is idempotent per line id
         // and opt-in gated inside the provider.
         if let Some(history) = self.live_history.as_ref() {
             crate::plugin_runtime::capture_history(&self.runtime, history);
         }
+        self.watchdog_phase(Phase::CursorSync);
         // CTX-0367: the presented frame refreshed the focused caret; forward
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
@@ -1565,6 +1661,7 @@ impl TerminalApp {
                     String::from("warning: terminal reply queue overflowed (bounded cap)")
                 });
             }
+            self.watchdog_phase(Phase::ReplyFlush);
             // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
             // When no writer is present (headless), replies stay queued for `take_replies` observation.
             let written = self.runtime.write_replies();
@@ -1584,6 +1681,7 @@ impl TerminalApp {
                 );
             }
         }
+        self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
         // present, IME sync, and the PTY reply flush, so a slow Lua handler
         // never delays terminal replies or the frame.
@@ -3626,8 +3724,19 @@ impl AppHandler for TerminalApp {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
+        // Issue #2483: mark the event as active before any routing so a stall
+        // in this handler names the loop, not the previous idle state.
+        self.watchdog_phase(Phase::Event);
+        self.handle_event_inner(ctx, event);
+    }
+}
+
+impl TerminalApp {
+    /// Event-handler body; the `AppHandler` wrapper owns the watchdog mark.
+    fn handle_event_inner(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
         // Bounded PTY pump: drain before handling the event so fresh bytes are
         // visible to the state machine before the tick.
+        self.watchdog_phase(Phase::PtyPump);
         self.poll_pty_pump();
 
         // CTX-0943 (CodeRabbit PR #1643): expire captures before routing so
@@ -3639,6 +3748,7 @@ impl AppHandler for TerminalApp {
         // split pane sessions. When a split child exits, its pane is closed
         // and its sibling promoted. When the last child exits, the session
         // closes cleanly.
+        self.watchdog_phase(Phase::Reap);
         if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
             self.save_session_best_effort("shell-exit");
             self.runtime.shutdown();
@@ -3652,6 +3762,7 @@ impl AppHandler for TerminalApp {
         // plugin (inert, deny-by-default) > terminal encoding. A consumed
         // event never reaches `Runtime`.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
+            self.watchdog_phase(Phase::ChromeIntercept);
             if self.intercept_chrome_key(kind) {
                 // Issue #1783: a last-pane `close_view` that confirms the
                 // window-close gate requests exit here (single exit owner:
@@ -3718,9 +3829,11 @@ impl AppHandler for TerminalApp {
             },
             _ => None,
         };
+        self.watchdog_phase(Phase::RouteEvent);
         let should_exit = self.runtime.handle_platform_event(event.clone());
         if should_exit {
             crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
+            self.watchdog_phase(Phase::Shutdown);
             self.save_session_best_effort("exit");
             self.runtime.shutdown();
             ctx.exit();
@@ -3828,6 +3941,7 @@ impl AppHandler for TerminalApp {
                         .with_opacity(self.window.opacity)
                         .with_blur_radius(self.window.blur_radius)
                         .with_visible(true);
+                    self.watchdog_phase(Phase::WindowCreate);
                     match ctx.create_window(config) {
                         Ok(handle) => {
                             let id = handle.id();
@@ -3944,7 +4058,9 @@ impl AppHandler for TerminalApp {
                 // Per winit docs this is a good place to do per-frame work.
                 // Poll PTY pump again and drive tick; request redraw only when
                 // tick produced a present (frame-on-demand).
+                self.watchdog_phase(Phase::PtyPump);
                 self.poll_pty_pump();
+                self.watchdog_phase(Phase::Reap);
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");
                     self.runtime.shutdown();
@@ -3958,6 +4074,7 @@ impl AppHandler for TerminalApp {
                 // commands. Redraw/PTY-readable/resize/appearance arms never
                 // reach this pump.
                 let presented = self.drive_tick().is_some();
+                self.watchdog_phase(Phase::ColdCommands);
                 let delivered = self.pump_cold_commands();
                 if presented || delivered > 0 {
                     if let Some(win) = self.window.handle.as_ref() {
@@ -4027,6 +4144,9 @@ impl AppHandler for TerminalApp {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),
                 }
+                // Armed wait: a quiet window is expected, not a stall. The
+                // next delivered event marks the loop active again.
+                self.watchdog_idle();
             }
             PlatformEvent::PtyReadable => {
                 // Evented PTY wakeup: the top-of-handler `poll_pty_pump`

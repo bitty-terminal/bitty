@@ -438,7 +438,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies
@@ -513,6 +513,16 @@ perf-real-soak-run out *args:
 
 real-render-soak-test:
     bash scripts/tests/real-render-soak.test.sh
+
+# Long-run stability soak (issue #2483, CTX-2466). Isolated Xvfb display and
+# XDG roots, opt-in stall watchdog, liveness probe every sample, bounded
+# output/image/input/resize stages. `--stall-probe` reproduces the blocking
+# PTY-write class (issue #2457). Evidence stays in gitignored recording/.
+longrun-soak *args:
+    bash scripts/longrun-soak.sh {{args}}
+
+longrun-soak-test:
+    bash scripts/tests/longrun-soak.test.sh
 
 # Daily-driver dogfood session planner (CTX-0643, PERF-10). Headless-safe:
 # loads the clamped session config, prints the bounded cycle plan and the

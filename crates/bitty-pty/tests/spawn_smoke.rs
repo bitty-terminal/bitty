@@ -183,6 +183,94 @@ fn cat_echo_resize_and_graceful_shutdown() {
     reader.join().expect("pump ended cleanly at EOF");
 }
 
+/// bitty#2446 review F1: the queue bound must accept the largest legitimate
+/// producer frame — 64 KiB of composer content plus the 13 bytes of
+/// bracketed-paste framing (`ESC[200~` + `ESC[201~` + `CR`) — and actually
+/// deliver every byte to an idle child.
+///
+/// Raw mode (`stty raw`) is required for byte-exact accounting: canonical
+/// mode echoes line by line and discards input past its ~4 KiB line buffer,
+/// which would hide a dropped frame behind the line discipline.
+#[test]
+fn queued_writer_delivers_max_composer_frame_to_idle_cat_issue_2446() {
+    // Mirrors `bitty-rich`'s `COMPOSER_MAX_BYTES` + framing; this crate does
+    // not depend on the composer, so the runtime cross-crate test guards the
+    // two values against drift.
+    const MAX_COMPOSER_FRAME_BYTES: usize = 64 * 1024 + 13;
+    const RAW_READY: &[u8] = b"__RAW_READY__";
+
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .args([
+            "-c",
+            "stty raw -echo || exit 1; printf __RAW_READY__; exec cat",
+        ])
+        .size(200, 50)
+        .spawn()
+        .expect("spawn raw-mode cat");
+    let mut writer = pty.take_writer_async().expect("queued writer half");
+    let reader = pty.take_reader().expect("reader half");
+
+    let ready = observe_until(&reader, RAW_READY);
+    assert!(
+        contains(&ready, RAW_READY),
+        "raw-mode cat never reported readiness ({} bytes seen)",
+        ready.len()
+    );
+
+    let mut frame = Vec::with_capacity(MAX_COMPOSER_FRAME_BYTES);
+    frame.extend_from_slice(b"\x1b[200~");
+    frame.extend(std::iter::repeat_n(b'q', 64 * 1024));
+    frame.extend_from_slice(b"\x1b[201~");
+    frame.push(b'\r');
+    assert_eq!(frame.len(), MAX_COMPOSER_FRAME_BYTES);
+
+    writer
+        .write_all(&frame)
+        .expect("an idle queue must accept the largest producer frame");
+    assert!(
+        writer.queued_bytes() <= bitty_pty::QUEUED_WRITE_MAX_BYTES,
+        "queued bytes must stay inside the documented bound"
+    );
+
+    // Drain the echo until the frame is complete: `cat` copies input to
+    // output byte for byte in raw mode, so a short tail means the queue
+    // dropped the frame (or its tail) after accepting it.
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut echoed = Vec::new();
+    while echoed.len() < frame.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "cat echo timed out after {} of {} bytes",
+            echoed.len(),
+            frame.len()
+        );
+        match reader.recv_timeout(remaining).expect("recv_timeout") {
+            Some(chunk) => echoed.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    assert_eq!(
+        echoed, frame,
+        "raw-mode cat must echo the submitted frame verbatim"
+    );
+
+    // Delivery drained the queue: no accepted byte stayed parked.
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    while writer.queued_bytes() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued bytes never drained after delivery"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Raw mode disables `VEOF`, so the graceful drop sequence cannot end
+    // `cat`; `Pty`'s own drop kills and reaps the child this test spawned.
+    drop(writer);
+    drop(pty);
+}
+
 #[test]
 fn kill_path_reports_unsuccessful_status() {
     let mut pty = PtyBuilder::new("/bin/cat").spawn().expect("spawn cat");

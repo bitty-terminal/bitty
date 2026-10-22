@@ -10,16 +10,39 @@ use std::sync::{Arc, Condvar, Mutex};
 #[cfg(unix)]
 const DEFAULT_VEOF: u8 = 0x04;
 
+/// Largest single frame any producer may hand the queue in one write.
+///
+/// The composer is the widest producer: a submit carries at most the
+/// 64 KiB content cap (`COMPOSER_MAX_BYTES`, owned by `bitty-rich`) plus the
+/// byte-exact bracketed-paste framing `ESC[200~` (6 bytes) + `ESC[201~`
+/// (6 bytes) + `CR` (1 byte) = 13 bytes, for 65,549 bytes total.
+///
+/// `bitty-pty` deliberately does not depend on `bitty-rich` (the composer
+/// sits above the PTY boundary), so this mirrors the cap instead of
+/// importing it. The cross-crate regression in `bitty-runtime` builds that
+/// frame with `bitty_rich::host::frame_submit` and fails if the two drift.
+const MAX_PRODUCER_FRAME_BYTES: usize = 64 * 1024 + 13;
+
 /// Maximum bytes buffered in one queued writer (bitty#2446).
 ///
 /// The queue exists so the terminal event loop never parks in a PTY write
 /// when the child stops reading its input (a previewing TUI, a stopped job,
-/// a shell blocked on its own output backpressure). 64 KiB absorbs an
-/// interactive burst plus query replies while keeping the worst-case
-/// per-session memory bounded; beyond it writes fail closed with
-/// [`io::ErrorKind::WouldBlock`] and the caller's existing loss accounting
-/// reports the dropped bytes.
-pub const QUEUED_WRITE_MAX_BYTES: usize = 64 * 1024;
+/// a shell blocked on its own output backpressure).
+///
+/// The bound must exceed [`MAX_PRODUCER_FRAME_BYTES`] (65,549 bytes), because
+/// a max-size composer submit is offered as one write while the child may be
+/// idle: bounding at the composer cap alone rejected that legitimate frame
+/// after `terminal_submit` reported `Accepted`, silently losing the input
+/// (bitty#2446 review F1). 128 KiB accepts the largest frame plus a
+/// partially drained companion burst, so the worst-case queued-input memory
+/// stays bounded at 128 KiB per pane (plus one in-flight chunk per writer
+/// thread). Beyond it writes fail closed with [`io::ErrorKind::WouldBlock`]
+/// and the caller's existing loss accounting reports the dropped bytes.
+pub const QUEUED_WRITE_MAX_BYTES: usize = 128 * 1024;
+
+// One max-size producer frame must fit an otherwise idle queue; otherwise a
+// submit reported as accepted would be dropped instead of written.
+const _: () = assert!(QUEUED_WRITE_MAX_BYTES > MAX_PRODUCER_FRAME_BYTES);
 
 /// Maximum queued commands (data chunks plus flush/shutdown markers).
 ///
@@ -461,6 +484,55 @@ mod tests {
                 .ends_with(b"\n\x04"),
             "drop must still deliver EOT through the queue"
         );
+    }
+
+    /// Byte-exact max-size composer frame — `ESC[200~`, 64 KiB of payload,
+    /// `ESC[201~`, and `CR` — mirroring `bitty-rich`'s `frame_submit` without
+    /// depending on it (the composer sits above this crate's boundary).
+    fn max_composer_frame() -> Vec<u8> {
+        let mut frame = Vec::with_capacity(MAX_PRODUCER_FRAME_BYTES);
+        frame.extend_from_slice(b"\x1b[200~");
+        frame.extend(std::iter::repeat_n(b'q', 64 * 1024));
+        frame.extend_from_slice(b"\x1b[201~");
+        frame.push(b'\r');
+        frame
+    }
+
+    #[test]
+    fn queued_write_accepts_one_max_composer_frame_issue_2446_f1() {
+        // bitty#2446 review F1: a max-size composer submit is 64 KiB of
+        // content plus 13 bytes of bracketed-paste framing, offered as one
+        // write while the child is idle. When the bound equalled the composer
+        // cap the frame was rejected and `terminal_submit` still reported
+        // `Accepted`, silently dropping the input.
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = PtyWriter::new_queued(Box::new(RecordingWriter(Arc::clone(&sink))));
+        let frame = max_composer_frame();
+        assert_eq!(frame.len(), MAX_PRODUCER_FRAME_BYTES);
+        writer
+            .write_all(&frame)
+            .expect("an idle queue must accept the largest producer frame");
+
+        // The worker copies the whole frame through (one command, one sink
+        // write) and the queued-bytes accounting returns to zero.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let written = sink.lock().expect("recording mutex").len();
+            if written >= frame.len() {
+                assert_eq!(written, frame.len(), "frame must not be truncated");
+                break;
+            }
+            assert!(Instant::now() < deadline, "frame never reached the sink");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.queued_bytes() != 0 {
+            assert!(Instant::now() < deadline, "queued bytes never drained");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Drop queues EOT after the frame; the exact-length check above
+        // already proved every frame byte was offered verbatim.
+        drop(writer);
     }
 
     #[test]

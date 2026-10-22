@@ -9,7 +9,8 @@
 
 use std::time::Duration;
 
-use bitty_runtime::{Runtime, RuntimeConfig};
+use bitty_runtime::registry::{LeaseHolder, PanelLease};
+use bitty_runtime::{Runtime, RuntimeConfig, TerminalSubmitOutcome};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -246,8 +247,12 @@ fn runtime_input_write_never_blocks_on_a_nonreading_child_issue_2446() {
     });
 
     let start = Instant::now();
-    for _ in 0..32 {
-        rt.write_input(&vec![b'x'; 4096]);
+    // The bound must be exceeded, not merely reached: the writer thread pops
+    // (and releases) the first chunk before parking in the sink, so the burst
+    // needs more than `QUEUED_WRITE_MAX_BYTES` plus that in-flight chunk.
+    let chunk = vec![b'x'; 4096];
+    for _ in 0..(bitty_pty::QUEUED_WRITE_MAX_BYTES / chunk.len() + 8) {
+        rt.write_input(&chunk);
     }
     let elapsed = start.elapsed();
     let _ = done_tx.send(());
@@ -262,5 +267,107 @@ fn runtime_input_write_never_blocks_on_a_nonreading_child_issue_2446() {
     assert!(
         rt.input_write_dropped_bytes() > 0,
         "queue overflow must be reported through the existing loss counters"
+    );
+}
+
+/// bitty#2446 review F1: `terminal_submit` must never report `Accepted` for a
+/// frame the queued writer then drops.
+///
+/// The widest legitimate frame is the composer cap (64 KiB of content) plus
+/// the 13 bytes of bracketed-paste framing — 65,549 bytes — and it is offered
+/// as one write while the child is idle. When the queue bound equalled the
+/// composer cap, that frame was rejected at the queue while the submit
+/// outcome stayed `Accepted`; the Lua bridge reported success and the input
+/// vanished. This drives the real submit path against an idle child in raw
+/// mode (canonical mode would mask the loss behind its line discipline) and
+/// asserts the frame was delivered with zero recorded loss.
+#[test]
+fn runtime_submit_accepts_max_composer_frame_without_loss_issue_2446() {
+    use std::time::Instant;
+
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.spawn_shell_with_args(
+        "/bin/sh",
+        &[
+            "-c",
+            "stty raw -echo || exit 1; printf __RAW_READY__; exec cat",
+        ],
+    )
+    .expect("spawn raw-mode cat");
+
+    // Wait for the child to confirm raw mode: canonical mode would accept
+    // the frame but echo it line by line, hiding queue loss behind its own
+    // buffer limits. Bounded by the suite TIMEOUT.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut raw_ready = false;
+    while Instant::now() < deadline {
+        let _ = rt.poll_pty_timeout(Duration::from_millis(200));
+        let text: String = rt.snapshot().cells.iter().map(|c| c.glyph).collect();
+        if text.contains("__RAW_READY__") {
+            raw_ready = true;
+            break;
+        }
+    }
+    assert!(raw_ready, "raw-mode cat never reported readiness");
+
+    // The producer bound is the composer cap plus byte-exact framing; the
+    // queue bound must cover it. `bitty-pty` cannot depend on `bitty-rich`,
+    // so this cross-crate check is the drift guard between the two.
+    let text = "q".repeat(bitty_rich::host::COMPOSER_MAX_BYTES);
+    let frame = bitty_rich::host::frame_submit(&text).expect("max composer frame");
+    let framing = bitty_rich::host::PASTE_OPEN.len()
+        + bitty_rich::host::PASTE_CLOSE.len()
+        + bitty_rich::host::SUBMIT_TERMINATOR.len();
+    assert_eq!(frame.len(), bitty_rich::host::COMPOSER_MAX_BYTES + framing);
+    assert_eq!(frame.len(), 65_549, "largest legitimate producer frame");
+    assert!(
+        frame.len() <= bitty_pty::QUEUED_WRITE_MAX_BYTES,
+        "queued writer bound {} must accept the largest producer frame {}",
+        bitty_pty::QUEUED_WRITE_MAX_BYTES,
+        frame.len()
+    );
+
+    let mut lease = PanelLease::idle();
+    let holder = LeaseHolder(7);
+    lease.acquire(holder, 100, 0).expect("acquire lease");
+    let mut budget = bitty_rich::host::SubmitBudget::new("composer.regression", 1024 * 1024);
+    match rt.terminal_submit(&text, &lease, holder, 1, &mut budget) {
+        TerminalSubmitOutcome::Accepted { bytes } => {
+            assert_eq!(bytes, frame.len(), "submit must report the whole frame");
+        }
+        other => panic!("max composer frame must be accepted, got {other:?}"),
+    }
+    assert_eq!(budget.used(), frame.len() as u64);
+    assert_eq!(
+        rt.input_write_dropped_bytes(),
+        0,
+        "an accepted max-size frame must not be dropped by the input queue"
+    );
+    assert!(
+        rt.pending_input().is_empty(),
+        "an accepted submit must reach the live writer, not the headless buffer"
+    );
+
+    // The whole frame must reach the child: draining its echo also proves the
+    // writer thread emptied the queue instead of stranding the tail.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut echoed_any = 0;
+    while Instant::now() < deadline {
+        if rt.poll_pty_timeout(Duration::from_millis(200)) > 0 {
+            echoed_any += 1;
+        }
+        let text: String = rt.snapshot().cells.iter().map(|c| c.glyph).collect();
+        if text.matches('q').count() > 0 {
+            break;
+        }
+    }
+    assert!(
+        echoed_any > 0,
+        "the idle child must echo the accepted frame"
+    );
+    assert_eq!(
+        rt.input_write_dropped_bytes(),
+        0,
+        "delivery must not record loss after acceptance"
     );
 }

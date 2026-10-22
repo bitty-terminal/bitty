@@ -1216,7 +1216,7 @@ jobs:
               echo "::error::$base extracts outside its top-level directory" >&2
               exit 1
             fi
-            expected="$(printf '%s\n' CHANGELOG.md LICENSE README.md bin share)"
+            expected="$(printf '%s\n' CHANGELOG.md LICENSE README.md bin share terminfo)"
             # `tar -tf` also lists the archive's own top-level directory entry
             # ("<base>/"), which yields an empty field from `cut -d/ -f2` and a
             # leading empty line. That made this comparison impossible to
@@ -1346,6 +1346,7 @@ jobs:
 
   aur:
     name: Publish AUR (Arch)
+    environment: release
     needs: release
     runs-on: ubuntu-24.04
     container: archlinux:latest
@@ -1417,6 +1418,7 @@ jobs:
 
   aur-bin:
     name: Publish AUR bitty-bin (Arch, prebuilt)
+    environment: release
     # The PKGBUILD points at the R2/CDN release path (CTX-1413, #1847), so the
     # publish waits for the immutable mirror instead of racing it.
     needs: r2-mirror
@@ -1477,6 +1479,7 @@ jobs:
           # Asset stem comes from the template, never hardcoded twice:
           # CTX-0164 (bitty-terminal -> bitty) must keep this dist name stable.
           ASSET="$(awk -F'"' '/^_bitty_asset=/{print $2; exit}' packaging/PKGBUILD.bin)"
+          ASSET="${ASSET//\$\{pkgver\}/$VERSION}"
           if [ -z "$ASSET" ]; then
             echo "could not derive _bitty_asset from packaging/PKGBUILD.bin" >&2
             exit 1
@@ -1526,6 +1529,7 @@ jobs:
 
   homebrew:
     name: Bump Homebrew Formula
+    environment: release
     # R2/CDN is the primary formula source (CTX-1413, #1847); wait for the
     # immutable mirror so the rendered URLs and digests describe published bytes.
     needs: r2-mirror
@@ -1593,6 +1597,7 @@ jobs:
 
   scoop:
     name: Bump Scoop Manifest
+    environment: release
     # R2/CDN is the primary manifest source (CTX-1413, #1847); wait for the
     # immutable mirror so the rendered URLs and hashes describe published bytes.
     needs: r2-mirror
@@ -1664,6 +1669,7 @@ jobs:
   # sidecar before rendering; GitHub Releases stays the documented fallback.
   r2-mirror:
     name: Mirror release to R2
+    environment: release
     needs: release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1791,6 +1797,7 @@ jobs:
   # the stable scripts, so the skip path leaves them untouched.
   r2-stable:
     name: Publish R2 stable pointers
+    environment: release
     needs: r2-mirror
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1997,3 +2004,47 @@ jobs:
           else
             echo "all package channels succeeded"
           fi
+
+  post-release-smoke:
+    name: Post-release E2E (${{ matrix.channel }})
+    needs: channel-summary
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: "Linux install.sh (R2)"
+            os: ubuntu-latest
+            run: |
+              curl -fsSL https://cdn.bitty.run/install/install.sh | bash
+              ~/.local/bin/bitty --version
+          - channel: "macOS Homebrew (R2)"
+            os: macos-latest
+            run: |
+              brew tap bitty-terminal/homebrew-tap
+              brew install bitty
+              bitty --version
+          - channel: "Windows install.ps1 (R2)"
+            os: windows-latest
+            run: |
+              irm https://cdn.bitty.run/install/install.ps1 | iex
+              & "$HOME\.local\bin\bitty.exe" --version
+          - channel: "Windows Scoop (R2)"
+            os: windows-latest
+            run: |
+              Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+              irm get.scoop.sh | iex
+              scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
+              scoop install bitty
+              bitty --version
+    steps:
+      - name: Test installation from CDN (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: ${{ matrix.run }}
+      - name: Test installation from CDN (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ${{ matrix.run }}

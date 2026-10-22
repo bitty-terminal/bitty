@@ -87,14 +87,16 @@ SRC_NAME="$(awk -F'"' '/^_bitty_src=/{print $2; exit}' "$PKGBUILD_PATH")"
 [[ -n "$SRC_NAME" ]] || fail "rendered PKGBUILD does not declare _bitty_src"
 SRC_NAME="${SRC_NAME//\$\{pkgver\}/$VERSION}"
 
+RESOLVED_ASSET="${ASSET//\$\{pkgver\}/$VERSION}"
 RESOLVED_ENTRY="${SOURCE_ENTRY//\$\{pkgver\}/$VERSION}"
-RESOLVED_ENTRY="${RESOLVED_ENTRY//\$\{_bitty_asset\}/$ASSET}"
+RESOLVED_ENTRY="${RESOLVED_ENTRY//\$\{_bitty_asset\}/$RESOLVED_ASSET}"
 RESOLVED_ENTRY="${RESOLVED_ENTRY//\$\{_bitty_src\}/$SRC_NAME}"
 RESOLVED_URL="${RESOLVED_ENTRY#*::}"
 RESOLVED_URL="${RESOLVED_URL%\"}"
 RESOLVED_URL="${RESOLVED_URL%"${RESOLVED_URL##*[![:space:]]}"}"
+RESOLVED_URL="${RESOLVED_URL//\$\{pkgver\}/$VERSION}"
 
-EXPECTED_URL="${CDN_PREFIX//\$\{pkgver\}/$VERSION}${ASSET}"
+EXPECTED_URL="${CDN_PREFIX//\$\{pkgver\}/$VERSION}${RESOLVED_ASSET}"
 [[ "$RESOLVED_URL" == "$EXPECTED_URL" ]] ||
   fail "rendered binary source resolves to '${RESOLVED_URL}', expected '${EXPECTED_URL}'"
 case "$RESOLVED_URL" in

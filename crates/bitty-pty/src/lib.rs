@@ -136,3 +136,4 @@ pub use tree::TreeBackend;
 pub use tree::TreeLifetime;
 pub use tree::TreeSignal;
 pub use writer::PtyWriter;
+pub use writer::QUEUED_WRITE_MAX_BYTES;

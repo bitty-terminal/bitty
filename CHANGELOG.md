@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PTY input writes can no longer freeze the event loop (#2446):** the
+  production writer for every session now copies input into a bounded
+  128 KiB FIFO (plus a 512-command cap) drained by one named writer thread,
+  so a child that stops reading its stdin (a previewing `yazi`, a stopped job, a shell blocked on
+  its own output) cannot park the terminal thread in `write(2)`. Overflow
+  fails closed with `WouldBlock` and is reported through the existing
+  input/reply loss counters. Query replies, focus reports, and keyboard input
+  share the same ordered queue; the synchronous writer remains available for
+  tests that assert immediate child-side effects.
+
 - **Closing to an empty tiled base no longer reports a corrupt session
   (#2415, #2421):** when the last close leaves no tiled pane and no pinned
   panel, the exit save is skipped instead of writing a state the v3 codec

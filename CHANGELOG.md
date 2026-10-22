@@ -162,6 +162,13 @@ bitty-terminal.dashboard` and the other official ids resolve without a
 
 ### Changed
 
+- **AUR `bitty-bin` consumes the versioned R2 bundle (#2489/#2492):** the
+  package downloads `bitty-<version>-x86_64-unknown-linux-gnu.tar.zst` from
+  the CDN, checks the published digest, and installs the binary, desktop
+  entry, icons, AppStream metadata, and terminfo from that bundle instead of
+  fetching a second source archive. The Unix bundle now carries
+  `terminfo/bitty.ti`, and the release workflow runs post-publish install
+  smokes for `install.sh`, Homebrew, `install.ps1`, and Scoop.
 - **Release binaries carry no builder paths (CTX-1434, #2402):** release
   builds remap the workspace, cargo registry/git, rustup, and target roots to
   `/build/...` at compile time (`scripts/release-rustflags.sh`, used by

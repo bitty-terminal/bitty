@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, PanelCreateHandler, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
@@ -26,6 +26,19 @@ use bitty_runtime::registry::{
     RegistryConfig, TerminalRegistry, WorkspaceId,
 };
 use bitty_ui::{ViewId, panel::PanelType};
+
+/// Activation wall budget for this harness.
+///
+/// The probe plugin registers six commands and allocates nothing at
+/// activation, but RC-1 (50 ms) is calibrated for release builds: a loaded
+/// runner suspended one such `init.lua` at 51 ms
+/// (`WallClockExceeded { elapsed_ms: 51, budget_ms: 50 }`, bitty#2427). Panel
+/// semantics, not runner speed, are under test here, so only the wall
+/// dimension is widened (the bitty#1744/#1727 treatment). Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS`; activation-budget enforcement stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs`, `load_gate.rs`, and
+/// `bar_activation_budget.rs`.
+const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 struct NoSnapshot;
 
@@ -104,6 +117,8 @@ fn runtime(root: PathBuf, backend: Option<PanelCreateHandler>) -> PluginRuntime 
         snapshot: Rc::new(NoSnapshot),
     });
     rt.set_panel_create_backend(backend);
+    // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
+    rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     rt
 }
 

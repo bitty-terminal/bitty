@@ -146,9 +146,13 @@ sed "s/^pkgver=.*/pkgver=0.0.25/" "$RENDERED" >"$TMP/PKGBUILD.stale"
 expect_reject "a stale pkgver with the new version's digest" \
   "$ASSERT" "$TMP/PKGBUILD.stale" "$VERSION" "$SHA"
 
+# Use a version deliberately different from the template's current pkgver:
+# at release time the template is bumped in the same commit, so passing the
+# live VERSION would make this case a legitimate bump, not an unbumped one.
+UNBUMPED_VERSION=9.9.9
 sed "s/REPLACE_WITH_RELEASE_SHA256/$SHA/" "$TEMPLATE" >"$TMP/PKGBUILD.unrendered"
 expect_reject "a template copy whose pkgver was never bumped" \
-  "$ASSERT" "$TMP/PKGBUILD.unrendered" "$VERSION" "$SHA"
+  "$ASSERT" "$TMP/PKGBUILD.unrendered" "$UNBUMPED_VERSION" "$SHA"
 
 expect_reject "a version carrying the leading v" \
   "$ASSERT" "$RENDERED" "v$VERSION" "$SHA"

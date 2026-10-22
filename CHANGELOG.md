@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.26] - 2026-10-22
 
 ### Added
 
@@ -53,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   icon maps remain plugin data with no new protocol.
 
 ### Fixed
+
+- **Closing to an empty tiled base no longer reports a corrupt session
+  (#2415, #2421):** when the last close leaves no tiled pane and no pinned
+  panel, the exit save is skipped instead of writing a state the v3 codec
+  cannot encode. The last good session file stays authoritative and the skip
+  reports at info level, not as a corruption warning.
+
+- **Audio polling no longer blocks plugin activation (#2425, #2428):** the
+  audio monitor samples provider state off the activation thread, keeps one
+  bounded read in flight per window, and stamps samples with their landing
+  time so `stale_age_ms` and the 10 s grace reflect the real sample. A
+  three-group bar with memory + pulseaudio now mounts inside the RC-1
+  activation budget.
 
 - **`runtime.inspect` review follow-up (CTX-2396, #2416):** a granted
   generation whose read-only snapshot backend is not wired now checks

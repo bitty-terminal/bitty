@@ -663,7 +663,9 @@ R2 key:   bitty/extensions/catalog.v1
 CDN URL:  https://cdn.bitty.run/extensions/catalog.v1
 ```
 
-Live object (verified by read-back on 2026-10-22; schema 1):
+Live object (verified by read-back on 2026-10-22; 417 bytes, SHA-256
+`6d9018f0b880aa179efddf0d53c5af0b18583f4ea77db8924a8d01093b4fd6c8`,
+schema 1):
 
 ```text
 # bitty extension catalog v1

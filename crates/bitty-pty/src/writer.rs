@@ -26,6 +26,10 @@ const DEFAULT_VEOF: u8 = 0x04;
 /// before 1.88 does not count a `const _` initializer as a use, so the MSRV
 /// 1.85 leg reports it as dead code (the `-D warnings` gate then fails).
 #[cfg_attr(not(test), allow(dead_code))]
+// Referenced by the compile-time bound assertion and the cross-crate
+// regression; the non-test build only needs the assertion, which rustc's
+// dead-code pass does not count as a use.
+#[allow(dead_code)]
 const MAX_PRODUCER_FRAME_BYTES: usize = 64 * 1024 + 13;
 
 /// Maximum bytes buffered in one queued writer (bitty#2446).

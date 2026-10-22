@@ -474,6 +474,34 @@ fn commit_claim_expires_once_the_echo_window_elapses() {
 }
 
 #[test]
+fn expired_claim_does_not_eat_enter_or_delete_after_a_composition() {
+    // Owner reproduction: after composing Chinese, the first Enter/Delete must
+    // not be consumed as a phantom echo (fcitx5/XIM can commit without ever
+    // delivering the committing key). The shortened window releases the claim
+    // before a deliberate next key.
+    for key in [NamedKey::Enter, NamedKey::Delete] {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let base = std::time::Instant::now();
+        rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
+        rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
+        rt.drain_pending_input();
+        rt.tick_at(base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1));
+        let event = KeyEvent {
+            logical_key: LogicalKey::Named(key),
+            text: None,
+            location: KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert!(
+            rt.handle_key_event(event).is_some(),
+            "the first {key:?} after a composition must reach the PTY"
+        );
+    }
+}
+
+#[test]
 fn idle_after_commit_does_not_absorb_the_next_keystroke() {
     // The X11 shape with no tick in between, which a tick count could not
     // catch: the loop blocks after the commit and the user's next key is the

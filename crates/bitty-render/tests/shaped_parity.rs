@@ -274,13 +274,15 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
 
 #[test]
 fn swash_metrics_keep_the_legacy_baseline_path() {
-    let Some(raster) = live_chain() else {
+    let Some(mut raster) = live_chain() else {
         eprintln!("skipped: no host font stack or primary family");
         return;
     };
     let fixture = load_fixture();
-    // The recorded crossfont triple is degenerate on the FreeType path, so
-    // the grid demonstrably took the legacy fixed-baseline rule there.
+    // The baseline was captured from crossfont 0.9 before the face was
+    // sized ahead of `metrics()` (see the crossfont backend's
+    // `font_metrics`); its recorded triple is degenerate, so the grid
+    // demonstrably took the legacy fixed-baseline rule at capture time.
     let recorded = FontMetrics {
         average_advance_px: fixture.metrics.0,
         line_height_px: fixture.metrics.1,
@@ -292,9 +294,10 @@ fn swash_metrics_keep_the_legacy_baseline_path() {
     );
     // ... and the new backend answers no measurement, so the grid takes the
     // same legacy path (placement unchanged by construction).
+    let primary = raster.fonts()[0];
     let answered = raster
-        .inner()
-        .font_metrics(raster.fonts()[0], POINT_SIZE)
+        .inner_mut()
+        .font_metrics(primary, POINT_SIZE)
         .expect("metrics must not error");
     assert_eq!(answered, None, "Phase A reports no face measurement");
 }

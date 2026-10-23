@@ -2,6 +2,7 @@
 //!
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
+use super::selection::SelectionBoundary;
 use super::*;
 use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
@@ -113,6 +114,24 @@ fn clamp_frame_axis(offset_px: f64, cell_px: f64, max: i64) -> u16 {
     // and clamps to `max` below rather than wrapping.
     let index = (index as i64).clamp(0, max.max(0));
     u16::try_from(index).unwrap_or(u16::MAX)
+}
+
+/// Nearest cell-edge index for a frame-local offset (issue #2480).
+///
+/// `max` is the number of cells (so `0..=max` are valid edges). A finite
+/// offset rounds half away from zero; non-finite input fails to edge `0`.
+fn boundary_frame_axis(offset_px: f64, cell_px: f64, max: u16) -> u16 {
+    if cell_px <= 0.0 || !offset_px.is_finite() {
+        return 0;
+    }
+    let index = (offset_px / cell_px).round();
+    if index <= 0.0 {
+        0
+    } else if index >= f64::from(max) {
+        max
+    } else {
+        index as u16
+    }
 }
 
 /// One live-present View frame in physical pixels (CTX-0294).
@@ -1754,6 +1773,30 @@ impl Runtime {
         ))
     }
 
+    /// Frame-local horizontal caret nearest to `pos` (issue #2480).
+    ///
+    /// `col` counts cell edges: a position in the left half of a cell rounds
+    /// to that cell's leading edge, the right half to its trailing edge, and
+    /// the frame edges clamp to `0..=cols`. Dividing by the live (DPI-scaled)
+    /// cell width keeps the mapping physical-pixel exact at every scale, like
+    /// [`Self::clamped_frame_cell`].
+    fn clamped_frame_boundary(
+        &self,
+        frame: &PresentFrame,
+        pos: CursorPosition,
+    ) -> Option<SelectionBoundary> {
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        if cell_w <= 0.0 {
+            return None;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad - f64::from(frame.content.x);
+        Some(SelectionBoundary::new(boundary_frame_axis(
+            x, cell_w, frame.cols,
+        )))
+    }
+
     /// Live cell size in physical pixels at the current DPI scale
     /// (read-only headless seam, CTX-0803).
     ///
@@ -1954,8 +1997,9 @@ impl Runtime {
         self.frame_cell_to_owner_cell(owner, frame.rows, local)
     }
 
-    /// Owner and owner-grid cell for a selection press at `pos` (CTX-0803;
-    /// CTX-1021 scrolled viewport for issue #1807).
+    /// Owner, owner-grid cell, and horizontal caret for a selection press at
+    /// `pos` (CTX-0803; CTX-1021 scrolled viewport for issue #1807; issue
+    /// #2480 caret).
     ///
     /// The owner is the **hit** `View`, not the focused one, so `Shift`+press
     /// selects in the panel under the pointer without moving focus. A press
@@ -1968,22 +2012,66 @@ impl Runtime {
     /// `None` when the resolved `View` owns no live grid (a session-less,
     /// non-primary leaf): such a press selects nothing instead of selecting
     /// in the primary grid.
-    pub(super) fn selection_press_target(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+    ///
+    /// Issue #2480: the caret is the nearest horizontal cell edge in the
+    /// owner's grid or viewport space, so `Simple`/`Block` drag updates can
+    /// translate caret-to-caret (one column of travel selects one column).
+    /// The cell and caret derive from the same solver pass and can never
+    /// disagree about owner.
+    pub(super) fn selection_press_target_with_boundary(
+        &self,
+        pos: CursorPosition,
+    ) -> Option<(ViewId, CellPos, SelectionBoundary)> {
         // One solver pass for both the hit test and the frame geometry.
         let frames = self.present_frames();
         if let Some((view, local)) = self.present_cell_in(&frames, pos) {
-            let rows = frames
-                .iter()
-                .find(|frame| frame.view == view)
-                .map_or(0, |frame| frame.rows);
-            let cell = self.frame_cell_to_owner_cell(view, rows, local)?;
-            return Some((view, cell));
+            let frame = frames.iter().find(|frame| frame.view == view)?;
+            let cell = self.frame_cell_to_owner_cell(view, frame.rows, local)?;
+            let boundary =
+                self.frame_boundary_to_owner(view, self.clamped_frame_boundary(frame, pos)?)?;
+            return Some((view, cell, boundary));
         }
         let focused = self.focused_view()?;
         let frame = frames.iter().find(|frame| frame.view == focused)?;
         let local = self.clamped_frame_cell(frame, pos)?;
         let cell = self.frame_cell_to_owner_cell(focused, frame.rows, local)?;
-        Some((focused, cell))
+        let boundary =
+            self.frame_boundary_to_owner(focused, self.clamped_frame_boundary(frame, pos)?)?;
+        Some((focused, cell, boundary))
+    }
+
+    /// Clamps a frame-local horizontal caret into the owner's grid or
+    /// viewport width (issue #2480).
+    ///
+    /// Only columns are caret-addressed; rows use the existing floor-cell
+    /// mapping, so no row-window translation is needed here.
+    fn frame_boundary_to_owner(
+        &self,
+        owner: ViewId,
+        boundary: SelectionBoundary,
+    ) -> Option<SelectionBoundary> {
+        let (width, _) = self.selection_extent(owner)?;
+        Some(SelectionBoundary::new(boundary.col.min(width)))
+    }
+
+    /// Maps a physical cursor position into `owner`'s clamped cell **and**
+    /// horizontal caret in one solver pass (issue #2480).
+    ///
+    /// Drag/release paths need both: the cell addresses the owner's grid (and
+    /// the rows stay inclusive), the caret makes column travel exact. Solving
+    /// the frame list once keeps pointer motion at one layout pass.
+    pub(super) fn cursor_to_owner_cell_and_boundary(
+        &self,
+        owner: ViewId,
+        pos: CursorPosition,
+    ) -> Option<(CellPos, SelectionBoundary)> {
+        let frames = self.present_frames();
+        let frame = frames.iter().find(|frame| frame.view == owner)?;
+        let local = self.clamped_frame_cell(frame, pos)?;
+        let cell = self.frame_cell_to_owner_cell(owner, frame.rows, local)?;
+        let boundary =
+            self.frame_boundary_to_owner(owner, self.clamped_frame_boundary(frame, pos)?)?;
+        Some((cell, boundary))
     }
 
     /// Cell reported to the focused pane's app for a mouse event at `pos`

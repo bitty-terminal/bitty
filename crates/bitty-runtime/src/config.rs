@@ -1085,36 +1085,47 @@ pub struct RuntimeConfig {
     pub paste_confirm_timeout: std::time::Duration,
     /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
     ///
-    /// Default [`PanelLayoutMode::Balanced`]: the fresh pane bisects the
-    /// physically largest slot, so repeated `Mod+N` presses keep a usable,
-    /// balanced tree (issues #2521, #2528). `Spiral` keeps the 4-way
-    /// clockwise rotation adjacent to focus; `Dwindle` always splits the
-    /// focused pane right/down; `BisectLargest` (CTX-0964, #1698) bisects the
-    /// largest-area panel with a raw `width >= height` axis (no cell-aspect
-    /// correction). Move-to-workspace uses bisect-largest placement
-    /// regardless of this setting; this field only controls `NewPanel`.
+    /// Default [`PanelLayoutMode::Spiral`] (issue #2571): the fresh pane
+    /// continues the clockwise rotation adjacent to focus while the pane
+    /// created by the previous split stays focused. When the focused Spiral
+    /// slot cannot host two usable panes, the plan falls back to the largest
+    /// feasible `Balanced` target so `Mod+N` keeps the 0.0.27 capacity
+    /// (issue #2571 review). `Balanced` keeps the bisect-largest policy
+    /// (issues #2521, #2528) as an explicit opt-in; `Dwindle` always splits
+    /// the focused pane right/down; `BisectLargest` (CTX-0964, #1698) bisects
+    /// the largest-area panel with a raw `width >= height` axis (no
+    /// cell-aspect correction). Move-to-workspace uses bisect-largest
+    /// placement regardless of this setting; this field only controls
+    /// `NewPanel`.
     pub panel_layout_mode: PanelLayoutMode,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
 ///
-/// [`Balanced`](Self::Balanced) is the owner-facing default (issues #2521,
-/// #2528): the fresh pane bisects the physically largest slot with the
-/// cell-aspect-aware axis, so eight consecutive `Mod+N` presses keep a
-/// balanced, usable tree instead of nesting ever-smaller columns. `Spiral`
-/// keeps the 4-way clockwise rotation for users who want the newer pane
-/// adjacent to focus; `BisectLargest` opts into largest-panel bisection with
-/// the raw cell axis. Move-to-workspace also bisects independently of this
-/// setting (CTX-0964, #1698).
+/// [`Spiral`](Self::Spiral) is the owner-facing default (issue #2571): the
+/// fresh pane rotates clockwise around the focused pane (Right -> Down ->
+/// Left -> Up) while the pane created by the previous split stays focused;
+/// any other focus restarts the chain at Right. When the focused slot can no
+/// longer host two usable panes, `NewPanel` falls back deterministically to
+/// the largest-area Balanced target instead of dropping the chord (issue
+/// #2571 review). `Balanced` keeps the 0.0.27 bisect-largest policy (issues
+/// #2521, #2528) as an explicit opt-in: the fresh pane bisects the physically
+/// largest slot with the cell-aspect-aware axis. `Dwindle` always splits the
+/// focused pane right/down. `BisectLargest` opts into largest-panel bisection
+/// with the raw cell axis. Move-to-workspace also bisects independently of
+/// this setting (CTX-0964, #1698).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelLayoutMode {
     /// Balanced bisect-largest: split the physically largest slot with
     /// [`bitty_ui::balanced_split_axis`] and place the fresh pane after it
-    /// (right/down). Keeps pane sizes usable for long creation runs.
-    #[default]
+    /// (right/down). Keeps pane sizes usable for long creation runs; explicit
+    /// opt-in since 0.0.28 (issue #2571).
     Balanced,
     /// 4-way clockwise spiral: Right -> Down -> Left -> Up, continuing only
-    /// while the pane created by the previous split stays focused.
+    /// while the pane created by the previous split stays focused. Falls back
+    /// to the largest feasible Balanced target when the focused slot is too
+    /// small (issue #2571 review).
+    #[default]
     Spiral,
     /// Hyprland-style dwindle: always splits the focused pane Right or Down.
     Dwindle,

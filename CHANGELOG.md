@@ -38,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reload remove the generation's chords, and colliding suggestions produce
   bounded warnings naming the deterministic winner and the shadowed command.
 
+### Changed
+
+- **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
+  next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
+  -> Up around the focused pane) instead of `Balanced` bisect-largest.
+  `Balanced` and `Dwindle` remain explicit opt-ins through
+  `RuntimeConfig::panel_layout_mode` / `Runtime::set_panel_layout_mode`, and
+  `BisectLargest` is unchanged. When the focused Spiral slot can no longer
+  host two 10x4 panes, the plan falls back deterministically to the
+  largest-area `Balanced` target (with one bounded warning) instead of
+  dropping `Mod+N`, so normal windows keep the 0.0.27 pane capacity. Only a
+  grid where no leaf can host two usable 10x4 panes still refuses the chord.
+  Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
+  workspace IDs; the spiral phase resets to Right whenever focus lands on a
+  pane outside the active creation chain or the fallback runs.
+
 ### Fixed
 
 - **Copy-mode selection spans scrollback pages (#2470):** a visual selection is

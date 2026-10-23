@@ -1,5 +1,5 @@
 //! Visual + geometry evidence for the Hyprland tiling fixes (issues #2521,
-//! #2526, #2528).
+//! #2526, #2528) and the 0.0.28 Spiral default (issue #2571).
 //!
 //! Each scenario builds the exact deterministic tree, computes allocations
 //! with the headless solver, asserts the geometry the fix promises, and
@@ -16,14 +16,17 @@ use std::path::{Path, PathBuf};
 
 use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
 use bitty_runtime::{
-    LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId, drop_plan_for_point, largest_area_leaf,
-    splittable_axis,
+    LayoutNode, PanelLayoutMode, Runtime, SplitAxis, UiRect, View, ViewId, drop_plan_for_point,
+    largest_area_leaf, splittable_axis,
 };
 
 const SCALE: u16 = 10;
 const HEADER: u16 = 34;
 const FOOTER: u16 = 22;
 const CONTAINER: UiRect = UiRect::new(0, 0, 80, 24);
+/// Smallest grid where eight default `Spiral` presses keep all nine panes at
+/// the gap-aware 10x4 minimum (issue #2571).
+const SPIRAL_CONTAINER: UiRect = UiRect::new(0, 0, 160, 64);
 
 fn leaf(id: u64) -> LayoutNode {
     LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
@@ -53,8 +56,22 @@ fn render_svg(
     focus: Option<ViewId>,
     marker: Option<(u16, u16, &str)>,
 ) -> String {
-    let width = CONTAINER.width * SCALE;
-    let height = CONTAINER.height * SCALE + HEADER + FOOTER;
+    render_svg_in(CONTAINER, title, note, tree, allocations, focus, marker)
+}
+
+/// [`render_svg`] with an explicit container grid, for evidence that needs a
+/// larger canvas than the default 80x24 scenario container (issue #2571).
+fn render_svg_in(
+    container: UiRect,
+    title: &str,
+    note: &str,
+    tree: &LayoutNode,
+    allocations: &[(ViewId, UiRect)],
+    focus: Option<ViewId>,
+    marker: Option<(u16, u16, &str)>,
+) -> String {
+    let width = container.width * SCALE;
+    let height = container.height * SCALE + HEADER + FOOTER;
     let mut svg = String::new();
     let _ = writeln!(
         svg,
@@ -135,7 +152,7 @@ fn render_svg(
     let _ = writeln!(
         svg,
         r##"<text x="4" y="{}" fill="#8b949e" font-size="10">{}</text>"##,
-        CONTAINER.height * SCALE + HEADER + 15,
+        container.height * SCALE + HEADER + 15,
         escape(&tree_text)
     );
     svg.push_str("</svg>\n");
@@ -506,10 +523,13 @@ fn issue_2521_2528_eight_new_panels_before_after() {
 }
 
 /// The runtime plan and the pure evidence builder must agree for every
-/// press, so the screenshots cannot drift from the shipped algorithm.
+/// press, so the screenshots cannot drift from the shipped algorithm. The
+/// builder pins the explicit `Balanced` opt-in (issue #2571 moved the default
+/// to `Spiral`), so the scenario stays comparable with the 0.0.27 artifacts.
 #[test]
 fn runtime_plan_matches_balanced_evidence_builder() {
     let mut rt = Runtime::with_defaults().expect("runtime");
+    rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
     let mut tree = leaf(rt.focused_view().expect("focus").0);
     // Seed the runtime with a single leaf and verify each plan/split pair.
     rt.set_layout(tree.clone());
@@ -635,4 +655,71 @@ fn issue_2572_center_junction_cross_drag_before_after() {
         before_path.display(),
         after_path.display()
     );
+}
+
+/// Issue #2571: the fresh-config default is `Spiral`. Drive eight adaptive
+/// presses through the shipped plan on the smallest grid that keeps all nine
+/// panes usable, assert the gap-aware 10x4 minimum, and render the resulting
+/// tree as the human-readable default-layout evidence.
+#[test]
+fn issue_2571_default_spiral_eight_new_panels() {
+    let mut rt = Runtime::with_defaults().expect("runtime");
+    assert_eq!(
+        rt.panel_layout_mode(),
+        PanelLayoutMode::Spiral,
+        "a fresh runtime defaults to Spiral"
+    );
+    rt.set_container(SPIRAL_CONTAINER);
+    let mut tree = leaf(1);
+    rt.set_layout(tree.clone());
+    let mut phases = Vec::new();
+    for next in 2..=9u64 {
+        let plan = rt.panel_split_plan().expect("every spiral split fits");
+        phases.push(plan.spiral_phase);
+        assert!(split(
+            &mut tree,
+            plan.target,
+            plan.axis,
+            ViewId::new(next),
+            plan.place_new_first
+        ));
+        rt.set_layout(tree.clone());
+        rt.set_focus(ViewId::new(next));
+        rt.note_panel_split_created(ViewId::new(next), plan.spiral_phase);
+    }
+    assert_eq!(
+        phases,
+        vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3)
+        ],
+        "eight presses rotate Right -> Down -> Left -> Up twice"
+    );
+    assert_eq!(tree.validate_structure(), Ok(9));
+    let allocations = tree.layout(SPIRAL_CONTAINER);
+    assert_eq!(allocations.len(), 9);
+    for (id, rect) in &allocations {
+        assert!(
+            rect.width >= bitty_runtime::MIN_PANE_COLS
+                && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+            "p{id:?} below the minimum: {rect:?} (all {allocations:?})"
+        );
+    }
+    let svg = render_svg_in(
+        SPIRAL_CONTAINER,
+        "#2571 default Mod+N: Spiral (0.0.28)",
+        "fresh config: clockwise rotation keeps every pane at or above 10x4",
+        &tree,
+        &allocations,
+        None,
+        None,
+    );
+    let path = check_or_update("tiling-2571-default-spiral.svg", &svg);
+    eprintln!("evidence: {}", path.display());
 }

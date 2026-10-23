@@ -229,13 +229,18 @@ fn present_plan_extent_matches_draw_list_pixels_so_gpu_scale_stays_near_one() {
     rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
     let surface = rt.surface_extent().expect("adopted surface");
     let plan = rt.present_plan_extent();
-    // 177x49 grid at 14x30 scaled cells plus the 13px physical padding
-    // per side (CTX-0223) = 2504x1496 draw-list pixels.
-    assert_eq!((plan.width, plan.height), (177 * 14 + 26, 49 * 30 + 26));
+    // The 177x49 grid at 14x30 scaled cells plus the 13px physical padding
+    // per side (CTX-0223) is 2504x1496, but the adopted surface is
+    // 2506x1496. The plan spans the surface (#2520): the 2px residual strip
+    // is background, never a content scale factor.
+    assert_eq!(
+        (plan.width, plan.height),
+        (surface.width(), surface.height())
+    );
     let scale = derive_scale(surface.width(), surface.height(), plan);
-    assert!(
-        (scale - 1.0).abs() < 0.05,
-        "adopted frame must present near 1.0, got {scale}"
+    assert_eq!(
+        scale, 1.0,
+        "adopted frame must present at exactly 1.0, got {scale}"
     );
     // The stale 1-cell probe extent this replaced clamped to 4x
     // magnification (the dominant blur behind #232).

@@ -10,16 +10,30 @@
 //!
 //! - **Observability only.** The watchdog never changes routing, timing, or
 //!   state. It marks phases and, on a stall, writes a bounded report.
-//! - **Opt-in.** `BITTY_STALL_WATCHDOG` enables the monitor thread; CI,
-//!   headless smoke runs, and normal sessions stay quiet by default.
+//! - **Opt-in.** `BITTY_STALL_WATCHDOG` is the required enable switch for the
+//!   monitor thread; CI, headless smoke runs, and normal sessions stay quiet
+//!   by default. A threshold variable never enables the watchdog on its own.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
 //!   second, and the monitor thread touches `/proc` only after a stall.
 //! - **Bounded.** A fixed thread-row cap, a fixed report-byte cap, and a
 //!   report count/interval limit per stall; repeated stalls cannot grow the
-//!   log without bound. The latest stall report also lands in one truncated
-//!   XDG state slot (`bitty/stall-watchdog.log`), so a terminated session
-//!   still leaves evidence behind.
+//!   log without bound. The latest stall report atomically replaces one XDG
+//!   state slot (`bitty/stall-watchdog.log`) inside a disposable helper
+//!   process that also owns the stderr copy: the previous slot stays intact
+//!   unless a complete new report is renamed in, and a blocked stderr pipe is
+//!   bounded by killing the helper, never by changing the application's
+//!   descriptor flags.
+//! - **Shutdown-clean.** Dropping the handle wakes and joins the monitor, so
+//!   no detached monitor survives app shutdown and no report is written once
+//!   shutdown completed. Report delivery is deadline-bounded (spawn, stdin,
+//!   helper work, wait, and a bounded reap window), so shutdown does not wait
+//!   on an unread stderr pipe. A helper stuck in uninterruptible I/O can
+//!   outlive that window and is abandoned (process exit reaps it); process
+//!   cancellation is best-effort, not a proven kill guarantee.
+//! - **No process-wide stderr mutation.** The monitor never duplicates or
+//!   re-flags fd 2; the helper inherits it as a plain blocking descriptor and
+//!   is killed at the deadline if the reader is gone.
 //! - **No host paths.** Reports name phases, ids, counts, thread states, and
 //!   kernel wait channels; never a checkout, home, or config path.
 //!
@@ -28,8 +42,8 @@
 //! - `BITTY_STALL_WATCHDOG=1` (or `true`/`on`) enables the watchdog with the
 //!   default 2000 ms threshold.
 //! - `BITTY_STALL_WATCHDOG=<milliseconds>` enables it with that threshold.
-//! - `BITTY_STALL_WATCHDOG_MS=<milliseconds>` enables it and overrides the
-//!   threshold (clamped to `50..=600000`).
+//! - `BITTY_STALL_WATCHDOG_MS=<milliseconds>` overrides the threshold
+//!   (clamped to `50..=600000`) but does not enable the watchdog by itself.
 //! - `0`/`false`/`off` leaves it disabled; invalid values stay disabled.
 //!
 //! The idle state is explicit: after the event loop arms `ControlFlow::Wait`
@@ -38,9 +52,12 @@
 //! heartbeat has not advanced past the threshold.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::logging;
@@ -82,6 +99,24 @@ const MAX_REPORTS_PER_STALL: u32 = 5;
 const MAX_THREAD_ROWS: usize = 64;
 /// Maximum bytes in one report (hard cap after rendering).
 const MAX_REPORT_BYTES: usize = 8 * 1024;
+/// Deadline for the complete isolated report delivery.
+///
+/// Covers helper spawn, the bounded stdin transfer, helper work (atomic state
+/// slot, then stderr), and the wait. The monitor never blocks on a report for
+/// longer than this deadline plus [`REPORT_HELPER_REAP_GRACE`]; spawn and
+/// stdin are off-loaded to helper threads so neither can pin the monitor.
+const REPORT_HELPER_TIMEOUT: Duration = Duration::from_millis(250);
+/// Extra bounded window to reap a killed helper and collect its writer.
+///
+/// A helper stuck in uninterruptible I/O can outlive this window; the monitor
+/// then abandons it (reaped by process exit) instead of blocking shutdown.
+const REPORT_HELPER_REAP_GRACE: Duration = Duration::from_millis(100);
+/// Supervision poll cadence (short sleep, never a busy spin).
+const REPORT_HELPER_POLL: Duration = Duration::from_millis(5);
+/// Private argv used by the bounded report helper.
+pub(crate) const STATE_WRITER_ARG: &str = "--internal-stall-watchdog-state";
+/// Environment variable carrying the optional state-slot path to the helper.
+const STATE_WRITER_PATH_ENV: &str = "BITTY_WATCHDOG_STATE_PATH";
 /// Maximum identifier characters rendered per plugin id.
 const MAX_IDENTIFIER_CHARS: usize = 48;
 /// Maximum plugin ids rendered per list.
@@ -318,7 +353,7 @@ struct ThreadRow {
     comm: String,
     state: char,
     wchan: String,
-    syscall: String,
+    syscall_number: String,
 }
 
 /// Process totals sampled alongside the thread rows.
@@ -473,36 +508,102 @@ impl Shared {
     }
 }
 
+/// Monitor wake-up signal.
+///
+/// A plain sleep would make shutdown wait up to one poll interval; the
+/// condition variable wakes the monitor as soon as the stop flag is set.
+struct StopSignal {
+    stopped: AtomicBool,
+    waiter: Mutex<()>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            stopped: AtomicBool::new(false),
+            waiter: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn request(&self) {
+        // Hold the waiter lock so a monitor between the check and the wait
+        // cannot miss the notification.
+        let _guard = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Wait up to `timeout` for a stop request; `true` means stop now.
+    ///
+    /// The stop flag is read *after* taking `waiter`: `request` holds the same
+    /// lock while setting the flag and notifying, so a request that lands
+    /// between the check and the wait cannot be missed.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_stopped() {
+            return true;
+        }
+        let (guard, _) = self
+            .wake
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(guard);
+        self.is_stopped()
+    }
+}
+
 /// Opt-in main-loop watchdog handle.
 ///
-/// `Drop` stops the monitor; the thread handle is deliberately detached so a
-/// wedged stderr sink can never block application shutdown.
+/// `Drop` requests a stop and joins the monitor: shutdown leaves no detached
+/// monitor behind and no report is written once `Drop` returns. The production
+/// sink never writes to the process's own stderr; it hands the report to a
+/// killable helper under a hard deadline, so a closed or unread stderr pipe
+/// cannot panic the monitor and cannot pin the join past that deadline plus
+/// the bounded reap window. Injected test sinks retain normal join semantics
+/// so no arbitrary closure is ever detached.
 pub(crate) struct StallWatchdog {
     shared: Arc<Shared>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
+    monitor: Option<JoinHandle<()>>,
+    /// Set by the monitor thread right before it exits (test observability).
+    #[cfg(test)]
+    finished: Arc<AtomicBool>,
 }
 
 impl StallWatchdog {
     /// Start the watchdog when the environment opts in.
     pub(crate) fn from_env() -> Option<Self> {
         config_from_env().map(|config| {
-            Self::start(
-                config,
-                Box::new(|line: &str| {
-                    let redacted = crate::observability::redact_text_for_stderr(line);
-                    eprintln!("{redacted}");
-                    persist_state_file(&redacted);
-                }),
-            )
+            let mut sink = ReportSink {
+                state_path: state_file_path(),
+                delivery: Box::new(HelperDelivery::current()),
+            };
+            Self::start(config, Box::new(move |line| sink.emit(line)))
         })
     }
 
     /// Start a watchdog with an explicit configuration and sink.
     fn start(config: WatchdogConfig, mut sink: Box<dyn FnMut(&str) + Send>) -> Self {
         let shared = Arc::new(Shared::new());
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::new());
+        #[cfg(test)]
+        let finished = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_stop = Arc::clone(&stop);
+        #[cfg(test)]
+        let thread_finished = Arc::clone(&finished);
         let threshold = config.threshold;
         let poll_interval = std::cmp::max(
             MIN_POLL_INTERVAL,
@@ -518,13 +619,29 @@ impl StallWatchdog {
                     poll_interval,
                     &mut sink,
                 );
+                #[cfg(test)]
+                thread_finished.store(true, Ordering::SeqCst);
             });
-        if let Err(error) = spawn {
-            logging::warn(|| {
-                format!("bitty: stall watchdog thread unavailable ({error}); diagnostics stay off")
-            });
+        let monitor = match spawn {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                logging::warn(|| {
+                    format!(
+                        "bitty: stall watchdog thread unavailable ({error}); diagnostics stay off"
+                    )
+                });
+                #[cfg(test)]
+                finished.store(true, Ordering::SeqCst);
+                None
+            }
+        };
+        Self {
+            shared,
+            stop,
+            monitor,
+            #[cfg(test)]
+            finished,
         }
-        Self { shared, stop }
     }
 
     /// Mark the loop active in `phase` and advance the heartbeat.
@@ -555,27 +672,32 @@ impl StallWatchdog {
         }
     }
 
-    /// Stop the monitor and wait for it to observe the flag.
+    /// Request monitor shutdown and wait for the thread to exit.
+    fn shutdown(&mut self) -> std::thread::Result<()> {
+        self.stop.request();
+        match self.monitor.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the monitor and assert the thread actually exited (tests).
     #[cfg(test)]
-    fn stop_and_join(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // The monitor samples at most `poll_interval`, which the test
-        // configurations keep small; a short bounded wait is enough.
-        std::thread::sleep(MIN_POLL_INTERVAL);
+    fn stop_and_join(mut self) -> std::thread::Result<()> {
+        self.shutdown()
     }
 }
 
 impl Drop for StallWatchdog {
     fn drop(&mut self) {
-        // Detach: a wedged stderr sink must never delay process shutdown.
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.shutdown();
     }
 }
 
 /// Monitor thread body.
 fn monitor_loop(
     shared: &Shared,
-    stop: &AtomicBool,
+    stop: &StopSignal,
     threshold: Duration,
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) + Send),
@@ -585,10 +707,9 @@ fn monitor_loop(
         ..MonitorState::default()
     };
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.wait(poll_interval) {
             return;
         }
-        std::thread::sleep(poll_interval);
         let now = Instant::now();
         let progress = shared.progress.load(Ordering::Relaxed);
         let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
@@ -609,9 +730,18 @@ fn monitor_loop(
                     threads: totals_snapshot.0,
                     totals: totals_snapshot.1,
                 };
-                sink(&render_report(&report));
+                let rendered = render_report(&report);
+                // Sampling /proc and rendering takes time; never emit once
+                // shutdown was requested.
+                if stop.is_stopped() {
+                    return;
+                }
+                sink(&rendered);
             }
             MonitorAction::Recovered { stalled_for } => {
+                if stop.is_stopped() {
+                    return;
+                }
                 sink(&format!(
                     "bitty: main-loop stall recovered after {} ms (phase={})",
                     stalled_for.as_millis(),
@@ -619,6 +749,9 @@ fn monitor_loop(
                 ));
             }
             MonitorAction::Suppressed => {
+                if stop.is_stopped() {
+                    return;
+                }
                 sink(&format!(
                     "bitty: main-loop stall still active after {} reports; further reports suppressed",
                     MAX_REPORTS_PER_STALL
@@ -671,15 +804,15 @@ fn linux_thread_snapshot() -> (Vec<ThreadRow>, ProcessTotals) {
             let wchan = read_proc_text(&format!("{base}/wchan"), 128)
                 .map(|text| sanitize_kernel_token(&text))
                 .unwrap_or_else(|| String::from("?"));
-            let syscall = read_proc_text(&format!("{base}/syscall"), 128)
-                .map(|text| syscall_name(&text))
+            let syscall_number = read_proc_text(&format!("{base}/syscall"), 128)
+                .map(|text| syscall_number(&text))
                 .unwrap_or_else(|| String::from("?"));
             rows.push(ThreadRow {
                 tid,
                 comm,
                 state,
                 wchan,
-                syscall,
+                syscall_number,
             });
         }
     }
@@ -721,9 +854,9 @@ fn stat_state(stat: &str) -> char {
         .unwrap_or('?')
 }
 
-/// Keep only the syscall name (never its argument registers/pointers).
+/// Keep only the syscall number (never its argument registers/pointers).
 #[cfg(target_os = "linux")]
-fn syscall_name(raw: &str) -> String {
+fn syscall_number(raw: &str) -> String {
     let name = raw.split_whitespace().next().unwrap_or_default();
     if name.is_empty() || name == "running" || name.starts_with('-') {
         String::from("-")
@@ -805,8 +938,8 @@ fn render_report(report: &StallReport) -> String {
             let marker = if row.tid == main_tid { "[main] " } else { "" };
             let _ = writeln!(
                 out,
-                "  {marker}tid={} state={} wchan={} syscall={} comm={}",
-                row.tid, row.state, row.wchan, row.syscall, row.comm,
+                "  {marker}tid={} state={} wchan={} syscall_number={} comm={}",
+                row.tid, row.state, row.wchan, row.syscall_number, row.comm,
             );
         }
     }
@@ -843,32 +976,334 @@ fn truncate_report(mut report: String) -> String {
     report
 }
 
-/// Production sink: stderr through the same emission-time redaction gate as
-/// every other app diagnostic, plus one bounded state slot.
+/// Report delivery seam.
+///
+/// Production always goes through [`HelperDelivery`]: a separate helper
+/// process owns the atomic state write and the stderr write, so the monitor
+/// never touches the application's stderr descriptor or its blocking mode.
+/// Tests inject deterministic deliveries; the production supervisor itself is
+/// exercised with real child processes.
+trait ReportDelivery: Send {
+    /// Deliver one already-redacted report.
+    ///
+    /// `state_path` is `Some` only for a stall report; recovery and
+    /// suppression lines reach stderr without touching the state slot.
+    fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome;
+}
+
+/// Outcome of one helper delivery (status evidence, never a dispatch input).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryOutcome {
+    /// Helper exited 0: the state slot (when requested) and stderr were
+    /// handled by the helper.
+    Delivered,
+    /// Helper exited non-zero (state write failed) or the wait itself failed.
+    HelperFailed,
+    /// Deadline elapsed; the helper was killed and reaped within the grace
+    /// window, or abandoned when it could not be reaped.
+    TimedOut,
+    /// The helper could not be spawned (EMFILE/ENFILE, missing exe).
+    SpawnFailed,
+}
+
+/// Production delivery through the private report helper.
+struct HelperDelivery {
+    /// Current executable; `None` when it cannot be resolved (fail closed).
+    program: Option<PathBuf>,
+}
+
+impl HelperDelivery {
+    fn current() -> Self {
+        Self {
+            program: std::env::current_exe().ok(),
+        }
+    }
+}
+
+impl ReportDelivery for HelperDelivery {
+    fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome {
+        let Some(program) = self.program.as_ref() else {
+            return DeliveryOutcome::SpawnFailed;
+        };
+        let mut command = Command::new(program);
+        command.arg(STATE_WRITER_ARG);
+        match state_path {
+            Some(path) => {
+                command.env(STATE_WRITER_PATH_ENV, path);
+            }
+            None => {
+                command.env_remove(STATE_WRITER_PATH_ENV);
+            }
+        }
+        supervise_helper(
+            command,
+            line,
+            Instant::now() + REPORT_HELPER_TIMEOUT,
+            Stdio::inherit(),
+        )
+    }
+}
+
+/// Report sink used in production: one bounded state slot, then stderr.
 ///
 /// The owner's report had no captured log because the graphical launcher's
 /// stderr was lost and the process was terminated. Persisting the latest stall
 /// report under the XDG state directory makes the next occurrence readable
 /// after the fact; it is a single truncated slot, never an append log.
-fn persist_state_file(line: &str) {
-    if !line.starts_with(STALL_REPORT_PREFIX) {
-        return;
-    }
-    let Some(path) = state_file_path() else {
-        return;
-    };
-    write_state_slot(&path, line);
+///
+/// Ordering is deliberate and enforced inside the helper: the state slot is
+/// atomically replaced first, so a blocked or broken stderr pipe cannot lose
+/// the evidence. The monitor never writes to its own stderr: it hands the
+/// redacted report to the killable helper and abandons it at the deadline.
+struct ReportSink {
+    state_path: Option<PathBuf>,
+    delivery: Box<dyn ReportDelivery>,
 }
 
-/// Write (truncate) the single state slot, best-effort.
-fn write_state_slot(path: &std::path::Path, line: &str) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
+impl ReportSink {
+    fn emit(&mut self, line: &str) {
+        let redacted = crate::observability::redact_text_for_stderr(line);
+        // Recovery/suppression lines share the sink but never overwrite the
+        // stall evidence.
+        let state_path = if line.starts_with(STALL_REPORT_PREFIX) {
+            self.state_path.as_deref()
+        } else {
+            None
+        };
+        let _outcome = self.delivery.deliver(&redacted, state_path);
     }
-    let _ = std::fs::write(path, line);
+}
+
+/// Run one helper to completion or the deadline, whichever comes first.
+///
+/// The full operation is bounded: spawn runs on its own thread (a hung exec
+/// cannot pin the monitor and a late child is contained), the stdin transfer
+/// runs on a writer thread, the wait polls until the deadline, and a timed-out
+/// child is killed with a bounded reap window. A child that survives the reap
+/// window is abandoned (process exit reaps it); the writer thread is likewise
+/// abandoned if the closed pipe does not release it. Cancellation is
+/// best-effort: a helper already running may still write after this returns if
+/// the kernel refuses to terminate it.
+fn supervise_helper(
+    command: Command,
+    line: &str,
+    deadline: Instant,
+    stderr: Stdio,
+) -> DeliveryOutcome {
+    let mut child = match spawn_helper_bounded(command, deadline, stderr) {
+        Ok(child) => child,
+        Err(outcome) => return outcome,
+    };
+    let writer = child.stdin.take().and_then(|mut stdin| {
+        let bytes = line.as_bytes().to_vec();
+        std::thread::Builder::new()
+            .name(String::from("bitty-stall-helper-stdin"))
+            .spawn(move || {
+                // Bounded by the helper reading or dying; the supervisor never
+                // joins this thread while the helper is alive.
+                let _ = stdin.write_all(&bytes);
+                drop(stdin);
+            })
+            .ok()
+    });
+    let mut outcome = DeliveryOutcome::TimedOut;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                outcome = if status.success() {
+                    DeliveryOutcome::Delivered
+                } else {
+                    DeliveryOutcome::HelperFailed
+                };
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                outcome = DeliveryOutcome::HelperFailed;
+                break;
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(REPORT_HELPER_POLL.min(deadline.saturating_duration_since(now)));
+    }
+    if outcome == DeliveryOutcome::TimedOut {
+        let _ = child.kill();
+        let reap_deadline = Instant::now() + REPORT_HELPER_REAP_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() < reap_deadline => {
+                    std::thread::sleep(REPORT_HELPER_POLL);
+                }
+                // Survived the grace window: abandon it. Process exit is the
+                // last resort reap; shutdown must not join forever behind a
+                // helper stuck in uninterruptible I/O.
+                Ok(None) => break,
+            }
+        }
+    }
+    if let Some(handle) = writer {
+        let collect_deadline = Instant::now() + REPORT_HELPER_REAP_GRACE;
+        while !handle.is_finished() && Instant::now() < collect_deadline {
+            std::thread::sleep(REPORT_HELPER_POLL);
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+    outcome
+}
+
+/// Spawn the helper on a dedicated thread so a hung `exec` cannot hold the
+/// monitor past the deadline.
+fn spawn_helper_bounded(
+    mut command: Command,
+    deadline: Instant,
+    stderr: Stdio,
+) -> Result<Child, DeliveryOutcome> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    let budget = deadline.saturating_duration_since(Instant::now());
+    if budget.is_zero() {
+        return Err(DeliveryOutcome::TimedOut);
+    }
+    let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
+    let spawned = std::thread::Builder::new()
+        .name(String::from("bitty-stall-helper-spawn"))
+        .spawn(move || match command.spawn() {
+            Ok(mut child) => {
+                if started.elapsed() >= budget {
+                    // The receiver already gave up; contain the late child.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                if let Err(send) = tx.send(Ok(child)) {
+                    if let Ok(mut child) = send.0 {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(Err(error));
+            }
+        });
+    if spawned.is_err() {
+        return Err(DeliveryOutcome::SpawnFailed);
+    }
+    match rx.recv_timeout(budget) {
+        Ok(Ok(child)) => Ok(child),
+        Ok(Err(_)) => Err(DeliveryOutcome::SpawnFailed),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(DeliveryOutcome::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(DeliveryOutcome::SpawnFailed),
+    }
+}
+
+/// Write one report to the optional atomic state slot, then stderr.
+///
+/// The state slot is replaced (temp file + rename) before the stderr write, so
+/// a failure or kill during the stderr write cannot destroy the previous
+/// report. A state-slot failure fails the helper (non-zero exit) without
+/// touching the existing slot; stderr errors (EPIPE/EBADF) are tolerated.
+fn write_report_to(
+    state_path: Option<&Path>,
+    report: &str,
+    stderr: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let persisted = match state_path {
+        Some(path) => write_state_atomic(path, report),
+        None => Ok(()),
+    };
+    // Stderr is attempted even when the state slot failed: the report is the
+    // diagnostic of last resort, and the helper's non-zero status still
+    // records the persistence failure for the supervisor.
+    let _ = stderr.write_all(report.as_bytes());
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+    persisted
+}
+
+/// Deterministic temp sibling used for the atomic state replacement.
+///
+/// One fixed sibling per slot (not per helper PID): a report killed mid-write
+/// leaves at most one temp file, which the next report truncates, instead of
+/// accumulating one leftover per timeout.
+fn state_temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("stall-watchdog.log"));
+    path.with_file_name(format!(".{name}.tmp"))
+}
+
+/// Atomically replace the single state slot.
+///
+/// The previous slot stays intact on any failure: the new report is fully
+/// written and synced to a sibling temp file first, then renamed over the
+/// target (atomic on the same filesystem).
+fn write_state_atomic(path: &Path, line: &str) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state slot path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temp = state_temp_path(path);
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Read the helper's report from stdin, capped at [`MAX_REPORT_BYTES`].
+fn read_helper_report(input: &mut dyn std::io::Read) -> Option<String> {
+    let mut buffer = Vec::new();
+    input
+        .take(u64::try_from(MAX_REPORT_BYTES).unwrap_or(u64::MAX) + 1)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    if buffer.len() > MAX_REPORT_BYTES {
+        return None;
+    }
+    String::from_utf8(buffer).ok()
+}
+
+/// Private report helper invoked before normal CLI parsing.
+///
+/// Reads one bounded report, atomically replaces the optional state slot, then
+/// writes the report to its inherited stderr. The helper is disposable: the
+/// monitor kills it at the delivery deadline, which is how a blocked stderr
+/// pipe stays bounded without ever changing the application's fd 2 flags.
+pub(crate) fn handle_state_writer(raw: &[String]) -> bool {
+    if raw.get(1).map(String::as_str) != Some(STATE_WRITER_ARG) {
+        return false;
+    }
+    let path = std::env::var_os(STATE_WRITER_PATH_ENV).map(PathBuf::from);
+    let Some(report) = read_helper_report(&mut std::io::stdin()) else {
+        std::process::exit(1);
+    };
+    match write_report_to(path.as_deref(), &report, &mut std::io::stderr()) {
+        Ok(()) => std::process::exit(0),
+        Err(_) => std::process::exit(1),
+    }
 }
 
 /// Resolve the single-slot state file path from XDG state conventions.
@@ -1089,10 +1524,42 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let path = dir.join(STATE_FILE_NAME);
-        write_state_slot(&path, "first");
-        write_state_slot(&path, "second");
+        write_state_atomic(&path, "first").expect("initial slot");
+        write_state_atomic(&path, "second").expect("replace slot");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_replacement_is_atomic_and_keeps_the_previous_report_on_failure() {
+        let dir = test_dir("state-atomic");
+        let path = dir.join(STATE_FILE_NAME);
+        write_state_atomic(&path, "first").expect("initial slot");
+        // Block the deterministic temp sibling with a directory: the new
+        // report cannot be staged, so the helper fails before the rename and
+        // the previous evidence stays byte-identical.
+        std::fs::create_dir(state_temp_path(&path)).expect("block temp sibling");
+        assert!(write_state_atomic(&path, "second").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("previous slot"),
+            "first"
+        );
+        std::fs::remove_dir(state_temp_path(&path)).expect("unblock temp sibling");
+        write_state_atomic(&path, "second").expect("replacement after unblock");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn helper_input_is_capped_at_the_report_bound() {
+        let exact = vec![b'x'; MAX_REPORT_BYTES];
+        assert!(read_helper_report(&mut exact.as_slice()).is_some());
+        let over = vec![b'x'; MAX_REPORT_BYTES + 1];
+        assert!(
+            read_helper_report(&mut over.as_slice()).is_none(),
+            "an over-cap helper input must fail closed"
+        );
+        assert!(read_helper_report(&mut b"short report".as_slice()).is_some());
     }
 
     #[test]
@@ -1121,11 +1588,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn syscall_name_never_keeps_arguments() {
-        assert_eq!(syscall_name("futex 0x7f 0x81 0 0"), "futex");
-        assert_eq!(syscall_name("running"), "-");
-        assert_eq!(syscall_name(""), "-");
-        assert_eq!(syscall_name("-1 0 0 0"), "-");
+    fn syscall_number_never_keeps_arguments() {
+        assert_eq!(syscall_number("202 0x7f 0x81 0 0"), "202");
+        assert_eq!(syscall_number("running"), "-");
+        assert_eq!(syscall_number(""), "-");
+        assert_eq!(syscall_number("-1 0 0 0"), "-");
     }
 
     #[cfg(target_os = "linux")]
@@ -1139,7 +1606,7 @@ mod tests {
                 comm: "worker".to_string(),
                 state: 'S',
                 wchan: "futex_wait_queue".to_string(),
-                syscall: "futex".to_string(),
+                syscall_number: "202".to_string(),
             });
         }
         rows.truncate(MAX_THREAD_ROWS);
@@ -1190,6 +1657,356 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("recovery line must arrive");
         assert!(recovered.contains("stall recovered"), "{recovered}");
-        watchdog.stop_and_join();
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// Deterministic temp directory for one hermetic monitor test.
+    fn test_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-watchdog-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Stderr stand-in that fails exactly like a closed pipe.
+    struct BrokenStderr {
+        state_path: PathBuf,
+        saw_state_before_write: Arc<AtomicBool>,
+    }
+
+    impl std::io::Write for BrokenStderr {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            // Record whether the state evidence already existed when this
+            // write arrived; that is the ordering the helper guarantees.
+            if self.state_path.exists() {
+                self.saw_state_before_write.store(true, Ordering::SeqCst);
+            }
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// Delivery that runs the helper's real state+stderr body in-process with
+    /// an injected failing stderr, so the sink wiring is covered without
+    /// depending on the test harness running as the CLI binary.
+    struct OrderingDelivery {
+        state_path: PathBuf,
+        saw_state_before_write: Arc<AtomicBool>,
+    }
+
+    impl ReportDelivery for OrderingDelivery {
+        fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome {
+            let _ = write_report_to(
+                state_path,
+                line,
+                &mut BrokenStderr {
+                    state_path: self.state_path.clone(),
+                    saw_state_before_write: Arc::clone(&self.saw_state_before_write),
+                },
+            );
+            DeliveryOutcome::Delivered
+        }
+    }
+
+    #[test]
+    fn report_sink_persists_state_before_a_broken_stderr_write() {
+        let dir = test_dir("sink-order");
+        let path = dir.join(STATE_FILE_NAME);
+        let saw_state = Arc::new(AtomicBool::new(false));
+        let mut sink = ReportSink {
+            state_path: Some(path.clone()),
+            delivery: Box::new(OrderingDelivery {
+                state_path: path.clone(),
+                saw_state_before_write: Arc::clone(&saw_state),
+            }),
+        };
+        let line = concat!(
+            "bitty: main-loop stall detected: no progress for 2000 ms ",
+            "(threshold 2000 ms, phase=plugin-timers, app_uptime 10 ms, progress=3)\n",
+            "  thread-state snapshot\n"
+        );
+        sink.emit(line);
+
+        assert!(
+            saw_state.load(Ordering::SeqCst),
+            "the state slot must exist before stderr is written"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        // Recovery lines share the sink but never overwrite the evidence.
+        sink.emit("bitty: main-loop stall recovered after 2000 ms (phase=idle)");
+        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn monitor_soak_with_broken_stderr_keeps_phase_and_thread_evidence() {
+        let dir = test_dir("soak");
+        let state_path = dir.join(STATE_FILE_NAME);
+        let writes = Arc::new(AtomicU64::new(0));
+        let saw_state = Arc::new(AtomicBool::new(false));
+        let sink_path = state_path.clone();
+        let sink_writes = Arc::clone(&writes);
+        let sink_saw_state = Arc::clone(&saw_state);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(45),
+            Box::new(move |line| {
+                let mut sink = ReportSink {
+                    state_path: Some(sink_path.clone()),
+                    delivery: Box::new(OrderingDelivery {
+                        state_path: sink_path.clone(),
+                        saw_state_before_write: Arc::clone(&sink_saw_state),
+                    }),
+                };
+                sink.emit(line);
+                sink_writes.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        watchdog.enter(Phase::PluginTimers);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let evidence = loop {
+            if let Ok(text) = std::fs::read_to_string(&state_path) {
+                if text.contains("phase=plugin-timers") {
+                    break text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "monitor never persisted a stall report"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(evidence.starts_with(STALL_REPORT_PREFIX), "{evidence}");
+        assert!(evidence.contains("phase=plugin-timers"), "{evidence}");
+        assert!(evidence.contains("threads="), "{evidence}");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(evidence.contains("tid="), "{evidence}");
+            assert!(evidence.contains("[main]"), "{evidence}");
+            assert!(evidence.contains("state="), "{evidence}");
+        }
+        assert!(
+            saw_state.load(Ordering::SeqCst),
+            "evidence must be on disk before the failing stderr write"
+        );
+
+        // The broken stderr must not panic the monitor: join succeeds and the
+        // thread records its own exit.
+        let finished = Arc::clone(&watchdog.finished);
+        let writes_deadline = Instant::now() + Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < writes_deadline,
+                "sink never observed the persisted report"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let writes_at_stop = writes.load(Ordering::SeqCst);
+        watchdog
+            .stop_and_join()
+            .expect("broken stderr must not panic the monitor");
+        assert!(finished.load(Ordering::SeqCst), "monitor must exit");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            writes_at_stop,
+            "no report may be written after shutdown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).expect("state slot"),
+            evidence,
+            "state evidence must survive shutdown unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_joins_the_monitor_and_stops_writing() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (drop_started_tx, drop_started_rx) = mpsc::channel::<()>();
+        let (drop_done_tx, drop_done_rx) = mpsc::channel::<()>();
+        let writes = Arc::new(AtomicU64::new(0));
+        let sink_writes = Arc::clone(&writes);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(30),
+            Box::new(move |_line| {
+                let _ = entered_tx.send(());
+                // Hold the monitor inside the sink until the test releases it.
+                let _ = release_rx.recv();
+                sink_writes.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        watchdog.enter(Phase::RuntimeTick);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first stall report must enter the sink");
+
+        let finished = Arc::clone(&watchdog.finished);
+        let dropper = std::thread::spawn(move || {
+            let _ = drop_started_tx.send(());
+            drop(watchdog);
+            let _ = drop_done_tx.send(());
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drop thread must start");
+        // The sink is still blocked. A detached monitor returns from Drop
+        // immediately; a joining Drop must stay blocked here.
+        assert!(
+            drop_done_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "Drop must join the monitor thread, not detach it"
+        );
+        release_tx.send(()).expect("release the sink");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Drop must return after the monitor exits");
+        dropper.join().expect("drop thread");
+        assert!(finished.load(Ordering::SeqCst), "monitor must exit");
+
+        let writes_at_drop = writes.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            writes_at_drop,
+            "a stopped monitor must not write"
+        );
+    }
+
+    #[cfg(unix)]
+    fn shell_helper(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn helper_spawn_failure_is_fail_closed() {
+        // EMFILE/ENFILE or a missing executable must not panic or block: the
+        // monitor simply loses the stderr copy while the state slot remains
+        // best-effort.
+        let command = Command::new("bitty-watchdog-helper-that-does-not-exist-0123456789");
+        let outcome = supervise_helper(
+            command,
+            "report\n",
+            Instant::now() + Duration::from_millis(200),
+            Stdio::null(),
+        );
+        assert_eq!(outcome, DeliveryOutcome::SpawnFailed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_with_an_unread_stderr_pipe_times_out_and_is_reaped() {
+        // Production shape: the helper inherits a pipe nobody reads. It blocks
+        // writing to stderr; the supervisor must kill it at the deadline
+        // instead of pinning the monitor.
+        let (reader, writer) = nix::unistd::pipe().expect("OS pipe");
+        let started = Instant::now();
+        let outcome = supervise_helper(
+            shell_helper("head -c 1000000 /dev/zero >&2"),
+            "stall report\n",
+            started + Duration::from_millis(120),
+            Stdio::from(writer),
+        );
+        assert_eq!(outcome, DeliveryOutcome::TimedOut);
+        assert!(
+            started.elapsed()
+                <= Duration::from_millis(120)
+                    + REPORT_HELPER_REAP_GRACE
+                    + Duration::from_millis(500),
+            "saturated stderr pipe must stay deadline-bounded, got {:?}",
+            started.elapsed()
+        );
+        drop(reader);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_status_is_observed() {
+        let outcome = supervise_helper(
+            shell_helper("cat >/dev/null; exit 7"),
+            "report\n",
+            Instant::now() + Duration::from_secs(2),
+            Stdio::null(),
+        );
+        assert_eq!(outcome, DeliveryOutcome::HelperFailed);
+        let delivered = supervise_helper(
+            shell_helper("cat >/dev/null"),
+            "report\n",
+            Instant::now() + Duration::from_secs(2),
+            Stdio::null(),
+        );
+        assert_eq!(delivered, DeliveryOutcome::Delivered);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_that_never_reads_stdin_cannot_pin_the_supervisor() {
+        // A helper that never reads stdin leaves the writer thread blocked on
+        // the pipe. The supervisor still returns at the deadline and only
+        // drains the writer within the bounded grace window.
+        let line = "x".repeat(1024 * 1024);
+        let started = Instant::now();
+        let outcome = supervise_helper(
+            shell_helper("sleep 5"),
+            &line,
+            started + Duration::from_millis(120),
+            Stdio::null(),
+        );
+        assert_eq!(outcome, DeliveryOutcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a blocked stdin write must not pin the supervisor, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_is_bounded_while_a_helper_is_hung_on_an_unread_pipe() {
+        // Production-path bounded Drop: the monitor is inside the helper
+        // supervisor when the handle is dropped. Drop joins the monitor but
+        // must return within the deadline plus the bounded reap grace.
+        let (reader, writer) = nix::unistd::pipe().expect("OS pipe");
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(30),
+            Box::new(move |line| {
+                let _ = entered_tx.send(());
+                let started = Instant::now();
+                let cloned = writer.try_clone().expect("clone pipe writer");
+                let _ = supervise_helper(
+                    shell_helper("head -c 1000000 /dev/zero >&2"),
+                    line,
+                    started + Duration::from_millis(120),
+                    Stdio::from(cloned),
+                );
+            }),
+        );
+        watchdog.enter(Phase::RuntimeTick);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor must enter the helper supervisor");
+        let started = Instant::now();
+        drop(watchdog);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Drop must be bounded under a hung helper, got {:?}",
+            started.elapsed()
+        );
+        drop(reader);
     }
 }

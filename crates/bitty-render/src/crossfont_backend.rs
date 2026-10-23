@@ -105,7 +105,7 @@ impl GlyphRasterizer for CrossFontRasterizer {
     }
 
     fn font_metrics(
-        &self,
+        &mut self,
         font: FontId,
         point_size: f32,
     ) -> Result<Option<FontMetrics>, RenderError> {
@@ -115,6 +115,31 @@ impl GlyphRasterizer for CrossFontRasterizer {
             });
         }
         let font_key = self.upstream_key(font)?;
+        // crossfont 0.9 sizes the FreeType face lazily, inside `get_glyph`
+        // (`FT_Set_Char_Size`) before each bitmap load, and `metrics()`
+        // reads the face's *current* `FT_Size_Metrics` while ignoring its
+        // size argument. Measuring a freshly loaded face therefore reported
+        // zero line height/descent and an advance in font units (`1233 / 64
+        // = 19.265625px` for DejaVu at every size), which made
+        // `FontMetrics::is_usable` false and forced the fixed 3/4 baseline.
+        // Probe one glyph at the requested size first; the bitmap is
+        // discarded and the char size it sets is what `metrics()` reads.
+        // A missing glyph still sets the char size before failing, so this
+        // holds for fonts without '0'.
+        let probe = UpstreamGlyphKey {
+            character: '0',
+            font_key,
+            size: UpstreamSize::new(point_size),
+        };
+        match self.inner.get_glyph(probe) {
+            // `MissingGlyph` is raised after `FT_Set_Char_Size` and the
+            // bitmap load, so the face is sized and the previous-size
+            // metrics trap is still closed.
+            Ok(_) | Err(UpstreamError::MissingGlyph(_)) => {}
+            // Any other failure may predate sizing; report "no
+            // measurement" instead of reading a stale face size.
+            Err(err) => return Err(map_upstream_error(err)),
+        }
         match self.inner.metrics(font_key, UpstreamSize::new(point_size)) {
             Ok(upstream) => Ok(Some(FontMetrics {
                 average_advance_px: upstream.average_advance as f32,
@@ -311,7 +336,7 @@ mod tests {
     fn font_metrics_rejects_bad_sizes_and_stale_handles() {
         // Needs a live font stack (FreeType+fontconfig); bare CI runners
         // skip gracefully instead of failing on missing platform fonts.
-        let backend = match CrossFontRasterizer::new() {
+        let mut backend = match CrossFontRasterizer::new() {
             Ok(backend) => backend,
             Err(_) => return,
         };

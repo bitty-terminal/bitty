@@ -456,13 +456,19 @@ pub trait GlyphRasterizer {
     /// legacy fixed-baseline rule. Returning `Ok(None)` is always valid;
     /// callers treat `None` and unusable values identically (fallback).
     ///
+    /// Takes `&mut self` because a backend may have to set its face's
+    /// raster size before it can read size metrics (crossfont does:
+    /// FreeType is sized inside its glyph path, and its `metrics()` ignores
+    /// the size argument). Measurement runs once per load/rescale, never
+    /// per frame.
+    ///
     /// # Errors
     ///
     /// [`RenderError::UnknownFontHandle`] for stale handles,
     /// [`RenderError::InvalidInput`] for non-finite/non-positive sizes,
     /// [`RenderError::UpstreamRasterizer`] for engine failures.
     fn font_metrics(
-        &self,
+        &mut self,
         font: FontId,
         point_size: f32,
     ) -> Result<Option<FontMetrics>, RenderError> {
@@ -590,7 +596,7 @@ mod tests {
                 Ok(None)
             }
         }
-        let bare = Bare;
+        let mut bare = Bare;
         let id = FontId::next(&mut 7);
         assert_eq!(bare.font_metrics(id, 12.0).unwrap(), None);
     }

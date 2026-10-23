@@ -8,6 +8,9 @@ use bitty_platform::PhysicalSize;
 use bitty_runtime::Runtime;
 use bitty_ui::ViewId;
 
+#[cfg(unix)]
+use bitty_runtime::{LayoutNode, SplitAxis, View};
+
 #[test]
 fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     let mut rt = Runtime::with_defaults().expect("defaults");
@@ -158,4 +161,92 @@ fn headless_still_works_after_multiple_resizes_and_prints() {
             "headless rgba must exist after resize"
         );
     }
+}
+
+/// #2529 multi-panel repro: dragging a horizontal divider changes a pane's
+/// height (and nothing else). The pane's grid must keep its logical lines and
+/// round-trip them through scrollback instead of collapsing/squashing them.
+#[cfg(unix)]
+#[test]
+fn two_pane_height_resize_roundtrips_pane_content() {
+    const SHELL: &str = "/bin/sh";
+    fn two_pane_vertical(ratio: f32) -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            ratio,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        )
+    }
+    fn pane_rows(rt: &Runtime) -> Vec<String> {
+        let snap = rt.pane_snapshot(&ViewId::new(2)).expect("pane 2 frame");
+        (0..snap.height)
+            .map(|row| {
+                let start = row * snap.width;
+                snap.cells[start..start + snap.width]
+                    .iter()
+                    .map(|cell| if cell.spacer { ' ' } else { cell.glyph })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    rt.set_layout(two_pane_vertical(0.5));
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == ViewId::new(2))
+        .expect("bottom pane frame");
+    rt.spawn_shell_for_view(
+        ViewId::new(2),
+        SHELL,
+        &["-c", "exec sleep 30"],
+        frame.cols,
+        frame.rows,
+    )
+    .expect("spawn pane shell");
+
+    // Short `ls`-style rows plus a long Markdown paragraph that soft-wraps.
+    for i in 0..4 {
+        rt.handle_pane_bytes(
+            ViewId::new(2),
+            format!("file-{i:02}.md  README.md\r\n").as_bytes(),
+        );
+    }
+    rt.handle_pane_bytes(
+        ViewId::new(2),
+        b"# Heading\r\n\r\nA paragraph that is long enough to wrap across more than one physical row in this pane.\r\n",
+    );
+
+    let before = pane_rows(&rt);
+    let joined = before.join("\n");
+    assert!(joined.contains("file-03.md"), "fixture content: {joined:?}");
+    assert!(
+        joined.contains("more than one physical row"),
+        "fixture must show the wrapped paragraph: {joined:?}"
+    );
+
+    // Shrink the bottom pane hard (divider drag), then restore it. At one
+    // row the visible row can be the blank cursor row; the contract is that
+    // nothing is lost and the round-trip restores the grid.
+    rt.set_layout(two_pane_vertical(0.9));
+    let _ = pane_rows(&rt);
+    rt.set_layout(two_pane_vertical(0.5));
+
+    let restored = pane_rows(&rt);
+    let content = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| !row.trim().is_empty())
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        content(&restored),
+        content(&before),
+        "height round-trip must restore every pane line without merging or loss"
+    );
+    assert!(rt.state().check_invariants().is_ok());
 }

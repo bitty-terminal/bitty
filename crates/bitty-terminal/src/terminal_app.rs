@@ -3652,25 +3652,42 @@ impl TerminalApp {
         }
     }
 
-    /// Syncs the OS pointer with hover-vs-`OSC 22` precedence (issues #1759/#1762).
+    /// Syncs the OS pointer with the full shape precedence (issue #2480,
+    /// extending #1759/#1762).
     ///
-    /// Hover wins: either hyperlink hover (OSC 8 in #1759 or Ctrl-gated
-    /// plaintext in #1760) forces `Pointer`. Otherwise the focused pane's
-    /// `OSC 22` icon applies, failing open to `Default` for an empty stack,
-    /// unknown focus, or a pane exit, so a focus move or `RIS` (`FullReset`)
-    /// resets the pointer on the next tick without extra plumbing. Called
-    /// once per tick after the IME sync and after mouse events. Change-gated
-    /// through [`Self::apply_cursor_icon`].
+    /// Order, highest first:
+    /// 1. outside the window or over an overlay (capture or modal panel):
+    ///    `Default`, so a shape never sticks after leave or behind a modal;
+    /// 2. a hovered hyperlink/plaintext URL: `Pointer`;
+    /// 3. an explicit focused-pane `OSC 22` shape: that shape (terminal
+    ///    applications keep control of their pointer);
+    /// 4. selectable terminal text: `Text` (the I-beam this issue adds);
+    /// 5. everything else: `Default`.
+    ///
+    /// Called once per tick after the IME sync and after mouse events.
+    /// Change-gated through [`Self::apply_cursor_icon`], so steady hover over
+    /// text costs no OS call.
     pub(crate) fn sync_cursor_icon(&mut self) {
         // CTX-0943: while a focusable overlay capture holds, the modal
-        // obscures the grid — never show an underlying URL pointer.
-        let hovered = !self.overlay_capture_active()
+        // obscures the grid — never show an underlying URL pointer. Issue
+        // #2480 extends the same rule to modal panel overlays and to a
+        // pointer that left the window.
+        let overlay_active = self.overlay_capture_active() || self.runtime.overlay_modal_active();
+        let inside = self.runtime.cursor_inside_window();
+        let hovered = inside
+            && !overlay_active
             && (self.runtime.hovered_hyperlink_span().is_some()
                 || self.runtime.hovered_plaintext_span().is_some());
-        let icon = if hovered {
+        let icon = if !inside || overlay_active {
+            bitty_platform::CursorIcon::Default
+        } else if hovered {
             bitty_platform::CursorIcon::Pointer
+        } else if let Some(shape) = self.runtime.focused_pointer_shape() {
+            bitty_runtime::runtime::pointer::cursor_icon_for_shape(shape)
+        } else if self.runtime.pointer_over_selectable_text() {
+            bitty_platform::CursorIcon::Text
         } else {
-            self.runtime.cursor_icon_for_focused()
+            bitty_platform::CursorIcon::Default
         };
         self.apply_cursor_icon(icon);
     }

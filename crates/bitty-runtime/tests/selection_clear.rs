@@ -165,7 +165,7 @@ fn new_drag_replaces_old_selection() {
     // New drag via the mouse path replaces the old range.
     rt.handle_cursor_moved(cell_pos(6, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
-    rt.handle_cursor_moved(cell_pos(10, 0));
+    rt.handle_cursor_moved(cell_pos(11, 0));
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert!(rt.has_selection());
     assert_eq!(rt.selection_text().as_deref(), Some("world"));
@@ -230,7 +230,7 @@ fn drag_auto_copy_proves_capture_for_wl_paste() {
     feed_text(&mut rt, "hello world");
     rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
-    rt.handle_cursor_moved(cell_pos(4, 0));
+    rt.handle_cursor_moved(cell_pos(5, 0));
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
     assert_eq!(rt.clipboard().headless_contents(), "hello");

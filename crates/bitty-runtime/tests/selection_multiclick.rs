@@ -41,6 +41,14 @@ fn cell_pos(col: u16, row: u16) -> CursorPosition {
     }
 }
 
+/// Physical position inside the right half of a grid cell (the caret rounds
+/// to the trailing edge, issue #2480).
+fn cell_pos_right_half(col: u16, row: u16) -> CursorPosition {
+    let mut pos = cell_pos(col, row);
+    pos.x += 6.0;
+    pos
+}
+
 fn press_at(rt: &mut Runtime, col: u16, row: u16, now: Instant) {
     rt.handle_cursor_moved_at(cell_pos(col, row), now);
     rt.handle_mouse_input_at(MouseEvent::new(MouseButton::Left, PressState::Pressed), now);
@@ -118,8 +126,8 @@ fn single_click_drag_stays_simple_no_regression() {
     feed_text(&mut rt, "hello world");
     let base = Instant::now();
     press_at(&mut rt, 0, 0, base);
-    move_at(&mut rt, 4, 0, base + Duration::from_millis(30));
-    release_at(&mut rt, 4, 0, base + Duration::from_millis(60));
+    move_at(&mut rt, 5, 0, base + Duration::from_millis(30));
+    release_at(&mut rt, 5, 0, base + Duration::from_millis(60));
     assert_eq!(rt.last_click_count(), 1);
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Simple));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
@@ -289,14 +297,78 @@ fn alt_press_starts_block_selection() {
     let base = Instant::now();
     press_at(&mut rt, 1, 0, base);
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Block));
-    move_at(&mut rt, 2, 2, base + Duration::from_millis(40));
-    release_at(&mut rt, 2, 2, base + Duration::from_millis(80));
+    move_at(&mut rt, 3, 2, base + Duration::from_millis(40));
+    release_at(&mut rt, 3, 2, base + Duration::from_millis(80));
     assert_eq!(rt.selection_kind(), Some(SelectionKind::Block));
     assert_eq!(rt.selection_text().as_deref(), Some("bc\nfg\njk"));
     // The block rectangle normalizes independent of drag direction.
     assert_eq!(
         rt.selection().expect("block").normalized().start,
         CellPos::new(0, 1)
+    );
+}
+
+#[test]
+fn backward_drag_resets_the_click_chain() {
+    // Issue #2480 review: drag-vs-click must compare the press cell with the
+    // snapped pointer cell, never the span end. For a backward drag the span
+    // end is the press-side cell, so the old check kept the click chain and
+    // a quick follow-up press became a double-click word.
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "abcdefgh");
+    let base = Instant::now();
+    rt.handle_cursor_moved_at(cell_pos(6, 0), base);
+    rt.handle_mouse_input_at(
+        MouseEvent::new(MouseButton::Left, PressState::Pressed),
+        base,
+    );
+    rt.handle_cursor_moved_at(cell_pos(2, 0), base + Duration::from_millis(40));
+    rt.handle_mouse_input_at(
+        MouseEvent::new(MouseButton::Left, PressState::Released),
+        base + Duration::from_millis(80),
+    );
+    assert_eq!(rt.selection_text().as_deref(), Some("cdef"));
+    press_at(&mut rt, 6, 0, base + Duration::from_millis(150));
+    assert_eq!(
+        rt.last_click_count(),
+        1,
+        "a backward drag starts a fresh click chain"
+    );
+    release_at(&mut rt, 6, 0, base + Duration::from_millis(180));
+}
+
+#[test]
+fn block_drag_from_the_right_half_keeps_the_pressed_column() {
+    // Issue #2480 review: block anchors stay cell-based. A vertical Alt+drag
+    // from the right half of column 1 must keep column 1, not shift to 2.
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "abcd\r\nefgh\r\nijkl");
+    rt.handle_platform_event(bitty_platform::PlatformEvent::Window {
+        window_id: bitty_platform::WindowId::from_raw_public(1),
+        kind: bitty_platform::WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: false,
+            control: false,
+            alt: true,
+            super_pressed: false,
+        }),
+    });
+    let base = Instant::now();
+    let start = cell_pos_right_half(1, 0);
+    rt.handle_cursor_moved_at(start, base);
+    rt.handle_mouse_input_at(
+        MouseEvent::new(MouseButton::Left, PressState::Pressed),
+        base,
+    );
+    rt.handle_cursor_moved_at(cell_pos_right_half(1, 2), base + Duration::from_millis(40));
+    rt.handle_mouse_input_at(
+        MouseEvent::new(MouseButton::Left, PressState::Released),
+        base + Duration::from_millis(80),
+    );
+    assert_eq!(rt.selection_kind(), Some(SelectionKind::Block));
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("b\nf\nj"),
+        "the pressed cell column is the block anchor"
     );
 }
 

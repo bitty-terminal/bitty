@@ -1182,7 +1182,7 @@ impl GlyphRasterizer for SwashSingle {
     }
 
     fn font_metrics(
-        &self,
+        &mut self,
         font: FontId,
         point_size: f32,
     ) -> Result<Option<FontMetrics>, RenderError> {

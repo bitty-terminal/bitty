@@ -54,11 +54,22 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt;
+use std::io;
+use std::time::{Duration, Instant};
 
 use bitty_a11y::{
     A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
     InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
     MAX_PENDING_ANNOUNCEMENTS, SceneKind, Snapshot, SnapshotBuilder, SnapshotHost, TextRun,
+};
+use bitty_a11y_component::component::protocol::{
+    BOUNDS_UNIT_CHARS, CAPABILITY_MASK, MAX_GRID_COLS, MAX_GRID_ROWS, MAX_TREE_DEPTH,
+    PROTOCOL_VERSION, ROLE_NONE, STATE_FOCUSED, STATE_MASK, SURFACE_NONE, SURFACE_OVERLAY,
+};
+use bitty_a11y_component::component::{
+    CAPABILITY_DIFF, CAPABILITY_SELECTION, CAPABILITY_SNAPSHOT, ErrorKind,
+    HELLO_CAPABILITY_GRANTED, Message, Selection, TreeRow,
 };
 
 use crate::motion::MotionSpec;
@@ -105,6 +116,621 @@ pub const FALLBACK_ACCESSIBLE_NAME: &str = "terminal";
 /// copy in the a11y host; the host only names the extension [`Role`]
 /// vocabulary.
 pub use crate::uitree::a11y_role_of;
+
+const MAX_COMPONENT_NAME_CHARS: usize = 256;
+const MAX_COMPONENT_TEXT_BYTES: usize = 1024;
+const MAX_COMPONENT_ROW_BYTES: usize = 8192;
+const MAX_COMPONENT_PROJECTION_BYTES: usize = 1024 * 1024;
+const MAX_COMPONENT_NODES: usize = 4096;
+const MAX_COMPONENT_PAGES: u32 = 256;
+const DEFAULT_COMPONENT_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Default-off component host configuration.
+///
+/// The Core composition root must explicitly construct this value after its
+/// installer, capability authority, and safe-mode policy have made the
+/// decision to expose accessibility. This module does not spawn processes,
+/// open files, select a platform backend, or grant the capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentHostConfig {
+    /// Whether the Core process is in safe mode.
+    pub safe_mode: bool,
+    /// Whether the Core policy granted component accessibility projection.
+    pub capability_granted: bool,
+    /// Maximum time allowed for one handshake or snapshot exchange.
+    pub deadline: Duration,
+}
+
+impl Default for ComponentHostConfig {
+    fn default() -> Self {
+        Self {
+            safe_mode: true,
+            capability_granted: false,
+            deadline: DEFAULT_COMPONENT_DEADLINE,
+        }
+    }
+}
+
+/// Errors returned by the default-off component host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComponentHostError {
+    /// Safe mode or missing capability withheld the projection.
+    Denied,
+    /// The peer returned a typed error.
+    Peer(ErrorKind),
+    /// The stream or component ended before a complete exchange.
+    ComponentLost,
+    /// The exchange exceeded its caller-supplied deadline.
+    Deadline,
+    /// The peer violated the protocol or the bounded tree contract.
+    Invalid(String),
+}
+
+impl fmt::Display for ComponentHostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Denied => f.write_str("accessibility component denied"),
+            Self::Peer(kind) => write!(f, "accessibility component error: {kind}"),
+            Self::ComponentLost => f.write_str("accessibility component lost"),
+            Self::Deadline => f.write_str("accessibility component deadline exceeded"),
+            Self::Invalid(reason) => {
+                write!(f, "invalid accessibility component response: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ComponentHostError {}
+
+/// A complete, validated component projection.
+///
+/// This is read-only presentation data. Stable ids are retained only as
+/// projection data; no id is converted into a Core action target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentProjection {
+    generation: u64,
+    rows: Vec<TreeRow>,
+    focus: Option<u64>,
+    selection: Option<Selection>,
+}
+
+impl ComponentProjection {
+    /// Projection generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Validated rows in deterministic wire order.
+    #[must_use]
+    pub fn rows(&self) -> &[TreeRow] {
+        &self.rows
+    }
+
+    /// Stable focused id, if the component reported one.
+    #[must_use]
+    pub const fn focus(&self) -> Option<u64> {
+        self.focus
+    }
+
+    /// Selection state, if the component reported one.
+    #[must_use]
+    pub const fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+}
+
+/// Transport boundary owned by the Core composition root.
+///
+/// Implementations must enforce their own I/O deadline. The host never
+/// performs blocking I/O on the UI thread and never assumes that EOF means a
+/// valid empty projection: EOF is always a fail-closed component loss.
+pub trait ComponentTransport {
+    /// Writes one complete framed message.
+    fn send(&mut self, message: &Message) -> io::Result<()>;
+    /// Reads one complete framed message before `deadline`.
+    fn receive(&mut self, deadline: Instant) -> io::Result<Option<Message>>;
+}
+
+/// Validating Core client for the installable `bitty-a11y` component.
+///
+/// It is intentionally not wired into the default linked [`SnapshotHost`]
+/// path. Until a platform backend and an explicit composition-root policy are
+/// accepted, the linked model remains the safe fallback and this client is a
+/// contract seam only.
+#[derive(Debug)]
+pub struct ComponentSnapshotHost<T> {
+    transport: T,
+    config: ComponentHostConfig,
+    capabilities: u8,
+    projection: Option<ComponentProjection>,
+    retired_ids: std::collections::BTreeSet<u64>,
+    next_request: u64,
+}
+
+impl<T: ComponentTransport> ComponentSnapshotHost<T> {
+    /// Completes the capability-gated handshake.
+    pub fn connect(
+        mut transport: T,
+        config: ComponentHostConfig,
+    ) -> Result<Self, ComponentHostError> {
+        if config.safe_mode || !config.capability_granted || config.deadline.is_zero() {
+            return Err(ComponentHostError::Denied);
+        }
+        let mode = HELLO_CAPABILITY_GRANTED;
+        transport
+            .send(&Message::Hello {
+                min: PROTOCOL_VERSION,
+                max: PROTOCOL_VERSION,
+                component: "a11y".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                mode,
+            })
+            .map_err(|_| ComponentHostError::ComponentLost)?;
+        let deadline = Instant::now()
+            .checked_add(config.deadline)
+            .ok_or(ComponentHostError::Deadline)?;
+        let response = transport
+            .receive(deadline)
+            .map_err(map_receive_error)?
+            .ok_or(ComponentHostError::ComponentLost)?;
+        if Instant::now() > deadline {
+            return Err(ComponentHostError::Deadline);
+        }
+        match response {
+            Message::HelloAck {
+                protocol,
+                component,
+                capabilities,
+                ..
+            } if protocol == PROTOCOL_VERSION && component == "a11y" => {
+                if capabilities == 0 {
+                    return Err(ComponentHostError::Denied);
+                }
+                if capabilities & !CAPABILITY_MASK != 0 || capabilities & CAPABILITY_SNAPSHOT == 0 {
+                    return Err(ComponentHostError::Invalid(
+                        "unsupported capability set".to_owned(),
+                    ));
+                }
+                Ok(Self {
+                    transport,
+                    config,
+                    capabilities,
+                    projection: None,
+                    retired_ids: std::collections::BTreeSet::new(),
+                    next_request: 1,
+                })
+            }
+            Message::HelloAck { .. } => {
+                Err(ComponentHostError::Invalid("handshake mismatch".to_owned()))
+            }
+            Message::Error { kind, .. } => Err(ComponentHostError::Peer(kind)),
+            _ => Err(ComponentHostError::Invalid(
+                "expected handshake acknowledgement".to_owned(),
+            )),
+        }
+    }
+
+    /// Requests and validates a complete snapshot or bounded diff.
+    ///
+    /// A diff is applied only after every page, id, parent, depth, generation,
+    /// focus, and selection invariant passes. Any failure leaves the prior
+    /// projection unavailable and returns a fail-closed error.
+    pub fn refresh(&mut self) -> Result<&ComponentProjection, ComponentHostError> {
+        let result = self.refresh_inner();
+        if result.is_err() {
+            // A crashed, stale, malformed, or timed-out component must not
+            // leave the last tree exposed as if it were current.
+            self.projection = None;
+        }
+        match result {
+            Ok(projection) => {
+                if let Some(previous) = self.projection.as_ref() {
+                    for row in &previous.rows {
+                        if !projection.rows.iter().any(|next| next.id == row.id) {
+                            self.retired_ids.insert(row.id);
+                        }
+                    }
+                }
+                self.projection = Some(projection);
+                Ok(self.projection.as_ref().expect("projection inserted"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn refresh_inner(&mut self) -> Result<ComponentProjection, ComponentHostError> {
+        let request = self.mint_request()?;
+        let since = self
+            .projection
+            .as_ref()
+            .map_or(0, ComponentProjection::generation);
+        self.transport
+            .send(&Message::SnapshotRequest { request, since })
+            .map_err(map_receive_error)?;
+        let deadline = Instant::now()
+            .checked_add(self.config.deadline)
+            .ok_or(ComponentHostError::Deadline)?;
+        let first = self.receive_for(request, deadline)?;
+        let is_diff = matches!(first, Message::DiffBegin { .. });
+        let candidate = match first {
+            Message::SnapshotBegin {
+                generation,
+                nodes,
+                focus,
+                selection,
+                pages,
+                ..
+            } => self.read_snapshot(
+                request, generation, nodes, focus, selection, pages, deadline,
+            )?,
+            Message::DiffBegin {
+                base,
+                generation,
+                removed,
+                upserts,
+                focus,
+                selection,
+                pages,
+                ..
+            } => {
+                let current = self.projection.clone().ok_or_else(|| {
+                    ComponentHostError::Invalid("diff without baseline".to_owned())
+                })?;
+                if base != current.generation || self.capabilities & CAPABILITY_DIFF == 0 {
+                    return Err(ComponentHostError::Peer(ErrorKind::StaleGeneration));
+                }
+                self.read_diff(
+                    request, &current, generation, removed, upserts, focus, selection, pages,
+                    deadline,
+                )?
+            }
+            Message::Error { kind, .. } => return Err(ComponentHostError::Peer(kind)),
+            _ => {
+                return Err(ComponentHostError::Invalid(
+                    "unexpected snapshot response".to_owned(),
+                ));
+            }
+        };
+        if is_diff {
+            self.transport
+                .send(&Message::DiffAck {
+                    generation: candidate.generation,
+                })
+                .map_err(map_receive_error)?;
+        }
+        Ok(candidate)
+    }
+
+    /// Current validated projection, if one has been accepted.
+    #[must_use]
+    pub const fn projection(&self) -> Option<&ComponentProjection> {
+        self.projection.as_ref()
+    }
+
+    fn mint_request(&mut self) -> Result<u64, ComponentHostError> {
+        let request = self.next_request;
+        self.next_request = self
+            .next_request
+            .checked_add(1)
+            .ok_or_else(|| ComponentHostError::Invalid("request id exhausted".to_owned()))?;
+        Ok(request)
+    }
+
+    fn receive_for(
+        &mut self,
+        request: u64,
+        deadline: Instant,
+    ) -> Result<Message, ComponentHostError> {
+        if Instant::now() >= deadline {
+            return Err(ComponentHostError::Deadline);
+        }
+        let message = self
+            .transport
+            .receive(deadline)
+            .map_err(map_receive_error)?
+            .ok_or(ComponentHostError::ComponentLost)?;
+        if Instant::now() > deadline {
+            return Err(ComponentHostError::Deadline);
+        }
+        if message.request_id().is_some_and(|id| id != request) {
+            return Err(ComponentHostError::Invalid(
+                "response request mismatch".to_owned(),
+            ));
+        }
+        Ok(message)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_snapshot(
+        &mut self,
+        request: u64,
+        generation: u64,
+        nodes: u32,
+        focus: Option<u64>,
+        selection: Option<Selection>,
+        pages: u32,
+        deadline: Instant,
+    ) -> Result<ComponentProjection, ComponentHostError> {
+        if generation == 0
+            || self
+                .projection
+                .as_ref()
+                .is_some_and(|current| generation <= current.generation)
+            || nodes == 0
+            || pages == 0
+            || nodes as usize > MAX_COMPONENT_NODES
+            || pages > MAX_COMPONENT_PAGES
+        {
+            return Err(ComponentHostError::Invalid(
+                "invalid snapshot header".to_owned(),
+            ));
+        }
+        let mut rows = Vec::new();
+        for index in 0..pages {
+            match self.receive_for(request, deadline)? {
+                Message::SnapshotPage {
+                    index: received,
+                    rows: page,
+                    last,
+                    ..
+                } if received == index => {
+                    rows.extend(page);
+                    if last != (index + 1 == pages) {
+                        return Err(ComponentHostError::Invalid(
+                            "snapshot page termination".to_owned(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ComponentHostError::Invalid(
+                        "invalid snapshot page".to_owned(),
+                    ));
+                }
+            }
+        }
+        if rows.len() != nodes as usize {
+            return Err(ComponentHostError::Invalid(
+                "snapshot node count".to_owned(),
+            ));
+        }
+        self.validate_projection(generation, rows, focus, selection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_diff(
+        &mut self,
+        request: u64,
+        current: &ComponentProjection,
+        generation: u64,
+        removed: u32,
+        upserts: u32,
+        focus: Option<u64>,
+        selection: Option<Selection>,
+        pages: u32,
+        deadline: Instant,
+    ) -> Result<ComponentProjection, ComponentHostError> {
+        if generation < current.generation
+            || generation == current.generation && (removed != 0 || upserts != 0)
+            || pages > MAX_COMPONENT_PAGES
+            || pages == 0 && (removed != 0 || upserts != 0)
+            || removed as usize > MAX_COMPONENT_NODES
+            || upserts as usize > MAX_COMPONENT_NODES
+        {
+            return Err(ComponentHostError::Invalid(
+                "invalid diff header".to_owned(),
+            ));
+        }
+        let mut rows = current.rows.clone();
+        let mut removed_ids = Vec::new();
+        let mut upsert_rows = Vec::new();
+        for index in 0..pages {
+            match self.receive_for(request, deadline)? {
+                Message::DiffPage {
+                    index: received,
+                    removed: page_removed,
+                    upserts: page_upserts,
+                    last,
+                    ..
+                } if received == index => {
+                    removed_ids.extend(page_removed);
+                    upsert_rows.extend(page_upserts);
+                    if last != (index + 1 == pages) {
+                        return Err(ComponentHostError::Invalid(
+                            "diff page termination".to_owned(),
+                        ));
+                    }
+                }
+                _ => return Err(ComponentHostError::Invalid("invalid diff page".to_owned())),
+            }
+        }
+        if removed_ids.len() != removed as usize || upsert_rows.len() != upserts as usize {
+            return Err(ComponentHostError::Invalid("diff entry count".to_owned()));
+        }
+        let current_ids: std::collections::BTreeSet<u64> = rows.iter().map(|row| row.id).collect();
+        let removed_set: std::collections::BTreeSet<u64> = removed_ids.iter().copied().collect();
+        if removed_set.len() != removed_ids.len()
+            || removed_ids.iter().any(|id| !current_ids.contains(id))
+        {
+            return Err(ComponentHostError::Invalid(
+                "unknown or duplicate removed id".to_owned(),
+            ));
+        }
+        let upsert_ids: std::collections::BTreeSet<u64> =
+            upsert_rows.iter().map(|row| row.id).collect();
+        if upsert_ids.len() != upsert_rows.len() {
+            return Err(ComponentHostError::Invalid(
+                "duplicate upsert id".to_owned(),
+            ));
+        }
+        if upsert_ids.iter().any(|id| removed_set.contains(id)) {
+            return Err(ComponentHostError::Invalid(
+                "removed id reused in diff".to_owned(),
+            ));
+        }
+        for id in &removed_ids {
+            rows.retain(|row| row.id != *id);
+        }
+        for row in upsert_rows {
+            rows.retain(|existing| existing.id != row.id);
+            rows.push(row);
+        }
+        rows.sort_by_key(|row| row.id);
+        let candidate = self.validate_projection(generation, rows, focus, selection)?;
+        self.retired_ids.extend(removed_ids);
+        Ok(candidate)
+    }
+
+    fn validate_projection(
+        &mut self,
+        generation: u64,
+        rows: Vec<TreeRow>,
+        focus: Option<u64>,
+        selection: Option<Selection>,
+    ) -> Result<ComponentProjection, ComponentHostError> {
+        if rows.is_empty() || rows.len() > MAX_COMPONENT_NODES {
+            return Err(ComponentHostError::Invalid("node bound".to_owned()));
+        }
+        if rows.iter().any(|row| {
+            row.name.as_ref().is_some_and(|value| {
+                value.chars().count() > MAX_COMPONENT_NAME_CHARS
+                    || value.len() > MAX_COMPONENT_TEXT_BYTES
+            }) || row.state_text.as_ref().is_some_and(|value| {
+                value.chars().count() > MAX_COMPONENT_NAME_CHARS
+                    || value.len() > MAX_COMPONENT_TEXT_BYTES
+            }) || row
+                .content
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_COMPONENT_ROW_BYTES)
+        }) {
+            return Err(ComponentHostError::Invalid("text byte bound".to_owned()));
+        }
+        let text_bytes: usize = rows
+            .iter()
+            .map(|row| {
+                row.name.as_ref().map_or(0, String::len)
+                    + row.content.as_ref().map_or(0, String::len)
+                    + row.state_text.as_ref().map_or(0, String::len)
+            })
+            .sum();
+        if text_bytes > MAX_COMPONENT_PROJECTION_BYTES {
+            return Err(ComponentHostError::Invalid(
+                "projection byte bound".to_owned(),
+            ));
+        }
+        let ids: std::collections::BTreeSet<u64> = rows.iter().map(|row| row.id).collect();
+        if ids.len() != rows.len() || ids.iter().any(|id| self.retired_ids.contains(id)) {
+            return Err(ComponentHostError::Invalid(
+                "duplicate or retired id".to_owned(),
+            ));
+        }
+        let root_count = rows.iter().filter(|row| row.parent == 0).count();
+        if root_count != 1 {
+            return Err(ComponentHostError::Invalid("root count".to_owned()));
+        }
+        for row in &rows {
+            if row.id == 0
+                || row.depth > MAX_TREE_DEPTH
+                || row.states & !STATE_MASK != 0
+                || row.parent == row.id
+                || (row.parent != 0 && !ids.contains(&row.parent))
+                || row.role > ROLE_NONE
+                || row.surface > SURFACE_OVERLAY
+            {
+                return Err(ComponentHostError::Invalid(
+                    "tree identity or depth".to_owned(),
+                ));
+            }
+            if let Some(parent) = rows.iter().find(|candidate| candidate.id == row.parent) {
+                if row.depth != parent.depth.saturating_add(1) {
+                    return Err(ComponentHostError::Invalid(
+                        "tree depth relation".to_owned(),
+                    ));
+                }
+            } else if row.depth != 0 {
+                return Err(ComponentHostError::Invalid("root depth".to_owned()));
+            }
+            if (row.surface == SURFACE_NONE) == (row.role == ROLE_NONE) {
+                return Err(ComponentHostError::Invalid(
+                    "role and surface mismatch".to_owned(),
+                ));
+            }
+            if let Some(bounds) = row.bounds {
+                if bounds.unit != BOUNDS_UNIT_CHARS {
+                    return Err(ComponentHostError::Invalid("bounds unit".to_owned()));
+                }
+            }
+            if let Some(focus_cell) = row.focus {
+                if focus_cell.row >= MAX_GRID_ROWS || focus_cell.col >= MAX_GRID_COLS {
+                    return Err(ComponentHostError::Invalid(
+                        "focus coordinate bound".to_owned(),
+                    ));
+                }
+            }
+            if let Some(span) = row.selection {
+                if span.start_col >= span.end_col || span.end_col > MAX_GRID_COLS {
+                    return Err(ComponentHostError::Invalid(
+                        "selection span bound".to_owned(),
+                    ));
+                }
+            }
+        }
+        if let Some(selection) = selection {
+            for (row, col) in [
+                (selection.anchor_row, selection.anchor_col),
+                (selection.focus_row, selection.focus_col),
+            ] {
+                if row >= MAX_GRID_ROWS || col >= MAX_GRID_COLS {
+                    return Err(ComponentHostError::Invalid(
+                        "selection coordinate bound".to_owned(),
+                    ));
+                }
+            }
+        }
+        if let Some(id) = focus {
+            if !ids.contains(&id) {
+                return Err(ComponentHostError::Invalid("unknown focus id".to_owned()));
+            }
+            if rows
+                .iter()
+                .filter(|row| row.states & STATE_FOCUSED != 0)
+                .count()
+                != 1
+                || rows
+                    .iter()
+                    .all(|row| row.id != id || row.states & STATE_FOCUSED == 0)
+            {
+                return Err(ComponentHostError::Invalid(
+                    "focus state mismatch".to_owned(),
+                ));
+            }
+        } else if rows.iter().any(|row| row.states & STATE_FOCUSED != 0) {
+            return Err(ComponentHostError::Invalid(
+                "orphan focused state".to_owned(),
+            ));
+        }
+        if selection.is_some() && self.capabilities & CAPABILITY_SELECTION == 0 {
+            return Err(ComponentHostError::Peer(ErrorKind::Denied));
+        }
+        Ok(ComponentProjection {
+            generation,
+            rows,
+            focus,
+            selection,
+        })
+    }
+}
+
+fn map_receive_error(error: io::Error) -> ComponentHostError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        ComponentHostError::Deadline
+    } else {
+        ComponentHostError::ComponentLost
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Terminal projection (text runs only, never styling)
@@ -508,7 +1134,91 @@ impl A11ySettings {
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
+
     use bitty_a11y::Generation;
+    use bitty_a11y_component::component::protocol::{ROLE_GROUP, ROLE_TEXT};
+
+    #[derive(Debug, Default)]
+    struct MockTransport {
+        incoming: VecDeque<Message>,
+        sent: Vec<Message>,
+        receive_error: Option<io::ErrorKind>,
+    }
+
+    impl MockTransport {
+        fn with_messages(messages: impl IntoIterator<Item = Message>) -> Self {
+            Self {
+                incoming: messages.into_iter().collect(),
+                sent: Vec::new(),
+                receive_error: None,
+            }
+        }
+    }
+
+    impl ComponentTransport for MockTransport {
+        fn send(&mut self, message: &Message) -> io::Result<()> {
+            self.sent.push(message.clone());
+            Ok(())
+        }
+
+        fn receive(&mut self, _deadline: Instant) -> io::Result<Option<Message>> {
+            if let Some(kind) = self.receive_error.take() {
+                return Err(io::Error::from(kind));
+            }
+            Ok(self.incoming.pop_front())
+        }
+    }
+
+    fn component_config() -> ComponentHostConfig {
+        ComponentHostConfig {
+            safe_mode: false,
+            capability_granted: true,
+            deadline: Duration::from_secs(1),
+        }
+    }
+
+    fn row(id: u64, parent: u64, depth: u8, role: u8, states: u16) -> TreeRow {
+        TreeRow {
+            id,
+            parent,
+            depth,
+            role,
+            surface: SURFACE_NONE,
+            name: Some(format!("node-{id}")),
+            content: None,
+            state_text: None,
+            states,
+            focus: None,
+            selection: None,
+            bounds: None,
+        }
+    }
+
+    fn snapshot_messages(generation: u64, rows: Vec<TreeRow>) -> Vec<Message> {
+        vec![
+            Message::HelloAck {
+                protocol: PROTOCOL_VERSION,
+                component: "a11y".to_owned(),
+                version: "0.0.1".to_owned(),
+                capabilities: CAPABILITY_SNAPSHOT | CAPABILITY_DIFF | CAPABILITY_SELECTION,
+            },
+            Message::SnapshotBegin {
+                request: 1,
+                generation,
+                nodes: rows.len() as u32,
+                focus: None,
+                selection: None,
+                pages: 1,
+            },
+            Message::SnapshotPage {
+                request: 1,
+                index: 0,
+                rows,
+                last: true,
+            },
+        ]
+    }
 
     #[test]
     fn host_holds_owned_values_only() {
@@ -564,5 +1274,144 @@ mod tests {
         let stored = &notices[0].1;
         assert_eq!(stored.chars().count(), MAX_ANNOUNCEMENT_TEXT_LEN + 1);
         assert_ne!(stored, &payload, "the original payload must not be kept");
+    }
+
+    #[test]
+    fn component_host_denies_safe_mode_before_transport() {
+        let transport = MockTransport::default();
+        let result = ComponentSnapshotHost::connect(transport, ComponentHostConfig::default());
+        assert!(matches!(result, Err(ComponentHostError::Denied)));
+    }
+
+    #[test]
+    fn component_host_accepts_bounded_snapshot_and_handshakes() {
+        let rows = vec![row(1, 0, 0, ROLE_GROUP, 0), row(2, 1, 1, ROLE_TEXT, 0)];
+        let transport = MockTransport::with_messages(snapshot_messages(1, rows.clone()));
+        let mut host = ComponentSnapshotHost::connect(transport, component_config())
+            .expect("component handshake");
+        let projection = host.refresh().expect("bounded snapshot");
+        assert_eq!(projection.generation(), 1);
+        assert_eq!(projection.rows(), rows);
+        assert_eq!(
+            host.projection().expect("retained projection").rows().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn component_host_rejects_stale_generation_and_clears_projection() {
+        let rows = vec![row(1, 0, 0, ROLE_GROUP, 0)];
+        let mut messages = snapshot_messages(1, rows);
+        messages.extend([Message::SnapshotBegin {
+            request: 2,
+            generation: 1,
+            nodes: 1,
+            focus: None,
+            selection: None,
+            pages: 1,
+        }]);
+        let transport = MockTransport::with_messages(messages);
+        let mut host = ComponentSnapshotHost::connect(transport, component_config())
+            .expect("component handshake");
+        host.refresh().expect("initial snapshot");
+        assert!(matches!(
+            host.refresh(),
+            Err(ComponentHostError::Invalid(_))
+        ));
+        assert!(host.projection().is_none(), "stale data must fail closed");
+    }
+
+    #[test]
+    fn component_host_rejects_unknown_diff_removal() {
+        let rows = vec![row(1, 0, 0, ROLE_GROUP, 0)];
+        let mut messages = snapshot_messages(1, rows);
+        messages.extend([
+            Message::DiffBegin {
+                request: 2,
+                base: 1,
+                generation: 2,
+                removed: 1,
+                upserts: 0,
+                focus: None,
+                selection: None,
+                pages: 1,
+            },
+            Message::DiffPage {
+                request: 2,
+                index: 0,
+                removed: vec![99],
+                upserts: Vec::new(),
+                last: true,
+            },
+        ]);
+        let transport = MockTransport::with_messages(messages);
+        let mut host = ComponentSnapshotHost::connect(transport, component_config())
+            .expect("component handshake");
+        host.refresh().expect("initial snapshot");
+        assert!(matches!(
+            host.refresh(),
+            Err(ComponentHostError::Invalid(_))
+        ));
+        assert!(host.projection().is_none(), "unknown ids must fail closed");
+    }
+
+    #[test]
+    fn component_host_accepts_same_generation_empty_diff() {
+        let transport = MockTransport::with_messages([
+            Message::HelloAck {
+                protocol: PROTOCOL_VERSION,
+                component: "a11y".to_owned(),
+                version: "0.0.1".to_owned(),
+                capabilities: CAPABILITY_SNAPSHOT | CAPABILITY_DIFF,
+            },
+            Message::SnapshotBegin {
+                request: 1,
+                generation: 1,
+                nodes: 1,
+                focus: None,
+                selection: None,
+                pages: 1,
+            },
+            Message::SnapshotPage {
+                request: 1,
+                index: 0,
+                rows: vec![row(1, 0, 0, ROLE_GROUP, 0)],
+                last: true,
+            },
+            Message::DiffBegin {
+                request: 2,
+                base: 1,
+                generation: 1,
+                removed: 0,
+                upserts: 0,
+                focus: None,
+                selection: None,
+                pages: 0,
+            },
+        ]);
+        let mut host = ComponentSnapshotHost::connect(transport, component_config())
+            .expect("component handshake");
+        host.refresh().expect("initial snapshot");
+        assert_eq!(host.refresh().expect("empty diff").generation(), 1);
+    }
+
+    #[test]
+    fn component_eof_clears_last_projection() {
+        let transport =
+            MockTransport::with_messages(snapshot_messages(1, vec![row(1, 0, 0, ROLE_GROUP, 0)]));
+        let mut host = ComponentSnapshotHost::connect(transport, component_config())
+            .expect("component handshake");
+        host.refresh().expect("initial snapshot");
+        assert_eq!(host.refresh(), Err(ComponentHostError::ComponentLost));
+        assert!(host.projection().is_none(), "EOF must fail closed");
+    }
+
+    #[test]
+    fn component_timeout_clears_last_projection() {
+        let mut transport =
+            MockTransport::with_messages(snapshot_messages(1, vec![row(1, 0, 0, ROLE_GROUP, 0)]));
+        transport.receive_error = Some(io::ErrorKind::TimedOut);
+        let result = ComponentSnapshotHost::connect(transport, component_config());
+        assert!(matches!(result, Err(ComponentHostError::Deadline)));
     }
 }

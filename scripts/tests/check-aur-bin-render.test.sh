@@ -27,7 +27,7 @@ ASSERT=./scripts/assert-aur-bin-render.sh
 TEMPLATE=./packaging/PKGBUILD.bin
 WORKFLOW=./.github/workflows/release.yml
 FAIL=0
-VERSION=0.0.26
+VERSION=0.0.27
 SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-aur-bin-render.XXXXXX")"
@@ -124,7 +124,7 @@ if command -v makepkg >/dev/null 2>&1 && [[ "$EUID" -ne 0 ]]; then
       fail "checker rejected a matching .SRCINFO: $(tail -n 2 "$TMP/assert-srcinfo.log")"
     fi
 
-    sed "s#/v${VERSION}/#/v0.0.25/#" "$SRCINFO" >"$TMP/.SRCINFO.stale"
+    sed "s#/v${VERSION}/#/v0.0.26/#" "$SRCINFO" >"$TMP/.SRCINFO.stale"
     expect_reject "an .SRCINFO pinned to another release" \
       "$ASSERT" "$RENDERED" "$VERSION" "$SHA" "$TMP/.SRCINFO.stale"
   else
@@ -143,7 +143,7 @@ sed "s/$SHA/SKIP/" "$RENDERED" >"$TMP/PKGBUILD.skip"
 expect_reject "a binary sha256 slot of SKIP" \
   "$ASSERT" "$TMP/PKGBUILD.skip" "$VERSION" "$SHA"
 
-sed "s/^pkgver=.*/pkgver=0.0.25/" "$RENDERED" >"$TMP/PKGBUILD.stale"
+sed "s/^pkgver=.*/pkgver=0.0.26/" "$RENDERED" >"$TMP/PKGBUILD.stale"
 expect_reject "a stale pkgver with the new version's digest" \
   "$ASSERT" "$TMP/PKGBUILD.stale" "$VERSION" "$SHA"
 

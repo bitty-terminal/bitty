@@ -727,7 +727,7 @@ pub(crate) fn starter_init_lua() -> String {
     out.push_str("-- consumed by its action and never reaches the shell; unbound keys (Tab,\n");
     out.push_str("-- arrows, plain letters) always go to the shell. The shipped map uses Alt\n");
     out.push_str("-- as Mod; set mod_key = \"super\" at top level to rebind it.\n");
-    out.push_str("-- Commented blocks are schema examples: uncomment a whole block to opt in;\n");
+    out.push_str("-- Commented lines and blocks are schema examples: uncomment what you need;\n");
     out.push_str("-- every uncommented value is a shipped default.\n");
     out.push_str("return {\n");
     out.push_str(&crate::init::init_render_appearance_section(

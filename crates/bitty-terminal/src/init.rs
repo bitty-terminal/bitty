@@ -1392,7 +1392,12 @@ pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     init_line(
         &mut out,
         0,
-        "-- Commented blocks are schema examples: uncomment a whole block to opt in.",
+        "-- Commented lines and blocks are schema examples: uncomment what you need;",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- every uncommented value is a shipped default or a wizard answer.",
     );
     init_line(&mut out, 0, "return {");
     out.push_str(&init_render_appearance_section(&answers.theme));

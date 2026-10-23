@@ -615,6 +615,17 @@ mod enabled {
             if !config.gate.allows() {
                 return Err(StorageHostError::Denied);
             }
+            if config
+                .user_root
+                .as_ref()
+                .is_some_and(|root| !root.is_absolute())
+                || config
+                    .system_root
+                    .as_ref()
+                    .is_some_and(|root| !root.is_absolute())
+            {
+                return Err(StorageHostError::Resolution);
+            }
             let searched = resolve_search_for_protocol(
                 config.user_root.as_deref(),
                 config.system_root.as_deref(),

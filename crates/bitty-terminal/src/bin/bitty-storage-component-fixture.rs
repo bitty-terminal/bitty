@@ -54,11 +54,11 @@ fn main() -> ExitCode {
         "wrong-protocol" => wrong_ack(2, "storage", COMPONENT_VERSION),
         "wrong-component" => wrong_ack(PROTOCOL_VERSION, "other", COMPONENT_VERSION),
         "wrong-version" => wrong_ack(PROTOCOL_VERSION, "storage", "9.9.9"),
-        "malformed-frame" => after_handshake(|out| {
+        "malformed-frame" => after_handshake_linger(|out| {
             out.write_all(&[0, 0, 0, 1, 0x7f])?;
             out.flush()
         }),
-        "oversized-frame" => after_handshake(|out| {
+        "oversized-frame" => after_handshake_linger(|out| {
             let declared = u32::try_from(MAX_FRAME_BYTES + 1).expect("fits u32");
             out.write_all(&declared.to_be_bytes())?;
             out.flush()
@@ -170,6 +170,16 @@ fn wrong_ack(protocol: u16, component: &str, version: &str) -> u8 {
 }
 
 fn after_handshake(write: impl FnOnce(&mut io::Stdout) -> io::Result<()>) -> u8 {
+    after_handshake_mode(write, false)
+}
+
+/// Writes a malformed/oversized frame and stays alive so the host reads it
+/// instead of racing the child exit into a write failure.
+fn after_handshake_linger(write: impl FnOnce(&mut io::Stdout) -> io::Result<()>) -> u8 {
+    after_handshake_mode(write, true)
+}
+
+fn after_handshake_mode(write: impl FnOnce(&mut io::Stdout) -> io::Result<()>, linger: bool) -> u8 {
     let mut reader = FrameReader::new(io::stdin());
     if !read_hello(&mut reader) {
         return EXIT_PROTOCOL;
@@ -180,6 +190,9 @@ fn after_handshake(write: impl FnOnce(&mut io::Stdout) -> io::Result<()>) -> u8 
     }
     if write(&mut out).is_err() {
         return EXIT_PROTOCOL;
+    }
+    if linger {
+        std::thread::sleep(Duration::from_secs(5));
     }
     EXIT_PROTOCOL
 }

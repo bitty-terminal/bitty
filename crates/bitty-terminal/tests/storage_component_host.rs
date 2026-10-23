@@ -284,6 +284,13 @@ fn policy_denies_before_resolution_and_install_errors_fail_closed() {
         StorageHostError::Resolution
     );
 
+    let mut relative = config(&install_root, &base, ENABLED);
+    relative.user_root = Some(PathBuf::from("relative/extensions"));
+    assert_eq!(
+        StorageComponentClient::connect(&relative).expect_err("relative install root"),
+        StorageHostError::Resolution
+    );
+
     // A tampered executable fails the descriptor digest check before spawn.
     let executable = install(&install_root, None);
     let mut tampered = std::fs::OpenOptions::new()
@@ -350,7 +357,15 @@ fn handshake_and_wire_faults_fail_closed() {
         let install_root = scratch.subdir("extensions");
         let base = scratch.subdir("state");
         install(&install_root, Some(mode));
-        let client = match StorageComponentClient::connect(&config(&install_root, &base, ENABLED)) {
+        let mut mode_config = config(&install_root, &base, ENABLED);
+        if mode == "empty-page-loop" {
+            // 4096 one-row pages are legal; give every exchange headroom so a
+            // loaded CI runner cannot turn the page-bound assertion into a
+            // per-exchange timeout.
+            mode_config.operation_deadline = Duration::from_secs(10);
+        }
+        let operation_deadline = mode_config.operation_deadline;
+        let client = match StorageComponentClient::connect(&mode_config) {
             Ok(client) => client,
             Err(error) => {
                 // `unsolicited-frame` may fail during the handshake exchange
@@ -361,19 +376,19 @@ fn handshake_and_wire_faults_fail_closed() {
         };
         let error = if mode == "empty-page-loop" {
             client
-                .open_namespace("sessions", DEADLINE)
+                .open_namespace("sessions", operation_deadline)
                 .expect("namespace opens");
             client
-                .read_snapshot("sessions", DEADLINE)
+                .read_snapshot("sessions", operation_deadline)
                 .expect_err("snapshot fault")
         } else {
             client
-                .open_namespace("sessions", DEADLINE)
+                .open_namespace("sessions", operation_deadline)
                 .expect_err("wire fault")
         };
         assert_eq!(error, expected, "mode {mode}");
         assert!(matches!(
-            client.open_namespace("sessions", DEADLINE),
+            client.open_namespace("sessions", operation_deadline),
             Err(StorageHostError::Poisoned)
         ));
     }

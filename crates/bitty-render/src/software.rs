@@ -904,11 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_rounded_chrome_paints_above_overlay_fills() {
+    fn overlay_rounded_chrome_paints_above_background_and_overlay_fills() {
         // CTX-1477: the help card is an opaque rounded overlay, so it must
-        // cover the selection/cursor overlay fills that paint before it and
-        // stay below the glyphs that paint after it.
-        use crate::grid::{DrawList, FillRect, RoundedFill};
+        // cover per-View background images and selection/cursor overlay fills
+        // that paint before it, and stay below the glyphs that paint after it.
+        use crate::grid::{DrawList, FillRect, ImageBlit, RoundedFill};
         let mut surface = SurfaceRgba::try_new(4, 4).unwrap();
         surface.clear([0, 0, 0, 255]);
         let list = DrawList {
@@ -921,10 +921,16 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
-            backgrounds: vec![],
+            backgrounds: vec![
+                ImageBlit::try_new(
+                    crate::geometry::RectPx::new(0, 0, 4, 4),
+                    [255, 0, 0, 255].repeat(16),
+                )
+                .expect("background bytes match extent"),
+            ],
             overlay_fills: vec![FillRect {
                 rect: crate::geometry::RectPx::new(0, 0, 4, 4),
-                color: [255, 0, 0, 255],
+                color: [0, 0, 255, 255],
             }],
             overlay_rounded_fills: vec![RoundedFill {
                 frame: crate::geometry::RectPx::new(0, 0, 4, 4),
@@ -941,7 +947,7 @@ mod tests {
         assert_eq!(
             pixel,
             [0, 255, 0, 255],
-            "overlay rounded chrome covers the earlier overlay fill"
+            "overlay rounded chrome covers the background image and overlay fill"
         );
     }
 

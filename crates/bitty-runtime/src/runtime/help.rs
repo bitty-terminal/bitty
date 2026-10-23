@@ -300,10 +300,10 @@ impl Runtime {
 }
 
 /// True when `glyph`'s pixel bounding box intersects the axis-aligned `rect`
-/// (CTX-0336). Zero-area glyphs never intersect. `i64` throughout so extreme
-/// destinations cannot overflow (matching the present path's saturation
-/// discipline).
-fn glyph_overlaps_rect(
+/// (CTX-0336, shared with the overlay card occlusion in CTX-1477). Zero-area
+/// glyphs never intersect. `i64` throughout so extreme destinations cannot
+/// overflow (matching the present path's saturation discipline).
+pub(super) fn glyph_overlaps_rect(
     glyph: &bitty_render::grid::GlyphInstance,
     rect: bitty_render::geometry::RectPx,
 ) -> bool {

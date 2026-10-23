@@ -4597,13 +4597,20 @@ impl Runtime {
         if let Some(surface) =
             overlay_surface_rect(&painted_rows, chrome.padding_px, clip_rect, bottom_limit)
         {
+            // CTX-1477 (CodeRabbit, PR #2584): drop underlay glyphs inside the
+            // card before adding the row text. DrawList composites every glyph
+            // after every fill, so terminal text under the card padding would
+            // otherwise draw through the opaque surface and ring.
+            layers
+                .combined_glyphs
+                .retain(|glyph| !super::help::glyph_overlaps_rect(glyph, surface));
             let chrome_frame = bitty_render::chrome::ChromeFrame::new(
                 surface,
                 chrome,
                 state,
                 bitty_render::chrome::ChromeElevation::Overlay,
             );
-            chrome_clip = chrome_frame.push(&mut layers.combined_rounded).clip;
+            chrome_clip = chrome_frame.push(&mut layers.combined_overlay_rounded).clip;
         }
         for (index, pill) in painted_rows {
             self.paint_overlay_row(layers, &rows[index], pill, surface_color, chrome_clip);
@@ -6850,6 +6857,46 @@ mod plugin_overlay_paint_tests {
     }
 
     #[test]
+    fn overlay_card_occludes_underlay_glyphs() {
+        // CTX-1477 (CodeRabbit, PR #2584): glyphs accepted before the card
+        // would paint after every fill; the card must drop the ones inside its
+        // rect, exactly like the help panel's CTX-0336 occlusion.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let frame = frame_for(1, 100, 60, 20);
+        rt.focus_mut().set(frame.view);
+        let underlay = bitty_render::grid::GlyphInstance {
+            dest: [frame.content.x, frame.content.y],
+            size: [frame.content.width, frame.content.height],
+            uv: [0.0; 4],
+            color: [1, 2, 3, 255],
+            clip: None,
+            source: bitty_render::grid::GlyphSource::Inline {
+                mask: vec![255],
+                width: 1,
+                height: 1,
+            },
+        };
+        let mut layers = FrameLayers {
+            combined_glyphs: vec![underlay],
+            ..FrameLayers::default()
+        };
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert_eq!(layers.combined_overlay_rounded.len(), 2, "card must paint");
+        assert!(
+            layers
+                .combined_glyphs
+                .iter()
+                .all(|glyph| glyph.color != [1, 2, 3, 255]),
+            "underlay glyphs inside the card must be dropped"
+        );
+        assert!(
+            !layers.combined_glyphs.is_empty(),
+            "the card's own row glyphs still paint"
+        );
+    }
+
+    #[test]
     fn capture_overlay_uses_the_focused_chrome_border() {
         // CTX-1477: the capture-holding overlay (composer/palette) is the
         // focused chrome state; a non-modal presentation surface stays muted.
@@ -6860,9 +6907,9 @@ mod plugin_overlay_paint_tests {
         rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
         let tokens =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).scaled(rt.dpi_scale());
-        assert_eq!(layers.combined_rounded.len(), 2);
-        let surface = &layers.combined_rounded[0];
-        let ring = &layers.combined_rounded[1];
+        assert_eq!(layers.combined_overlay_rounded.len(), 2);
+        let surface = &layers.combined_overlay_rounded[0];
+        let ring = &layers.combined_overlay_rounded[1];
         assert_eq!(ring.color, tokens.border_focus);
         assert_eq!(ring.border, tokens.border_px);
         assert_eq!(ring.radius, tokens.radius_px);
@@ -6885,14 +6932,14 @@ mod plugin_overlay_paint_tests {
         let mut layers = FrameLayers::default();
         rt.paint_presentation_overlay(&[frame], 8, &mut layers);
         assert_eq!(
-            layers.combined_rounded.len(),
+            layers.combined_overlay_rounded.len(),
             2,
             "one surface fill plus one border ring"
         );
         let tokens =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).scaled(rt.dpi_scale());
-        let surface = &layers.combined_rounded[0];
-        let ring = &layers.combined_rounded[1];
+        let surface = &layers.combined_overlay_rounded[0];
+        let ring = &layers.combined_overlay_rounded[1];
         assert_eq!(surface.border, 0, "surface is a solid rounded fill");
         assert_eq!(surface.radius, tokens.radius_px);
         assert_eq!(surface.color, tokens.surface_elevated);

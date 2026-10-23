@@ -7482,6 +7482,7 @@ mod unicode_run_union_tests {
             style: Style::default(),
             width: 2,
             spacer: false,
+            padding: false,
             hyperlink: None,
             zerowidth: Zerowidth::new(),
         };

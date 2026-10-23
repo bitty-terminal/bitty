@@ -1008,7 +1008,13 @@ impl Runtime {
         }
         let target_changed = drag.session.preview_target() != before;
         if moved || target_changed {
-            self.pending_full_redraw = true;
+            // Issue #2573: ghost motion is paint-only. The solver tree, leaf
+            // grids, and PTY winsizes stay untouched, so this must not force
+            // the full leaf pass: the next present re-emits the translated
+            // ghost and the untouched siblings from their retained
+            // primitives. A full invalidation (grab, commit, cancel) still
+            // wins when both flags are armed.
+            self.pending_paint_redraw = true;
         }
         // CTX-1167 (issue #1981): accumulate, never restart. The grab
         // admitted the source ghost and the first hover admits the target

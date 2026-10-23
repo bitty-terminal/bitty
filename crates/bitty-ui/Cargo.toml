@@ -27,9 +27,10 @@ bitty-term-state = { version = "0.0.26", path = "../bitty-term-state" }
 # component protocol pin below.
 bitty-a11y = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-a11y", rev = "8e02ab5" }
 # CTX-1466 / #2496 / #2257: default-off component protocol pin. This is the
-# merged bitty-a11y#18 protocol revision. Keep the component path default-off;
-# W-147 confines both names to a11y_host.rs.
-bitty-a11y-component = { package = "bitty-a11y", version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-a11y", rev = "f7e57091ae12d4e179b059798cc234f074bfb111" }
+# merged bitty-a11y#19 protocol revision (squash of #18 plus the MSRV fix).
+# Keep the component path default-off; W-147 confines both names to
+# a11y_host.rs.
+bitty-a11y-component = { package = "bitty-a11y", version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-a11y", rev = "99486eef216d77b8f81d2b67f2cef856af266a3f" }
 
 
 [dev-dependencies]

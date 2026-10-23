@@ -89,6 +89,7 @@ fn scroll_offset(rt: &Runtime) -> usize {
 
 /// Scroll offset of a tiling leaf (floats are not in the tree; their scrolled
 /// state is proven through the resolved selection text instead).
+#[cfg(unix)]
 fn scroll_offset_of(rt: &Runtime, view: ViewId) -> usize {
     rt.layout()
         .find_leaf(view)
@@ -103,6 +104,7 @@ fn rows(rt: &Runtime) -> u16 {
         .rows()
 }
 
+#[cfg(unix)]
 fn rows_of(rt: &Runtime, view: ViewId) -> u16 {
     rt.layout().find_leaf(view).map_or(0, |leaf| leaf.rows())
 }

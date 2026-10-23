@@ -303,6 +303,47 @@ impl ZoomState {
         restored
     }
 
+    /// Restore the zoom backup containing `view`, whether its workspace is
+    /// active or stashed. Inactive workspaces cannot use `disengage` directly
+    /// because the runtime's live layout belongs to another slot.
+    pub(crate) fn restore_for_view_mutation(
+        &mut self,
+        runtime: &mut Runtime,
+        view: ViewId,
+    ) -> bool {
+        self.prune(runtime);
+        let Some(seq) = self
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.backup.leaf_ids().contains(&view))
+            .map(|(seq, _)| *seq)
+        else {
+            return false;
+        };
+        let Some(entry) = self.entries.get(&seq) else {
+            return false;
+        };
+        let Some(index) = runtime.workspace_index_by_seq(seq) else {
+            return false;
+        };
+        if !runtime
+            .workspace_layout(index)
+            .is_some_and(|layout| same_layout_shape(layout, &entry.proxy))
+        {
+            eprintln!(
+                "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
+            );
+            return false;
+        }
+        let entry = self.entries.remove(&seq).expect("zoom entry still present");
+        if index == runtime.active_workspace_index() {
+            runtime.set_layout(entry.backup);
+            true
+        } else {
+            runtime.set_stashed_layout_for_seq(seq, entry.backup)
+        }
+    }
+
     /// Drops entries whose workspace no longer exists (closed, or replaced
     /// by a session restore), so the map stays bounded by the live
     /// workspace count instead of the session's close history.
@@ -4658,6 +4699,39 @@ mod tests {
             "disengaging in A restores A's exact two-leaf tree"
         );
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn stale_inactive_zoom_proxy_keeps_backup_for_later_restore() {
+        // A stale proxy must not consume the backup before the shape check:
+        // another path may still restore the useful real tree later.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_zoom_test_app();
+        let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+            Some(vec![ViewId::new(1), ViewId::new(2)])
+        );
+        assert!(app.runtime.workspace_switch(1));
+
+        // Replace A's proxy with a different shape while A is inactive.
+        assert!(
+            app.runtime.set_stashed_layout_for_seq(
+                seq,
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            )
+        );
+        assert!(
+            !app.chrome
+                .zoom
+                .restore_for_view_mutation(&mut app.runtime, ViewId::new(1))
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+            Some(vec![ViewId::new(1), ViewId::new(2)]),
+            "stale proxy must not discard the useful backup"
+        );
     }
 
     #[test]

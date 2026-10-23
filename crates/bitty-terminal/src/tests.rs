@@ -11574,6 +11574,58 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
     let _ = std::fs::remove_file(&script);
 }
 
+#[test]
+#[cfg(unix)]
+fn reap_exited_zoomed_alt_screen_pane_in_inactive_workspace_restores_tree_2527() {
+    // #2527 control: leaving an alternate-screen program before its shell
+    // exits must use the same inactive zoom restoration path without
+    // resurrecting a dead proxy or losing the sibling pane.
+    require_pty!();
+    let mut app = editor_test_app();
+    let survivor = ViewId::new(1);
+    let exiting = ViewId::new(2);
+    let survivor_script = write_fake_editor("sleep-alt-survivor-2527", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn survivor");
+    let alt_script = write_fake_editor(
+        "alt-screen-exit-2527",
+        "#!/bin/sh\nprintf '\x1b[?1049h\x1b[2J\x1b[H ALT-SCREEN-2527\\n'; read -r _; printf '\x1b[?1049l'; exit 0\n",
+    );
+    let alt_arg = alt_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, alt_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn alt-screen pane");
+    assert!(app.runtime.set_focus(exiting));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    app.runtime.workspace_new().expect("second workspace");
+    assert!(app.runtime.workspace_switch(0));
+    assert!(app.runtime.push_input_bytes(b"leave-alt\r"));
+    assert!(app.runtime.workspace_switch(1));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(app.runtime.has_pane_session(&survivor));
+    assert!(!app.runtime.has_pane_session(&exiting));
+    assert!(app.runtime.push_input_bytes(b"echo alt-survivor\r"));
+    let _ = app.drive_tick();
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&survivor_script);
+    let _ = std::fs::remove_file(&alt_script);
+}
+
 /// Issue #2221 / CTX-1336: closing the last tiled host while a detached
 /// float survives must remove the host leaf instead of leaving a
 /// session-less tile focused. The old path tore the primary session down
@@ -11591,7 +11643,7 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
     let hidden = ViewId::new(1);
     let exiting = ViewId::new(2);
 
-    let hidden_script = write_fake_editor("sleep-hidden-2525", "#!/bin/sh\nsleep 10\n");
+    let hidden_script = write_fake_editor("sleep-hidden-2531", "#!/bin/sh\nsleep 10\n");
     let hidden_arg = hidden_script.to_string_lossy().into_owned();
     app.runtime
         .spawn_shell_for_view_in(hidden, hidden_arg.as_str(), &[], 80, 24, None)
@@ -11654,16 +11706,93 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
         !app.runtime.has_pane_session(&exiting),
         "the exited zoomed pane is torn down"
     );
+    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+
+    // This is the missing half of the old regression: restore the inactive
+    // workspace after reap, not only its app-side backup bookkeeping. The
+    // dead proxy must not come back as a focused, session-less tile, and the
+    // primary owner must remain reachable and typable.
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![hidden]);
+    assert_eq!(app.runtime.workspace_panel_count(0), Some(1));
+    assert_eq!(app.runtime.pane_session_count(), 1);
+    assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+    assert_eq!(app.runtime.focused_view(), Some(hidden));
     assert!(
-        app.chrome
-            .zoom
-            .backup_leaf_ids_for_seq(seq)
-            .is_some_and(|ids| ids.contains(&hidden)),
-        "the hidden leaf stays in the real tree"
+        app.runtime
+            .push_input_bytes(b"echo inactive-zoom-survivor\r")
     );
+    let _ = app.drive_tick();
 
     app.runtime.close_pane_session(&hidden);
     let _ = std::fs::remove_file(&hidden_script);
+    let _ = std::fs::remove_file(&exit_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
+    // CTX-1460 / #2531: a non-focused pane can exit while its workspace is
+    // inactive and zoomed. It is present only in the app-side backup, not in
+    // the stashed proxy. Reap must restore that backup before surgery so the
+    // dead leaf is removed and the zoomed survivor remains reachable.
+    require_pty!();
+    let mut app = editor_test_app();
+    let survivor = ViewId::new(1);
+    let exiting = ViewId::new(2);
+
+    let survivor_script = write_fake_editor("sleep-zoom-survivor-1460", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn zoom survivor");
+    let exit_script = write_fake_editor("exit-hidden-zoom-1460", "#!/bin/sh\nexit 0\n");
+    let exit_arg = exit_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn hidden exiting pane");
+
+    assert!(app.runtime.set_focus(survivor));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(
+        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        Some(vec![survivor, exiting])
+    );
+
+    app.runtime.workspace_new().expect("second workspace");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert!(app.runtime.has_pane_session(&survivor));
+    assert!(!app.runtime.has_pane_session(&exiting));
+    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_eq!(app.runtime.primary_view(), Some(survivor));
+    assert!(app.runtime.has_pane_session(&survivor));
+    assert!(app.runtime.push_input_bytes(b"echo hidden-zoom-survivor\r"));
+    let _ = app.drive_tick();
+
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&survivor_script);
     let _ = std::fs::remove_file(&exit_script);
 }
 

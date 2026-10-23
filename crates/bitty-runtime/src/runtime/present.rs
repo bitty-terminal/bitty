@@ -3318,7 +3318,7 @@ impl Runtime {
         // geometry transition. Their logical state and hit-testing remain
         // final.
         let paint = basis.painted_allocations();
-        self.paint_selection_highlight(paint, &basis.view_map, basis.pad_px, layers);
+        self.paint_selection_highlight(paint, basis.pad_px, layers);
         self.paint_plaintext_hover(paint, basis.pad_px, layers);
         self.paint_ime_preedit(layers);
         self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
@@ -3428,7 +3428,6 @@ impl Runtime {
     fn paint_selection_highlight(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        view_map: &std::collections::HashMap<ViewId, View>,
         pad_px: i32,
         layers: &mut FrameLayers,
     ) {
@@ -3462,10 +3461,11 @@ impl Runtime {
         if sel.is_empty() && !selection_state.single_cell && !buffer_selected {
             return;
         }
-        let scrolled = view_map
-            .get(&owner)
-            .is_some_and(|view| view.scroll_offset() != 0)
-            && self.is_viewport_scrolled(owner);
+        // Resolve the owner's scroll state through the shared owner lookup:
+        // detached floats and pinned leaves are not `view_map` layout leaves,
+        // so a map-only check read offset 0 and painted their scrolled range
+        // against the live grid (issue #2523 review).
+        let scrolled = self.is_viewport_scrolled(owner);
         let Some(frame) = allocations.iter().find(|frame| frame.view == owner) else {
             return;
         };
@@ -3473,6 +3473,12 @@ impl Runtime {
         // Issue #2470: pointer selections paint from their buffer anchors so
         // a range spanning several scrollback pages stays continuous.
         let (snapshot, row_offset, start, end) = if let Some(pers) = selection_state.buffer {
+            // Match `selection_text`: a pruned or drifted buffer range has no
+            // text, so it must not paint stale rows either (issue #2523
+            // review).
+            if !pers.is_valid(state) {
+                return;
+            }
             let (paint_start, snapshot, row_offset) = if scrolled {
                 let Some(window) = self.selection_window(owner) else {
                     return;

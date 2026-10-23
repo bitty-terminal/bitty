@@ -104,6 +104,25 @@ fn drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPosition]) {
     ))));
 }
 
+/// Asserts the active selection adds at least one fill versus the same frame
+/// with the selection cleared (issue #2523 review: a normal frame already has
+/// dozens of background fills, so a bare `fills > 0` is vacuous).
+fn assert_selection_adds_fills(rt: &mut Runtime, context: &str) {
+    let selected = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: selection must force a present"))
+        .fills;
+    rt.clear_selection();
+    let cleared = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: clearing must force a present"))
+        .fills;
+    assert!(
+        selected > cleared,
+        "{context}: selection must add fills (selected {selected}, cleared {cleared})"
+    );
+}
+
 #[test]
 fn adjacent_cells_map_to_adjacent_columns_at_scale_one() {
     adjacent_cells_map_to_adjacent_columns(1.0);
@@ -192,11 +211,7 @@ fn one_cell_drag_selects_one_cell(scale: f64) {
     );
     // The one-cell selection must paint (the inclusive range is collapsed,
     // so a plain `is_empty` guard would have skipped the highlight).
-    let stats = rt.tick().expect("selection must force a present");
-    assert!(
-        stats.fills > 0,
-        "scale {scale}: the single-cell highlight must paint"
-    );
+    assert_selection_adds_fills(&mut rt, "single-cell selection");
 
     // The same travel backwards selects the cell under the start edge too.
     let mut rt = runtime_at(scale);
@@ -332,8 +347,7 @@ fn single_cell_selection_survives_a_dpi_change() {
         Some("b"),
         "the same character stays selected after scaling"
     );
-    let stats = rt.tick().expect("the surviving selection must repaint");
-    assert!(stats.fills > 0);
+    assert_selection_adds_fills(&mut rt, "DPI-clamped single-cell selection");
 }
 
 #[test]

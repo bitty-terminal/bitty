@@ -79,6 +79,25 @@ fn press(rt: &mut Runtime) {
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Left, PressState::Pressed));
 }
 
+/// Asserts the active selection adds at least one fill versus the same frame
+/// with the selection cleared (issue #2523 review: background fills make a
+/// bare `fills > 0` vacuous).
+fn assert_selection_adds_fills(rt: &mut Runtime, context: &str) {
+    let selected = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: selection must force a present"))
+        .fills;
+    rt.clear_selection();
+    let cleared = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: clearing must force a present"))
+        .fills;
+    assert!(
+        selected > cleared,
+        "{context}: selection must add fills (selected {selected}, cleared {cleared})"
+    );
+}
+
 fn release(rt: &mut Runtime) {
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Left, PressState::Released));
 }
@@ -99,6 +118,10 @@ fn scrolled_viewport_drag_selects_visible_text() {
         rt.state().scrollback_len()
     );
     // Scroll up 6 lines (two default notches of 3) into history.
+    // Present once first: the first frame reflows the leaf to its content
+    // extent, and pointer mapping must match the geometry the highlight
+    // paints into.
+    rt.tick().expect("the warm-up frame must present");
     rt.handle_wheel(ScrollDelta::Lines(0.0, 2.0));
     assert_eq!(scroll_offset(&rt), 6, "wheel must scroll into history");
 
@@ -155,8 +178,7 @@ fn scrolled_viewport_drag_selects_visible_text() {
         "must not select live-bottom text while scrolled"
     );
     // The highlight must actually paint while scrolled (previously suppressed).
-    let stats = rt.tick().expect("selection must force a present");
-    assert!(stats.fills > 0, "scrolled highlight must paint fills");
+    assert_selection_adds_fills(&mut rt, "scrolled viewport selection");
 }
 
 #[test]
@@ -364,5 +386,64 @@ fn committed_scrolled_selection_tracks_on_wheel() {
         rt.selection_text().as_deref(),
         Some(before_text.as_str()),
         "buffer-pinned text survives the scroll"
+    );
+}
+
+#[test]
+fn pruned_buffer_selection_is_not_painted() {
+    // Issue #2523 review: a buffer range whose scrollback lines were pruned
+    // must not paint stale rows; the paint path applies the same `is_valid`
+    // rule as `selection_text`.
+    let mut rt = Runtime::new(RuntimeConfig {
+        scrollback: 8,
+        ..RuntimeConfig::default()
+    })
+    .expect("bounded-scrollback runtime must build");
+    rt.force_headless_clipboard();
+    feed_lines(&mut rt, 60);
+    let id = view_id(&rt);
+    assert_eq!(rt.state().scrollback_len(), 8, "scrollback must be full");
+    // Settle the presented geometry before pointer mapping.
+    rt.tick().expect("the warm-up frame must present");
+
+    // Scroll into history and select only scrollback rows (line-id anchored).
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 1.0));
+    let start = cell_edge(&rt, id, 0, 0);
+    let end = cell_edge(&rt, id, 0, 5);
+    rt.handle_cursor_moved(start);
+    press(&mut rt);
+    rt.handle_cursor_moved(end);
+    release(&mut rt);
+    let pers = rt
+        .persistent_selection()
+        .expect("the drag installs a buffer range");
+    assert!(
+        pers.anchor_line_id.is_some() && pers.focus_line_id.is_some(),
+        "the selected rows must be scrollback lines with stable ids, got {pers:?}"
+    );
+    assert!(
+        rt.is_persistent_selection_valid(&pers),
+        "the fresh history selection must be valid"
+    );
+    assert!(rt.selection_text().is_some(), "history selection must read");
+
+    // Evict every selected line from the bounded scrollback.
+    for _ in 0..40 {
+        rt.handle_pty_bytes(b"prune\r\n");
+    }
+    assert!(
+        !rt.is_persistent_selection_valid(&pers),
+        "pruning must invalidate the stored line ids"
+    );
+    assert!(
+        rt.selection_text().is_none(),
+        "a pruned buffer selection reports no text"
+    );
+    let selected = rt.tick().map_or(0, |stats| stats.fills);
+    rt.clear_selection();
+    let cleared = rt.tick().map_or(0, |stats| stats.fills);
+    assert_eq!(
+        selected, cleared,
+        "a pruned buffer selection must not paint fills"
     );
 }

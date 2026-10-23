@@ -375,6 +375,21 @@ pub const DEFAULT_PASTE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Durati
 /// buggy process can never stall presentation indefinitely.
 pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Upper bound on how long presentation may be held for PTY output to go
+/// quiet (bitty#2486, [`Runtime::set_present_settle`]).
+///
+/// A full-screen TUI writes one screen repaint per logical frame, but the tty
+/// delivers it as several reads. Presenting between them commits a
+/// half-applied selector (an old row beside its replacement), which reads as
+/// ghosting or flicker under rapid cursor movement. The settle gate holds a
+/// dirty present until the stream has been quiet for the configured window,
+/// so the whole repaint applies before the frame snapshot is taken.
+///
+/// Continuous producers (a `yes` flood, a streaming log) must still present:
+/// past this bound since the burst began, the latest state commits even
+/// though bytes keep arriving.
+pub const PRESENT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
 ///
@@ -562,6 +577,28 @@ pub struct Runtime {
     /// consumes damage). While set, `present_coalescing_deadline` arms the
     /// app wake so a quiet window still presents the latest frame on time.
     coalesced_pending: bool,
+    /// Wake deadline of the deferred frame, if any (CTX-1231, bitty#2486).
+    ///
+    /// The later of the cadence and PTY-quiescence opening times computed on
+    /// the deferring tick; `present_coalescing_deadline` reports it so the
+    /// embedder can arm one wait instead of polling. Stored rather than
+    /// recomputed: the settle gate also needs the burst start to apply its
+    /// [`PRESENT_SETTLE_MAX`] cap.
+    coalesced_deadline: Option<std::time::Instant>,
+    /// PTY-quiescence settle window for presentation (bitty#2486).
+    ///
+    /// `ZERO` (default) presents on every dirty tick, unchanged. A non-zero
+    /// window holds a dirty present until PTY input has been quiet for this
+    /// long (bounded by [`PRESENT_SETTLE_MAX`] since the burst began), so a
+    /// multi-read screen repaint is applied whole before the frame snapshot
+    /// is taken. See [`Runtime::set_present_settle`].
+    present_settle: std::time::Duration,
+    /// Arrival time of the most recent PTY output consumed by the embedder,
+    /// if any (`Runtime::note_present_input`). Cleared on every present.
+    settle_input_at: Option<std::time::Instant>,
+    /// Arrival time of the first byte in the current PTY output burst,
+    /// cleared on every present (the [`PRESENT_SETTLE_MAX`] cap base).
+    settle_burst_at: Option<std::time::Instant>,
     /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
     /// Geometry-only layout changes (tree edits via `layout_mut`,
@@ -1823,6 +1860,10 @@ impl Runtime {
             last_present_at: None,
             presents_coalesced: 0,
             coalesced_pending: false,
+            coalesced_deadline: None,
+            present_settle: std::time::Duration::ZERO,
+            settle_input_at: None,
+            settle_burst_at: None,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,
@@ -2107,6 +2148,10 @@ impl Runtime {
             last_present_at: None,
             presents_coalesced: 0,
             coalesced_pending: false,
+            coalesced_deadline: None,
+            present_settle: std::time::Duration::ZERO,
+            settle_input_at: None,
+            settle_burst_at: None,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,

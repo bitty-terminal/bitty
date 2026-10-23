@@ -1633,6 +1633,12 @@ impl Runtime {
     /// re-attaches main (leave). Idempotent, and called before every rich
     /// mutation and once per visible origin during present, so a
     /// `?1049h`/`a=T` pair in one PTY batch cannot mix planes.
+    ///
+    /// The stash is what keeps a primary-screen image alive across a TUI
+    /// (bitty#2437): real full-screen apps clear the alternate screen on the
+    /// way out (`btop` sends `ED 2` *before* `?1049l`), and without the
+    /// detached main layer that clear would erase the invisible primary
+    /// descriptors before the leave could re-attach them.
     pub(super) fn sync_kitty_screen_for(&mut self, origin: Option<u64>) {
         let alt = self.kitty_screen_is_alt(origin);
         let alt_layer = self.kitty_alt_layers.contains(&origin);

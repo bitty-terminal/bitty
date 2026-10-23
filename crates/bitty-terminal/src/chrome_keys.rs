@@ -8469,6 +8469,86 @@ claims = []
     }
 
     #[test]
+    fn plugin_suggestion_rejects_malformed_and_prefix_chords_at_dispatch() {
+        // Issue #2407 review B1: the grammar gate is exercised in the chord
+        // position with a *valid* qualified target, at the dispatcher level
+        // too. If publication ever fell back to a default chord or kept the
+        // raw spelling, these presses would no longer fall through to the
+        // terminal and `resolve_dispatch` would report the plugin slot.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-grammar");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[
+                ("leader w", SUGGESTION_QUALIFIED),
+                ("not-a-chord", SUGGESTION_QUALIFIED),
+                ("ctrl+alt+g", SUGGESTION_QUALIFIED),
+            ],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Only the valid row published.
+        let directory = app
+            .plugin_runtime
+            .as_ref()
+            .expect("runtime")
+            .suggested_bindings()
+            .borrow();
+        assert_eq!(directory.active().len(), 1);
+        assert_eq!(directory.active()[0].chord.canonical(), "ctrl+alt+g");
+        drop(directory);
+        // A press that could resemble the rejected spellings is unbound.
+        for keyref in [
+            KeyRef {
+                key: KeyName::Char('w'),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                super_held: false,
+            },
+            KeyRef {
+                key: KeyName::Char('n'),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                super_held: false,
+            },
+        ] {
+            assert_eq!(app.match_plugin_binding(keyref), None);
+            assert_eq!(
+                app.resolve_dispatch(keyref, None),
+                (DispatchPriority::Terminal, None),
+                "a rejected suggestion must leave the chord to terminal encoding"
+            );
+        }
+        // The valid row dispatches normally.
+        let valid = KeyRef {
+            key: KeyName::Char('g'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            app.resolve_dispatch(valid, None),
+            (
+                DispatchPriority::Plugin,
+                Some(ChromeAction::InvokeCommand(
+                    SUGGESTION_QUALIFIED.to_string()
+                ))
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn plugin_suggestion_disappears_on_suspend_and_generation_change() {
         // Issue #2407: disable/suspend parks the suggestions, resume restores
         // them in place, and dispose/reload (a generation change) removes
@@ -8580,6 +8660,88 @@ claims = []
             app.resolve_dispatch(chord, None),
             (DispatchPriority::Terminal, None)
         );
+    }
+
+    #[test]
+    fn plugin_suggestion_conflicts_are_bounded_diagnostics_on_the_cold_path() {
+        // Issue #2407 review B3 / LUA-OQ-5: a collision still has one
+        // deterministic dispatch owner (lexicographically first owner), but
+        // the loser is reported as a bounded diagnostic and drained by the
+        // cold path instead of silently disappearing.
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        const OTHER_OWNER: &str = "bitty-featured.alpha-fixture";
+        let root = fixture::temp_dir("suggestion-conflict");
+        for (owner, command) in [
+            (SUGGESTION_OWNER, SUGGESTION_QUALIFIED),
+            (OTHER_OWNER, "bitty-featured.alpha-fixture:toggle-help"),
+        ] {
+            write_suggesting_plugin(
+                &root,
+                owner,
+                &[SUGGESTION_COMMAND],
+                &[("ctrl+alt+g", command)],
+                &[SUGGESTION_COMMAND],
+            );
+        }
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        for owner in [SUGGESTION_OWNER, OTHER_OWNER] {
+            let pid = bitty_plugin_host::manifest::PluginId::new(owner).expect("id");
+            plugin_runtime.activate(&pid).expect("activate");
+        }
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('g'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        // `bitty-featured.alpha-fixture` sorts before `bitty-featured.help-fixture`.
+        assert_eq!(
+            app.match_plugin_binding(chord),
+            Some(ChromeAction::InvokeCommand(
+                "bitty-featured.alpha-fixture:toggle-help".to_string()
+            ))
+        );
+        {
+            let directory = app
+                .plugin_runtime
+                .as_ref()
+                .expect("runtime")
+                .suggested_bindings()
+                .borrow();
+            assert_eq!(directory.active().len(), 2, "both rows stay published");
+            let pending = directory.pending_conflicts();
+            assert_eq!(pending.len(), 1, "one diagnostic per colliding chord");
+            assert_eq!(
+                pending[0].winner,
+                "bitty-featured.alpha-fixture:toggle-help"
+            );
+            assert_eq!(pending[0].loser, SUGGESTION_QUALIFIED);
+        }
+        // The cold path drains the pending diagnostic exactly once.
+        let _ = app.pump_cold_commands();
+        let mut directory = app
+            .plugin_runtime
+            .as_ref()
+            .expect("runtime")
+            .suggested_bindings()
+            .borrow_mut();
+        assert!(directory.drain_conflicts().is_empty(), "drained once");
+        assert_eq!(directory.conflicts_dropped(), 0);
+        drop(directory);
+        // The deterministic winner still dispatches after the drain.
+        assert_eq!(
+            app.match_plugin_binding(chord),
+            Some(ChromeAction::InvokeCommand(
+                "bitty-featured.alpha-fixture:toggle-help".to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

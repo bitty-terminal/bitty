@@ -2817,6 +2817,9 @@ impl TerminalApp {
     /// still-parked work counts as an attempt, while a completed resume counts
     /// as one delivered result. Returns attempts plus completed resumed parks.
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
+        // Issue #2407 (review B3): surface plugin-suggestion chord
+        // collisions once, on the cold path, before other plugin work.
+        self.log_keymap_suggestion_conflicts();
         // bitty #2314: resume commands parked by the previous cold tick
         // before admitting new work. A resume advances at most one RC-1 wall
         // window per plugin; a command that still needs work stays parked for
@@ -2943,6 +2946,46 @@ impl TerminalApp {
             attempted = attempted.saturating_add(1);
         }
         attempted
+    }
+
+    /// Drain and log pending plugin-suggestion chord conflicts (issue #2407
+    /// review B3; LUA-OQ-5 conflict diagnostics).
+    ///
+    /// Publication keeps its deterministic tiebreak (lexicographically first
+    /// owner, first registered suggestion) but never hides the loser: the
+    /// runtime records one bounded row per colliding chord, and this cold-path
+    /// drain logs each row once as a warning. The input path only reads the
+    /// directory and never touches this buffer.
+    fn log_keymap_suggestion_conflicts(&mut self) {
+        let Some(runtime) = self.plugin_runtime.as_ref() else {
+            return;
+        };
+        let directory = runtime.suggested_bindings();
+        let (conflicts, dropped) = {
+            let mut directory = directory.borrow_mut();
+            (directory.drain_conflicts(), directory.conflicts_dropped())
+        };
+        if conflicts.is_empty() {
+            return;
+        }
+        for conflict in &conflicts {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin keybinding conflict: {} is claimed by {}; {} is shadowed",
+                    conflict.chord.canonical(),
+                    conflict.winner,
+                    conflict.loser
+                )
+            });
+        }
+        if dropped > 0 {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin keybinding conflicts: {dropped} additional row(s) dropped \
+                     (bounded diagnostic buffer)"
+                )
+            });
+        }
     }
 
     /// Empty args value for argument-free host-mediated invocations

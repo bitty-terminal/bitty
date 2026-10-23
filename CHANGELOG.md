@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin-suggested keybindings are live (#2407):** `bitty.keymaps.suggest`
+  captures now publish into a generation-fenced Core directory and dispatch at
+  the reserved plugin priority slot — after the user/default keymap table and
+  before terminal encoding. Only a command registered by the same generation
+  can be suggested; unqualified, foreign, unregistered, malformed, and
+  prefix-spelled suggestions fail closed. Explicit user and default bindings
+  always win, `alt`-bearing suggestions follow `mod_key`, suspend/unload/crash
+  and reload remove the generation's chords, and colliding suggestions produce
+  bounded warnings naming the deterministic winner and the shadowed command.
+
 ## [0.0.27] - 2026-10-23
 
 ### Added

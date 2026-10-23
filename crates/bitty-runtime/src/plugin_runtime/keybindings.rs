@@ -33,10 +33,46 @@
 //! iteration can never change which suggestion owns a chord. An explicit user
 //! binding always wins because the application only consults this directory
 //! when the user table produced no match.
+//!
+//! # Conflict diagnostics
+//!
+//! A chord published by more than one suggestion has exactly one dispatch
+//! owner (lexicographically first owner, then first registered suggestion),
+//! but the losers are never silently invisible: [`SuggestedBindingDirectory::publish`]
+//! records one bounded [`SuggestedChordConflict`] row per shadowed
+//! suggestion.
+//! The application drains those on its cold path and logs them as warnings,
+//! so a shipped plugin collision is a visible diagnostic instead of an
+//! arbitrary winner (the accepted LUA-OQ-5 conflict-diagnostic rule). The
+//! deterministic tiebreak stays as the documented fallback for dispatch.
 
 use std::collections::BTreeMap;
 
 use bitty_config::{Chord, ChromeAction, KeyRef, ModKey};
+
+/// Maximum pending conflict diagnostics retained between cold-path drains.
+///
+/// Bounded like the notification queue: a hostile or broken plugin set can
+/// flood publications, but the application only ever logs this many rows per
+/// drain and the overflow is counted (never hidden as memory growth).
+pub const MAX_KEYMAP_SUGGESTION_CONFLICTS: usize = 32;
+
+/// One chord claimed by more than one published suggestion.
+///
+/// `winner` dispatches; `loser` is shadowed. Both are qualified
+/// `owner:command` names, and `chord` is the captured (Mod-independent)
+/// spelling. Rows are emitted at publication (one per shadowed suggestion)
+/// for the LUA-OQ-5 conflict diagnostics and drained by the application's
+/// cold path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedChordConflict {
+    /// Colliding chord in captured spelling.
+    pub chord: Chord,
+    /// Qualified command that owns the chord.
+    pub winner: String,
+    /// Qualified command shadowed by `winner`.
+    pub loser: String,
+}
 
 /// One published suggestion: a chord bound to a same-generation command.
 ///
@@ -86,6 +122,12 @@ impl OwnerBindings {
 #[derive(Debug, Default)]
 pub struct SuggestedBindingDirectory {
     owners: BTreeMap<String, OwnerBindings>,
+    /// Undrained conflict diagnostics, bounded by
+    /// [`MAX_KEYMAP_SUGGESTION_CONFLICTS`].
+    conflicts: Vec<SuggestedChordConflict>,
+    /// Conflict rows dropped because the pending buffer was full (bounded
+    /// overflow accounting; never silent memory growth).
+    conflicts_dropped: u64,
 }
 
 impl SuggestedBindingDirectory {
@@ -102,31 +144,107 @@ impl SuggestedBindingDirectory {
     /// chord grammar; this method additionally pins every row to the calling
     /// owner and generation, normalizes ordering, and keeps the first
     /// registered suggestion when one owner repeats a chord.
+    ///
+    /// Collisions produce one bounded [`SuggestedChordConflict`] row per
+    /// shadowed suggestion: a repeated chord inside this publication (first
+    /// registered wins) and a chord already claimed by another owner
+    /// (lexicographically smaller owner wins). The winner is deterministic,
+    /// but it is never silent — the application drains and logs the rows on
+    /// its cold path.
     pub fn publish(&mut self, owner: &str, generation: u32, bindings: Vec<SuggestedBinding>) {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut normalized: Vec<SuggestedBinding> = bindings
-            .into_iter()
-            .filter_map(|mut binding| {
-                if !seen.insert(binding.chord.canonical()) {
-                    return None;
-                }
-                // Pin the row to this publication: a caller can never publish
-                // a row under another owner or a stale generation.
-                binding.owner = owner.to_string();
-                binding.generation = generation;
-                Some(binding)
-            })
-            .collect();
+        let mut kept: BTreeMap<String, SuggestedBinding> = BTreeMap::new();
+        let mut internal: Vec<SuggestedChordConflict> = Vec::new();
+        for mut binding in bindings {
+            // Pin the row to this publication: a caller can never publish a
+            // row under another owner or a stale generation.
+            binding.owner = owner.to_string();
+            binding.generation = generation;
+            let canonical = binding.chord.canonical();
+            if let Some(existing) = kept.get(&canonical) {
+                internal.push(SuggestedChordConflict {
+                    chord: binding.chord,
+                    winner: existing.qualified.clone(),
+                    loser: binding.qualified.clone(),
+                });
+                continue;
+            }
+            kept.insert(canonical, binding);
+        }
+        let mut normalized: Vec<SuggestedBinding> = kept.into_values().collect();
         normalized.sort_by(|a, b| {
             a.chord
                 .canonical()
                 .cmp(&b.chord.canonical())
                 .then_with(|| a.qualified.cmp(&b.qualified))
         });
+        // Cross-owner collisions: one diagnostic per colliding chord at the
+        // publication that introduces the loser. The owner map already
+        // iterates lexicographically, so the first owner to claim a chord is
+        // also the dispatch winner (`action_for` uses the same order).
+        let mut cross: Vec<SuggestedChordConflict> = Vec::new();
+        for binding in &normalized {
+            let canonical = binding.chord.canonical();
+            for (other_owner, other) in &self.owners {
+                if other_owner == owner {
+                    continue;
+                }
+                for existing in &other.bindings {
+                    if existing.chord.canonical() != canonical {
+                        continue;
+                    }
+                    let (winner, loser) = if other_owner.as_str() < owner {
+                        (existing.qualified.clone(), binding.qualified.clone())
+                    } else {
+                        (binding.qualified.clone(), existing.qualified.clone())
+                    };
+                    cross.push(SuggestedChordConflict {
+                        chord: binding.chord,
+                        winner,
+                        loser,
+                    });
+                }
+            }
+        }
         self.owners.insert(
             owner.to_string(),
             OwnerBindings::new(generation, normalized),
         );
+        for conflict in internal.into_iter().chain(cross) {
+            self.record_conflict(conflict);
+        }
+    }
+
+    /// Take every pending conflict diagnostic, oldest first.
+    ///
+    /// Called by the application's cold path, which logs each row once.
+    /// Draining is bounded by [`MAX_KEYMAP_SUGGESTION_CONFLICTS`]; the
+    /// overflow counter ([`Self::conflicts_dropped`]) is not reset.
+    pub fn drain_conflicts(&mut self) -> Vec<SuggestedChordConflict> {
+        std::mem::take(&mut self.conflicts)
+    }
+
+    /// Pending (not yet drained) conflict diagnostics, oldest first.
+    ///
+    /// Read-only view for diagnostics and tests; the application drains the
+    /// buffer instead of copying it on the input path.
+    #[must_use]
+    pub fn pending_conflicts(&self) -> &[SuggestedChordConflict] {
+        &self.conflicts
+    }
+
+    /// Conflict rows dropped since startup because the pending buffer was
+    /// full (diagnostics only; never a dispatch input).
+    #[must_use]
+    pub fn conflicts_dropped(&self) -> u64 {
+        self.conflicts_dropped
+    }
+
+    fn record_conflict(&mut self, conflict: SuggestedChordConflict) {
+        if self.conflicts.len() >= MAX_KEYMAP_SUGGESTION_CONFLICTS {
+            self.conflicts_dropped = self.conflicts_dropped.saturating_add(1);
+            return;
+        }
+        self.conflicts.push(conflict);
     }
 
     /// Park one owner's suggestions (suspend / disable). They stay keyed for
@@ -355,6 +473,13 @@ mod tests {
             directory.action_for(alt_question(), ModKey::Alt),
             Some(ChromeAction::InvokeCommand("help:toggle".to_string()))
         );
+        // The shadowed suggestion is reported, never silently dropped.
+        let conflicts = directory.drain_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].chord.canonical(), "alt+?");
+        assert_eq!(conflicts[0].winner, "help:toggle");
+        assert_eq!(conflicts[0].loser, "help:other");
+        assert!(directory.drain_conflicts().is_empty(), "drain is one-shot");
     }
 
     #[test]
@@ -376,6 +501,28 @@ mod tests {
             Some(ChromeAction::InvokeCommand("alpha:toggle".to_string()))
         );
         assert_eq!(directory.active().len(), 2);
+        // One diagnostic for the colliding chord, naming the real winner and
+        // the shadowed owner. Activation order does not decide either.
+        let conflicts = directory.drain_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].chord.canonical(), "alt+?");
+        assert_eq!(conflicts[0].winner, "alpha:toggle");
+        assert_eq!(conflicts[0].loser, "zebra:toggle");
+    }
+
+    #[test]
+    fn conflict_diagnostics_are_bounded_and_count_overflow() {
+        let mut directory = SuggestedBindingDirectory::new();
+        // Repeating one chord `MAX + 8` times keeps the first row and turns
+        // every other row into a conflict: `MAX + 7` diagnostics, of which
+        // the bounded buffer retains `MAX` and counts 7 as overflow.
+        let repeater: Vec<SuggestedBinding> = (0..(MAX_KEYMAP_SUGGESTION_CONFLICTS + 8))
+            .map(|index| binding("repeater", 1, "alt+?", &format!("repeater:cmd{index}")))
+            .collect();
+        directory.publish("repeater", 1, repeater);
+        let drained = directory.drain_conflicts();
+        assert_eq!(drained.len(), MAX_KEYMAP_SUGGESTION_CONFLICTS);
+        assert_eq!(directory.conflicts_dropped(), 7);
     }
 
     #[test]

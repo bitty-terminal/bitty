@@ -4571,9 +4571,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     // suggestions: `{ chord = "leader w", command = "my-cmd" }` names the
     // configured Leader (never a hardcoded chord) plus the follow-up chord
     // (bare letters allowed, per `bitty-config` prefix grammar). Capture
-    // accepts the spelling today; dispatch activation rides the Core
-    // pending-window router once the plugin-binding facility lands (the
-    // `match_plugin_binding` slot stays deny-by-default until then).
+    // accepts the spelling; the publication layer drops it for now because
+    // plugin-suggested chords have no pending-window router yet, so it binds
+    // nothing until that router lands.
     let keymaps = Table::new(&ctx);
     keymaps
         .set(

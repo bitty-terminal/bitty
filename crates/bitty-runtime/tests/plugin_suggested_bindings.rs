@@ -148,8 +148,6 @@ fn only_same_generation_owner_targets_are_published() {
             ("alt+2", COMMAND),
             ("alt+3", "bitty-featured.other:toggle-help"),
             ("alt+4", "bitty-featured.help-fixture:missing"),
-            ("alt+5", "leader w"),
-            ("alt+6", "not-a-chord"),
         ],
         "return {}\n",
     );
@@ -164,15 +162,63 @@ fn only_same_generation_owner_targets_are_published() {
         "only the owner-local registered target survives: {active:?}"
     );
     assert_eq!(active[0].qualified, QUALIFIED);
-    // Unqualified, foreign, unregistered, prefix, and malformed suggestions
-    // bind nothing and keep falling through.
-    for ch in ['2', '3', '4', '5', '6'] {
+    // Unqualified, foreign, and unregistered targets bind nothing and keep
+    // falling through.
+    for ch in ['2', '3', '4'] {
         assert_eq!(
             directory.action_for(alt(ch), ModKey::Alt),
             None,
             "suggestion alt+{ch} must fail closed"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn grammar_failures_with_a_valid_target_never_publish() {
+    // The grammar gate is a separate filter from the owner-only target
+    // filter: both suggestions below name a command this generation really
+    // registered and still must not bind anything. If the gate were ever
+    // replaced by a fallback (a default chord, a raw-string parse, or a
+    // silently kept row), the surviving-row count would change and this test
+    // would fail.
+    let root = temp_dir("grammar");
+    write_plugin(
+        &root,
+        OWNER,
+        &[COMMAND],
+        &[
+            ("leader w", QUALIFIED),
+            ("not-a-chord", QUALIFIED),
+            ("ctrl+alt+g", QUALIFIED),
+        ],
+        "return {}\n",
+    );
+    let mut runtime = runtime(root.clone());
+    runtime.discover();
+    runtime.activate(&pid(OWNER)).expect("activate");
+    let directory = runtime.suggested_bindings().borrow();
+    let active = directory.active();
+    assert_eq!(
+        active.len(),
+        1,
+        "only the valid chord may publish: {active:?}"
+    );
+    assert_eq!(active[0].chord.canonical(), "ctrl+alt+g");
+    assert_eq!(active[0].qualified, QUALIFIED);
+    // The malformed and prefix spellings bind nothing: the valid chord is
+    // the only live row, and an unrelated press still falls through.
+    let valid = KeyRef {
+        key: KeyName::Char('g'),
+        ctrl: true,
+        alt: true,
+        shift: false,
+        super_held: false,
+    };
+    assert_eq!(
+        directory.action_for(valid, ModKey::Alt),
+        Some(ChromeAction::InvokeCommand(QUALIFIED.to_string()))
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -295,5 +341,15 @@ fn conflicting_owners_resolve_deterministically() {
         "lexical owner order wins regardless of activation order"
     );
     assert_eq!(directory.active().len(), 2);
+    // The losing suggestion is reported (LUA-OQ-5), not silently invisible.
+    assert_eq!(directory.pending_conflicts().len(), 1);
+    assert_eq!(
+        directory.pending_conflicts()[0].winner,
+        "alpha.plugin:toggle"
+    );
+    assert_eq!(
+        directory.pending_conflicts()[0].loser,
+        "zebra.plugin:toggle"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

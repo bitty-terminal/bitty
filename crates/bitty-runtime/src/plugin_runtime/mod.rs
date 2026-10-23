@@ -93,7 +93,10 @@ pub use history::{
     HISTORY_MAX_ROWS_PER_QUERY, HISTORY_RATE_WINDOW, HISTORY_SNAPSHOT_MAX_ROWS, HistoryProvider,
     TranscriptHistory, history_caps, history_page_value,
 };
-pub use keybindings::{SuggestedBinding, SuggestedBindingDirectory};
+pub use keybindings::{
+    MAX_KEYMAP_SUGGESTION_CONFLICTS, SuggestedBinding, SuggestedBindingDirectory,
+    SuggestedChordConflict,
+};
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
     OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,

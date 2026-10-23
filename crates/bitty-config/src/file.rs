@@ -230,7 +230,7 @@
 
 use std::path::{Path, PathBuf};
 
-use bitty_lua::config::ConfigEval;
+use bitty_lua::config::{ConfigData, ConfigEval};
 
 use crate::error::ConfigError;
 use crate::keymap::{ModKey, MouseButtonBinding};
@@ -1142,12 +1142,74 @@ pub fn resolve_effective_with_profiles(
 // Lua loader (wezterm-style return table -> ConfigPlan)
 // ---------------------------------------------------------------------------
 
+/// One top-level configuration element dropped by startup salvage
+/// (CTX-1490, issue #2580).
+///
+/// The strict loader never emits these; only the salvaging startup loader
+/// reports the exact source, config path, and underlying error so the app can
+/// print one actionable diagnostic per ignored element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SalvageDiagnostic {
+    /// Layer + file the element came from.
+    pub source: ConfigSource,
+    /// Top-level element that was dropped (e.g. `window`,
+    /// `appearance.animations`).
+    pub field: String,
+    /// Underlying validation error, formatted for diagnostics. Messages carry
+    /// key paths and bounded reasons only — never file contents.
+    pub message: String,
+}
+
+/// A parsed plan plus the top-level elements dropped while building it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SalvagedConfig {
+    /// Plan with every salvageable invalid element removed.
+    pub plan: ConfigPlan,
+    /// One entry per dropped element, in drop order (bounded by the top-level
+    /// element count).
+    pub diagnostics: Vec<SalvageDiagnostic>,
+}
+
+/// A loaded layer plus the top-level elements startup salvage dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SalvagedLayer {
+    /// The layer with every salvageable invalid element removed.
+    pub layer: LayeredPlan,
+    /// One entry per dropped element, in drop order.
+    pub diagnostics: Vec<SalvageDiagnostic>,
+}
+
+/// Whether the Lua loader may drop an invalid top-level element.
+///
+/// `Strict` is the diagnostic path (`bitty config check`, `bitty doctor`,
+/// live reload): the first invalid element rejects the whole layer with its
+/// exact error. `Startup` is the app-start path: an invalid top-level element
+/// is dropped, re-validated, and reported, so valid siblings from the same
+/// layer survive (issue #2580).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SalvagePolicy {
+    /// Fail the layer on the first invalid element.
+    Strict,
+    /// Drop only the invalid top-level element and keep the rest.
+    Startup,
+}
+
+/// Upper bound on startup salvage retries.
+///
+/// One retry drops at least one top-level element, and [`ConfigData`] has a
+/// fixed element set; the bound keeps the loop total even if a future key
+/// maps ambiguously to an already-dropped element.
+const MAX_SALVAGE_DROPS: usize = 32;
+
 /// Parses Lua config content into a [`ConfigPlan`] via the shared
 /// `bitty-lua` sandbox (same budgets as plugins).
 ///
 /// `source` is used for error attribution. The returned plan has
 /// `schema_version: None` (implicit 0); callers run [`crate::migrate`]
 /// before merging (see [`load_user_layer`]).
+///
+/// Strict: any invalid element rejects the whole layer with its exact error.
+/// The app-start path uses [`parse_lua_config_salvaging`] instead.
 ///
 /// # Errors
 ///
@@ -1156,6 +1218,36 @@ pub fn resolve_effective_with_profiles(
 /// typed validation failures. Messages carry key paths and Lua line info
 /// only — never file contents.
 pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPlan, ConfigError> {
+    parse_lua_config_with_policy(content, source, SalvagePolicy::Strict)
+        .map(|salvaged| salvaged.plan)
+}
+
+/// Parses Lua config content, dropping only invalid top-level elements.
+///
+/// This is the startup-only variant (CTX-1490, issue #2580): when a
+/// top-level table/scalar fails validation (or its typed conversion), that
+/// element alone is removed from the candidate plan, the rest is
+/// re-validated, and the exact `(source, field, message)` is reported. Whole
+/// layer failures that cannot be attributed to a salvageable element —
+/// Lua syntax/runtime faults, budget exhaustion, undeclared keys, profile
+/// envelope errors — still return `Err`, and the caller decides whether the
+/// external layer is recoverable (startup) or fatal (strict diagnostics).
+///
+/// # Errors
+///
+/// Same as [`parse_lua_config`] for non-salvageable failures.
+pub fn parse_lua_config_salvaging(
+    content: &str,
+    source: &ConfigSource,
+) -> Result<SalvagedConfig, ConfigError> {
+    parse_lua_config_with_policy(content, source, SalvagePolicy::Startup)
+}
+
+fn parse_lua_config_with_policy(
+    content: &str,
+    source: &ConfigSource,
+    policy: SalvagePolicy,
+) -> Result<SalvagedConfig, ConfigError> {
     if content.len() > MAX_CONFIG_FILE_BYTES {
         return Err(ConfigError::InvalidInput {
             message: format!(
@@ -1190,7 +1282,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     .map_err(|e| ConfigError::InvalidInput {
         message: format!("config evaluation refused: {e}"),
     })?;
-    let data = match vm
+    let mut data = match vm
         .eval_config(content)
         .map_err(|e| ConfigError::InvalidInput {
             message: format!("config evaluation refused: {e}"),
@@ -1258,10 +1350,10 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         "a profile selector cannot declare extends; declare it in the selected profile",
                     ));
                 }
-                let raw = data.profile.ok_or_else(|| {
+                let raw = data.profile.as_deref().ok_or_else(|| {
                     ConfigError::validation("profile", "profile selector requires a profile name")
                 })?;
-                let profile = validate_profile_name(&raw)
+                let profile = validate_profile_name(raw)
                     .map_err(|err| ConfigError::validation("profile", err.to_string()))?;
                 (None, Some(ProfileSelector { profile }))
             }
@@ -1279,7 +1371,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 source: Some(src_desc),
             });
         }
-        let extends = match data.extends {
+        let extends = match data.extends.take() {
             None => None,
             Some(raw) => {
                 if source.layer != LayerKind::Profile {
@@ -1294,6 +1386,142 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         (extends, None)
     };
 
+    let mut dropped: Vec<&'static str> = Vec::new();
+    let mut diagnostics: Vec<SalvageDiagnostic> = Vec::new();
+    loop {
+        match build_plan_from_data(data.clone(), extends.clone(), selector.clone()) {
+            Ok(plan) => return Ok(SalvagedConfig { plan, diagnostics }),
+            Err(err) if policy == SalvagePolicy::Startup => {
+                let Some((element, label)) = salvageable_element(&err) else {
+                    return Err(err);
+                };
+                if dropped.contains(&element) || dropped.len() >= MAX_SALVAGE_DROPS {
+                    return Err(err);
+                }
+                if !drop_element(&mut data, element) {
+                    return Err(err);
+                }
+                dropped.push(element);
+                diagnostics.push(SalvageDiagnostic {
+                    source: source.clone(),
+                    field: label.to_string(),
+                    message: err.to_string(),
+                });
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Maps a validation failure to the raw top-level element that owns it.
+///
+/// Only configuration elements are salvageable. Profile-envelope keys
+/// (`format`, `profile`, `extends`), schema version, unknown keys, and
+/// whole-file errors (Lua syntax/runtime/budget) return `None`, so the caller
+/// drops the entire external layer instead of pretending a partial file is
+/// safe to keep. The returned pair is `(ConfigData element, user-facing
+/// config path)`.
+fn salvageable_element(err: &ConfigError) -> Option<(&'static str, &'static str)> {
+    let field = err.field()?;
+    // `appearance` has three optional sub-tables with independent raw
+    // elements; drop just the failing one so a bad palette cannot discard a
+    // valid theme or animation block.
+    if field.starts_with("appearance.animations") {
+        return Some(("animations", "appearance.animations"));
+    }
+    if field.starts_with("appearance.colors") {
+        return Some(("appearance_colors", "appearance.colors"));
+    }
+    if field.starts_with("appearance.style") {
+        return Some(("appearance_style", "appearance.style"));
+    }
+    let head = field.split(['.', '[']).next().unwrap_or(field);
+    Some(match head {
+        "appearance" | "theme" => ("appearance", "appearance"),
+        "font" => ("font", "font"),
+        "window" => ("window", "window"),
+        "terminal" => ("terminal", "terminal"),
+        "selection" => ("selection", "selection"),
+        "history" => ("history", "history"),
+        "layout" => ("layout", "layout"),
+        "workspace" => ("workspace", "workspace"),
+        "chrome" => ("chrome", "chrome"),
+        "decoration" => ("decoration", "decoration"),
+        "views" => ("views", "views"),
+        "scrollbar" => ("scrollbar", "scrollbar"),
+        "mouse" => ("mouse", "mouse"),
+        "mod_key" => ("mod_key", "mod_key"),
+        "leader_key" => ("leader_key", "leader_key"),
+        "leader_timeout_ms" => ("leader_timeout_ms", "leader_timeout_ms"),
+        "input" => ("input", "input"),
+        "hints_enabled" => ("hints_enabled", "hints_enabled"),
+        "session" => ("session", "session"),
+        "close_confirm" => ("close_confirm", "close_confirm"),
+        "keymaps" => ("keymaps", "keymaps"),
+        "plugins" => ("plugins", "plugins"),
+        "panel_rules" => ("panel_rules", "panel_rules"),
+        _ => return None,
+    })
+}
+
+/// Removes one raw top-level element from a candidate layer.
+///
+/// A dropped element means "this layer says nothing" for that element, exactly
+/// like an absent table: merge keeps lower-precedence layers and built-in
+/// defaults. Built-ins are deny-by-default for capability surfaces (no
+/// plugins, no background-image roots), and an invalid declaration never
+/// becomes a permissive value, so salvage cannot escalate a grant. Returns
+/// `false` when the element was already absent (the retry would make no
+/// progress).
+fn drop_element(data: &mut ConfigData, element: &str) -> bool {
+    match element {
+        "appearance" => {
+            let mut dropped = data.appearance_theme.take().is_some();
+            dropped |= data.theme.take().is_some();
+            dropped |= data.appearance_colors.take().is_some();
+            dropped |= data.animations.take().is_some();
+            dropped |= data.appearance_style.take().is_some();
+            dropped
+        }
+        "animations" => data.animations.take().is_some(),
+        "appearance_colors" => data.appearance_colors.take().is_some(),
+        "appearance_style" => data.appearance_style.take().is_some(),
+        "font" => data.font.take().is_some(),
+        "window" => data.window.take().is_some(),
+        "terminal" => data.terminal.take().is_some(),
+        "selection" => data.selection.take().is_some(),
+        "history" => data.history.take().is_some(),
+        "layout" => data.layout.take().is_some(),
+        "workspace" => data.workspace.take().is_some(),
+        "chrome" => data.chrome.take().is_some(),
+        "decoration" => data.decoration.take().is_some(),
+        "views" => data.views.take().is_some(),
+        "scrollbar" => data.scrollbar.take().is_some(),
+        "mouse" => data.mouse.take().is_some(),
+        "mod_key" => data.mod_key.take().is_some(),
+        "leader_key" => data.leader_key.take().is_some(),
+        "leader_timeout_ms" => data.leader_timeout_ms.take().is_some(),
+        "input" => data.input.take().is_some(),
+        "hints_enabled" => data.hints_enabled.take().is_some(),
+        "session" => data.session.take().is_some(),
+        "close_confirm" => data.close_confirm.take().is_some(),
+        "keymaps" => data.keymaps.take().is_some(),
+        "plugins" => data.plugins.take().is_some(),
+        "panel_rules" => data.panel_rules.take().is_some(),
+        _ => false,
+    }
+}
+
+/// Builds one candidate plan from the raw Lua data (CTX-1490).
+///
+/// Extracted from the Lua loader so startup salvage can retry after dropping
+/// one invalid top-level element. `data` is consumed; the salvage loop clones
+/// the raw data per attempt (cold path, bounded retries).
+fn build_plan_from_data(
+    data: ConfigData,
+    extends: Option<String>,
+    selector: Option<ProfileSelector>,
+) -> Result<ConfigPlan, ConfigError> {
     // Table-wins for the theme alias.
     let theme = data.appearance_theme.or(data.theme);
 
@@ -1496,17 +1724,44 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     };
     let window = match data.window {
         None => None,
-        Some(w) => match (w.opacity, w.padding) {
-            (Some(opacity), Some(padding)) => {
-                if !(0..=crate::types::MAX_WINDOW_PADDING as i64).contains(&padding) {
-                    return Err(ConfigError::validation(
-                        "window.padding",
-                        format!(
-                            "must be within [0, {}] (found {padding})",
-                            crate::types::MAX_WINDOW_PADDING
-                        ),
-                    ));
+        Some(w) => {
+            // CTX-1490 (issue #2580): `opacity` and `padding` default
+            // individually when absent, matching every other optional
+            // `window` key (`radius_px`, the background leaves). A partial
+            // owner table such as `window = { opacity = 0.9 }` therefore
+            // stays usable instead of invalidating the whole layer. Present
+            // values keep the fail-closed type/range contract below.
+            let opacity = match w.opacity {
+                None => crate::types::DEFAULT_WINDOW_OPACITY,
+                Some(v) => {
+                    // Range-check the `f64` before the `f32` conversion:
+                    // values like `1.00000001` round to `1.0` in `f32` and
+                    // would pass a post-conversion check.
+                    if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                        return Err(ConfigError::validation(
+                            "window.opacity",
+                            format!("must be finite within [0.0, 1.0] (found {v})"),
+                        ));
+                    }
+                    v as f32
                 }
+            };
+            let padding = match w.padding {
+                None => crate::types::DEFAULT_WINDOW_PADDING,
+                Some(v) => {
+                    if !(0..=crate::types::MAX_WINDOW_PADDING as i64).contains(&v) {
+                        return Err(ConfigError::validation(
+                            "window.padding",
+                            format!(
+                                "must be within [0, {}] (found {v})",
+                                crate::types::MAX_WINDOW_PADDING
+                            ),
+                        ));
+                    }
+                    v as u32
+                }
+            };
+            {
                 // CTX-0241 S0: `radius_px` is optional (absent means "this
                 // layer says nothing" only at merge — here it defaults to 0
                 // so existing `{ opacity, padding }` tables keep working).
@@ -1591,8 +1846,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     },
                 };
                 Some(WindowConfig {
-                    opacity: opacity as f32,
-                    padding: padding as u32,
+                    opacity,
+                    padding,
                     radius_px,
                     blur_radius,
                     background_image: w.background_image,
@@ -1601,13 +1856,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                     background_position,
                 })
             }
-            _ => {
-                return Err(ConfigError::validation(
-                    "window",
-                    "table 'window' requires both 'opacity' (number) and 'padding' (integer)",
-                ));
-            }
-        },
+        }
     };
     let terminal = match data.terminal {
         None => None,
@@ -2776,6 +3025,20 @@ pub fn load_user_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
     load_layer_with_kind(path, LayerKind::User)
 }
 
+/// Startup variant of [`load_user_layer`] (CTX-1490, issue #2580).
+///
+/// Invalid top-level tables/scalars are dropped from the layer and reported
+/// in [`SalvagedLayer::diagnostics`]; whole-file failures (syntax, runtime,
+/// budget, undeclared keys, migration) still return `Err` so the caller can
+/// drop the layer and start with the remaining layers.
+///
+/// # Errors
+///
+/// Same as [`load_user_layer`] for non-salvageable failures.
+pub fn load_user_layer_salvaging(path: &Path) -> Result<SalvagedLayer, ConfigError> {
+    load_layer_with_kind_salvaging(path, LayerKind::User)
+}
+
 /// Loads, evaluates, validates, and migrates a named-profile file into a
 /// [`LayerKind::Profile`] plan (CTX-0169).
 ///
@@ -2792,10 +3055,44 @@ pub fn load_profile_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
     load_layer_with_kind(path, LayerKind::Profile)
 }
 
+/// Startup variant of [`load_profile_layer`] (CTX-1490, issue #2580).
+///
+/// # Errors
+///
+/// Same as [`load_profile_layer`] for non-salvageable failures.
+pub fn load_profile_layer_salvaging(path: &Path) -> Result<SalvagedLayer, ConfigError> {
+    load_layer_with_kind_salvaging(path, LayerKind::Profile)
+}
+
 /// Shared Lua-file loader behind [`load_user_layer`] and
 /// [`load_profile_layer`]: size-bounded read, sandboxed [`parse_lua_config`],
 /// [`crate::migration::migrate`], tagged with `kind`.
 fn load_layer_with_kind(path: &Path, kind: LayerKind) -> Result<LayeredPlan, ConfigError> {
+    let content = read_config_file(path)?;
+    let source = ConfigSource::new(kind, Some(path.display().to_string()));
+    let plan = parse_lua_config(&content, &source)?;
+    let migrated = crate::migration::migrate(plan)?;
+    Ok(LayeredPlan::new(source, migrated))
+}
+
+/// Startup variant of [`load_layer_with_kind`]: table-level salvage
+/// (CTX-1490, issue #2580).
+fn load_layer_with_kind_salvaging(
+    path: &Path,
+    kind: LayerKind,
+) -> Result<SalvagedLayer, ConfigError> {
+    let content = read_config_file(path)?;
+    let source = ConfigSource::new(kind, Some(path.display().to_string()));
+    let salvaged = parse_lua_config_salvaging(&content, &source)?;
+    let migrated = crate::migration::migrate(salvaged.plan)?;
+    Ok(SalvagedLayer {
+        layer: LayeredPlan::new(source, migrated),
+        diagnostics: salvaged.diagnostics,
+    })
+}
+
+/// Size-bounded config read shared by the strict and salvaging loaders.
+fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     let meta = std::fs::metadata(path).map_err(|e| ConfigError::InvalidInput {
         message: format!("cannot read config '{}': {e}", path.display()),
     })?;
@@ -2822,10 +3119,7 @@ fn load_layer_with_kind(path: &Path, kind: LayerKind) -> Result<LayeredPlan, Con
             ),
         });
     }
-    let source = ConfigSource::new(kind, Some(path.display().to_string()));
-    let plan = parse_lua_config(&content, &source)?;
-    let migrated = crate::migration::migrate(plan)?;
-    Ok(LayeredPlan::new(source, migrated))
+    Ok(content)
 }
 
 /// Loads one named profile plus its single-parent `extends` ancestors as
@@ -2887,7 +3181,57 @@ pub fn load_profile_chain_with_env(
 ///
 /// Same as [`load_profile_chain_with_env`].
 pub fn load_profile_chain_in_dir(name: &str, dir: &Path) -> Result<Vec<LayeredPlan>, ConfigError> {
-    let mut chain: Vec<LayeredPlan> = Vec::new();
+    load_profile_chain_in_dir_with(name, dir, SalvagePolicy::Strict).map(|chain| {
+        chain
+            .into_iter()
+            .map(|salvaged| salvaged.layer)
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Startup variant of [`load_profile_chain`] (CTX-1490, issue #2580).
+///
+/// Every chain link may drop its own invalid top-level elements; the returned
+/// diagnostics carry the per-profile source and field. A chain-level failure
+/// (cycle, missing parent, invalid parent name, unreadable/syntax-invalid
+/// entry) still returns `Err`, so the startup caller drops the whole profile
+/// chain and starts with the remaining layers.
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain`].
+pub fn load_profile_chain_salvaging(name: &str) -> Result<Vec<SalvagedLayer>, ConfigError> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    let dir = profile_dir_with_platform_env(
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+    )?;
+    load_profile_chain_in_dir_with(name, &dir, SalvagePolicy::Startup)
+}
+
+/// Startup variant of [`load_profile_chain_in_dir`] (CTX-1490).
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain_in_dir`].
+pub fn load_profile_chain_in_dir_salvaging(
+    name: &str,
+    dir: &Path,
+) -> Result<Vec<SalvagedLayer>, ConfigError> {
+    load_profile_chain_in_dir_with(name, dir, SalvagePolicy::Startup)
+}
+
+fn load_profile_chain_in_dir_with(
+    name: &str,
+    dir: &Path,
+    policy: SalvagePolicy,
+) -> Result<Vec<SalvagedLayer>, ConfigError> {
+    let mut chain: Vec<SalvagedLayer> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut current = validate_profile_name(name)?;
     loop {
@@ -2910,14 +3254,20 @@ pub fn load_profile_chain_in_dir(name: &str, dir: &Path) -> Result<Vec<LayeredPl
                 format!("profile '{current}' not found ('{}')", path.display()),
             ));
         }
-        let layer = load_layer_with_kind(&path, LayerKind::Profile)?;
-        let parent = match &layer.plan.extends {
+        let loaded = match policy {
+            SalvagePolicy::Strict => SalvagedLayer {
+                layer: load_layer_with_kind(&path, LayerKind::Profile)?,
+                diagnostics: Vec::new(),
+            },
+            SalvagePolicy::Startup => load_layer_with_kind_salvaging(&path, LayerKind::Profile)?,
+        };
+        let parent = match &loaded.layer.plan.extends {
             None => None,
             Some(raw) => Some(validate_profile_name(raw).map_err(|e| {
                 ConfigError::validation("extends", format!("invalid parent profile: {e}"))
             })?),
         };
-        chain.push(layer);
+        chain.push(loaded);
         match parent {
             None => break,
             Some(next) => current = next,
@@ -4251,6 +4601,143 @@ mod tests {
     }
 
     #[test]
+    fn lua_window_partial_table_defaults_missing_leaves() {
+        // CTX-1490 (issue #2580): a `window` table may declare either leaf;
+        // the omitted one defaults individually (`opacity = 1.0`,
+        // padding = DEFAULT_WINDOW_PADDING), matching the other optional keys.
+        // This is the exact owner shape from the report.
+        let plan = parse_lua_config(r#"return { window = { opacity = 0.9 } }"#, &test_source())
+            .expect("partial opacity-only window must parse");
+        let window = plan.window.expect("window present");
+        assert!((window.opacity - 0.9).abs() < f32::EPSILON);
+        assert_eq!(window.padding, crate::types::DEFAULT_WINDOW_PADDING);
+
+        let plan = parse_lua_config(r#"return { window = { padding = 3 } }"#, &test_source())
+            .expect("partial padding-only window must parse");
+        let window = plan.window.expect("window present");
+        assert!((window.opacity - crate::types::DEFAULT_WINDOW_OPACITY).abs() < f32::EPSILON);
+        assert_eq!(window.padding, 3);
+
+        let plan = parse_lua_config("return { window = {} }", &test_source())
+            .expect("empty window table must default both leaves");
+        let window = plan.window.expect("window present");
+        assert!((window.opacity - crate::types::DEFAULT_WINDOW_OPACITY).abs() < f32::EPSILON);
+        assert_eq!(window.padding, crate::types::DEFAULT_WINDOW_PADDING);
+
+        // Present values keep the fail-closed range contract.
+        for (bad, field) in [
+            (r#"return { window = { opacity = 2.0 } }"#, "window.opacity"),
+            (
+                r#"return { window = { opacity = -0.1 } }"#,
+                "window.opacity",
+            ),
+            (r#"return { window = { padding = -1 } }"#, "window.padding"),
+            (r#"return { window = { padding = 65 } }"#, "window.padding"),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            assert_eq!(err.field(), Some(field), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn lua_salvage_drops_only_the_invalid_table() {
+        // CTX-1490: a bad top-level table is dropped, valid siblings from the
+        // same file survive, and the strict path keeps the exact error.
+        let content = concat!(
+            "return { font = { family = \"Mono\", size = 12.0 },",
+            " window = { opacity = 2.0 },",
+            " terminal = { scrollback = 1000 } }"
+        );
+        let strict = parse_lua_config(content, &test_source()).unwrap_err();
+        assert_eq!(strict.field(), Some("window.opacity"));
+
+        let salvaged =
+            parse_lua_config_salvaging(content, &test_source()).expect("salvage must succeed");
+        let plan = salvaged.plan;
+        assert!(plan.window.is_none(), "invalid table must be dropped");
+        assert_eq!(plan.font.as_ref().expect("valid font kept").family, "Mono");
+        assert_eq!(
+            plan.terminal
+                .as_ref()
+                .expect("valid terminal kept")
+                .scrollback,
+            1000
+        );
+        plan.validate().expect("salvaged plan is valid");
+        assert_eq!(salvaged.diagnostics.len(), 1);
+        let diagnostic = &salvaged.diagnostics[0];
+        assert_eq!(diagnostic.field, "window");
+        assert_eq!(diagnostic.source.layer, LayerKind::User);
+        assert!(
+            diagnostic.message.contains("window.opacity"),
+            "diagnostic must name the field: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn lua_salvage_bounded_across_multiple_invalid_tables() {
+        // Every invalid table is dropped (bounded loop), never an infinite
+        // retry, and the empty result stays a valid plan.
+        let content = concat!(
+            "return { window = { opacity = 2.0 },",
+            " font = { family = \"Mono\" },",
+            " keymaps = { { chord = \"alt+h\", action = \"not-an-action\", context = \"global\" } },",
+            " plugins = { { id = \"owner/name\", enabled = true } } }"
+        );
+        let salvaged =
+            parse_lua_config_salvaging(content, &test_source()).expect("salvage must succeed");
+        assert!(salvaged.plan.window.is_none());
+        assert!(salvaged.plan.font.is_none());
+        assert!(salvaged.plan.keymaps.is_none());
+        assert_eq!(salvaged.plan.plugins.expect("valid plugins kept").len(), 1);
+        let fields: Vec<&str> = salvaged
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.field.as_str())
+            .collect();
+        assert_eq!(fields, vec!["font", "window", "keymaps"]);
+    }
+
+    #[test]
+    fn lua_salvage_rejects_whole_file_failures() {
+        // Non-element failures stay whole-layer errors: the caller drops the
+        // layer and starts with the remaining layers.
+        for content in [
+            "return { theme = }",
+            r#"return { frobnicate = 1 }"#,
+            r#"return { window = { opacity = "high" } }"#,
+        ] {
+            assert!(
+                parse_lua_config_salvaging(content, &test_source()).is_err(),
+                "must stay a whole-layer failure: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_salvage_security_sensitive_invalid_value_falls_back_to_denial() {
+        // A malformed background-image allowlist must not keep any parsed
+        // grant: the whole table is dropped, so the effective config uses the
+        // deny-by-default built-ins rather than a partially trusted root set.
+        let content = concat!(
+            "return { decoration = { background_image_roots = { \"relative/one\" } },",
+            " font = { family = \"Mono\", size = 12.0 } }"
+        );
+        let sv = parse_lua_config_salvaging(content, &test_source()).expect("salvage");
+        assert!(
+            sv.plan.decoration.is_none(),
+            "invalid allowlist table must be dropped, not partially kept"
+        );
+        assert_eq!(
+            sv.plan.font.as_ref().expect("valid sibling kept").family,
+            "Mono"
+        );
+        assert_eq!(sv.diagnostics.len(), 1);
+        assert_eq!(sv.diagnostics[0].field, "decoration");
+    }
+
+    #[test]
     fn lua_window_radius_optional_with_default_and_bounds() {
         // CTX-0241 S0: `radius_px` is optional in the atomic `window` table
         // (legacy `{ opacity, padding }` keeps working, defaulting to 0);
@@ -4761,6 +5248,52 @@ mod tests {
             merged_default.source_of("close_confirm").unwrap().layer,
             LayerKind::CoreDefaults
         );
+    }
+
+    #[test]
+    fn load_user_layer_salvaging_reports_and_keeps_valid_tables() {
+        // CTX-1490: the file loader drops only the invalid table and reports
+        // it; the strict loader keeps failing on the same file.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx1490-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            concat!(
+                "return { font = { family = \"Mono\", size = 12.0 },",
+                " window = { opacity = 2.0, padding = 8 } }"
+            ),
+        )
+        .expect("write temp config");
+
+        assert!(load_user_layer(&path).is_err(), "strict path must fail");
+        let salvaged = load_user_layer_salvaging(&path).expect("startup loader salvages");
+        assert_eq!(salvaged.layer.source.layer, LayerKind::User);
+        assert_eq!(
+            salvaged
+                .layer
+                .plan
+                .font
+                .as_ref()
+                .map(|font| font.family.as_str()),
+            Some("Mono")
+        );
+        assert!(salvaged.layer.plan.window.is_none());
+        assert_eq!(salvaged.diagnostics.len(), 1);
+        assert_eq!(salvaged.diagnostics[0].field, "window");
+        assert!(
+            salvaged.diagnostics[0]
+                .source
+                .path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("init.lua"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

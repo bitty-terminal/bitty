@@ -1719,10 +1719,19 @@ pub const MAX_WINDOW_BLUR_RADIUS: u32 = 128;
 /// unchanged.
 pub const DEFAULT_WINDOW_BACKGROUND_OPACITY: f32 = 1.0;
 
+/// Default `window.opacity` (CTX-1490, issue #2580): `1.0` (opaque).
+///
+/// A `window` table that omits `opacity` defaults this key individually, the
+/// same way the other optional `window` keys default, so a partial table stays
+/// usable instead of invalidating the layer. Present values keep the
+/// fail-closed `[0.0, 1.0]` range check.
+pub const DEFAULT_WINDOW_OPACITY: f32 = 1.0;
+
 /// Default window padding in logical pixels (CTX-0223).
 ///
 /// 8px keeps ghostty/alacritty-class breathing room between the grid and the
-/// window edge; the padding band keeps the theme background.
+/// window edge; the padding band keeps the theme background. A `window` table
+/// that omits `padding` defaults it individually (CTX-1490, issue #2580).
 pub const DEFAULT_WINDOW_PADDING: u32 = 8;
 
 /// Maximum window padding in logical pixels (`0..=64`).
@@ -2379,7 +2388,7 @@ pub struct WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            opacity: 1.0,
+            opacity: DEFAULT_WINDOW_OPACITY,
             padding: DEFAULT_WINDOW_PADDING,
             radius_px: DEFAULT_WINDOW_RADIUS_PX,
             blur_radius: DEFAULT_WINDOW_BLUR_RADIUS,

@@ -1737,6 +1737,59 @@ mod tests {
     }
 
     #[test]
+    fn invalid_config_edit_keeps_the_last_good_plan() {
+        // CTX-1490 (issue #2580): live reload stays strict. An invalid edit
+        // must report `load-error` and keep the last-good plan instead of
+        // silently dropping to defaults through startup salvage.
+        let dir = temp_dir("lastgood-lua");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            "return { font = { family = \"Mono\", size = 13.0 } }\n",
+        )
+        .expect("write valid config");
+        let mut args = crate::cli::Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        let baseline = crate::config_cli::load_app_config(&args)
+            .expect("valid config loads")
+            .effective;
+        let resolver_args = args.clone();
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || {
+                crate::config_cli::load_app_config(&resolver_args).map(|app| app.effective)
+            }),
+            Some(path.clone()),
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "unchanged");
+
+        std::fs::write(&path, "return { window = { opacity = 2.0 } }\n")
+            .expect("write invalid config");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "load-error");
+        assert!(!info.applied);
+        assert!(
+            info.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("window.opacity"),
+            "reload message must name the field: {:?}",
+            info.message
+        );
+        assert_eq!(
+            current_effective(),
+            Some(baseline),
+            "an invalid edit must retain the last good plan"
+        );
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn classification_marks_font_size_live() {
         // Guard the assumption the engine relies on: font.size is a live field
         // (so `engine_applies_a_live_field` exercises the apply path).

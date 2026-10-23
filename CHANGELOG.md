@@ -53,20 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and optional Kitty image; its optional budget gate reads resident memory
   only. `crates/bitty-runtime/tests/memory_resize_regression.rs` pins repeated
   grow/shrink and zoom passes to a byte-stable `workspace_memory_report()`.
-- **Capability consent profiles (#2472):** `bitty plugin install` and
-  `bitty plugin grant` accept `--profile minimal|editor-like|panel-like|agent-like`.
-  A profile only preselects capabilities the manifest already requests; exec,
-  network, agent, clipboard read, environment secrets, and absolute/home
-  filesystem paths still require explicit consent, and an existing denial is
-  never cleared. Unmet selections leave the plugin disabled.
 - **Accessibility component host (#2496):** the `bitty-a11y` component server
   ships a bounded snapshot/diff protocol, and Core includes a default-off
   `ComponentSnapshotHost` with safe-mode and capability denial, stable
   generations, and fail-closed EOF/crash handling. No AT-SPI/UIA/AX platform
   backend is included.
-- **Distribution channels:** an APT repository served from Cloudflare R2
-  (#2510), a Fedora Copr pipeline (#2503), and a Nix/Cachix binary cache
-  (#2519).
+- **Linux packaging channels:** Alpine `APKBUILD`, a Gentoo overlay
+  (`bitty-bin` and `9999` ebuilds), and a Void `xbps-src` template (#2513,
+  #2516, #2517); an openSUSE OBS spec with a zypper repository recipe
+  (#2514); and a portable AppImage bundle produced by
+  `scripts/make-appimage.sh` for every Linux release leg (#2555). The distro
+  recipes are gated by `scripts/tests/check-distro-recipes.test.sh` under
+  `just check`. Earlier this cycle the APT repository served from Cloudflare
+  R2 (#2510), the Fedora Copr pipeline (#2503), and the Nix/Cachix binary
+  cache (#2519) landed, with the flake dependencies locked through crane and
+  the Cachix CD hardened (#2515).
 
 ### Fixed
 
@@ -99,6 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Last-shell workspace ghost (#2525, #2531):** exiting the only panel of a
   workspace now prunes that workspace instead of leaving a focused session-less
   tile, with zoom-backup and float/pin guards.
+- **Inactive-workspace zoom backups (#2531):** reaping a pane or primary shell
+  in a background workspace restores that workspace's zoom backup first, drops
+  dead views from the authoritative stashed layout instead of leaving ghost
+  tiles, and keeps surviving hidden-pane sessions plus workspace focus and
+  primary-shell ownership intact. A stale zoom proxy is preserved instead of
+  consumed, so a failed restore no longer discards a usable backup.
 - **Selection and copy mode (#2480, #2470, #2523):** I-beam over selectable
   text, caret-anchored one-cell selections, Block and Simple paint geometry,
   wide-glyph leaders, selections that span scrollback while dragging or
@@ -106,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Resize/reflow (#2529):** height-only resizes preserve rows and anchors;
   width reflow trims only synthetic padding, so CJK, emoji, and real spaces
   survive repeated resizes and copy exactly.
+- **Resize follow-ups (#2543):** a height-only resize now reports the signed
+  primary-content row shift, and the runtime remaps a held non-buffer
+  selection by that shift before clamping; endpoints pushed into scrollback
+  drop fail-closed, while width reflows keep the clamp path. The cursor-detach
+  condition is documented and regressed (`new_rows < used_rows - cursor_row`
+  detaches, attachment needs `used_rows - cursor_row` rows), the width-1
+  reflow `max_lines` cap is covered, and a vertical-divider shrink keeps a
+  pane-owned selection on its content.
 - **Floating outlines and the pink profile (#2522):** tiled panel rings stay
   visible under a detached float, and `border=1, radius=4` keeps the right
   border.

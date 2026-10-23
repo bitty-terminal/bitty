@@ -1599,6 +1599,11 @@ impl TerminalApp {
         // observations on the cold tick path so session end is observable
         // without polling.
         self.deliver_overlay_released();
+        // CTX-1431 (`bitty` #2406): deliver queued presentation-overlay
+        // dismissal observations on the same cold path. The `Esc` press that
+        // dismissed the surface already routed onward; this tick only reports
+        // `{ owner, handle, reason }` to subscribers.
+        self.deliver_overlay_dismissed();
         // CTX-1170 (issue #1972): deliver the `overlay.input.available`
         // pump nudge on the same cold path when a live capture owner has
         // undrained queued input, so buffer arrival repaints the modal
@@ -2096,6 +2101,39 @@ impl TerminalApp {
         plugin_runtime.revoke_overlay_capture_with_reason(reason)
     }
 
+    /// Whether a presentation-only overlay is currently shown (CTX-1431).
+    ///
+    /// True while the live session has a retained `overlay` slot block; the
+    /// surface is paint-only and never claims input capture.
+    pub(crate) fn presentation_overlay_active(&self) -> bool {
+        self.plugin_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.presentation_overlay().borrow().is_active())
+    }
+
+    /// Dismiss the presentation-only overlay because Core routed `Esc`
+    /// (CTX-1431, `bitty` #2406).
+    ///
+    /// Hides the surface without consuming the press and queues exactly one
+    /// `overlay.dismissed` observation for the cold tick. The caller keeps
+    /// routing the same press, so a confirmation gate (paste, workspace
+    /// close, view/window close) still owns its consume and both drop
+    /// together; with no gate the `Esc` reaches the focused PTY. Never called
+    /// while a focusable capture session is active: that session owns `Esc`
+    /// until it ends.
+    pub(crate) fn dismiss_presentation_overlay(&mut self) -> bool {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return false;
+        };
+        let dismissed = plugin_runtime.dismiss_presentation_overlay();
+        if dismissed {
+            // Clear before present so a dismissal outside the tick cadence
+            // never paints one extra stale frame.
+            self.runtime.set_presentation_overlay(None);
+        }
+        dismissed
+    }
+
     /// Deliver pending `overlay.released` bus observations (CTX-0941).
     ///
     /// Called on the application tick after expiry handling: each ended
@@ -2117,8 +2155,32 @@ impl TerminalApp {
         }
     }
 
-    /// Deliver the `overlay.input.available` pump nudge (CTX-1170, #1972).
+    /// Deliver queued presentation-overlay dismissal observations
+    /// (CTX-1431, `bitty` #2406).
     ///
+    /// Called on the application tick immediately after
+    /// [`Self::deliver_overlay_released`]: an `Esc` that dismissed a
+    /// presentation-only overlay already routed onward (the press is never
+    /// consumed for the overlay), and this cold-path delivery reports exactly
+    /// one `overlay.dismissed` event with `{ owner, handle, reason }`. No VM
+    /// runs on the input path. No-op without a plugin runtime or with no
+    /// queued dismissals.
+    fn deliver_overlay_dismissed(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        let dismissed = plugin_runtime.drain_overlay_dismissed();
+        for event in dismissed {
+            let payload = LuaValue::table([
+                ("owner", LuaValue::String(event.owner)),
+                ("handle", LuaValue::Integer(event.handle)),
+                ("reason", LuaValue::String(event.reason)),
+            ]);
+            plugin_runtime.deliver_event("overlay.dismissed", &payload);
+        }
+    }
+
+    /// Deliver the `overlay.input.available` pump nudge (CTX-1170, #1972).    ///
     /// Called on the application tick right after
     /// [`Self::deliver_overlay_released`]: when a live capture owner has
     /// undrained queued input, one observation-only event with payload
@@ -2185,22 +2247,42 @@ impl TerminalApp {
         )
     }
 
-    /// Sync the Core-hosted overlay surface to the capture owner (CTX-0943).
+    /// Sync the Core-hosted overlay surfaces to their owners (CTX-0943).
     ///
     /// Reads the retained `overlay`-slot blocks, keeps the single global
-    /// owner's first block in discovery order as the surface (one session
-    /// per plugin; the acquire gate already required the handle to be such
-    /// a block), and clears the surface otherwise — capture end removes the
-    /// surface per the contract. The [`Runtime`](bitty_runtime::Runtime)
-    /// setter only marks redraw on actual change, so capture-less ticks
-    /// stay idle.
+    /// capture owner's first block in discovery order as the modal surface
+    /// (one session per plugin; the acquire gate already required the handle
+    /// to be such a block), and clears the surface otherwise — capture end
+    /// removes the surface per the contract. CTX-1431 adds the independent
+    /// presentation-only session: its owner's retained block is painted
+    /// below the modal (if any) and disappears when the session ends or the
+    /// generation unloads. The [`Runtime`](bitty_runtime::Runtime) setters
+    /// only mark redraw on actual change, so overlay-less ticks stay idle.
     fn update_plugin_overlay(&mut self) {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
             if self.runtime.plugin_overlay().is_some() {
                 self.runtime.set_plugin_overlay(None);
             }
+            if self.runtime.presentation_overlay().is_some() {
+                self.runtime.set_presentation_overlay(None);
+            }
             return;
         };
+        // CTX-1431 (`bitty` #2406): the presentation-only session is
+        // independent of the capture/tooltip surface. Resolve it from the
+        // live mount registry so a `ui.update` refreshes the panel contents
+        // here; the capture modal, when it also exists, still paints above
+        // it. The session check is O(1) and no block is copied without a
+        // live session.
+        let presentation = plugin_runtime.presentation_overlay_block().map(
+            |(id, slot, root, version, _handle)| bitty_runtime::BandContent {
+                plugin_id: id.to_string(),
+                slot,
+                root,
+                version,
+            },
+        );
+        self.runtime.set_presentation_overlay(presentation);
         let capture_owner = plugin_runtime
             .overlay_capture()
             .borrow()

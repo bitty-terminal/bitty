@@ -1249,6 +1249,16 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the effective `mod_key` slot (issue #2407).
+    ///
+    /// Resolved once at startup from `mod_key`; applied to plugin-suggested
+    /// `alt`-bearing chords at match time, exactly like the shipped defaults,
+    /// and adopted live on reload via [`Self::adopt_live_config`].
+    pub(crate) fn with_mod_key(mut self, mod_key: bitty_config::ModKey) -> Self {
+        self.chrome = self.chrome.with_mod_key(mod_key);
+        self
+    }
+
     /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
     ///
     /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
@@ -1256,7 +1266,8 @@ impl TerminalApp {
     /// `input.leader` + `input.timeout_len`, CTX-1002), the prefix-sequence
     /// bindings (`"leader <second>"` entries, CTX-1002), the hint kill switch
     /// (`hints_enabled`), the tiled resize step (`layout.resize_step`,
-    /// CTX-0963), and re-applies the platform transparency hint for
+    /// CTX-0963), the `mod_key` slot applied to plugin-suggested chords
+    /// (issue #2407), and re-applies the platform transparency hint for
     /// `window.opacity`. A Leader window or hint session armed under the old
     /// binding is cancelled when the binding changes or hints are disabled,
     /// so no stale chord or armed window outlives the reload. Held-key
@@ -1272,6 +1283,10 @@ impl TerminalApp {
         self.chrome.prefix_bindings = adoption.prefix_bindings;
         self.chrome.hints_enabled = adoption.hints_enabled;
         self.chrome.resize_step = crate::chrome_keys::sanitize_resize_step(adoption.resize_step);
+        // Issue #2407: plugin-suggested `alt`-bearing chords follow the same
+        // Mod slot as the shipped defaults, so a `mod_key` flip re-spells
+        // them on the next keypress without republishing the suggestions.
+        self.chrome.mod_key = adoption.mod_key;
         // Issue #2405: keep the plugin keymap source on the exact table the
         // input path now uses, so the next `bitty.keymaps.list()` observes the
         // reloaded registry. No rows are cached: the source stores the typed

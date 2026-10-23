@@ -251,6 +251,9 @@ pub(crate) struct AppAdoption {
     /// Tiled resize step (`layout.resize_step`, CTX-0963): read at keypress
     /// time, adopted live like the keymaps.
     pub(crate) resize_step: f32,
+    /// Effective `mod_key` slot (issue #2407): plugin-suggested `alt`-bearing
+    /// chords are re-spelled through it at match time.
+    pub(crate) mod_key: bitty_config::ModKey,
     /// Effective `window.opacity` for the platform transparency hint.
     pub(crate) window_opacity: f32,
     /// Resolved theme identity for the window title (CTX-0898): a built-in
@@ -356,6 +359,7 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         prefix_bindings,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
+        mod_key: effective.mod_key,
         window_opacity: effective.window.opacity,
         theme_name,
     })

@@ -1266,6 +1266,8 @@ fn main() {
     .with_hints_enabled(hints.enabled)
     // CTX-0963 (#1697): the tiled resize step per keypress.
     .with_resize_step(app_config.effective.layout.resize_step)
+    // Issue #2407: plugin-suggested `alt`-bearing chords follow `mod_key`.
+    .with_mod_key(app_config.effective.mod_key)
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)

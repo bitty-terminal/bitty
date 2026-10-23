@@ -13143,6 +13143,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         prefix_bindings: bitty_config::resolve_prefix_bindings(&edited.keymaps).expect("prefixes"),
         hints_enabled: false,
         resize_step: edited.layout.resize_step,
+        mod_key: edited.mod_key,
         window_opacity: 0.6,
         theme_name: bitty_config::theme::DEFAULT_THEME_NAME.to_string(),
     });
@@ -13173,6 +13174,7 @@ fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_rel
             .expect("prefixes"),
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
+        mod_key: effective.mod_key,
         window_opacity: effective.window.opacity,
         theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref())
             .name

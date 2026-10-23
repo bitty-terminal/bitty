@@ -25,6 +25,7 @@ use crate::dev::{
 use crate::inspect::InspectTarget;
 use crate::list::ListKind;
 use crate::plugin::{ConfigAction, PluginVerb};
+use crate::plus::PlusAction;
 use crate::profile::ProfileVerb;
 
 /// Global flags accepted before/after every first-level word.
@@ -186,6 +187,9 @@ pub(crate) fn nodes() -> Vec<Node> {
         top.push(name);
         top.extend_from_slice(aliases);
     }
+    for (name, _) in PlusAction::ALL {
+        top.push(name);
+    }
     push_node(&mut nodes, "", top.clone(), &[], false);
 
     push_node(
@@ -233,6 +237,9 @@ pub(crate) fn nodes() -> Vec<Node> {
     let profile_verbs: Vec<&'static str> =
         ProfileVerb::VERBS.iter().map(|(name, _)| *name).collect();
     push_node(&mut nodes, "config profile", profile_verbs, &[], false);
+    for (name, action) in PlusAction::ALL {
+        push_node(&mut nodes, name, Vec::new(), action.flags(), false);
+    }
 
     push_node(
         &mut nodes,
@@ -450,6 +457,22 @@ mod tests {
             !root.contains(&"component"),
             "hidden component alias must not be completed"
         );
+    }
+
+    #[test]
+    fn root_offers_every_plus_action_alias() {
+        let root = candidates_for("").expect("root node");
+        for (name, _) in PlusAction::ALL {
+            assert!(root.contains(name), "root missing alias {name}");
+            let node =
+                candidates_for(name).unwrap_or_else(|| panic!("missing grammar node for {name}"));
+            for flag in ["--help", "--format"] {
+                if flag == "--format" && *name == "+edit-config" {
+                    continue;
+                }
+                assert!(node.contains(&flag), "{name} missing {flag}");
+            }
+        }
     }
 
     #[test]

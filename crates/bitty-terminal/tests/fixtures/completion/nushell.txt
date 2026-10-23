@@ -585,6 +585,446 @@ extern "bitty config profile" [
     --no-print-shell-init
     --no-shell-init
 ]
+extern "bitty +list-themes" [
+    --format: string
+    --safe
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-colors" [
+    --format: string
+    --config: string
+    --profile: string
+    --safe
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-fonts" [
+    --format: string
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-keybinds" [
+    --format: string
+    --config: string
+    --profile: string
+    --safe
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-actions" [
+    --format: string
+    --config: string
+    --profile: string
+    --safe
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-plugins" [
+    --format: string
+    --safe
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +list-extensions" [
+    --format: string
+    --no-color
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +show-config" [
+    --format: string
+    --config: string
+    --profile: string
+    --safe
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +validate-config" [
+    --format: string
+    --config: string
+    --profile: string
+    --safe
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty +edit-config" [
+    --config: string
+    --profile: string
+    --safe
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
 extern "bitty init" [
     --yes
     --force
@@ -1588,12 +2028,16 @@ extern "bitty ctl consent revoke" []
 extern "bitty ctl consent revoke-session" []
 extern "bitty config path" []
 extern "bitty config check" []
+extern "bitty config show" []
+extern "bitty config validate" []
 extern "bitty config edit" []
 extern "bitty config profile list" []
 extern "bitty config profile show" []
 extern "bitty config profile use" []
 extern "bitty config profile path" []
 extern "bitty list themes" []
+extern "bitty list colors" []
+extern "bitty list fonts" []
 extern "bitty list plugins" []
 extern "bitty list instances" []
 extern "bitty list actions" []
@@ -1663,11 +2107,25 @@ extern "bitty help cmd" []
 extern "bitty help x" []
 extern "bitty help shell-init" []
 extern "bitty help help" []
+extern "bitty help +list-themes" []
+extern "bitty help +list-colors" []
+extern "bitty help +list-fonts" []
+extern "bitty help +list-keybinds" []
+extern "bitty help +list-actions" []
+extern "bitty help +list-plugins" []
+extern "bitty help +list-extensions" []
+extern "bitty help +show-config" []
+extern "bitty help +validate-config" []
+extern "bitty help +edit-config" []
 extern "bitty cfg path" []
 extern "bitty cfg check" []
+extern "bitty cfg show" []
+extern "bitty cfg validate" []
 extern "bitty cfg edit" []
 extern "bitty cfg profile" []
 extern "bitty ls themes" []
+extern "bitty ls colors" []
+extern "bitty ls fonts" []
 extern "bitty ls plugins" []
 extern "bitty ls instances" []
 extern "bitty ls actions" []

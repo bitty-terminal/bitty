@@ -642,18 +642,21 @@ fn builtin_app_config() -> Result<AppConfig, String> {
 
 /// Short usage for `bitty config` (stderr, fail-closed exit 2).
 pub(crate) fn config_usage() -> String {
-    "usage: bitty config <path|check|edit|profile> [--config PATH] [--profile NAME]\n\
+    "usage: bitty config <path|check|show|validate|edit|profile> [--format table|json|jsonl] [--config PATH] [--profile NAME]\n\
      \n\
      verbs:\n\
-     \x20 path     print the resolved config file path\n\
-     \x20 check    load + validate; print per-key sources (cli/file/profile/default)\n\
-     \x20 edit     open the file in $VISUAL/$EDITOR (vi fallback)\n\
-     \x20 profile  manage named profiles (list|show|use|path NAME)\n\
+     \x20 path      print the resolved config file path\n\
+     \x20 check     load + validate; print per-key sources (cli/file/profile/default)\n\
+     \x20 show      load + validate; same rows, JSON carries layer attribution\n\
+     \x20 validate  load + validate only; exit 2 when invalid, no key dump\n\
+     \x20 edit      open the file in $VISUAL/$EDITOR (vi fallback), then validate\n\
+     \x20 profile   manage named profiles (list|show|use|path NAME)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
      profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua\n\
      \x20         (--profile, else BITTY_PROFILE, else the persisted init.lua selector)\n\
-     env: BITTY_CONFIG (path), BITTY_PROFILE (name); CLI flags win over env"
+     env: BITTY_CONFIG (path), BITTY_PROFILE (name); CLI flags win over env\n\
+     aliases: bitty +show-config / +validate-config / +edit-config (same code)"
         .to_string()
 }
 
@@ -813,6 +816,18 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
         args.config_path.as_deref(),
         bitty_config_env.as_deref(),
     );
+    let format = match config_format(args) {
+        Ok(format) => format,
+        Err(message) => {
+            eprintln!("{message}");
+            return 2;
+        }
+    };
+    // `show`/`check` keep the exact text path below; JSON goes through the
+    // bounded typed projection (same loader, same attribution).
+    if matches!(cmd, ConfigCommand::Check | ConfigCommand::Show) && format != ConfigFormat::Table {
+        return run_config_show_json(args, cmd, format);
+    }
     match cmd {
         ConfigCommand::Path => match bitty_config::file::probe_config_path(explicit.as_deref()) {
             Some(probed) => {
@@ -824,7 +839,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 2
             }
         },
-        ConfigCommand::Check => match load_merged_config(args) {
+        ConfigCommand::Check | ConfigCommand::Show => match load_merged_config(args) {
             Ok(loaded) => {
                 let merged = loaded.merged;
                 let probed = loaded.probed;
@@ -1566,50 +1581,557 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
         },
         // Handled before the positional rejection above; kept exhaustive.
         ConfigCommand::Profile => crate::profile::run_profile_subcommand(args),
-        ConfigCommand::Edit => {
-            let probed = bitty_config::file::probe_config_path(explicit.as_deref());
-            let target = match probed {
-                Some(p) => p.path,
-                None => {
-                    eprintln!(
-                        "bitty config edit: no config root ($XDG_CONFIG_HOME or $HOME unset)"
-                    );
-                    return 2;
-                }
-            };
-            if !target.exists() {
-                // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
-                if let Some(parent) = target.parent() {
-                    if let Err(err) = std::fs::create_dir_all(parent) {
-                        eprintln!(
-                            "bitty config edit: cannot create '{}': {err}",
-                            parent.display()
-                        );
-                        return 1;
-                    }
-                }
-                // Starter only when missing: never clobbers existing content.
-                if let Err(err) = std::fs::write(&target, starter_init_lua()) {
-                    eprintln!(
-                        "bitty config edit: cannot write '{}': {err}",
-                        target.display()
-                    );
-                    return 1;
-                }
-                eprintln!("bitty config edit: created '{}'", target.display());
+        ConfigCommand::Validate => run_config_validate(args, format),
+        ConfigCommand::Edit => run_config_edit(args, format),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `bitty config show|validate|edit` machine surface (CTX-1446, issue #2464)
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes for a `config --format` value (matches `list`).
+const MAX_CONFIG_FORMAT_LEN: usize = 16;
+/// Bound on the JSON key projection (30 rows today; defense in depth).
+const MAX_CONFIG_ROWS: usize = 64;
+/// Bound on a diagnostic string embedded in an envelope.
+const MAX_CONFIG_MESSAGE_BYTES: usize = 1024;
+
+/// Output shape for `bitty config show|validate|edit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFormat {
+    /// Human rows / plain diagnostics (not a machine contract).
+    Table,
+    /// One compact versioned envelope (`jsonl` is the same single line).
+    Json,
+}
+
+/// Parses `--format` for config actions (fail-closed, exit 2 upstream).
+fn config_format(args: &Args) -> Result<ConfigFormat, String> {
+    match args.config_format.as_deref() {
+        None => Ok(ConfigFormat::Table),
+        Some(value) => {
+            if value.len() > MAX_CONFIG_FORMAT_LEN || value.contains('\0') {
+                return Err(format!(
+                    "bitty config: unknown --format {value:?} (want table|json|jsonl)\n{}",
+                    config_usage()
+                ));
             }
-            let editor = resolve_editor();
-            match std::process::Command::new(&editor).arg(&target).status() {
-                Ok(status) if status.success() => 0,
-                Ok(status) => status.code().unwrap_or(1),
-                Err(err) => {
-                    eprintln!("bitty config edit: cannot run editor '{editor}': {err}");
-                    1
-                }
+            match value.trim().to_ascii_lowercase().as_str() {
+                "table" => Ok(ConfigFormat::Table),
+                "json" | "jsonl" => Ok(ConfigFormat::Json),
+                other => Err(format!(
+                    "bitty config: unknown --format {other:?} (want table|json|jsonl)\n{}",
+                    config_usage()
+                )),
             }
         }
     }
 }
+
+/// Envelope `command` value: the invoked alias or the canonical verb.
+fn config_command_spelling(args: &Args, cmd: ConfigCommand) -> String {
+    match args.plus_action {
+        Some(action) => action.name().to_string(),
+        None => format!("config {}", cmd.name()),
+    }
+}
+
+/// Char-boundary truncation for diagnostics.
+fn bounded_message(raw: &str) -> String {
+    if raw.len() <= MAX_CONFIG_MESSAGE_BYTES {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(MAX_CONFIG_MESSAGE_BYTES);
+    for ch in raw.chars() {
+        if out.len() + ch.len_utf8() > MAX_CONFIG_MESSAGE_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+/// One typed value in the bounded key projection.
+enum ConfigValue {
+    /// String value.
+    Text(String),
+    /// Numeric value rendered with `Display` (stable, locale-independent).
+    Number(String),
+    /// Boolean value.
+    Bool(bool),
+    /// Absent optional value.
+    Null,
+    /// String list.
+    List(Vec<String>),
+}
+
+impl ConfigValue {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "string",
+            Self::Number(_) => "number",
+            Self::Bool(_) => "boolean",
+            Self::Null => "null",
+            Self::List(_) => "string[]",
+        }
+    }
+
+    fn json(&self) -> String {
+        match self {
+            Self::Text(value) => format!("\"{}\"", crate::list::json_escape(value)),
+            Self::Number(value) => value.clone(),
+            Self::Bool(value) => value.to_string(),
+            Self::Null => String::from("null"),
+            Self::List(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(|value| format!("\"{}\"", crate::list::json_escape(value)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+}
+
+/// One projected effective-config row with attribution.
+struct ConfigRow {
+    key: &'static str,
+    value: ConfigValue,
+    layer: String,
+    source: String,
+}
+
+/// Source layer label for one field (`core-defaults` when unattributed).
+fn config_layer(merged: &bitty_config::MergedConfig, field: &str) -> String {
+    merged.source_of(field).map_or_else(
+        || String::from("core-defaults"),
+        |source| source.layer.label().to_string(),
+    )
+}
+
+/// Builds the bounded typed projection from a loaded config.
+///
+/// Values come straight from the same `MergedConfig` the text path prints;
+/// attribution uses the shared [`layer_source_label`]. The projection is a
+/// deliberately bounded core-key set (30 rows), not a second validator.
+fn config_rows(loaded: &LoadedConfig) -> Vec<ConfigRow> {
+    let merged = &loaded.merged;
+    let effective = &merged.effective;
+    let file_path = loaded
+        .probed
+        .as_ref()
+        .filter(|probe| probe.path.exists())
+        .map(|probe| probe.path.clone());
+    let profile_path = loaded.profile_path.clone();
+    let source = |field: &str| {
+        layer_source_label(merged, field, file_path.as_deref(), profile_path.as_deref())
+    };
+    let mut rows: Vec<ConfigRow> = Vec::with_capacity(32);
+    let mut push = |field: &'static str, value: ConfigValue| {
+        rows.push(ConfigRow {
+            key: field,
+            value,
+            layer: config_layer(merged, field),
+            source: source(field),
+        });
+    };
+
+    push(
+        "profile",
+        loaded
+            .profile_name
+            .as_deref()
+            .map_or(ConfigValue::Null, |name| {
+                ConfigValue::Text(name.to_string())
+            }),
+    );
+    push(
+        "appearance.theme",
+        effective
+            .appearance
+            .theme
+            .as_deref()
+            .map_or(ConfigValue::Null, |theme| {
+                ConfigValue::Text(theme.to_string())
+            }),
+    );
+    push(
+        "appearance.colors",
+        ConfigValue::Bool(effective.appearance.colors.is_some()),
+    );
+    push(
+        "font.family",
+        ConfigValue::Text(effective.font.family.clone()),
+    );
+    push(
+        "font.size",
+        ConfigValue::Number(format!("{}", effective.font.size)),
+    );
+    push(
+        "font.fallback",
+        ConfigValue::List(effective.font.fallback.clone()),
+    );
+    push(
+        "window.opacity",
+        ConfigValue::Number(format!("{}", effective.window.opacity)),
+    );
+    push(
+        "window.padding",
+        ConfigValue::Number(format!("{}", effective.window.padding)),
+    );
+    push(
+        "window.radius_px",
+        ConfigValue::Number(format!("{}", effective.window.radius_px)),
+    );
+    push(
+        "terminal.scrollback",
+        ConfigValue::Number(format!("{}", effective.terminal.scrollback)),
+    );
+    push(
+        "terminal.shell",
+        effective
+            .terminal
+            .shell
+            .as_deref()
+            .map_or(ConfigValue::Null, |shell| {
+                ConfigValue::Text(shell.to_string())
+            }),
+    );
+    push(
+        "terminal.cursor_style",
+        ConfigValue::Text(effective.terminal.cursor_style.as_str().to_string()),
+    );
+    push(
+        "terminal.bell",
+        ConfigValue::Text(effective.terminal.bell.as_str().to_string()),
+    );
+    push(
+        "terminal.page_scroll_percent",
+        ConfigValue::Number(format!("{}", effective.terminal.page_scroll_percent)),
+    );
+    push(
+        "selection.auto_copy",
+        ConfigValue::Bool(effective.selection.auto_copy),
+    );
+    push(
+        "layout.gaps_in",
+        ConfigValue::Number(format!("{}", effective.layout.gaps_in)),
+    );
+    push(
+        "layout.gaps_out",
+        ConfigValue::Number(format!("{}", effective.layout.gaps_out)),
+    );
+    push(
+        "layout.resize_step",
+        ConfigValue::Number(format!("{}", effective.layout.resize_step)),
+    );
+    push(
+        "decoration.border",
+        ConfigValue::Number(format!("{}", effective.decoration.border)),
+    );
+    push(
+        "decoration.radius",
+        ConfigValue::Number(format!("{}", effective.decoration.radius)),
+    );
+    push(
+        "decoration.content_inset",
+        ConfigValue::Number(format!("{}", effective.decoration.content_inset)),
+    );
+    push(
+        "scrollbar.mode",
+        ConfigValue::Text(effective.scrollbar.mode.as_str().to_string()),
+    );
+    push(
+        "scrollbar.width",
+        ConfigValue::Number(format!("{}", effective.scrollbar.width)),
+    );
+    push(
+        "mouse.focus_follows_mouse",
+        ConfigValue::Bool(effective.mouse.focus_follows_mouse),
+    );
+    push(
+        "mouse.right",
+        ConfigValue::Text(effective.mouse.right.canonical().to_string()),
+    );
+    push(
+        "mouse.middle",
+        ConfigValue::Text(effective.mouse.middle.canonical().to_string()),
+    );
+    push(
+        "mod_key",
+        ConfigValue::Text(effective.mod_key.canonical().to_string()),
+    );
+    push(
+        "close_confirm",
+        ConfigValue::Text(effective.close_confirm.as_str().to_string()),
+    );
+    push(
+        "keymaps",
+        ConfigValue::Number(format!("{}", effective.keymaps.len())),
+    );
+    let theme = effective.effective_theme_for(startup_prefer_light());
+    let violations = bitty_config::theme::contrast_violations(&theme).len();
+    push(
+        "theme.contrast",
+        ConfigValue::Text(if violations == 0 {
+            String::from("pass")
+        } else {
+            format!("{violations} violation(s)")
+        }),
+    );
+    rows.truncate(MAX_CONFIG_ROWS);
+    rows
+}
+
+/// Renders one path/profile pair for an envelope.
+fn config_path_json(path: Option<&std::path::Path>) -> String {
+    path.map_or_else(
+        || String::from("null"),
+        |path| {
+            format!(
+                "\"{}\"",
+                crate::list::json_escape(&path.display().to_string())
+            )
+        },
+    )
+}
+
+/// Renders the `config show` success envelope.
+fn config_show_envelope(command: &str, loaded: &LoadedConfig) -> String {
+    let rows = config_rows(loaded);
+    let file_path = loaded
+        .probed
+        .as_ref()
+        .filter(|probe| probe.path.exists())
+        .map(|probe| probe.path.as_path());
+    let mut out = String::with_capacity(2048);
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"count\":{},\"truncated\":false,\"keys\":[",
+            crate::list::json_escape(command),
+            config_path_json(file_path),
+            loaded.profile_name.as_deref().map_or_else(
+                || String::from("null"),
+                |name| format!("\"{}\"", crate::list::json_escape(name))
+            ),
+            rows.len()
+        ),
+    );
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"key\":\"{}\",\"value\":{},\"type\":\"{}\",\"layer\":\"{}\",\"source\":\"{}\"}}",
+                row.key,
+                row.value.json(),
+                row.value.kind(),
+                crate::list::json_escape(&row.layer),
+                crate::list::json_escape(&row.source)
+            ),
+        );
+    }
+    out.push_str("]}}");
+    out
+}
+
+/// Renders a failed config envelope (`ok:false` + typed error).
+fn config_error_envelope(
+    command: &str,
+    args: &Args,
+    code: &str,
+    message: &str,
+    valid: bool,
+) -> String {
+    let explicit = bitty_config::file::resolve_config_explicit(
+        args.config_path.as_deref(),
+        std::env::var("BITTY_CONFIG").ok().as_deref(),
+    );
+    let path = bitty_config::file::probe_config_path(explicit.as_deref())
+        .filter(|probe| probe.path.exists())
+        .map(|probe| probe.path);
+    let message = bounded_message(message);
+    format!(
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":false,\"error\":{{\"class\":\"config\",\"code\":\"{}\",\"message\":\"{}\"}},\"result\":{{\"kind\":\"config\",\"valid\":{},\"path\":{},\"profile\":null,\"diagnostics\":[{{\"severity\":\"error\",\"message\":\"{}\"}}]}}}}",
+        crate::list::json_escape(command),
+        crate::list::json_escape(code),
+        crate::list::json_escape(&message),
+        valid,
+        config_path_json(path.as_deref()),
+        crate::list::json_escape(&message)
+    )
+}
+
+/// `bitty config show --format json|jsonl` / `+show-config`.
+fn run_config_show_json(args: &Args, cmd: ConfigCommand, format: ConfigFormat) -> i32 {
+    debug_assert_eq!(format, ConfigFormat::Json);
+    let command = config_command_spelling(args, cmd);
+    match load_merged_config(args) {
+        Ok(loaded) => {
+            println!("{}", config_show_envelope(&command, &loaded));
+            0
+        }
+        Err(message) => {
+            println!(
+                "{}",
+                config_error_envelope(&command, args, "E_CONFIG_INVALID", &message, false)
+            );
+            eprintln!("{message}");
+            2
+        }
+    }
+}
+
+/// `bitty config validate` / `+validate-config`.
+///
+/// Text mode prints nothing on success (script-friendly) and the loader error
+/// on stderr when invalid. JSON mode always emits the stable envelope.
+fn run_config_validate(args: &Args, format: ConfigFormat) -> i32 {
+    let command = config_command_spelling(args, ConfigCommand::Validate);
+    match load_merged_config(args) {
+        Ok(loaded) => {
+            if format == ConfigFormat::Json {
+                let file_path = loaded
+                    .probed
+                    .as_ref()
+                    .filter(|probe| probe.path.exists())
+                    .map(|probe| probe.path.as_path());
+                println!(
+                    "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"diagnostics\":[]}}}}",
+                    crate::list::json_escape(&command),
+                    config_path_json(file_path),
+                    loaded.profile_name.as_deref().map_or_else(
+                        || String::from("null"),
+                        |name| format!("\"{}\"", crate::list::json_escape(name))
+                    )
+                );
+            }
+            0
+        }
+        Err(message) => {
+            if format == ConfigFormat::Json {
+                println!(
+                    "{}",
+                    config_error_envelope(&command, args, "E_CONFIG_INVALID", &message, false)
+                );
+            }
+            eprintln!("{message}");
+            2
+        }
+    }
+}
+
+/// Runs the editor and returns its path/name, or a stable failure.
+fn execute_config_edit(args: &Args) -> Result<(std::path::PathBuf, String), (i32, String)> {
+    let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+    let explicit = bitty_config::file::resolve_config_explicit(
+        args.config_path.as_deref(),
+        bitty_config_env.as_deref(),
+    );
+    let target = match bitty_config::file::probe_config_path(explicit.as_deref()) {
+        Some(probed) => probed.path,
+        None => {
+            return Err((
+                2,
+                String::from("bitty config edit: no config root ($XDG_CONFIG_HOME or $HOME unset)"),
+            ));
+        }
+    };
+    if !target.exists() {
+        // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
+        if let Some(parent) = target.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                return Err((
+                    1,
+                    format!(
+                        "bitty config edit: cannot create '{}': {err}",
+                        parent.display()
+                    ),
+                ));
+            }
+        }
+        // Starter only when missing: never clobbers existing content.
+        if let Err(err) = std::fs::write(&target, starter_init_lua()) {
+            return Err((
+                1,
+                format!(
+                    "bitty config edit: cannot write '{}': {err}",
+                    target.display()
+                ),
+            ));
+        }
+        eprintln!("bitty config edit: created '{}'", target.display());
+    }
+    let editor = resolve_editor();
+    match std::process::Command::new(&editor).arg(&target).status() {
+        Ok(status) if status.success() => Ok((target, editor)),
+        Ok(status) => Err((status.code().unwrap_or(1), String::new())),
+        Err(err) => Err((
+            1,
+            format!("bitty config edit: cannot run editor '{editor}': {err}"),
+        )),
+    }
+}
+
+/// `bitty config edit` / `+edit-config`: edit, then re-validate in place.
+///
+/// The command never rewrites the file after the editor exits: a failed
+/// validation is reported (exit 2) while the user's bytes stay untouched, so
+/// a broken edit is visible and recoverable rather than silently replaced.
+fn run_config_edit(args: &Args, format: ConfigFormat) -> i32 {
+    let command = config_command_spelling(args, ConfigCommand::Edit);
+    let (path, editor) = match execute_config_edit(args) {
+        Ok(outcome) => outcome,
+        Err((code, message)) => {
+            if !message.is_empty() {
+                eprintln!("{message}");
+            }
+            if format == ConfigFormat::Json {
+                println!(
+                    "{}",
+                    config_error_envelope(&command, args, "E_EDITOR_FAILED", &message, false)
+                );
+            }
+            return code;
+        }
+    };
+    match load_merged_config(args) {
+        Ok(_) => {
+            if format == ConfigFormat::Json {
+                println!(
+                    "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"editor\":\"{}\",\"diagnostics\":[]}}}}",
+                    crate::list::json_escape(&command),
+                    config_path_json(Some(path.as_path())),
+                    crate::list::json_escape(&editor)
+                );
+            }
+            0
+        }
+        Err(message) => {
+            let message = bounded_message(&message);
+            if format == ConfigFormat::Json {
+                println!(
+                    "{{\"v\":1,\"command\":\"{}\",\"ok\":false,\"error\":{{\"class\":\"config\",\"code\":\"E_CONFIG_INVALID\",\"message\":\"{}\"}},\"result\":{{\"kind\":\"config\",\"valid\":false,\"path\":{},\"editor\":\"{}\",\"diagnostics\":[{{\"severity\":\"error\",\"message\":\"{}\"}}]}}}}",
+                    crate::list::json_escape(&command),
+                    crate::list::json_escape(&message),
+                    config_path_json(Some(path.as_path())),
+                    crate::list::json_escape(&editor),
+                    crate::list::json_escape(&message)
+                );
+            }
+            eprintln!("bitty config edit: configuration is invalid after editing");
+            eprintln!("{message}");
+            2
+        }
+    }
+}
+
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
 ///
 /// Cell geometry applies the configured breathing room scaled with point size
@@ -2156,6 +2678,46 @@ mod startup_tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn config_format_accepts_table_and_json_and_rejects_unknown() {
+        let mut args = Args::new();
+        assert_eq!(config_format(&args).unwrap(), ConfigFormat::Table);
+        args.config_format = Some(String::from("json"));
+        assert_eq!(config_format(&args).unwrap(), ConfigFormat::Json);
+        args.config_format = Some(String::from("JSONL"));
+        assert_eq!(config_format(&args).unwrap(), ConfigFormat::Json);
+        args.config_format = Some(String::from("yaml"));
+        let error = config_format(&args).unwrap_err();
+        assert!(error.contains("unknown --format"), "{error}");
+        args.config_format = Some("x".repeat(64));
+        assert!(config_format(&args).is_err());
+    }
+
+    #[test]
+    fn config_command_spelling_keeps_alias_and_canonical_forms() {
+        let mut args = Args::new();
+        assert_eq!(
+            config_command_spelling(&args, ConfigCommand::Show),
+            "config show"
+        );
+        args.plus_action = Some(crate::plus::PlusAction::ShowConfig);
+        assert_eq!(
+            config_command_spelling(&args, ConfigCommand::Show),
+            "+show-config"
+        );
+    }
+
+    #[test]
+    fn bounded_message_never_splits_a_character() {
+        let raw = "é".repeat(MAX_CONFIG_MESSAGE_BYTES);
+        let bounded = bounded_message(&raw);
+        assert!(bounded.len() <= MAX_CONFIG_MESSAGE_BYTES + 3);
+        assert!(bounded.ends_with("..."));
+        assert!(bounded.is_char_boundary(bounded.len() - 3));
+        // Under the bound, the message is unchanged.
+        assert_eq!(bounded_message("short"), "short");
     }
 
     #[test]

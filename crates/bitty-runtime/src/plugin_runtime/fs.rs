@@ -102,7 +102,9 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
             ));
         };
         let final_component = components.peek().is_none();
-        let file = if final_component {
+        // All components must be nonblocking: a FIFO in an ancestor position
+        // must reach descriptor validation instead of waiting for a writer.
+        let file = {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 let fd = rustix::fs::openat(
@@ -131,38 +133,6 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
                     nix::fcntl::OFlag::O_RDONLY
                         | nix::fcntl::OFlag::O_NOFOLLOW
                         | nix::fcntl::OFlag::O_NONBLOCK
-                        | nix::fcntl::OFlag::O_CLOEXEC,
-                    nix::sys::stat::Mode::empty(),
-                )?;
-                std::fs::File::from(fd)
-            }
-        } else {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                let fd = rustix::fs::openat(
-                    &directory,
-                    name,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                )?;
-                std::fs::File::from(fd)
-            }
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly"
-            ))]
-            {
-                let fd = nix::fcntl::openat(
-                    &directory,
-                    name,
-                    nix::fcntl::OFlag::O_RDONLY
-                        | nix::fcntl::OFlag::O_NOFOLLOW
                         | nix::fcntl::OFlag::O_CLOEXEC,
                     nix::sys::stat::Mode::empty(),
                 )?;
@@ -700,6 +670,31 @@ mod tests {
         std::fs::create_dir(&real).expect("real directory");
         std::fs::write(real.join("state.toml"), b"state").expect("state");
         std::os::unix::fs::symlink(&real, &link).expect("directory symlink");
+        assert!(NativeFileSystem.read_bounded_bytes(&path, 16).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_fifo_directory_ancestors_without_blocking() {
+        let dir = sweep_dir("bounded-read-fifo");
+        let fifo = dir.path().join("fifo");
+        let path = fifo.join("state.toml");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .expect("fifo");
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("fifo");
         assert!(NativeFileSystem.read_bounded_bytes(&path, 16).is_err());
     }
 }

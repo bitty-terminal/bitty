@@ -235,3 +235,42 @@ fn invalid_security_sensitive_value_never_aborts_or_escalates() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn whole_layer_drop_denies_profile_history_capture() {
+    // CTX-1490 review finding 1 probe: a broken user layer used to let the
+    // profile re-enable history capture. The whole-layer drop now denies every
+    // security-sensitive element for the launch, so the profile cannot
+    // resurrect transcript/command capture.
+    let root = scratch_root("deny-history");
+    write_init(&root, "return { font = }\n");
+    write_profile(
+        &root,
+        "work",
+        concat!(
+            "return { history = { capture = { transcript = true, commands = true } },\n",
+            "  font = { family = \"Mono\", size = 13.0 } }\n"
+        ),
+    );
+
+    let startup = run_bitty(&root, &["--headless", "--profile", "work"]);
+    assert_reached_a_tick(&startup, "startup with a whole-layer drop");
+    let text = stderr(&startup);
+    assert!(
+        text.contains("ignoring invalid config file"),
+        "the dropped user layer must be reported: {text}"
+    );
+    assert!(
+        text.contains("profile 'work' from"),
+        "the valid profile still loads: {text}"
+    );
+    assert!(
+        text.contains("history capture off"),
+        "the deny overlay must cover history: {text}"
+    );
+    assert!(
+        text.contains("lower layers cannot re-enable them"),
+        "the deny summary must explain the contract: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

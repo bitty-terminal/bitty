@@ -178,6 +178,109 @@ fn source_label(source: &bitty_config::ConfigSource) -> String {
         .unwrap_or_else(|| String::from("(built-in layer)"))
 }
 
+/// Security-sensitive configuration elements denied after startup salvage
+/// (CTX-1490 review finding 1).
+///
+/// A dropped element must never resurrect a more-permissive value from a lower
+/// layer. Table-level salvage records only the dropped element; a whole-layer
+/// drop denies every element the vanished layer might have restricted.
+///
+/// `keymaps` is intentionally absent: dropping it resolves to the shipped
+/// default map and grants no capability, and the plugin-suggested binding slot
+/// is inert (deny-by-default), so no plugin binding is resurrected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SafeDeny {
+    /// No configured plugin is enabled or activated.
+    plugins: bool,
+    /// Transcript/command capture stays off.
+    history: bool,
+    /// Middle/right button actions resolve to `none`.
+    mouse_buttons: bool,
+    /// No decoration background-image root is approved.
+    background_image_roots: bool,
+}
+
+impl SafeDeny {
+    /// Records the security-sensitive elements dropped by table-level salvage.
+    fn record_salvage(&mut self, diagnostics: &[bitty_config::file::SalvageDiagnostic]) {
+        for diagnostic in diagnostics {
+            match diagnostic.field.as_str() {
+                "plugins" => self.plugins = true,
+                "history" => self.history = true,
+                "mouse" => self.mouse_buttons = true,
+                // Any dropped decoration table could have carried the root
+                // allowlist; deny image roots even when the failing leaf was
+                // geometric.
+                "decoration" => self.background_image_roots = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// A whole external layer vanished, so every security-sensitive element it
+    /// might have restricted is denied for this launch.
+    fn deny_all_sensitive(&mut self) {
+        self.plugins = true;
+        self.history = true;
+        self.mouse_buttons = true;
+        self.background_image_roots = true;
+    }
+
+    /// Whether any element is denied.
+    fn is_empty(&self) -> bool {
+        !(self.plugins || self.history || self.mouse_buttons || self.background_image_roots)
+    }
+
+    /// Applies the most restrictive value for every denied element.
+    ///
+    /// Runs after the normal merge and before validation/installation, so a
+    /// lower layer can never re-enable the element for this launch.
+    fn apply(&self, effective: &mut bitty_config::EffectiveConfig) {
+        if self.plugins {
+            // Deny-all: no configured plugin is enabled or activated, so no
+            // plugin can request a grant through this launch's config.
+            effective.plugins.clear();
+        }
+        if self.history {
+            effective.history.capture.transcript = false;
+            effective.history.capture.commands = false;
+        }
+        if self.mouse_buttons {
+            effective.mouse.right = bitty_config::MouseButtonBinding::None;
+            effective.mouse.middle = bitty_config::MouseButtonBinding::None;
+        }
+        if self.background_image_roots {
+            // No approved root: the decoration loader keeps its
+            // deny-by-default posture even if a lower layer granted one.
+            effective.decoration.background_image_roots = None;
+        }
+    }
+
+    /// One bounded diagnostic naming the denied surfaces.
+    fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.plugins {
+            parts.push("plugins disabled");
+        }
+        if self.history {
+            parts.push("history capture off");
+        }
+        if self.mouse_buttons {
+            parts.push("mouse buttons none");
+        }
+        if self.background_image_roots {
+            parts.push("background-image roots empty");
+        }
+        Some(format!(
+            "bitty: warning: configuration salvage disabled security-sensitive settings for this launch: {}; lower layers cannot re-enable them",
+            parts.join(", ")
+        ))
+    }
+}
+
 /// A config-load failure plus whether the first-start fallback may absorb it.
 ///
 /// Only a *present* user config file or profile that cannot be loaded or merged
@@ -339,6 +442,7 @@ fn resolve_merged_config(args: &Args) -> Result<LoadedConfig, LoadFailure> {
 fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig, LoadFailure> {
     let startup = mode == LoadMode::Startup;
     let mut diagnostics = StartupDiagnostics::default();
+    let mut deny = SafeDeny::default();
     // CTX-0346 `--safe` (R-009/P0-AC-019, spec rule 5): select the built-in
     // safe effective config and do not read any external layer. User files,
     // `BITTY_CONFIG`, profiles, and CLI appearance overrides are ignored —
@@ -385,12 +489,14 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                 match bitty_config::file::load_user_layer_salvaging(&probe.path) {
                     Ok(salvaged) => {
                         diagnostics.extend_salvage(&salvaged.layer.source, &salvaged.diagnostics);
+                        deny.record_salvage(&salvaged.diagnostics);
                         used_path = Some(probe.path.clone());
                         file_layer = Some(salvaged.layer);
                         file_loaded = true;
                     }
                     Err(err) => {
                         diagnostics.push_layer("config file", &probe.path, &err);
+                        deny.deny_all_sensitive();
                     }
                 }
             } else {
@@ -454,16 +560,20 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
         .map(|parent| parent.join(bitty_config::file::PROFILES_DIR_NAME));
     let mut profile_layers: Vec<bitty_config::LayeredPlan> = Vec::new();
     let mut profile_path: Option<std::path::PathBuf> = None;
+    // Reported profile identity: cleared when startup drops the profile, so
+    // the app reports the actual source instead of claiming a layer that did
+    // not participate (CTX-1490 review finding 3).
+    let mut profile_name = profile_request.clone();
     if let Some(requested) = profile_request.clone() {
-        let resolved = if profile_from_selector {
+        let resolved_path = if profile_from_selector {
             match &selector_profile_dir {
                 Some(dir) => Ok(dir.join(format!("{requested}.lua"))),
                 None => bitty_config::file::profile_file_path(&requested),
             }
         } else {
             bitty_config::file::profile_file_path(&requested)
-        }
-        .map_err(|err| {
+        };
+        let invalid_selection = |err: &bitty_config::ConfigError| -> LoadFailure {
             if profile_from_cli {
                 LoadFailure::fatal(format!("bitty: invalid --profile '{requested}': {err}"))
             } else if profile_from_selector {
@@ -473,64 +583,108 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
             } else {
                 LoadFailure::fatal(format!("bitty: invalid BITTY_PROFILE '{requested}': {err}"))
             }
-        })?;
-        if !resolved.exists() {
+        };
+        let missing_selection = |path: &std::path::Path| -> LoadFailure {
             if profile_from_cli {
-                return Err(LoadFailure::fatal(format!(
+                LoadFailure::fatal(format!(
                     "bitty: --profile '{requested}' not found ('{}')",
-                    resolved.display()
-                )));
-            }
-            if profile_from_selector {
-                return Err(LoadFailure::fatal(format!(
+                    path.display()
+                ))
+            } else if profile_from_selector {
+                LoadFailure::fatal(format!(
                     "bitty: selected profile '{requested}' not found ('{}')",
-                    resolved.display()
-                )));
+                    path.display()
+                ))
+            } else {
+                LoadFailure::fatal(format!(
+                    "bitty: BITTY_PROFILE '{requested}' not found ('{}')",
+                    path.display()
+                ))
             }
-            return Err(LoadFailure::fatal(format!(
-                "bitty: BITTY_PROFILE '{requested}' not found ('{}')",
-                resolved.display()
-            )));
-        }
-        // CTX-0759 (#1366): resolve the single-parent `extends` chain
-        // (base-first `Profile` layers); the child overrides the base per
-        // field. CTX-1490: startup salvages each profile link and, when the
-        // chain itself is unusable (cycle, missing parent, invalid name,
-        // syntax/undeclared keys), drops the profile layer with a diagnostic
-        // instead of aborting. Strict diagnostic commands keep the exact
-        // error.
-        if startup {
-            let chain = match (&selector_profile_dir, profile_from_selector) {
-                (Some(dir), true) => {
-                    bitty_config::file::load_profile_chain_in_dir_salvaging(&requested, dir)
+        };
+        let resolved = match resolved_path {
+            Ok(path) => Some(path),
+            Err(err) => {
+                if startup && profile_from_selector {
+                    // A persisted selector is external configuration too: a
+                    // renamed/removed profile must not block startup. The
+                    // selector is not rewritten; the next launch retries.
+                    diagnostics.push(format!(
+                        "bitty: warning: ignoring persisted profile selector '{requested}': {err}; ignored; using defaults and remaining layers"
+                    ));
+                    profile_name = None;
+                    deny.deny_all_sensitive();
+                    None
+                } else {
+                    return Err(invalid_selection(&err));
                 }
-                _ => bitty_config::file::load_profile_chain_salvaging(&requested),
-            };
-            match chain {
-                Ok(links) => {
-                    profile_path = Some(resolved.clone());
-                    for link in links {
-                        diagnostics.extend_salvage(&link.layer.source, &link.diagnostics);
-                        profile_layers.push(link.layer);
+            }
+        };
+        let resolved = match resolved {
+            Some(path) if path.exists() => Some(path),
+            Some(path) => {
+                if startup && profile_from_selector {
+                    diagnostics.push(format!(
+                        "bitty: warning: ignoring persisted profile selector '{requested}': not found ('{}'); ignored; using defaults and remaining layers",
+                        path.display()
+                    ));
+                    profile_name = None;
+                    deny.deny_all_sensitive();
+                    None
+                } else {
+                    return Err(missing_selection(&path));
+                }
+            }
+            None => None,
+        };
+        if let Some(resolved) = resolved {
+            // CTX-0759 (#1366): resolve the single-parent `extends` chain
+            // (base-first `Profile` layers); the child overrides the base per
+            // field. CTX-1490: startup salvages each profile link and, when
+            // the chain itself is unusable (cycle, missing parent, invalid
+            // name, syntax/undeclared keys), drops the profile layer with a
+            // diagnostic instead of aborting. Strict diagnostic commands keep
+            // the exact error.
+            if startup {
+                let chain = match (&selector_profile_dir, profile_from_selector) {
+                    (Some(dir), true) => {
+                        bitty_config::file::load_profile_chain_in_dir_salvaging(&requested, dir)
+                    }
+                    _ => bitty_config::file::load_profile_chain_salvaging(&requested),
+                };
+                match chain {
+                    Ok(links) => {
+                        profile_path = Some(resolved.clone());
+                        for link in links {
+                            diagnostics.extend_salvage(&link.layer.source, &link.diagnostics);
+                            deny.record_salvage(&link.diagnostics);
+                            profile_layers.push(link.layer);
+                        }
+                    }
+                    Err(err) => {
+                        diagnostics.push_layer("profile file", &resolved, &err);
+                        deny.deny_all_sensitive();
+                        profile_name = None;
                     }
                 }
-                Err(err) => diagnostics.push_layer("profile file", &resolved, &err),
-            }
-        } else {
-            let chain = match (&selector_profile_dir, profile_from_selector) {
-                (Some(dir), true) => bitty_config::file::load_profile_chain_in_dir(&requested, dir),
-                _ => bitty_config::file::load_profile_chain(&requested),
-            };
-            match chain {
-                Ok(layers) => {
-                    profile_path = Some(resolved.clone());
-                    profile_layers = layers;
-                }
-                Err(err) => {
-                    return Err(LoadFailure::recoverable(format!(
-                        "bitty: invalid profile file '{}': {err}",
-                        resolved.display()
-                    )));
+            } else {
+                let chain = match (&selector_profile_dir, profile_from_selector) {
+                    (Some(dir), true) => {
+                        bitty_config::file::load_profile_chain_in_dir(&requested, dir)
+                    }
+                    _ => bitty_config::file::load_profile_chain(&requested),
+                };
+                match chain {
+                    Ok(layers) => {
+                        profile_path = Some(resolved.clone());
+                        profile_layers = layers;
+                    }
+                    Err(err) => {
+                        return Err(LoadFailure::recoverable(format!(
+                            "bitty: invalid profile file '{}': {err}",
+                            resolved.display()
+                        )));
+                    }
                 }
             }
         }
@@ -592,6 +746,8 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                             .unwrap_or_default()
                     ));
                     profile_path = None;
+                    profile_name = None;
+                    deny.deny_all_sensitive();
                     recovered
                 } else if file_layer.is_some() {
                     let recovered = bitty_config::file::resolve_effective_with_profiles(
@@ -612,8 +768,10 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                             .unwrap_or_else(|| String::from("(unknown)"))
                     ));
                     file_loaded = false;
+                    deny.deny_all_sensitive();
                     recovered
                 } else {
+                    deny.deny_all_sensitive();
                     return Err(LoadFailure::recoverable(format!(
                         "bitty: invalid configuration: {err}; ignored; using defaults"
                     )));
@@ -634,8 +792,10 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         .unwrap_or_else(|| String::from("(unknown)"))
                 ));
                 file_loaded = false;
+                deny.deny_all_sensitive();
                 recovered
             } else {
+                deny.deny_all_sensitive();
                 return Err(LoadFailure::recoverable(format!(
                     "bitty: invalid configuration: {err}; ignored; using defaults"
                 )));
@@ -654,6 +814,18 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
             ));
         }
     };
+    // CTX-1490 review finding 1: a salvaged/dropped security-sensitive element
+    // must never resurrect a more-permissive lower-layer value. Apply the
+    // deny overlay after the normal merge and before validation/installation.
+    if startup {
+        deny.apply(&mut merged.effective);
+        if let Some(summary) = deny.summary() {
+            diagnostics.push(summary);
+        }
+        merged.effective.validate().map_err(|err| {
+            LoadFailure::fatal(format!("bitty: invalid built-in deny overlay: {err}"))
+        })?;
+    }
     // CTX-2464 (OQ-047): a `local:<name>` selection is resolved here, on the
     // one load path shared by startup, `config check`, doctor, and reload.
     // The built-in path performs no filesystem access. A missing, malformed,
@@ -674,7 +846,7 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
     Ok(LoadedConfig {
         merged,
         probed,
-        profile_name: profile_request,
+        profile_name,
         profile_path,
         file_loaded,
         diagnostics,
@@ -2694,7 +2866,13 @@ mod startup_tests {
 
         let (app, diagnostics) =
             resolve_app_config_in(&args, LoadMode::Startup).expect("startup must continue");
-        assert_eq!(app.effective, EffectiveConfig::default());
+        // CTX-1490 review finding 1: a whole-layer drop denies every
+        // security-sensitive element for this launch; everything else stays
+        // at the built-in defaults.
+        let mut expected = EffectiveConfig::default();
+        expected.mouse.middle = bitty_config::MouseButtonBinding::None;
+        expected.mouse.right = bitty_config::MouseButtonBinding::None;
+        assert_eq!(app.effective, expected);
         assert!(
             app.file_path.is_none(),
             "a dropped file is not reported loaded"
@@ -2705,6 +2883,10 @@ mod startup_tests {
         assert!(
             rendered.contains("ignored; using defaults and remaining layers"),
             "{rendered}"
+        );
+        assert!(
+            rendered.contains("history capture off"),
+            "a whole-layer drop denies all sensitive elements: {rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2767,6 +2949,272 @@ mod startup_tests {
         assert_eq!(app.effective.font.family, "Mono");
         let rendered = diagnostics.render().expect("diagnostic expected");
         assert!(rendered.contains("decoration"), "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a profile-backed scratch config beside an explicit `--config`
+    /// root and returns `(dir, args)`; the persisted selector resolves
+    /// profiles under `<dir>/profiles`, so these tests stay environment-free.
+    fn selector_args(tag: &str, init: &str, profile: Option<&str>) -> (std::path::PathBuf, Args) {
+        let dir = scratch_dir(tag);
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles dir");
+        std::fs::write(dir.join("init.lua"), init).expect("write init.lua");
+        if let Some(body) = profile {
+            std::fs::write(dir.join("profiles").join("work.lua"), body).expect("write profile");
+        }
+        let mut args = Args::new();
+        args.config_path = Some(dir.join("init.lua").to_string_lossy().into_owned());
+        (dir, args)
+    }
+
+    #[test]
+    fn safe_deny_applies_most_restrictive_values() {
+        // CTX-1490 review finding 1: the overlay forces the most restrictive
+        // value for every denied element.
+        let mut effective = EffectiveConfig {
+            plugins: vec![bitty_config::types::PluginSpec {
+                id: String::from("owner/name"),
+                enabled: true,
+            }],
+            history: bitty_config::types::HistoryConfig {
+                capture: bitty_config::types::HistoryCaptureConfig {
+                    transcript: true,
+                    commands: true,
+                },
+            },
+            mouse: bitty_config::types::MouseConfig {
+                middle: bitty_config::MouseButtonBinding::Action(
+                    bitty_config::ChromeAction::PasteFromPrimary,
+                ),
+                right: bitty_config::MouseButtonBinding::Action(
+                    bitty_config::ChromeAction::PasteFromPrimary,
+                ),
+                ..Default::default()
+            },
+            decoration: bitty_config::types::DecorationConfig {
+                background_image_roots: Some(vec![String::from("/approved-root")]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let deny = SafeDeny {
+            plugins: true,
+            history: true,
+            mouse_buttons: true,
+            background_image_roots: true,
+        };
+        deny.apply(&mut effective);
+
+        assert!(effective.plugins.is_empty(), "plugins are deny-all");
+        assert!(!effective.history.capture.transcript);
+        assert!(!effective.history.capture.commands);
+        assert_eq!(
+            effective.mouse.middle,
+            bitty_config::MouseButtonBinding::None
+        );
+        assert_eq!(
+            effective.mouse.right,
+            bitty_config::MouseButtonBinding::None
+        );
+        assert_eq!(effective.decoration.background_image_roots, None);
+        effective.validate().expect("deny overlay stays valid");
+        let summary = deny.summary().expect("summary");
+        for part in [
+            "plugins disabled",
+            "history capture off",
+            "mouse buttons none",
+            "background-image roots empty",
+        ] {
+            assert!(summary.contains(part), "{summary}");
+        }
+    }
+
+    #[test]
+    fn safe_deny_denies_all_sensitive_after_a_whole_layer_drop() {
+        // A vanished layer might have restricted any sensitive element, so the
+        // whole-layer path denies all of them (including history capture,
+        // which has no table-level salvage).
+        let mut deny = SafeDeny::default();
+        assert!(deny.is_empty());
+        deny.deny_all_sensitive();
+        assert!(!deny.is_empty());
+        let summary = deny.summary().expect("summary");
+        assert!(summary.contains("history capture off"), "{summary}");
+        assert!(
+            summary.contains("lower layers cannot re-enable them"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn safe_deny_records_only_salvaged_security_elements() {
+        let source =
+            bitty_config::ConfigSource::new(bitty_config::LayerKind::User, Some("init.lua"));
+        let diagnostic = |field: &str| bitty_config::file::SalvageDiagnostic {
+            source: source.clone(),
+            field: field.to_string(),
+            message: String::from("validation error"),
+        };
+        let mut deny = SafeDeny::default();
+        deny.record_salvage(&[
+            diagnostic("plugins"),
+            diagnostic("history"),
+            diagnostic("mouse"),
+            diagnostic("decoration"),
+            diagnostic("font"),
+            diagnostic("window"),
+            diagnostic("appearance.theme"),
+        ]);
+        assert!(deny.plugins);
+        assert!(deny.history);
+        assert!(deny.mouse_buttons);
+        assert!(deny.background_image_roots);
+    }
+
+    #[test]
+    fn startup_denies_plugins_instead_of_resurrecting_profile() {
+        // CTX-1490 review finding 1 probe: a salvaged `plugins` table in the
+        // user file must not let the profile re-enable plugins.
+        let (dir, args) = selector_args(
+            "deny-plugins",
+            concat!(
+                "return { format = \"bitty-profile-v1\", profile = \"work\",",
+                " plugins = { { id = \"\", enabled = true } },",
+                " font = { family = \"Mono\", size = 13.0 } }"
+            ),
+            Some("return { plugins = { { id = \"owner/name\", enabled = true } } }"),
+        );
+        let (app, diagnostics) =
+            resolve_app_config_in(&args, LoadMode::Startup).expect("startup salvages plugins");
+        assert!(
+            app.effective.plugins.is_empty(),
+            "the profile must not resurrect an enable list: {:?}",
+            app.effective.plugins
+        );
+        assert_eq!(app.effective.font.family, "Mono", "valid siblings stay");
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(rendered.contains("ignoring 'plugins'"), "{rendered}");
+        assert!(rendered.contains("plugins disabled"), "{rendered}");
+        assert!(
+            resolve_app_config(&args).is_err(),
+            "strict path stays strict"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_denies_mouse_buttons_instead_of_resurrecting_profile() {
+        let (dir, args) = selector_args(
+            "deny-mouse",
+            concat!(
+                "return { format = \"bitty-profile-v1\", profile = \"work\",",
+                " mouse = { middle = \"none\", focus_follows_mouse_delay_ms = 100000 },",
+                " font = { family = \"Mono\", size = 13.0 } }"
+            ),
+            Some("return { mouse = { middle = \"paste_from_primary\" } }"),
+        );
+        let (app, diagnostics) =
+            resolve_app_config_in(&args, LoadMode::Startup).expect("startup salvages mouse");
+        assert_eq!(
+            app.effective.mouse.middle,
+            bitty_config::MouseButtonBinding::None,
+            "the profile paste binding must not be resurrected"
+        );
+        assert_eq!(
+            app.effective.mouse.right,
+            bitty_config::MouseButtonBinding::None
+        );
+        assert_eq!(app.effective.font.family, "Mono");
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(rendered.contains("mouse buttons none"), "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_denies_background_roots_instead_of_resurrecting_profile() {
+        let (dir, args) = selector_args(
+            "deny-roots",
+            concat!(
+                "return { format = \"bitty-profile-v1\", profile = \"work\",",
+                " decoration = { gaps_in = 1, background_image_roots = { \"relative/one\" } },",
+                " font = { family = \"Mono\", size = 13.0 } }"
+            ),
+            Some(
+                "return { decoration = { gaps_in = 2, background_image_roots = { \"/approved-root\" } } }",
+            ),
+        );
+        let (app, diagnostics) =
+            resolve_app_config_in(&args, LoadMode::Startup).expect("startup salvages decoration");
+        assert_eq!(
+            app.effective.decoration.background_image_roots, None,
+            "the profile root grant must not be resurrected"
+        );
+        assert_eq!(
+            app.effective.decoration.gaps_in, 2,
+            "unrelated profile decoration stays effective"
+        );
+        assert_eq!(app.effective.font.family, "Mono");
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(
+            rendered.contains("background-image roots empty"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_ignored_profile_is_not_reported_active() {
+        // CTX-1490 review finding 3: a dropped profile leaves
+        // `profile_name/profile_path` empty instead of claiming it loaded.
+        let (dir, args) = selector_args(
+            "profile-report",
+            "return { format = \"bitty-profile-v1\", profile = \"work\", font = { family = \"Mono\", size = 12.0 } }",
+            Some("return { font = }"),
+        );
+        let (app, diagnostics) =
+            resolve_app_config_in(&args, LoadMode::Startup).expect("startup drops the profile");
+        assert!(app.profile_name.is_none(), "{:?}", app.profile_name);
+        assert!(app.profile_path.is_none(), "{:?}", app.profile_path);
+        assert_eq!(app.effective.font.family, "Mono", "user file stays");
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(
+            rendered.contains("ignoring invalid profile file"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("history capture off"),
+            "a whole profile drop denies all sensitive elements: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_ignores_a_missing_persisted_selector() {
+        // CTX-1490 review finding 5: a persisted selector that no longer
+        // resolves is external config, so startup ignores it; explicit
+        // `--profile`/`BITTY_PROFILE` selection stays fatal elsewhere.
+        let (dir, args) = selector_args(
+            "persisted-missing",
+            "return { format = \"bitty-profile-v1\", profile = \"work\", font = { family = \"Mono\", size = 12.0 } }",
+            None,
+        );
+        let (app, diagnostics) = resolve_app_config_in(&args, LoadMode::Startup)
+            .expect("startup ignores a missing persisted selector");
+        assert!(app.profile_name.is_none());
+        assert!(app.profile_path.is_none());
+        assert_eq!(app.effective.font.family, "Mono");
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(
+            rendered.contains("ignoring persisted profile selector 'work'"),
+            "{rendered}"
+        );
+
+        let strict = resolve_app_config(&args)
+            .err()
+            .expect("strict diagnostics keep the selector failure");
+        assert!(!strict.fallback_allowed, "{}", strict.message);
+        assert!(strict.message.contains("not found"), "{}", strict.message);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

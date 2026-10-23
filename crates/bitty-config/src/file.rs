@@ -1435,9 +1435,15 @@ fn salvageable_element(err: &ConfigError) -> Option<(&'static str, &'static str)
     if field.starts_with("appearance.style") {
         return Some(("appearance_style", "appearance.style"));
     }
+    // The theme is an independent scalar (and the legacy `theme` alias):
+    // dropping it must not discard valid animations, colors, or style from
+    // the same layer (CTX-1490 review finding 2).
+    if field == "theme" || field.starts_with("appearance.theme") {
+        return Some(("appearance_theme", "appearance.theme"));
+    }
     let head = field.split(['.', '[']).next().unwrap_or(field);
     Some(match head {
-        "appearance" | "theme" => ("appearance", "appearance"),
+        "appearance" => ("appearance", "appearance"),
         "font" => ("font", "font"),
         "window" => ("window", "window"),
         "terminal" => ("terminal", "terminal"),
@@ -1486,6 +1492,11 @@ fn drop_element(data: &mut ConfigData, element: &str) -> bool {
         "animations" => data.animations.take().is_some(),
         "appearance_colors" => data.appearance_colors.take().is_some(),
         "appearance_style" => data.appearance_style.take().is_some(),
+        "appearance_theme" => {
+            let mut dropped = data.appearance_theme.take().is_some();
+            dropped |= data.theme.take().is_some();
+            dropped
+        }
         "font" => data.font.take().is_some(),
         "window" => data.window.take().is_some(),
         "terminal" => data.terminal.take().is_some(),
@@ -4713,6 +4724,32 @@ mod tests {
                 "must stay a whole-layer failure: {content}"
             );
         }
+    }
+
+    #[test]
+    fn lua_salvage_drops_only_the_invalid_theme_not_the_whole_appearance_table() {
+        // CTX-1490 review finding 2: an invalid `appearance.theme` salvages
+        // the theme scalar only; valid animations and style survive.
+        let content = concat!(
+            "return { appearance = {",
+            " theme = \"not-a-real-theme\",",
+            " animations = { enabled = false, duration_ms = { open = 10 } },",
+            " style = { glow_width = 4 } } }"
+        );
+        let salvaged =
+            parse_lua_config_salvaging(content, &test_source()).expect("salvage must succeed");
+        assert_eq!(salvaged.diagnostics.len(), 1);
+        assert_eq!(salvaged.diagnostics[0].field, "appearance.theme");
+        let appearance = salvaged.plan.appearance.expect("appearance kept");
+        assert!(appearance.theme.is_none(), "the theme scalar is dropped");
+        assert_eq!(
+            appearance.style.expect("style kept").glow_width,
+            Some(4),
+            "valid style must survive the theme salvage"
+        );
+        let animations = appearance.animations.expect("animations kept");
+        assert_eq!(animations.enabled, Some(false));
+        assert_eq!(animations.duration_open, Some(10));
     }
 
     #[test]

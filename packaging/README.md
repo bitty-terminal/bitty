@@ -17,6 +17,7 @@ and is labeled as such below.
 | --------- | -------------------------------------------------------- | ---------------------------------------------------------- |
 | deb       | `nfpm.yaml` + `deb` packager                             | Ubuntu 24.04 (verified); Debian 12 best-effort             |
 | rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort         |
+| rpm (OBS) | `packaging/opensuse/bitty.spec` + `_service`             | openSUSE Tumbleweed and Leap 15.6 best-effort (zypper)     |
 | apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`) |
 | archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated            |
 | apk (aports) | `packaging/alpine/APKBUILD`                     | In-tree aports recipe, not published to aports; best-effort |
@@ -32,7 +33,7 @@ pushed. `bash scripts/tests/check-distro-recipes.test.sh` (also
 `just distro-recipes-test`, run by the CI packaging step) keeps the recipes
 internally consistent and version-agnostic.
 
-Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
+Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE consumes RPMs two ways: the release `nfpm` RPM passes `rpm -qip` and a local `zypper install` check, and `packaging/opensuse/bitty.spec` is the OBS source recipe that publishes a zypper repository (see `packaging/opensuse/README.md` and `packaging/opensuse.md`). No release `verify-install` leg covers OpenSUSE, so both stay best-effort, not supported. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
 
 ## Install smoke
 

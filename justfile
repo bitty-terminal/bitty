@@ -423,6 +423,8 @@ install-smoke distro package:
 workflow-publish-test:
     ./scripts/tests/workflow-publish.test.sh
 
+# Distro recipe gate: openSUSE spec + OBS source service (#2514); sibling
+# Alpine/Gentoo/Void sections append their own independent blocks.
 distro-recipes-test:
     ./scripts/tests/check-distro-recipes.test.sh
 

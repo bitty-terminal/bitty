@@ -84,8 +84,10 @@ What each script installs:
 - **Void Linux**: `xbps-src` template (in-tree draft, not in void-packages:
   best-effort) in `packaging/void/srcpkgs/bitty/template`; see
   `packaging/void.md`.
-- **openSUSE**: best-effort, not supported (no release `verify-install`
-  leg); see `packaging/opensuse.md`.
+- **openSUSE (zypper)**: best-effort, not supported (no release
+  `verify-install` leg); `zypper addrepo` + `zypper install bitty` from the OBS
+  repository, source recipe in `packaging/opensuse/bitty.spec`; see
+  `packaging/opensuse.md`.
 
 ## Prebuilt binaries (manual download)
 

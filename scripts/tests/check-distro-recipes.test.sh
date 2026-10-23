@@ -5,14 +5,17 @@
 #   - Alpine Linux (aports APKBUILD)
 #   - Gentoo Linux (live ebuild + prebuilt binary ebuild + overlay config)
 #   - Void Linux (xbps-src template)
+#   - openSUSE (OBS spec + source service)
 #
 # Version-agnostic on purpose: recipe versions are derived from the files
 # themselves (globbed ebuild names, pkgver/version fields) and cross-checked
 # against the workspace version in Cargo.toml, so a release bump does not
 # require editing this gate. Patterns are anchored so a renamed package,
-# recipe, or subpackage fails instead of sliding past a prefix match.
+# recipe, or subpackage fails instead of sliding past a prefix match. The
+# openSUSE checks compare the spec's Version against the source-service
+# revision and its Rust requirement against the workspace MSRV.
 #
-# Part of CTX-1471 (#2513, #2516, #2517).
+# Part of CTX-1471 (#2513, #2516, #2517) and CTX-1474 (#2514).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -347,6 +350,205 @@ if grep -q 'packaging/gentoo.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   pass "INSTALL.md references all three distro packaging guides"
 else
   fail "INSTALL.md missing references to distro recipes"
+fi
+
+# --- openSUSE: spec required fields -----------------------------------------
+OPENSPEC="$REPO_ROOT/packaging/opensuse/bitty.spec"
+OBS_SERVICE="$REPO_ROOT/packaging/opensuse/_service"
+
+if [[ -f "$OPENSPEC" ]]; then
+  for field in Name Version Release Summary License Group URL Source0; do
+    if grep -qE "^${field}:[[:space:]]+[^[:space:]]+" "$OPENSPEC"; then
+      pass "openSUSE spec has $field"
+    else
+      fail "openSUSE spec missing $field"
+    fi
+  done
+
+  if grep -qE '^License:[[:space:]]+MIT OR Apache-2\.0' "$OPENSPEC"; then
+    pass "openSUSE spec license matches the project (MIT OR Apache-2.0)"
+  else
+    fail "openSUSE spec license is not 'MIT OR Apache-2.0'"
+  fi
+
+  # The release tarball pattern: the tag archive of the packaged Version.
+  if grep -qE '^Source0:.*(v%\{version\}|%\{version\}).*\.tar\.(gz|xz|zst)' "$OPENSPEC"; then
+    pass "openSUSE spec Source0 points at the release tarball"
+  else
+    fail "openSUSE spec Source0 is not a versioned release tarball"
+  fi
+
+  # %build / %install / %files / %changelog must exist as sections.
+  for section in description prep build install files changelog; do
+    if grep -qE "^%${section}([[:space:]]|$)" "$OPENSPEC"; then
+      pass "openSUSE spec has %$section section"
+    else
+      fail "openSUSE spec missing %$section section"
+    fi
+  done
+
+  # Cargo invocation: source build of the binary crate, no prebuilt payload.
+  if grep -qE '^cargo build --release (--locked )?-p bitty-terminal --bin bitty$' "$OPENSPEC"; then
+    pass "openSUSE spec builds the binary with cargo"
+  else
+    fail "openSUSE spec missing 'cargo build --release -p bitty-terminal --bin bitty'"
+  fi
+
+  # Terminfo is compiled, never installed as the raw source file.
+  if grep -qE '^tic -x -o %\{buildroot\}' "$OPENSPEC"; then
+    pass "openSUSE spec compiles terminfo with tic -x"
+  else
+    fail "openSUSE spec missing compiled terminfo install (tic -x)"
+  fi
+
+  # BuildRequires: cargo plus the font stack devel packages and the MSRV.
+  for br in cargo fontconfig-devel freetype2-devel zlib-devel; do
+    if grep -qE "^BuildRequires:[[:space:]]+${br}([[:space:]]|\$)" "$OPENSPEC"; then
+      pass "openSUSE spec BuildRequires $br"
+    else
+      fail "openSUSE spec missing BuildRequires $br"
+    fi
+  done
+
+  MSRV="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$REPO_ROOT/Cargo.toml" | head -n1)"
+  SPEC_RUST="$(sed -n 's/^BuildRequires:[[:space:]]*rust[[:space:]]*>=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$OPENSPEC" | head -n1)"
+  if [[ -n "$MSRV" && "$SPEC_RUST" == "$MSRV" ]]; then
+    pass "openSUSE spec BuildRequires rust >= $MSRV matches the workspace MSRV"
+  else
+    fail "openSUSE spec rust requirement '${SPEC_RUST:-missing}' does not match workspace MSRV '${MSRV:-missing}'"
+  fi
+
+  # --- openSUSE: %files assets exist in-tree --------------------------------
+  # The spec ships no prebuilt payload, so every share/ path it lists must
+  # resolve to a checked-in asset (icons, .desktop, metainfo). Paths the build
+  # produces itself (binary, compiled terminfo) and doc paths are skipped.
+  if python3 - "$OPENSPEC" "$REPO_ROOT" <<'PY'; then
+# Trusted in-tree input: this parses a file from the repository checkout and
+# never fetches or interpolates external XML, so stdlib ElementTree is fine
+# here (no external entity or DTD processing is enabled).
+import glob
+import os
+import sys
+
+spec, root = sys.argv[1], sys.argv[2]
+macros = {"%{_datadir}": "usr/share", "%{_bindir}": "usr/bin"}
+generated = ("usr/bin/", "usr/share/terminfo/", "usr/share/licenses/", "usr/share/doc/")
+
+entries = []
+in_files = False
+directives = (
+    "%license",
+    "%doc",
+    "%dir",
+    "%attr",
+    "%defattr",
+    "%config",
+    "%exclude",
+    "%ghost",
+    "%lang",
+    "%verify",
+)
+with open(spec, encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if line.startswith("%files"):
+            in_files = True
+            continue
+        if in_files and line.startswith("%changelog"):
+            break
+        if not in_files or not line or line.startswith("#"):
+            continue
+        # Directive lines (%license, %doc, %attr, ...) carry source-tree-relative
+        # names, not installed paths, so they are not asset-mapped here. Only
+        # plain path lines are: those start with a path macro, not a directive.
+        if line.startswith(directives):
+            continue
+        entries.extend(line.split())
+
+missing = []
+for entry in entries:
+    path = entry
+    for macro, value in macros.items():
+        path = path.replace(macro, value)
+    if "%{" in path:
+        continue
+    if path.startswith(generated):
+        continue
+    rel = path[len("usr/share/"):] if path.startswith("usr/share/") else path
+    basename = os.path.basename(rel)
+    candidates = [
+        os.path.join(root, "packaging", rel),
+        os.path.join(root, "packaging", basename),
+        os.path.join(root, "terminfo", basename),
+    ]
+    if any(os.path.exists(c) for c in candidates):
+        continue
+    if any(glob.glob(c) for c in candidates):
+        continue
+    missing.append(entry)
+
+for entry in missing:
+    print(f"    %files asset not in tree: {entry}", file=sys.stderr)
+sys.exit(1 if missing else 0)
+PY
+    pass "openSUSE spec %files assets all exist in-tree"
+  else
+    fail "openSUSE spec %files references assets that do not exist in-tree"
+  fi
+else
+  fail "openSUSE spec not found at $OPENSPEC"
+fi
+
+# --- openSUSE: OBS source service is well-formed XML ------------------------
+if [[ -f "$OBS_SERVICE" ]]; then
+  if python3 - "$OBS_SERVICE" <<'PY'; then
+# Trusted in-tree input (see the note above): parse only, no entity expansion.
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+assert root.tag == "services", f"root element is <{root.tag}>, expected <services>"
+services = root.findall("service")
+assert services, "no <service> elements"
+for service in services:
+    name = service.get("name")
+    assert name, "a <service> element has no name"
+    assert service.get("mode") == "disabled", f"service {name} is not mode=\"disabled\""
+    for param in service.findall("param"):
+        assert param.get("name"), f"service {name} has a <param> without a name"
+        assert (param.text or "").strip(), f"service {name} param {param.get('name')} is empty"
+PY
+    pass "openSUSE _service parses as XML and declares only disabled services"
+  else
+    fail "openSUSE _service is not valid XML or not in disabled mode"
+  fi
+
+  # The service revision and the spec Version must name the same release.
+  SPEC_VERSION="$(sed -n 's/^Version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$OPENSPEC" 2>/dev/null | head -n1)"
+  SERVICE_VERSION="$(sed -n 's/.*<param name="revision">v\([^<]*\)<\/param>.*/\1/p' "$OBS_SERVICE" | head -n1)"
+  if [[ -n "$SPEC_VERSION" && "$SPEC_VERSION" == "$SERVICE_VERSION" ]]; then
+    pass "openSUSE _service revision matches spec Version $SPEC_VERSION"
+  else
+    fail "openSUSE _service revision '${SERVICE_VERSION:-missing}' does not match spec Version '${SPEC_VERSION:-missing}'"
+  fi
+else
+  fail "openSUSE _service not found at $OBS_SERVICE"
+fi
+
+# --- openSUSE: documentation coverage ---------------------------------------
+for doc in packaging/opensuse.md packaging/opensuse/README.md; do
+  if [[ -f "$REPO_ROOT/$doc" ]]; then
+    pass "Documentation exists: $doc"
+  else
+    fail "Documentation missing: $doc"
+  fi
+done
+
+if grep -q 'packaging/opensuse.md' "$REPO_ROOT/packaging/INSTALL.md" &&
+  grep -q 'packaging/opensuse/bitty.spec' "$REPO_ROOT/packaging/README.md"; then
+  pass "INSTALL.md and packaging/README.md reference the openSUSE recipe"
+else
+  fail "INSTALL.md or packaging/README.md does not reference the openSUSE recipe"
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

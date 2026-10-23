@@ -6,10 +6,12 @@
 
 use bitty_platform::PhysicalSize;
 use bitty_runtime::Runtime;
-use bitty_ui::{CellPos, Selection, ViewId};
+use bitty_ui::{CellPos, ViewId};
 
 #[cfg(unix)]
 use bitty_runtime::{LayoutNode, SplitAxis, View};
+#[cfg(unix)]
+use bitty_ui::Selection;
 
 #[test]
 fn runtime_handle_resize_actually_resizes_state_and_is_headless() {

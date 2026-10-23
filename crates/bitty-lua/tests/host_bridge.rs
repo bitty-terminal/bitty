@@ -765,6 +765,7 @@ fn slow_spawn_is_delivered_not_timed_out() {
 /// (check-then-act inside the budget).
 struct SlowStoreServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
+    events: RefCell<Vec<String>>,
 }
 
 impl HostServices for SlowStoreServices {
@@ -786,13 +787,18 @@ impl HostServices for SlowStoreServices {
         value: LuaValue,
         expiry: std::time::Instant,
     ) -> Result<(), BridgeError> {
+        self.events.borrow_mut().push(format!("entered:{key}"));
         if key == "k" {
             std::thread::sleep(Duration::from_millis(30));
         }
         if std::time::Instant::now() > expiry {
+            self.events
+                .borrow_mut()
+                .push(format!("precommit-refused:{key}"));
             return Err(BridgeError::timeout());
         }
         self.store.borrow_mut().insert(key.to_string(), value);
+        self.events.borrow_mut().push(format!("committed:{key}"));
         Ok(())
     }
 
@@ -818,6 +824,7 @@ fn post_deadline_effects_never_commit() {
     // typed timeout is still delivered via the fast `code` write.
     let services = Rc::new(SlowStoreServices {
         store: RefCell::new(BTreeMap::new()),
+        events: RefCell::new(Vec::new()),
     });
     let mut vm = gate_vm("pre-commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
@@ -844,6 +851,18 @@ fn post_deadline_effects_never_commit() {
         Some(&LuaValue::String("E_TIMEOUT".to_string())),
         "slow write must report typed timeout"
     );
+    let events: Vec<String> = services
+        .events
+        .borrow()
+        .iter()
+        .filter(|event| event.ends_with(":k"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        events,
+        ["entered:k", "precommit-refused:k"],
+        "the slow mutation must reach the service and refuse before commit"
+    );
     assert!(
         services.store.borrow().get("k").is_none(),
         "post-deadline write must never commit"
@@ -859,6 +878,7 @@ fn post_deadline_effects_never_commit() {
 /// effect landed.
 struct SlowCommitServices {
     store: RefCell<BTreeMap<String, LuaValue>>,
+    events: RefCell<Vec<String>>,
 }
 
 impl HostServices for SlowCommitServices {
@@ -880,10 +900,16 @@ impl HostServices for SlowCommitServices {
         value: LuaValue,
         expiry: std::time::Instant,
     ) -> Result<(), BridgeError> {
+        self.events.borrow_mut().push(format!("entered:{key}"));
         if std::time::Instant::now() > expiry {
+            self.events
+                .borrow_mut()
+                .push(format!("precommit-refused:{key}"));
             return Err(BridgeError::timeout());
         }
-        self.store_set(key, value)
+        self.store_set(key, value)?;
+        self.events.borrow_mut().push(format!("committed:{key}"));
+        Ok(())
     }
 
     fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
@@ -909,32 +935,78 @@ fn committed_mutation_is_not_reported_as_timeout() {
     // Mutating calls must deliver the committed result instead.
     let services = Rc::new(SlowCommitServices {
         store: RefCell::new(BTreeMap::new()),
+        events: RefCell::new(Vec::new()),
     });
     let mut vm = gate_vm("commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
-    let outcome = vm
+    let registration = vm
         .execute_bounded(
             r#"
-            local ok = pcall(bitty.store.set, "k", "v")
-            bitty.store.set("code", ok and "OK" or "ERR")
+            bitty.commands.register({
+                id = "commit_probe",
+                title = "commit probe",
+                run = function(key)
+                    local ok, err = pcall(bitty.store.set, key, "v")
+                    return {
+                        ok = ok,
+                        code = ok and "OK" or (type(err) == "table" and err.code or "UN_TYPED")
+                    }
+                end
+            })
         "#,
         )
-        .expect("execute");
-    assert!(
-        matches!(outcome, BoundedExecution::Completed),
-        "{outcome:?}"
+        .expect("register commit probe");
+    assert!(matches!(registration, BoundedExecution::Completed));
+    let run = vm
+        .take_registrations()
+        .commands
+        .into_iter()
+        .find(|command| command.id == "commit_probe")
+        .expect("commit probe registration")
+        .run;
+    // Warm the already-compiled callback at a normal host deadline, then
+    // tighten the live bridge cell to the requested 1 ms before the slow
+    // mutation. This removes compile/scheduling overhead from the diagnosis
+    // without changing the production deadline or the regression stimulus.
+    vm.set_host_call_deadline_ms(DEFAULT_HOST_DEADLINE_MS)
+        .expect("warm-up deadline");
+    let warmup = vm
+        .call_function(&run, &[LuaValue::String("warmup".to_string())])
+        .expect("warm-up commit probe");
+    assert_eq!(warmup.get("ok"), Some(&LuaValue::Bool(true)));
+    services.events.borrow_mut().clear();
+    vm.set_host_call_deadline_ms(1)
+        .expect("restore one-millisecond deadline");
+    let result = vm
+        .call_function(&run, &[LuaValue::String("k".to_string())])
+        .expect("run commit probe");
+    let events = services.events.borrow().clone();
+    let key_events: Vec<String> = events
+        .iter()
+        .filter(|event| event.ends_with(":k"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        key_events,
+        ["entered:k", "committed:k"],
+        "the successful pcall must have entered and committed the service mutation: {events:?}"
     );
     assert_eq!(
-        services.store.borrow().get("code"),
+        result.get("ok"),
+        Some(&LuaValue::Bool(true)),
+        "typed pcall result: {result:?}; service events: {events:?}"
+    );
+    assert_eq!(
+        result.get("code"),
         Some(&LuaValue::String("OK".to_string())),
-        "a committed slow write must not be reported as a timeout"
+        "a committed mutation must return a typed success result: {result:?}; service events: {events:?}"
     );
     assert_eq!(
         services.store.borrow().get("k"),
         Some(&LuaValue::String("v".to_string())),
-        "the committed value must be observable"
+        "the committed value must be observable; events: {events:?}"
     );
 }
 

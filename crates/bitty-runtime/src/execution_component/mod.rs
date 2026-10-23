@@ -3,7 +3,7 @@
 //! The execution supervisor is being split out of Core (`bitty-execution`):
 //! the linked `JobRegistry` stays the fallback for this release, while the
 //! same supervisor is also installable as a stdio coprocess named
-//! `execution` (`bitty-execution` executable, protocol v1). This module is
+//! `execution` (`bitty-execution` executable, protocol v2). This module is
 //! Core's client for that component:
 //!
 //! - Resolve the component through the shared two-tier install layout
@@ -14,7 +14,7 @@
 //!   in its own process group on Unix, as a stdio coprocess.
 //! - Complete the `Hello`/`HelloAck` handshake within a bounded deadline and
 //!   reject a different component, protocol, or version surface.
-//! - Speak the length-prefixed execution protocol v1: `Spawn`, `Terminate`,
+//! - Speak the length-prefixed execution protocol v2: `Spawn`, `Terminate`,
 //!   `ReadOutput`, `Shutdown`, and the `Spawned`/`Started`/`Output`/`Exit`/
 //!   `Canceled`/`OutputView`/`Error`/`ShutdownAck` replies. The codec itself
 //!   is the pinned extension's authoritative `component::protocol` module, so
@@ -58,13 +58,13 @@
 //!   linked registry unless a host injects [`ComponentGateConfig`]).
 //! - Removing the linked `bitty-execution` dependency (parity and rollout
 //!   follow).
-//! - Core exec confinement for admitted `[tools.*]` spawns: protocol v1 has
+//! - Core exec confinement for admitted `[tools.*]` spawns: protocol v2 has
 //!   no confinement field, so the bridge keeps those spawns on the linked
 //!   registry (`Preferred` falls back, `Required` refuses).
 //! - Windows Job Object containment for the component process itself; the
 //!   component is killed directly, and its own supervisor remains responsible
 //!   for its job trees.
-//! - PTY/interactive jobs: protocol v1 reserves those codes and the component
+//! - PTY/interactive jobs: protocol v2 reserves those codes and the component
 //!   refuses them. Interactive ownership stays with the terminal primitive.
 
 #![forbid(unsafe_code)]
@@ -87,10 +87,10 @@ pub use host::ComponentExecutionHost;
 pub const EXECUTION_COMPONENT_NAME: &str = "execution";
 
 /// Lowest execution-component wire protocol version this host speaks.
-pub const EXECUTION_COMPONENT_PROTOCOL_MIN: u16 = 1;
+pub const EXECUTION_COMPONENT_PROTOCOL_MIN: u16 = 2;
 
 /// Highest execution-component wire protocol version this host speaks.
-pub const EXECUTION_COMPONENT_PROTOCOL_MAX: u16 = 1;
+pub const EXECUTION_COMPONENT_PROTOCOL_MAX: u16 = 2;
 
 /// Maximum jobs the component tracks (mirrors the wire `MAX_JOBS`).
 pub const EXECUTION_COMPONENT_MAX_JOBS: usize = bitty_execution::component::protocol::MAX_JOBS;
@@ -147,6 +147,12 @@ pub const EXECUTION_COMPONENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(
 /// Default graceful-shutdown deadline (the component waits up to 5 s for its
 /// own jobs to observe the kill before `ShutdownAck`).
 pub const EXECUTION_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Maximum time the host spends joining its own I/O threads after the child
+/// process and its owned process group have been stopped. A descendant that
+/// escapes the host-owned group may retain a pipe; that third-party lifetime
+/// remains bounded here by detaching the blocked reader.
+pub const EXECUTION_COMPONENT_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Finished-record retention sent to the component.
 ///
@@ -664,7 +670,7 @@ pub enum ComponentError {
         /// Component name.
         name: String,
     },
-    /// The installed component does not speak protocol v1.
+    /// The installed component does not speak the required protocol v2.
     Incompatible {
         /// Lowest protocol version the component supports.
         min: u16,

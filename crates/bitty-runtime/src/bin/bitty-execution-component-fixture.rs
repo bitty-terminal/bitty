@@ -15,6 +15,11 @@
 //! - `crash-on-spawn`: complete the handshake, then exit as soon as a
 //!   `Spawn` arrives.
 //! - `silent-handshake`: never answer `Hello`.
+//! - `v1-ack`: answer the v2 `Hello` with a v1 `HelloAck`.
+//! - `job-error-on-spawn`: return a high-bit job-correlated error.
+//! - `read-error`: complete one job, then return a request-correlated read
+//!   error.
+//! - `connection-error`: return a connection-level error after the handshake.
 //!
 //! Every mode is test-only: the release bundles ship only the `bitty` binary.
 
@@ -26,7 +31,9 @@ use std::time::Duration;
 
 use bitty_execution::component::COMPONENT_VERSION;
 use bitty_execution::component::protocol::{
-    FrameReader, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, write_frame,
+    ErrorKind, ExitKind, FrameReader, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, WireCancelEffect,
+    WireDeadlineClock, WireKillScope, WireOomGap, WireOomVerdict, job_error_correlation,
+    write_frame,
 };
 
 fn main() -> ExitCode {
@@ -82,6 +89,28 @@ fn main() -> ExitCode {
             std::thread::sleep(Duration::from_secs(30));
             3
         }
+        "v1-ack" => {
+            let (_reader, _output) = handshake_with_protocol(1);
+            wait_for_host_close();
+            0
+        }
+        "job-error-on-spawn" => job_error_on_spawn(),
+        "read-error" => read_error(),
+        "connection-error" => {
+            let (_reader, mut output) = handshake_with_protocol(PROTOCOL_VERSION);
+            write_frame(
+                &mut output,
+                &Message::Error {
+                    request: 0,
+                    kind: ErrorKind::ComponentLost,
+                    message: "fixture connection lost".to_owned(),
+                },
+            )
+            .ok();
+            output.flush().ok();
+            wait_for_host_close();
+            0
+        }
         _ => {
             eprintln!("bitty-execution-component-fixture: unknown mode '{mode}'");
             2
@@ -101,6 +130,11 @@ fn fixture_mode_file() -> Option<String> {
 
 /// Reads `Hello` and answers `HelloAck`; returns the reader for follow-ups.
 fn handshake() -> (FrameReader<std::io::Stdin>, std::io::Stdout) {
+    handshake_with_protocol(PROTOCOL_VERSION)
+}
+
+/// Reads `Hello` and answers with a selected protocol version.
+fn handshake_with_protocol(protocol: u16) -> (FrameReader<std::io::Stdin>, std::io::Stdout) {
     let mut reader = FrameReader::new(std::io::stdin());
     let hello = reader.read_message();
     if !matches!(hello, Ok(Some(Message::Hello { .. }))) {
@@ -108,13 +142,94 @@ fn handshake() -> (FrameReader<std::io::Stdin>, std::io::Stdout) {
     }
     let mut output = std::io::stdout();
     let ack = Message::HelloAck {
-        protocol: PROTOCOL_VERSION,
+        protocol,
         component: "execution".to_owned(),
         version: COMPONENT_VERSION.to_owned(),
     };
     let _ = write_frame(&mut output, &ack);
     let _ = output.flush();
     (reader, output)
+}
+
+/// Sends a high-bit job-correlated error for the first submitted spawn.
+fn job_error_on_spawn() -> u8 {
+    let (mut reader, mut output) = handshake();
+    loop {
+        match reader.read_message() {
+            Ok(Some(Message::Spawn { job, .. })) => {
+                write_frame(
+                    &mut output,
+                    &Message::Error {
+                        request: job_error_correlation(job),
+                        kind: ErrorKind::InvalidRequest,
+                        message: "fixture rejected job".to_owned(),
+                    },
+                )
+                .ok();
+                output.flush().ok();
+            }
+            Ok(Some(Message::Shutdown)) => {
+                write_frame(&mut output, &Message::ShutdownAck).ok();
+                output.flush().ok();
+                return 0;
+            }
+            Ok(None) => return 0,
+            Ok(Some(_)) => {}
+            Err(_) => return 3,
+        }
+    }
+}
+
+/// Completes one synthetic job, then returns a low-bit read-request error.
+fn read_error() -> u8 {
+    let (mut reader, mut output) = handshake();
+    loop {
+        match reader.read_message() {
+            Ok(Some(Message::Spawn { job, .. })) => {
+                write_frame(&mut output, &Message::Spawned { job, generation: 1 }).ok();
+                write_frame(&mut output, &Message::Started { job }).ok();
+                write_frame(
+                    &mut output,
+                    &Message::Exit {
+                        job,
+                        outcome: ExitKind::Success,
+                        detail: 0,
+                        cancel: WireCancelEffect::None,
+                        clock: WireDeadlineClock::None,
+                        kill_scope: WireKillScope::OwnedTree,
+                        oom: WireOomVerdict::NotOom,
+                        oom_gap: WireOomGap::None,
+                        stdout_total: 0,
+                        stdout_evicted: 0,
+                        stderr_total: 0,
+                        stderr_evicted: 0,
+                    },
+                )
+                .ok();
+                output.flush().ok();
+            }
+            Ok(Some(Message::ReadOutput { request, .. })) => {
+                write_frame(
+                    &mut output,
+                    &Message::Error {
+                        request,
+                        kind: ErrorKind::InvalidRequest,
+                        message: "fixture rejected read".to_owned(),
+                    },
+                )
+                .ok();
+                output.flush().ok();
+            }
+            Ok(Some(Message::Shutdown)) => {
+                write_frame(&mut output, &Message::ShutdownAck).ok();
+                output.flush().ok();
+                return 0;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return 0,
+            Err(_) => return 3,
+        }
+    }
 }
 
 /// Keeps the fixture alive until the host closes stdin, so the host side of

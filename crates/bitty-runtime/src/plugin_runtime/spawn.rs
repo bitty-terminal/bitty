@@ -1004,7 +1004,7 @@ impl SpawnService {
     ///
     /// Admitted `[tools.*]` spawns always stay on the linked path in this
     /// release: Core's Landlock `EXECUTE` preparer runs in the linked
-    /// registry's child, and protocol v1 has no field for carrying that
+    /// registry's child, and protocol v2 has no field for carrying that
     /// ruleset to the component. `Preferred` therefore falls back for those
     /// spawns and `Required` refuses them; non-tool commands remain eligible
     /// for the component.

@@ -143,6 +143,41 @@ pub fn resolve_search(
     })
 }
 
+/// Resolve `name` with user-over-system priority for an explicit protocol.
+pub fn resolve_search_for_protocol(
+    user_root: Option<&Path>,
+    system_root: Option<&Path>,
+    name: &str,
+    protocol: u16,
+) -> Result<SearchedComponent, ResolveError> {
+    super::descriptor::validate_component_name(name).map_err(|_| ResolveError::InvalidName)?;
+    if let Some(user) = user_root {
+        match super::descriptor::resolve_with_protocol(user, name, protocol) {
+            Ok(resolved) => {
+                return Ok(SearchedComponent {
+                    resolved,
+                    source: ComponentSource::User,
+                });
+            }
+            Err(ResolveError::NotInstalled { .. }) | Err(ResolveError::NoRoot) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    if let Some(system) = system_root {
+        let resolved = super::descriptor::resolve_with_protocol(system, name, protocol)?;
+        return Ok(SearchedComponent {
+            resolved,
+            source: ComponentSource::System,
+        });
+    }
+    if user_root.is_none() && system_root.is_none() {
+        return Err(ResolveError::NoRoot);
+    }
+    Err(ResolveError::NotInstalled {
+        name: name.to_owned(),
+    })
+}
+
 /// One installed version of one component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {

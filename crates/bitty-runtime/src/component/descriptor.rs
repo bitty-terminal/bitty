@@ -437,6 +437,17 @@ impl From<DescriptorError> for ResolveError {
 /// checks every descriptor field, and verifies the executable's SHA-256.
 /// Call this before every spawn; the broker does.
 pub fn resolve(root: &Path, name: &str) -> Result<ResolvedComponent, ResolveError> {
+    resolve_with_protocol(root, name, PROTOCOL_VERSION)
+}
+
+/// Resolve and verify a component against an explicitly selected wire
+/// protocol. This is required when one component family advances without
+/// changing the shared inventory protocol used by other components.
+pub fn resolve_with_protocol(
+    root: &Path,
+    name: &str,
+    protocol: u16,
+) -> Result<ResolvedComponent, ResolveError> {
     validate_component_name(name).map_err(|_| ResolveError::InvalidName)?;
     let component_dir = root.join(name);
     let current_path = component_dir.join(COMPONENT_CURRENT_FILE);
@@ -483,7 +494,7 @@ pub fn resolve(root: &Path, name: &str) -> Result<ResolvedComponent, ResolveErro
             found: descriptor.version,
         });
     }
-    if !descriptor.supports_core_protocol() {
+    if !(descriptor.protocol_min..=descriptor.protocol_max).contains(&protocol) {
         return Err(ResolveError::IncompatibleProtocol {
             min: descriptor.protocol_min,
             max: descriptor.protocol_max,

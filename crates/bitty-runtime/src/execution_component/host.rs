@@ -15,6 +15,7 @@ use bitty_execution::component::protocol::{
     CONNECTION_ID, ErrorKind, ExitKind, FrameReader, MAX_OUTPUT_CHUNK_BYTES, MAX_OUTPUT_READ_BYTES,
     MAX_TAIL_LINES, Message, PROTOCOL_VERSION, TerminateMode, TerminateOutcome, WireCancelEffect,
     WireDeadlineClock, WireEnv, WireEnvVar, WireKillScope, WireOomVerdict,
+    job_from_error_correlation,
 };
 
 use super::{
@@ -27,9 +28,9 @@ use super::{
     EXECUTION_COMPONENT_POLL_MAX_FRAMES, EXECUTION_COMPONENT_POLL_SLICE,
     EXECUTION_COMPONENT_PROTOCOL_MAX, EXECUTION_COMPONENT_PROTOCOL_MIN,
     EXECUTION_COMPONENT_RETAINED_BYTES, EXECUTION_COMPONENT_STDERR_BYTES,
-    EXECUTION_COMPONENT_WAIT_GRACE,
+    EXECUTION_COMPONENT_THREAD_JOIN_TIMEOUT, EXECUTION_COMPONENT_WAIT_GRACE,
 };
-use crate::component::{ResolveError, StderrRing, resolve_search, stderr_log_tail};
+use crate::component::{ResolveError, StderrRing, resolve_search_for_protocol, stderr_log_tail};
 
 /// One item read from the component's stdout by the reader thread.
 enum Inbound {
@@ -186,16 +187,17 @@ impl ComponentExecutionHost {
         if config.safe_mode {
             return Err(ComponentError::SafeMode);
         }
-        let searched = resolve_search(
+        let searched = resolve_search_for_protocol(
             config.user_root.as_deref(),
             config.system_root.as_deref(),
             EXECUTION_COMPONENT_NAME,
+            EXECUTION_COMPONENT_PROTOCOL_MIN,
         )
         .map_err(map_resolve_error)?;
         let resolved = searched.resolved;
         // `resolve` already checks the descriptor against the shared
         // `bitty-network-wire` protocol version (currently 1); the execution
-        // protocol is independently v1. The explicit range check below keeps
+        // protocol is independently v2. The explicit range check below keeps
         // this boundary honest if either codec ever moves.
         if resolved.descriptor.protocol_min > EXECUTION_COMPONENT_PROTOCOL_MAX
             || resolved.descriptor.protocol_max < EXECUTION_COMPONENT_PROTOCOL_MIN
@@ -743,6 +745,7 @@ impl ComponentExecutionHost {
                 reason: "component closed stdout before ShutdownAck".to_owned(),
             });
         }
+        self.join_io_threads_bounded();
         Ok(())
     }
 
@@ -1060,7 +1063,12 @@ impl ComponentExecutionHost {
             self.read_error = Some(error);
             return Ok(());
         }
-        if let Some(state) = self.jobs.get_mut(&request) {
+        if let Some(job) = job_from_error_correlation(request) {
+            let Some(state) = self.jobs.get_mut(&job) else {
+                return Err(
+                    self.protocol_fault(format!("error frame for unknown job correlation {job}"))
+                );
+            };
             state.error = Some(error);
             return Ok(());
         }
@@ -1250,14 +1258,58 @@ impl ComponentExecutionHost {
         }
         let _ = self.child.wait();
         self.exited = true;
+        self.join_io_threads_bounded();
+    }
+
+    /// Join host-owned I/O threads after closing the process group and stdin.
+    ///
+    /// The normal component process and descendants in its own Unix group
+    /// close the pipes promptly. A descendant that retains an inherited pipe
+    /// can still block a reader; after the short bound that thread is detached
+    /// rather than allowing Core shutdown to hang on third-party lifetime.
+    fn join_io_threads_bounded(&mut self) {
+        let deadline = Instant::now()
+            .checked_add(EXECUTION_COMPONENT_THREAD_JOIN_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        while Instant::now() < deadline {
+            let finished = self.reader.as_ref().is_none_or(JoinHandle::is_finished)
+                && self.writer.as_ref().is_none_or(JoinHandle::is_finished)
+                && self
+                    .stderr_reader
+                    .as_ref()
+                    .is_none_or(JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if self.reader.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(thread) = self.reader.take() {
+                let _ = thread.join();
+            }
+        }
+        if self.writer.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(thread) = self.writer.take() {
+                let _ = thread.join();
+            }
+        }
+        if self
+            .stderr_reader
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(thread) = self.stderr_reader.take() {
+                let _ = thread.join();
+            }
+        }
     }
 }
 
 impl Drop for ComponentExecutionHost {
     fn drop(&mut self) {
         self.abort_process();
-        // The reader/writer/stderr threads observe the closed pipes and end;
-        // joining them here would be unbounded, so detach them instead.
+        // Any thread still holding an inherited third-party pipe is detached
+        // by `join_io_threads_bounded`; Core never waits on that lifetime.
         self.reader.take();
         self.writer.take();
         self.stderr_reader.take();

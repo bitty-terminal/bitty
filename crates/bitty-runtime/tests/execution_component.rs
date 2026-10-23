@@ -66,7 +66,7 @@ fn install(root: &Path, mode: Option<&str>) -> PathBuf {
     let executable = version_dir.join(executable_file_name("bitty-execution"));
     std::fs::copy(COMPONENT_FIXTURE, &executable).expect("copy component fixture");
     let digest = sha256_hex(&std::fs::read(&executable).expect("read fixture"));
-    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 1, 1, &digest);
+    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 2, 2, &digest);
     if let Some(mode) = mode {
         std::fs::write(version_dir.join("fixture-mode"), mode).expect("fixture mode");
     }
@@ -528,7 +528,7 @@ fn safe_mode_absent_and_incompatible_installs_fail_closed() {
         .join(COMPONENT_VERSION);
     let executable = version_dir.join(executable_file_name("bitty-execution"));
     let digest = sha256_hex(&std::fs::read(&executable).expect("read"));
-    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 2, 2, &digest);
+    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 1, 1, &digest);
     assert!(matches!(
         ComponentExecutionHost::connect(host_config(incompatible.path())),
         Err(ComponentError::Incompatible { .. })
@@ -538,11 +538,75 @@ fn safe_mode_absent_and_incompatible_installs_fail_closed() {
     install(tampered.path(), None);
     let version_dir = tampered.path().join("execution").join(COMPONENT_VERSION);
     let digest = sha256_hex(b"not the installed executable");
-    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 1, 1, &digest);
+    write_descriptor(&version_dir, "execution", COMPONENT_VERSION, 2, 2, &digest);
     assert!(matches!(
         ComponentExecutionHost::connect(host_config(tampered.path())),
         Err(ComponentError::UnsafeInstall { .. })
     ));
+}
+
+#[test]
+fn v2_handshake_refuses_a_v1_ack() {
+    let scratch = Scratch::new("v1-ack");
+    install(scratch.path(), Some("v1-ack"));
+    let error = ComponentExecutionHost::connect(host_config(scratch.path()))
+        .expect_err("a v1 HelloAck must be refused");
+    assert!(matches!(
+        error,
+        ComponentError::Incompatible { min: 1, max: 1 }
+    ));
+}
+
+#[test]
+fn v2_typed_error_namespaces_route_job_and_read_failures() {
+    let scratch = Scratch::new("job-error");
+    install(scratch.path(), Some("job-error-on-spawn"));
+    let mut host = connect(scratch.path());
+    let error = host
+        .spawn_and_wait(&spec("stdout-stderr", 5_000))
+        .expect_err("job-correlated error must fail the submitted job");
+    assert!(
+        matches!(error, ComponentError::InvalidRequest { .. }),
+        "{error:?}"
+    );
+    // The request-level error is terminal for this synthetic connection. Drop
+    // performs the host-owned process-group/pipe cleanup; no fallback or
+    // second mutation is attempted.
+    drop(host);
+
+    let scratch = Scratch::new("read-error");
+    install(scratch.path(), Some("read-error"));
+    let mut host = connect(scratch.path());
+    let job = host.spawn(&spec("stdout-stderr", 5_000)).expect("spawn");
+    host.wait_terminal(job, Instant::now() + REAL_WAIT)
+        .expect("terminal");
+    let error = host
+        .read_output(job, ComponentStream::Stdout, 0, 0, Duration::from_secs(2))
+        .expect_err("request-correlated error must fail only the read");
+    assert!(
+        matches!(error, ComponentError::InvalidRequest { .. }),
+        "{error:?}"
+    );
+    // The synthetic server is intentionally only a namespace-routing probe;
+    // drop it after the request-level result and exercise graceful shutdown
+    // separately against the real server above.
+    drop(host);
+}
+
+#[test]
+fn connection_level_error_fails_the_host_connection() {
+    let scratch = Scratch::new("connection-error");
+    install(scratch.path(), Some("connection-error"));
+    let mut host = connect(scratch.path());
+    let error = host
+        .poll(Duration::from_secs(2))
+        .expect_err("request zero must be a connection-level failure");
+    assert!(
+        matches!(error, ComponentError::ComponentLost { .. }),
+        "{error:?}"
+    );
+    assert!(!host.is_running(), "lost component must be reaped");
+    host.shutdown().expect("shutdown after connection loss");
 }
 
 #[test]

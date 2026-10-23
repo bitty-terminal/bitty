@@ -1160,6 +1160,23 @@ mod tests {
     }
 
     #[test]
+    fn preferred_failure_after_mutation_submission_is_not_replayed() {
+        // `Failed` models a component that has accepted the Spawn and then
+        // lost its result. The linked registry must not receive the same
+        // mutating request as a fallback.
+        let (supervisor, calls) = fake(ExecutionComponentMode::Preferred, FakeOutcome::Failed);
+        let error = supervisor
+            .spawn_and_wait(
+                &linked_probe_request(),
+                &principal(),
+                Duration::from_millis(10),
+            )
+            .expect_err("a submitted mutation must fail closed");
+        assert!(matches!(error, IpcError::Unavailable { .. }), "{error:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn component_success_maps_to_the_existing_job_run() {
         let (supervisor, calls) = fake(ExecutionComponentMode::Preferred, FakeOutcome::Success);
         let run = supervisor

@@ -55,7 +55,7 @@ test = false
 doc = false
 
 # bitty#2494: hermetic execution-component fixture. Serves the execution
-# component wire protocol v1 by delegating to the pinned
+# component wire protocol v2 by delegating to the pinned
 # `bitty_execution::component::server` (the same server the installable
 # `bitty-execution` binary ships), with fault-injection modes for the Core
 # host client's malformed/oversized-frame, crash, and handshake paths. Never
@@ -105,7 +105,7 @@ bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-
 # are the only modules allowed to name the extension implementation (W-147
 # seam exception). Re-pin to the merged #2494 component commit before this
 # workspace merges it; until then the revision is the component PR tip.
-bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "0e6b68f" }
+bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "36404ab" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of

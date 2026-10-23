@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# check-distro-recipes.test.sh — verify Linux distribution packaging templates.
+# check-distro-recipes.test.sh — verify distribution packaging templates.
 #
 # Asserts integrity of packaging recipes for:
 #   - Alpine Linux (aports APKBUILD)
 #   - Gentoo Linux (ebuilds for source & prebuilt binary + overlay config)
 #   - Void Linux (xbps-src template)
+#   - FreeBSD (Ports recipe: Makefile, pkg-plist, pkg-descr, distinfo)
 #
-# Part of CTX-1471 (#2513, #2516, #2517).
+# FreeBSD checks are version-agnostic on purpose: the port's PORTVERSION moves
+# with each release, so the gate pins structure, not a version string.
+#
+# Part of CTX-1471 (#2513, #2516, #2517) and CTX-1473 (#2512).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -83,8 +87,125 @@ else
   fail "Void Linux template not found at $VOID_TEMPLATE"
 fi
 
-# 4. Documentation coverage
-for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md; do
+# 4. FreeBSD ports recipe (x11/bitty)
+FREEBSD_PORT_DIR="$REPO_ROOT/packaging/freebsd/x11/bitty"
+FREEBSD_MAKEFILE="$FREEBSD_PORT_DIR/Makefile"
+FREEBSD_PLIST="$FREEBSD_PORT_DIR/pkg-plist"
+FREEBSD_DESCR="$FREEBSD_PORT_DIR/pkg-descr"
+FREEBSD_DISTINFO="$FREEBSD_PORT_DIR/distinfo"
+
+# plist_source_for <plist entry> — print the in-tree file a pkg-plist entry is
+# installed from, so a renamed or moved asset fails the gate instead of shipping
+# a stale plist.
+plist_source_for() {
+  local entry="$1"
+  case "$entry" in
+  share/applications/*) printf '%s\n' "$REPO_ROOT/packaging/${entry#share/applications/}" ;;
+  share/metainfo/*) printf '%s\n' "$REPO_ROOT/packaging/${entry#share/metainfo/}" ;;
+  share/icons/*) printf '%s\n' "$REPO_ROOT/packaging/${entry#share/}" ;;
+  share/doc/bitty/*) printf '%s\n' "$REPO_ROOT/${entry#share/doc/bitty/}" ;;
+  *) printf '%s\n' "$REPO_ROOT/$entry" ;;
+  esac
+}
+
+if [[ -f "$FREEBSD_MAKEFILE" ]]; then
+  freebsd_makefile_failures=$FAIL
+  grep -Eq '^PORTNAME=[[:space:]]+bitty[[:space:]]*$' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile missing PORTNAME=bitty"
+  # Version-agnostic: any numeric PORTVERSION/DISTVERSION passes, so a release
+  # bump never needs a test edit.
+  grep -Eq '^(PORTVERSION|DISTVERSION)=[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile missing a numeric PORTVERSION/DISTVERSION"
+  freebsd_categories="$(sed -n 's/^CATEGORIES=[[:space:]]*//p' "$FREEBSD_MAKEFILE")"
+  case " ${freebsd_categories} " in
+  *" x11 "* | *" x11-servers "*) ;;
+  *) fail "FreeBSD Makefile CATEGORIES lacks x11: '${freebsd_categories}'" ;;
+  esac
+  grep -Eq '^MASTER_SITES=[[:space:]]+[^[:space:]]+' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile missing MASTER_SITES"
+  grep -Eq '^LICENSE=[[:space:]]*MIT[[:space:]]+APACHE20[[:space:]]*$' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile LICENSE is not 'MIT APACHE20' (Cargo.toml/nfpm/PKGBUILD declare both)"
+  grep -Eq '^USES=.*cargo' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile does not build with USES=cargo"
+  grep -Eq '^[[:space:]]*CARGO_CRATES=' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile has no CARGO_CRATES list (make cargo-crates output)"
+  grep -Eq '^do-install:' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD Makefile has no do-install target"
+  grep -q 'PREFIX}/bin/bitty' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD do-install does not install bin/bitty"
+  grep -q 'tic -x' "$FREEBSD_MAKEFILE" ||
+    fail "FreeBSD do-install does not compile terminfo with tic -x"
+  if [[ "$FAIL" -eq "$freebsd_makefile_failures" ]]; then
+    pass "FreeBSD ports Makefile integrity"
+  fi
+else
+  fail "FreeBSD ports Makefile not found at $FREEBSD_MAKEFILE"
+fi
+
+if [[ -s "$FREEBSD_DESCR" ]] && grep -q '^WWW:' "$FREEBSD_DESCR"; then
+  pass "FreeBSD pkg-descr is non-empty and carries a WWW line"
+else
+  fail "FreeBSD pkg-descr missing, empty, or without a WWW line"
+fi
+
+if [[ -f "$FREEBSD_DISTINFO" ]] && grep -q 'make makesum' "$FREEBSD_DISTINFO"; then
+  pass "FreeBSD distinfo defers checksums to make makesum"
+else
+  fail "FreeBSD distinfo missing or does not document make makesum"
+fi
+
+if [[ -s "$FREEBSD_PLIST" ]]; then
+  freebsd_plist_entries=0
+  freebsd_plist_failures=$FAIL
+  while IFS= read -r raw_line; do
+    entry="${raw_line%%[[:space:]]*}"
+    [[ -z "$entry" ]] && continue
+    case "$entry" in
+    \#* | @*) continue ;;
+    esac
+    entry="${entry#%%PORTDOCS%%}"
+    freebsd_plist_entries=$((freebsd_plist_entries + 1))
+    case "$entry" in
+    bin/bitty) ;; # produced by do-install, asserted above
+    share/terminfo/*) ;; # produced by tic from terminfo/bitty.ti
+    *)
+      source_path="$(plist_source_for "$entry")"
+      [[ -f "$source_path" ]] ||
+        fail "pkg-plist entry has no in-tree source: $entry (looked for $source_path)"
+      ;;
+    esac
+  done <"$FREEBSD_PLIST"
+  if [[ "$freebsd_plist_entries" -eq 0 ]]; then
+    fail "FreeBSD pkg-plist lists no files"
+  fi
+  # The icon sizes do-install copies must be exactly the sizes pkg-plist ships.
+  # Both sides are normalised to numeric order: pkg-plist sorts lexicographically
+  # (128 before 16), do-install lists sizes in numeric order.
+  makefile_sizes="$(sed -n 's/^\.for size in //p' "$FREEBSD_MAKEFILE" |
+    tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tr '\n' ' ')"
+  plist_sizes="$(sed -n 's|^share/icons/hicolor/\([0-9]*\)x[0-9]*/apps/bitty\.png$|\1|p' \
+    "$FREEBSD_PLIST" | sort -n | tr '\n' ' ')"
+  if [[ "$makefile_sizes" != "$plist_sizes" ]]; then
+    fail "FreeBSD icon sizes drift: do-install '${makefile_sizes}' vs pkg-plist '${plist_sizes}'"
+  fi
+  if [[ "$FAIL" -eq "$freebsd_plist_failures" ]]; then
+    pass "FreeBSD pkg-plist (${freebsd_plist_entries} entries) matches in-tree sources"
+  fi
+else
+  fail "FreeBSD pkg-plist missing or empty"
+fi
+
+freebsd_host_paths="$(grep -nE '/(home|Users|Volumes|mnt)/' \
+  "$FREEBSD_MAKEFILE" "$FREEBSD_PLIST" "$FREEBSD_DESCR" "$FREEBSD_DISTINFO" \
+  "$REPO_ROOT/packaging/freebsd.md" 2>/dev/null || true)"
+if [[ -n "$freebsd_host_paths" ]]; then
+  fail "FreeBSD recipe carries a hardcoded host path: ${freebsd_host_paths}"
+else
+  pass "FreeBSD recipe has no hardcoded host paths"
+fi
+
+# 5. Documentation coverage
+for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/freebsd.md; do
   if [[ -f "$REPO_ROOT/$doc" ]]; then
     pass "Documentation exists: $doc"
   else
@@ -94,8 +215,9 @@ done
 
 if grep -q 'packaging/gentoo.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/void.md' "$REPO_ROOT/packaging/INSTALL.md" &&
+  grep -q 'packaging/freebsd.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/alpine/APKBUILD' "$REPO_ROOT/packaging/INSTALL.md"; then
-  pass "INSTALL.md references all three distro packaging guides"
+  pass "INSTALL.md references all four distro packaging guides"
 else
   fail "INSTALL.md missing references to distro recipes"
 fi

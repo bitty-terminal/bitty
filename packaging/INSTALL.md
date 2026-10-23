@@ -80,6 +80,9 @@ What each script installs:
   see `packaging/gentoo.md`.
 - **Void Linux**: `xbps-src` package template in `packaging/void/srcpkgs/bitty/template`;
   see `packaging/void.md`.
+- **FreeBSD**: Ports recipe in `packaging/freebsd/x11/bitty/` (`make install`
+  from a ports tree); best-effort, not supported (no release job installs it);
+  see `packaging/freebsd.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`
   leg); see `packaging/opensuse.md`.
 

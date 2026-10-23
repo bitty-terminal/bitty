@@ -19,8 +19,9 @@ and is labeled as such below.
 | rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort         |
 | apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`) |
 | archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated            |
+| freebsd   | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported  |
 
-Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
+Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`). FreeBSD has no `pkg` backend in nfpm; the release publishes a `.tar.xz` plus a ports recipe at `packaging/freebsd/x11/bitty/`, and no release job installs that package, so the port is best-effort, not supported (see `packaging/freebsd.md`).
 
 ## Install smoke
 
@@ -361,6 +362,10 @@ registry/uninstall scripting for the same bar.
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
 - macos Universal 2 (`Bitty-<version>-universal.dmg`, `macos-universal` job)
+- freebsd x64 (`x86_64-unknown-freebsd`, FreeBSD 15.1 VM; binary plus the
+  `bitty-<version>-x86_64-unknown-freebsd.tar.xz` bundle, `build-freebsd` job).
+  Build-only: no `verify-install` leg and no `pkg` artifact, so it stays
+  best-effort (see `packaging/freebsd.md`)
 
 The Universal 2 DMG fuses the two macOS slices into `Bitty.app` with `lipo`
 inside `scripts/make-macos-dmg.sh`; the job mounts the DMG and launches both

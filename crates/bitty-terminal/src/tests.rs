@@ -11801,9 +11801,10 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
 fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
     // CTX-1460 / #2531: the primary owner can be one of the hidden leaves in
     // an inactive zoom backup. Reap must restore that backup before removing
-    // the dead owner, then re-home primary ownership to the active workspace
-    // rather than leaving the dead id or a session-less backup proxy behind.
-    require_pty!();
+    // the dead owner (`remove_stashed_view` branch) instead of leaving a
+    // session-less tile behind; the workspace keeps its live survivor, which
+    // stays focused and typable. Deliberately not gated on `require_pty!`:
+    // this is the only cover for that branch, so it must not skip silently.
     let mut app = editor_test_app();
 
     let primary = ViewId::new(1);
@@ -11849,25 +11850,32 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(
+        app.runtime.workspace_count(),
+        2,
+        "the inactive workspace keeps its live survivor"
+    );
     assert_eq!(app.runtime.active_workspace_index(), 1);
     assert!(!app.runtime.has_pane_session(&primary));
     assert!(app.runtime.has_pane_session(&survivor));
     assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
-    assert_eq!(
-        app.runtime.primary_view(),
-        Some(ViewId::new(3)),
-        "dead primary ownership must re-home to the active workspace"
-    );
-    assert!(app.runtime.has_pane_session(&ViewId::new(3)));
 
+    // The restored stash must no longer carry the dead primary leaf.
     assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_eq!(
+        app.runtime.layout().leaf_ids(),
+        vec![survivor],
+        "the dead primary leaf must be gone from the restored stashed layout"
+    );
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(survivor),
+        "the survivor keeps focus after the primary owner is reaped"
+    );
     assert_ne!(
         app.runtime.primary_view(),
         Some(primary),
-        "switching back must never restore the dead primary owner"
+        "primary ownership must not stay on the reaped primary"
     );
     assert!(app.runtime.has_pane_session(&survivor));
     assert!(

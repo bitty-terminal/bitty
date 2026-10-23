@@ -335,7 +335,9 @@ impl ZoomState {
             );
             return false;
         }
-        let entry = self.entries.remove(&seq).expect("zoom entry still present");
+        let Some(entry) = self.entries.remove(&seq) else {
+            return false;
+        };
         if index == runtime.active_workspace_index() {
             runtime.set_layout(entry.backup);
             true

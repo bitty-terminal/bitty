@@ -84,6 +84,9 @@ What each script installs:
 - **Void Linux**: `xbps-src` template (in-tree draft, not in void-packages:
   best-effort) in `packaging/void/srcpkgs/bitty/template`; see
   `packaging/void.md`.
+- **FreeBSD**: Ports recipe in `packaging/freebsd/x11/bitty/` (`make install`
+  from a ports tree); best-effort, not supported (no release job installs it);
+  see `packaging/freebsd.md`.
 - **openSUSE (zypper)**: best-effort, not supported (no release
   `verify-install` leg); `zypper addrepo` + `zypper install bitty` from the OBS
   repository, source recipe in `packaging/opensuse/bitty.spec`; see

@@ -550,6 +550,9 @@ dogfood-session-test:
 mem-measure-test:
     bash scripts/tests/mem-measure.test.sh
 
+mem-probe-headless-test:
+    bash scripts/tests/mem-probe-headless.test.sh
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref

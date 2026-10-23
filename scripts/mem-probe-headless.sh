@@ -164,6 +164,7 @@ if [ -z "$BIN" ]; then
 fi
 [ -x "$BIN" ] || die "no executable binary at $BIN (pass --binary or build release)"
 BIN="$(readlink -f "$BIN")"
+source "$ROOT/scripts/lib/mem-probe-headless.sh"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "mem-probe-headless: plan bin=$BIN panels=$PANELS scrollback=$SCROLLBACK"
@@ -171,6 +172,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  max_rss_kb=$MAX_RSS_KB max_pss_kb=$MAX_PSS_KB out=${OUT_DIR:-<mktemp -d>}"
   exit 0
 fi
+require_pidfd_support || die "safe cleanup requires Linux pidfd_open and pidfd_send_signal support"
 
 if [ -z "$OUT_DIR" ]; then
   RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bitty-mem-probe-XXXXXX")"
@@ -189,21 +191,19 @@ printf 'return { terminal = { scrollback = %s } }\n' "$SCROLLBACK" \
 SOCK="$ISOLATED/run/sock"
 INSTANCE="mem-probe-$$"
 APP_PID=""
+APP_STARTTIME=""
 PSS_SAMPLE_FAILED=0
 SAMPLES="$RUN_DIR/samples.csv"
 LOG="$RUN_DIR/session.log"
 
 cleanup() {
-  if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
-    # Only signal the process this run started and can still identify.
-    if tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null |
-      grep -Fqx "BITTY_INSTANCE_ID=$INSTANCE"; then
-      kill -TERM "$APP_PID" 2>/dev/null || true
-      for _ in $(seq 1 30); do
-        kill -0 "$APP_PID" 2>/dev/null || break
-        sleep 0.1
-      done
-      kill -KILL "$APP_PID" 2>/dev/null || true
+  if [ -n "$APP_PID" ] && [ -n "$APP_STARTTIME" ]; then
+    # pidfd pins the process object across signaling; verify both the launch
+    # starttime and instance marker before each signal. If pidfd is unavailable
+    # or identity no longer matches, refuse to signal a numeric PID.
+    signal_owned_process "$APP_PID" "$INSTANCE" "$APP_STARTTIME" SIGTERM 2>/dev/null || true
+    if ! wait_for_owned_process_exit "$APP_PID" "$INSTANCE" "$APP_STARTTIME"; then
+      signal_owned_process "$APP_PID" "$INSTANCE" "$APP_STARTTIME" SIGKILL 2>/dev/null || true
     fi
   fi
   if [ "$KEEP" = "1" ]; then
@@ -225,6 +225,12 @@ unset WAYLAND_DISPLAY DISPLAY SHELL
 "$BIN" --test-mode --log-level info --config "$CONFIG_DIR/init.lua" \
   >"$LOG" 2>&1 &
 APP_PID=$!
+for _ in $(seq 1 30); do
+  APP_STARTTIME="$(process_starttime "$APP_PID" "$INSTANCE" 2>/dev/null || true)"
+  [ -n "$APP_STARTTIME" ] && break
+  sleep 0.02
+done
+[ -n "$APP_STARTTIME" ] || die "could not identify the launched bitty process safely"
 
 for _ in $(seq 1 300); do
   [ -S "$SOCK" ] && break
@@ -293,14 +299,24 @@ while IFS= read -r pane_id; do
 done <<<"$PANE_IDS"
 sleep 2
 
-# Wait for each shell's final marker, then confirm the scrollback reached the
-# configured cap in every live pane before taking memory samples.
+# Queue one marker after each pane's line generator. Seeing that pane-specific
+# marker in its captured terminal text proves its shell finished `seq` before
+# memory is sampled; scrollback length alone does not establish completion.
+COMPLETION_TOKEN="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 while IFS= read -r pane_id; do
   pane_num="${pane_id#t:}"
+  marker="BITTY_MEM_PROBE_DONE_${COMPLETION_TOKEN}${pane_num}"
+  marker_octal="$(python3 -c 'import sys; print("".join(f"\\{byte:03o}" for byte in sys.argv[1].encode()))' "$marker")"
   ctl view focus "v:$pane_num"
-  ctl terminal send "$pane_id" "echo BITTY_MEM_PROBE_DONE_$pane_num"$'\r'
+  ctl terminal send "$pane_id" "printf '$marker_octal'"$'\r'
 done <<<"$PANE_IDS"
-sleep 1
+for pane_id in $PANE_IDS; do
+  pane_num="${pane_id#t:}"
+  marker="BITTY_MEM_PROBE_DONE_${COMPLETION_TOKEN}${pane_num}"
+  if ! wait_for_terminal_marker "$pane_id" "$marker"; then
+    die "completion marker $marker was not observed for $pane_id before timeout"
+  fi
+done
 "$BIN" ctl --socket "$SOCK" terminal list >"$TERMINALS_JSON"
 [ "$SCROLLBACK" -eq 0 ] && REQUIRED_LINES=0 || REQUIRED_LINES="$SCROLLBACK"
 for _ in $(seq 1 30); do

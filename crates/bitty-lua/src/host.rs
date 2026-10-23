@@ -1795,6 +1795,59 @@ pub trait HostServices {
         ))
     }
 
+    /// Present a block mounted in the `overlay` slot without capturing input
+    /// (CTX-1431, `bitty` #2406: `bitty.ui.overlay.show`).
+    ///
+    /// This is the presentation-only session: the block must belong to the
+    /// calling generation and be an `overlay`-slot mount, and the generation
+    /// must hold `ui.rich` and `ui.overlay`. `ui.overlay.focus` is neither
+    /// required nor implied, and no keyboard or pointer capture is started.
+    /// At most one presentation overlay exists per window: a second `show`
+    /// by another plugin fails closed with [`E_UI_UNAVAILABLE`], while a
+    /// re-show by the same plugin replaces the presented handle. The default
+    /// fails closed with [`E_UI_UNAVAILABLE`], so a host without the surface
+    /// can never gain ambient authority.
+    fn ui_overlay_show(&self, _handle: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no presentation-only overlay surface",
+        ))
+    }
+
+    /// Expiry-aware `ui_overlay_show` for the pre-commit timeout path.
+    ///
+    /// Showing a presentation overlay commits session state, so an expired
+    /// call returns [`BridgeError::timeout`] without admitting anything. The
+    /// default checks expiry before delegating (fail-fast).
+    fn ui_overlay_show_with_expiry(
+        &self,
+        handle: i64,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_overlay_show(handle)
+    }
+
+    /// Remove the presentation-only overlay shown for `handle`
+    /// (CTX-1431, `bitty` #2406: `bitty.ui.overlay.hide`).
+    ///
+    /// Idempotent and Core-owned: `Ok(false)` means this generation owns no
+    /// live presentation for `handle` (including a second hide), never an
+    /// error, so cleanup can never wedge. Hiding someone else's live surface
+    /// is a success-without-effect, never a steal. The default fails closed
+    /// with [`E_UI_UNAVAILABLE`]; release-style cleanup verbs stay ungated at
+    /// the implementing host.
+    fn ui_overlay_hide(&self, _handle: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no presentation-only overlay surface",
+        ))
+    }
+
     /// Collect a bounded, read-only target snapshot (W-29, CTX-0942, DEC-0085 thin host).
     ///
     /// Returns at most `max` entries of the current cold-path collection over
@@ -6050,6 +6103,64 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("overlay table accepts 'release'");
+    // CTX-1431 (`bitty` #2406, ADR-0014 presentation split): the
+    // presentation-only session. `show` presents an `overlay`-slot block
+    // without any capture grant; `hide` removes it idempotently. Neither
+    // call registers a callback or starts input capture.
+    overlay
+        .set(
+            ctx,
+            "show",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.show handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let shown = state
+                        .bounded_mutation(|expiry| {
+                            state.services.ui_overlay_show_with_expiry(handle, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(shown));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'show'");
+    overlay
+        .set(
+            ctx,
+            "hide",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.overlay.hide handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    // Cleanup stays ungated at the host: a hide whose grant
+                    // was revoked mid-session must still remove the surface.
+                    let hidden = state
+                        .bounded_mutation(|_expiry| state.services.ui_overlay_hide(handle))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(hidden));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("overlay table accepts 'hide'");
     overlay
         .set(
             ctx,

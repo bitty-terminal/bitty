@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Presentation-only plugin overlays (#2406):** a plugin can now present an
+  `overlay`-slot block without becoming modal. `bitty.ui.overlay.show(handle)`
+  and `bitty.ui.overlay.hide(handle)` require only `ui.rich` + `ui.overlay`
+  (never `ui.overlay.focus`), start no keyboard or pointer capture, and paint
+  one non-modal `Popup` surface centered on the focused view and clipped to
+  its frame. A second plugin's `show` fails closed with `E_UI_UNAVAILABLE`;
+  owner re-show replaces, `hide` is idempotent, and a bare `Esc` hides the
+  panel without consuming the press (the focused PTY still receives it) while
+  queueing one `overlay.dismissed` observation. Paste, workspace-close, and
+  view/window-close confirmation gates keep their consume.
+
 ### Fixed
 
 - **Hover tooltip formatting, centering, and refresh (#2530):** the

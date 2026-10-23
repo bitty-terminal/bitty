@@ -36,6 +36,8 @@ struct UiServices {
     overlay_updates: RefCell<Vec<i64>>,
     overlay_releases: RefCell<Vec<(i64, Option<String>)>>,
     overlay_polls: RefCell<Vec<(i64, usize)>>,
+    overlay_shows: RefCell<Vec<i64>>,
+    overlay_hides: RefCell<Vec<i64>>,
     overlay_events: RefCell<Vec<OverlayInput>>,
     snapshot_rows: Vec<TargetSnapshotRow>,
 }
@@ -150,6 +152,30 @@ impl HostServices for UiServices {
         self.overlay_polls.borrow_mut().push((handle, max));
         let take = max.min(self.overlay_events.borrow().len());
         Ok(self.overlay_events.borrow_mut().drain(..take).collect())
+    }
+
+    fn ui_overlay_show(&self, handle: i64) -> Result<bool, BridgeError> {
+        if let Some(capability) = self.overlay_deny {
+            return Err(BridgeError::capability_denied(capability));
+        }
+        self.overlay_shows.borrow_mut().push(handle);
+        Ok(true)
+    }
+
+    fn ui_overlay_show_with_expiry(
+        &self,
+        handle: i64,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_overlay_show(handle)
+    }
+
+    fn ui_overlay_hide(&self, handle: i64) -> Result<bool, BridgeError> {
+        self.overlay_hides.borrow_mut().push(handle);
+        Ok(false)
     }
 
     fn ui_overlay_poll_detailed(
@@ -700,6 +726,46 @@ fn overlay_capture_surface_round_trips_through_host() {
     assert_eq!(services.overlay_polls.borrow().as_slice(), &[(11, 4)]);
 }
 
+/// CTX-1431 (`bitty` #2406): `bitty.ui.overlay.show` / `hide` are the
+/// presentation-only verbs. They route through the host boundary without any
+/// capture call, return the host boolean, and reject a non-integer handle
+/// with the accepted component-invalid diagnostic.
+#[test]
+fn overlay_presentation_show_hide_round_trips_through_host() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("overlay-presentation");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local shown = bitty.ui.overlay.show(21)
+        local hidden = bitty.ui.overlay.hide(21)
+        bitty.store.set("shown", shown)
+        bitty.store.set("hidden", hidden)
+        local show_ok, show_err = pcall(bitty.ui.overlay.show, "21")
+        local hide_ok, hide_err = pcall(bitty.ui.overlay.hide, {})
+        bitty.store.set("show_code", show_ok and "NONE" or show_err.code)
+        bitty.store.set("hide_code", hide_ok and "NONE" or hide_err.code)
+    "#,
+    );
+    assert_eq!(stored(&services, "shown"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "hidden"), Some(LuaValue::Bool(false)));
+    assert_eq!(services.overlay_shows.borrow().as_slice(), &[21]);
+    assert_eq!(services.overlay_hides.borrow().as_slice(), &[21]);
+    assert_eq!(
+        stored(&services, "show_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "hide_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert!(
+        services.overlay_acquires.borrow().is_empty(),
+        "presentation verbs never claim input capture"
+    );
+}
+
 /// CTX-0941: spec acquire mounts the surface from presentation hints and
 /// returns the session handle; unknown fields are ignored.
 #[test]
@@ -737,6 +803,8 @@ fn overlay_capture_table_is_read_only() {
         "bitty.ui.overlay = {}",
         "bitty.ui.overlay.acquire = function() end",
         "bitty.ui.overlay.update = function() end",
+        "bitty.ui.overlay.show = function() end",
+        "bitty.ui.overlay.hide = function() end",
     ] {
         let outcome = vm.execute_bounded(chunk).expect("execute");
         assert!(

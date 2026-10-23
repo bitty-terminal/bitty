@@ -746,6 +746,14 @@ pub struct Runtime {
     /// `None` with no capture, so the present path is byte-identical to the
     /// pre-overlay frame. Presentation-only: never grid truth.
     plugin_overlay: Option<BandContent>,
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// Populated from the plugin runtime's live presentation session each
+    /// tick. Paint-only and non-modal: no hit-testing, no pointer capture, no
+    /// input routing, and never the modal authority. Painted below the
+    /// focusable capture surface and above the chrome bands, centered on the
+    /// focused view and clipped to its frame. `None` with no session.
+    presentation_overlay: Option<BandContent>,
     /// Present-time target annotation batch (W-29 successor, issue #2253).
     ///
     /// Populated from `PluginRuntime::target_annotations()` each tick and
@@ -2049,6 +2057,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            presentation_overlay: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2337,6 +2346,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            presentation_overlay: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2621,6 +2631,40 @@ impl Runtime {
         if self.plugin_overlay.is_none() {
             self.plugin_overlay_anchor = None;
         }
+        if changed {
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// The live `overlay`-slot block of the one plugin holding the
+    /// presentation session, or `None`. Paint-only: the surface has no
+    /// hit-testing, no pointer capture, and no input routing, and it never
+    /// touches the modal authority. Follows the focused view; a focus switch
+    /// re-centers it and never dismisses it.
+    #[must_use]
+    pub fn presentation_overlay(&self) -> Option<&BandContent> {
+        self.presentation_overlay.as_ref()
+    }
+
+    /// Updates the presentation-only overlay surface (CTX-1431).
+    ///
+    /// Marks a full redraw only when the surface actually changes (appears,
+    /// clears, or the retained block's version/content moves), so ticks stay
+    /// idle while an unchanged panel is up. `None` clears the surface.
+    pub fn set_presentation_overlay(&mut self, overlay: Option<BandContent>) {
+        let changed = match (&self.presentation_overlay, &overlay) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(current), Some(next)) => {
+                current.plugin_id != next.plugin_id
+                    || current.slot != next.slot
+                    || current.version != next.version
+                    || current.root != next.root
+            }
+        };
+        self.presentation_overlay = overlay;
         if changed {
             self.pending_full_redraw = true;
         }

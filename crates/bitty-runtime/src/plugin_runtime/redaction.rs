@@ -223,6 +223,7 @@ mod tests {
             "focus.changed",
             "overlay.released",
             "overlay.input.available",
+            "overlay.dismissed",
             "selection.changed",
             "process.exited",
             "config.reloaded",

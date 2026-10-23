@@ -15091,3 +15091,426 @@ events = []
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+// ---------------------------------------------------------------------------
+// Presentation-only overlay session (CTX-1431, bitty #2406)
+// ---------------------------------------------------------------------------
+
+use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+use bitty_runtime::{CloseConfirmMode, RuntimeConfig};
+
+/// A pressed, non-synthetic `Esc` event.
+fn presentation_escape() -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Escape),
+        text: None,
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+/// Snapshot source for the presentation-overlay fixtures.
+struct PresentationSnapshot;
+
+impl bitty_runtime::plugin_runtime::SnapshotSource for PresentationSnapshot {
+    fn snapshot(
+        &self,
+        _scope: &str,
+    ) -> Result<bitty_runtime::plugin_runtime::LuaValue, bitty_lua::BridgeError> {
+        Ok(bitty_runtime::plugin_runtime::LuaValue::table([
+            (
+                "version",
+                bitty_runtime::plugin_runtime::LuaValue::Integer(1),
+            ),
+            (
+                "zones",
+                bitty_runtime::plugin_runtime::LuaValue::array(vec![]),
+            ),
+        ]))
+    }
+}
+
+fn presentation_store_value(
+    app: &TerminalApp,
+    id: &bitty_plugin_host::manifest::PluginId,
+    key: &str,
+) -> Option<bitty_runtime::plugin_runtime::LuaValue> {
+    app.plugin_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.services(id))
+        .and_then(|services| services.with_store(|store| store.get(key)))
+}
+
+/// Build a headless app with a presenter (mounts and shows an `overlay` block)
+/// and a watcher subscribed to `overlay.dismissed`.
+fn presentation_overlay_app(
+    case: &str,
+    runtime: Runtime,
+) -> (
+    TerminalApp,
+    bitty_plugin_host::manifest::PluginId,
+    String,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig,
+    };
+
+    let root = std::env::temp_dir().join(format!(
+        "bitty-presentation-overlay-{case}-{}",
+        std::process::id()
+    ));
+    let data = std::env::temp_dir().join(format!(
+        "bitty-presentation-overlay-{case}-data-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let presenter = format!("bitty-featured.ctx1431presenter{}", case.replace('-', ""));
+    let watcher = format!("bitty-featured.ctx1431watcher{}", case.replace('-', ""));
+
+    let plugin_dir = root.join(&presenter);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("presenter dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{presenter}"
+name = "CTX-1431 presentation presenter"
+version = "0.1.0"
+description = "presentation-only overlay app fixture"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+ui.overlay = true
+
+[lazy]
+commands = ["{presenter}:show", "{presenter}:update"]
+events = ["key"]
+claims = []
+"#
+        ),
+    )
+    .expect("presenter manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local ok, handle = pcall(bitty.ui.mount, "overlay", {
+          kind = "List",
+          children = {
+            { kind = "Text", text = "Keyboard shortcuts" },
+            { kind = "Text", text = "alt+h  toggle_help" },
+          },
+        })
+        bitty.store.set("mount_ok", ok)
+        bitty.store.set("handle", ok and handle or -1)
+        if ok then
+          local shown, err = pcall(bitty.ui.overlay.show, handle)
+          bitty.store.set("shown", shown)
+          if not shown then bitty.store.set("show_err", err.code or "unknown") end
+        end
+        -- Hot-path trap: any callback during input routing bumps this.
+        bitty.events.subscribe("key", function(envelope)
+          bitty.store.set("callback_count", (bitty.store.get("callback_count") or 0) + 1)
+        end)
+        bitty.commands.register({
+          id = "show",
+          title = "Show presentation",
+          run = function()
+            local h = bitty.store.get("handle")
+            local shown = bitty.ui.overlay.show(h)
+            return shown
+          end,
+        })
+        bitty.commands.register({
+          id = "update",
+          title = "Update presentation",
+          run = function()
+            local h = bitty.store.get("handle")
+            local updated = bitty.ui.update(h, {
+              kind = "List",
+              children = { { kind = "Text", text = "updated panel" } },
+            })
+            return updated
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("presenter init");
+
+    let watcher_dir = root.join(&watcher);
+    std::fs::create_dir_all(watcher_dir.join("lua")).expect("watcher dirs");
+    std::fs::write(
+        watcher_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{watcher}"
+name = "CTX-1431 presentation watcher"
+version = "0.1.0"
+description = "overlay.dismissed observation fixture"
+
+[compat]
+plugin-api = "^1.0"
+
+[lazy]
+commands = ["{watcher}:report"]
+events = ["overlay.dismissed"]
+claims = []
+"#
+        ),
+    )
+    .expect("watcher manifest");
+    std::fs::write(
+        watcher_dir.join("lua/init.lua"),
+        r#"
+        bitty.events.subscribe("overlay.dismissed", function(envelope)
+          local payload = envelope.payload
+          bitty.store.set("dismissed", tostring(payload.owner) .. "|"
+            .. tostring(payload.handle) .. "|" .. tostring(payload.reason))
+        end)
+        bitty.commands.register({
+          id = "report",
+          title = "Report dismissal",
+          run = function()
+            return bitty.store.get("dismissed") or "NONE"
+          end,
+        })
+        return {}
+        "#,
+    )
+    .expect("watcher init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(PresentationSnapshot),
+    });
+    plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+        crate::storage_backends::StorageKvBackend::new(),
+    )));
+    plugin_runtime.discover();
+    let presenter_id = bitty_plugin_host::manifest::PluginId::new(&presenter).expect("id");
+    let watcher_id = bitty_plugin_host::manifest::PluginId::new(&watcher).expect("id");
+    assert_eq!(
+        plugin_runtime
+            .activate(&presenter_id)
+            .expect("presenter activates")
+            .state,
+        LifecycleState::Active
+    );
+    assert_eq!(
+        plugin_runtime
+            .activate(&watcher_id)
+            .expect("watcher activates")
+            .state,
+        LifecycleState::Active
+    );
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let app = TerminalApp::with_theme(
+        runtime,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime));
+    (app, presenter_id, watcher, root, data)
+}
+
+/// Esc dismisses the presentation surface, still reaches the PTY, queues one
+/// `overlay.dismissed` observation, and never runs a plugin callback on input.
+#[test]
+fn presentation_overlay_esc_dismisses_and_reaches_pty() {
+    let runtime = Runtime::with_defaults().expect("runtime must build");
+    let (mut app, presenter, watcher, root, data) = presentation_overlay_app("esc", runtime);
+    let _ = app.drive_tick();
+    assert!(
+        app.presentation_overlay_active(),
+        "init.lua presented the block"
+    );
+    assert!(
+        app.runtime.presentation_overlay().is_some(),
+        "the tick mirrors the live session into the paint path"
+    );
+    assert!(
+        !app.runtime.overlay_modal_active(),
+        "presentation never sets the modal authority"
+    );
+    assert!(
+        !app.overlay_capture_active(),
+        "presentation needs no capture grant"
+    );
+    assert!(
+        !app.capture_fallthrough_input(&WindowEventKind::MouseInput(
+            bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Pressed,
+            )
+        )),
+        "clicks pass through the presentation surface to the grid beneath"
+    );
+    let handle = match presentation_store_value(&app, &presenter, "handle") {
+        Some(bitty_runtime::plugin_runtime::LuaValue::Integer(handle)) => handle,
+        other => panic!("presented handle expected, got {other:?}"),
+    };
+
+    let esc = presentation_escape();
+    assert!(
+        !app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc.clone())),
+        "Esc must route onward, not be consumed by the presentation surface"
+    );
+    let out = app.runtime.handle_key_event(esc);
+    assert_eq!(out, Some(vec![27]), "Esc reaches the focused PTY");
+    assert_eq!(app.runtime.pending_input(), b"\x1b");
+    assert!(!app.presentation_overlay_active(), "the surface is gone");
+    assert!(
+        app.runtime.presentation_overlay().is_none(),
+        "the paint path clears immediately"
+    );
+    assert_eq!(
+        presentation_store_value(&app, &presenter, "callback_count"),
+        None,
+        "no plugin callback runs on the input path"
+    );
+
+    // The observation is queued, not synchronously delivered: only the cold
+    // tick hands it to subscribers.
+    let _ = app.drive_tick();
+    let report = app
+        .invoke_plugin_command(
+            &format!("{watcher}:report"),
+            &TerminalApp::empty_command_args(),
+        )
+        .expect("report dispatches");
+    assert_eq!(
+        report,
+        bitty_runtime::plugin_runtime::LuaValue::String(format!("{presenter}|{handle}|escape")),
+        "exactly one observation with owner, handle, and escape reason"
+    );
+    // The trap is live: an explicit delivery still increments it.
+    app.plugin_runtime.as_mut().expect("runtime").deliver_event(
+        "key",
+        &bitty_runtime::plugin_runtime::LuaValue::String(String::from("k")),
+    );
+    assert_eq!(
+        presentation_store_value(&app, &presenter, "callback_count"),
+        Some(bitty_runtime::plugin_runtime::LuaValue::Integer(1)),
+        "explicit delivery proves the hot-path trap was armed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A real confirmation gate keeps the consume and both the gate and the
+/// presentation drop together; the press never reaches the PTY.
+#[test]
+fn presentation_overlay_esc_gate_precedence_keeps_the_consume() {
+    // Paste gate: cancelling it consumes the press.
+    let runtime = Runtime::with_defaults().expect("runtime must build");
+    let (mut app, _presenter, _watcher, root, data) = presentation_overlay_app("paste", runtime);
+    let _ = app.drive_tick();
+    assert!(app.presentation_overlay_active());
+    assert!(app.runtime.paste_text_via_gate(String::from("one\ntwo")));
+    let esc = presentation_escape();
+    assert!(
+        app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc)),
+        "the paste gate owns the consume"
+    );
+    assert!(!app.presentation_overlay_active(), "the surface drops too");
+    assert!(!app.runtime.has_pending_paste(), "the gate drops too");
+    assert!(
+        app.runtime.pending_input().is_empty(),
+        "no Esc leaks to the PTY"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+
+    // View-close confirmation gate: same precedence.
+    let runtime = Runtime::new(RuntimeConfig {
+        close_confirm: CloseConfirmMode::Always,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime must build");
+    let (mut app, _presenter, _watcher, root, data) = presentation_overlay_app("close", runtime);
+    let _ = app.drive_tick();
+    assert!(app.presentation_overlay_active());
+    app.runtime.view_close_request(ViewId::new(1));
+    assert!(
+        app.runtime.has_pending_close_confirm(),
+        "the close arm is armed"
+    );
+    let esc = presentation_escape();
+    assert!(
+        app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc)),
+        "the close confirmation owns the consume"
+    );
+    assert!(!app.presentation_overlay_active());
+    assert!(!app.runtime.has_pending_close_confirm());
+    assert!(app.runtime.pending_input().is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Re-show replaces content and unload tears the surface down before the next
+/// frame; no stale block is painted.
+#[test]
+fn presentation_overlay_update_and_unload_teardown() {
+    let runtime = Runtime::with_defaults().expect("runtime must build");
+    let (mut app, presenter, _watcher, root, data) = presentation_overlay_app("teardown", runtime);
+    let _ = app.drive_tick();
+
+    // `ui.update` changes the retained block; a re-show keeps the same
+    // session and the next tick paints the new content.
+    app.invoke_plugin_command(
+        &format!("{presenter}:update"),
+        &TerminalApp::empty_command_args(),
+    )
+    .expect("update dispatches");
+    app.invoke_plugin_command(
+        &format!("{presenter}:show"),
+        &TerminalApp::empty_command_args(),
+    )
+    .expect("re-show dispatches");
+    let _ = app.drive_tick();
+    let painted = format!(
+        "{:?}",
+        app.runtime
+            .presentation_overlay()
+            .expect("presentation surface")
+            .root
+    );
+    assert!(painted.contains("updated panel"), "{painted}");
+
+    // Unload: dispose clears the session and the next tick clears the paint.
+    app.plugin_runtime
+        .as_mut()
+        .expect("runtime")
+        .dispose(&presenter)
+        .expect("dispose");
+    assert!(
+        !app.presentation_overlay_active(),
+        "unload leaves no stale surface"
+    );
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime.presentation_overlay().is_none(),
+        "the present path clears on the next tick"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

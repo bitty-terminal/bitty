@@ -7,6 +7,14 @@ use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
 use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
+/// Minimum focused-frame width (cells) for a legible presentation overlay.
+///
+/// The presentation surface is informational and non-modal, so a frame too
+/// narrow to read is left unpainted instead of drawing a truncated sliver;
+/// the session stays live and a later resize paints it. The capture modal
+/// keeps its own fail-open rule (it holds the keyboard while up).
+pub(super) const PRESENTATION_OVERLAY_MIN_COLS: u16 = 10;
+
 /// Deterministic headless rasterizer: no font stack required, bit-identical
 /// on every platform and on both Linux and Windows CI.
 ///
@@ -2147,6 +2155,10 @@ impl Runtime {
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_chrome_bands(basis.pad_px, &mut layers);
+        // CTX-1431 (#2406): the presentation-only panel paints above chrome
+        // and below the focusable capture surface, matching its accepted
+        // `OverlayTier::Popup` admission. It is paint-only: no input routing.
+        self.paint_presentation_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_target_annotations(basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
@@ -4321,6 +4333,54 @@ impl Runtime {
         let Some(overlay) = self.plugin_overlay.clone() else {
             return;
         };
+        let anchor = self.plugin_overlay_anchor;
+        self.paint_overlay_surface(&overlay, anchor, 0, allocations, pad_px, layers);
+    }
+
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// Paints the live `overlay`-slot block of the one presentation session.
+    /// Same flattening walk and v1 scene budgets as the capture surface, but
+    /// always centered over the focused view (never anchored, never modal),
+    /// clipped to that frame, and left unpainted below
+    /// [`PRESENTATION_OVERLAY_MIN_COLS`] so a tiny frame never shows an
+    /// illegible sliver. No hit-testing, no pointer capture: clicks pass
+    /// through to the grid beneath. No-op with no surface.
+    fn paint_presentation_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        let Some(overlay) = self.presentation_overlay.clone() else {
+            return;
+        };
+        self.paint_overlay_surface(
+            &overlay,
+            None,
+            PRESENTATION_OVERLAY_MIN_COLS,
+            allocations,
+            pad_px,
+            layers,
+        );
+    }
+
+    /// Shared row-stack paint for the capture surface and the presentation
+    /// surface (CTX-0943, CTX-1431).
+    ///
+    /// `anchor` is the hover-band placement used by the non-modal tooltip
+    /// path (`None` = centered). `min_frame_cols` refuses a frame too narrow
+    /// for the surface's legibility rule; `0` keeps the capture modal's
+    /// pre-existing fail-open chrome.
+    fn paint_overlay_surface(
+        &mut self,
+        overlay: &BandContent,
+        anchor: Option<band_host::BandOverlayAnchor>,
+        min_frame_cols: u16,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
         let rows = Self::overlay_scene_rows(&overlay.root);
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
@@ -4333,7 +4393,7 @@ impl Runtime {
         let Some(frame) = frame else {
             return;
         };
-        if frame.rows == 0 || frame.cols == 0 {
+        if frame.rows == 0 || frame.cols == 0 || frame.cols < min_frame_cols {
             return;
         }
         let full_w = px_span(frame.cols, live.width);
@@ -4355,7 +4415,7 @@ impl Runtime {
             })
             .max()
             .unwrap_or(0);
-        let anchored = self.plugin_overlay_anchor.and_then(|anchor| {
+        let anchored = anchor.and_then(|anchor| {
             if window.width == 0 || window.height == 0 || self.band_geometry_violated() {
                 return None;
             }
@@ -5914,7 +5974,7 @@ mod present_origin_tests {
 
 #[cfg(test)]
 mod plugin_overlay_paint_tests {
-    use super::{FrameLayers, centered_tooltip_x};
+    use super::{FrameLayers, PRESENTATION_OVERLAY_MIN_COLS, centered_tooltip_x};
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
     use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
@@ -5955,6 +6015,22 @@ mod plugin_overlay_paint_tests {
             content: RectPx::new(8, 8, 704, 344),
             cols: 80,
             rows: 24,
+            border: 1,
+            radius: 0,
+            tier: None,
+            style: crate::config::RuntimeViewStyle::default(),
+        }
+    }
+
+    /// One frame at an explicit content origin/size (focus-follow tests).
+    fn frame_for(view: u64, content_x: i32, cols: u16, rows: u16) -> PresentFrame {
+        use bitty_render::geometry::RectPx;
+        PresentFrame {
+            view: bitty_ui::ViewId::new(view),
+            frame: RectPx::new(content_x - 8, 0, 720, 360),
+            content: RectPx::new(content_x, 8, 704, 344),
+            cols,
+            rows,
             border: 1,
             radius: 0,
             tier: None,
@@ -6560,6 +6636,116 @@ mod plugin_overlay_paint_tests {
             [accent[0], accent[1], accent[2], 0xFF],
             "root fg resolves through the closed token table"
         );
+    }
+
+    #[test]
+    fn presentation_overlay_paints_centered_over_the_focused_frame() {
+        // CTX-1431: the presentation surface is Core-centered in the focused
+        // frame, painted as fills plus glyphs on the overlay layer.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let frame = frame_for(1, 100, 60, 20);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert_eq!(layers.combined_overlay.len(), 1, "one row, one pill");
+        assert!(!layers.combined_glyphs.is_empty(), "text paints glyphs");
+        assert!(layers.any_needs_draw);
+        let (cell_w, _) = rt.live_cell_size();
+        let expected = 8
+            + 100
+            + i32::try_from((u32::from(frame.cols) - 5) * cell_w / 2).expect("center offset fits");
+        assert_eq!(
+            layers.combined_overlay[0].rect.x, expected,
+            "the five-cell row centers in the focused frame"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_follows_focus_without_dismissing() {
+        // A focus switch re-centers the panel; it never dismisses it.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let first = frame_for(1, 100, 60, 20);
+        let second = frame_for(2, 600, 60, 20);
+        rt.focus_mut().set(first.view);
+        let mut before = FrameLayers::default();
+        rt.paint_presentation_overlay(&[first, second], 8, &mut before);
+        rt.focus_mut().set(second.view);
+        let mut after = FrameLayers::default();
+        rt.paint_presentation_overlay(&[first, second], 8, &mut after);
+        assert!(
+            after.combined_overlay[0].rect.x > before.combined_overlay[0].rect.x,
+            "the surface follows the focused view's frame"
+        );
+        assert!(
+            rt.presentation_overlay().is_some(),
+            "a focus switch must not dismiss the presentation"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_tiny_view_skips_paint_and_keeps_state() {
+        // Below the legibility floor the panel refuses to paint; the session
+        // survives for a later resize.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let tiny = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS - 1, 20);
+        rt.focus_mut().set(tiny.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[tiny], 8, &mut layers);
+        assert!(
+            layers.combined_overlay.is_empty(),
+            "a too-narrow frame paints nothing"
+        );
+        assert!(!layers.any_needs_draw);
+        assert!(rt.presentation_overlay().is_some(), "the state stays live");
+
+        let wide = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS, 20);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[wide], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            1,
+            "the same state paints after a resize"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_clips_width_and_row_tail_to_the_frame() {
+        // Wide rows clip to the focused frame; rows past the frame bottom
+        // disappear instead of painting outside it.
+        let long = "x".repeat(200);
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_rows(&[&long, "two", "three", "four"])));
+        let frame = frame_for(1, 100, 12, 3);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert_eq!(layers.combined_overlay.len(), 3, "only fitting rows paint");
+        let (cell_w, _) = rt.live_cell_size();
+        let frame_left = 8 + 100;
+        let frame_width = u32::from(frame.cols) * cell_w;
+        let first = &layers.combined_overlay[0];
+        assert_eq!(
+            first.rect.width, frame_width,
+            "the over-wide row clips to the frame"
+        );
+        assert_eq!(
+            first.rect.x, frame_left,
+            "a full-width row starts at the frame"
+        );
+        for fill in &layers.combined_overlay {
+            assert!(
+                fill.rect.x >= frame_left,
+                "no row starts left of the focused frame"
+            );
+            assert!(
+                fill.rect.x + i32::try_from(fill.rect.width).expect("width fits")
+                    <= frame_left + i32::try_from(frame_width).expect("frame width fits"),
+                "no row paints past the focused frame"
+            );
+        }
     }
 }
 

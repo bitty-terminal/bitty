@@ -32,6 +32,7 @@ pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
 pub mod plugin_settings;
+pub mod presentation_overlay;
 pub mod redaction;
 pub mod resolution;
 pub mod services;
@@ -96,6 +97,10 @@ pub use overlay::{
     OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,
     ReleasedEvent, TIMEOUT_RELEASE_REASON, UNLOADED_RELEASE_REASON, is_owner_release_reason,
     is_release_reason,
+};
+pub use presentation_overlay::{
+    DismissedEvent, ESCAPE_DISMISS_REASON, PENDING_DISMISSED_MAX, PRESENTATION_OVERLAY_KIND,
+    PRESENTATION_OVERLAY_TIER, PresentationOverlay,
 };
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
@@ -802,6 +807,11 @@ pub struct PluginRuntime {
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
     overlay_capture: Rc<RefCell<OverlayCapture>>,
+    /// CTX-1431 (`bitty` #2406): runtime-shared single presentation-only
+    /// overlay session. Shared with every generation's services so the
+    /// one-surface-per-window invariant holds across plugins and reload;
+    /// suspension/disposal/rollback revoke this generation's surface.
+    presentation_overlay: Rc<RefCell<PresentationOverlay>>,
     /// CTX-0973: runtime-shared overlay peer table for lazy-expiry disposal.
     /// Shared with every generation's services so an acquire that lazily
     /// expires another generation's session can dispose that session's
@@ -979,6 +989,7 @@ impl PluginRuntime {
             component_requests: Rc::new(RefCell::new(ComponentRequestQueue::new())),
             theme_persist_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
+            presentation_overlay: Rc::new(RefCell::new(PresentationOverlay::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
             target_registry: Rc::new(RefCell::new(bitty_ui::TargetRegistry::new())),
             target_lenses: Rc::new(RefCell::new(Vec::new())),
@@ -1638,6 +1649,75 @@ impl PluginRuntime {
     #[must_use]
     pub fn overlay_capture(&self) -> &Rc<RefCell<OverlayCapture>> {
         &self.overlay_capture
+    }
+
+    /// Runtime-shared presentation-only overlay session (CTX-1431, #2406).
+    ///
+    /// One surface per window across every generation: `bitty.ui.overlay.show`
+    /// admits, `hide` clears, `Esc` dismisses, and suspend/dispose/rollback
+    /// revoke. Presentation never touches the capture switch, the modal
+    /// authority, or input routing. Diagnostics and tests read the live
+    /// session and queued dismissal observations through this handle.
+    #[must_use]
+    pub fn presentation_overlay(&self) -> &Rc<RefCell<PresentationOverlay>> {
+        &self.presentation_overlay
+    }
+
+    /// Live presentation session as `(owner plugin, handle)`, if any.
+    #[must_use]
+    pub fn presentation_overlay_session(&self) -> Option<(String, i64)> {
+        self.presentation_overlay
+            .borrow()
+            .session()
+            .map(|(owner, handle)| (owner.to_string(), handle))
+    }
+
+    /// Retained block of the live presentation session, if any.
+    ///
+    /// `(owner, slot, root, version, handle)` in the same plain shape as
+    /// [`Self::ui_blocks_with_handles`]; the application reads it once per
+    /// tick and pushes it into `Runtime` as plain presentation data. A
+    /// session whose retained block is gone (generation cleared) reports
+    /// `None`, so the paint path cannot present a stale surface.
+    #[must_use]
+    pub fn presentation_overlay_block(
+        &self,
+    ) -> Option<(PluginId, bitty_lua::ui::UiSlot, UiNode, u32, i64)> {
+        let (owner, handle) = self.presentation_overlay_session()?;
+        let id = PluginId::new(&owner).ok()?;
+        let services = self.services(&id)?;
+        services.with_ui_blocks(|blocks| {
+            blocks.iter().find_map(|(candidate, block)| {
+                (candidate == handle && block.ui_slot() == bitty_lua::ui::UiSlot::Overlay).then(
+                    || {
+                        (
+                            id.clone(),
+                            block.ui_slot(),
+                            block.node().clone(),
+                            block.version(),
+                            handle,
+                        )
+                    },
+                )
+            })
+        })
+    }
+
+    /// Dismiss the live presentation overlay because Core routed `Esc`.
+    ///
+    /// Hides the surface without consuming the press and queues exactly one
+    /// `overlay.dismissed` observation (`{ owner, handle, reason = "escape" }`)
+    /// for the application's cold tick. Returns whether a surface was
+    /// dismissed; a second press is a no-op and queues nothing. This never
+    /// runs on behalf of a focusable capture session, whose `Esc` owns its
+    /// own release path.
+    pub fn dismiss_presentation_overlay(&mut self) -> bool {
+        self.presentation_overlay.borrow_mut().dismiss_escape()
+    }
+
+    /// Drain pending `overlay.dismissed` observations in order.
+    pub fn drain_overlay_dismissed(&mut self) -> Vec<DismissedEvent> {
+        self.presentation_overlay.borrow_mut().drain_dismissed()
     }
 
     /// Runtime-shared targeting mechanism state (W-29, CTX-0942).
@@ -2551,6 +2631,10 @@ impl PluginRuntime {
         // so the single-owner invariant spans every plugin and survives
         // reload; suspend/dispose revoke this generation's capture.
         plugin_services.set_overlay_capture(self.overlay_capture.clone());
+        // CTX-1431: the one runtime-shared presentation-only overlay session,
+        // so the one-surface-per-window invariant spans every plugin and
+        // survives reload; suspend/dispose revoke this generation's surface.
+        plugin_services.set_presentation_overlay(self.presentation_overlay.clone());
         // CTX-0973: the runtime-shared overlay peer table, so an acquire
         // that lazily expires another generation's session can dispose that
         // session's transient spec surface synchronously.
@@ -2935,6 +3019,12 @@ impl PluginRuntime {
         // keep the transient input capture (honored even when the VM is
         // parked rather than disposed).
         self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
+        // CTX-1431: suspend clears the generation's UI blocks, so its
+        // presentation-only surface must leave with them. A resumed plugin
+        // re-shows; a stale session can never block another owner.
+        self.presentation_overlay
+            .borrow_mut()
+            .revoke_plugin(id.as_str());
         // LUA-OQ-8: park this generation's publications in place. Records
         // stay keyed for resume but resolve and serve nothing while parked,
         // so live consumer handles fail closed with `E_SERVICE_GONE`.
@@ -3034,6 +3124,12 @@ impl PluginRuntime {
         // CTX-0941: unload/crash/dispose is a release. Core drops the capture
         // so a faulty or dead generation can never pin input.
         self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
+        // CTX-1431: the disposed generation's presentation-only surface
+        // leaves with the generation; no stale panel survives unload,
+        // disable, crash, or reload.
+        self.presentation_overlay
+            .borrow_mut()
+            .revoke_plugin(id.as_str());
         entry.state = LifecycleState::Disposed;
         // CTX-0897: traces never outlive the generation (also on reload,
         // where dispose and the next activation share one public call).
@@ -3913,6 +4009,11 @@ impl PluginRuntime {
         self.overlay_capture
             .borrow_mut()
             .revoke_plugin_with_reason(id.as_str(), CRASHED_RELEASE_REASON);
+        // CTX-1431: a failed activation also drops any presentation-only
+        // surface the rolled-back generation had shown during `init.lua`.
+        self.presentation_overlay
+            .borrow_mut()
+            .revoke_plugin(id.as_str());
         // W-29: a failed activation also drops the generation's lenses (the
         // entry services are dropped above, but the shared lens set must not
         // retain a failed generation's registrations).

@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use bitty_platform::PhysicalSize;
 use bitty_runtime::{
-    AnimationKind, LayoutNode, PRESENT_SETTLE_MAX, Runtime, RuntimeConfig, View, ViewId,
+    AnimationKind, LayoutNode, PRESENT_SETTLE_MAX, Runtime, RuntimeConfig,
+    SYNC_UPDATE_DEFER_TIMEOUT, View, ViewId,
 };
 
 /// Settle window used by the test (the shipped GUI value is 2 ms).
@@ -345,4 +346,64 @@ fn an_idle_query_burst_does_not_poison_the_next_repaint() {
         rt.tick_at(next + SETTLE).is_some(),
         "the quiet deadline presents the complete repaint"
     );
+}
+
+#[test]
+fn sync_update_deferral_replaces_a_stale_settle_deadline() {
+    // Review of bitty#2486: a settle deferral arms a deadline. If `DECSET
+    // 2026` then defers the frame past that deadline, the app must not keep
+    // arming the past instant: `set_wait_until` would fire immediately on
+    // every loop turn until the 100 ms sync bound (a spin). The sync gate
+    // owns the wake while it holds and arms its own future bound.
+    let t0 = Instant::now();
+    let mut rt = runtime();
+    rt.set_present_settle(SETTLE);
+    rt.handle_pty_bytes(&full_frame(0));
+    rt.note_present_input_at(t0);
+    assert!(rt.tick_at(t0 + SETTLE).is_some(), "settle the first frame");
+
+    let burst = t0 + Duration::from_millis(10);
+    rt.handle_pty_bytes(&full_frame(1));
+    rt.note_present_input_at(burst);
+    assert!(
+        rt.tick_at(burst + Duration::from_micros(500)).is_none(),
+        "the settle gate holds the repaint"
+    );
+    let settle_deadline = rt
+        .present_coalescing_deadline()
+        .expect("settle deferral arms a wake");
+    assert_eq!(settle_deadline, burst + SETTLE);
+
+    // The TUI opens a synchronized update; this tick happens after the
+    // settle deadline but inside the (much longer) sync bound.
+    rt.handle_pty_bytes(b"\x1b[?2026h");
+    let sync_tick = burst + Duration::from_millis(5);
+    assert!(sync_tick > settle_deadline, "past the settle deadline");
+    assert!(
+        rt.tick_at(sync_tick).is_none(),
+        "the sync gate defers the frame"
+    );
+    let deadline = rt
+        .present_coalescing_deadline()
+        .expect("the sync deferral must arm a wake");
+    assert!(
+        deadline > sync_tick,
+        "the wake must be in the future, not the past settle deadline {settle_deadline:?}"
+    );
+    assert_eq!(deadline, sync_tick + SYNC_UPDATE_DEFER_TIMEOUT);
+
+    // No spin: another tick inside the window keeps the same future instant.
+    assert!(rt.tick_at(sync_tick + Duration::from_millis(1)).is_none());
+    assert_eq!(
+        rt.present_coalescing_deadline(),
+        Some(sync_tick + SYNC_UPDATE_DEFER_TIMEOUT),
+        "the armed instant must not move backwards or churn"
+    );
+
+    // At the bound the frame commits and the wake clears.
+    assert!(
+        rt.tick_at(sync_tick + SYNC_UPDATE_DEFER_TIMEOUT).is_some(),
+        "the sync bound commits the held frame"
+    );
+    assert_eq!(rt.present_coalescing_deadline(), None);
 }

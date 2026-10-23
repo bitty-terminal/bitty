@@ -1382,12 +1382,14 @@ impl Runtime {
     /// Wake deadline for a deferred frame, if any (CTX-1231, bitty#2486).
     ///
     /// `Some(open_at)` while a deferred frame holds un-presented damage:
-    /// `last_present + interval` for the cadence gate, or the PTY-quiescence
-    /// deadline for the settle gate, whichever is later. `None` otherwise
-    /// (no gate, nothing deferred, or already presented). The app arms
-    /// `set_wait_until` at it so a burst followed by quiet still presents the
-    /// latest frame on time instead of holding it until unrelated activity
-    /// (frame-on-demand liveness).
+    /// `last_present + interval` for the cadence gate, the PTY-quiescence
+    /// deadline for the settle gate, or `sync_defer_since +
+    /// SYNC_UPDATE_DEFER_TIMEOUT` while `DECSET 2026` holds the frame. `None`
+    /// otherwise (no gate, nothing deferred, or already presented). The app
+    /// arms `set_wait_until` at it so a burst followed by quiet still presents
+    /// the latest frame on time instead of holding it until unrelated activity
+    /// (frame-on-demand liveness); the sync arm also bounds a hung producer
+    /// that never resets the mode.
     #[must_use]
     pub fn present_coalescing_deadline(&self) -> Option<std::time::Instant> {
         if !self.coalesced_pending {
@@ -2178,6 +2180,14 @@ impl Runtime {
         if self.synchronized_update_active() {
             let since = *self.sync_defer_since.get_or_insert(now);
             if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT {
+                // Keep the app wake at the sync bound, replacing any earlier
+                // settle/cadence deadline. A settle deferral may have armed a
+                // deadline that this gate has now outlived; leaving it in
+                // place makes the embedder's `set_wait_until` fire immediately
+                // on every loop turn until the 100 ms bound elapses (a spin,
+                // not a present). The frame itself stays deferred here.
+                self.coalesced_pending = true;
+                self.coalesced_deadline = since.checked_add(SYNC_UPDATE_DEFER_TIMEOUT);
                 return true;
             }
             // Bound reached: commit this frame, then open a fresh window so
@@ -2364,6 +2374,12 @@ impl Runtime {
             // exists to prevent.
             self.settle_input_at = None;
             self.settle_burst_at = None;
+            // A synchronized-update deferral also arms the coalesced wake
+            // (the sync gate owns it while it holds). If the mode exited
+            // without damage, nothing is pending and a kept deadline would
+            // fire immediately.
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
             return None;
         }
 

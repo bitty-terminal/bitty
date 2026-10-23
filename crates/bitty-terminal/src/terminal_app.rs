@@ -3441,7 +3441,9 @@ impl TerminalApp {
                 // panel is window-global and keeps the workspace meaningful
                 // (CTX-1337), and a detached float still owns the slot
                 // (CTX-1336), so both keep the existing leaf handling.
-                self.restore_zoom();
+                self.chrome
+                    .zoom
+                    .restore_for_view_mutation(&mut self.runtime, view);
                 if let Some(workspace) = self.runtime.workspace_index_of_view(&view) {
                     let sole_panel = self.workspace_real_panel_count(workspace) == Some(1);
                     if sole_panel
@@ -3508,7 +3510,9 @@ impl TerminalApp {
                 // leaf was actually released (or deliberately kept as a
                 // singleton-stash tile). A leaf in no container keeps its
                 // session: never strand a session-less live tile.
-                self.restore_zoom();
+                self.chrome
+                    .zoom
+                    .restore_for_view_mutation(&mut self.runtime, view);
                 let mut layout = self.runtime.layout().clone();
                 if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
                     self.runtime.set_layout_closing(layout, view);
@@ -3558,7 +3562,13 @@ impl TerminalApp {
                         self.runtime.pane_session_count()
                     )
                 });
-                self.restore_zoom();
+                if !self
+                    .chrome
+                    .zoom
+                    .restore_for_view_mutation(&mut self.runtime, primary_view)
+                {
+                    self.restore_zoom();
+                }
                 // Issue #2525: the primary shell exiting in the last panel
                 // of a workspace is the same panel close as the close-view
                 // gesture (CTX-1297). `close_focused_leaf` refuses a
@@ -3616,6 +3626,17 @@ impl TerminalApp {
                     let mut layout = self.runtime.layout().clone();
                     if crate::chrome_keys::close_focused_leaf(&mut layout, primary_view) {
                         self.runtime.set_layout_closing(layout, primary_view);
+                    } else if self.runtime.remove_stashed_view(primary_view) {
+                        // The primary owner may be in an inactive workspace's
+                        // restored zoom backup. The live layout belongs to a
+                        // different workspace, so remove the dead owner from
+                        // the authoritative stash instead of leaving a
+                        // session-less tile behind.
+                        crate::logging::info(|| {
+                            format!(
+                                "bitty: primary shell {primary_view:?} exited — removed from stashed workspace"
+                            )
+                        });
                     }
                 }
                 self.push_pending_exit(primary_view.0, status.code());

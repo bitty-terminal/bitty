@@ -251,6 +251,50 @@ impl Runtime {
         self.workspaces.iter().position(|s| s.seq == seq)
     }
 
+    /// Authoritative layout of `index`: the live tree for the active slot,
+    /// and its stashed tree otherwise. No workspace activation occurs.
+    #[must_use]
+    pub fn workspace_layout(&self, index: usize) -> Option<&LayoutNode> {
+        if index == self.active_workspace {
+            return Some(&self.layout);
+        }
+        self.workspaces.get(index).map(|slot| &slot.layout)
+    }
+
+    /// Replace an inactive workspace's stashed layout with `layout`.
+    ///
+    /// The visible runtime layout is owned by the active slot; inactive slots
+    /// are authoritative in their stash. This narrow hook lets an app-level
+    /// owner (such as per-workspace zoom state) restore an inactive slot before
+    /// applying view surgery, without switching the user's active workspace.
+    /// Focus is retained when its view remains in the replacement tree and is
+    /// clamped to the first replacement leaf otherwise.
+    pub fn set_stashed_layout_for_seq(&mut self, seq: u64, layout: LayoutNode) -> bool {
+        let Some(index) = self.workspace_index_by_seq(seq) else {
+            return false;
+        };
+        if index == self.active_workspace {
+            return false;
+        }
+        let Some(slot) = self.workspaces.get_mut(index) else {
+            return false;
+        };
+        let focused = slot.focus.focused();
+        slot.layout = layout;
+        slot.focus = focused
+            .filter(|id| {
+                slot.layout.leaf_ids().contains(id)
+                    || slot.floats.contains(*id)
+                    || self.pinned.contains(*id)
+            })
+            .or_else(|| slot.layout.leaf_ids().into_iter().next())
+            .map(Focus::with_focus)
+            .unwrap_or_default();
+        self.raise_view_id_high_water();
+        self.pending_full_redraw = true;
+        true
+    }
+
     /// Lowest free workspace id in `1..=MAX_WORKSPACES` (issue #2532).
     ///
     /// Workspace ids stay dense across delete/create: closing `ws2` from

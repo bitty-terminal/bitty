@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panel without consuming the press (the focused PTY still receives it) while
   queueing one `overlay.dismissed` observation. Paste, workspace-close, and
   view/window-close confirmation gates keep their consume.
+- **Read-only `bitty plugin explain <id> <capability>` (#2471):** prints the
+  capability decision chain for one capability declared by a plugin's
+  manifest. Each layer (host ceiling, user policy, project policy, parent
+  delegation, task grant, agent request) reports `allow`/`deny`/`empty`; the
+  report names the first denying layer, the typed `DenialKind`, the engine's
+  bounded reason chain, the resolved trust level, the enforcement record,
+  pins/conflicts, the effective grant, a static resource-budget envelope, and
+  minimal remediation hints. Unknown ids/capabilities, malformed identifiers,
+  and unreadable/malformed/symlinked policy files fail closed; a denied
+  capability exits 4 after the report. `--format table|json|jsonl` and
+  `--no-color` match the other read-only plugin commands. No plugin code runs,
+  no VM is created, no network is used, and no state is mutated.
 
 ### Fixed
 

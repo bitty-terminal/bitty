@@ -112,6 +112,7 @@ fn run_in_with_env(
     let mut command = Command::new(BITTY_BIN);
     command
         .args(args)
+        .current_dir(home)
         .env("XDG_CONFIG_HOME", home)
         .env("XDG_DATA_HOME", home)
         .env("HOME", home)
@@ -258,6 +259,98 @@ fn plugin_full_lifecycle_live() {
         assert_eq!(mode(&backup), 0o600, "backup must be 0600");
         assert_eq!(mode(&home.join("bitty")), 0o700, "managed dir must be 0700");
     }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_explain_reports_allow_and_deny_live() {
+    let home = scratch_dir("explain");
+    let output = run_in(&home, &["plugin", "install", PLUGIN, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // Allow path: the mutual-grant chain names all six layers, the trust
+    // level, enforcement, and the remediation/inspection pointer.
+    let before = std::fs::read(state_file(&home)).expect("state bytes");
+    let output = run_in(
+        &home,
+        &["plugin", "explain", PLUGIN, "terminal.semantic-read"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("decision:     allow"), "{text}");
+    assert!(text.contains("first denying layer: none"), "{text}");
+    assert!(
+        text.contains("trust:        bundled-lua (level 1)"),
+        "{text}"
+    );
+    for layer in [
+        "host-ceiling",
+        "user-policy",
+        "project-policy",
+        "parent-delegation",
+        "task-grant",
+        "agent-request",
+    ] {
+        assert!(text.contains(layer), "missing {layer}: {text}");
+    }
+    assert!(text.contains("budget:"), "{text}");
+    assert!(text.contains("remediation:"), "{text}");
+    // Safe mode is parity: the diagnostic never loads a VM, config, or store
+    // state beyond the same read-only paths, so the report is byte-identical.
+    let safe = run_in(
+        &home,
+        &[
+            "--safe",
+            "plugin",
+            "explain",
+            PLUGIN,
+            "terminal.semantic-read",
+        ],
+        None,
+    );
+    assert_eq!(safe.status.code(), Some(0), "{}", stderr(&safe));
+    assert_eq!(stdout(&safe), text, "--safe must not change the report");
+    let after = std::fs::read(state_file(&home)).expect("state bytes");
+    assert_eq!(before, after, "explain must never mutate the ledger");
+
+    // Revoke the only grant: task-grant becomes the first denying layer and
+    // the command exits 4 with the reason chain on stdout.
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "revoke",
+            PLUGIN,
+            "--cap",
+            "terminal.semantic-read",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(
+        &home,
+        &["plugin", "explain", PLUGIN, "terminal.semantic-read"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("decision:     deny"), "{text}");
+    assert!(text.contains("first denying layer: task-grant"), "{text}");
+    assert!(text.contains("denial kind:  exceeds-policy"), "{text}");
+    assert!(text.contains("reason chain:"), "{text}");
+    assert!(text.contains("bitty plugin install"), "{text}");
+    assert!(stderr(&output).contains("denied"), "{}", stderr(&output));
+
+    // Unknown capability: actionable stderr, exit 4, no panic.
+    let output = run_in(&home, &["plugin", "explain", PLUGIN, "ui.rich"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("does not declare capability 'ui.rich'"),
+        "{}",
+        stderr(&output)
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

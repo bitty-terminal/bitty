@@ -67,6 +67,9 @@ pollster = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "poll", "term"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [features]
 default = []
 # Enables `bitty dev capture|synthesize|dump|overlay` (CTX-0922): developer

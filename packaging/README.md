@@ -19,6 +19,18 @@ and is labeled as such below.
 | rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort         |
 | apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`) |
 | archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated            |
+| apk (aports) | `packaging/alpine/APKBUILD`                     | In-tree aports recipe, not published to aports; best-effort |
+| ebuild    | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`) | In-tree overlay, not in the gentoo tree; best-effort        |
+| xbps      | `packaging/void/srcpkgs/bitty/template`         | In-tree template, not in void-packages; best-effort         |
+
+The three upstream distro recipes (Alpine aports, Gentoo overlay, Void
+`xbps-src`) are in-tree drafts: nothing is published to `alpine/aports`,
+`gentoo/gentoo`, or `void-linux/void-packages`, so none of them is support
+evidence. Their source and checksum steps run **at tag time**, because the
+distfiles are GitHub tag archives that do not exist before the release tag is
+pushed. `bash scripts/tests/check-distro-recipes.test.sh` (also
+`just distro-recipes-test`, run by the CI packaging step) keeps the recipes
+internally consistent and version-agnostic.
 
 Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE is rpm-based; the rpm passes `rpm -qip` and a local `zypper install` check, but no release `verify-install` leg covers OpenSUSE, so it stays best-effort, not supported (see `packaging/opensuse.md`). Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
 

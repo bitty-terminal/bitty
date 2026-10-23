@@ -75,7 +75,15 @@ What each script installs:
 - **Nix / NixOS (Flake & Cachix)**: `nix run github:bitty-terminal/bitty` with binary cache `https://bitty.cachix.org`; see `packaging/nix.md`.
 - **AppImage (Universal Portable Linux)**: download `bitty-<target>.AppImage`, `chmod +x`, and execute; see `packaging/appimage.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
-  `packaging/alpine.md`.
+  `packaging/alpine.md`. In-tree aports draft (not submitted to aports,
+  best-effort) in `packaging/alpine/APKBUILD`.
+- **Gentoo**: overlay ebuilds `x11-terms/bitty-bin` (tag-pinned binary) and
+  live `x11-terms/bitty-9999` (source build). In-tree overlay drafts, not in
+  the Gentoo tree: best-effort, no `verify-install` leg. See
+  `packaging/gentoo.md`.
+- **Void Linux**: `xbps-src` template (in-tree draft, not in void-packages:
+  best-effort) in `packaging/void/srcpkgs/bitty/template`; see
+  `packaging/void.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`
   leg); see `packaging/opensuse.md`.
 

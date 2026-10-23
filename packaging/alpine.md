@@ -41,3 +41,41 @@ scripts/install-smoke.sh --distro alpine --package dist/bitty-x86_64-unknown-lin
 
 Alpine 3.22 is the pinned build image; no scripts with unbounded work, and the
 `apk` packager uses no-op scripts.
+
+## Upstream aports template
+
+For building from source via Alpine's official packaging system (`abuild`), an
+`APKBUILD` template is provided at `packaging/alpine/APKBUILD`:
+
+```sh
+# Setup Alpine build environment
+apk add alpine-sdk cargo-auditable rust
+
+# Build the package from source
+cd packaging/alpine
+abuild checksum
+abuild -r
+```
+
+The template adheres to Alpine aports packaging standards:
+
+- Sets `options="net"` for the `prepare()` phase to execute `cargo fetch --locked`.
+- Compiles with `cargo auditable build --release --locked -p bitty-terminal` and
+  `RUSTFLAGS="-C target-feature=-crt-static"` for shared musl linkage.
+- Installs the binary, AppStream metadata, `.desktop` launcher, Hicolor icon
+  hierarchy, and compiled terminfo database (`tic -x`).
+- Splits the documentation into `bitty-doc` through an explicit `doc()`
+  function, so `abuild validate` finds a split function for every declared
+  subpackage.
+- Declares `license="MIT OR Apache-2.0"`, matching `Cargo.toml`, the AUR
+  recipes, the RPM spec, and `nfpm.yaml`.
+
+## Release timing
+
+Source and checksum steps run **at tag time**. `abuild checksum` fetches
+`https://github.com/bitty-terminal/bitty/archive/refs/tags/v$pkgver.tar.gz`,
+which does not exist until the release tag is pushed, so `pkgver` is bumped in
+the release PR and the checksum is committed with that tag. Running
+`abuild checksum` against an unreleased `pkgver` fails closed on the 404
+instead of pinning a hash for a tarball that may never be published.
+

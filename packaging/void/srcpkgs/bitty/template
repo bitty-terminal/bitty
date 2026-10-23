@@ -1,0 +1,33 @@
+# Template file for 'bitty'
+pkgname=bitty
+version=0.0.27
+revision=1
+build_style=cargo
+make_install_args="--path crates/bitty-terminal --bin bitty"
+hostmakedepends="pkg-config cargo ncurses"
+makedepends="fontconfig-devel freetype-devel"
+short_desc="GPU-accelerated terminal emulator with panes and Lua extensions"
+maintainer="Xuepo <xuepo@bitty.run>"
+license="MIT OR Apache-2.0"
+homepage="https://bitty.run"
+changelog="https://raw.githubusercontent.com/bitty-terminal/bitty/main/CHANGELOG.md"
+distfiles="https://github.com/bitty-terminal/bitty/archive/refs/tags/v${version}.tar.gz"
+# checksum=SKIP is deliberate for the in-tree draft: the distfile is the
+# GitHub tag archive, which does not exist until the release tag is pushed.
+# At tag time replace SKIP with the value printed by
+# `./xbps-src xgensum -a bitty` (see packaging/void.md); a template submitted
+# to void-packages must carry the real sha256, never SKIP.
+checksum="SKIP"
+
+post_install() {
+	vdesk packaging/run.bitty.Bitty.desktop
+	vinstall packaging/run.bitty.Bitty.metainfo.xml 644 usr/share/metainfo
+	for size in 16 32 64 128 256 512; do
+		vinstall packaging/icons/hicolor/${size}x${size}/apps/bitty.png 644 usr/share/icons/hicolor/${size}x${size}/apps
+	done
+	vinstall packaging/icons/hicolor/scalable/apps/bitty.svg 644 usr/share/icons/hicolor/scalable/apps
+	vlicense LICENSE
+	vdoc README.md
+	vdoc CHANGELOG.md
+	tic -x -o "${DESTDIR}/usr/share/terminfo" terminfo/bitty.ti
+}

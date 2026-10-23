@@ -123,7 +123,7 @@ pub use placement::{
 pub use replies::{REPLY_CAP_BYTES, Replies};
 pub use scrollback::{SCROLLBACK_DEFAULT_LINES, SCROLLBACK_MAX_LINES, ScrollbackLine};
 pub use state::{
-    GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, MAX_GRID_DIM,
+    GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, MAX_GRID_DIM, ResizeReport,
     SNAPSHOT_VERSION, Snapshot, State, TelemetryCounters, ZONE_RECORDS_MAX, ZoneRecord,
 };
 pub use tabs::TabStops;

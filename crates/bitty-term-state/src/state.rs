@@ -202,6 +202,27 @@ pub struct TelemetryCounters {
     pub kitty_refused: u64,
 }
 
+/// Content displacement produced by one [`State::resize`] call.
+///
+/// Advisory observation for consumers that hold *grid coordinates* (the
+/// runtime selection). It is not part of Terminal Truth and never enters the
+/// canonical state hash.
+///
+/// `row_shift` is the signed distance the primary-screen content moved:
+/// negative after a height shrink moved the oldest rows into scrollback,
+/// positive after a height grow pulled history back in above the viewport.
+/// It is `0` when the content did not move (unused padding absorbed the
+/// shrink, the viewport grew downward, or the alternate screen was active)
+/// and when the width changed, because a width reflow remaps rows and
+/// columns non-linearly and is not a constant shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResizeReport {
+    /// Signed row displacement of primary-screen content, in grid rows.
+    pub row_shift: i32,
+    /// Whether this resize changed the grid width (and therefore reflowed).
+    pub width_changed: bool,
+}
+
 #[derive(Debug, Clone)]
 struct ScreenSave {
     cursor_position: CursorPosition,
@@ -429,13 +450,29 @@ impl State {
     /// scrollback-reflow damage tagged with the new generation. Headless:
     /// pure in-memory, no I/O, deterministic.
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) -> Damage {
+        self.resize_with_report(new_cols, new_rows).0
+    }
+
+    /// [`Self::resize`] plus the [`ResizeReport`] consumers use to keep
+    /// grid-anchored state (the runtime selection) on the same content.
+    ///
+    /// The report is advisory: it describes this call only and is not stored
+    /// in the state or the canonical hash.
+    pub fn resize_with_report(
+        &mut self,
+        new_cols: usize,
+        new_rows: usize,
+    ) -> (Damage, ResizeReport) {
         let cols = new_cols.clamp(1, MAX_GRID_DIM);
         let rows = new_rows.clamp(1, MAX_GRID_DIM);
         if cols == self.width && rows == self.height {
-            return Damage {
-                generation: self.generation,
-                regions: Vec::new().into_boxed_slice(),
-            };
+            return (
+                Damage {
+                    generation: self.generation,
+                    regions: Vec::new().into_boxed_slice(),
+                },
+                ResizeReport::default(),
+            );
         }
         let erase = self.bce_style();
         // M1-18: any geometry change reassigns scrollback ids (width
@@ -445,13 +482,17 @@ impl State {
         let old_cols = self.width;
         let old_rows = self.height;
         let alt_active = self.alt_screen != AltScreen::Off;
+        let width_changed = cols != old_cols;
+        let mut report = ResizeReport {
+            row_shift: 0,
+            width_changed,
+        };
         // Snapshot old logical lines + primary cursor offset before mutating,
         // so a width reflow can keep the cursor on the same content. Only
         // when the primary screen is active; alt-screen cursors clamp.
         // Collected once and reused by the reflow below (single pass,
         // CTX-0469); the cursor mapping additionally reuses the reflow's
         // per-logical row counts instead of rewrapping every logical again.
-        let width_changed = cols != old_cols;
         // Pre-take scrollback length for cursor bookkeeping: the take below
         // drains the buffer, so the combined index must use this snapshot.
         let sb_len_before = self.scrollback.len();
@@ -488,7 +529,12 @@ impl State {
             // Height-only: keep the logical rows intact and move lines
             // between the viewport and scrollback instead of truncating the
             // newest rows (#2529). Alt keeps the xterm truncate/pad policy.
-            self.resize_height_only(rows, &erase);
+            let shift = self.resize_height_only(rows, &erase);
+            // A selection on the active alt screen addresses the alt grid,
+            // which truncates/pads in place; the primary shift is invisible.
+            if !alt_active {
+                report.row_shift = shift;
+            }
             (Vec::new(), None)
         } else {
             // Width change: reflow primary (main + scrollback), truncate alt.
@@ -634,7 +680,7 @@ impl State {
             "RFC invariants violated after resize: {:?}",
             self.check_invariants()
         );
-        damage
+        (damage, report)
     }
 
     /// Height-only resize of the primary screen (#2529).
@@ -653,7 +699,20 @@ impl State {
     /// The alternate grid keeps the application-owned truncate/pad policy.
     /// Kitty placements follow the primary content shift and are clipped
     /// when they no longer fit; alt-screen placements are only clipped.
-    fn resize_height_only(&mut self, new_rows: usize, erase: &Style) {
+    ///
+    /// Cursor-detach edge (#2543): the cursor detaches only when
+    /// `new_rows < used_rows - cursor_row`: after every absorbable padding
+    /// row below the used height is gone, the remaining push is large enough
+    /// to move the cursor's own row into scrollback. Its content is preserved
+    /// there, but the cursor cannot stay attached to a row the viewport no
+    /// longer contains, so it clamps to row 0 (the top of the remaining
+    /// content). Attachment requires at least `used_rows - cursor_row` rows
+    /// (the cursor row plus every used row below it); keeping fewer would
+    /// drop newer rows, violating the never-drop-newest contract.
+    ///
+    /// Returns the signed row shift applied to the primary content (negative
+    /// on a push, positive on a history pull, `0` when nothing moved).
+    fn resize_height_only(&mut self, new_rows: usize, erase: &Style) -> i32 {
         let old_rows = self.height;
         let cols = self.width;
         let alt_active = self.alt_screen != AltScreen::Off;
@@ -748,6 +807,7 @@ impl State {
         self.kitty_placements
             .resize_height(new_rows_u32, primary_shift, false);
         self.kitty_placements.resize_height(new_rows_u32, 0, true);
+        primary_shift
     }
 
     /// Number of rows the primary grid actually uses: from the top through
@@ -3790,6 +3850,14 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
         }
         // Width-one bounded representation (CTX-0829): when new_cols == 1,
         // a width=2 char cannot fit with its spacer. Emit the lead as width=1.
+        //
+        // Bounded-memory tradeoff (#2543): at one column every printable
+        // cell becomes its own physical row, so a W-column transcript
+        // repacks into roughly W times as many rows and a deep history is
+        // pruned by `Scrollback::max_lines` (oldest first) on the way back
+        // up. That cap is the intended bound for threat T-01: eviction is
+        // ordinary oldest-first pruning, never a panic or a partially
+        // rewritten line, and the retained suffix reflows back losslessly.
         if w == 2 && new_cols == 1 {
             let mut narrow = *lead;
             narrow.width = 1;

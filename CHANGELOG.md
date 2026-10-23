@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.27] - 2026-10-23
+
 ### Added
 
 - **Capability consent profiles (#2472):** bundled plugin installs and grants
@@ -45,6 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability exits 4 after the report. `--format table|json|jsonl` and
   `--no-color` match the other read-only plugin commands. No plugin code runs,
   no VM is created, no network is used, and no state is mutated.
+- **Headless memory probe and resize/zoom regression (#2524):**
+  `scripts/mem-probe-headless.sh` samples RSS, PSS, VmSize, threads, and fds
+  for an isolated `--test-mode` session at a chosen pane count, scrollback,
+  and optional Kitty image; its optional budget gate reads resident memory
+  only. `crates/bitty-runtime/tests/memory_resize_regression.rs` pins repeated
+  grow/shrink and zoom passes to a byte-stable `workspace_memory_report()`.
+- **Accessibility component host (#2496):** the `bitty-a11y` component server
+  ships a bounded snapshot/diff protocol, and Core includes a default-off
+  `ComponentSnapshotHost` with safe-mode and capability denial, stable
+  generations, and fail-closed EOF/crash handling. No AT-SPI/UIA/AX platform
+  backend is included.
+- **Linux packaging channels:** Alpine `APKBUILD`, a Gentoo overlay
+  (`bitty-bin` and `9999` ebuilds), and a Void `xbps-src` template (#2513,
+  #2516, #2517); an openSUSE OBS spec with a zypper repository recipe
+  (#2514); and a portable AppImage bundle produced by
+  `scripts/make-appimage.sh` for every Linux release leg (#2555). The distro
+  recipes are gated by `scripts/tests/check-distro-recipes.test.sh` under
+  `just check`. Earlier this cycle the APT repository served from Cloudflare
+  R2 (#2510), the Fedora Copr pipeline (#2503), and the Nix/Cachix binary
+  cache (#2519) landed, with the flake dependencies locked through crane and
+  the Cachix CD hardened (#2515).
 
 ### Fixed
 
@@ -69,15 +92,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line height and descent, forcing the legacy 3/4 baseline. The backend now
   sizes the face with one probe glyph at the requested size before
   measuring, restoring the metric-aware baseline.
-
-### Added
-
-- **Headless memory probe and resize/zoom regression (#2524):**
-  `scripts/mem-probe-headless.sh` samples RSS, PSS, VmSize, threads, and fds
-  for an isolated `--test-mode` session at a chosen pane count, scrollback,
-  and optional Kitty image; its optional budget gate reads resident memory
-  only. `crates/bitty-runtime/tests/memory_resize_regression.rs` pins repeated
-  grow/shrink and zoom passes to a byte-stable `workspace_memory_report()`.
+- **Hyprland-style tiling (#2521, #2526, #2528, #2532):** new panels use the
+  `Balanced` policy by default, split the largest slot along the cell-aspect
+  axis, and always keep a gap-aware 10x4-cell minimum. `Mod+j` follows facing
+  edges and dwindle adjacency; closing a pane focuses the sibling that expands
+  into its slot; workspace IDs reuse the lowest free number.
+- **Last-shell workspace ghost (#2525, #2531):** exiting the only panel of a
+  workspace now prunes that workspace instead of leaving a focused session-less
+  tile, with zoom-backup and float/pin guards.
+- **Inactive-workspace zoom backups (#2531):** reaping a pane or primary shell
+  in a background workspace restores that workspace's zoom backup first, drops
+  dead views from the authoritative stashed layout instead of leaving ghost
+  tiles, and keeps surviving hidden-pane sessions plus workspace focus and
+  primary-shell ownership intact. A stale zoom proxy is preserved instead of
+  consumed, so a failed restore no longer discards a usable backup.
+- **Selection and copy mode (#2480, #2470, #2523):** I-beam over selectable
+  text, caret-anchored one-cell selections, Block and Simple paint geometry,
+  wide-glyph leaders, selections that span scrollback while dragging or
+  wheel-scrolling, and selection in detached floats and pinned leaves.
+- **Resize/reflow (#2529):** height-only resizes preserve rows and anchors;
+  width reflow trims only synthetic padding, so CJK, emoji, and real spaces
+  survive repeated resizes and copy exactly.
+- **Resize follow-ups (#2543):** a height-only resize now reports the signed
+  primary-content row shift, and the runtime remaps a held non-buffer
+  selection by that shift before clamping; endpoints pushed into scrollback
+  drop fail-closed, while width reflows keep the clamp path. The cursor-detach
+  condition is documented and regressed (`new_rows < used_rows - cursor_row`
+  detaches, attachment needs `used_rows - cursor_row` rows), the width-1
+  reflow `max_lines` cap is covered, and a vertical-divider shrink keeps a
+  pane-owned selection on its content.
+- **Floating outlines and the pink profile (#2522):** tiled panel rings stay
+  visible under a detached float, and `border=1, radius=4` keeps the right
+  border.
+- **Rapid redraw and kitty images (#2486, #2437):** PTY bursts settle into one
+  presented frame without stale rows, and kitty images in a panel survive
+  entering and leaving a full-screen TUI.
+- **Memory and resize/zoom stability (#2524):** the per-pane writer thread uses
+  a 128 KiB stack, reducing the per-thread virtual stack reservation; measured
+  resident memory and resize/zoom frame times are at parity with 0.0.25. An
+  idle writer thread can still retain a glibc malloc-arena mapping (see
+  Changed).
+- **Release smoke checks (#2504):** post-release version checks fail closed on
+  missing, empty, multiline, wrong-channel, or prerelease output across Linux,
+  macOS, Windows, Scoop, Homebrew, Nix, and the Unix bundle.
+- **Windows version pointer (#2511):** `install.ps1` decodes the release
+  pointer correctly.
 
 ### Changed
 
@@ -91,6 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   On glibc, an idle writer thread can retain a reserved 64 MiB malloc-arena
   mapping after its first allocation; that reservation is virtual and is not
   equivalent to 64 MiB of RSS.
+- **Official bar plugin:** the bundled catalog pin moves to `0fa15139`
+  (`bitty-plugins#115`).
 
 ## [0.0.26] - 2026-10-22
 

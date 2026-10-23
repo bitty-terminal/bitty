@@ -470,6 +470,20 @@ struct KittyAltStash {
     virtuals: Vec<bitty_rich::KittyVirtualPrototype>,
 }
 
+/// Bounded retry state after a GPU present failure (issue #2570).
+///
+/// Hyprland can stop releasing a swap-chain image while a window is hidden;
+/// the next acquire then reports `Timeout`/`Outdated`/`Lost`. The failed frame
+/// keeps its damage and is retried on a bounded exponential backoff instead of
+/// being consumed by an invisible CPU fallback.
+#[derive(Debug, Default)]
+struct SurfaceRetry {
+    /// Consecutive failed presents since the last success.
+    failures: u32,
+    /// Next retry wake, when a retry is armed.
+    deadline: Option<std::time::Instant>,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -1179,6 +1193,14 @@ pub struct Runtime {
     kitty_log: log_throttle::LogThrottle,
     /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
     spawn_log: log_throttle::LogThrottle,
+    /// Rate-limited diagnostics for failed GPU presents (issue #2570).
+    ///
+    /// A present failure used to fall back to the CPU compositor silently and
+    /// then consume the frame's damage, leaving the window stale. The failure
+    /// is now loud (bounded) and the frame is retried.
+    gpu_present_log: log_throttle::LogThrottle,
+    /// Bounded retry state after a failed GPU present (issue #2570).
+    surface_retry: SurfaceRetry,
     pending_activation_gesture: Option<ActivationGesture>,
     /// Exact URI bound to [`Self::pending_activation_gesture`] at mint time
     /// (CTX-0577); consumed together with it so the live consumer never
@@ -1969,6 +1991,11 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
+            gpu_present_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            surface_retry: SurfaceRetry::default(),
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,
@@ -2260,6 +2287,11 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
+            gpu_present_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            surface_retry: SurfaceRetry::default(),
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,

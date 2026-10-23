@@ -238,6 +238,7 @@ mod composer_owner;
 mod config_cli;
 mod config_reload;
 mod consent;
+mod crash_report;
 mod ctl;
 mod dev;
 mod doctor;
@@ -1346,18 +1347,27 @@ fn main() {
             app_config.file_path.clone(),
         );
     }
+    // Issue #2570: capture the next silent disappearance with a bounded
+    // panic report even when the opt-in stall watchdog is off. Installed only
+    // for the interactive event loop (headless smoke stays quiet).
+    crash_report::install();
     let headless_fallback_needed = match App::run(app) {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => {
+            crash_report::record_exit(crash_report::ExitReason::EventLoopReturned);
+            std::process::exit(0);
+        }
         Err(PlatformError::DisplayUnavailable(detail)) => {
             logging::warn(|| {
                 format!(
                     "bitty: no usable display server ({detail}) — falling back to headless smoke (CI path)"
                 )
             });
+            crash_report::record_exit(crash_report::ExitReason::DisplayFallback);
             true
         }
         Err(other) => {
             eprintln!("bitty: event loop failed: {other}");
+            crash_report::record_exit(crash_report::ExitReason::Unknown);
             std::process::exit(1);
         }
     };

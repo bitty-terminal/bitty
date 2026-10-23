@@ -7,6 +7,22 @@ use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
 use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
+/// First retry delay after a failed real-GPU present (issue #2570).
+const SURFACE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Retry-delay ceiling: a permanently lost surface retries once per second.
+const SURFACE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Bounded exponential backoff for a failed real-GPU present.
+///
+/// `failures` is the consecutive failure count (saturating). The returned
+/// delay starts at [`SURFACE_RETRY_INITIAL`], doubles per failure, and is
+/// capped at [`SURFACE_RETRY_MAX`]; it never reaches zero.
+fn surface_retry_delay(failures: u32) -> std::time::Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    let scaled = SURFACE_RETRY_INITIAL.saturating_mul(1u32 << shift);
+    scaled.min(SURFACE_RETRY_MAX)
+}
+
 /// Minimum focused-frame width (cells) for a legible presentation overlay.
 ///
 /// The presentation surface is informational and non-modal, so a frame too
@@ -2127,6 +2143,26 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        let stats = self.tick_at_inner(now);
+        // Issue #2570: a retry tick that produced no present (the frame was
+        // deferred, had no damage to rebuild, or returned before the present
+        // phase) must not leave a past-due retry deadline behind:
+        // `AboutToWait` would wake immediately and spin. Push the next
+        // attempt out on the bounded backoff. A failed present already armed
+        // a future deadline, and a successful one cleared it.
+        if stats.is_none() {
+            if let Some(deadline) = self.surface_retry.deadline {
+                if now >= deadline {
+                    self.arm_surface_retry(now);
+                }
+            }
+        }
+        stats
+    }
+
+    /// Tick body behind [`Self::tick_at`] (kept separate so every early
+    /// return passes through the surface-retry deadline guard).
+    fn tick_at_inner(&mut self, now: std::time::Instant) -> Option<PresentStats> {
         // Issue #2470: apply at most one pending pointer-drag edge auto-scroll
         // step before the time gates and idle short-circuit, so a stationary
         // pointer at the viewport edge keeps extending the selection while the
@@ -2186,7 +2222,7 @@ impl Runtime {
         if self.reject_stale_atlas_frame(&layers) {
             return None;
         }
-        let stats = self.present_assembled_frame(basis, layers);
+        let stats = self.present_assembled_frame(basis, layers, now);
         // CTX-1231: the pacing gate measures real present cadence — stamp
         // only ticks that actually committed a frame, never deferred, idle,
         // or rejected ones.
@@ -5497,6 +5533,41 @@ impl Runtime {
         }
     }
 
+    /// Next wake armed after a failed real-GPU present (issue #2570).
+    ///
+    /// `None` when no retry is pending. The embedder includes this in its
+    /// `AboutToWait` wake selection so a window whose compositor stopped
+    /// releasing buffers recovers without requiring unrelated input.
+    #[must_use]
+    pub fn surface_retry_deadline(&self) -> Option<std::time::Instant> {
+        self.surface_retry.deadline
+    }
+
+    /// Records one failed real-GPU present and reports it (rate-limited).
+    ///
+    /// Never logs a host path: the render error is a driver/surface class
+    /// string.
+    fn note_surface_present_failure(&mut self, error: &RenderError) {
+        if let Some(suppressed) = self.gpu_present_log.admit_now() {
+            let suffix = log_throttle::suppressed_suffix(suppressed);
+            eprintln!(
+                "bitty: gpu present failed ({error}); retained damage and queued a retry{suffix}"
+            );
+        }
+    }
+
+    /// Arms the next bounded retry after a failed present.
+    fn arm_surface_retry(&mut self, now: std::time::Instant) {
+        self.surface_retry.failures = self.surface_retry.failures.saturating_add(1);
+        let delay = surface_retry_delay(self.surface_retry.failures);
+        self.surface_retry.deadline = Some(now + delay);
+    }
+
+    /// Clears the retry state after a successful present.
+    fn clear_surface_retry(&mut self) {
+        self.surface_retry = SurfaceRetry::default();
+    }
+
     /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
     /// and build [`PresentStats`]; returns `None` on an empty or idle frame
     /// after recording the consumed generations. Body moved verbatim from
@@ -5505,6 +5576,7 @@ impl Runtime {
         &mut self,
         basis: TickBasis,
         layers: FrameLayers,
+        now: std::time::Instant,
     ) -> Option<PresentStats> {
         let TickBasis {
             snapshot,
@@ -5663,16 +5735,21 @@ impl Runtime {
                 .surface
                 .present_draw_list(gpu, &combined_list, Some((&atlas_texels, dims)))
             {
-                Ok(s) => s,
-                Err(_) => {
-                    // GPU present failed (surface lost/outdated): fallback to headless for this frame
-                    match self
-                        .surface
-                        .headless_present(&combined_list, Some((&atlas_texels, dims)))
-                    {
-                        Ok(h) => h,
-                        Err(_) => return None,
-                    }
+                Ok(s) => {
+                    self.clear_surface_retry();
+                    s
+                }
+                Err(err) => {
+                    // Issue #2570: a failed real-GPU present must not be
+                    // papered over by an invisible CPU composite that then
+                    // consumes the frame's damage. Retain the damage, report
+                    // the failure (rate-limited), and retry on a bounded
+                    // backoff so the window recovers when the compositor
+                    // releases the swap chain again.
+                    self.note_surface_present_failure(&err);
+                    self.arm_surface_retry(now);
+                    self.pending_full_redraw = true;
+                    return None;
                 }
             }
         } else {
@@ -5680,7 +5757,10 @@ impl Runtime {
                 .surface
                 .headless_present(&combined_list, Some((&atlas_texels, dims)))
             {
-                Ok(stats) => stats,
+                Ok(stats) => {
+                    self.clear_surface_retry();
+                    stats
+                }
                 Err(_) => return None,
             }
         };
@@ -8090,5 +8170,16 @@ mod unicode_run_union_tests {
         assert_eq!(pixel(3, 0), [0; 4]);
         assert_eq!(pixel(3, 1), [255; 4], "covered cell on the second row");
         assert_eq!(pixel(0, 1), [0; 4], "uncovered cell stays text-visible");
+    }
+
+    #[test]
+    fn surface_retry_backoff_is_bounded_and_monotonic() {
+        assert_eq!(surface_retry_delay(1), SURFACE_RETRY_INITIAL);
+        assert_eq!(surface_retry_delay(2), SURFACE_RETRY_INITIAL * 2);
+        assert_eq!(surface_retry_delay(3), SURFACE_RETRY_INITIAL * 4);
+        assert_eq!(surface_retry_delay(6), SURFACE_RETRY_MAX);
+        assert_eq!(surface_retry_delay(9), SURFACE_RETRY_MAX);
+        assert_eq!(surface_retry_delay(u32::MAX), SURFACE_RETRY_MAX);
+        assert!(surface_retry_delay(0) >= SURFACE_RETRY_INITIAL);
     }
 }

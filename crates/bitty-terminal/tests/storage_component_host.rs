@@ -484,14 +484,34 @@ fn component_session_and_kv_backends_match_the_linked_model() {
             .is_err()
     );
 
-    // Whole-object bounds are enforced before any component write.
+    // Whole-object bounds are enforced before any component write. The v1
+    // batch ceiling is lower than the 1 MiB snapshot read bound, so a
+    // too-large object must fail closed and leave the previous state intact.
+    let bounded =
+        StorageComponentBytesBackend::new(Arc::clone(&client), "bounded".to_owned(), DEADLINE)
+            .expect("bounded namespace");
+    bounded.commit(b"small").expect("small object");
+    assert_eq!(
+        bounded
+            .commit(&vec![
+                0u8;
+                bitty_terminal::storage_component_host::MAX_BATCH_BYTES
+            ])
+            .expect_err("batch ceiling"),
+        StorageHostError::Bounds
+    );
+    assert_eq!(
+        bounded.load().expect("previous object"),
+        Some(b"small".to_vec())
+    );
     let oversized = vec![0u8; bitty_terminal::storage_component_host::MAX_COMPONENT_BYTES + 1];
     assert_eq!(
-        StorageComponentBytesBackend::new(Arc::clone(&client), "bounded".to_owned(), DEADLINE,)
-            .expect("bounded namespace")
-            .commit(&oversized)
-            .expect_err("oversized object"),
+        bounded.commit(&oversized).expect_err("oversized object"),
         StorageHostError::Bounds
+    );
+    assert_eq!(
+        bounded.load().expect("previous object after oversized"),
+        Some(b"small".to_vec())
     );
 
     // Plugin KV parity over the same opaque store image.

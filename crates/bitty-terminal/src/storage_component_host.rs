@@ -1409,10 +1409,16 @@ mod enabled {
         /// Submit a whole-object mutation as bounded chunks. Once submitted,
         /// this method never retries or falls back.
         ///
+        /// The v1 batch ceiling ([`MAX_BATCH_BYTES`]) is lower than the
+        /// snapshot ceiling, so an object whose encoded upsert/delete batch
+        /// would exceed it is refused with [`StorageHostError::Bounds`] before
+        /// any mutation. Whole-object atomic commits above that ceiling need a
+        /// transaction extension in the component protocol.
+        ///
         /// # Errors
         ///
-        /// Returns [`StorageHostError::Bounds`] for an over-bound object and
-        /// the fail-closed protocol/component errors otherwise.
+        /// Returns [`StorageHostError::Bounds`] for an over-bound object or
+        /// batch and the fail-closed protocol/component errors otherwise.
         pub fn commit(&self, bytes: &[u8]) -> Result<StorageCommit, StorageHostError> {
             if bytes.len() > MAX_COMPONENT_BYTES {
                 return Err(StorageHostError::Bounds);

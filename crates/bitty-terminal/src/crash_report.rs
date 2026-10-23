@@ -151,7 +151,6 @@ static INSTALLED: Once = Once::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PHASE: AtomicU8 = AtomicU8::new(Phase::Startup as u8);
 static LAST_LIFECYCLE: AtomicU8 = AtomicU8::new(Lifecycle::Startup as u8);
-static EXIT_REASON: AtomicU8 = AtomicU8::new(ExitReason::Unknown as u8);
 static EXIT_RECORDED: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_COUNTS: [AtomicU64; Lifecycle::COUNT] =
     [const { AtomicU64::new(0) }; Lifecycle::COUNT];
@@ -211,7 +210,6 @@ pub(crate) fn lifecycle(event: Lifecycle) {
 /// Called on every explicit exit path; the panic hook overwrites the crash
 /// slot, so a panic and a clean exit stay distinguishable.
 pub(crate) fn record_exit(reason: ExitReason) {
-    EXIT_REASON.store(reason as u8, Ordering::Relaxed);
     // The first exit path is the specific one (shell-exit, close-view,
     // route-event); the event loop then returns and `main` would otherwise
     // overwrite it with the generic `event-loop-returned`.

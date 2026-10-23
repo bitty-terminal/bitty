@@ -2010,6 +2010,19 @@ mod tests {
         assert!(scope.source.is_char_boundary(scope.source.len()));
         assert!(scope.source.len() <= MAX_RAW_DECLARATION_BYTES);
         assert!(scope.source.ends_with('a'));
+
+        let source = format!(
+            "policies/{}/capabilities.conf",
+            "é".repeat(MAX_RAW_DECLARATION_BYTES)
+        );
+        for provenance in [PolicyProvenance::User, PolicyProvenance::Project] {
+            let scope = parse_policy("allow ui.rich\n", provenance, &source)
+                .expect("long multibyte source attribution must remain valid");
+            assert!(scope.source.len() <= MAX_RAW_DECLARATION_BYTES);
+            assert!(scope.source.is_char_boundary(scope.source.len()));
+            let prefix = format!("{}:", provenance.as_str());
+            assert!(scope.source.starts_with(&prefix));
+        }
     }
 
     #[test]
@@ -2819,7 +2832,7 @@ pub fn parse_policy(
         }
     }
     // Provenance prefix keeps the RFC layer visible in reason chains.
-    scope.source = format!("{}:{source}", provenance.as_str());
+    scope.source = bounded_source(format!("{}:{source}", provenance.as_str()));
     scope.validate()?;
     Ok(scope)
 }

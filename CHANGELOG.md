@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Crisp glyphs on fractional-DPI windows (#2520):** the GPU present path
   derived its sampling scale from `surface / plan`, but the cell-aligned plan
   stops short of a window that is not an exact multiple of the cell. At
-  11pt with a 1.6 DPI factor (14x32 px cells) the leftover 30 px column made
-  every glyph stretch ~1.01x through bilinear filtering, which the owner saw
-  as blurred/damaged text. The plan now spans the configured surface extent,
-  so the scale is exactly 1.0 and the leftover strip stays background.
+  11pt with a 1.6 DPI factor (14x32 px cells) the leftover 30 px horizontal
+  strip made every glyph stretch ~1.01x through bilinear filtering, which the
+  owner saw as blurred/damaged text. The plan now spans the configured
+  surface extent, so the scale is exactly 1.0 and the leftover strip stays
+  background.
 - **Font metrics are measured at the requested size (#2520):** the crossfont
   backend read FreeType line metrics before the face had a raster size, so it
   reported font-unit advances (DejaVu: 19.265625 px at every size) with zero

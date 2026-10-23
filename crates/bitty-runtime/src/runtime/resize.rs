@@ -915,22 +915,29 @@ mod tests {
 
     #[test]
     fn present_plan_keeps_owner_size_11_at_scale_1_6_crisp() {
-        // #2520 reproduction numbers: 11pt at 1.6 DPI has a 14x32 physical
-        // cell. A 2506x1496 window leaves a 12 px horizontal and 30 px
-        // vertical strip past the cell-aligned plan; the old plan made the
-        // GPU stretch all text by ~1.01x (visible vertical smearing).
+        // #2520 reproduction numbers: the owner's 11pt base cell is 9x20.
+        // Adopting 1.6 DPI gives the 14x32 physical cell actually rendered on
+        // the 2506x1496 window; the cell-aligned plan stops at 2504x1466, and
+        // the old GPU path stretched all text by ~1.01x (visible vertical
+        // smearing). Use the deterministic rasterizer so this exercises the
+        // real `apply_dpi_scale` path without requiring host fonts in CI.
         use bitty_platform::PhysicalSize;
 
         let cfg = RuntimeConfig {
             font_family: "DejaVu Sans Mono".to_string(),
             font_size: 11.0,
-            cell_width: 14,
-            cell_height: 32,
+            cell_width: 9,
+            cell_height: 20,
             ..RuntimeConfig::default()
         };
-        let mut rt = Runtime::new(cfg).expect("runtime builds");
-        rt.handle_resize(PhysicalSize::new(2506, 1496))
-            .expect("resize reflows");
+        let mut rt = Runtime::with_deterministic_rasterizer(cfg).expect("runtime builds");
+        rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
+        assert_eq!(rt.dpi_scale(), 1.6);
+        assert_eq!(
+            (rt.live_cell_metrics().width, rt.live_cell_metrics().height),
+            (14, 32),
+            "11pt at 1.6 DPI must adopt the 14x32 physical cell"
+        );
 
         let surface = rt.surface_extent().expect("surface configured");
         let plan = rt.present_plan_extent();

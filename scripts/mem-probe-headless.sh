@@ -9,9 +9,16 @@
 #
 # What it does: creates an isolated XDG tree, writes a throwaway `init.lua`
 # with the requested scrollback, starts `bitty --test-mode` on a private
-# socket, splits to the requested panel count through `bitty ctl`, optionally
-# feeds one Kitty-protocol image payload into pane 1, then samples
+# socket, splits to the requested panel count through `bitty ctl`, runs a
+# scrollback-filling command in every live pane, optionally feeds one
+# Kitty-protocol image payload into pane 1, then samples
 # /proc/PID/status + smaps_rollup + fd/task counts on a fixed interval.
+#
+# CSV columns: t_s,rss_kb,vsize_kb,pss_kb,anon_kb,file_kb,shmem_kb,threads,fds.
+# `rss_kb` (VmRSS) and `pss_kb` are resident; `vsize_kb` (VmSize) is virtual
+# address space and is reported separately so a VSZ claim can be reproduced
+# without being conflated with memory pressure. Optional RSS/PSS gates read
+# their respective resident peaks only, never VmSize.
 #
 # Isolation and process safety:
 # - HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME, and
@@ -23,10 +30,12 @@
 # Evidence stays local under the out dir: `samples.csv`, `session.log`,
 # `status.txt`, `summary.txt`. Use `memory-summary.sh`-style diffing (or any
 # CSV reader) to compare two runs; comparability requires the same panel
-# count, scrollback, image payload, sample interval, and binary build flags.
+# count, configured scrollback, generated lines per pane, image payload,
+# sample interval, and binary build flags.
 #
-# Gate (optional): `--max-rss-kb N` exits 1 when the final or peak VmRSS
-# exceeds N, mirroring mem-measure.sh's interim gate for a caller-owned budget.
+# Gates (optional): `--max-rss-kb N` and `--max-pss-kb N` independently exit 1
+# when their respective resident-memory peaks exceed the caller-owned budget.
+# VmSize is reported for analysis but never used as a resident-memory gate.
 #
 # Usage:
 #   scripts/mem-probe-headless.sh --binary target/release/bitty [options]
@@ -44,6 +53,7 @@ SAMPLE_INTERVAL=10
 IMAGE=""
 OUT_DIR=""
 MAX_RSS_KB=0
+MAX_PSS_KB=0
 DRY_RUN=0
 KEEP=0
 
@@ -59,6 +69,7 @@ Options:
   --seconds N          observation window 0..3600 (default: 60)
   --interval N         sample interval 1..60 seconds (default: 10)
   --max-rss-kb N       optional gate: exit 1 when final/peak VmRSS exceeds N
+  --max-pss-kb N       optional resident gate: exit 1 when peak PSS exceeds N
   --out-dir DIR        evidence directory (default: <tmp>/bitty-mem-probe-XXXX)
   --keep               keep the isolated tree (default: removed on exit)
   --dry-run            print the plan; launch nothing
@@ -108,6 +119,10 @@ while [ $# -gt 0 ]; do
     MAX_RSS_KB="${2:-}"
     shift 2
     ;;
+  --max-pss-kb)
+    MAX_PSS_KB="${2:-}"
+    shift 2
+    ;;
   --out-dir)
     OUT_DIR="${2:-}"
     shift 2
@@ -140,6 +155,7 @@ is_uint "$SAMPLE_INTERVAL" || die "--interval must be a positive integer"
 [ "$SAMPLE_INTERVAL" -ge 1 ] && [ "$SAMPLE_INTERVAL" -le 60 ] ||
   die "--interval must be 1..60"
 is_uint "$MAX_RSS_KB" || die "--max-rss-kb must be a non-negative integer"
+is_uint "$MAX_PSS_KB" || die "--max-pss-kb must be a non-negative integer"
 [ -z "$IMAGE" ] || [ -f "$IMAGE" ] || die "no such image payload: $IMAGE"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -152,7 +168,7 @@ BIN="$(readlink -f "$BIN")"
 if [ "$DRY_RUN" = "1" ]; then
   echo "mem-probe-headless: plan bin=$BIN panels=$PANELS scrollback=$SCROLLBACK"
   echo "  seconds=$SECONDS_TO_RUN interval=$SAMPLE_INTERVAL image=${IMAGE:-none}"
-  echo "  max_rss_kb=$MAX_RSS_KB out=${OUT_DIR:-<mktemp -d>}"
+  echo "  max_rss_kb=$MAX_RSS_KB max_pss_kb=$MAX_PSS_KB out=${OUT_DIR:-<mktemp -d>}"
   exit 0
 fi
 
@@ -173,6 +189,7 @@ printf 'return { terminal = { scrollback = %s } }\n' "$SCROLLBACK" \
 SOCK="$ISOLATED/run/sock"
 INSTANCE="mem-probe-$$"
 APP_PID=""
+PSS_SAMPLE_FAILED=0
 SAMPLES="$RUN_DIR/samples.csv"
 LOG="$RUN_DIR/session.log"
 
@@ -216,20 +233,25 @@ for _ in $(seq 1 300); do
 done
 [ -S "$SOCK" ] || die "test-mode socket did not appear (see $LOG)"
 
-ctl() { "$BIN" ctl --socket "$SOCK" "$@" >/dev/null 2>&1 || true; }
+ctl() { "$BIN" ctl --socket "$SOCK" "$@" >/dev/null; }
 
-echo "t_s,rss_kb,pss_kb,anon_kb,file_kb,shmem_kb,threads,fds" >"$SAMPLES"
+echo "t_s,rss_kb,vsize_kb,pss_kb,anon_kb,file_kb,shmem_kb,threads,fds" >"$SAMPLES"
 sample() {
-  local t="$1" rss pss anon file shmem threads fds
+  local t="$1" rss vsize pss anon file shmem threads fds
   rss="$(awk '/^VmRSS:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
+  vsize="$(awk '/^VmSize:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
   anon="$(awk '/^RssAnon:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
   file="$(awk '/^RssFile:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
   shmem="$(awk '/^RssShmem:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
   threads="$(awk '/^Threads:/{print $2}' "/proc/$APP_PID/status" 2>/dev/null || echo 0)"
-  pss="$(awk '/^Pss:/{print $2}' "/proc/$APP_PID/smaps_rollup" 2>/dev/null || echo 0)"
+  pss="$(awk '/^Pss:/{print $2}' "/proc/$APP_PID/smaps_rollup" 2>/dev/null || true)"
+  if [ -z "$pss" ]; then
+    if [ "$MAX_PSS_KB" -gt 0 ]; then PSS_SAMPLE_FAILED=1; fi
+    pss=0
+  fi
   fds="$(ls "/proc/$APP_PID/fd" 2>/dev/null | wc -l)"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$t" "$rss" "$pss" "$anon" "$file" "$shmem" "$threads" "$fds" >>"$SAMPLES"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$t" "$rss" "$vsize" "$pss" "$anon" "$file" "$shmem" "$threads" "$fds" >>"$SAMPLES"
 }
 
 # A short settle after startup, then the requested panel count.
@@ -241,6 +263,53 @@ while [ "$i" -lt "$PANELS" ]; do
   sleep 0.2
 done
 sleep 1
+
+# Fail closed if any split did not create all requested pane sessions. A
+# successful `view split` can leave an empty leaf when shell spawn fails.
+TERMINALS_JSON="$RUN_DIR/terminals.json"
+"$BIN" ctl --socket "$SOCK" terminal list >"$TERMINALS_JSON"
+ACTUAL_PANELS="$(jq '.terminals | length' "$TERMINALS_JSON")"
+LIVE_PANELS="$(jq '[.diagnostics[] | select(.has_session)] | length' "$TERMINALS_JSON")"
+[ "$ACTUAL_PANELS" -eq "$PANELS" ] || die "expected $PANELS panes, got $ACTUAL_PANELS (see $TERMINALS_JSON)"
+for _ in $(seq 1 30); do
+  [ "$LIVE_PANELS" -eq "$PANELS" ] && break
+  sleep 0.2
+  "$BIN" ctl --socket "$SOCK" terminal list >"$TERMINALS_JSON"
+  LIVE_PANELS="$(jq '[.diagnostics[] | select(.has_session)] | length' "$TERMINALS_JSON")"
+done
+[ "$LIVE_PANELS" -eq "$PANELS" ] || die "expected $PANELS live pane sessions, got $LIVE_PANELS (see $TERMINALS_JSON)"
+
+# A layout split creates a distinct live shell per pane. Fill every one rather
+# than claiming the configured scrollback limit is populated merely because
+# the panes exist. Generate beyond the history cap so the visible rows do not
+# prevent all panes from reaching the configured scrollback limit.
+PANE_IDS="$(jq -r '.diagnostics[] | select(.has_session) | .terminal_id' "$TERMINALS_JSON")"
+[ "$SCROLLBACK" -eq 0 ] && GENERATED_LINES=1 || GENERATED_LINES="$((SCROLLBACK + 100))"
+while IFS= read -r pane_id; do
+  pane_num="${pane_id#t:}"
+  ctl view focus "v:$pane_num"
+  ctl terminal send "$pane_id" "seq 1 $GENERATED_LINES"$'\r'
+  sleep 0.2
+done <<<"$PANE_IDS"
+sleep 2
+
+# Wait for each shell's final marker, then confirm the scrollback reached the
+# configured cap in every live pane before taking memory samples.
+while IFS= read -r pane_id; do
+  pane_num="${pane_id#t:}"
+  ctl view focus "v:$pane_num"
+  ctl terminal send "$pane_id" "echo BITTY_MEM_PROBE_DONE_$pane_num"$'\r'
+done <<<"$PANE_IDS"
+sleep 1
+"$BIN" ctl --socket "$SOCK" terminal list >"$TERMINALS_JSON"
+[ "$SCROLLBACK" -eq 0 ] && REQUIRED_LINES=0 || REQUIRED_LINES="$SCROLLBACK"
+for _ in $(seq 1 30); do
+  SHORT_PANELS="$(jq --argjson required "$REQUIRED_LINES" '[.diagnostics[] | select(.has_session and .scrollback_lines < $required)] | length' "$TERMINALS_JSON")"
+  [ "$SHORT_PANELS" -eq 0 ] && break
+  sleep 0.2
+  "$BIN" ctl --socket "$SOCK" terminal list >"$TERMINALS_JSON"
+done
+[ "$SHORT_PANELS" -eq 0 ] || die "scrollback was not populated to $REQUIRED_LINES lines in every live pane (see $TERMINALS_JSON)"
 
 if [ -n "$IMAGE" ]; then
   # Feed the payload through the pane's shell so it crosses the PTY parser
@@ -257,12 +326,19 @@ while [ $(($(date +%s) - START)) -lt "$SECONDS_TO_RUN" ]; do
   sample $(($(date +%s) - START))
 done
 
-grep -E 'VmRSS|VmHWM|RssAnon|RssFile|RssShmem|Threads' \
+grep -E 'VmRSS|VmHWM|VmSize|RssAnon|RssFile|RssShmem|Threads' \
   "/proc/$APP_PID/status" >"$RUN_DIR/status.txt" 2>/dev/null || true
+if [ "$MAX_PSS_KB" -gt 0 ] && [ "$PSS_SAMPLE_FAILED" -eq 1 ]; then
+  die "PSS gate enabled but one or more smaps_rollup samples could not be read"
+fi
 FINAL_RSS="$(awk -F, 'END{print $2}' "$SAMPLES")"
+FINAL_VSIZE="$(awk -F, 'END{print $3}' "$SAMPLES")"
+FINAL_PSS="$(awk -F, 'END{print $4}' "$SAMPLES")"
 PEAK_RSS="$(awk -F, 'NR > 1 && $2 > max {max = $2} END{print max + 0}' "$SAMPLES")"
-FINAL_THREADS="$(awk -F, 'END{print $7}' "$SAMPLES")"
-FINAL_FDS="$(awk -F, 'END{print $8}' "$SAMPLES")"
+PEAK_VSIZE="$(awk -F, 'NR > 1 && $3 > max {max = $3} END{print max + 0}' "$SAMPLES")"
+PEAK_PSS="$(awk -F, 'NR > 1 && $4 > max {max = $4} END{print max + 0}' "$SAMPLES")"
+FINAL_THREADS="$(awk -F, 'END{print $8}' "$SAMPLES")"
+FINAL_FDS="$(awk -F, 'END{print $9}' "$SAMPLES")"
 {
   echo "BIN=$BIN"
   echo "PANELS=$PANELS"
@@ -272,6 +348,10 @@ FINAL_FDS="$(awk -F, 'END{print $8}' "$SAMPLES")"
   echo "SAMPLE_INTERVAL=$SAMPLE_INTERVAL"
   echo "FINAL_RSS_KB=$FINAL_RSS"
   echo "PEAK_RSS_KB=$PEAK_RSS"
+  echo "FINAL_VSIZE_KB=$FINAL_VSIZE"
+  echo "PEAK_VSIZE_KB=$PEAK_VSIZE"
+  echo "FINAL_PSS_KB=$FINAL_PSS"
+  echo "PEAK_PSS_KB=$PEAK_PSS"
   echo "FINAL_THREADS=$FINAL_THREADS"
   echo "FINAL_FDS=$FINAL_FDS"
   echo "SAMPLES=$SAMPLES"
@@ -282,8 +362,16 @@ FINAL_FDS="$(awk -F, 'END{print $8}' "$SAMPLES")"
       echo "GATE=FAIL (peak ${PEAK_RSS}kB > ${MAX_RSS_KB}kB)"
     fi
   fi
+  if [ "$MAX_PSS_KB" -gt 0 ]; then
+    if [ "$PEAK_PSS" -le "$MAX_PSS_KB" ]; then
+      echo "PSS_GATE=PASS (peak ${PEAK_PSS}kB <= ${MAX_PSS_KB}kB)"
+    else
+      echo "PSS_GATE=FAIL (peak ${PEAK_PSS}kB > ${MAX_PSS_KB}kB)"
+    fi
+  fi
 } | tee "$RUN_DIR/summary.txt"
 
-if [ "$MAX_RSS_KB" -gt 0 ] && [ "$PEAK_RSS" -gt "$MAX_RSS_KB" ]; then
+if { [ "$MAX_RSS_KB" -gt 0 ] && [ "$PEAK_RSS" -gt "$MAX_RSS_KB" ]; } ||
+  { [ "$MAX_PSS_KB" -gt 0 ] && [ "$PEAK_PSS" -gt "$MAX_PSS_KB" ]; }; then
   exit 1
 fi

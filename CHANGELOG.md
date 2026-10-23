@@ -17,6 +17,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left edge, and an anchored tooltip re-reads the plugin's `overlay` block on
   every tick so its detail stays live while the pointer rests on a module.
 
+### Added
+
+- **Headless memory probe and resize/zoom regression (#2524):**
+  `scripts/mem-probe-headless.sh` samples RSS, PSS, VmSize, threads, and fds
+  for an isolated `--test-mode` session at a chosen pane count, scrollback,
+  and optional Kitty image; its optional budget gate reads resident memory
+  only. `crates/bitty-runtime/tests/memory_resize_regression.rs` pins repeated
+  grow/shrink and zoom passes to a byte-stable `workspace_memory_report()`.
+
+### Changed
+
+- **Bounded queued-writer stack (#2524):** the eagerly spawned per-pane PTY
+  writer thread (bitty#2446) uses a 128 KiB stack instead of Rust's default
+  stack reservation. The non-recursive I/O loop needs only a few KiB in the
+  measured workload; a refused spawn still falls back to the direct writer.
+  In the measured comparison, six panes reclaimed about 11.25 MiB of `VmSize`
+  from the writer stack reservations. This bounds stack virtual address space;
+  it does not fix resident-memory growth.
+  On glibc, an idle writer thread can retain a reserved 64 MiB malloc-arena
+  mapping after its first allocation; that reservation is virtual and is not
+  equivalent to 64 MiB of RSS.
+
 ## [0.0.26] - 2026-10-22
 
 ### Added

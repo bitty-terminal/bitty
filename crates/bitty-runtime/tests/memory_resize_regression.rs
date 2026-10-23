@@ -8,11 +8,19 @@
 //! scrollback snapshot shows up here as monotonic `owned_bytes` growth even
 //! though no PTY bytes arrived.
 //!
+//! The scenario is a six-pane layout with one primary scrollback owner:
+//! this headless runtime does not spawn PTY sessions for layout leaves, so the
+//! 5000 fed lines belong to the primary state while the other five leaves
+//! exercise layout/reflow only. Do not describe this as 5000 lines in each
+//! pane; the separate headless process probe configures each live shell's
+//! scrollback limit to 5000 but does not generate lines in every shell.
+//!
 //! The assertions are deliberately structural (accounting + line counts), not
 //! wall-clock or RSS: host scheduling and the allocator must not make a CI
 //! gate flaky. The first passes may legitimately rewrap history for the new
-//! width; the test requires the accounting to converge within one percent and
-//! then stay byte-identical for a long tail of identical passes.
+//! width; the test bounds the total warm-up increase by a **+1% ceiling**
+//! versus the initial accounting (not a measured convergence rate), then
+//! requires a long tail of identical passes to stay byte-identical.
 
 #![forbid(unsafe_code)]
 
@@ -20,11 +28,14 @@ use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View,
 
 /// Provider-neutral scrollback cap used by the regression scenario.
 const SCROLLBACK_LINES: usize = 5000;
-/// Panes in the scenario: the largest per-window layout the strip supports.
+/// Panes in the scenario (layout leaves; one owns the primary scrollback).
 const PANES: usize = 6;
 /// Lines fed through the primary parser; > cap so the ring evicts.
 const FED_LINES: usize = SCROLLBACK_LINES + 1000;
-/// Warm-up passes that may rewrap scrollback for the cycled widths.
+/// Warm-up passes allowed to rewrap scrollback for the cycled widths.
+///
+/// The test does not assert a convergence rate: it only requires the warm-up
+/// total to stay under the +1% ceiling below, then checks the steady tail.
 const WARMUP_PASSES: usize = 40;
 /// Identical passes after convergence; any retained buffer shows up here.
 const STEADY_PASSES: usize = 100;
@@ -91,7 +102,7 @@ fn geometry_pass(runtime: &mut Runtime) {
 }
 
 #[test]
-fn resize_and_zoom_passes_converge_and_stay_byte_stable() {
+fn resize_and_zoom_are_byte_stable_after_bounded_warmup() {
     let mut runtime = runtime_with_scrollback();
     assert_eq!(runtime.leaf_count(), PANES);
     // The ring is capped, not the feed count.
@@ -111,8 +122,8 @@ fn resize_and_zoom_passes_converge_and_stay_byte_stable() {
     }
     let warm = runtime.workspace_memory_report();
     let warm_bytes = warm.aggregate.unique_owned_bytes;
-    // Rewrap normalisation only: one percent of the retained state, never a
-    // per-pass buffer.
+    // Warm-up ceiling (not a convergence measurement): rewrap normalisation
+    // may move the accounting by at most one percent, never a per-pass buffer.
     assert!(
         warm_bytes <= initial + initial / 100,
         "warm-up grew {initial} -> {warm_bytes}; resize/zoom must not accumulate"

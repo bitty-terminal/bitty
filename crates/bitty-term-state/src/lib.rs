@@ -40,7 +40,7 @@
 //! | [`MAX_ZEROWIDTH_CHARS`](cell::MAX_ZEROWIDTH_CHARS) | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
 //! | [`MAX_BIDI_PARAGRAPH_CELLS`](bidi::MAX_BIDI_PARAGRAPH_CELLS) | 4096 | Candidate BiDi paragraph bound: longer logical paragraphs split at cell boundaries (M1-21 scope-deferred reorder; `OQ-091` open) |
 //! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 9 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers, v4 adds soft-wrap continuation flags for CTX-0266 reflow, v5 adds synchronized-update mode for CTX-0380, v6 adds the hyperlink id-space position for CTX-0490, v7 adds the alternate-scroll mode for CTX-0566, v8 adds the Kitty keyboard flag stack for CTX-0575, v9 adds the per-screen inactive Kitty flag register for CTX-0575 F3) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 12 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker) |
 //!
 //! # Determinism
 //!

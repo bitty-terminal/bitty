@@ -101,6 +101,61 @@ fn result_payload(text: &str) -> &str {
         .1
 }
 
+/// Extracts one flat key-attribution row from the `config show` envelope.
+///
+/// Row values are scalars or string arrays (no nested objects), so the first
+/// closing brace after the key marker ends the row.
+fn json_row<'a>(text: &'a str, key: &str) -> &'a str {
+    let marker = format!("\"key\":\"{key}\"");
+    let position = text
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing row {key:?}: {text}"));
+    let start = text[..position]
+        .rfind('{')
+        .unwrap_or_else(|| panic!("row {key:?} has no object start: {text}"));
+    let end = text[position..]
+        .find('}')
+        .map(|offset| position + offset)
+        .unwrap_or_else(|| panic!("row {key:?} has no object end: {text}"));
+    &text[start..=end]
+}
+
+/// Decodes one JSON string field so Windows path separators compare equal to
+/// the source path (the envelope escapes `\` as `\\`).
+fn json_string_field(object: &str, field: &str) -> String {
+    let marker = format!("\"{field}\":\"");
+    let start = object
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing field {field:?}: {object}"))
+        + marker.len();
+    let mut out = String::new();
+    let mut chars = object[start..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return out,
+            '\\' => match chars.next().expect("JSON escape") {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    let code = u32::from_str_radix(&hex, 16)
+                        .unwrap_or_else(|_| panic!("bad \\u escape {hex:?}"));
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                }
+                other => panic!("unsupported JSON escape \\{other}"),
+            },
+            other => out.push(other),
+        }
+    }
+    panic!("unterminated JSON string for {field:?}: {object}");
+}
+
 fn assert_success(output: &Output, context: &str) {
     assert_eq!(
         output.status.code(),
@@ -299,20 +354,21 @@ fn show_config_attributes_profile_and_policy_rows() {
     assert_success(&out, "+show-config --profile work");
     let text = stdout(&out);
     assert!(text.contains("\"profile\":\"work\""), "{text}");
-    let profile_source = format!(
-        "{{\"key\":\"profile\",\"value\":\"work\",\"type\":\"string\",\"layer\":\"profile\",\"source\":\"profile: {}\"}}",
-        profile.display()
+    // Compare decoded fields: the JSON writer escapes Windows backslashes, so
+    // raw substring matching against `Path::display()` is not portable.
+    let profile_row = json_row(&text, "profile");
+    assert_eq!(json_string_field(profile_row, "value"), "work");
+    assert_eq!(json_string_field(profile_row, "type"), "string");
+    assert_eq!(json_string_field(profile_row, "layer"), "profile");
+    assert_eq!(
+        json_string_field(profile_row, "source"),
+        format!("profile: {}", profile.display()),
+        "profile row must use the loaded profile path: {profile_row}"
     );
-    assert!(
-        text.contains(&profile_source),
-        "profile row must use the loaded profile path: {text}"
-    );
-    assert!(
-        text.contains(
-            "{\"key\":\"theme.contrast\",\"value\":\"pass\",\"type\":\"string\",\"layer\":\"policy\",\"source\":\"policy\"}"
-        ),
-        "derived contrast row must be attributed to policy: {text}"
-    );
+    let contrast_row = json_row(&text, "theme.contrast");
+    assert_eq!(json_string_field(contrast_row, "value"), "pass");
+    assert_eq!(json_string_field(contrast_row, "layer"), "policy");
+    assert_eq!(json_string_field(contrast_row, "source"), "policy");
     assert!(
         text.contains("\"font.size\",\"value\":14"),
         "profile value must reach the projection: {text}"

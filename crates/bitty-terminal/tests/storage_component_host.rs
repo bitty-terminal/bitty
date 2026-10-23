@@ -1,16 +1,20 @@
 //! bitty#2495 / CTX-1479: hermetic storage-component host tests.
 //!
-//! The component under test is the in-repo `bitty-storage-component-fixture`
-//! binary: with no fault mode it delegates to the pinned `bitty-storage`
-//! protocol-v1 server, so parity tests drive the real server implementation.
-//! Every root is a scratch directory and every child runs with a cleared
-//! environment; no network, shell, or ambient XDG state is involved.
+//! This harness-free test binary is also the component fixture: the host passes
+//! `--root`, so `main` serves the real pinned `bitty-storage` protocol-v1
+//! server (or a fault-injection mode selected by a `fixture-mode` file next to
+//! the executable). Otherwise `main` runs the tests below. A stripped copy of
+//! the test binary is installed because the unstripped executable exceeds the
+//! component's 256 MiB ceiling. Every root is a scratch directory and every
+//! child runs with a cleared environment; no network, shell, or ambient XDG
+//! state is involved.
 
-#![cfg(feature = "storage-component")]
+mod storage_component_fixture;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bitty_package::integrity::sha256_hex;
@@ -24,7 +28,6 @@ use bitty_terminal::storage_component_host::{
     StorageRootSelection, StorageRow, migrate_linked_file,
 };
 
-const COMPONENT_FIXTURE: &str = env!("CARGO_BIN_EXE_bitty-storage-component-fixture");
 const COMPONENT_VERSION: &str = "0.0.1";
 const DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE: Duration = Duration::from_secs(2);
@@ -35,6 +38,98 @@ const ENABLED: StorageComponentGate = StorageComponentGate {
     safe_mode: false,
     capability_granted: true,
 };
+
+/// One stripped copy of this test binary serves as the fixture; debug test
+/// executables are far larger than the component's 256 MiB ceiling.
+fn fixture_path() -> PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("bitty-ctx2495-fixture-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            let output = dir.join(format!(
+                "bitty-storage-component-fixture{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            std::fs::copy(
+                std::env::current_exe().expect("current test executable"),
+                &output,
+            )
+            .expect("copy test executable");
+            let strip = std::env::var_os("STRIP").unwrap_or_else(|| "strip".into());
+            let status = Command::new(strip)
+                .arg(&output)
+                .status()
+                .expect("run strip for the storage fixture");
+            assert!(status.success(), "strip the storage fixture");
+            output
+        })
+        .clone()
+}
+
+fn cleanup_fixture() {
+    let path = fixture_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+fn main() {
+    if let Some(root) = storage_component_fixture::root_argument() {
+        std::process::exit(i32::from(storage_component_fixture::run(root)));
+    }
+    let tests: &[(&str, fn())] = &[
+        (
+            "protocol_roundtrip_and_clean_shutdown",
+            protocol_roundtrip_and_clean_shutdown,
+        ),
+        (
+            "policy_denies_before_resolution_and_install_errors_fail_closed",
+            policy_denies_before_resolution_and_install_errors_fail_closed,
+        ),
+        (
+            "handshake_and_wire_faults_fail_closed",
+            handshake_and_wire_faults_fail_closed,
+        ),
+        (
+            "mutation_errors_poison_and_never_replay",
+            mutation_errors_poison_and_never_replay,
+        ),
+        (
+            "component_session_and_kv_backends_match_the_linked_model",
+            component_session_and_kv_backends_match_the_linked_model,
+        ),
+        (
+            "migration_is_explicit_confined_and_idempotent",
+            migration_is_explicit_confined_and_idempotent,
+        ),
+        (
+            "storage_root_is_owner_only_and_rejects_symlinks",
+            storage_root_is_owner_only_and_rejects_symlinks,
+        ),
+        (
+            "stderr_ring_is_bounded_and_escaped",
+            stderr_ring_is_bounded_and_escaped,
+        ),
+    ];
+    let mut failed = 0;
+    for (name, test) in tests {
+        print!("test {name} ... ");
+        match std::panic::catch_unwind(test) {
+            Ok(()) => println!("ok"),
+            Err(_) => {
+                println!("FAILED");
+                failed += 1;
+            }
+        }
+    }
+    cleanup_fixture();
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
 
 struct Scratch(PathBuf);
 
@@ -78,7 +173,10 @@ fn install(install_root: &Path, mode: Option<&str>) -> PathBuf {
     )
     .expect("current");
     let executable = version_dir.join("bitty-storage");
-    std::fs::copy(COMPONENT_FIXTURE, &executable).expect("copy fixture");
+    let fixture = fixture_path();
+    if std::fs::hard_link(&fixture, &executable).is_err() {
+        std::fs::copy(&fixture, &executable).expect("copy fixture");
+    }
     let digest = sha256_hex(&std::fs::read(&executable).expect("read fixture"));
     let descriptor = format!(
         "[component]\nname = \"storage\"\nversion = \"{COMPONENT_VERSION}\"\nprotocol = [1, 1]\nexecutable = \"bitty-storage\"\nsha256 = \"{digest}\"\n"
@@ -107,7 +205,6 @@ fn connect(install_root: &Path, base: &Path) -> Arc<StorageComponentClient> {
         .expect("component host connects")
 }
 
-#[test]
 fn protocol_roundtrip_and_clean_shutdown() {
     let scratch = Scratch::new("roundtrip");
     let install_root = scratch.subdir("extensions");
@@ -237,7 +334,6 @@ fn protocol_roundtrip_and_clean_shutdown() {
     assert!(client.stderr_tail().is_empty());
 }
 
-#[test]
 fn policy_denies_before_resolution_and_install_errors_fail_closed() {
     let scratch = Scratch::new("policy");
     let install_root = scratch.subdir("extensions");
@@ -317,7 +413,6 @@ fn policy_denies_before_resolution_and_install_errors_fail_closed() {
     );
 }
 
-#[test]
 fn handshake_and_wire_faults_fail_closed() {
     // Handshake failures surface from `connect`.
     for mode in [
@@ -394,7 +489,6 @@ fn handshake_and_wire_faults_fail_closed() {
     }
 }
 
-#[test]
 fn mutation_errors_poison_and_never_replay() {
     let scratch = Scratch::new("mutation-error");
     let install_root = scratch.subdir("extensions");
@@ -428,7 +522,6 @@ fn mutation_errors_poison_and_never_replay() {
     );
 }
 
-#[test]
 fn component_session_and_kv_backends_match_the_linked_model() {
     let scratch = Scratch::new("parity");
     let install_root = scratch.subdir("extensions");
@@ -542,7 +635,6 @@ fn component_session_and_kv_backends_match_the_linked_model() {
     client.shutdown(DEADLINE).expect("shutdown");
 }
 
-#[test]
 fn migration_is_explicit_confined_and_idempotent() {
     let scratch = Scratch::new("migration");
     let install_root = scratch.subdir("extensions");
@@ -618,7 +710,6 @@ fn migration_is_explicit_confined_and_idempotent() {
     client.shutdown(DEADLINE).expect("shutdown");
 }
 
-#[test]
 fn storage_root_is_owner_only_and_rejects_symlinks() {
     let scratch = Scratch::new("root");
     let base = scratch.subdir("state");
@@ -653,7 +744,6 @@ fn storage_root_is_owner_only_and_rejects_symlinks() {
     }
 }
 
-#[test]
 fn stderr_ring_is_bounded_and_escaped() {
     let scratch = Scratch::new("stderr");
     let install_root = scratch.subdir("extensions");

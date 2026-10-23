@@ -17,9 +17,8 @@
 //!   normal dependency edge and no Core source identifier; `bitty-storage` is
 //!   the single composition-root mechanics seam, linked only by
 //!   `bitty-terminal` and named only in `storage_backends.rs` plus the
-//!   default-off component host and its hermetic fixture
-//!   (`crates/bitty-terminal/src/storage_component_host.rs`,
-//!   `crates/bitty-terminal/src/bin/bitty-storage-component-fixture.rs`).
+//!   default-off component host
+//!   (`crates/bitty-terminal/src/storage_component_host.rs`).
 //!   `bitty-a11y` is the deliberate accessibility snapshot-model/component
 //!   seam (CTX-1362 / CTX-1466 / #2257 / #2496): linked only by `bitty-ui` and
 //!   named only in `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`).
@@ -171,8 +170,8 @@ const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
 /// Core tracker.
 /// `bitty-storage` is the composition-root mechanics seam: the linked adapter
 /// (`storage_backends.rs`) and the default-off component host
-/// (`storage_component_host.rs`) plus its hermetic fixture binary are the only
-/// files allowed to name either storage pin (CTX-1479 / bitty#2495).
+/// (`storage_component_host.rs`) are the only files allowed to name either
+/// storage pin (CTX-1479 / bitty#2495).
 const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
     ("bitty-a11y", &["crates/bitty-ui/src/a11y_host.rs"]),
     (
@@ -190,7 +189,6 @@ const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
         &[
             "crates/bitty-terminal/src/storage_backends.rs",
             "crates/bitty-terminal/src/storage_component_host.rs",
-            "crates/bitty-terminal/src/bin/bitty-storage-component-fixture.rs",
         ],
     ),
 ];
@@ -1261,9 +1259,9 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Source-level fence violations: Core library sources may not name an
 /// implementation crate. Seam crates are legal by design, except a source
 /// seam restricted by [`SOURCE_SEAM_FILES`]; `bitty-storage` is legal only in
-/// its composition-root adapter, default-off host, and hermetic fixture. The
-/// graphics entry is a source seam with no dependency edge, so it is legal only
-/// in [`GRAPHICS_SOURCE_SEAM`].
+/// its composition-root adapter and default-off host. The graphics entry is a
+/// source seam with no dependency edge, so it is legal only in
+/// [`GRAPHICS_SOURCE_SEAM`].
 fn extension_source_violations(root: &Path) -> Vec<String> {
     let members = workspace_members(root);
     let mut violations = Vec::new();
@@ -1351,8 +1349,8 @@ fn core_library_sources_never_name_extension_impls() {
     // (audit CTX-1085 F10), so this scan rejects the Rust identifiers directly.
     // The composition-root exception is `storage_backends.rs`, which may name
     // `bitty_storage` to implement the Core-owned backends behind Core
-    // validation; the default-off component host and its hermetic fixture are
-    // the only other storage naming points (CTX-1479 / bitty#2495). Every
+    // validation; the default-off component host is
+    // the only other storage naming point (CTX-1479 / bitty#2495). Every
     // other crate reaches persistence through the
     // `SessionFileBackend` / `KvCommitBackend` traits. Seam crates
     // (`bitty-ipc`, `bitty-network-wire`, `bitty-network-publication`,

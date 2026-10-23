@@ -20,15 +20,14 @@ workspace = true
 name = "bitty"
 path = "src/main.rs"
 
-# CTX-1479: hermetic storage-component fixture for the Core host client. It
-# delegates to the pinned extension's real v1 server (with fault modes) and is
-# built only with the default-off `storage-component` feature; release bundles
-# ship only the `bitty` binary.
-[[bin]]
-name = "bitty-storage-component-fixture"
-path = "src/bin/bitty-storage-component-fixture.rs"
+# CTX-1479: the storage-component fixture is this harness-free test binary
+# (invoked with --root by the host). Keeping it a test target leaves exactly
+# one release binary, so packaging recipes need no change.
+[[test]]
+name = "storage_component_host"
+path = "tests/storage_component_host.rs"
+harness = false
 required-features = ["storage-component"]
-test = false
 
 # CTX-1361: the composition root's component-store/staging implementation is
 # also exposed as a library so integration tests in `bitty-runtime` can drive

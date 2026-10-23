@@ -26,7 +26,6 @@
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::time::Duration;
 
 use bitty_storage_component::component::COMPONENT_VERSION;
@@ -39,16 +38,10 @@ use bitty_storage_component::component::store::StorageRoot;
 const EXIT_REFUSED: u8 = 2;
 const EXIT_PROTOCOL: u8 = 3;
 
-fn main() -> ExitCode {
+/// Runs the selected fixture mode and returns the process exit code.
+pub fn run(root: PathBuf) -> u8 {
     let mode = fixture_mode();
-    let root = match root_argument() {
-        Some(root) => root,
-        None => {
-            eprintln!("bitty-storage-component-fixture: expected --root PATH");
-            return ExitCode::from(EXIT_REFUSED);
-        }
-    };
-    let code = match mode.as_str() {
+    match mode.as_str() {
         "" | "serve" => serve(root),
         "silent-handshake" => silent_handshake(),
         "wrong-protocol" => wrong_ack(2, "storage", COMPONENT_VERSION),
@@ -95,8 +88,7 @@ fn main() -> ExitCode {
             eprintln!("bitty-storage-component-fixture: unknown mode '{other}'");
             EXIT_REFUSED
         }
-    };
-    ExitCode::from(code)
+    }
 }
 
 fn fixture_mode() -> String {
@@ -111,7 +103,8 @@ fn fixture_mode() -> String {
         .unwrap_or_default()
 }
 
-fn root_argument() -> Option<PathBuf> {
+/// Parses the host's fixed `--root PATH` argument.
+pub fn root_argument() -> Option<PathBuf> {
     let mut args = std::env::args_os().skip(1);
     let flag = args.next()?;
     if flag == "--root" {

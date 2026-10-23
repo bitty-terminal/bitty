@@ -44,6 +44,8 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -88,6 +90,13 @@ const MAX_REPORTS_PER_STALL: u32 = 5;
 const MAX_THREAD_ROWS: usize = 64;
 /// Maximum bytes in one report (hard cap after rendering).
 const MAX_REPORT_BYTES: usize = 8 * 1024;
+/// Deadline for one report sink, including partial pipe writes.
+const REPORT_WRITE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Deadline for the isolated state-file writer.
+#[cfg(not(test))]
+const STATE_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Private argv used by the bounded state-file helper.
+pub(crate) const STATE_WRITER_ARG: &str = "--internal-stall-watchdog-state";
 /// Maximum identifier characters rendered per plugin id.
 const MAX_IDENTIFIER_CHARS: usize = 48;
 /// Maximum plugin ids rendered per list.
@@ -536,8 +545,8 @@ impl StopSignal {
 /// `Drop` requests a stop and joins the monitor: shutdown leaves no detached
 /// thread behind and no report is written once `Drop` returns. Sink writes
 /// ignore errors, so a closed stderr pipe cannot panic the monitor or strand
-/// the join. A sink blocked forever on a full pipe still delays shutdown; the
-/// state slot is written first, so the evidence survives a later termination.
+/// the join. Owned production sinks have deadlines; injected test sinks retain
+/// normal join semantics so no arbitrary closure is ever detached.
 pub(crate) struct StallWatchdog {
     shared: Arc<Shared>,
     stop: Arc<StopSignal>,
@@ -553,7 +562,7 @@ impl StallWatchdog {
         config_from_env().map(|config| {
             let mut sink = ReportSink {
                 state_path: state_file_path(),
-                stderr: std::io::stderr(),
+                stderr: BoundedStderr::new(std::io::stderr()),
             };
             Self::start(config, Box::new(move |line| sink.emit(line)))
         })
@@ -964,6 +973,86 @@ impl<W: std::io::Write> ReportSink<W> {
         // `writeln!` on stderr returns an error for EPIPE/EBADF instead of
         // panicking (`eprintln!` would panic and kill the monitor thread).
         let _ = writeln!(self.stderr, "{redacted}");
+        let _ = self.stderr.flush();
+    }
+}
+
+/// A duplicated, nonblocking stderr fd. The duplicate prevents changing the
+/// process-global blocking mode while allowing poll to bound pipe backpressure.
+#[cfg(unix)]
+struct BoundedStderr {
+    fd: std::os::fd::OwnedFd,
+    deadline: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl BoundedStderr {
+    fn new(stderr: std::io::Stderr) -> Self {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use nix::unistd::dup;
+        let fd = dup(&stderr).expect("duplicate stderr for watchdog");
+        let _ = fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
+        Self { fd, deadline: None }
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Write for BoundedStderr {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + REPORT_WRITE_TIMEOUT);
+        let result = write_fd_with_deadline(&self.fd, bytes, deadline);
+        if result.is_err() {
+            self.deadline = None;
+        }
+        result
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.deadline = None;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_fd_with_deadline(
+    fd: &impl std::os::fd::AsFd,
+    bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::unistd::write;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+        if poll(
+            &mut fds,
+            PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX),
+        )
+        .map_err(std::io::Error::other)?
+            == 0
+        {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match write(fd, bytes) {
+            Ok(count) => return Ok(count),
+            Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => continue,
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+type BoundedStderr = std::io::Stderr;
+
+#[cfg(not(unix))]
+impl BoundedStderr {
+    fn new(stderr: std::io::Stderr) -> Self {
+        stderr
     }
 }
 
@@ -980,13 +1069,77 @@ fn persist_state_file_at(path: Option<&std::path::Path>, line: &str) {
 
 /// Write (truncate) the single state slot, best-effort.
 fn write_state_slot(path: &std::path::Path, line: &str) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
+    #[cfg(test)]
+    {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let _ = std::fs::write(path, line);
     }
-    let _ = std::fs::write(path, line);
+    #[cfg(not(test))]
+    {
+        use std::io::Write as _;
+        let Ok(mut child) = Command::new(std::env::current_exe().unwrap_or_default())
+            .arg(STATE_WRITER_ARG)
+            .env("BITTY_WATCHDOG_STATE_PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        let write_result = stdin.write_all(line.as_bytes());
+        drop(stdin);
+        if write_result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        let deadline = Instant::now() + STATE_WRITE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Private state writer invoked before normal CLI parsing.
+pub(crate) fn handle_state_writer(raw: &[String]) -> bool {
+    use std::io::Read as _;
+    if raw.get(1).map(String::as_str) != Some(STATE_WRITER_ARG) {
+        return false;
+    }
+    let Some(path) = std::env::var_os("BITTY_WATCHDOG_STATE_PATH") else {
+        std::process::exit(1);
+    };
+    let Some(parent) = std::path::Path::new(&path).parent() else {
+        std::process::exit(1);
+    };
+    let mut line = String::new();
+    if std::io::stdin().read_to_string(&mut line).is_err()
+        || std::fs::create_dir_all(parent)
+            .and_then(|_| std::fs::write(&path, line))
+            .is_err()
+    {
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 /// Resolve the single-slot state file path from XDG state conventions.
@@ -1511,6 +1664,32 @@ mod tests {
             writes.load(Ordering::SeqCst),
             writes_at_drop,
             "a stopped monitor must not write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saturated_os_pipe_report_write_is_deadline_bounded() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use nix::unistd::{pipe, write};
+
+        let (_reader, writer) = pipe().expect("OS pipe");
+        fcntl(&writer, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("nonblocking pipe");
+        let fill = [0_u8; 4096];
+        loop {
+            match write(&writer, &fill) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(error) => panic!("fill pipe: {error}"),
+            }
+        }
+        let started = Instant::now();
+        let result =
+            write_fd_with_deadline(&writer, b"stall report\n", started + REPORT_WRITE_TIMEOUT);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() <= REPORT_WRITE_TIMEOUT + Duration::from_millis(100),
+            "pipe report write exceeded deadline"
         );
     }
 }

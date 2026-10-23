@@ -370,6 +370,9 @@ fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
+    if stall_watchdog::handle_state_writer(&raw) {
+        return;
+    }
     let args = parse_args(&raw);
     // CTX-0482 (#763): install the process-wide stderr gate once so startup
     // diagnostics obey `--log-level` instead of printing unconditionally.

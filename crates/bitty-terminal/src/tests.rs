@@ -1925,6 +1925,53 @@ fn terminal_app_poll_and_tick_are_total() {
 }
 
 #[test]
+fn poll_pty_pump_marks_the_burst_for_the_settle_gate() {
+    // bitty#2486 wiring regression: the Runtime-direct suites prove the
+    // settle gate, but they stay green if production stops calling
+    // `note_present_input` from the pump. Drive the real demo pump through
+    // `poll_pty_pump` and assert the very next present defers.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_demo_pump(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    app.runtime
+        .set_present_settle(std::time::Duration::from_millis(2));
+    app.runtime
+        .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+    app.runtime
+        .handle_resize(bitty_platform::PhysicalSize::new(736, 472))
+        .expect("resize applies");
+    app._pty_thread
+        .take()
+        .expect("demo pump thread must be attached")
+        .join()
+        .expect("demo pump thread must join");
+
+    // The tick clock is captured before the pump consumes its bytes, so the
+    // settle deadline is provably in the future without sleeping.
+    let before = std::time::Instant::now();
+    assert!(app.poll_pty_pump(), "demo pump must deliver bytes");
+    assert!(
+        app.runtime.tick_at(before).is_none(),
+        "poll_pty_pump must mark the consumed burst; without the mark the frame presents immediately"
+    );
+    let deadline = app
+        .runtime
+        .present_coalescing_deadline()
+        .expect("a deferred frame must arm the app wake");
+    assert!(deadline > before, "the armed wake must be in the future");
+    assert!(
+        app.runtime.tick_at(deadline).is_some(),
+        "the quiet deadline must commit the held frame"
+    );
+    assert_eq!(app.runtime.present_coalescing_deadline(), None);
+}
+
+#[test]
 fn window_title_sanitizer_strips_controls_and_bounds_length() {
     use crate::terminal_app::{WINDOW_TITLE_MAX_CHARS, sanitize_window_title};
     // Printable text survives; every control scalar (C0, DEL, C1) is dropped.

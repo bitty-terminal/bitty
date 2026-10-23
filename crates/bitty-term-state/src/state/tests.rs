@@ -131,6 +131,21 @@ fn combining_mark_changes_state_hash() {
 }
 
 #[test]
+fn layout_padding_marker_changes_state_hash() {
+    let content = State::new();
+    let mut layout_padding = content.clone();
+    let mut cell = *layout_padding.screens.main.get(0, 0);
+    cell.padding = !cell.padding;
+    layout_padding.screens.main.set(0, 0, cell);
+
+    assert_ne!(
+        content.state_hash(),
+        layout_padding.state_hash(),
+        "otherwise-identical cells with different reflow padding semantics must hash differently"
+    );
+}
+
+#[test]
 fn deferred_wrap_latches_at_last_column() {
     let mut s = State::new();
     s.cursor.position.col = GRID_COLUMNS as u16 - 1;

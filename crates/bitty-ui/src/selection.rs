@@ -1095,7 +1095,14 @@ impl PersistentSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitty_term_state::{Cell, Style, Zerowidth};
+    use bitty_term_state::{Cell, State, Style, TerminalAction, Zerowidth};
+    use bitty_vt::{ControlChar, GraphemeCell};
+
+    fn prints(state: &mut State, text: &str) {
+        for c in text.chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+    }
 
     fn make_snapshot(cells_grid: Vec<Vec<char>>) -> Snapshot {
         // cells_grid is rows x cols with ' ' blank, '中' wide char via two entries: '中' at lead, '\0' spacer marker.
@@ -1115,6 +1122,7 @@ mod tests {
                             style: Style::default(),
                             width: 2,
                             spacer: false,
+                            padding: false,
                             hyperlink: None,
                             zerowidth: Zerowidth::new(),
                         });
@@ -1124,6 +1132,7 @@ mod tests {
                             style: Style::default(),
                             width: 1,
                             spacer: false,
+                            padding: false,
                             hyperlink: None,
                             zerowidth: Zerowidth::new(),
                         });
@@ -1159,6 +1168,7 @@ mod tests {
             style: Style::default(),
             width,
             spacer: false,
+            padding: false,
             hyperlink: None,
             zerowidth: Zerowidth::new(),
         };
@@ -1265,6 +1275,33 @@ mod tests {
         // Also selection starting at spacer should snap and not duplicate.
         let sel2 = Selection::simple(CellPos::new(0, 2), CellPos::new(0, 2));
         assert_eq!(sel2.text(&snap), "中");
+    }
+
+    #[test]
+    fn selection_copy_stays_exact_after_repeated_wide_reflow() {
+        for text in [
+            "这是一段很长的中文段落，用来检查窗口宽度变化时是否会在字符之间插入多余的空格，从而破坏可复制文本。",
+            "mixed 😀 text  中文字符 with  real  spaces  and emoji 😀😀 end",
+        ] {
+            let mut state = State::new();
+            state.resize(160, 24);
+            prints(&mut state, text);
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+
+            for _ in 0..5 {
+                state.resize(37, 24);
+                state.resize(160, 24);
+                let snapshot = state.snapshot();
+                let range = Selection::line_at(&snapshot, 0);
+                let selection = Selection::simple(range.start, range.end);
+                assert_eq!(
+                    selection.text(&snapshot),
+                    text,
+                    "copy text must remain exact after a 37<->80 cycle"
+                );
+            }
+        }
     }
 
     #[test]

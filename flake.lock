@@ -2,7 +2,7 @@
   "nodes": {
     "crane": {
       "locked": {
-        "lastModified": 1729278552,
+        "lastModified": 1792350552,
         "narHash": "sha256-292lvpvxTGKryKxh3/3tcIVi85CwYGdl4oOi113Sob8=",
         "owner": "ipetkov",
         "repo": "crane",
@@ -20,7 +20,7 @@
         "systems": "systems"
       },
       "locked": {
-        "lastModified": 1728842995,
+        "lastModified": 1791914995,
         "narHash": "sha256-Zf/xfQEAasnwnmEfHqW/4hjDE/s44yn2hD4RuVIZRjA=",
         "owner": "numtide",
         "repo": "flake-utils",
@@ -35,8 +35,8 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1729506237,
-        "narHash": "sha256-hVMDyAXU0kxRuG3GygbZkzf5x+aBNEC0NYEJ6KwHtD4=",
+        "lastModified": 1792506237,
+        "narHash": "sha256-Q/8KLB6jNfpaUN1HAedE/u/Et9feE/zYSsutBLKrCFk=",
         "owner": "NixOS",
         "repo": "nixpkgs",
         "rev": "5adc50831c259f87faeb09ddf930d43597197473",
@@ -64,7 +64,7 @@
         ]
       },
       "locked": {
-        "lastModified": 1729667799,
+        "lastModified": 1792739799,
         "narHash": "sha256-M2rr/yPbTHvgAzCyZ+zHJHflFM0XU7t42Sw2skA3TQM=",
         "owner": "oxalica",
         "repo": "rust-overlay",

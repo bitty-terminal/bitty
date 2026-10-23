@@ -96,7 +96,7 @@ fn list_help_exits_zero() {
     );
     let text = stdout(&output);
     assert!(
-        text.contains("bitty list") && text.contains("themes|plugins|instances"),
+        text.contains("bitty list") && text.contains("themes|colors|fonts|plugins|instances"),
         "list --help must describe kinds, got {text:?}"
     );
 }
@@ -124,7 +124,7 @@ fn list_missing_kind_is_usage_error() {
 
 #[test]
 fn list_unknown_kind_is_usage_error() {
-    let output = run_bitty(&["list", "fonts"], &[]);
+    let output = run_bitty(&["list", "commands"], &[]);
     assert_eq!(
         output.status.code(),
         Some(2),

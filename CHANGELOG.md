@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ghostty-style `+<action>` helper aliases (#2464):** `bitty +list-themes`,
+  `+list-colors`, `+list-fonts`, `+list-keybinds`, `+list-actions`,
+  `+list-plugins`, `+list-extensions`, `+show-config`, `+validate-config`, and
+  `+edit-config` are aliases over the canonical `bitty list ...` /
+  `bitty config ...` / `bitty extension list` implementations, never a
+  parallel path. `bitty list colors` reports all 16 ANSI slots plus UI roles
+  with resolved values, measured WCAG contrast, floor, pass flag, and any
+  documented exemption, using the same theme policy `config check` prints.
+  `bitty list fonts` enumerates system faces (family/style/source) through the
+  renderer's shared fontdb scan, sorted, deduplicated, capped at 512 rows, and
+  headless safe. `bitty config show` adds a bounded JSON projection of the
+  validated effective config with per-key layer/source attribution;
+  `bitty config validate` exits 2 on invalid input with no key dump; and
+  `config edit` now re-validates the file after the editor exits without
+  rewriting it. Static lists stay VM-less and network-free, `--safe` keeps its
+  built-in-only parity, and every action emits the stable envelope v1.
+- **`bitty list colors|fonts` canonical kinds (#2464):** the new catalogs are
+  available under the canonical `list` spelling as well; the `+list-*`
+  spellings are aliases.
+
 ### Changed
 
 - **Thin rounded Core chrome tokens (#2468):** help/which-key, command

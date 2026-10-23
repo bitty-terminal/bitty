@@ -193,6 +193,7 @@ pub mod chrome;
 pub mod crossfont_backend;
 pub mod error;
 pub mod fallback;
+pub mod font_catalog;
 pub mod frame;
 pub mod geometry;
 pub mod glyph;

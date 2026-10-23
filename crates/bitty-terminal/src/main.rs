@@ -250,6 +250,7 @@ mod layout_cmd;
 mod logging;
 mod observability;
 mod plugin_runtime;
+mod plus;
 mod prefix_dispatch;
 mod profile;
 mod runtime_inspect;
@@ -386,6 +387,15 @@ fn main() {
     // a violation panics in debug (fail-closed development, never production).
     debug_assert!(observability::default_posture_pins_hold(args.safe));
 
+    // `bitty +<action> --help` prints the alias contract (local, no config).
+    // Checked before the canonical list/config/extension help branches so an
+    // alias never renders the canonical command's usage under its own name.
+    if args.help {
+        if let Some(action) = args.plus_action {
+            print!("{}", action.help_text());
+            std::process::exit(0);
+        }
+    }
     // CodeRabbit 4240219272: `bitty config/init/doctor --help` must print
     // the same command help as the documented `bitty help <cmd>` alias
     // (which prints `config_usage`/`init_usage`/`doctor_usage`), not the
@@ -506,6 +516,12 @@ fn main() {
                 help_usage()
             );
             std::process::exit(2);
+        }
+        if let Some(raw) = args.help_cmd.as_deref() {
+            if let Some(action) = crate::plus::PlusAction::parse(raw) {
+                print!("{}", action.help_text());
+                std::process::exit(0);
+            }
         }
         match args.help_cmd.as_deref() {
             None => {

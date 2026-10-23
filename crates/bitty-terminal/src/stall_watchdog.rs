@@ -24,13 +24,34 @@
 //!   unless a complete new report is renamed in, and a blocked stderr pipe is
 //!   bounded by killing the helper, never by changing the application's
 //!   descriptor flags.
+//! - **Observable delivery.** Every delivery returns a [`DeliveryOutcome`].
+//!   The sink mirrors a bounded ledger (`attempts`, `failures`, last outcome,
+//!   up to four recent failures) to a companion slot
+//!   (`bitty/stall-watchdog-delivery.log`), and the next stall report carries
+//!   the same summary in-band. `SpawnFailed`, `TimedOut`, `HelperFailed`, and
+//!   `EvidenceFailed` therefore stay visible even when the report itself could
+//!   not be stored and stderr is gone.
+//! - **Generation-safe evidence.** Each delivery gets a monotonic generation
+//!   from a locked sequence file and stages its bytes in a temp sibling named
+//!   after that generation (never a shared `.tmp`). The helper re-checks the
+//!   generation under the same lock immediately before renaming, and the
+//!   supervisor removes a timed-out attempt's temp; a late helper can
+//!   therefore never replace newer evidence.
+//! - **Confined paths.** The slot is derived from `XDG_STATE_HOME`/`HOME`;
+//!   `BITTY_WATCHDOG_STATE_PATH` is only honored when it repeats that derived
+//!   path, and symlinked, hard-linked, foreign-owned, group/world-writable, or
+//!   special-file slots are rejected. Temp files are created with `O_EXCL`
+//!   (no-follow) semantics.
 //! - **Shutdown-clean.** Dropping the handle wakes and joins the monitor, so
 //!   no detached monitor survives app shutdown and no report is written once
 //!   shutdown completed. Report delivery is deadline-bounded (spawn, stdin,
 //!   helper work, wait, and a bounded reap window), so shutdown does not wait
-//!   on an unread stderr pipe. A helper stuck in uninterruptible I/O can
-//!   outlive that window and is abandoned (process exit reaps it); process
-//!   cancellation is best-effort, not a proven kill guarantee.
+//!   on an unread stderr pipe. Helper resources are single-flight: at most one
+//!   spawn thread, one stdin writer, and a fixed abandoned-child set are live
+//!   across repeated stalls, and finished ones are joined on the next
+//!   delivery. A helper stuck in uninterruptible I/O can outlive that window
+//!   and is abandoned (process exit reaps it); process cancellation is
+//!   best-effort, not a proven kill guarantee.
 //! - **No process-wide stderr mutation.** The monitor never duplicates or
 //!   re-flags fd 2; the helper inherits it as a plain blocking descriptor and
 //!   is killed at the deadline if the reader is gone.
@@ -51,9 +72,11 @@
 //! as a stall. The monitor only fires while a phase is active and the
 //! heartbeat has not advanced past the threshold.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -87,6 +110,11 @@ const REPORT_REPEAT_INTERVAL: Duration = Duration::from_secs(30);
 const CONTEXT_REFRESH_NANOS: u64 = 500_000_000;
 /// Single-slot state file name under the XDG state directory.
 const STATE_FILE_NAME: &str = "stall-watchdog.log";
+/// Companion single-slot file recording delivery outcomes.
+///
+/// Written directly by the monitor (local file I/O only) so a helper that could
+/// not be spawned, timed out, or failed is still visible after the fact.
+const DELIVERY_FILE_NAME: &str = "stall-watchdog-delivery.log";
 /// Prefix of a stall report line; only these overwrite the state slot.
 const STALL_REPORT_PREFIX: &str = "bitty: main-loop stall detected";
 /// Maximum reports for one continuous stall (bounded log growth).
@@ -116,7 +144,28 @@ const REPORT_HELPER_POLL: Duration = Duration::from_millis(5);
 /// Private argv used by the bounded report helper.
 pub(crate) const STATE_WRITER_ARG: &str = "--internal-stall-watchdog-state";
 /// Environment variable carrying the optional state-slot path to the helper.
+///
+/// The helper only honors a value that repeats the XDG-derived slot path; any
+/// other value is rejected, so the variable cannot redirect evidence.
 const STATE_WRITER_PATH_ENV: &str = "BITTY_WATCHDOG_STATE_PATH";
+/// Environment variable carrying the evidence generation to the helper.
+const ATTEMPT_ENV: &str = "BITTY_WATCHDOG_ATTEMPT";
+/// Maximum recent failure records kept in the companion delivery slot.
+const MAX_DELIVERY_FAILURES: usize = 4;
+/// Hard cap for the companion delivery slot.
+const MAX_DELIVERY_BYTES: usize = 1024;
+/// Bounded monitor-side wait for the evidence generation lock.
+///
+/// A late helper stuck mid-commit holds the lock; the monitor then records a
+/// skipped delivery instead of writing unordered evidence.
+const SLOT_LOCK_WAIT: Duration = Duration::from_millis(25);
+/// Bounded helper-side wait for the evidence generation lock.
+///
+/// The supervisor's delivery deadline is shorter, so this only bounds a
+/// directly invoked helper; it is never a path to an unbounded wait.
+const HELPER_LOCK_WAIT: Duration = Duration::from_secs(1);
+/// Maximum killed-but-unreaped helper children retained across stalls.
+const MAX_ABANDONED_CHILDREN: usize = 4;
 /// Maximum identifier characters rendered per plugin id.
 const MAX_IDENTIFIER_CHARS: usize = 48;
 /// Maximum plugin ids rendered per list.
@@ -378,6 +427,38 @@ struct StallReport {
     context: Option<WatchdogContext>,
     threads: Vec<ThreadRow>,
     totals: ProcessTotals,
+    /// Outcomes of earlier report deliveries, shown in-band so a lost evidence
+    /// write is visible in the next report that does get through.
+    delivery: DeliverySummary,
+}
+
+/// Bounded in-band delivery summary carried by the monitor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DeliverySummary {
+    attempts: u64,
+    failures: u64,
+    last: Option<DeliveryOutcome>,
+}
+
+impl DeliverySummary {
+    fn record(&mut self, outcome: DeliveryOutcome) {
+        self.attempts = self.attempts.saturating_add(1);
+        if outcome.is_failure() {
+            self.failures = self.failures.saturating_add(1);
+        }
+        self.last = Some(outcome);
+    }
+
+    /// One bounded report line; `None` before the first delivery.
+    fn render(&self) -> Option<String> {
+        let last = self.last?;
+        Some(format!(
+            "  watchdog-delivery: attempts={} failures={} last={}",
+            self.attempts,
+            self.failures,
+            last.as_str(),
+        ))
+    }
 }
 
 /// Monitor state machine, kept separate from the thread for deterministic
@@ -590,16 +671,17 @@ impl StallWatchdog {
     /// Start the watchdog when the environment opts in.
     pub(crate) fn from_env() -> Option<Self> {
         config_from_env().map(|config| {
-            let mut sink = ReportSink {
-                state_path: state_file_path(),
-                delivery: Box::new(HelperDelivery::current()),
-            };
+            let slot = StateSlot::from_env();
+            let mut sink = ReportSink::new(slot, Box::new(HelperDelivery::current()));
             Self::start(config, Box::new(move |line| sink.emit(line)))
         })
     }
 
     /// Start a watchdog with an explicit configuration and sink.
-    fn start(config: WatchdogConfig, mut sink: Box<dyn FnMut(&str) + Send>) -> Self {
+    fn start(
+        config: WatchdogConfig,
+        mut sink: Box<dyn FnMut(&str) -> DeliveryOutcome + Send>,
+    ) -> Self {
         let shared = Arc::new(Shared::new());
         let stop = Arc::new(StopSignal::new());
         #[cfg(test)]
@@ -704,12 +786,13 @@ fn monitor_loop(
     stop: &StopSignal,
     threshold: Duration,
     poll_interval: Duration,
-    sink: &mut (dyn FnMut(&str) + Send),
+    sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
 ) {
     let mut state = MonitorState {
         last_progress: shared.progress.load(Ordering::Relaxed),
         ..MonitorState::default()
     };
+    let mut delivery = DeliverySummary::default();
     loop {
         if stop.wait(poll_interval) {
             return;
@@ -733,6 +816,7 @@ fn monitor_loop(
                     context,
                     threads: totals_snapshot.0,
                     totals: totals_snapshot.1,
+                    delivery,
                 };
                 let rendered = render_report(&report);
                 // Sampling /proc and rendering takes time; never emit once
@@ -740,26 +824,26 @@ fn monitor_loop(
                 if stop.is_stopped() {
                     return;
                 }
-                sink(&rendered);
+                delivery.record(sink(&rendered));
             }
             MonitorAction::Recovered { stalled_for } => {
                 if stop.is_stopped() {
                     return;
                 }
-                sink(&format!(
+                delivery.record(sink(&format!(
                     "bitty: main-loop stall recovered after {} ms (phase={})",
                     stalled_for.as_millis(),
                     phase.as_str()
-                ));
+                )));
             }
             MonitorAction::Suppressed => {
                 if stop.is_stopped() {
                     return;
                 }
-                sink(&format!(
+                delivery.record(sink(&format!(
                     "bitty: main-loop stall still active after {} reports; further reports suppressed",
                     MAX_REPORTS_PER_STALL
-                ));
+                )));
             }
         }
     }
@@ -969,6 +1053,9 @@ fn render_report(report: &StallReport) -> String {
             );
         }
     }
+    if let Some(delivery) = report.delivery.render() {
+        let _ = writeln!(out, "{delivery}");
+    }
     truncate_report(out)
 }
 
@@ -988,18 +1075,22 @@ fn format_ids(ids: &[String]) -> String {
 }
 
 /// Hard-cap one report at a char boundary.
-fn truncate_report(mut report: String) -> String {
-    const SUFFIX: &str = "\n  ... report truncated";
-    if report.len() <= MAX_REPORT_BYTES {
-        return report;
+fn truncate_report(report: String) -> String {
+    truncate_text(report, MAX_REPORT_BYTES, "\n  ... report truncated")
+}
+
+/// Hard-cap arbitrary evidence text at a char boundary with a marker.
+fn truncate_text(mut text: String, max_bytes: usize, suffix: &str) -> String {
+    if text.len() <= max_bytes {
+        return text;
     }
-    let mut boundary = MAX_REPORT_BYTES.saturating_sub(SUFFIX.len());
-    while boundary > 0 && !report.is_char_boundary(boundary) {
+    let mut boundary = max_bytes.saturating_sub(suffix.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    report.truncate(boundary);
-    report.push_str(SUFFIX);
-    report
+    text.truncate(boundary);
+    text.push_str(suffix);
+    text
 }
 
 /// Report delivery seam.
@@ -1010,16 +1101,27 @@ fn truncate_report(mut report: String) -> String {
 /// Tests inject deterministic deliveries; the production supervisor itself is
 /// exercised with real child processes.
 trait ReportDelivery: Send {
-    /// Deliver one already-redacted report.
-    ///
-    /// `state_path` is `Some` only for a stall report; recovery and
-    /// suppression lines reach stderr without touching the state slot.
-    fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome;
+    /// Deliver one already-redacted report and report what happened to it.
+    fn deliver(&mut self, request: DeliveryRequest<'_>) -> DeliveryOutcome;
 }
 
-/// Outcome of one helper delivery (status evidence, never a dispatch input).
+/// One report handed to a [`ReportDelivery`].
+struct DeliveryRequest<'a> {
+    /// Redacted report text.
+    line: &'a str,
+    /// Confined evidence slot; `Some` only for a stall report (recovery and
+    /// suppression lines never replace the persisted evidence).
+    slot: Option<&'a StateSlot>,
+}
+
+/// Outcome of one helper delivery.
+///
+/// Every variant is recorded: [`ReportSink`] keeps a bounded ledger, mirrors it
+/// to the companion delivery slot, and the next stall report carries the
+/// summary. A failed delivery is therefore never silent even when both the
+/// state slot and stderr are unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeliveryOutcome {
+pub(crate) enum DeliveryOutcome {
     /// Helper exited 0: the state slot (when requested) and stderr were
     /// handled by the helper.
     Delivered,
@@ -1030,42 +1132,518 @@ enum DeliveryOutcome {
     TimedOut,
     /// The helper could not be spawned (EMFILE/ENFILE, missing exe).
     SpawnFailed,
+    /// The confined evidence slot could not be prepared, locked, or sequenced.
+    EvidenceFailed,
 }
 
-/// Production delivery through the private report helper.
-struct HelperDelivery {
-    /// Current executable; `None` when it cannot be resolved (fail closed).
-    program: Option<PathBuf>,
+impl DeliveryOutcome {
+    /// Stable lowercase name used in durable evidence.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::HelperFailed => "helper-failed",
+            Self::TimedOut => "timed-out",
+            Self::SpawnFailed => "spawn-failed",
+            Self::EvidenceFailed => "evidence-failed",
+        }
+    }
+
+    /// Whether this delivery left no evidence.
+    fn is_failure(self) -> bool {
+        self != Self::Delivered
+    }
 }
 
-impl HelperDelivery {
-    fn current() -> Self {
-        Self {
-            program: std::env::current_exe().ok(),
+/// Confined single-slot evidence file plus its directory.
+///
+/// The path is derived from `XDG_STATE_HOME`/`HOME`; the helper additionally
+/// requires `BITTY_WATCHDOG_STATE_PATH` to repeat that derived path, so a
+/// hostile or stale value can never redirect evidence. Every write is staged
+/// in a fresh `O_EXCL` temp file and renamed into place, and symlinked,
+/// hard-linked, foreign-owned, group/world-writable, or special-file slots are
+/// rejected before anything is replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StateSlot {
+    path: PathBuf,
+}
+
+impl StateSlot {
+    /// Monitor-side resolution: use the shared platform resolver.
+    fn from_env() -> Option<Self> {
+        Some(Self {
+            path: state_file_path()?,
+        })
+    }
+
+    /// Pure monitor-side resolution (tests and fixtures).
+    #[cfg(test)]
+    fn from_values(
+        xdg_state: Option<&std::ffi::OsStr>,
+        home: Option<&std::ffi::OsStr>,
+        local_app_data: Option<&std::ffi::OsStr>,
+    ) -> Option<Self> {
+        Some(Self {
+            path: state_file_path_from(xdg_state, home, local_app_data, STATE_FILE_NAME)?,
+        })
+    }
+
+    /// Helper-side resolution: the inherited path must repeat the derived one.
+    fn from_helper_env() -> Option<Self> {
+        Self::from_helper_values(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("LOCALAPPDATA").as_deref(),
+            std::env::var_os(STATE_WRITER_PATH_ENV).as_deref(),
+        )
+    }
+
+    /// Pure helper-side confinement.
+    fn from_helper_values(
+        xdg_state: Option<&std::ffi::OsStr>,
+        home: Option<&std::ffi::OsStr>,
+        local_app_data: Option<&std::ffi::OsStr>,
+        override_path: Option<&std::ffi::OsStr>,
+    ) -> Option<Self> {
+        let derived = state_file_path_from(xdg_state, home, local_app_data, STATE_FILE_NAME)?;
+        let raw = override_path?;
+        let candidate = normalize_absolute(Path::new(raw))?;
+        if candidate != derived {
+            // Fail closed: never honor a path outside the derived slot.
+            return None;
+        }
+        Some(Self { path: candidate })
+    }
+
+    fn dir(&self) -> &Path {
+        match self.path.parent() {
+            Some(dir) => dir,
+            None => Path::new("."),
+        }
+    }
+
+    fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from(STATE_FILE_NAME))
+    }
+
+    /// Companion single-slot file recording delivery outcomes.
+    fn delivery_path(&self) -> PathBuf {
+        self.dir().join(DELIVERY_FILE_NAME)
+    }
+
+    /// Deterministic temp sibling for one helper attempt.
+    ///
+    /// The attempt sequence makes the name unique per delivery, so a timed-out
+    /// helper can never truncate or rename the staged bytes of a newer attempt.
+    fn attempt_temp(&self, attempt: u64) -> PathBuf {
+        self.dir()
+            .join(format!(".{}.{attempt}.tmp", self.file_name()))
+    }
+
+    /// Validate the confined directory and the existing evidence files without
+    /// following symlinks; create the state directory with private permissions.
+    fn prepare(&self) -> std::io::Result<()> {
+        create_private_dir(self.dir())?;
+        let dir_meta = std::fs::symlink_metadata(self.dir())?;
+        if dir_meta.file_type().is_symlink() {
+            return Err(invalid_input("state directory is a symlink"));
+        }
+        if !dir_meta.is_dir() {
+            return Err(invalid_input("state directory is not a directory"));
+        }
+        check_owned_directory(&dir_meta)?;
+        check_existing_slot(&self.path)?;
+        check_existing_slot(&self.lock_path())?;
+        Ok(())
+    }
+
+    /// Stage bytes in a fresh, no-follow temp file (`O_EXCL` semantics).
+    ///
+    /// `create_new` never follows an existing symlink and never truncates a
+    /// file another attempt owns; a pre-planted entry fails closed.
+    fn stage(&self, temp: &Path, contents: &str) -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    }
+
+    /// Validate the target and atomically rename the staged file over it.
+    fn publish(&self, temp: &Path) -> std::io::Result<()> {
+        self.prepare()?;
+        std::fs::rename(temp, &self.path)
+    }
+
+    /// Remove the temp sibling owned by one attempt (timeout cleanup).
+    fn remove_attempt_temp(&self, attempt: u64) {
+        let _ = std::fs::remove_file(self.attempt_temp(attempt));
+    }
+
+    /// Lock/sequence file used for generation-ordered publication.
+    fn lock_path(&self) -> PathBuf {
+        self.dir().join(format!(".{}.lock", self.file_name()))
+    }
+
+    fn open_lock(&self) -> std::io::Result<File> {
+        check_existing_slot(&self.lock_path())?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+        }
+        let file = options.open(self.lock_path())?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(invalid_input("evidence lock is not a regular file"));
+        }
+        check_owned_regular_file(&meta)?;
+        Ok(file)
+    }
+
+    /// Allocate the next evidence generation under the slot lock.
+    ///
+    /// `Ok(None)` means the bounded lock window expired: the caller skips this
+    /// delivery instead of writing unordered evidence. Skipping is recorded as
+    /// a [`DeliveryOutcome`], never silently ignored.
+    fn next_attempt(&self, deadline: Instant) -> std::io::Result<Option<u64>> {
+        self.prepare()?;
+        let mut file = self.open_lock()?;
+        let mut lock = loop {
+            match try_lock_slot(file) {
+                Ok(lock) => break lock,
+                Err(returned) => {
+                    file = returned;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(
+                        REPORT_HELPER_POLL.min(deadline.saturating_duration_since(now)),
+                    );
+                }
+            }
+        };
+        let next = match read_attempt(lock.file_mut()) {
+            Ok(current) => current.saturating_add(1),
+            Err(error) => {
+                lock.release();
+                return Err(error);
+            }
+        };
+        let written = write_attempt(lock.file_mut(), next);
+        lock.release();
+        written?;
+        Ok(Some(next))
+    }
+
+    /// Stage and publish one helper report with generation ordering.
+    ///
+    /// The generation check, staging, and rename all happen under the lock the
+    /// monitor uses to allocate attempts; an attempt older than the current
+    /// generation is discarded before it writes anything, so a late helper can
+    /// never replace newer evidence. Temp removal by the supervisor after a
+    /// timeout is a second, independent guard. Concurrent app instances share
+    /// the slot: the newest allocated generation wins and a superseded attempt
+    /// is discarded rather than overwriting it.
+    fn commit(&self, attempt: u64, contents: &str) -> std::io::Result<CommitOutcome> {
+        self.prepare()?;
+        let mut file = self.open_lock()?;
+        let deadline = Instant::now() + HELPER_LOCK_WAIT;
+        let mut lock = loop {
+            match try_lock_slot(file) {
+                Ok(lock) => break lock,
+                Err(returned) => {
+                    file = returned;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "evidence lock unavailable",
+                        ));
+                    }
+                    std::thread::sleep(
+                        REPORT_HELPER_POLL.min(deadline.saturating_duration_since(now)),
+                    );
+                }
+            }
+        };
+        let result = (|| {
+            if read_attempt(lock.file_mut())? > attempt {
+                return Ok(CommitOutcome::Stale);
+            }
+            let temp = self.attempt_temp(attempt);
+            self.stage(&temp, contents)?;
+            self.publish(&temp)?;
+            Ok(CommitOutcome::Published)
+        })();
+        if !matches!(result, Ok(CommitOutcome::Published)) {
+            self.remove_attempt_temp(attempt);
+        }
+        lock.release();
+        result
+    }
+
+    /// Atomically replace the companion delivery slot (best effort, bounded).
+    fn write_delivery(&self, contents: &str) -> std::io::Result<()> {
+        self.prepare()?;
+        let temp = self.dir().join(format!(
+            ".{DELIVERY_FILE_NAME}.{}-{}.tmp",
+            std::process::id(),
+            next_sidecar_sequence(),
+        ));
+        self.stage(&temp, contents)?;
+        let target = self.delivery_path();
+        let checked = check_existing_slot(&target);
+        let result = checked.and_then(|()| std::fs::rename(&temp, &target));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+}
+
+/// Result of a generation-ordered helper commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitOutcome {
+    /// The staged report replaced the slot.
+    Published,
+    /// A newer attempt already holds the slot; the staged report was dropped.
+    Stale,
+}
+
+/// Per-process sequence for sidecar temp names (unique across attempts).
+fn next_sidecar_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Lexically normalize an absolute path; `None` for relative or escaping paths.
+fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+        }
+    }
+    Some(normalized)
+}
+
+/// Create the state directory with owner-only permissions.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Reject a symlink, special file, hard link, or file another user owns.
+fn check_existing_slot(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => check_owned_regular_file(&meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_owned_regular_file(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if meta.file_type().is_symlink() {
+        return Err(invalid_input("evidence file is a symlink"));
+    }
+    if !meta.is_file() {
+        return Err(invalid_input("evidence file is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(permission_denied("evidence file is owned by another user"));
+        }
+        if meta.nlink() != 1 {
+            return Err(invalid_input("evidence file is hard-linked"));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(permission_denied("evidence file is group/world writable"));
+        }
+    }
+    Ok(())
+}
+
+fn check_owned_directory(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(permission_denied(
+                "state directory is owned by another user",
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(permission_denied("state directory is group/world writable"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+    }
+    Ok(())
+}
+
+fn invalid_input(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(unix)]
+fn permission_denied(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+}
+
+/// Held slot lock; explicitly released to avoid a panicking third-party drop.
+struct SlotLock {
+    #[cfg(unix)]
+    inner: nix::fcntl::Flock<File>,
+    #[cfg(not(unix))]
+    inner: File,
+}
+
+impl SlotLock {
+    fn file_mut(&mut self) -> &mut File {
+        &mut self.inner
+    }
+
+    /// Release the lock without ever panicking on an unlock error.
+    fn release(self) {
+        #[cfg(unix)]
+        {
+            match self.inner.unlock() {
+                Ok(file) => drop(file),
+                // Unlock failure cannot be surfaced from `Drop` and must not
+                // panic inside the helper; leak the descriptor until exit.
+                Err((lock, _)) => std::mem::forget(lock),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(self.inner);
         }
     }
 }
 
-impl ReportDelivery for HelperDelivery {
-    fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome {
-        let Some(program) = self.program.as_ref() else {
-            return DeliveryOutcome::SpawnFailed;
-        };
-        let mut command = Command::new(program);
-        command.arg(STATE_WRITER_ARG);
-        match state_path {
-            Some(path) => {
-                command.env(STATE_WRITER_PATH_ENV, path);
+/// Acquire the slot lock without blocking; `Err` returns the file to retry.
+#[cfg(unix)]
+fn try_lock_slot(file: File) -> Result<SlotLock, File> {
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(inner) => Ok(SlotLock { inner }),
+        Err((file, _errno)) => Err(file),
+    }
+}
+
+/// Windows has no advisory lock in this crate's feature set; the generation
+/// check still rejects any attempt that observes a newer sequence.
+#[cfg(not(unix))]
+fn try_lock_slot(file: File) -> Result<SlotLock, File> {
+    Ok(SlotLock { inner: file })
+}
+
+/// Read the current evidence generation (missing or unparsable reads as 0).
+fn read_attempt(file: &mut File) -> std::io::Result<u64> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = [0u8; 32];
+    let mut filled = 0;
+    loop {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(count) => {
+                filled += count;
+                if filled == buffer.len() {
+                    break;
+                }
             }
-            None => {
-                command.env_remove(STATE_WRITER_PATH_ENV);
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(std::str::from_utf8(&buffer[..filled])
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
+/// Persist the current evidence generation.
+fn write_attempt(file: &mut File, attempt: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(format!("{attempt}\n").as_bytes())?;
+    file.sync_data()
+}
+
+/// Bounded delivery ledger mirrored to the companion evidence slot.
+#[derive(Debug, Default)]
+struct DeliveryLedger {
+    attempts: u64,
+    failures: u64,
+    last: Option<DeliveryOutcome>,
+    recent_failures: VecDeque<(u64, DeliveryOutcome)>,
+}
+
+impl DeliveryLedger {
+    fn record(&mut self, attempt: u64, outcome: DeliveryOutcome) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.last = Some(outcome);
+        if outcome.is_failure() {
+            self.failures = self.failures.saturating_add(1);
+            self.recent_failures.push_back((attempt, outcome));
+            while self.recent_failures.len() > MAX_DELIVERY_FAILURES {
+                self.recent_failures.pop_front();
             }
         }
-        supervise_helper(
-            command,
-            line,
-            Instant::now() + REPORT_HELPER_TIMEOUT,
-            Stdio::inherit(),
+    }
+
+    /// Render the bounded companion slot contents.
+    fn render(&self) -> String {
+        let mut out = String::with_capacity(256);
+        let last = self.last.map_or("none", DeliveryOutcome::as_str);
+        let _ = writeln!(
+            out,
+            "bitty: stall watchdog delivery: attempts={} failures={} last={last}",
+            self.attempts, self.failures,
+        );
+        for (attempt, outcome) in &self.recent_failures {
+            let _ = writeln!(
+                out,
+                "bitty: stall watchdog delivery failed: attempt={attempt} outcome={}",
+                outcome.as_str(),
+            );
+        }
+        truncate_text(
+            out,
+            MAX_DELIVERY_BYTES,
+            "\n  ... delivery evidence truncated",
         )
     }
 }
@@ -1081,57 +1659,255 @@ impl ReportDelivery for HelperDelivery {
 /// atomically replaced first, so a blocked or broken stderr pipe cannot lose
 /// the evidence. The monitor never writes to its own stderr: it hands the
 /// redacted report to the killable helper and abandons it at the deadline.
+/// The delivery outcome is returned to the monitor, kept in a bounded ledger,
+/// and mirrored to a companion slot so `SpawnFailed`, `TimedOut`,
+/// `HelperFailed`, and `EvidenceFailed` stay observable when the report itself
+/// could not be stored.
 struct ReportSink {
-    state_path: Option<PathBuf>,
+    slot: Option<StateSlot>,
     delivery: Box<dyn ReportDelivery>,
+    ledger: DeliveryLedger,
 }
 
 impl ReportSink {
-    fn emit(&mut self, line: &str) {
+    fn new(slot: Option<StateSlot>, delivery: Box<dyn ReportDelivery>) -> Self {
+        Self {
+            slot,
+            delivery,
+            ledger: DeliveryLedger::default(),
+        }
+    }
+
+    /// Emit one line, record what happened, and return the outcome.
+    fn emit(&mut self, line: &str) -> DeliveryOutcome {
         let redacted = crate::observability::redact_text_for_stderr(line);
         // Recovery/suppression lines share the sink but never overwrite the
         // stall evidence.
-        let state_path = if line.starts_with(STALL_REPORT_PREFIX) {
-            self.state_path.as_deref()
+        let slot = if line.starts_with(STALL_REPORT_PREFIX) {
+            self.slot.as_ref()
         } else {
             None
         };
-        let _outcome = self.delivery.deliver(&redacted, state_path);
+        let attempt = self.ledger.attempts.saturating_add(1);
+        let outcome = self.delivery.deliver(DeliveryRequest {
+            line: redacted.as_ref(),
+            slot,
+        });
+        self.ledger.record(attempt, outcome);
+        self.persist_ledger();
+        outcome
     }
+
+    /// Mirror the bounded ledger to the companion slot.
+    ///
+    /// Bounded local file I/O only (one path under the confined state
+    /// directory, at most [`MAX_DELIVERY_BYTES`]): never stderr, never a wait
+    /// on the helper, and every error is contained so a read-only or full state
+    /// directory cannot panic a stalled monitor.
+    fn persist_ledger(&mut self) {
+        let Some(slot) = self.slot.as_ref() else {
+            return;
+        };
+        let rendered = self.ledger.render();
+        let _ = slot.write_delivery(&rendered);
+    }
+}
+
+/// Production delivery through the private report helper.
+struct HelperDelivery {
+    /// Current executable; `None` when it cannot be resolved (fail closed).
+    program: Option<PathBuf>,
+    /// Bounded helper resource tracking across repeated stalls.
+    runtime: HelperRuntime,
+}
+
+impl HelperDelivery {
+    fn current() -> Self {
+        Self {
+            program: std::env::current_exe().ok(),
+            runtime: HelperRuntime::default(),
+        }
+    }
+}
+
+impl ReportDelivery for HelperDelivery {
+    fn deliver(&mut self, request: DeliveryRequest<'_>) -> DeliveryOutcome {
+        self.runtime.reap_finished();
+        let Some(program) = self.program.as_ref() else {
+            return DeliveryOutcome::SpawnFailed;
+        };
+        let deadline = Instant::now() + REPORT_HELPER_TIMEOUT;
+        let attempt = match request.slot {
+            Some(slot) => {
+                let lock_deadline = deadline.min(Instant::now() + SLOT_LOCK_WAIT);
+                match slot.next_attempt(lock_deadline) {
+                    Ok(Some(attempt)) => Some(attempt),
+                    // A stuck lock or unusable state directory: skip rather
+                    // than publish out of order, and record the skip.
+                    Ok(None) | Err(_) => return DeliveryOutcome::EvidenceFailed,
+                }
+            }
+            None => None,
+        };
+        let mut command = Command::new(program);
+        command.arg(STATE_WRITER_ARG);
+        match (request.slot, attempt) {
+            (Some(slot), Some(attempt)) => {
+                command.env(STATE_WRITER_PATH_ENV, &slot.path);
+                command.env(ATTEMPT_ENV, attempt.to_string());
+            }
+            _ => {
+                command.env_remove(STATE_WRITER_PATH_ENV);
+                command.env_remove(ATTEMPT_ENV);
+            }
+        }
+        supervise_helper(HelperRun {
+            command,
+            line: request.line,
+            deadline,
+            stderr: Stdio::inherit(),
+            runtime: &mut self.runtime,
+            cleanup: request.slot.zip(attempt),
+        })
+    }
+}
+
+/// Bounded lifetimes of helper resources across repeated stalls.
+///
+/// At most one spawn thread and one stdin writer are live at a time; a previous
+/// resource that an unkillable helper still pins makes the next delivery skip
+/// its own resource instead of accumulating threads. At most
+/// [`MAX_ABANDONED_CHILDREN`] unreaped children are retained and every delivery
+/// first tries to reap them.
+#[derive(Default)]
+struct HelperRuntime {
+    spawn: Option<JoinHandle<()>>,
+    stdin: Option<JoinHandle<()>>,
+    abandoned: Vec<Child>,
+    #[cfg(test)]
+    spawns: u32,
+    #[cfg(test)]
+    writers: u32,
+}
+
+impl HelperRuntime {
+    /// Join finished threads and reap exited abandoned children (never blocks).
+    #[allow(clippy::zombie_processes)] // `try_wait` observed the exit; drop is safe.
+    fn reap_finished(&mut self) {
+        for slot in [&mut self.spawn, &mut self.stdin] {
+            if slot.as_ref().is_some_and(JoinHandle::is_finished) {
+                if let Some(handle) = slot.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let mut index = 0;
+        while index < self.abandoned.len() {
+            let reaped = matches!(self.abandoned[index].try_wait(), Ok(Some(_)) | Err(_));
+            if reaped {
+                let _ = self.abandoned.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn spawn_in_flight(&self) -> bool {
+        self.spawn
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    fn writer_in_flight(&self) -> bool {
+        self.stdin
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Retain a killed-but-unreaped child within the fixed bound.
+    fn track_abandoned(&mut self, child: Child) {
+        if self.abandoned.len() < MAX_ABANDONED_CHILDREN {
+            self.abandoned.push(child);
+        }
+        // Beyond the cap the handle is dropped; process exit is the last
+        // resort reap. The cap keeps pid/fd retention bounded per stall.
+    }
+
+    /// Collect the stdin writer within the bounded grace window.
+    fn finish_stdin(&mut self) {
+        let Some(handle) = self.stdin.take() else {
+            return;
+        };
+        let deadline = Instant::now() + REPORT_HELPER_REAP_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(REPORT_HELPER_POLL);
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            // Keep the single in-flight writer tracked; the next delivery will
+            // not spawn a second one while it is alive.
+            self.stdin = Some(handle);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn live_resources(&self) -> (bool, bool, usize) {
+        (
+            self.spawn_in_flight(),
+            self.writer_in_flight(),
+            self.abandoned.len(),
+        )
+    }
+}
+
+impl Drop for HelperRuntime {
+    fn drop(&mut self) {
+        // Non-blocking: a writer pinned by an unkillable helper is detached and
+        // exits with the process; every finished thread is joined here.
+        self.reap_finished();
+    }
+}
+
+/// One supervised helper invocation.
+struct HelperRun<'a> {
+    command: Command,
+    line: &'a str,
+    deadline: Instant,
+    stderr: Stdio,
+    runtime: &'a mut HelperRuntime,
+    /// State slot and attempt whose temp sibling must not outlive a failure.
+    cleanup: Option<(&'a StateSlot, u64)>,
 }
 
 /// Run one helper to completion or the deadline, whichever comes first.
 ///
 /// The full operation is bounded: spawn runs on its own thread (a hung exec
 /// cannot pin the monitor and a late child is contained), the stdin transfer
-/// runs on a writer thread, the wait polls until the deadline, and a timed-out
-/// child is killed with a bounded reap window. A child that survives the reap
-/// window is abandoned (process exit reaps it); the writer thread is likewise
-/// abandoned if the closed pipe does not release it. Cancellation is
-/// best-effort: a helper already running may still write after this returns if
-/// the kernel refuses to terminate it.
-fn supervise_helper(
-    command: Command,
-    line: &str,
-    deadline: Instant,
-    stderr: Stdio,
-) -> DeliveryOutcome {
-    let mut child = match spawn_helper_bounded(command, deadline, stderr) {
+/// runs on at most one writer thread, the wait polls until the deadline, and a
+/// timed-out child is killed with a bounded reap window. A timed-out attempt's
+/// temp file is removed so a late helper cannot publish stale evidence; the
+/// helper-side generation check is the second guard. A child that survives the
+/// reap window is abandoned (process exit reaps it); cancellation remains
+/// best-effort and is measured by the repeated-stall test.
+fn supervise_helper(run: HelperRun<'_>) -> DeliveryOutcome {
+    let HelperRun {
+        command,
+        line,
+        deadline,
+        stderr,
+        runtime,
+        cleanup,
+    } = run;
+    runtime.reap_finished();
+    let mut child = match spawn_helper_bounded(command, deadline, stderr, runtime) {
         Ok(child) => child,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            remove_attempt_temp(cleanup);
+            return outcome;
+        }
     };
-    let writer = child.stdin.take().and_then(|mut stdin| {
-        let bytes = line.as_bytes().to_vec();
-        std::thread::Builder::new()
-            .name(String::from("bitty-stall-helper-stdin"))
-            .spawn(move || {
-                // Bounded by the helper reading or dying; the supervisor never
-                // joins this thread while the helper is alive.
-                let _ = stdin.write_all(&bytes);
-                drop(stdin);
-            })
-            .ok()
-    });
+    start_stdin_writer(&mut child, line, runtime);
     let mut outcome = DeliveryOutcome::TimedOut;
     loop {
         match child.try_wait() {
@@ -1157,38 +1933,36 @@ fn supervise_helper(
     }
     if outcome == DeliveryOutcome::TimedOut {
         let _ = child.kill();
-        let reap_deadline = Instant::now() + REPORT_HELPER_REAP_GRACE;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) if Instant::now() < reap_deadline => {
-                    std::thread::sleep(REPORT_HELPER_POLL);
-                }
-                // Survived the grace window: abandon it. Process exit is the
-                // last resort reap; shutdown must not join forever behind a
-                // helper stuck in uninterruptible I/O.
-                Ok(None) => break,
-            }
+        if let Some(abandoned) = wait_child_bounded(child, REPORT_HELPER_REAP_GRACE) {
+            runtime.track_abandoned(abandoned);
         }
     }
-    if let Some(handle) = writer {
-        let collect_deadline = Instant::now() + REPORT_HELPER_REAP_GRACE;
-        while !handle.is_finished() && Instant::now() < collect_deadline {
-            std::thread::sleep(REPORT_HELPER_POLL);
-        }
-        if handle.is_finished() {
-            let _ = handle.join();
-        }
+    if outcome.is_failure() {
+        remove_attempt_temp(cleanup);
     }
+    runtime.finish_stdin();
     outcome
+}
+
+/// Remove a timed-out or failed attempt's staged bytes.
+fn remove_attempt_temp(cleanup: Option<(&StateSlot, u64)>) {
+    if let Some((slot, attempt)) = cleanup {
+        slot.remove_attempt_temp(attempt);
+    }
 }
 
 /// Spawn the helper on a dedicated thread so a hung `exec` cannot hold the
 /// monitor past the deadline.
+///
+/// Only one spawn thread is ever live: if the previous exec never returned,
+/// the next delivery is recorded as timed out instead of accumulating threads.
+/// A child that arrives after the supervisor gave up is killed and reaped with
+/// the same bounded grace window, never an unbounded `wait`.
 fn spawn_helper_bounded(
     mut command: Command,
     deadline: Instant,
     stderr: Stdio,
+    runtime: &mut HelperRuntime,
 ) -> Result<Child, DeliveryOutcome> {
     command
         .stdin(Stdio::piped())
@@ -1198,53 +1972,108 @@ fn spawn_helper_bounded(
     if budget.is_zero() {
         return Err(DeliveryOutcome::TimedOut);
     }
+    if runtime.spawn_in_flight() {
+        return Err(DeliveryOutcome::TimedOut);
+    }
     let (tx, rx) = mpsc::channel();
-    let started = Instant::now();
     let spawned = std::thread::Builder::new()
         .name(String::from("bitty-stall-helper-spawn"))
         .spawn(move || match command.spawn() {
-            Ok(mut child) => {
-                if started.elapsed() >= budget {
-                    // The receiver already gave up; contain the late child.
+            Ok(child) => {
+                // The receiver gave up: contain the late child.
+                if let Err(mpsc::SendError(Ok(mut child))) = tx.send(Ok(child)) {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-                if let Err(send) = tx.send(Ok(child)) {
-                    if let Ok(mut child) = send.0 {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
+                    let _ = wait_child_bounded(child, REPORT_HELPER_REAP_GRACE);
                 }
             }
             Err(error) => {
                 let _ = tx.send(Err(error));
             }
         });
-    if spawned.is_err() {
+    let Ok(handle) = spawned else {
         return Err(DeliveryOutcome::SpawnFailed);
+    };
+    runtime.spawn = Some(handle);
+    #[cfg(test)]
+    {
+        runtime.spawns = runtime.spawns.saturating_add(1);
     }
-    match rx.recv_timeout(budget) {
+    let outcome = match rx.recv_timeout(budget) {
         Ok(Ok(child)) => Ok(child),
         Ok(Err(_)) => Err(DeliveryOutcome::SpawnFailed),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(DeliveryOutcome::TimedOut),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(DeliveryOutcome::SpawnFailed),
+    };
+    if !matches!(outcome, Err(DeliveryOutcome::TimedOut)) {
+        // The thread already sent its result; collecting it now keeps at most
+        // one spawn thread tracked instead of relying on the next delivery.
+        if let Some(handle) = runtime.spawn.take() {
+            let _ = handle.join();
+        }
+    }
+    outcome
+}
+
+/// Write the report into the helper's stdin from a single bounded writer.
+///
+/// A report is capped at [`MAX_REPORT_BYTES`]; the writer thread exists only so
+/// a helper that never reads cannot pin the supervisor. If a previous writer is
+/// still blocked on an unkillable helper, this delivery closes its stdin
+/// immediately (the helper rejects the empty report) instead of spawning a
+/// second writer.
+fn start_stdin_writer(child: &mut Child, line: &str, runtime: &mut HelperRuntime) {
+    let Some(mut stdin) = child.stdin.take() else {
+        return;
+    };
+    if runtime.writer_in_flight() {
+        drop(stdin);
+        return;
+    }
+    let bytes = line.as_bytes().to_vec();
+    let spawned = std::thread::Builder::new()
+        .name(String::from("bitty-stall-helper-stdin"))
+        .spawn(move || {
+            let _ = stdin.write_all(&bytes);
+            drop(stdin);
+        });
+    if let Ok(handle) = spawned {
+        runtime.stdin = Some(handle);
+        #[cfg(test)]
+        {
+            runtime.writers = runtime.writers.saturating_add(1);
+        }
+    }
+}
+
+/// Wait for a child up to `grace`; `Some(child)` means it survived the window.
+fn wait_child_bounded(mut child: Child, grace: Duration) -> Option<Child> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Some(child);
+        }
+        std::thread::sleep(REPORT_HELPER_POLL.min(deadline.saturating_duration_since(now)));
     }
 }
 
 /// Write one report to the optional atomic state slot, then stderr.
 ///
-/// The state slot is replaced (temp file + rename) before the stderr write, so
-/// a failure or kill during the stderr write cannot destroy the previous
-/// report. A state-slot failure fails the helper (non-zero exit) without
-/// touching the existing slot; stderr errors (EPIPE/EBADF) are tolerated.
+/// The state slot is replaced before the stderr write, so a failure or kill
+/// during the stderr write cannot destroy the previous report. A state-slot
+/// failure fails the helper (non-zero exit) without touching the existing
+/// slot; stderr errors (EPIPE/EBADF) are tolerated.
 fn write_report_to(
-    state_path: Option<&Path>,
+    target: Option<(&StateSlot, u64)>,
     report: &str,
     stderr: &mut dyn std::io::Write,
 ) -> std::io::Result<()> {
-    let persisted = match state_path {
-        Some(path) => write_state_atomic(path, report),
+    let persisted = match target {
+        Some((slot, attempt)) => slot.commit(attempt, report).map(|_| ()),
         None => Ok(()),
     };
     // Stderr is attempted even when the state slot failed: the report is the
@@ -1254,49 +2083,6 @@ fn write_report_to(
     let _ = stderr.write_all(b"\n");
     let _ = stderr.flush();
     persisted
-}
-
-/// Deterministic temp sibling used for the atomic state replacement.
-///
-/// One fixed sibling per slot (not per helper PID): a report killed mid-write
-/// leaves at most one temp file, which the next report truncates, instead of
-/// accumulating one leftover per timeout.
-fn state_temp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from("stall-watchdog.log"));
-    path.with_file_name(format!(".{name}.tmp"))
-}
-
-/// Atomically replace the single state slot.
-///
-/// The previous slot stays intact on any failure: the new report is fully
-/// written and synced to a sibling temp file first, then renamed over the
-/// target (atomic on the same filesystem).
-fn write_state_atomic(path: &Path, line: &str) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "state slot path has no parent",
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let temp = state_temp_path(path);
-    let written = (|| {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(line.as_bytes())?;
-        file.sync_all()
-    })();
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
-    Ok(())
 }
 
 /// Read the helper's report from stdin, capped at [`MAX_REPORT_BYTES`].
@@ -1318,21 +2104,55 @@ fn read_helper_report(input: &mut dyn std::io::Read) -> Option<String> {
 /// writes the report to its inherited stderr. The helper is disposable: the
 /// monitor kills it at the delivery deadline, which is how a blocked stderr
 /// pipe stays bounded without ever changing the application's fd 2 flags.
+/// Every state decision is fail-closed: a redirected path, a symlinked or
+/// special-file slot, a missing generation, or an empty report exits non-zero
+/// without replacing the previous evidence.
 pub(crate) fn handle_state_writer(raw: &[String]) -> bool {
     if raw.get(1).map(String::as_str) != Some(STATE_WRITER_ARG) {
         return false;
     }
-    let path = std::env::var_os(STATE_WRITER_PATH_ENV).map(PathBuf::from);
-    let Some(report) = read_helper_report(&mut std::io::stdin()) else {
-        std::process::exit(1);
+    let code = run_state_writer(&mut std::io::stdin(), &mut std::io::stderr());
+    std::process::exit(code);
+}
+
+/// Helper body split from the process exit so tests can drive the exact path.
+fn run_state_writer(input: &mut dyn std::io::Read, stderr: &mut dyn std::io::Write) -> i32 {
+    let state_requested = std::env::var_os(STATE_WRITER_PATH_ENV).is_some();
+    let slot = if state_requested {
+        StateSlot::from_helper_env()
+    } else {
+        None
     };
-    match write_report_to(path.as_deref(), &report, &mut std::io::stderr()) {
-        Ok(()) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+    let attempt = std::env::var(ATTEMPT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let Some(report) = read_helper_report(input) else {
+        return 1;
+    };
+    if report.trim().is_empty() {
+        // An empty report means the supervisor could not hand over its bytes;
+        // never replace good evidence with nothing.
+        return 1;
+    }
+    let target = match (state_requested, slot.as_ref(), attempt) {
+        (false, _, _) => None,
+        (true, Some(slot), Some(attempt)) => Some((slot, attempt)),
+        // A redirected or unresolvable path, or a missing generation: fail
+        // closed without touching evidence, still emitting stderr.
+        (true, _, _) => {
+            let _ = stderr.write_all(report.as_bytes());
+            let _ = stderr.write_all(b"\n");
+            let _ = stderr.flush();
+            return 1;
+        }
+    };
+    match write_report_to(target, &report, stderr) {
+        Ok(()) => 0,
+        Err(_) => 1,
     }
 }
 
-/// Resolve the single-slot state file path from XDG state conventions.
+/// Resolve the single-slot state file path from platform state conventions.
 fn state_file_path() -> Option<PathBuf> {
     state_file_path_for(STATE_FILE_NAME)
 }
@@ -1352,6 +2172,9 @@ pub(crate) fn state_file_path_for(name: &str) -> Option<PathBuf> {
 }
 
 /// Pure path resolution for [`state_file_path`].
+///
+/// A relative base directory is invalid per the XDG base-directory spec and
+/// would resolve against the process working directory; it fails closed.
 fn state_file_path_from(
     xdg_state: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
@@ -1362,6 +2185,9 @@ fn state_file_path_from(
         .map(PathBuf::from)
         .or_else(|| home.map(|home| PathBuf::from(home).join(".local").join("state")))
         .or_else(|| local_app_data.map(PathBuf::from))?;
+    if !base.is_absolute() {
+        return None;
+    }
     Some(base.join("bitty").join(name))
 }
 
@@ -1555,39 +2381,179 @@ mod tests {
         assert!(shared.context_due());
     }
 
-    #[test]
-    fn state_slot_is_a_single_bounded_file() {
+    /// Deterministic temp directory for one hermetic monitor test.
+    fn test_dir(tag: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "bitty-watchdog-{}-{}",
+            "bitty-watchdog-{tag}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let path = dir.join(STATE_FILE_NAME);
-        write_state_atomic(&path, "first").expect("initial slot");
-        write_state_atomic(&path, "second").expect("replace slot");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Confined slot rooted at a test directory.
+    fn state_slot_in(dir: &Path) -> StateSlot {
+        StateSlot::from_values(Some(dir.as_os_str()), None, None).expect("state slot")
+    }
+
+    #[test]
+    fn state_slot_is_a_single_bounded_file() {
+        let dir = test_dir("state-slot");
+        let slot = state_slot_in(&dir);
+        slot.commit(1, "first").expect("initial slot");
+        slot.commit(2, "second").expect("replace slot");
+        assert_eq!(std::fs::read_to_string(&slot.path).unwrap(), "second");
+        assert!(
+            !slot.attempt_temp(2).exists(),
+            "published temp must be gone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn state_replacement_is_atomic_and_keeps_the_previous_report_on_failure() {
         let dir = test_dir("state-atomic");
-        let path = dir.join(STATE_FILE_NAME);
-        write_state_atomic(&path, "first").expect("initial slot");
-        // Block the deterministic temp sibling with a directory: the new
-        // report cannot be staged, so the helper fails before the rename and
-        // the previous evidence stays byte-identical.
-        std::fs::create_dir(state_temp_path(&path)).expect("block temp sibling");
-        assert!(write_state_atomic(&path, "second").is_err());
+        let slot = state_slot_in(&dir);
+        slot.commit(1, "first").expect("initial slot");
+        // Block the attempt temp with a directory: the new report cannot be
+        // staged, so the helper fails before the rename and the previous
+        // evidence stays byte-identical.
+        std::fs::create_dir(slot.attempt_temp(2)).expect("block temp sibling");
+        assert!(slot.commit(2, "second").is_err());
         assert_eq!(
-            std::fs::read_to_string(&path).expect("previous slot"),
+            std::fs::read_to_string(&slot.path).expect("previous slot"),
             "first"
         );
-        std::fs::remove_dir(state_temp_path(&path)).expect("unblock temp sibling");
-        write_state_atomic(&path, "second").expect("replacement after unblock");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        std::fs::remove_dir(slot.attempt_temp(2)).expect("unblock temp sibling");
+        slot.commit(2, "second").expect("replacement after unblock");
+        assert_eq!(std::fs::read_to_string(&slot.path).unwrap(), "second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_generation_cannot_replace_newer_evidence() {
+        let dir = test_dir("stale-generation");
+        let slot = state_slot_in(&dir);
+        let first = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        let stale_temp = slot.attempt_temp(first);
+        slot.stage(&stale_temp, "stale\n").expect("stage stale");
+        let second = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        assert!(second > first);
+        slot.commit(second, "newer\n").expect("newer evidence");
+        // A late helper republishes its staged bytes: rejected as stale.
+        assert_eq!(
+            slot.commit(first, "stale\n").expect("commit outcome"),
+            CommitOutcome::Stale
+        );
+        assert_eq!(std::fs::read_to_string(&slot.path).unwrap(), "newer\n");
+        assert!(!stale_temp.exists(), "stale staged bytes must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_slot_is_rejected_and_target_untouched() {
+        let dir = test_dir("symlink-slot");
+        let slot = state_slot_in(&dir);
+        std::fs::create_dir_all(slot.dir()).expect("state dir");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "untouched").expect("victim");
+        std::os::unix::fs::symlink(&victim, &slot.path).expect("symlink slot");
+        assert!(slot.prepare().is_err(), "a symlinked slot must fail closed");
+        assert!(slot.commit(1, "evidence").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "no write may follow the symlink"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_state_slot_is_rejected() {
+        let dir = test_dir("hardlink-slot");
+        let slot = state_slot_in(&dir);
+        slot.commit(1, "evidence").expect("slot");
+        std::fs::hard_link(&slot.path, dir.join("elsewhere")).expect("hard link");
+        assert!(
+            slot.prepare().is_err(),
+            "a hard-linked slot can redirect evidence and must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_state_slot_is_rejected() {
+        let dir = test_dir("fifo-slot");
+        let slot = state_slot_in(&dir);
+        slot.prepare().expect("state dir");
+        nix::unistd::mkfifo(
+            &slot.path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("fifo");
+        assert!(slot.prepare().is_err(), "a FIFO slot must fail closed");
+        assert!(slot.commit(1, "evidence").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_staging_never_follows_a_preexisting_symlink() {
+        let dir = test_dir("temp-symlink");
+        let slot = state_slot_in(&dir);
+        slot.prepare().expect("state dir");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "untouched").expect("victim");
+        let temp = slot.attempt_temp(7);
+        std::os::unix::fs::symlink(&victim, &temp).expect("symlink temp");
+        assert!(
+            slot.commit(7, "leak").is_err(),
+            "O_EXCL staging must not follow a pre-planted symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_path_override_is_confined_to_the_derived_slot() {
+        use std::ffi::OsStr;
+        let base = OsStr::new("/example/state");
+        let derived = Path::new("/example/state/bitty/stall-watchdog.log");
+        assert_eq!(
+            StateSlot::from_helper_values(Some(base), None, None, Some(derived.as_os_str())),
+            Some(StateSlot {
+                path: derived.to_path_buf()
+            })
+        );
+        for hostile in [
+            "/etc/passwd",
+            "/example/state/bitty/other.log",
+            "/example/state/bitty/../bitty/stall-watchdog.log",
+            "relative/stall-watchdog.log",
+            "/example/state/bitty/",
+        ] {
+            assert_eq!(
+                StateSlot::from_helper_values(Some(base), None, None, Some(OsStr::new(hostile))),
+                None,
+                "hostile override must be rejected: {hostile}"
+            );
+        }
+        assert_eq!(
+            StateSlot::from_helper_values(Some(base), None, None, None),
+            None,
+            "the helper only writes state when a path is requested"
+        );
     }
 
     #[test]
@@ -1640,6 +2606,133 @@ mod tests {
             state_file_path_from(None, None, None, STATE_FILE_NAME),
             None
         );
+        assert_eq!(
+            state_file_path_from(
+                Some(OsStr::new("relative/state")),
+                None,
+                None,
+                STATE_FILE_NAME
+            ),
+            None,
+            "a relative XDG state home must not resolve against the cwd"
+        );
+    }
+
+    #[test]
+    fn delivery_summary_is_rendered_in_band() {
+        let mut summary = DeliverySummary::default();
+        assert!(summary.render().is_none());
+        summary.record(DeliveryOutcome::TimedOut);
+        summary.record(DeliveryOutcome::Delivered);
+        let rendered = summary.render().expect("summary line");
+        assert!(rendered.contains("attempts=2"), "{rendered}");
+        assert!(rendered.contains("failures=1"), "{rendered}");
+        assert!(rendered.contains("last=delivered"), "{rendered}");
+    }
+
+    #[test]
+    fn delivery_ledger_is_bounded_and_names_every_failure() {
+        let mut ledger = DeliveryLedger::default();
+        let outcomes = [
+            DeliveryOutcome::SpawnFailed,
+            DeliveryOutcome::TimedOut,
+            DeliveryOutcome::HelperFailed,
+            DeliveryOutcome::EvidenceFailed,
+            DeliveryOutcome::Delivered,
+            DeliveryOutcome::SpawnFailed,
+        ];
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            ledger.record(index as u64 + 1, outcome);
+        }
+        let rendered = ledger.render();
+        assert!(
+            rendered.starts_with("bitty: stall watchdog delivery: attempts=6 failures=5"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("last=spawn-failed"), "{rendered}");
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.contains("delivery failed"))
+                .count(),
+            MAX_DELIVERY_FAILURES,
+            "recent failures must stay bounded: {rendered}"
+        );
+        assert!(rendered.len() <= MAX_DELIVERY_BYTES, "{rendered}");
+    }
+
+    /// Delivery seam that returns a scripted outcome with no side effects.
+    struct ScriptedDelivery {
+        outcomes: VecDeque<DeliveryOutcome>,
+    }
+
+    impl ReportDelivery for ScriptedDelivery {
+        fn deliver(&mut self, _request: DeliveryRequest<'_>) -> DeliveryOutcome {
+            self.outcomes
+                .pop_front()
+                .unwrap_or(DeliveryOutcome::Delivered)
+        }
+    }
+
+    #[test]
+    fn every_delivery_failure_reaches_the_bounded_companion_slot() {
+        let dir = test_dir("delivery-slot");
+        let slot = state_slot_in(&dir);
+        let mut sink = ReportSink::new(
+            Some(slot.clone()),
+            Box::new(ScriptedDelivery {
+                outcomes: VecDeque::from([
+                    DeliveryOutcome::SpawnFailed,
+                    DeliveryOutcome::TimedOut,
+                    DeliveryOutcome::HelperFailed,
+                ]),
+            }),
+        );
+        let line = concat!(
+            "bitty: main-loop stall detected: no progress for 2000 ms ",
+            "(threshold 2000 ms, phase=plugin-timers, app_uptime 10 ms, progress=3)\n"
+        );
+        assert_eq!(sink.emit(line), DeliveryOutcome::SpawnFailed);
+        assert_eq!(sink.emit(line), DeliveryOutcome::TimedOut);
+        assert_eq!(sink.emit(line), DeliveryOutcome::HelperFailed);
+        assert_eq!(sink.emit(line), DeliveryOutcome::Delivered);
+        let evidence = std::fs::read_to_string(slot.delivery_path()).expect("delivery slot");
+        assert!(
+            evidence.starts_with("bitty: stall watchdog delivery: attempts=4 failures=3"),
+            "{evidence}"
+        );
+        assert!(evidence.contains("last=delivered"), "{evidence}");
+        for expected in ["spawn-failed", "timed-out", "helper-failed"] {
+            assert!(
+                evidence.contains(&format!("outcome={expected}")),
+                "missing {expected}: {evidence}"
+            );
+        }
+        assert!(evidence.len() <= MAX_DELIVERY_BYTES, "{evidence}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn production_spawn_failure_is_recorded_without_panicking() {
+        let dir = test_dir("spawn-failure");
+        let slot = state_slot_in(&dir);
+        let mut sink = ReportSink::new(
+            Some(slot.clone()),
+            Box::new(HelperDelivery {
+                program: None,
+                runtime: HelperRuntime::default(),
+            }),
+        );
+        let outcome = sink.emit(concat!(
+            "bitty: main-loop stall detected: no progress for 2000 ms ",
+            "(threshold 2000 ms, phase=runtime-tick, app_uptime 10 ms, progress=1)\n"
+        ));
+        assert_eq!(outcome, DeliveryOutcome::SpawnFailed);
+        let evidence = std::fs::read_to_string(slot.delivery_path()).expect("delivery slot");
+        assert!(evidence.contains("last=spawn-failed"), "{evidence}");
+        assert!(evidence.contains("outcome=spawn-failed"), "{evidence}");
+        assert!(!slot.path.exists(), "no stall slot may be written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
@@ -1694,10 +2787,19 @@ mod tests {
             }),
             threads: rows,
             totals,
+            delivery: DeliverySummary {
+                attempts: 2,
+                failures: 1,
+                last: Some(DeliveryOutcome::TimedOut),
+            },
         };
         let rendered = render_report(&report);
         assert!(rendered.contains("phase=runtime-tick"), "{rendered}");
         assert!(rendered.contains("[main]"), "{rendered}");
+        assert!(
+            rendered.contains("watchdog-delivery: attempts=2 failures=1 last=timed-out"),
+            "{rendered}"
+        );
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());
         assert!(rendered.contains("surface: last=none"), "{rendered}");
         assert!(!rendered.contains("/home/"), "{rendered}");
@@ -1710,6 +2812,7 @@ mod tests {
             WatchdogConfig::with_threshold_ms(40),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
             }),
         );
         watchdog.enter(Phase::PluginTimers);
@@ -1726,18 +2829,6 @@ mod tests {
         watchdog
             .stop_and_join()
             .expect("monitor thread must exit cleanly");
-    }
-
-    /// Deterministic temp directory for one hermetic monitor test.
-    fn test_dir(tag: &str) -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-watchdog-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
     }
 
     /// Stderr stand-in that fails exactly like a closed pipe.
@@ -1770,10 +2861,18 @@ mod tests {
     }
 
     impl ReportDelivery for OrderingDelivery {
-        fn deliver(&mut self, line: &str, state_path: Option<&Path>) -> DeliveryOutcome {
+        fn deliver(&mut self, request: DeliveryRequest<'_>) -> DeliveryOutcome {
+            let Some(slot) = request.slot else {
+                return DeliveryOutcome::Delivered;
+            };
+            let attempt = slot
+                .next_attempt(Instant::now() + Duration::from_millis(100))
+                .ok()
+                .flatten()
+                .unwrap_or(0);
             let _ = write_report_to(
-                state_path,
-                line,
+                Some((slot, attempt)),
+                request.line,
                 &mut BrokenStderr {
                     state_path: self.state_path.clone(),
                     saw_state_before_write: Arc::clone(&self.saw_state_before_write),
@@ -1786,61 +2885,66 @@ mod tests {
     #[test]
     fn report_sink_persists_state_before_a_broken_stderr_write() {
         let dir = test_dir("sink-order");
-        let path = dir.join(STATE_FILE_NAME);
+        let slot = state_slot_in(&dir);
         let saw_state = Arc::new(AtomicBool::new(false));
-        let mut sink = ReportSink {
-            state_path: Some(path.clone()),
-            delivery: Box::new(OrderingDelivery {
-                state_path: path.clone(),
+        let mut sink = ReportSink::new(
+            Some(slot.clone()),
+            Box::new(OrderingDelivery {
+                state_path: slot.path.clone(),
                 saw_state_before_write: Arc::clone(&saw_state),
             }),
-        };
+        );
         let line = concat!(
             "bitty: main-loop stall detected: no progress for 2000 ms ",
             "(threshold 2000 ms, phase=plugin-timers, app_uptime 10 ms, progress=3)\n",
             "  thread-state snapshot\n"
         );
-        sink.emit(line);
+        assert_eq!(sink.emit(line), DeliveryOutcome::Delivered);
 
         assert!(
             saw_state.load(Ordering::SeqCst),
             "the state slot must exist before stderr is written"
         );
-        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        assert_eq!(
+            std::fs::read_to_string(&slot.path).expect("state slot"),
+            line
+        );
         // Recovery lines share the sink but never overwrite the evidence.
         sink.emit("bitty: main-loop stall recovered after 2000 ms (phase=idle)");
-        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        assert_eq!(
+            std::fs::read_to_string(&slot.path).expect("state slot"),
+            line
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn monitor_soak_with_broken_stderr_keeps_phase_and_thread_evidence() {
         let dir = test_dir("soak");
-        let state_path = dir.join(STATE_FILE_NAME);
+        let slot = state_slot_in(&dir);
         let writes = Arc::new(AtomicU64::new(0));
         let saw_state = Arc::new(AtomicBool::new(false));
-        let sink_path = state_path.clone();
+        let mut sink = ReportSink::new(
+            Some(slot.clone()),
+            Box::new(OrderingDelivery {
+                state_path: slot.path.clone(),
+                saw_state_before_write: Arc::clone(&saw_state),
+            }),
+        );
         let sink_writes = Arc::clone(&writes);
-        let sink_saw_state = Arc::clone(&saw_state);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(45),
             Box::new(move |line| {
-                let mut sink = ReportSink {
-                    state_path: Some(sink_path.clone()),
-                    delivery: Box::new(OrderingDelivery {
-                        state_path: sink_path.clone(),
-                        saw_state_before_write: Arc::clone(&sink_saw_state),
-                    }),
-                };
-                sink.emit(line);
+                let outcome = sink.emit(line);
                 sink_writes.fetch_add(1, Ordering::SeqCst);
+                outcome
             }),
         );
         watchdog.enter(Phase::PluginTimers);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let evidence = loop {
-            if let Ok(text) = std::fs::read_to_string(&state_path) {
+            if let Ok(text) = std::fs::read_to_string(&slot.path) {
                 if text.contains("phase=plugin-timers") {
                     break text;
                 }
@@ -1889,7 +2993,7 @@ mod tests {
             "no report may be written after shutdown"
         );
         assert_eq!(
-            std::fs::read_to_string(&state_path).expect("state slot"),
+            std::fs::read_to_string(&slot.path).expect("state slot"),
             evidence,
             "state evidence must survive shutdown unchanged"
         );
@@ -1911,6 +3015,7 @@ mod tests {
                 // Hold the monitor inside the sink until the test releases it.
                 let _ = release_rx.recv();
                 sink_writes.fetch_add(1, Ordering::SeqCst);
+                DeliveryOutcome::Delivered
             }),
         );
         watchdog.enter(Phase::RuntimeTick);
@@ -1958,18 +3063,38 @@ mod tests {
         command
     }
 
+    #[cfg(unix)]
+    fn run_helper(
+        runtime: &mut HelperRuntime,
+        command: Command,
+        line: &str,
+        timeout: Duration,
+    ) -> DeliveryOutcome {
+        supervise_helper(HelperRun {
+            command,
+            line,
+            deadline: Instant::now() + timeout,
+            stderr: Stdio::null(),
+            runtime,
+            cleanup: None,
+        })
+    }
+
     #[test]
     fn helper_spawn_failure_is_fail_closed() {
         // EMFILE/ENFILE or a missing executable must not panic or block: the
         // monitor simply loses the stderr copy while the state slot remains
         // best-effort.
+        let mut runtime = HelperRuntime::default();
         let command = Command::new("bitty-watchdog-helper-that-does-not-exist-0123456789");
-        let outcome = supervise_helper(
+        let outcome = supervise_helper(HelperRun {
             command,
-            "report\n",
-            Instant::now() + Duration::from_millis(200),
-            Stdio::null(),
-        );
+            line: "report\n",
+            deadline: Instant::now() + Duration::from_millis(200),
+            stderr: Stdio::null(),
+            runtime: &mut runtime,
+            cleanup: None,
+        });
         assert_eq!(outcome, DeliveryOutcome::SpawnFailed);
     }
 
@@ -1980,13 +3105,16 @@ mod tests {
         // writing to stderr; the supervisor must kill it at the deadline
         // instead of pinning the monitor.
         let (reader, writer) = nix::unistd::pipe().expect("OS pipe");
+        let mut runtime = HelperRuntime::default();
         let started = Instant::now();
-        let outcome = supervise_helper(
-            shell_helper("head -c 1000000 /dev/zero >&2"),
-            "stall report\n",
-            started + Duration::from_millis(120),
-            Stdio::from(writer),
-        );
+        let outcome = supervise_helper(HelperRun {
+            command: shell_helper("head -c 1000000 /dev/zero >&2"),
+            line: "stall report\n",
+            deadline: started + Duration::from_millis(120),
+            stderr: Stdio::from(writer),
+            runtime: &mut runtime,
+            cleanup: None,
+        });
         assert_eq!(outcome, DeliveryOutcome::TimedOut);
         assert!(
             started.elapsed()
@@ -2002,18 +3130,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn helper_status_is_observed() {
-        let outcome = supervise_helper(
+        let mut runtime = HelperRuntime::default();
+        let outcome = run_helper(
+            &mut runtime,
             shell_helper("cat >/dev/null; exit 7"),
             "report\n",
-            Instant::now() + Duration::from_secs(2),
-            Stdio::null(),
+            Duration::from_secs(2),
         );
         assert_eq!(outcome, DeliveryOutcome::HelperFailed);
-        let delivered = supervise_helper(
+        let delivered = run_helper(
+            &mut runtime,
             shell_helper("cat >/dev/null"),
             "report\n",
-            Instant::now() + Duration::from_secs(2),
-            Stdio::null(),
+            Duration::from_secs(2),
         );
         assert_eq!(delivered, DeliveryOutcome::Delivered);
     }
@@ -2025,12 +3154,13 @@ mod tests {
         // the pipe. The supervisor still returns at the deadline and only
         // drains the writer within the bounded grace window.
         let line = "x".repeat(1024 * 1024);
+        let mut runtime = HelperRuntime::default();
         let started = Instant::now();
-        let outcome = supervise_helper(
+        let outcome = run_helper(
+            &mut runtime,
             shell_helper("sleep 5"),
             &line,
-            started + Duration::from_millis(120),
-            Stdio::null(),
+            Duration::from_millis(120),
         );
         assert_eq!(outcome, DeliveryOutcome::TimedOut);
         assert!(
@@ -2038,6 +3168,129 @@ mod tests {
             "a blocked stdin write must not pin the supervisor, got {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_stalls_keep_helper_resources_bounded() {
+        // Six consecutive stalls with a helper that never reads stdin and an
+        // unread stderr pipe: every delivery is deadline-bounded and no thread
+        // or child accumulates across attempts.
+        let line = "x".repeat(1024 * 1024);
+        let mut runtime = HelperRuntime::default();
+        let started = Instant::now();
+        for _ in 0..6 {
+            let (reader, writer) = nix::unistd::pipe().expect("OS pipe");
+            let outcome = supervise_helper(HelperRun {
+                command: shell_helper("sleep 5"),
+                line: &line,
+                deadline: Instant::now() + Duration::from_millis(60),
+                stderr: Stdio::from(writer),
+                runtime: &mut runtime,
+                cleanup: None,
+            });
+            assert_eq!(outcome, DeliveryOutcome::TimedOut);
+            let (spawn_live, writer_live, abandoned) = runtime.live_resources();
+            assert!(!spawn_live, "no spawn thread may survive a delivery");
+            assert!(!writer_live, "no stdin writer may survive a delivery");
+            assert!(abandoned <= MAX_ABANDONED_CHILDREN, "{abandoned}");
+            drop(reader);
+        }
+        assert_eq!(runtime.spawns, 6);
+        assert_eq!(runtime.writers, 6);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "repeated stalls must stay bounded, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_writer_is_single_flight_when_a_previous_writer_is_pinned() {
+        let mut runtime = HelperRuntime::default();
+        runtime.stdin = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+        }));
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat >/dev/null")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("child");
+        start_stdin_writer(&mut child, "report\n", &mut runtime);
+        assert_eq!(
+            runtime.writers, 0,
+            "a second writer must not be spawned while one is pinned"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_is_single_flight_when_a_previous_exec_is_stuck() {
+        let mut runtime = HelperRuntime::default();
+        runtime.spawn = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+        }));
+        let outcome = spawn_helper_bounded(
+            Command::new("/bin/sh"),
+            Instant::now() + Duration::from_millis(100),
+            Stdio::null(),
+            &mut runtime,
+        );
+        assert_eq!(outcome.unwrap_err(), DeliveryOutcome::TimedOut);
+        assert_eq!(runtime.spawns, 0, "no second spawn thread may exist");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_helper_after_timeout_cannot_replace_newer_evidence() {
+        // Attempt 1 stages bytes, outlives the deadline, and performs the same
+        // rename the real helper uses after newer evidence exists. The
+        // supervisor removes the attempt temp at the deadline and the
+        // generation check rejects the stale commit, so the newer slot wins.
+        let dir = test_dir("late-helper");
+        let slot = state_slot_in(&dir);
+        slot.prepare().expect("state dir");
+        let mut runtime = HelperRuntime::default();
+        let attempt = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        let temp = slot.attempt_temp(attempt);
+        let script = format!(
+            "printf 'stale\\n' > '{temp}'; sleep 1; mv '{temp}' '{slot}' 2>/dev/null; true",
+            temp = temp.display(),
+            slot = slot.path.display(),
+        );
+        let outcome = supervise_helper(HelperRun {
+            command: shell_helper(&script),
+            line: "short report\n",
+            deadline: Instant::now() + Duration::from_millis(100),
+            stderr: Stdio::null(),
+            runtime: &mut runtime,
+            cleanup: Some((&slot, attempt)),
+        });
+        assert_eq!(outcome, DeliveryOutcome::TimedOut);
+        assert!(!temp.exists(), "the timed-out temp must be removed");
+
+        let newer = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        assert!(newer > attempt);
+        slot.commit(newer, "newer\n").expect("newer evidence");
+
+        // Let the late helper wake up and attempt its rename.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            std::fs::read_to_string(&slot.path).unwrap(),
+            "newer\n",
+            "a late helper must never replace newer evidence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -2054,12 +3307,15 @@ mod tests {
                 let _ = entered_tx.send(());
                 let started = Instant::now();
                 let cloned = writer.try_clone().expect("clone pipe writer");
-                let _ = supervise_helper(
-                    shell_helper("head -c 1000000 /dev/zero >&2"),
+                let mut runtime = HelperRuntime::default();
+                supervise_helper(HelperRun {
+                    command: shell_helper("head -c 1000000 /dev/zero >&2"),
                     line,
-                    started + Duration::from_millis(120),
-                    Stdio::from(cloned),
-                );
+                    deadline: started + Duration::from_millis(120),
+                    stderr: Stdio::from(cloned),
+                    runtime: &mut runtime,
+                    cleanup: None,
+                })
             }),
         );
         watchdog.enter(Phase::RuntimeTick);

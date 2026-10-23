@@ -476,6 +476,8 @@ capture_stall_evidence() {
     grep -n 'main-loop stall' "$OUT_DIR/bitty.log" || true
     echo "=== single-slot watchdog report ==="
     cat "$XDG_STATE_HOME/bitty/stall-watchdog.log" 2>/dev/null || echo "(none)"
+    echo "=== watchdog delivery evidence ==="
+    cat "$XDG_STATE_HOME/bitty/stall-watchdog-delivery.log" 2>/dev/null || echo "(none)"
     echo "=== kernel thread snapshot (bounded) ==="
     ps -L -o pid,tid,stat,wchan:32,comm -p "$APP_PID" 2>/dev/null | head -n 80 || true
     echo "=== process totals ==="

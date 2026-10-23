@@ -2,7 +2,7 @@
 
 Bitty is a Rust terminal workspace: a GPU-rendered terminal emulator and
 multi-pane window manager for shell sessions. It is pre-1.0 and pre-alpha; the
-current release line is `v0.0.26`, there is no stable public API, and behavior,
+current release line is `v0.0.27`, there is no stable public API, and behavior,
 configuration keys, and package names may change between releases.
 
 The product site is [bitty.run](https://bitty.run). Release artifacts and

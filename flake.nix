@@ -36,7 +36,7 @@
         src = craneLib.cleanCargoSource ./.;
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-        version = cargoToml.workspace.package.version or "0.0.26";
+        version = cargoToml.workspace.package.version or "0.0.27";
 
         commonArgs = {
           inherit src version;

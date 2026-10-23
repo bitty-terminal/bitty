@@ -99,6 +99,18 @@
 //!   repair bound it refuses with a typed error and changes nothing. Rebuilt
 //!   records keep grants only when the manifest hash still matches; otherwise
 //!   they start disabled with no grants and need a fresh `install` consent.
+//! - `explain <id> <capability> [--format table|json|jsonl]` prints the
+//!   read-only capability decision chain for one declared capability: every
+//!   layer in authority order (`host-ceiling`, `user-policy`,
+//!   `project-policy`, `parent-delegation`, `task-grant`, `agent-request`)
+//!   with allow/deny/empty, the first denying layer, `DenialKind`, the
+//!   engine's bounded reason chain, resolved `TrustLevel`, the enforcement
+//!   record, pins/conflicts, the effective grant, a static budget envelope,
+//!   and minimal non-applying remediation hints. User/project policy files
+//!   are read (bounded, regular files only) and marked advisory until the
+//!   host wires them; the task grant and trust gate are enforced today. A
+//!   denied capability exits 4 after the report; unknown ids/capabilities and
+//!   malformed input fail closed with actionable messages, never a panic.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
 //!   code is ever loaded or executed**; safe-mode clean).
 //!
@@ -150,14 +162,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use bitty_config::plugin_file::PLUGINS_DIR_NAME;
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
+use bitty_plugin_host::effective::{
+    AgentRequest, CapabilityExplanation, CapabilityScope, DenialKind, ENFORCEMENT_MAP,
+    EffectiveLayer, EffectiveStack, EnforcementEntry, LayerState, MAX_POLICY_FILE_BYTES,
+    PolicyProvenance, RequestKind, explain_capability, parse_policy, project_policy_path,
+    user_policy_path_with_env,
+};
 use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
 use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl, SettingDefault};
 use bitty_plugin_host::official::{OfficialPlugin, official_plugin_for, official_plugins};
+use bitty_plugin_host::trust_levels::TrustLevel;
 use bitty_runtime::plugin_runtime::plugin_settings::{
     self, LoadedPluginSettings, PluginConfigKind, PluginConfigPaths, SelectedPluginFile,
     SettingLayer,
@@ -265,6 +285,8 @@ pub enum PluginVerb {
     Disable,
     /// `info <id>`: explain one plugin's static manifest + state.
     Info,
+    /// `explain <id> <capability>`: read-only capability decision chain.
+    Explain,
     /// `revoke <id> [--cap <capability>]`: drop grants (durable denial).
     Revoke,
     /// `config [show|scaffold] <id>`: inspect or scaffold per-plugin settings.
@@ -306,6 +328,7 @@ impl PluginVerb {
         ("enable", Self::Enable),
         ("disable", Self::Disable),
         ("info", Self::Info),
+        ("explain", Self::Explain),
         ("revoke", Self::Revoke),
         ("config", Self::Config),
         ("doctor", Self::Doctor),
@@ -330,6 +353,7 @@ impl PluginVerb {
             Self::Enable => "enable",
             Self::Disable => "disable",
             Self::Info => "info",
+            Self::Explain => "explain",
             Self::Revoke => "revoke",
             Self::Config => "config",
             Self::Doctor => "doctor",
@@ -350,7 +374,9 @@ pub struct PluginRequest {
     pub verb: PluginVerb,
     /// Plugin id operand (validated as a token; grammar checked at resolve).
     pub id: Option<String>,
-    /// Output shape for `list`/`info`.
+    /// Capability operand for `explain` (validated as a closed id at dispatch).
+    pub capability: Option<String>,
+    /// Output shape for `list`/`info`/`explain`/`config show`.
     pub format: PluginFormat,
     /// `install --yes`: approve capability consent non-interactively.
     pub yes: bool,
@@ -400,6 +426,7 @@ pub fn parse_plugin_request(
 ) -> Result<PluginRequest, PluginParseError> {
     let mut verb: Option<PluginVerb> = None;
     let mut id: Option<String> = None;
+    let mut capability: Option<String> = None;
     let mut format: Option<String> = None;
     let mut yes = false;
     let mut force = false;
@@ -521,7 +548,7 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info|revoke|config|doctor)"
+                         (want list|install|remove|enable|disable|info|explain|revoke|config|doctor)"
                     )));
                 }
             }
@@ -540,6 +567,11 @@ pub fn parse_plugin_request(
             index += 1;
             continue;
         }
+        if verb == Some(PluginVerb::Explain) && capability.is_none() {
+            capability = Some(token.to_string());
+            index += 1;
+            continue;
+        }
         return Err(PluginParseError::Usage(format!(
             "bitty plugin: unexpected extra argument {token:?}"
         )));
@@ -547,7 +579,7 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|revoke|config|doctor)"
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|explain|revoke|config|doctor)"
                 .to_string(),
         )
     })?;
@@ -560,6 +592,20 @@ pub fn parse_plugin_request(
     if verb.needs_id() && id.is_none() {
         return Err(PluginParseError::Usage(format!(
             "bitty plugin: `{}` needs a plugin id (owner.name)",
+            verb.name()
+        )));
+    }
+    if verb == PluginVerb::Explain && capability.is_none() {
+        return Err(PluginParseError::Usage(
+            "bitty plugin: `explain` needs a capability id after the plugin id \
+             (for example `bitty plugin explain bitty-terminal.shell-integration \
+             terminal.semantic-read`)"
+                .to_string(),
+        ));
+    }
+    if verb != PluginVerb::Explain && capability.is_some() {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: `{}` takes no capability operand",
             verb.name()
         )));
     }
@@ -584,22 +630,26 @@ pub fn parse_plugin_request(
     if format != PluginFormat::Table
         && !matches!(
             verb,
-            PluginVerb::List | PluginVerb::Info | PluginVerb::Config
+            PluginVerb::List | PluginVerb::Info | PluginVerb::Config | PluginVerb::Explain
         )
     {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --format/--json only apply to `list`, `info`, and `config` (got `{}`)",
+            "bitty plugin: --format/--json only apply to `list`, `info`, `explain`, and `config` (got `{}`)",
             verb.name()
         )));
     }
     if no_color
         && !matches!(
             verb,
-            PluginVerb::List | PluginVerb::Info | PluginVerb::Config | PluginVerb::Doctor
+            PluginVerb::List
+                | PluginVerb::Info
+                | PluginVerb::Config
+                | PluginVerb::Explain
+                | PluginVerb::Doctor
         )
     {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --no-color only applies to `list`, `info`, `config`, and `doctor` (got `{}`)",
+            "bitty plugin: --no-color only applies to `list`, `info`, `explain`, `config`, and `doctor` (got `{}`)",
             verb.name()
         )));
     }
@@ -660,6 +710,7 @@ pub fn parse_plugin_request(
     Ok(PluginRequest {
         verb,
         id,
+        capability,
         format,
         yes,
         force,
@@ -684,6 +735,7 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin revoke <id> [--cap <capability>]\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
+     \x20      bitty plugin explain <id> <capability> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config show <id> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config scaffold <id> [--force]\n\
      \n\
@@ -778,6 +830,15 @@ pub fn plugin_help_text() -> String {
      \x20                             Re-grant with `install` (explicit consent).\n\
      \x20 info <id>                   Manifest + recorded state, with the plain-\
      \x20                             language effect per capability.\n\
+     \x20 explain <id> <capability>    Read-only capability decision chain for one\n\
+     \x20                             declared capability: every layer\n\
+     \x20                             (host/user/project/parent/task/request)\n\
+     \x20                             with allow/deny/empty, the first denying\n\
+     \x20                             layer, DenialKind, reason chain, trust\n\
+     \x20                             level, enforcement record, effective\n\
+     \x20                             grant, and a remediation hint. Exits 4\n\
+     \x20                             when the capability is denied. No plugin\n\
+     \x20                             code runs and nothing is mutated.\n\
      \x20 config show <id>            Print the declared [settings] schema, the\n\
      \x20                             selected user file, and the effective\n\
      \x20                             value plus serving layer per key. No\n\
@@ -802,10 +863,10 @@ pub fn plugin_help_text() -> String {
      \x20                             `install <source> --force` to re-consent.\n\
      \n\
      flags:\n\
-     \x20 --format table|json|jsonl   list/info/config show output (default table).\n\
+     \x20 --format table|json|jsonl   list/info/explain/config show output (default table).\n\
      \x20 --json                      Alias for --format json.\n\
-     \x20 --no-color                  list/info/config/doctor output (tables are\n\
-     \x20                             plain text; this also honors NO_COLOR).\n\
+     \x20 --no-color                  list/info/explain/config/doctor output (tables\n\
+     \x20                             are plain text; this also honors NO_COLOR).\n\
      \x20 --yes                       install only: approve capability consent and\n\
      \x20                             an orphan/same-version repair prompt.\n\
      \x20 --force                     install/remove/config scaffold: install\n\
@@ -899,7 +960,7 @@ pub fn plugin_help_text() -> String {
      \x20 2 usage: bad verb/flag/format/id, stray `--`, wrong-verb flags.\n\
      \x20 4 plugin error: unknown id, bad manifest/pin/grant, rejected fetch\n\
      \x20    scheme (file://, http://, ssh://, ...), malformed git URL,\n\
-     \x20    hostile archive member.\n\
+     \x20    hostile archive member, or a denied `plugin explain` capability.\n\
      \n\
      examples:\n\
      \x20 bitty plugin list\n\
@@ -913,6 +974,8 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin install ./my-plugin.tar.gz --yes\n\
      \x20 bitty plugin install ./my-plugin.zip --yes\n\
      \x20 bitty plugin info xuepoo.hello\n\
+     \x20 bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read\n\
+     \x20 bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read --json\n\
      \x20 bitty plugin config show xuepoo.hello\n\
      \x20 bitty plugin config scaffold xuepoo.hello\n\
      \x20 bitty plugin disable bitty-terminal.shell-integration\n\
@@ -2488,6 +2551,691 @@ pub fn format_error_envelope(verb: &str, class: &str, code: &str, message: &str)
 }
 
 // ---------------------------------------------------------------------------
+// `bitty plugin explain` (issue #2471): read-only capability decision chain
+// ---------------------------------------------------------------------------
+
+/// Budget limits named in the explanation. Live usage is not observable from
+/// a separate CLI process, so the report states limits only (never invents a
+/// live counter).
+const EXPLAIN_BUDGET_NOTE: &str =
+    "limits only; live usage is not observable from a read-only CLI process";
+
+/// Advisory marker for policy layers that are not yet enforced by the host.
+const EXPLAIN_POLICY_NOTE: &str = "user/project policy layers are advisory in this build; the running host enforces the \
+     task grant and trust gate; a policy-layer denial is fail-closed guidance, not a mutation";
+
+/// Report built for one `bitty plugin explain` invocation.
+struct ExplainReport {
+    id: String,
+    capability: String,
+    effect: &'static str,
+    high_risk: bool,
+    source: String,
+    state: &'static str,
+    trust: TrustLevel,
+    explanation: CapabilityExplanation,
+    enforcement: Option<EnforcementEntry>,
+    remediation: Vec<String>,
+    policy_advisory: bool,
+}
+
+/// Load one bounded policy file when present.
+///
+/// Read-only and fail-closed: symlinks and non-regular files are rejected,
+/// at most [`MAX_POLICY_FILE_BYTES`] are read, and malformed syntax is a
+/// plugin error naming the file and the bounded parse reason. Parsing stays
+/// in [`bitty_plugin_host::effective::parse_policy`]; this function only
+/// performs the bounded read.
+fn load_policy_scope(
+    path: &Path,
+    provenance: PolicyProvenance,
+) -> Result<Option<CapabilityScope>, PluginFailure> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PluginFailure::generic(
+                "PolicyUnreadable",
+                format!(
+                    "bitty plugin: policy file '{}' is unreadable: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(PluginFailure::plugin(
+            "PolicyUnsafe",
+            format!(
+                "bitty plugin: policy file '{}' is a symlink; replace it with a regular file",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(PluginFailure::plugin(
+            "PolicyUnsafe",
+            format!(
+                "bitty plugin: policy path '{}' is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > MAX_POLICY_FILE_BYTES as u64 {
+        return Err(PluginFailure::plugin(
+            "PolicyTooLarge",
+            format!(
+                "bitty plugin: policy file '{}' exceeds {MAX_POLICY_FILE_BYTES} bytes",
+                path.display()
+            ),
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        PluginFailure::generic(
+            "PolicyUnreadable",
+            format!(
+                "bitty plugin: policy file '{}' could not be opened: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_POLICY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            PluginFailure::generic(
+                "PolicyUnreadable",
+                format!(
+                    "bitty plugin: policy file '{}' could not be read: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if bytes.len() > MAX_POLICY_FILE_BYTES {
+        return Err(PluginFailure::plugin(
+            "PolicyTooLarge",
+            format!(
+                "bitty plugin: policy file '{}' exceeds {MAX_POLICY_FILE_BYTES} bytes",
+                path.display()
+            ),
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        PluginFailure::plugin(
+            "PolicyInvalid",
+            format!(
+                "bitty plugin: policy file '{}' is not valid UTF-8; fix it and re-run",
+                path.display()
+            ),
+        )
+    })?;
+    parse_policy(text, provenance, &path.display().to_string())
+        .map(Some)
+        .map_err(|denial| {
+            PluginFailure::plugin(
+                "PolicyInvalid",
+                format!(
+                    "bitty plugin: policy file '{}' is invalid: {}; fix it and re-run",
+                    path.display(),
+                    denial.reason_chain().join("; ")
+                ),
+            )
+        })
+}
+
+/// Build the read-only explanation report for one declared capability.
+fn build_explain_report(
+    row: &PluginRow,
+    raw_capability: &str,
+    context: &PluginContext<'_>,
+) -> Result<ExplainReport, PluginFailure> {
+    if matches!(row.state, "broken" | "orphaned") {
+        return Err(PluginFailure::plugin(
+            "PluginUnusable",
+            format!(
+                "bitty plugin: '{}' is {} ({}); repair it with `bitty plugin doctor --repair` \
+                 or reinstall before explaining capabilities",
+                row.id, row.state, row.description
+            ),
+        ));
+    }
+    let capability = CapabilityId::parse(raw_capability).map_err(|error| {
+        PluginFailure::usage(format!(
+            "bitty plugin: invalid capability '{raw_capability}': {error}"
+        ))
+    })?;
+    if !row.requested.contains(&capability) {
+        if row.granted.contains(&capability) {
+            return Err(PluginFailure::plugin(
+                "CapabilityNotDeclared",
+                format!(
+                    "bitty plugin: '{capability}' is recorded as granted for '{}' but the \
+                     manifest no longer declares it (stale grant); re-install to re-consent \
+                     with `bitty plugin install {} --yes`",
+                    row.id, row.id
+                ),
+            ));
+        }
+        let declared = if row.requested.is_empty() {
+            "(none)".to_string()
+        } else {
+            row.requested
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(PluginFailure::plugin(
+            "UnknownCapability",
+            format!(
+                "bitty plugin: '{}' does not declare capability '{raw_capability}'; \
+                 declared capabilities: {declared}",
+                row.id
+            ),
+        ));
+    }
+
+    let user_path = user_policy_path_with_env(context.xdg_config_home, context.home);
+    let user_scope = match user_path.as_deref() {
+        Some(path) => load_policy_scope(Path::new(path), PolicyProvenance::User)?,
+        None => None,
+    };
+    let project_path = context.cwd.map(project_policy_path);
+    let project_scope = match project_path.as_deref() {
+        Some(path) => load_policy_scope(Path::new(path), PolicyProvenance::Project)?,
+        None => None,
+    };
+
+    let stale_pin = row.pin_ok == Some(false);
+    let hash_hint: String = row
+        .manifest_hash
+        .as_deref()
+        .map(|hash| hash.chars().take(12).collect())
+        .unwrap_or_else(|| "unrecorded".to_string());
+    let mut task = CapabilityScope::unconstrained(format!("task-grant:{}@{hash_hint}", row.id));
+    task.closed = true;
+    if !stale_pin {
+        task.caps = row.granted.clone();
+        task.denied = row.denied.clone();
+    }
+    let stack = EffectiveStack {
+        host: CapabilityScope::unconstrained("host-ceiling:built-in"),
+        user: user_scope
+            .clone()
+            .unwrap_or_else(|| CapabilityScope::unconstrained("user:absent")),
+        project: project_scope.clone(),
+        parent: CapabilityScope::unconstrained("parent-delegation:not-applicable"),
+        task,
+    };
+    let mut request_scope =
+        CapabilityScope::unconstrained(format!("agent-request:{} manifest", row.id));
+    request_scope.caps.insert(capability.clone());
+    let request = AgentRequest {
+        scope: request_scope,
+        raw_wide: Vec::new(),
+    };
+    let trust = if row.bundled {
+        TrustLevel::BundledLua
+    } else {
+        TrustLevel::ThirdPartyLua
+    };
+    let mut explanation = explain_capability(
+        &stack,
+        &request,
+        RequestKind::PluginLifecycle,
+        true,
+        Some(trust),
+        &capability,
+    )
+    .map_err(|denial| {
+        PluginFailure::plugin(
+            "ExplanationInvalid",
+            format!(
+                "bitty plugin: could not explain '{}' for '{}': {}",
+                capability.as_str(),
+                row.id,
+                denial.reason_chain().join("; ")
+            ),
+        )
+    })?;
+
+    if stale_pin {
+        // A grant bound to a different manifest hash never contributes
+        // authority. Surface it as the conflict it is (PolicyConflict), not as
+        // a generic excess.
+        if let Some(task_row) = explanation
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer == EffectiveLayer::TaskGrant)
+        {
+            task_row.state = LayerState::Deny;
+            task_row.blocks = true;
+            task_row.detail = "grant bound to a different manifest hash".to_string();
+        }
+        explanation.allowed = false;
+        explanation.first_denying_layer = Some(EffectiveLayer::TaskGrant);
+        explanation.denial_kind = Some(DenialKind::PolicyConflict);
+        explanation.reason_chain = vec![format!(
+            "task-grant: manifest hash pin mismatch (recorded {}, current manifest differs); \
+             re-install with `bitty plugin install {} --yes` to re-consent",
+            row.manifest_hash.as_deref().unwrap_or("unrecorded"),
+            row.id
+        )];
+        explanation.effective.caps.clear();
+    }
+
+    let enforcement = ENFORCEMENT_MAP
+        .iter()
+        .copied()
+        .find(|entry| entry.kind == RequestKind::PluginLifecycle);
+    // Name the policy file a denial came from (or say it is absent) without
+    // changing the decision. Paths are environment-derived, never literals.
+    for layer in &mut explanation.layers {
+        match layer.layer {
+            EffectiveLayer::UserPolicy if user_scope.is_none() => {
+                layer.detail = match user_path.as_deref() {
+                    Some(path) => format!("file not present: {path}"),
+                    None => "no config root (set XDG_CONFIG_HOME or HOME)".to_string(),
+                };
+            }
+            EffectiveLayer::ProjectPolicy if project_scope.is_none() => {
+                layer.detail = match project_path.as_deref() {
+                    Some(path) => format!("file not present: {path}"),
+                    None => "current directory unavailable".to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+    let remediation = explain_remediation(
+        row,
+        &capability,
+        trust,
+        &explanation,
+        user_path.as_deref(),
+        project_path.as_deref(),
+        stale_pin,
+    );
+    let policy_advisory = user_scope.is_some() || project_scope.is_some();
+
+    Ok(ExplainReport {
+        id: row.id.clone(),
+        capability: capability.as_str().to_string(),
+        effect: effect_statement(&capability),
+        high_risk: capability.is_high_risk(),
+        source: row.source.clone(),
+        state: row.state,
+        trust,
+        explanation,
+        enforcement,
+        remediation,
+        policy_advisory,
+    })
+}
+
+/// Minimal, non-applying remediation hints for a denied explanation.
+fn explain_remediation(
+    row: &PluginRow,
+    capability: &CapabilityId,
+    trust: TrustLevel,
+    explanation: &CapabilityExplanation,
+    user_path: Option<&str>,
+    project_path: Option<&str>,
+    stale_pin: bool,
+) -> Vec<String> {
+    let mut hints: Vec<String> = Vec::new();
+    if stale_pin {
+        hints.push(format!(
+            "Re-consent to the current manifest: bitty plugin install {} --yes",
+            row.id
+        ));
+    } else if !explanation.allowed {
+        match explanation.first_denying_layer {
+            Some(EffectiveLayer::TaskGrant) => {
+                if row.denied.contains(capability) {
+                    hints.push(format!(
+                        "Re-grant the revoked capability: bitty plugin install {} --yes \
+                         (revocation is durable until explicit re-consent)",
+                        row.id
+                    ));
+                } else {
+                    hints.push(format!(
+                        "Grant the declared capability: bitty plugin install {} --yes",
+                        row.id
+                    ));
+                }
+            }
+            Some(EffectiveLayer::UserPolicy) => {
+                if let Some(path) = user_path {
+                    hints.push(format!(
+                        "Add `allow {}` to '{path}' (user policy layer; advisory in this build)",
+                        capability.as_str()
+                    ));
+                }
+            }
+            Some(EffectiveLayer::ProjectPolicy) => {
+                if let Some(path) = project_path {
+                    hints.push(format!(
+                        "Add `allow {}` to '{path}' (project policy layer; advisory in this build)",
+                        capability.as_str()
+                    ));
+                }
+            }
+            Some(EffectiveLayer::HostCeiling) => {
+                hints.push(format!(
+                    "Host admission denies '{capability}' for trust level '{}'; \
+                     no local override exists",
+                    trust.as_str()
+                ));
+            }
+            Some(EffectiveLayer::ParentDelegation) => hints.push(
+                "No parent delegation applies to a plugin invocation; inspect the delegating \
+                 agent's grant instead"
+                    .to_string(),
+            ),
+            Some(EffectiveLayer::AgentRequest) | None => {}
+        }
+    }
+    if !row.enabled && row.state != "available" {
+        hints.push(format!(
+            "Enable the plugin after the grant is present: bitty plugin enable {}",
+            row.id
+        ));
+    }
+    hints.push(format!(
+        "Inspect the full record: bitty plugin info {}",
+        row.id
+    ));
+    hints.truncate(4);
+    hints
+}
+
+/// Render the explain report as a bounded human table.
+fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", bold(&format!("plugin {}", report.id), color));
+    let risk = if report.high_risk { " (high risk)" } else { "" };
+    let _ = writeln!(
+        out,
+        "  capability:   {}{risk} — {}",
+        report.capability, report.effect
+    );
+    let _ = writeln!(out, "  source:       {}", report.source);
+    let _ = writeln!(out, "  state:        {}", report.state);
+    let _ = writeln!(
+        out,
+        "  trust:        {} (level {})",
+        report.trust.as_str(),
+        report.trust.level_number()
+    );
+    if let Some(enforcement) = report.enforcement {
+        let _ = writeln!(
+            out,
+            "  enforcement:  {} ({}) — {}",
+            enforcement.kind.as_str(),
+            enforcement.class.as_str(),
+            enforcement.owner
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  decision:     {}",
+        if report.explanation.allowed {
+            "allow"
+        } else {
+            "deny"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  first denying layer: {}",
+        report
+            .explanation
+            .first_denying_layer
+            .map_or("none", EffectiveLayer::label)
+    );
+    let _ = writeln!(
+        out,
+        "  denial kind:  {}",
+        report
+            .explanation
+            .denial_kind
+            .map_or("none", DenialKind::as_str)
+    );
+    let _ = writeln!(
+        out,
+        "  effective:    {} ({} of 1 requested capability)",
+        if report.explanation.allowed {
+            "allow"
+        } else {
+            "deny"
+        },
+        report.explanation.effective.caps.len()
+    );
+    let _ = writeln!(
+        out,
+        "  pins:         {}",
+        if report.explanation.pins.is_empty() {
+            "none".to_string()
+        } else {
+            report.explanation.pins.join(", ")
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  budget:       {EXPLAIN_BUDGET_NOTE} (instructions={}, wall_clock_ms={}, \
+         memory_bytes={}, queued_events={}, queued_bytes={}, file_descriptors={})",
+        bitty_plugin_host::event::RC1_INSTRUCTION_BUDGET,
+        bitty_plugin_host::event::RC1_WALL_CLOCK_BUDGET_MS,
+        bitty_plugin_host::event::RC2_MEMORY_PER_PLUGIN_BYTES,
+        bitty_plugin_host::event::PER_PLUGIN_QUEUED_EVENT_LIMIT,
+        bitty_plugin_host::event::PER_PLUGIN_QUEUED_BYTES_LIMIT,
+        bitty_plugin_host::event::RC6_FD_PER_PLUGIN,
+    );
+    out.push_str("  layers (highest authority first):\n");
+    for layer in &report.explanation.layers {
+        let _ = writeln!(
+            out,
+            "    {:<18} {:<6} {} — {}",
+            layer.layer.label(),
+            layer.state.as_str(),
+            layer.source,
+            layer.detail
+        );
+    }
+    if !report.explanation.reason_chain.is_empty() {
+        out.push_str("  reason chain:\n");
+        for step in &report.explanation.reason_chain {
+            let _ = writeln!(out, "    - {step}");
+        }
+    }
+    if report.policy_advisory {
+        let _ = writeln!(out, "  note:         {EXPLAIN_POLICY_NOTE}");
+    }
+    if !report.remediation.is_empty() {
+        out.push_str("  remediation:\n");
+        for hint in &report.remediation {
+            let _ = writeln!(out, "    - {hint}");
+        }
+    }
+    out
+}
+
+/// Render the explain report as a versioned JSON envelope.
+fn format_explain_envelope(report: &ExplainReport) -> String {
+    let explanation = &report.explanation;
+    let mut out = String::from(
+        "{\"v\":1,\"command\":\"plugin\",\"ok\":true,\"result\":{\"verb\":\"explain\",",
+    );
+    let _ = write!(
+        out,
+        "\"plugin\":\"{}\",\"capability\":\"{}\",\"effect\":\"{}\",\"high_risk\":{},\
+         \"source\":\"{}\",\"state\":\"{}\",",
+        json_escape(&report.id),
+        json_escape(&report.capability),
+        json_escape(report.effect),
+        report.high_risk,
+        json_escape(&report.source),
+        report.state
+    );
+    let _ = write!(
+        out,
+        "\"request_kind\":\"{}\",\"decision\":\"{}\",",
+        explanation.request_kind.as_str(),
+        if explanation.allowed { "allow" } else { "deny" }
+    );
+    let _ = write!(
+        out,
+        "\"first_denying_layer\":{},\"denial_kind\":{},",
+        match explanation.first_denying_layer {
+            Some(layer) => format!("\"{}\"", layer.label()),
+            None => "null".to_string(),
+        },
+        match explanation.denial_kind {
+            Some(kind) => format!("\"{}\"", kind.as_str()),
+            None => "null".to_string(),
+        }
+    );
+    let _ = write!(
+        out,
+        "\"trust\":{{\"level\":\"{}\",\"number\":{},\"family\":\"{}\",\"admits_family\":{}}},",
+        report.trust.as_str(),
+        report.trust.level_number(),
+        explanation.capability.family().as_str(),
+        report
+            .trust
+            .check_family(explanation.capability.family())
+            .is_ok()
+    );
+    out.push_str("\"layers\":[");
+    for (index, layer) in explanation.layers.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"layer\":\"{}\",\"config_layer\":\"{}\",\"state\":\"{}\",\
+             \"constrains\":{},\"blocks\":{},\"source\":\"{}\",\"detail\":\"{}\"}}",
+            layer.layer.label(),
+            layer.layer.config_layer(),
+            layer.state.as_str(),
+            layer.constrains,
+            layer.blocks,
+            json_escape(&layer.source),
+            json_escape(&layer.detail)
+        );
+    }
+    out.push_str("],\"reason_chain\":[");
+    for (index, step) in explanation.reason_chain.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{}\"", json_escape(step));
+    }
+    out.push_str("],\"pins\":[");
+    for (index, pin) in explanation.pins.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{}\"", json_escape(pin));
+    }
+    out.push_str("],\"effective\":{");
+    let _ = write!(out, "\"allowed\":{},\"caps\":[", explanation.allowed);
+    for (index, cap) in explanation.effective.caps.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{}\"", json_escape(cap.as_str()));
+    }
+    let _ = write!(
+        out,
+        "],\"max_agents\":{},\"allow_root\":{}}}",
+        explanation.effective.max_agents, explanation.effective.allow_root
+    );
+    out.push_str(",\"budget\":{\"observable\":false");
+    let _ = write!(out, ",\"note\":\"{}\"", json_escape(EXPLAIN_BUDGET_NOTE));
+    let _ = write!(
+        out,
+        ",\"limits\":{{\"instructions\":{},\"wall_clock_ms\":{},\"memory_bytes\":{},\
+         \"queued_events\":{},\"queued_bytes\":{},\"file_descriptors\":{}}}}}",
+        bitty_plugin_host::event::RC1_INSTRUCTION_BUDGET,
+        bitty_plugin_host::event::RC1_WALL_CLOCK_BUDGET_MS,
+        bitty_plugin_host::event::RC2_MEMORY_PER_PLUGIN_BYTES,
+        bitty_plugin_host::event::PER_PLUGIN_QUEUED_EVENT_LIMIT,
+        bitty_plugin_host::event::PER_PLUGIN_QUEUED_BYTES_LIMIT,
+        bitty_plugin_host::event::RC6_FD_PER_PLUGIN,
+    );
+    let _ = write!(
+        out,
+        ",\"enforcement\":{}",
+        match report.enforcement {
+            Some(enforcement) => format!(
+                "{{\"request_kind\":\"{}\",\"class\":\"{}\",\"owner\":\"{}\",\"note\":\"{}\"}}",
+                enforcement.kind.as_str(),
+                enforcement.class.as_str(),
+                json_escape(enforcement.owner),
+                json_escape(enforcement.note)
+            ),
+            None => "null".to_string(),
+        }
+    );
+    out.push_str(",\"remediation\":[");
+    for (index, hint) in report.remediation.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{}\"", json_escape(hint));
+    }
+    let _ = write!(
+        out,
+        "],\"policy_advisory\":{},\"policy_note\":{}}}}}",
+        report.policy_advisory,
+        if report.policy_advisory {
+            format!("\"{}\"", json_escape(EXPLAIN_POLICY_NOTE))
+        } else {
+            "null".to_string()
+        }
+    );
+    out
+}
+
+fn finish_explain(
+    report: &ExplainReport,
+    format: PluginFormat,
+    no_color: bool,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    match format {
+        PluginFormat::Table => {
+            let _ = output.write_all(format_explain_table(report, no_color).as_bytes());
+        }
+        PluginFormat::Json | PluginFormat::Jsonl => {
+            let _ = writeln!(output, "{}", format_explain_envelope(report));
+        }
+    }
+    if report.explanation.allowed {
+        EXIT_OK
+    } else {
+        eprintln!(
+            "bitty plugin: capability '{}' denied for '{}' by {} ({}); \
+             see the decision chain above",
+            report.capability,
+            report.id,
+            report
+                .explanation
+                .first_denying_layer
+                .map_or("an unknown layer", EffectiveLayer::label),
+            report
+                .explanation
+                .denial_kind
+                .map_or("unknown", DenialKind::as_str)
+        );
+        EXIT_PLUGIN
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-plugin config inspection and scaffolding (`bitty plugin config`, #2246)
 // ---------------------------------------------------------------------------
 
@@ -3152,6 +3900,9 @@ pub struct PluginContext<'a> {
     pub xdg_data_home: Option<&'a str>,
     /// `HOME` environment value.
     pub home: Option<&'a str>,
+    /// Current working directory for the project policy layer
+    /// (`<cwd>/.bitty/capabilities.conf`); `None` when undeterminable.
+    pub cwd: Option<&'a str>,
     /// Pre-word global `--format` fallback (mirrors `bitty dev`).
     pub pre_format: Option<&'a str>,
     /// Pre-word `--no-color`.
@@ -3255,6 +4006,23 @@ pub fn run_plugin_subcommand(
                     }
                     EXIT_OK
                 }
+                Err(failure) => fail_read_only(&request, &failure, output),
+            }
+        }
+        PluginVerb::Explain => {
+            let id = request.id.as_deref().expect("explain requires an id");
+            if let Err(failure) = resolve_plugin_id(id) {
+                return fail_read_only(&request, &failure, output);
+            }
+            let capability = request
+                .capability
+                .as_deref()
+                .expect("explain requires a capability");
+            match row_for_id(&state, store_root.as_deref(), id) {
+                Ok(row) => match build_explain_report(&row, capability, context) {
+                    Ok(report) => finish_explain(&report, request.format, no_color, output),
+                    Err(failure) => fail_read_only(&request, &failure, output),
+                },
                 Err(failure) => fail_read_only(&request, &failure, output),
             }
         }
@@ -6414,6 +7182,27 @@ mod tests {
         (code, String::from_utf8(output).expect("utf-8"), dir)
     }
 
+    /// [`run`] with injected XDG config and project cwd (policy-layer tests).
+    fn run_with_env(
+        raw: &[&str],
+        config_path: &str,
+        xdg_config_home: Option<&str>,
+        cwd: Option<&str>,
+        input: &str,
+    ) -> (i32, String) {
+        let context = PluginContext {
+            config_path: Some(config_path),
+            xdg_config_home,
+            cwd,
+            ..PluginContext::default()
+        };
+        let owned: Vec<String> = raw.iter().map(|token| (*token).to_string()).collect();
+        let mut input = Cursor::new(input.as_bytes().to_vec());
+        let mut output = Vec::new();
+        let code = run_plugin_subcommand(&owned, &context, &mut input, &mut output);
+        (code, String::from_utf8(output).expect("utf-8"))
+    }
+
     fn state_path(dir: &Path) -> PathBuf {
         dir.join(STATE_FILE_NAME)
     }
@@ -6695,6 +7484,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_explain_takes_id_and_capability() {
+        let request = parse_ok(&[
+            "explain",
+            "bitty-terminal.shell-integration",
+            "terminal.semantic-read",
+        ]);
+        assert_eq!(request.verb, PluginVerb::Explain);
+        assert_eq!(
+            request.id.as_deref(),
+            Some("bitty-terminal.shell-integration")
+        );
+        assert_eq!(
+            request.capability.as_deref(),
+            Some("terminal.semantic-read")
+        );
+        assert_eq!(request.format, PluginFormat::Table);
+
+        let json = parse_ok(&["explain", "owner.name", "ui.rich", "--format=json"]);
+        assert_eq!(json.format, PluginFormat::Json);
+        assert_eq!(json.capability.as_deref(), Some("ui.rich"));
+
+        assert!(parse_error(&["explain"]).contains("needs a plugin id"));
+        assert!(parse_error(&["explain", "owner.name"]).contains("needs a capability"));
+        assert!(
+            parse_error(&["explain", "owner.name", "ui.rich", "extra"]).contains("extra argument")
+        );
+        // A second operand only exists for `explain`.
+        assert!(parse_error(&["info", "owner.name", "ui.rich"]).contains("extra argument"));
+    }
+
+    #[test]
+    fn help_and_usage_name_explain() {
+        let help = plugin_help_text();
+        assert!(help.contains("explain <id> <capability>"), "{help}");
+        assert!(help.contains("capability decision chain"), "{help}");
+        let usage = plugin_usage();
+        assert!(usage.contains("explain <id> <capability>"), "{usage}");
+    }
+
+    #[test]
     fn parse_bounds_tokens_and_help() {
         let long = "x".repeat(MAX_PLUGIN_TOKEN_BYTES + 1);
         assert!(parse_error(&["install", &long]).contains("exceeds"));
@@ -6930,6 +7759,265 @@ mod tests {
         assert!(!text.contains("shell-integration"));
         let backup = dir.join(format!("{STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
         assert!(backup.exists(), "backup kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── explain (issue #2471) ─────────────────────────────────────────────
+
+    const EXPLAIN_CAP: &str = "terminal.semantic-read";
+    const EXPLAIN_PLUGIN: &str = "bitty-terminal.shell-integration";
+
+    #[test]
+    fn explain_allow_path_prints_layers_and_effective_grant() {
+        let dir = scratch_dir("explain-allow");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("decision:     allow"), "{out}");
+        assert!(out.contains("first denying layer: none"), "{out}");
+        assert!(out.contains("trust:        bundled-lua (level 1"), "{out}");
+        assert!(out.contains("layers (highest authority first):"), "{out}");
+        for layer in [
+            "host-ceiling",
+            "user-policy",
+            "project-policy",
+            "parent-delegation",
+            "task-grant",
+            "agent-request",
+        ] {
+            assert!(out.contains(layer), "missing {layer}: {out}");
+        }
+        assert!(out.contains("task-grant"), "{out}");
+        assert!(out.contains("effective:    allow"), "{out}");
+        assert!(out.contains("pins:         none"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_deny_path_selects_the_task_grant_and_prints_the_chain() {
+        let dir = scratch_dir("explain-deny");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+        let (code, out, _) = run(
+            &["revoke", EXPLAIN_PLUGIN, "--cap", EXPLAIN_CAP],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("decision:     deny"), "{out}");
+        assert!(out.contains("first denying layer: task-grant"), "{out}");
+        assert!(out.contains("denial kind:  exceeds-policy"), "{out}");
+        assert!(out.contains("reason chain:"), "{out}");
+        assert!(out.contains("remediation:"), "{out}");
+        assert!(out.contains("bitty plugin install"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_user_policy_is_the_first_denying_layer() {
+        let dir = scratch_dir("explain-user-policy");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        // A constraining user policy that omits the capability denies by
+        // omission before the task grant (which allows it) is considered.
+        let xdg = scratch_dir("explain-user-policy-xdg");
+        let policy_dir = xdg.join("bitty");
+        std::fs::create_dir_all(&policy_dir).expect("policy dir");
+        std::fs::write(policy_dir.join("capabilities.conf"), "allow ui.rich\n")
+            .expect("policy file");
+
+        let xdg_text = xdg.display().to_string();
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            Some(&xdg_text),
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("first denying layer: user-policy"), "{out}");
+        assert!(
+            out.contains("capability not listed (deny-by-default)"),
+            "{out}"
+        );
+        assert!(out.contains("policy layers are advisory"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    #[test]
+    fn explain_unknown_id_capability_and_malformed_input_fail_closed() {
+        let dir = scratch_dir("explain-unknown");
+        let config = dir.join("init.lua").display().to_string();
+
+        // Unknown plugin: plugin error, never a panic. JSON keeps the
+        // actionable message on stdout for this unit-level capture.
+        let (code, out) = run_with_env(
+            &["explain", "no.such-plugin", EXPLAIN_CAP, "--json"],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("\"code\":\"PluginNotFound\""), "{out}");
+        assert!(out.contains("unknown plugin 'no.such-plugin'"), "{out}");
+
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        // Valid capability grammar, not requested by this manifest.
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, "ui.rich", "--json"],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("\"code\":\"UnknownCapability\""), "{out}");
+        assert!(out.contains("does not declare capability"), "{out}");
+        assert!(out.contains(EXPLAIN_CAP), "{out}");
+
+        // Malformed capability grammar is a usage error.
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, "FS-READ", "--json"],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        assert!(out.contains("\"class\":\"UsageError\""), "{out}");
+        assert!(out.contains("invalid capability"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_json_envelope_has_stable_shape_and_escapes() {
+        let dir = scratch_dir("explain-json");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP, "--format", "json"],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.starts_with("{\"v\":1,\"command\":\"plugin\",\"ok\":true"),
+            "{out}"
+        );
+        assert!(out.contains("\"verb\":\"explain\""), "{out}");
+        assert!(
+            out.contains("\"capability\":\"terminal.semantic-read\""),
+            "{out}"
+        );
+        assert!(out.contains("\"decision\":\"allow\""), "{out}");
+        assert!(out.contains("\"first_denying_layer\":null"), "{out}");
+        assert!(out.contains("\"denial_kind\":null"), "{out}");
+        assert!(
+            out.contains("\"trust\":{\"level\":\"bundled-lua\",\"number\":1"),
+            "{out}"
+        );
+        assert!(out.contains("\"layers\":["), "{out}");
+        assert!(
+            out.contains(
+                "\"layer\":\"task-grant\",\"config_layer\":\"runtime-task\",\"state\":\"allow\""
+            ),
+            "{out}"
+        );
+        assert!(out.contains("\"budget\":{\"observable\":false"), "{out}");
+        assert!(out.contains("\"policy_note\":null"), "{out}");
+        assert!(
+            out.contains("\"enforcement\":{\"request_kind\":\"plugin.lifecycle\""),
+            "{out}"
+        );
+
+        let (code, out, _) = run(
+            &["revoke", EXPLAIN_PLUGIN, "--cap", EXPLAIN_CAP],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP, "--json"],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("\"decision\":\"deny\""), "{out}");
+        assert!(
+            out.contains("\"first_denying_layer\":\"task-grant\""),
+            "{out}"
+        );
+        assert!(out.contains("\"denial_kind\":\"exceeds-policy\""), "{out}");
+        assert!(out.contains("\"remediation\":["), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_reports_a_stale_grant_pin_as_policy_conflict() {
+        let dir = scratch_dir("explain-pin");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+        let file = state_path(&dir);
+        let text = std::fs::read_to_string(&file).expect("state");
+        // Rewrite the pin to a different (valid) hash: the grant is bound to
+        // the old manifest, so the diagnostic must fail closed as a conflict.
+        let stale = "0".repeat(64);
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("manifest_hash = ") {
+                    format!("\tmanifest_hash = \"{stale}\"")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file, rewritten).expect("rewrite");
+
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("first denying layer: task-grant"), "{out}");
+        assert!(out.contains("denial kind:  policy-conflict"), "{out}");
+        assert!(out.contains("manifest hash pin mismatch"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

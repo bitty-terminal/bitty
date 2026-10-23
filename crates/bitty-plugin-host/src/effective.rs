@@ -27,7 +27,11 @@
 //! `fs.read:~/projects/**` covers only itself, never a wider or narrower
 //! spelling. Absent layers say nothing (unconstrained), except that
 //! capabilities are deny-by-default: with no affirmative allow anywhere the
-//! effective set is empty.
+//! effective set is empty. A layer can be marked `closed` ([`CapabilityScope`])
+//! to constrain even when its allow set is empty: a required grant such as the
+//! task layer must deny an empty grant rather than silently say nothing.
+//! The read-only [`explain_capability`] diagnostic folds the same layers into
+//! per-layer allow/deny/empty rows without granting authority.
 //!
 //! Authority order (highest first) is
 //! `HostCeiling > UserPolicy > ProjectPolicy > ParentDelegation > TaskGrant >
@@ -399,8 +403,10 @@ pub const fn enforcement_class_for(kind: RequestKind) -> EnforcementClass {
 /// `max_agents` ceilings fan-out (`None` says nothing, effective is the
 /// minimum); `allow_root` gates privilege (`None` says nothing, effective is
 /// the conjunction, default deny); `pins` names non-overridable entries that
-/// every layer must preserve (see module docs). `source` attributes the layer
-/// for reason chains (e.g. `user:/path/capabilities.conf`).
+/// every layer must preserve (see module docs); `closed` marks an allowlist
+/// layer that constrains even when it is empty (a required grant, e.g. an
+/// empty task grant must deny rather than say nothing); `source` attributes
+/// the layer for reason chains (e.g. `user:/path/capabilities.conf`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityScope {
     /// Affirmatively allowed capabilities (exact match).
@@ -413,6 +419,8 @@ pub struct CapabilityScope {
     pub allow_root: Option<bool>,
     /// Non-overridable entries: capability raw strings, `max_agents`, `allow_root`.
     pub pins: BTreeSet<String>,
+    /// Whether an empty allow set still constrains (closed allowlist).
+    pub closed: bool,
     /// Source attribution for diagnostics.
     pub source: String,
 }
@@ -426,6 +434,7 @@ impl CapabilityScope {
             max_agents: None,
             allow_root: None,
             pins: BTreeSet::new(),
+            closed: false,
             source: bounded_source(source.into()),
         }
     }
@@ -433,7 +442,7 @@ impl CapabilityScope {
     /// Whether this scope constrains capabilities at all.
     #[must_use]
     pub fn constrains_caps(&self) -> bool {
-        !self.caps.is_empty() || !self.denied.is_empty()
+        self.closed || !self.caps.is_empty() || !self.denied.is_empty()
     }
 
     /// Whether `cap` survives this scope (allowed and not denied).
@@ -966,6 +975,275 @@ pub fn authorize_with_trust_and_role(
     check_trust_gate(request, kind, level)?;
     check_role_gate(kind, role)?;
     authorize(stack, request, kind, project_trusted)
+}
+
+// ── capability explanation (read-only diagnostic, issue #2471) ─────────────
+
+/// Per-layer state for one capability in a [`CapabilityExplanation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LayerState {
+    /// The layer affirmatively lists the capability.
+    Allow,
+    /// The layer explicitly denies the capability.
+    Deny,
+    /// The layer says nothing about the capability (absent, unconstrained, or
+    /// a constraining allowlist that omits it).
+    Empty,
+}
+
+impl LayerState {
+    /// Stable lowercase label for diagnostics and JSON output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl fmt::Display for LayerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One layer's decision for a capability, in authority order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerExplanation {
+    /// Layer this row describes.
+    pub layer: EffectiveLayer,
+    /// Allow/deny/empty state for the explained capability.
+    pub state: LayerState,
+    /// Whether the layer constrains the capability set at all.
+    pub constrains: bool,
+    /// Whether this layer blocks the capability (explicit deny, or a
+    /// constraining allowlist that omits it).
+    pub blocks: bool,
+    /// Source attribution (`host-ceiling:built-in`, policy path, grant id).
+    pub source: String,
+    /// Bounded human-readable reason for the state.
+    pub detail: String,
+}
+
+/// Read-only explanation of one capability decision.
+///
+/// Produced by [`explain_capability`]; the decision is exactly the one
+/// [`authorize`]/[`authorize_with_trust`] would return (plus the trust gate
+/// when a level is supplied). Carrier only: no authority, no mutation, no
+/// I/O. The reason chain is the engine's bounded chain, never a raw value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityExplanation {
+    /// Capability being explained.
+    pub capability: CapabilityId,
+    /// Privileged request kind used for authorization.
+    pub request_kind: RequestKind,
+    /// Every layer in authority order (absent optional layers included as
+    /// `empty` so the chain has a stable six-row shape).
+    pub layers: Vec<LayerExplanation>,
+    /// Highest-authority layer that blocks the capability, when denied.
+    pub first_denying_layer: Option<EffectiveLayer>,
+    /// Whether the request may exercise the capability.
+    pub allowed: bool,
+    /// Typed denial reason, when denied.
+    pub denial_kind: Option<DenialKind>,
+    /// Bounded reason chain in layer-authority order.
+    pub reason_chain: Vec<String>,
+    /// What the decision permits: the authorized capability set, empty when
+    /// denied. `max_agents`/`allow_root` keep the intersection's scalar
+    /// diagnostics (never a grant on their own).
+    pub effective: EffectiveCapability,
+    /// Non-overridable entries, formatted `layer:entry`.
+    pub pins: Vec<String>,
+}
+
+/// Explain one capability without mutating state or producing authority.
+///
+/// Runs the same validation, trust gate, pin unanimity, and intersection as
+/// [`authorize_with_trust`] (or [`authorize`] when `level` is `None`), then
+/// folds the layers into per-layer allow/deny/empty rows for diagnostics.
+/// `request` must name `capability` exactly: the explanation is about that
+/// one request voice, never the plugin's whole manifest.
+///
+/// Fail-closed on an invalid stack or request ([`EffectiveDenial`]); a denied
+/// capability is a successful explanation with `allowed == false`, not an
+/// error. Never panics.
+pub fn explain_capability(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    kind: RequestKind,
+    project_trusted: bool,
+    level: Option<TrustLevel>,
+    capability: &CapabilityId,
+) -> Result<CapabilityExplanation, EffectiveDenial> {
+    stack.validate().map_err(|invalid| EffectiveDenial {
+        kind: DenialKind::InvalidRequest,
+        request_kind: kind,
+        chain: invalid.chain,
+    })?;
+    request.validate(kind)?;
+    if !request.scope.caps.contains(capability) || request.scope.denied.contains(capability) {
+        return Err(EffectiveDenial::invalid(
+            kind,
+            "explained capability is not the request voice (exactly one allowed entry required)",
+        ));
+    }
+
+    let engine_layers = stack.layers_in_order();
+    let intersection = intersect(&engine_layers);
+    let pins = collect_pins(&engine_layers);
+
+    let mut layers = six_layer_rows(stack, request, capability);
+    // Trust gate first, exactly like `authorize_with_trust`: a family outside
+    // the level's admitted domains denies before any intersection math and is
+    // attributed to host admission (the level is a host property).
+    if let Some(level) = level {
+        if let Err(error) = level.check_family(capability.family()) {
+            if let Some(host) = layers
+                .iter_mut()
+                .find(|row| row.layer == EffectiveLayer::HostCeiling)
+            {
+                host.state = LayerState::Deny;
+                host.blocks = true;
+                host.detail = format!("trust gate denies '{}'", capability.family().as_str());
+            }
+            return Ok(CapabilityExplanation {
+                capability: capability.clone(),
+                request_kind: kind,
+                layers,
+                first_denying_layer: Some(EffectiveLayer::HostCeiling),
+                allowed: false,
+                denial_kind: Some(DenialKind::PolicyConflict),
+                reason_chain: vec![format!("host-ceiling: {error}")],
+                effective: EffectiveCapability {
+                    caps: BTreeSet::new(),
+                    max_agents: intersection.max_agents,
+                    allow_root: intersection.allow_root,
+                },
+                pins,
+            });
+        }
+    }
+
+    match authorize(stack, request, kind, project_trusted) {
+        Ok(authorized) => Ok(CapabilityExplanation {
+            capability: capability.clone(),
+            request_kind: kind,
+            layers,
+            first_denying_layer: None,
+            allowed: true,
+            denial_kind: None,
+            reason_chain: Vec::new(),
+            effective: authorized,
+            pins,
+        }),
+        Err(denial) => {
+            let first_denying_layer = if denial.kind == DenialKind::UntrustedProject {
+                Some(EffectiveLayer::ProjectPolicy)
+            } else {
+                layers
+                    .iter()
+                    .find(|row| row.blocks)
+                    .map(|row| row.layer)
+                    .or_else(|| denial.chain.iter().find_map(|step| step.layer))
+            };
+            Ok(CapabilityExplanation {
+                capability: capability.clone(),
+                request_kind: kind,
+                layers,
+                first_denying_layer,
+                allowed: false,
+                denial_kind: Some(denial.kind),
+                reason_chain: denial.reason_chain(),
+                effective: EffectiveCapability {
+                    caps: BTreeSet::new(),
+                    max_agents: intersection.max_agents,
+                    allow_root: intersection.allow_root,
+                },
+                pins,
+            })
+        }
+    }
+}
+
+/// Build the stable six-row layer chain for one capability.
+fn six_layer_rows(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    capability: &CapabilityId,
+) -> Vec<LayerExplanation> {
+    EffectiveLayer::all()
+        .iter()
+        .map(|layer| {
+            let scope = match layer {
+                EffectiveLayer::HostCeiling => Some(&stack.host),
+                EffectiveLayer::UserPolicy => Some(&stack.user),
+                EffectiveLayer::ProjectPolicy => stack.project.as_ref(),
+                EffectiveLayer::ParentDelegation => Some(&stack.parent),
+                EffectiveLayer::TaskGrant => Some(&stack.task),
+                EffectiveLayer::AgentRequest => Some(&request.scope),
+            };
+            match scope {
+                Some(scope) => layer_row(*layer, scope, capability),
+                None => LayerExplanation {
+                    layer: *layer,
+                    state: LayerState::Empty,
+                    constrains: false,
+                    blocks: false,
+                    source: format!("{}:absent", layer.label()),
+                    detail: "layer not present".to_string(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Fold one scope into a layer row for `capability`.
+fn layer_row(
+    layer: EffectiveLayer,
+    scope: &CapabilityScope,
+    capability: &CapabilityId,
+) -> LayerExplanation {
+    let constrains = scope.constrains_caps();
+    let denied = scope.denied.contains(capability);
+    let allowed = scope.caps.contains(capability);
+    let (state, blocks, detail) = if denied {
+        (LayerState::Deny, true, "explicit deny entry".to_string())
+    } else if allowed {
+        (LayerState::Allow, false, "capability listed".to_string())
+    } else if constrains {
+        (
+            LayerState::Empty,
+            true,
+            if scope.closed {
+                "closed grant set (deny-by-default)".to_string()
+            } else {
+                "capability not listed (deny-by-default)".to_string()
+            },
+        )
+    } else {
+        (LayerState::Empty, false, "unconstrained".to_string())
+    };
+    LayerExplanation {
+        layer,
+        state,
+        constrains,
+        blocks,
+        source: scope.source.clone(),
+        detail,
+    }
+}
+
+/// Collect non-overridable pins as `layer:entry`, in authority order.
+fn collect_pins(layers: &[(EffectiveLayer, &CapabilityScope)]) -> Vec<String> {
+    let mut pins = Vec::new();
+    for (layer, scope) in layers {
+        for pin in &scope.pins {
+            pins.push(format!("{}:{pin}", layer.label()));
+        }
+    }
+    pins
 }
 
 /// Attenuate `request` under an already-computed `parent` set.
@@ -1529,6 +1807,212 @@ mod tests {
         )
         .expect("unmapped families defer to grants");
         assert_eq!(effective.caps, [cap("ui.rich")].into_iter().collect());
+    }
+
+    #[test]
+    fn explain_selects_the_first_denying_layer_in_authority_order() {
+        // The user policy is a constraining allowlist that omits the requested
+        // capability, so it denies by omission before the task grant (which
+        // allows it) is even considered.
+        let stack = EffectiveStack {
+            host: CapabilityScope::unconstrained("host-ceiling:built-in"),
+            user: scope_with("user:test", &["ui.rich"]),
+            project: None,
+            parent: CapabilityScope::unconstrained("parent:absent"),
+            task: {
+                let mut task = scope_with("task:test", &["terminal.semantic-read"]);
+                task.closed = true;
+                task
+            },
+        };
+        let request = AgentRequest {
+            scope: scope_with("agent-request:test", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        let explanation = explain_capability(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            Some(TrustLevel::BundledLua),
+            &cap("terminal.semantic-read"),
+        )
+        .expect("explanation");
+
+        assert!(!explanation.allowed);
+        assert_eq!(
+            explanation.first_denying_layer,
+            Some(EffectiveLayer::UserPolicy)
+        );
+        assert_eq!(explanation.denial_kind, Some(DenialKind::ExceedsPolicy));
+        let user = explanation
+            .layers
+            .iter()
+            .find(|layer| layer.layer == EffectiveLayer::UserPolicy)
+            .expect("user layer");
+        assert_eq!(user.state, LayerState::Empty);
+        assert!(user.constrains);
+        assert!(user.blocks);
+        let task = explanation
+            .layers
+            .iter()
+            .find(|layer| layer.layer == EffectiveLayer::TaskGrant)
+            .expect("task layer");
+        assert_eq!(task.state, LayerState::Allow);
+        assert!(!task.blocks);
+    }
+
+    #[test]
+    fn explain_empty_closed_task_denies_by_default() {
+        // No layer says anything and the task grant is a closed empty set:
+        // the request still denies (deny-by-default, never a silent allow).
+        let mut stack = EffectiveStack::unconstrained();
+        stack.task.closed = true;
+        let request = AgentRequest {
+            scope: scope_with("agent-request:test", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        let explanation = explain_capability(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            None,
+            &cap("terminal.semantic-read"),
+        )
+        .expect("explanation");
+
+        assert!(!explanation.allowed);
+        assert_eq!(
+            explanation.first_denying_layer,
+            Some(EffectiveLayer::TaskGrant)
+        );
+        assert_eq!(explanation.denial_kind, Some(DenialKind::ExceedsPolicy));
+        let empty: Vec<&EffectiveLayer> = explanation
+            .layers
+            .iter()
+            .filter(|layer| layer.state == LayerState::Empty && !layer.blocks)
+            .map(|layer| &layer.layer)
+            .collect();
+        assert_eq!(
+            empty,
+            vec![
+                &EffectiveLayer::HostCeiling,
+                &EffectiveLayer::UserPolicy,
+                &EffectiveLayer::ProjectPolicy,
+                &EffectiveLayer::ParentDelegation,
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_allow_path_reports_the_effective_grant() {
+        let mut stack = EffectiveStack::unconstrained();
+        stack.task = {
+            let mut task = scope_with("task:test", &["terminal.semantic-read"]);
+            task.closed = true;
+            task
+        };
+        let request = AgentRequest {
+            scope: scope_with("agent-request:test", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        let explanation = explain_capability(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            Some(TrustLevel::BundledLua),
+            &cap("terminal.semantic-read"),
+        )
+        .expect("explanation");
+
+        assert!(explanation.allowed);
+        assert_eq!(explanation.first_denying_layer, None);
+        assert_eq!(explanation.denial_kind, None);
+        assert!(explanation.reason_chain.is_empty());
+        assert_eq!(
+            explanation.effective.caps,
+            [cap("terminal.semantic-read")].into_iter().collect()
+        );
+        assert!(explanation.pins.is_empty());
+    }
+
+    #[test]
+    fn explain_trust_gate_attributes_the_host_layer() {
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        let explanation = explain_capability(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            Some(TrustLevel::ExternalTool),
+            &cap("fs.read:~/docs/*.md"),
+        )
+        .expect("explanation");
+
+        assert!(!explanation.allowed);
+        assert_eq!(
+            explanation.first_denying_layer,
+            Some(EffectiveLayer::HostCeiling)
+        );
+        assert_eq!(explanation.denial_kind, Some(DenialKind::PolicyConflict));
+        let chain = explanation.reason_chain.join("\n");
+        assert!(chain.contains("external-tool"), "{chain}");
+        assert!(chain.contains("host-ceiling"), "{chain}");
+    }
+
+    #[test]
+    fn explain_reports_non_overridable_pins_and_conflicts() {
+        // The host pins the capability; the closed task grant omits it, so the
+        // pin is not unanimous and the decision is a policy conflict.
+        let mut host = scope_with("host", &["terminal.semantic-read"]);
+        host.pins.insert("terminal.semantic-read".to_string());
+        let mut task = CapabilityScope::unconstrained("task:test");
+        task.closed = true;
+        let stack = EffectiveStack {
+            host,
+            user: CapabilityScope::unconstrained("user:absent"),
+            project: None,
+            parent: CapabilityScope::unconstrained("parent:absent"),
+            task,
+        };
+        let request = AgentRequest {
+            scope: scope_with("agent-request:test", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        let explanation = explain_capability(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            None,
+            &cap("terminal.semantic-read"),
+        )
+        .expect("explanation");
+
+        assert!(!explanation.allowed);
+        assert_eq!(explanation.denial_kind, Some(DenialKind::PolicyConflict));
+        assert_eq!(
+            explanation.first_denying_layer,
+            Some(EffectiveLayer::TaskGrant)
+        );
+        assert_eq!(
+            explanation.pins,
+            vec!["host-ceiling:terminal.semantic-read".to_string()]
+        );
+        let chain = explanation.reason_chain.join("\n");
+        assert!(chain.contains("non-overridable pin"), "{chain}");
     }
 
     #[test]
@@ -2207,6 +2691,7 @@ pub fn parse_policy(
                         max_agents: None,
                         allow_root: None,
                         pins: BTreeSet::new(),
+                        closed: false,
                         source: String::new(),
                     };
                     check_kind_fit(&probe, expected)?;

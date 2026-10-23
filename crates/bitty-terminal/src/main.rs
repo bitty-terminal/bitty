@@ -742,12 +742,16 @@ fn main() {
         let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
         let home = std::env::var("HOME").ok();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string());
         let context = plugin::PluginContext {
             config_path: args.config_path.as_deref(),
             bitty_config_env: bitty_config_env.as_deref(),
             xdg_config_home: xdg_config_home.as_deref(),
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
+            cwd: cwd.as_deref(),
             pre_format: args.plugin_format.as_deref(),
             pre_no_color: args.plugin_no_color,
         };

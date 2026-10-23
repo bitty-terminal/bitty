@@ -301,7 +301,7 @@ fn left_release_auto_copies_to_clipboard_and_primary() {
     rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 22.0 + 9.0 * 4.0,
+        x: 22.0 + 9.0 * 5.0,
         y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
@@ -333,7 +333,7 @@ fn left_release_with_auto_copy_off_highlights_without_copying() {
     rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 22.0 + 9.0 * 4.0,
+        x: 22.0 + 9.0 * 5.0,
         y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
@@ -366,7 +366,7 @@ fn default_selection_does_not_clobber_clipboard() {
     rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 22.0 + 9.0 * 4.0,
+        x: 22.0 + 9.0 * 5.0,
         y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
@@ -405,7 +405,7 @@ fn left_release_auto_copy_overwrites_divergent_primary() {
     rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 22.0 + 9.0 * 4.0,
+        x: 22.0 + 9.0 * 5.0,
         y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));

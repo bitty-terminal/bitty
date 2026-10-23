@@ -10,6 +10,7 @@
 //! selection; pressing in another `View` replaces it.
 use super::input::key_inspect_label;
 use super::*;
+use bitty_ui::selection::BufferPos;
 
 /// The single live selection plus the `View` that owns it (CTX-0803, D1;
 /// CTX-1021 scrolled viewport for issue #1807).
@@ -44,8 +45,315 @@ pub(crate) struct SelectionState {
     /// range). `None` once the drag is committed. Viewport coordinates when
     /// scrolled, live-grid coordinates when live (same space as `selection`).
     pub(crate) anchor_press: Option<CellPos>,
+    /// Caret boundary of the press for a pointer `Simple`/`Block` drag
+    /// (issue #2480).
+    ///
+    /// Pointer drags are caret-to-caret: a press and the live pointer each
+    /// map to a cell **edge**, and the selected cells lie between them. That
+    /// makes one cell of pointer travel select exactly one cell (instead of
+    /// the two-cell inclusive-cell jump) and lets a single character be
+    /// selected. Word/line drags keep the cell-based anchor and leave this
+    /// `None`; direct cell APIs ([`Runtime::start_selection`] and friends)
+    /// do the same.
+    pub(crate) press_boundary: Option<SelectionBoundary>,
+    /// Buffer-anchored twin of `selection` for pointer selections
+    /// (issue #2470).
+    ///
+    /// [`Selection`] addresses the live grid or the current viewport window;
+    /// once the viewport scrolls, those row indices slide and the range cannot
+    /// span more than one page. The persistent range anchors both endpoints
+    /// to combined scrollback + grid rows (with stable line ids for history),
+    /// so a drag or a committed selection survives every scroll position and
+    /// text extraction can span the whole retained transcript.
+    ///
+    /// `None` for direct cell APIs ([`Runtime::start_selection`] and friends),
+    /// which keep the historic live-grid coordinates bit-for-bit.
+    pub(crate) buffer: Option<PersistentSelection>,
+    /// Buffer position of the press endpoint for a pointer selection
+    /// (issue #2470). Stays fixed while the pointer/viewport scroll, so drag
+    /// extension always grows from the original anchor.
+    pub(crate) press_buffer: Option<BufferPos>,
     /// Whether a pointer drag is currently extending `selection`.
     pub(crate) dragging: bool,
+    /// Whether `selection` is a deliberately selected single cell
+    /// (issue #2480).
+    ///
+    /// [`Selection`] stores an inclusive range, so `anchor == focus` also
+    /// describes a collapsed press. A caret drag that covers exactly one cell
+    /// is a real selection, not a collapsed one; this flag distinguishes the
+    /// two for [`Runtime::has_selection`] and the highlight paint without
+    /// changing the public [`Selection`] shape.
+    pub(crate) single_cell: bool,
+}
+
+/// Addressable selection space of an owner (issues #2480/#2470).
+///
+/// `start` is the combined-buffer row shown at space row 0: the viewport
+/// window start when scrolled, the live grid origin (`scrollback_len`)
+/// otherwise. `rows`/`cols` are the space's extent (viewport when scrolled,
+/// live grid when live), so buffer ↔ cell projection is one subtraction plus
+/// a clamp.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SelectionWindow {
+    pub(super) start: usize,
+    pub(super) rows: u16,
+    pub(super) cols: u16,
+}
+
+/// Horizontal caret position in a `View`'s grid (issue #2480).
+///
+/// `col` counts **cell edges**, not cells: `col == width` is the right edge
+/// of the last cell. Pointer drags are caret-to-caret horizontally so the
+/// selected column count equals pointer travel in columns; rows stay
+/// inclusive (line-based terminal drags) and the stored [`Selection`]
+/// remains the inclusive cell range between the two carets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectionBoundary {
+    pub(crate) col: u16,
+}
+
+impl SelectionBoundary {
+    pub(crate) const fn new(col: u16) -> Self {
+        Self { col }
+    }
+}
+
+/// Inclusive cell span between two horizontal carets (issue #2480).
+///
+/// `anchor` and `focus` are the floor cells under the press and the live
+/// pointer (rows stay inclusive, matching line-based terminal drags); the
+/// column arguments are their caret edges. Columns are caret-to-caret, so
+/// one column of pointer travel selects exactly one column. `None` when no
+/// column lies between the edges on a single row.
+pub(crate) fn boundary_span(
+    anchor: CellPos,
+    anchor_col: u16,
+    focus: CellPos,
+    focus_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(CellPos, CellPos)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let anchor_row = anchor.row.min(height - 1);
+    let focus_row = focus.row.min(height - 1);
+    let (start_row, end_row) = if anchor_row <= focus_row {
+        (anchor_row, focus_row)
+    } else {
+        (focus_row, anchor_row)
+    };
+    let (start_col, end_col) = if anchor_row == focus_row {
+        let left = anchor_col.min(focus_col);
+        let right = anchor_col.max(focus_col);
+        if left == right {
+            return None;
+        }
+        (left, right - 1)
+    } else if anchor_row < focus_row {
+        // Dragging down: start at the press caret, end through the cell
+        // before the pointer caret. A zero pointer edge still includes the
+        // end row's first cell (rows stay inclusive).
+        (anchor_col, focus_col.saturating_sub(1))
+    } else {
+        // Dragging up: start at the pointer caret, end through the cell
+        // before the press caret.
+        (focus_col, anchor_col.saturating_sub(1))
+    };
+    // A press caret at the right edge contributes nothing on its row; a
+    // multi-row downward drag starts on the following row instead.
+    let (start_row, start_col) = if start_col >= width {
+        if start_row >= end_row {
+            return None;
+        }
+        (start_row.saturating_add(1), 0)
+    } else {
+        (start_row, start_col)
+    };
+    if start_row > end_row {
+        return None;
+    }
+    Some((
+        CellPos::new(start_row, start_col.min(width - 1)),
+        CellPos::new(end_row, end_col.min(width - 1)),
+    ))
+}
+
+/// Inclusive cell rectangle between a pressed cell and a caret (block
+/// selection).
+///
+/// Block mode stays **cell-anchored** (issue #2480 review): the pressed cell
+/// is one corner; the pointer contributes its nearest caret on the column
+/// axis and its cell row. A purely vertical `Alt`+drag therefore keeps the
+/// pressed column instead of shifting one column when the press landed in the
+/// right half of a cell, and a rightward drag still selects one cell per cell
+/// of travel. `None` for a click (same cell and caret).
+pub(crate) fn block_boundary_span(
+    anchor: CellPos,
+    focus: CellPos,
+    focus_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(CellPos, CellPos)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // Anchor edge is the pressed **cell** (inclusive); the pointer edge is
+    // its caret, so a vertical drag keeps exactly the pressed column even
+    // when the press landed in the right half of that cell. A leftward drag
+    // keeps the anchor cell (right edge inclusive), matching a rectangle.
+    let (col0, col1) = if focus_col > anchor.col {
+        (anchor.col, focus_col - 1)
+    } else {
+        (focus_col, anchor.col)
+    };
+    let col0 = col0.min(width - 1);
+    let col1 = col1.min(width - 1);
+    let row0 = anchor.row.min(focus.row).min(height - 1);
+    let row1 = anchor.row.max(focus.row).min(height - 1);
+    if row0 == row1 && col0 == col1 {
+        return None;
+    }
+    Some((CellPos::new(row0, col0), CellPos::new(row1, col1)))
+}
+
+/// Inclusive buffer-row span between two horizontal carets (issue #2470).
+///
+/// The buffer-coordinate twin of [`boundary_span`]: rows are combined
+/// scrollback + grid rows (`usize`, wrapping the `u16` cell space so a
+/// selection can span more than one page), columns keep the caret-to-caret
+/// semantics. `None` when no column lies between the edges on a single row.
+pub(crate) fn boundary_buffer_span(
+    anchor: BufferPos,
+    anchor_col: u16,
+    focus: BufferPos,
+    focus_col: u16,
+    width: u16,
+) -> Option<(BufferPos, BufferPos)> {
+    if width == 0 {
+        return None;
+    }
+    let (start_row, end_row) = if anchor.buffer_row <= focus.buffer_row {
+        (anchor.buffer_row, focus.buffer_row)
+    } else {
+        (focus.buffer_row, anchor.buffer_row)
+    };
+    let (start_col, end_col) = if anchor.buffer_row == focus.buffer_row {
+        let left = anchor_col.min(focus_col);
+        let right = anchor_col.max(focus_col);
+        if left == right {
+            return None;
+        }
+        (left, right - 1)
+    } else if anchor.buffer_row < focus.buffer_row {
+        (anchor_col, focus_col.saturating_sub(1))
+    } else {
+        (focus_col, anchor_col.saturating_sub(1))
+    };
+    let (start_row, start_col) = if start_col >= width {
+        if start_row >= end_row {
+            return None;
+        }
+        (start_row.saturating_add(1), 0)
+    } else {
+        (start_row, start_col)
+    };
+    if start_row > end_row {
+        return None;
+    }
+    Some((
+        BufferPos::new(start_row, start_col.min(width - 1)),
+        BufferPos::new(end_row, end_col.min(width - 1)),
+    ))
+}
+
+/// Inclusive buffer-row block rectangle between a pressed cell and a caret
+/// (issue #2470; same semantics as [`block_boundary_span`]).
+pub(crate) fn block_buffer_span(
+    anchor: BufferPos,
+    focus: BufferPos,
+    focus_col: u16,
+    width: u16,
+) -> Option<(BufferPos, BufferPos)> {
+    if width == 0 {
+        return None;
+    }
+    // Same anchor-cell/pointer-caret semantics as `block_boundary_span`.
+    let (col0, col1) = if focus_col > anchor.col {
+        (anchor.col, focus_col - 1)
+    } else {
+        (focus_col, anchor.col)
+    };
+    let col0 = col0.min(width - 1);
+    let col1 = col1.min(width - 1);
+    let row0 = anchor.buffer_row.min(focus.buffer_row);
+    let row1 = anchor.buffer_row.max(focus.buffer_row);
+    if row0 == row1 && col0 == col1 {
+        return None;
+    }
+    Some((BufferPos::new(row0, col0), BufferPos::new(row1, col1)))
+}
+
+/// Projects a buffer range into a window (issue #2470).
+///
+/// Returns inclusive `(row, col)` endpoints in window-local coordinates.
+/// Text-flow kinds widen an endpoint that lies beyond the window to the full
+/// edge row so a multi-page range paints as one continuous block; block mode
+/// keeps both columns and only clamps rows. `None` when the range lies
+/// entirely above or below the window.
+pub(crate) fn project_persistent_to(
+    pers: &PersistentSelection,
+    window_start: usize,
+    window_rows: u16,
+    window_cols: u16,
+) -> Option<((u16, u16), (u16, u16))> {
+    if window_rows == 0 || window_cols == 0 {
+        return None;
+    }
+    let (anchor, focus) =
+        if (pers.anchor.buffer_row, pers.anchor.col) <= (pers.focus.buffer_row, pers.focus.col) {
+            (pers.anchor, pers.focus)
+        } else {
+            (pers.focus, pers.anchor)
+        };
+    let window_end = window_start.saturating_add(usize::from(window_rows));
+    if focus.buffer_row < window_start || anchor.buffer_row >= window_end {
+        return None;
+    }
+    let max_col = window_cols - 1;
+    let rows = i64::from(window_rows);
+    let project = |row: usize, col: u16| -> (u16, u16) {
+        let local = row as i64 - window_start as i64;
+        if pers.kind == SelectionKind::Block {
+            return (local.clamp(0, rows - 1) as u16, col.min(max_col));
+        }
+        if local < 0 {
+            (0, 0)
+        } else if local >= rows {
+            (window_rows - 1, max_col)
+        } else {
+            (local as u16, col.min(max_col))
+        }
+    };
+    Some((
+        project(anchor.buffer_row, anchor.col),
+        project(focus.buffer_row, focus.col),
+    ))
+}
+
+/// Chebyshev distance between two buffer positions, saturating at `u16::MAX`
+/// (issue #2480 drag-vs-click, #2470 buffer space).
+pub(crate) fn buffer_cell_distance(a: BufferPos, b: BufferPos) -> u16 {
+    let rows = u16::try_from(a.buffer_row.abs_diff(b.buffer_row)).unwrap_or(u16::MAX);
+    rows.max(a.col.abs_diff(b.col))
+}
+
+/// Nearest cell at or before a caret, clamped into the grid.
+pub(crate) fn boundary_cell(cell: CellPos, width: u16, height: u16) -> CellPos {
+    CellPos::new(
+        cell.row.min(height.saturating_sub(1)),
+        cell.col.min(width.saturating_sub(1)),
+    )
 }
 
 /// Grid backing `view` from disjoint field borrows (CTX-0805).
@@ -114,7 +422,15 @@ impl Runtime {
     /// fail-closed guard every selection reader goes through: a stale owner
     /// yields no grid, so it yields no selection.
     pub(super) fn live_view_state(&self, view: ViewId) -> Option<&State> {
-        self.layout.find_leaf(view)?;
+        // Issue #2523: detached floats and pinned leaves are live surfaces
+        // too, so selection, copy, and search must resolve their grids even
+        // though they are not leaves of the tiling tree.
+        if self.layout.find_leaf(view).is_none()
+            && !self.floats.contains(view)
+            && self.pinned.get(view).is_none()
+        {
+            return None;
+        }
         self.session_state_for(view)
     }
 
@@ -158,7 +474,11 @@ impl Runtime {
             owner,
             selection,
             anchor_press,
+            press_boundary: None,
+            buffer: None,
+            press_buffer: None,
             dragging,
+            single_cell: false,
         });
         self.pending_full_redraw = true;
     }
@@ -177,13 +497,13 @@ impl Runtime {
     /// while any endpoint remains in bounds — fully out-of-window anchors are
     /// a deferred buffer-persistence follow-up).
     ///
-    /// When `dragging`, only the anchor (and its press pin) shifts: the focus
-    /// stays at the cursor's frame-local cell, so the selection tracks the
-    /// pointer as the viewport slides. Word/line drags additionally re-expand
-    /// around the shifted press pin in the new viewport composite, so the
-    /// focus word/line follows visible text. When committed, both endpoints
-    /// shift so the highlight scrolls with its content. No-op when no
-    /// selection exists or `owner` does not own it.
+    /// When `dragging`, only the buffer-anchored press endpoint stays fixed;
+    /// the pointer-side endpoint follows the pointer's new buffer row, so the
+    /// selection grows across the scroll instead of sliding. Word/line drags
+    /// re-expand around the shifted press pin in the new viewport composite.
+    /// When committed, both endpoints stay buffer-anchored and the viewport
+    /// projection simply slides with the content. No-op when no selection
+    /// exists or `owner` does not own it.
     pub(super) fn shift_selection_for_scroll(&mut self, owner: ViewId, delta_rows: isize) {
         if delta_rows == 0 {
             return;
@@ -192,6 +512,113 @@ impl Runtime {
             return;
         };
         if sel.owner != owner {
+            return;
+        }
+        // Pointer selections carry a buffer range (issue #2470): scrolling
+        // never moves the press endpoint and only re-projects the viewport.
+        if let Some(mut pers) = sel.buffer {
+            let Some(window) = self.selection_window(owner) else {
+                self.drop_selection();
+                return;
+            };
+            if !sel.dragging {
+                // Committed selections keep the historic viewport row shift
+                // for the public `selection()` shape; the buffer range stays
+                // untouched and `selection_text` reads the full span.
+                let shift_row = |row: u16| -> u16 {
+                    let next = i64::from(row) + delta_rows as i64;
+                    next.clamp(0, i64::from(u16::MAX)) as u16
+                };
+                let mut next = sel.selection;
+                next.anchor.row = shift_row(next.anchor.row);
+                next.focus.row = shift_row(next.focus.row);
+                let pin = sel.anchor_press.map(|pin| CellPos {
+                    row: shift_row(pin.row),
+                    col: pin.col,
+                });
+                self.install_selection(owner, next, pin, false);
+                self.restore_selection_meta(
+                    sel.press_boundary,
+                    sel.single_cell,
+                    Some(pers),
+                    sel.press_buffer,
+                );
+                return;
+            }
+            if sel.dragging {
+                let press_buffer = sel.press_buffer.or_else(|| {
+                    sel.anchor_press
+                        .and_then(|pin| self.buffer_pos_for_cell(owner, pin))
+                });
+                let pointer = self
+                    .last_cursor
+                    .and_then(|pos| self.cursor_to_owner_cell_and_boundary(owner, pos));
+                if let Some((cell, boundary)) = pointer {
+                    if let (Some(press), Some(pointer_buffer), Some(press_boundary)) = (
+                        press_buffer,
+                        self.buffer_pos_for_cell(owner, cell),
+                        sel.press_boundary,
+                    ) {
+                        let span = match sel.selection.kind {
+                            SelectionKind::Simple => boundary_buffer_span(
+                                press,
+                                press_boundary.col,
+                                pointer_buffer,
+                                boundary.col,
+                                window.cols,
+                            ),
+                            SelectionKind::Block => {
+                                block_buffer_span(press, pointer_buffer, boundary.col, window.cols)
+                            }
+                            SelectionKind::Word | SelectionKind::Line => None,
+                        };
+                        if let Some((start, end)) = span {
+                            pers =
+                                self.persistent_span(owner, start, end, sel.selection.kind, true);
+                        }
+                    }
+                } else {
+                    // No tracked pointer: the pointer endpoint now addresses
+                    // an older/newer buffer row at the same screen position.
+                    let delta = delta_rows as i64;
+                    let shift = |row: usize| -> usize {
+                        if delta >= 0 {
+                            row.saturating_sub(delta as usize)
+                        } else {
+                            row.saturating_add(delta.unsigned_abs() as usize)
+                        }
+                    };
+                    match press_buffer {
+                        Some(press) if press == pers.anchor => {
+                            pers.focus.buffer_row = shift(pers.focus.buffer_row);
+                        }
+                        Some(press) if press == pers.focus => {
+                            pers.anchor.buffer_row = shift(pers.anchor.buffer_row);
+                        }
+                        _ => {
+                            pers.anchor.buffer_row = shift(pers.anchor.buffer_row);
+                            pers.focus.buffer_row = shift(pers.focus.buffer_row);
+                        }
+                    }
+                }
+            }
+            let selection = self.project_persistent(&pers, owner).unwrap_or_else(|| {
+                let cell = sel.anchor_press.unwrap_or(sel.selection.anchor);
+                Selection {
+                    anchor: cell,
+                    focus: cell,
+                    kind: sel.selection.kind,
+                    active: true,
+                }
+            });
+            let pin = sel.anchor_press;
+            self.install_selection(owner, selection, pin, sel.dragging);
+            self.restore_selection_meta(
+                sel.press_boundary,
+                sel.single_cell,
+                Some(pers),
+                sel.press_buffer,
+            );
             return;
         }
         // Only viewport selections shift: a live-grid selection addresses the
@@ -206,6 +633,7 @@ impl Runtime {
             let next = row as i32 + delta_rows as i32;
             next.clamp(0, u16::MAX as i32) as u16
         };
+        let press_boundary = sel.press_boundary;
         if sel.dragging {
             match sel.selection.kind {
                 SelectionKind::Simple | SelectionKind::Block => {
@@ -215,8 +643,10 @@ impl Runtime {
                         row: shift_row(pin.row),
                         col: pin.col,
                     });
+                    let single_cell = sel.single_cell && next.anchor == next.focus;
                     // Focus stays at the cursor: do not shift it.
                     self.install_selection(sel.owner, next, pin.or(sel.anchor_press), true);
+                    self.restore_selection_meta(press_boundary, single_cell, None, None);
                 }
                 SelectionKind::Word | SelectionKind::Line => {
                     // Shift the press pin, then re-expand in the new viewport
@@ -240,6 +670,7 @@ impl Runtime {
                             _ => Selection::line_drag(&snap, shifted, current),
                         };
                         self.install_selection(sel.owner, next, Some(shifted), true);
+                        self.restore_selection_meta(press_boundary, false, None, None);
                         return;
                     };
                     let press = sel.anchor_press.unwrap_or(sel.selection.anchor);
@@ -259,6 +690,7 @@ impl Runtime {
                         _ => Selection::line_drag(&viewport, shifted, current),
                     };
                     self.install_selection(sel.owner, next, Some(shifted), true);
+                    self.restore_selection_meta(press_boundary, false, None, None);
                 }
             }
         } else {
@@ -269,8 +701,167 @@ impl Runtime {
                 row: shift_row(pin.row),
                 col: pin.col,
             });
+            let single_cell = sel.single_cell && next.anchor == next.focus;
             self.install_selection(sel.owner, next, pin, false);
+            self.restore_selection_meta(press_boundary, single_cell, None, None);
         }
+    }
+
+    /// Restores the caret/buffer metadata after [`Self::install_selection`]
+    /// (issues #2480/#2470).
+    pub(super) fn restore_selection_meta(
+        &mut self,
+        press_boundary: Option<SelectionBoundary>,
+        single_cell: bool,
+        buffer: Option<PersistentSelection>,
+        press_buffer: Option<BufferPos>,
+    ) {
+        if let Some(state) = self.selection_state.as_mut() {
+            state.press_boundary = press_boundary;
+            state.single_cell = single_cell;
+            state.buffer = buffer;
+            state.press_buffer = press_buffer;
+        }
+    }
+
+    /// Current selection space of `owner`, fail-closed.
+    pub(super) fn selection_window(&self, owner: ViewId) -> Option<SelectionWindow> {
+        let state = self.live_view_state(owner)?;
+        let to_u16 = |value: usize| u16::try_from(value).unwrap_or(u16::MAX);
+        if self.is_viewport_scrolled(owner) {
+            let view = self.find_view(owner)?;
+            let sb_len = state.scrollback_len();
+            let total = sb_len.saturating_add(state.height());
+            let rows = usize::from(view.rows());
+            let offset = view.scroll_offset().min(sb_len);
+            let start = total.saturating_sub(rows).saturating_sub(offset);
+            Some(SelectionWindow {
+                start,
+                rows: view.rows(),
+                cols: view.cols(),
+            })
+        } else {
+            Some(SelectionWindow {
+                start: state.scrollback_len(),
+                rows: to_u16(state.height()),
+                cols: to_u16(state.width()),
+            })
+        }
+    }
+
+    /// Stable scrollback line id for `buffer_row`, when the row is history.
+    fn buffer_line_id(&self, owner: ViewId, buffer_row: usize) -> Option<u64> {
+        let state = self.live_view_state(owner)?;
+        if buffer_row >= state.scrollback_len() {
+            return None;
+        }
+        state.scrollback_line(buffer_row).map(|line| line.id)
+    }
+
+    /// Maps a cell in the owner's selection space to combined-buffer
+    /// coordinates (issue #2470).
+    pub(super) fn buffer_pos_for_cell(&self, owner: ViewId, cell: CellPos) -> Option<BufferPos> {
+        let window = self.selection_window(owner)?;
+        Some(BufferPos::new(
+            window.start.saturating_add(usize::from(cell.row)),
+            cell.col,
+        ))
+    }
+
+    /// Snaps a buffer position that lands on a wide spacer back to the
+    /// leading cell of its glyph (issue #2523).
+    fn snap_buffer_pos(&self, owner: ViewId, pos: BufferPos) -> BufferPos {
+        let Some(state) = self.live_view_state(owner) else {
+            return pos;
+        };
+        let sb_len = state.scrollback_len();
+        let cell = if pos.buffer_row < sb_len {
+            state
+                .scrollback_line(pos.buffer_row)
+                .and_then(|line| line.cells.get(usize::from(pos.col)))
+                .copied()
+        } else {
+            let snap = state.snapshot();
+            let row = pos.buffer_row - sb_len;
+            (row < snap.height)
+                .then(|| snap.cells.get(row * snap.width + usize::from(pos.col)))
+                .flatten()
+                .copied()
+        };
+        match cell {
+            Some(cell) if cell.spacer && pos.col > 0 => BufferPos::new(pos.buffer_row, pos.col - 1),
+            _ => pos,
+        }
+    }
+
+    /// Builds a collapsed persistent range at `cell` (issues #2470).
+    fn persistent_at(&self, owner: ViewId, cell: CellPos) -> Option<PersistentSelection> {
+        let pos = self.snap_buffer_pos(owner, self.buffer_pos_for_cell(owner, cell)?);
+        let line_id = self.buffer_line_id(owner, pos.buffer_row);
+        Some(PersistentSelection {
+            anchor: pos,
+            anchor_line_id: line_id,
+            focus: pos,
+            focus_line_id: line_id,
+            kind: SelectionKind::Simple,
+            active: true,
+        })
+    }
+
+    /// Builds a persistent range from two buffer positions (issue #2470).
+    fn persistent_span(
+        &self,
+        owner: ViewId,
+        start: BufferPos,
+        end: BufferPos,
+        kind: SelectionKind,
+        active: bool,
+    ) -> PersistentSelection {
+        let start = self.snap_buffer_pos(owner, start);
+        let end = self.snap_buffer_pos(owner, end);
+        PersistentSelection {
+            anchor: start,
+            anchor_line_id: self.buffer_line_id(owner, start.buffer_row),
+            focus: end,
+            focus_line_id: self.buffer_line_id(owner, end.buffer_row),
+            kind,
+            active,
+        }
+    }
+
+    /// Projects a buffer range into the owner's selection space, clamping
+    /// rows to the visible/addressable window (issue #2470).
+    ///
+    /// Rows still inside the window keep their columns; an endpoint strictly
+    /// outside is clamped to the window edge and its column widened to the
+    /// full row so a range spanning several pages paints as a continuous
+    /// block. Returns `None` when the range does not intersect the window.
+    pub(super) fn project_persistent(
+        &self,
+        pers: &PersistentSelection,
+        owner: ViewId,
+    ) -> Option<Selection> {
+        let window = self.selection_window(owner)?;
+        let (start, end) = project_persistent_to(pers, window.start, window.rows, window.cols)?;
+        Some(Selection {
+            anchor: CellPos::new(start.0, start.1),
+            focus: CellPos::new(end.0, end.1),
+            kind: pers.kind,
+            active: pers.active,
+        })
+    }
+
+    /// Projects a buffer range into a frame-local rectangle for paint
+    /// (issue #2470).
+    pub(super) fn project_persistent_to_frame(
+        &self,
+        pers: &PersistentSelection,
+        window_start: usize,
+        frame_rows: u16,
+        frame_cols: u16,
+    ) -> Option<(CellPos, CellPos)> {
+        let (start, end) = project_persistent_to(pers, window_start, frame_rows, frame_cols)?;
+        Some((CellPos::new(start.0, start.1), CellPos::new(end.0, end.1)))
     }
 
     /// Drops the live selection when `view` owns it (CTX-0803 lifecycle).
@@ -380,7 +971,13 @@ impl Runtime {
     /// coordinates into someone else's grid.
     #[must_use]
     pub fn selection(&self) -> Option<Selection> {
-        self.selection_owner_state().map(|(sel, _)| sel.selection)
+        let (sel, _) = self.selection_owner_state()?;
+        if sel.dragging {
+            if let Some(pers) = sel.buffer {
+                return self.project_persistent(&pers, sel.owner);
+            }
+        }
+        Some(sel.selection)
     }
 
     /// `View` that owns the live selection, if any (CTX-0803).
@@ -400,9 +997,28 @@ impl Runtime {
     }
 
     /// Whether a selection currently exists and is non-empty.
+    ///
+    /// A caret drag that covers exactly one cell reports `true` even though
+    /// its inclusive [`Selection`] has `anchor == focus` (issue #2480): the
+    /// dedicated single-cell flag distinguishes it from a collapsed click.
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.selection().is_some_and(|s| !s.is_empty())
+        self.selection_owner_state().is_some_and(|(state, grid)| {
+            if !state.selection.is_empty() || state.single_cell {
+                return true;
+            }
+            state.buffer.is_some_and(|pers| {
+                pers.is_valid(grid) && (pers.anchor != pers.focus || state.single_cell)
+            })
+        })
+    }
+
+    /// Whether the live selection deliberately covers exactly one cell
+    /// (issue #2480, highlight-paint seam).
+    #[must_use]
+    pub fn selection_is_single_cell(&self) -> bool {
+        self.selection_owner_state()
+            .is_some_and(|(state, _)| state.single_cell)
     }
 
     /// Clears the current selection.
@@ -595,6 +1211,312 @@ impl Runtime {
         self.install_selection(owner, selection, Some(snapped), true);
     }
 
+    /// Starts a pointer `Simple`/`Block` selection with a caret boundary
+    /// (issue #2480).
+    ///
+    /// The cell-based [`Self::start_view_selection`] press behavior is kept
+    /// (click focus, wide-char snap, word/line expansion). `Simple` and
+    /// `Block` additionally remember the press caret so drag updates can
+    /// translate caret-to-caret: one cell of pointer travel selects exactly
+    /// one cell instead of two.
+    pub(super) fn start_view_selection_from_pointer(
+        &mut self,
+        owner: ViewId,
+        kind: SelectionKind,
+        cell: CellPos,
+        boundary: SelectionBoundary,
+    ) {
+        self.start_view_selection(owner, kind, cell);
+        if matches!(kind, SelectionKind::Simple | SelectionKind::Block) {
+            let press_buffer = self.buffer_pos_for_cell(owner, cell);
+            let buffer = self.persistent_at(owner, cell).map(|mut pers| {
+                pers.kind = kind;
+                pers
+            });
+            if let Some(state) = self.selection_state.as_mut() {
+                state.press_boundary = Some(boundary);
+                state.buffer = buffer;
+                state.press_buffer = press_buffer;
+            }
+        }
+    }
+
+    /// Grid extent the live selection addresses (issue #2480).
+    ///
+    /// The owner's live grid when unscrolled, the visible composite when
+    /// scrolled. `None` when the owner lost its grid (fail closed).
+    pub(super) fn selection_extent(&self, owner: ViewId) -> Option<(u16, u16)> {
+        let (width, height) = if self.is_viewport_scrolled(owner) {
+            let viewport = self.viewport_snapshot_for(owner)?;
+            (viewport.width, viewport.height)
+        } else {
+            let state = self.live_view_state(owner)?;
+            (state.width(), state.height())
+        };
+        Some((
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+        ))
+    }
+
+    /// Updates a pointer caret drag (issue #2480).
+    ///
+    /// Only `Simple` and `Block` drags carry a press boundary; word/line
+    /// drags keep the cell-based [`Self::update_selection`] path. A caret
+    /// span that covers no cell installs a collapsed selection so the drag
+    /// state survives until release (where a plain click still clears).
+    pub(super) fn update_boundary_selection(
+        &mut self,
+        focus: CellPos,
+        boundary: SelectionBoundary,
+    ) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let Some(press) = sel.press_boundary else {
+            return;
+        };
+        let Some((width, height)) = self.selection_extent(sel.owner) else {
+            self.drop_selection();
+            return;
+        };
+        let Some(snap) = self.selection_snapshot(sel.owner) else {
+            self.drop_selection();
+            return;
+        };
+        // Pointer Simple/Block drags carry buffer anchors (issue #2470):
+        // extend in combined-buffer space so the range can cross pages.
+        if sel.selection.kind == SelectionKind::Simple || sel.selection.kind == SelectionKind::Block
+        {
+            if let (Some(press_buffer), Some(state_buffer), Some(window)) = (
+                sel.press_buffer.or(sel.buffer.map(|pers| pers.anchor)),
+                self.buffer_pos_for_cell(sel.owner, focus),
+                self.selection_window(sel.owner),
+            ) {
+                let span = match sel.selection.kind {
+                    SelectionKind::Simple => boundary_buffer_span(
+                        press_buffer,
+                        press.col,
+                        state_buffer,
+                        boundary.col,
+                        window.cols,
+                    ),
+                    SelectionKind::Block => {
+                        block_buffer_span(press_buffer, state_buffer, boundary.col, window.cols)
+                    }
+                    SelectionKind::Word | SelectionKind::Line => None,
+                };
+                let (pers, single_cell) = match span {
+                    Some((start, end)) => (
+                        self.persistent_span(sel.owner, start, end, sel.selection.kind, true),
+                        start == end,
+                    ),
+                    None => (
+                        self.persistent_span(
+                            sel.owner,
+                            state_buffer,
+                            state_buffer,
+                            sel.selection.kind,
+                            true,
+                        ),
+                        false,
+                    ),
+                };
+                let next = self
+                    .project_persistent(&pers, sel.owner)
+                    .unwrap_or_else(|| {
+                        let cell = boundary_cell(focus, width, height);
+                        Selection {
+                            anchor: cell,
+                            focus: cell,
+                            kind: sel.selection.kind,
+                            active: true,
+                        }
+                    });
+                self.install_selection(sel.owner, next, sel.anchor_press, true);
+                self.restore_selection_meta(Some(press), single_cell, Some(pers), sel.press_buffer);
+                return;
+            }
+        }
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+        let span = match sel.selection.kind {
+            SelectionKind::Simple => {
+                boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Block => {
+                block_boundary_span(anchor_press, focus, boundary.col, width, height)
+            }
+            SelectionKind::Word | SelectionKind::Line => return,
+        }
+        .map(|(anchor, focus)| {
+            (
+                bitty_ui::snap_to_leading(&snap, anchor),
+                bitty_ui::snap_to_leading(&snap, focus),
+            )
+        });
+        // A caret span that covers no cell keeps the drag alive as a
+        // collapsed selection; a release then decides click vs selection.
+        let (next, single_cell) = match span {
+            Some((anchor, focus)) => (
+                Selection {
+                    anchor,
+                    focus,
+                    kind: sel.selection.kind,
+                    active: true,
+                },
+                anchor == focus,
+            ),
+            None => {
+                let cell = boundary_cell(focus, width, height);
+                (
+                    Selection {
+                        anchor: cell,
+                        focus: cell,
+                        kind: sel.selection.kind,
+                        active: true,
+                    },
+                    false,
+                )
+            }
+        };
+        self.install_selection(sel.owner, next, sel.anchor_press, true);
+        self.restore_selection_meta(Some(press), single_cell, None, None);
+    }
+
+    /// Snapshot the owner's selection space reads (issue #2480).
+    ///
+    /// The visible composite when scrolled, the live grid otherwise. `None`
+    /// fails closed when the owner lost its grid.
+    fn selection_snapshot(&self, owner: ViewId) -> Option<Snapshot> {
+        if self.is_viewport_scrolled(owner) {
+            self.viewport_snapshot_for(owner)
+        } else {
+            self.live_view_state(owner).map(State::snapshot)
+        }
+    }
+
+    /// Commits a pointer caret drag at `boundary` (issue #2480).
+    ///
+    /// A span that covers exactly one cell is kept as a real single-cell
+    /// selection ([`Self::selection_is_single_cell`]); a collapsed span
+    /// (press and release at the same caret) is a click and clears, matching
+    /// the previous release semantics.
+    pub(super) fn end_boundary_selection(&mut self, focus: CellPos, boundary: SelectionBoundary) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let Some(press) = sel.press_boundary else {
+            return;
+        };
+        let Some((width, height)) = self.selection_extent(sel.owner) else {
+            self.drop_selection();
+            self.click_tracker.reset();
+            return;
+        };
+        let Some(snap) = self.selection_snapshot(sel.owner) else {
+            self.drop_selection();
+            self.click_tracker.reset();
+            return;
+        };
+        // Pointer Simple/Block drags commit in combined-buffer space
+        // (issue #2470): the same span semantics as a live drag, but rows may
+        // span any number of scrollback pages.
+        if sel.selection.kind == SelectionKind::Simple || sel.selection.kind == SelectionKind::Block
+        {
+            if let (Some(press_buffer), Some(pointer_buffer), Some(window)) = (
+                sel.press_buffer.or(sel.buffer.map(|pers| pers.anchor)),
+                self.buffer_pos_for_cell(sel.owner, focus),
+                self.selection_window(sel.owner),
+            ) {
+                let span = match sel.selection.kind {
+                    SelectionKind::Simple => boundary_buffer_span(
+                        press_buffer,
+                        press.col,
+                        pointer_buffer,
+                        boundary.col,
+                        window.cols,
+                    ),
+                    SelectionKind::Block => {
+                        block_buffer_span(press_buffer, pointer_buffer, boundary.col, window.cols)
+                    }
+                    SelectionKind::Word | SelectionKind::Line => None,
+                };
+                let Some((start, end)) = span else {
+                    self.drop_selection();
+                    return;
+                };
+                // Drag-vs-click uses the pointer cell, never the span end:
+                // a backward drag's span end is the press-side cell (issue
+                // #2480 review).
+                let was_drag = buffer_cell_distance(press_buffer, pointer_buffer)
+                    > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+                let start = self.snap_buffer_pos(sel.owner, start);
+                let end = self.snap_buffer_pos(sel.owner, end);
+                let finished =
+                    self.persistent_span(sel.owner, start, end, sel.selection.kind, false);
+                let single_cell = start == end;
+                let next = self
+                    .project_persistent(&finished, sel.owner)
+                    .unwrap_or_else(|| {
+                        let cell = boundary_cell(focus, width, height);
+                        Selection {
+                            anchor: cell,
+                            focus: cell,
+                            kind: sel.selection.kind,
+                            active: false,
+                        }
+                    });
+                self.install_selection(sel.owner, next, None, false);
+                self.restore_selection_meta(None, single_cell, Some(finished), None);
+                if was_drag {
+                    self.click_tracker.reset();
+                }
+                return;
+            }
+        }
+        let anchor_press = sel.anchor_press.unwrap_or(sel.selection.anchor);
+        let span = match sel.selection.kind {
+            SelectionKind::Simple => {
+                boundary_span(anchor_press, press.col, focus, boundary.col, width, height)
+            }
+            SelectionKind::Block => {
+                block_boundary_span(anchor_press, focus, boundary.col, width, height)
+            }
+            SelectionKind::Word | SelectionKind::Line => return,
+        }
+        .map(|(anchor, focus)| {
+            (
+                bitty_ui::snap_to_leading(&snap, anchor),
+                bitty_ui::snap_to_leading(&snap, focus),
+            )
+        });
+        let Some((anchor, span_focus)) = span else {
+            self.drop_selection();
+            return;
+        };
+        let was_drag = super::click::cell_distance(sel.anchor_press.unwrap_or(anchor), focus)
+            > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+        let finished = Selection {
+            anchor,
+            focus: span_focus,
+            kind: sel.selection.kind,
+            active: false,
+        };
+        self.install_selection(sel.owner, finished, None, false);
+        if let Some(state) = self.selection_state.as_mut() {
+            state.single_cell = anchor == span_focus;
+        }
+        if was_drag {
+            self.click_tracker.reset();
+        }
+    }
+
     /// Updates the current selection's focus to `pos` (mouse drag).
     ///
     /// `pos` is a cell in the **owner's** grid when live and a viewport cell
@@ -763,10 +1685,26 @@ impl Runtime {
         if !sel.dragging {
             return;
         }
+        // A collapsed range without the one-cell flag was a click, not a
+        // selection: leaving the window must not leave a painted cell behind
+        // (issue #2480 review).
+        if sel.selection.is_empty()
+            && !sel.single_cell
+            && sel.buffer.is_none_or(|pers| pers.anchor == pers.focus)
+        {
+            self.click_tracker.reset();
+            self.drop_selection();
+            return;
+        }
         let mut selection = sel.selection;
         selection.active = false;
+        let mut buffer = sel.buffer;
+        if let Some(pers) = buffer.as_mut() {
+            pers.active = false;
+        }
         self.click_tracker.reset();
         self.install_selection(sel.owner, selection, None, false);
+        self.restore_selection_meta(None, sel.single_cell, buffer, None);
     }
 
     /// Returns selected text for the current selection, if any.
@@ -780,6 +1718,18 @@ impl Runtime {
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {
         let sel = self.selection_state.as_ref()?;
+        // Pointer selections read the combined buffer (issue #2470): the
+        // range can span pages, so a viewport snapshot would truncate it.
+        if let Some(pers) = sel.buffer {
+            // A press installs a collapsed buffer range; only the one-cell
+            // flag makes that a real selection (issue #2480 review).
+            if pers.anchor == pers.focus && !sel.single_cell {
+                return None;
+            }
+            let state = self.live_view_state(sel.owner)?;
+            let text = pers.text(state)?;
+            return if text.is_empty() { None } else { Some(text) };
+        }
         if self.is_viewport_scrolled(sel.owner) {
             let viewport = self.viewport_snapshot_for(sel.owner)?;
             // Fail closed like the live path when the owner left the layout:

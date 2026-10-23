@@ -2614,10 +2614,10 @@ ui.overlay.focus = true
         "overlay capture must clear the plaintext hover on tick"
     );
     app.sync_cursor_icon();
-    assert_ne!(
+    assert_eq!(
         app.window.last_applied_cursor,
-        Some(bitty_platform::CursorIcon::Pointer),
-        "overlay capture must not show a URL pointer"
+        Some(bitty_platform::CursorIcon::Default),
+        "overlay capture must not show a URL pointer or an underlying I-beam"
     );
 
     // Ctrl+press+release over the URL mints at Runtime level (which does
@@ -3135,6 +3135,100 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
         app.window.last_applied_cursor,
         Some(bitty_platform::CursorIcon::Default),
         "empty OSC 22 stack with no hover must restore default"
+    );
+}
+
+#[test]
+fn pointer_over_terminal_text_uses_the_text_cursor() {
+    // Issue #2480: the OS pointer must be an I-beam over selectable grid
+    // text, while OSC 22 shapes still win, mouse-capturing panes stay the
+    // arrow, and leaving the window restores it.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+    app.runtime.handle_pty_bytes(b"selectable text");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let frame = *app
+        .runtime
+        .present_frames()
+        .first()
+        .expect("primary frame must present");
+    let (cw, ch) = app.runtime.live_cell_size();
+    let pad = f64::from(app.runtime.window_padding_physical());
+    let text_pos = bitty_platform::CursorPosition {
+        x: pad + f64::from(frame.content.x) + 1.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y) + 0.5 * f64::from(ch),
+    };
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(text_pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Text),
+        "grid text must request the I-beam"
+    );
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [bitty_platform::CursorIcon::Text]
+    );
+
+    // `OSC 22` still owns the pointer when a terminal app sets one.
+    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Wait),
+        "OSC 22 must win over the automatic text cursor"
+    );
+
+    // Window padding is chrome: the arrow returns.
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "padding must not show the I-beam"
+    );
+
+    // A capturing pane returns the arrow even over its text.
+    app.runtime.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(text_pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "a mouse-capturing pane owns its pointer"
+    );
+
+    // Leaving the window restores the platform arrow even with OSC 22 set.
+    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorLeft,
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "leaving must not leave the pane shape stuck"
     );
 }
 

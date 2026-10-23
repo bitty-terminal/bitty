@@ -207,11 +207,12 @@ pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
 /// Resolved terminal palette carried by the renderer.
 ///
 /// A preset is a fixed set of window background, foreground, cursor,
-/// selection, and the 16 ANSI colors (CTX-0355). The [`Default`] value is the
-/// designed Bitty Dark preset, so every existing construction keeps the
-/// previously hardcoded fallback; a selected preset is resolved once in the
-/// app layer and carried here so the clear color, default cell colors, and
-/// ANSI 0–15 all follow `appearance.theme`.
+/// selection, the focused/idle outline pair, and the 16 ANSI colors
+/// (CTX-0355, CTX-1477). The [`Default`] value is the designed Bitty Dark
+/// preset, so every existing construction keeps the previously hardcoded
+/// fallback; a selected preset is resolved once in the app layer and carried
+/// here so the clear color, default cell colors, chrome borders, and ANSI
+/// 0–15 all follow `appearance.theme`.
 ///
 /// CTX-0392 adds the bounded dynamic layer: `dynamic` is the fixed
 /// 256-entry OSC 4 override table (`None` = no override, `Some(rgb)` =
@@ -229,6 +230,10 @@ pub struct ThemePalette {
     pub cursor: Rgba8,
     /// Selection background fill.
     pub selection: Rgba8,
+    /// Focused outline token (`border.focused`), theme-owned (CTX-1477).
+    pub border_focused: Rgba8,
+    /// Idle outline token (`border.idle`), theme-owned (CTX-1477).
+    pub border_idle: Rgba8,
     /// The 16 ANSI colors, indices 0–15 (8 normal + 8 bright).
     pub ansi: [[u8; 3]; 16],
     /// Live OSC 4 overrides, index-addressed `0..=255` (CTX-0392).
@@ -240,9 +245,10 @@ impl ThemePalette {
     /// Resolves a preset from the `bitty-config` theme registry.
     ///
     /// This is the single mapping from the config-side [`Theme`] to the
-    /// render-side palette; RGB channels are copied verbatim and alpha is
-    /// forced opaque for the four chrome colors (the preset has no alpha).
-    /// The dynamic layer starts empty (`[None; 256]`).
+    /// render-side palette; RGB channels are copied verbatim, alpha is forced
+    /// opaque for the four base chrome colors (the preset has no alpha), and
+    /// the outline pair keeps its theme-owned alpha. The dynamic layer starts
+    /// empty (`[None; 256]`).
     ///
     /// [`Theme`]: bitty_config::theme::Theme
     #[must_use]
@@ -267,6 +273,8 @@ impl ThemePalette {
                 theme.selection[2],
                 0xFF,
             ],
+            border_focused: theme.border_focused.0,
+            border_idle: theme.border_idle.0,
             ansi: theme.ansi,
             dynamic: [None; 256],
         }
@@ -275,8 +283,9 @@ impl ThemePalette {
     /// Resolves an inline custom palette (CTX-0392) to the render side.
     ///
     /// Same mapping as [`Self::from_theme`] but from the validated
-    /// [`CustomPalette`](bitty_config::theme::CustomPalette): chrome colors
-    /// become opaque `Rgba8`, ANSI copies verbatim, dynamic starts empty.
+    /// [`CustomPalette`](bitty_config::theme::CustomPalette): base chrome
+    /// colors become opaque `Rgba8`, the optional outline pair falls back to
+    /// the accepted Core defaults, ANSI copies verbatim, dynamic starts empty.
     #[must_use]
     pub fn from_custom(custom: &bitty_config::theme::CustomPalette) -> Self {
         Self {
@@ -299,6 +308,14 @@ impl ThemePalette {
                 custom.selection[2],
                 0xFF,
             ],
+            border_focused: custom.border_focused.map_or(
+                bitty_config::types::DEFAULT_DECORATION_BORDER_FOCUSED.0,
+                |color| color.0,
+            ),
+            border_idle: custom.border_idle.map_or(
+                bitty_config::types::DEFAULT_DECORATION_BORDER_IDLE.0,
+                |color| color.0,
+            ),
             ansi: custom.ansi,
             dynamic: [None; 256],
         }
@@ -422,39 +439,32 @@ pub const fn help_panel_bg_in(palette: &ThemePalette) -> Rgba8 {
     palette.selection
 }
 
-/// Theme-aware help-panel accent ring (CTX-1395, CTX-1418): ANSI 12.
+/// Theme-aware chrome border (CTX-1477, issue #2468): the accepted idle
+/// outline token.
 ///
-/// The ring is a non-text UI boundary drawn on the selection ground, so it
-/// must clear the 3:1 non-text floor. ANSI 12 is the primary accent, but on
-/// several presets it sits too close to that ground; the helper then falls
-/// back through ANSI 4, ANSI 6, and finally the foreground. Every candidate
-/// is theme-owned (including any live OSC 4 override), so the ring never
-/// invents a color and follows a theme switch.
+/// One shared resolver for normal chrome surfaces (help/which-key, palette,
+/// presentation/plugin overlays). The tone is muted by design; the focused
+/// state uses [`chrome_focus_border_in`] and stays distinguishable through the
+/// theme's accepted outline pair.
 #[must_use]
-pub fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
-    let candidates = [
-        palette.active_index(HELP_PANEL_ACCENT_ANSI_INDEX),
-        palette.active_index(4),
-        palette.active_index(6),
-        [
-            palette.foreground[0],
-            palette.foreground[1],
-            palette.foreground[2],
-        ],
-    ];
-    let selection = [
-        palette.selection[0],
-        palette.selection[1],
-        palette.selection[2],
-    ];
-    let winner = bitty_config::theme::readable_accent(
-        &candidates,
-        selection,
-        bitty_config::theme::MIN_UI_CONTRAST,
-    )
-    .unwrap_or(candidates.len() - 1);
-    let rgb = candidates[winner];
-    [rgb[0], rgb[1], rgb[2], 0xFF]
+pub const fn chrome_border_in(palette: &ThemePalette) -> Rgba8 {
+    palette.border_idle
+}
+
+/// Theme-aware focused chrome border (CTX-1477, issue #2468): the accepted
+/// focused outline token.
+#[must_use]
+pub const fn chrome_focus_border_in(palette: &ThemePalette) -> Rgba8 {
+    palette.border_focused
+}
+
+/// Theme-aware help-panel ring (CTX-1395, CTX-1477): the muted chrome border.
+///
+/// Retained as a named helper for the help panel; it now resolves through
+/// [`chrome_border_in`] so every Core overlay shares one border token.
+#[must_use]
+pub const fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
+    chrome_border_in(palette)
 }
 
 /// Theme-aware help-panel text (CTX-1395): the default foreground.

@@ -189,6 +189,7 @@ pub mod atlas;
 pub mod batch;
 mod block;
 pub mod cache;
+pub mod chrome;
 pub mod crossfont_backend;
 pub mod error;
 pub mod fallback;
@@ -206,6 +207,12 @@ pub mod window;
 pub mod software;
 
 pub use cache::{DEFAULT_GLYPH_CACHE_BYTE_CAPACITY, GlyphCache};
+pub use chrome::{
+    CHROME_BORDER_PX, CHROME_CORNER_MASKS, CHROME_CORNERS_BOX, CHROME_CORNERS_ROUNDED,
+    CHROME_ELEVATE_MIX, CHROME_PADDING_PX, CHROME_RADIUS_PX, CORNER_ORDER, ChromeCornerGlyphs,
+    ChromeElevation, ChromeFrame, ChromeGlyphCoverage, ChromePaint, ChromeState, ChromeTokens,
+    MIN_CHROME_FOCUS_CONTRAST, MIN_CHROME_MUTED_CONTRAST, inset, outline_ring,
+};
 pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;
 pub use fallback::{

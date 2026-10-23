@@ -472,6 +472,7 @@ dependencies = [
  "bitty-vt",
  "nix 0.31.3",
  "pollster",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

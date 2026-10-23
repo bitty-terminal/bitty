@@ -1491,8 +1491,23 @@ enum BoundedReadError {
     TooLarge,
 }
 
+#[cfg(target_os = "macos")]
+fn path_for_bounded_traversal(path: &Path) -> PathBuf {
+    let temp_dir = std::env::temp_dir();
+    if path.is_absolute() && path.starts_with(&temp_dir) {
+        if let (Ok(canonical_temp), Ok(relative)) =
+            (temp_dir.canonicalize(), path.strip_prefix(&temp_dir))
+        {
+            return canonical_temp.join(relative);
+        }
+    }
+    path.to_path_buf()
+}
+
 #[cfg(unix)]
 fn open_bounded_file(path: &Path) -> Result<std::fs::File, BoundedReadError> {
+    #[cfg(target_os = "macos")]
+    let path = path_for_bounded_traversal(path);
     let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })
         .map_err(|error| BoundedReadError::Io(error.to_string()))?;
     let mut components = path.components().peekable();
@@ -1509,17 +1524,10 @@ fn open_bounded_file(path: &Path) -> Result<std::fs::File, BoundedReadError> {
             ));
         };
         let final_component = components.peek().is_none();
-        let flags = if final_component {
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_NONBLOCK
-                | nix::fcntl::OFlag::O_CLOEXEC
-        } else {
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_DIRECTORY
-                | nix::fcntl::OFlag::O_CLOEXEC
-        };
+        let flags = nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_CLOEXEC;
         let fd = nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
             .map_err(|error| {
                 if error == nix::errno::Errno::ENOENT {
@@ -1531,6 +1539,16 @@ fn open_bounded_file(path: &Path) -> Result<std::fs::File, BoundedReadError> {
                 }
             })?;
         directory = std::fs::File::from(fd);
+        let metadata = directory
+            .metadata()
+            .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+        if final_component {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(BoundedReadError::Unsafe("not a regular file".to_string()));
+            }
+        } else if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(BoundedReadError::Unsafe("not a directory".to_string()));
+        }
         if final_component {
             return Ok(directory);
         }
@@ -8254,6 +8272,7 @@ mod tests {
     fn bounded_reader_rejects_symlinks_and_special_files() {
         let dir = scratch_dir("explain-bounded-reader");
         let target = dir.join("target");
+        #[cfg(unix)]
         let link = dir.join("link");
         std::fs::write(&target, "allow ui.rich\n").expect("target");
         #[cfg(unix)]
@@ -8265,6 +8284,15 @@ mod tests {
         ));
         #[cfg(unix)]
         {
+            let nested_link = dir.join("nested-link");
+            let nested_target = dir.join("nested-target");
+            std::fs::create_dir(&nested_target).expect("nested target");
+            std::fs::write(nested_target.join("policy"), "allow ui.rich\n").expect("nested policy");
+            std::os::unix::fs::symlink(&nested_target, &nested_link).expect("nested link");
+            assert!(matches!(
+                read_bounded_regular_file(&nested_link.join("policy"), MAX_POLICY_FILE_BYTES),
+                Err(BoundedReadError::Unsafe(_))
+            ));
             let fifo = dir.join("fifo");
             nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("fifo");
             assert!(matches!(
@@ -8279,6 +8307,7 @@ mod tests {
     fn state_reader_rejects_replaced_symlink_without_mutating_target() {
         let dir = scratch_dir("explain-state-symlink");
         let target = dir.join("real.toml");
+        #[cfg(unix)]
         let link = dir.join(STATE_FILE_NAME);
         std::fs::write(&target, "state_version = 1\n").expect("target");
         #[cfg(unix)]

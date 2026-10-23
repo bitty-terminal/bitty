@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{self, Read as _};
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -70,8 +72,23 @@ pub trait FileSystem: Send + Sync + Debug {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeFileSystem;
 
+#[cfg(target_os = "macos")]
+fn path_for_bounded_traversal(path: &Path) -> PathBuf {
+    let temp_dir = std::env::temp_dir();
+    if path.is_absolute() && path.starts_with(&temp_dir) {
+        if let (Ok(canonical_temp), Ok(relative)) =
+            (temp_dir.canonicalize(), path.strip_prefix(&temp_dir))
+        {
+            return canonical_temp.join(relative);
+        }
+    }
+    path.to_path_buf()
+}
+
 #[cfg(unix)]
 fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "macos")]
+    let path = path_for_bounded_traversal(path);
     let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })?;
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
@@ -127,7 +144,6 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
                     name,
                     rustix::fs::OFlags::RDONLY
                         | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::DIRECTORY
                         | rustix::fs::OFlags::CLOEXEC,
                     rustix::fs::Mode::empty(),
                 )?;
@@ -147,7 +163,6 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
                     name,
                     nix::fcntl::OFlag::O_RDONLY
                         | nix::fcntl::OFlag::O_NOFOLLOW
-                        | nix::fcntl::OFlag::O_DIRECTORY
                         | nix::fcntl::OFlag::O_CLOEXEC,
                     nix::sys::stat::Mode::empty(),
                 )?;
@@ -155,6 +170,20 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
             }
         };
         directory = file;
+        let metadata = directory.metadata()?;
+        if final_component {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "not a regular file",
+                ));
+            }
+        } else if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not a directory",
+            ));
+        }
         if final_component {
             return Ok(directory);
         }
@@ -646,5 +675,31 @@ mod tests {
         write_atomic_durably(&NativeFileSystem, &destination, b"new", &temp).expect("atomic write");
         assert_eq!(std::fs::read(&destination).expect("read"), b"new");
         assert!(!temp.exists(), "live temp renamed away");
+    }
+
+    #[test]
+    fn bounded_reader_accepts_verified_directory_ancestors() {
+        let dir = sweep_dir("bounded-read");
+        let nested = dir.path().join("nested");
+        let path = nested.join("state.toml");
+        std::fs::create_dir(&nested).expect("nested directory");
+        std::fs::write(&path, b"state").expect("state");
+        let bytes = NativeFileSystem
+            .read_bounded_bytes(&path, 16)
+            .expect("nested regular file");
+        assert_eq!(bytes, b"state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_symlinked_directory_ancestors() {
+        let dir = sweep_dir("bounded-read-symlink");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        let path = link.join("state.toml");
+        std::fs::create_dir(&real).expect("real directory");
+        std::fs::write(real.join("state.toml"), b"state").expect("state");
+        std::os::unix::fs::symlink(&real, &link).expect("directory symlink");
+        assert!(NativeFileSystem.read_bounded_bytes(&path, 16).is_err());
     }
 }

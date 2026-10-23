@@ -211,7 +211,7 @@ pub use chrome::{
     CHROME_BORDER_PX, CHROME_CORNER_MASKS, CHROME_CORNERS_BOX, CHROME_CORNERS_ROUNDED,
     CHROME_ELEVATE_MIX, CHROME_PADDING_PX, CHROME_RADIUS_PX, CORNER_ORDER, ChromeCornerGlyphs,
     ChromeElevation, ChromeFrame, ChromeGlyphCoverage, ChromePaint, ChromeState, ChromeTokens,
-    MIN_CHROME_FOCUS_CONTRAST, MIN_CHROME_MUTED_CONTRAST, inset, outline_ring,
+    MIN_CHROME_FOCUS_CONTRAST, inset, outline_ring,
 };
 pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;

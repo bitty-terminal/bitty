@@ -51,9 +51,12 @@ theme-owned muted/focused outlines, and raised/overlay surface elevations.
 Help/which-key, command-palette/presentation overlays, plugin overlay
 surfaces, panel rings, and band chrome resolve through this module; widgets do
 not choose raw border widths or ad-hoc accents. Pixel surfaces use the
-`RoundedFill` SDF ring plus the inner-arc glyph clip as the corner mask;
-one-row bands use rounded box-drawing corners when the corner cell is blank,
-with the documented light-box/square fallback when glyph coverage is absent.
+`RoundedFill` SDF ring plus the inner-arc glyph clip as the corner mask, and
+overlay cards paint in three ordered sublayers (card surface, hosted row
+backgrounds, border ring) so plugin row colours stay visible while the ring
+remains above content; one-row bands use rounded box-drawing corners when the
+corner cell is blank, with the documented light-box/square fallback when glyph
+coverage is absent.
 
 ## Layout
 

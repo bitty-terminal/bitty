@@ -24,8 +24,10 @@
 //! clears AC-1 (3:1 against the window ground) and AC-2 (3:1 against the
 //! composite idle border), and the idle border stays the designed muted
 //! tone. Using the theme pair keeps focus distinguishable on every shipped
-//! preset without inventing a second accent. A preset switch or a live OSC 4
-//! remap moves the whole chrome language with the terminal.
+//! preset without inventing a second accent. A preset switch recolours both
+//! states; the outline pair is preset-owned and deliberately does not follow
+//! live OSC 4 palette overrides (those remap terminal/ANSI cells, not Core
+//! chrome borders).
 //!
 //! # Grid-safe corners
 //!
@@ -54,8 +56,8 @@ use crate::hidpi::sanitize_dpi_scale;
 /// Thin chrome rule width in logical pixels (issue #2468).
 ///
 /// One logical pixel is the accepted thin-border weight; [`ChromeTokens::scaled`]
-/// turns it into one physical pixel at 1x and keeps the same physical weight on
-/// HiDPI displays.
+/// converts it to whole physical pixels (1 px at 1x, 2 px at 2x), preserving
+/// the same logical weight rather than pinning a physical-pixel count.
 pub const CHROME_BORDER_PX: u16 = 1;
 
 /// Default chrome corner radius in logical pixels.
@@ -88,12 +90,6 @@ const TRANSPARENT: Rgba8 = [0x00, 0x00, 0x00, 0x00];
 /// Fraction of the foreground mixed into the selection ground for the raised
 /// surface. A fixed, bounded step keeps elevation deterministic per theme.
 pub const CHROME_ELEVATE_MIX: f32 = 0.08;
-
-/// Advisory visibility floor for the normal chrome border (AC-3, 1.5:1).
-///
-/// The idle outline is a designed subtle tone; AC-3 is advisory and canonical
-/// presets may sit below it, exactly like the accepted panel outline pair.
-pub const MIN_CHROME_MUTED_CONTRAST: f64 = 1.5;
 
 /// Non-text UI floor for the focused chrome border (AC-1/AC-2, 3:1).
 pub const MIN_CHROME_FOCUS_CONTRAST: f64 = 3.0;

@@ -182,7 +182,8 @@ impl Runtime {
         frames: &[super::layout_focus::PresentFrame],
         view_map: &std::collections::HashMap<ViewId, View>,
         pad_px: i32,
-        rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+        card_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+        ring_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
         glyphs: &mut Vec<bitty_render::grid::GlyphInstance>,
     ) -> bool {
         if !self.help_visible || self.help_rows.is_empty() {
@@ -228,7 +229,13 @@ impl Runtime {
             bitty_render::chrome::ChromeState::Normal,
             bitty_render::chrome::ChromeElevation::Raised,
         );
-        let chrome_paint = chrome_frame.push(rounded);
+        let chrome_paint = chrome_frame.paint();
+        if !chrome_paint.is_empty() {
+            card_rounded.push(chrome_paint.surface.clone());
+            if let Some(ring) = &chrome_paint.border {
+                ring_rounded.push(ring.clone());
+            }
+        }
         let glyph_clip = chrome_paint.clip;
         // CTX-0336: `DrawList` composites every glyph after every fill, so
         // the base grid's glyphs would otherwise draw on top of the opaque
@@ -336,31 +343,34 @@ mod tests {
         let frames: Vec<super::super::layout_focus::PresentFrame> = rt.present_frames();
         let frame = frames.first().cloned().expect("one present frame");
         rt.focus_mut().set(frame.view);
-        let mut rounded = Vec::new();
+        let mut card = Vec::new();
+        let mut ring = Vec::new();
         let mut glyphs = Vec::new();
         let painted = rt.paint_help_panel(
             &frames,
             &std::collections::HashMap::new(),
             0,
-            &mut rounded,
+            &mut card,
+            &mut ring,
             &mut glyphs,
         );
         assert!(painted, "the help panel must paint");
-        assert_eq!(rounded.len(), 2, "surface plus border ring");
+        assert_eq!(card.len(), 1, "one surface");
+        assert_eq!(ring.len(), 1, "one border ring");
         let tokens =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config().theme).scaled(rt.dpi_scale());
-        assert_eq!(rounded[0].border, 0);
-        assert_eq!(rounded[0].color, tokens.surface);
-        assert_eq!(rounded[0].radius, tokens.radius_px);
-        assert_eq!(rounded[1].border, tokens.border_px);
-        assert_eq!(rounded[1].color, tokens.border_muted);
-        assert_eq!(rounded[1].radius, tokens.radius_px);
+        assert_eq!(card[0].border, 0);
+        assert_eq!(card[0].color, tokens.surface);
+        assert_eq!(card[0].radius, tokens.radius_px);
+        assert_eq!(ring[0].border, tokens.border_px);
+        assert_eq!(ring[0].color, tokens.border_muted);
+        assert_eq!(ring[0].radius, tokens.radius_px);
         assert_eq!(
-            rounded[0].frame, rounded[1].frame,
+            card[0].frame, ring[0].frame,
             "ring and surface share one frame"
         );
         assert!(!glyphs.is_empty(), "title and rows paint glyphs");
-        let clip = rounded[1].inner_clip().expect("radius leaves an inner arc");
+        let clip = ring[0].inner_clip().expect("radius leaves an inner arc");
         assert!(
             glyphs.iter().all(|glyph| glyph.clip == Some(clip)),
             "help glyphs carry the card's SDF corner mask"

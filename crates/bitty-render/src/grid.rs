@@ -353,9 +353,9 @@ pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
 /// Bitty Dark reference background for the help popup (CTX-0265); production
 /// uses [`help_panel_bg_in`] (theme selection ground).
 pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
-/// Bitty Dark reference accent for the help popup ring (CTX-0265); production
-/// uses [`help_panel_border_in`] (theme ANSI 12 accent, with a theme-owned
-/// fallback when the accent cannot clear the 3:1 non-text floor).
+/// Historical Bitty Dark reference accent for the help popup ring (CTX-0265);
+/// production uses [`help_panel_border_in`], which now resolves the theme's
+/// muted idle outline (CTX-1477) instead of this fixed accent.
 pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
 /// Bitty Dark reference text for [`HELP_PANEL_BG`]; production uses
 /// [`help_panel_fg_in`] (theme foreground).
@@ -371,11 +371,13 @@ pub const FAINT_ALPHA: u8 = 0x7F;
 /// [`readable_foreground_on`] instead of a second hardcoded role.
 pub const BANNER_ANSI_INDEX: u8 = 3;
 
-/// ANSI index carrying the help-panel accent ring (CTX-1395).
+/// Legacy ANSI index used by the diagnostic accent probe
+/// ([`bitty_config::theme::help_ring_source`]).
 ///
-/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue): a
-/// theme-owned chrome accent that a custom palette or OSC 4 remap moves with
-/// the rest of the terminal.
+/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue), but
+/// production help/chrome borders now use the theme outline pair
+/// (`border.idle` / `border.focused`, CTX-1477); this constant is retained for
+/// the contrast report's accent-family probe.
 pub const HELP_PANEL_ACCENT_ANSI_INDEX: u8 = 12;
 
 /// WCAG relative luminance of an sRGB triplet (0.0..=1.0).
@@ -1850,11 +1852,21 @@ pub struct DrawList {
     /// selection/cursor overlays stay visible on top of it.
     pub backgrounds: Vec<ImageBlit>,
     /// Overlay fills painted above the background image and below glyphs
-    /// (CTX-0347: the selection highlight and cursor fill).
+    /// (CTX-0347: the selection highlight and cursor fill; CTX-1477 leaves
+    /// this layer for non-card overlay chrome only).
     pub overlay_fills: Vec<FillRect>,
-    /// Rounded overlay chrome painted after [`Self::overlay_fills`] and before
-    /// glyphs (CTX-1477: opaque help/which-key cards that must stay above the
-    /// selection highlight while keeping the SDF corner mask).
+    /// Rounded overlay card surfaces (CTX-1477), painted after
+    /// [`Self::overlay_fills`] and before [`Self::overlay_content_fills`].
+    /// The card surface must cover selection/cursor fills but stay behind the
+    /// plugin row backgrounds it hosts.
+    pub overlay_card_rounded_fills: Vec<RoundedFill>,
+    /// Plugin overlay content fills (CTX-1477: styled row `bg` runs and
+    /// fail-open pills), painted after the card surface and before the border
+    /// ring so row backgrounds stay visible inside the card.
+    pub overlay_content_fills: Vec<FillRect>,
+    /// Rounded overlay border rings (CTX-1477: help and plugin card rings),
+    /// painted after [`Self::overlay_content_fills`] and before glyphs so the
+    /// ring stays above hosted content while retaining the SDF corner mask.
     pub overlay_rounded_fills: Vec<RoundedFill>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
@@ -1870,6 +1882,8 @@ impl DrawList {
             || !self.rounded_fills.is_empty()
             || !self.backgrounds.is_empty()
             || !self.overlay_fills.is_empty()
+            || !self.overlay_card_rounded_fills.is_empty()
+            || !self.overlay_content_fills.is_empty()
             || !self.overlay_rounded_fills.is_empty()
             || !self.glyphs.is_empty()
             || !self.images.is_empty()
@@ -2965,6 +2979,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // present path (CTX-0347); grid truth carries neither.
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             // Grid truth carries no images; the runtime present path pushes
@@ -3027,6 +3043,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
@@ -3764,6 +3782,8 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
@@ -3808,6 +3828,8 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),

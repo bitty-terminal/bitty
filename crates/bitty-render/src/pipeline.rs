@@ -1328,16 +1328,28 @@ impl GpuResources {
         }
         // Paint order mirrors both CPU compositors: fills, then rounded
         // decoration fills (CTX-0311), then per-View background images
-        // (CTX-0347), then selection/cursor overlay fills, then overlay rounded
-        // chrome (CTX-1477), then glyphs, then Kitty image blits on top
-        // (CTX-0291). Both image passes are bounded by
-        // `batch::plan_image_uploads` before any allocation.
+        // (CTX-0347), then selection/cursor overlay fills, then the overlay
+        // card surface, hosted row fills, and border ring (CTX-1477), then
+        // glyphs, then Kitty image blits on top (CTX-0291). Both image passes
+        // are bounded by `batch::plan_image_uploads` before any allocation.
 
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
         let rounded_chunks =
             batch::chunk_rounded_fills(&draw_list.rounded_fills, surface_w, surface_h, scale);
         let overlay_chunks =
             batch::chunk_fills(&draw_list.overlay_fills, surface_w, surface_h, scale);
+        let overlay_card_chunks = batch::chunk_rounded_fills(
+            &draw_list.overlay_card_rounded_fills,
+            surface_w,
+            surface_h,
+            scale,
+        );
+        let overlay_content_chunks = batch::chunk_fills(
+            &draw_list.overlay_content_fills,
+            surface_w,
+            surface_h,
+            scale,
+        );
         let overlay_rounded_chunks = batch::chunk_rounded_fills(
             &draw_list.overlay_rounded_fills,
             surface_w,
@@ -1358,6 +1370,8 @@ impl GpuResources {
             .map(|c| c.quad_count)
             .chain(rounded_chunks.iter().map(|c| c.quad_count))
             .chain(overlay_chunks.iter().map(|c| c.quad_count))
+            .chain(overlay_card_chunks.iter().map(|c| c.quad_count))
+            .chain(overlay_content_chunks.iter().map(|c| c.quad_count))
             .chain(overlay_rounded_chunks.iter().map(|c| c.quad_count))
             .chain(atlas_chunks.iter().map(|c| c.quad_count))
             .chain(inline_chunks.iter().map(|c| c.quad_count))
@@ -1492,8 +1506,13 @@ impl GpuResources {
         for chunk in &overlay_chunks {
             submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
         }
-        // CTX-1477: overlay rounded chrome (opaque help/which-key cards) stays
-        // above the selection/cursor fills and below glyphs.
+        // CTX-1477: card surface, hosted row backgrounds, then border ring.
+        for chunk in &overlay_card_chunks {
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+        }
+        for chunk in &overlay_content_chunks {
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+        }
         for chunk in &overlay_rounded_chunks {
             submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
         }

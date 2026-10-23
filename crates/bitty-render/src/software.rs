@@ -497,9 +497,9 @@ impl SurfaceRgba {
 /// topmost), preserving vector order. Atlas instances sample
 /// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
 ///
-/// Overlay rounded chrome (CTX-1477) paints after plain overlay fills and
-/// before glyphs, so an opaque help card stays above the selection highlight
-/// while retaining the SDF corner mask.
+/// Overlay rounded chrome (CTX-1477) paints in three ordered sublayers:
+/// card surface, hosted row backgrounds, then the border ring, so a plugin
+/// row keeps its declared `bg` inside the card while the ring stays above it.
 ///
 /// # Errors
 ///
@@ -529,6 +529,12 @@ pub fn draw_list_onto(
     }
     // CTX-0347: selection/cursor overlays stay visible above the image.
     for fill in &list.overlay_fills {
+        surface.fill_rect(fill.rect, fill.color);
+    }
+    for fill in &list.overlay_card_rounded_fills {
+        surface.fill_rounded_rect(fill);
+    }
+    for fill in &list.overlay_content_fills {
         surface.fill_rect(fill.rect, fill.color);
     }
     for fill in &list.overlay_rounded_fills {
@@ -904,50 +910,72 @@ mod tests {
     }
 
     #[test]
-    fn overlay_rounded_chrome_paints_above_background_and_overlay_fills() {
-        // CTX-1477: the help card is an opaque rounded overlay, so it must
-        // cover per-View background images and selection/cursor overlay fills
-        // that paint before it, and stay below the glyphs that paint after it.
+    fn overlay_card_paints_surface_then_content_then_ring() {
+        // CTX-1477: the card surface covers background images and selection
+        // fills, hosted row backgrounds stay visible above the surface, and
+        // the ring paints above the row fill.
         use crate::grid::{DrawList, FillRect, ImageBlit, RoundedFill};
-        let mut surface = SurfaceRgba::try_new(4, 4).unwrap();
+        let mut surface = SurfaceRgba::try_new(8, 8).unwrap();
         surface.clear([0, 0, 0, 255]);
         let list = DrawList {
             generation: 1,
             atlas_epoch: 0,
             plan: crate::frame::FramePlan {
-                extent: crate::geometry::ExtentPx::new(4, 4),
+                extent: crate::geometry::ExtentPx::new(8, 8),
                 mode: crate::frame::FrameMode::Full,
-                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 4, 4)],
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
             },
             fills: vec![],
             rounded_fills: vec![],
             backgrounds: vec![
                 ImageBlit::try_new(
-                    crate::geometry::RectPx::new(0, 0, 4, 4),
-                    [255, 0, 0, 255].repeat(16),
+                    crate::geometry::RectPx::new(0, 0, 8, 8),
+                    [255, 0, 0, 255].repeat(64),
                 )
                 .expect("background bytes match extent"),
             ],
             overlay_fills: vec![FillRect {
-                rect: crate::geometry::RectPx::new(0, 0, 4, 4),
+                rect: crate::geometry::RectPx::new(0, 0, 8, 8),
                 color: [0, 0, 255, 255],
             }],
-            overlay_rounded_fills: vec![RoundedFill {
-                frame: crate::geometry::RectPx::new(0, 0, 4, 4),
+            overlay_card_rounded_fills: vec![RoundedFill {
+                frame: crate::geometry::RectPx::new(0, 0, 8, 8),
                 border: 0,
-                radius: 1,
+                radius: 2,
                 color: [0, 255, 0, 255],
+            }],
+            overlay_content_fills: vec![FillRect {
+                rect: crate::geometry::RectPx::new(0, 0, 8, 8),
+                color: [255, 255, 0, 255],
+            }],
+            overlay_rounded_fills: vec![RoundedFill {
+                frame: crate::geometry::RectPx::new(0, 0, 8, 8),
+                border: 1,
+                radius: 2,
+                color: [255, 0, 255, 255],
             }],
             glyphs: vec![],
             images: vec![],
         };
         draw_list_onto(&list, None, &mut surface).unwrap();
-        let offset = (4 + 1) * 4;
-        let pixel = &surface.as_bytes()[offset..offset + 4];
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 8 + x) * 4;
+            surface.as_bytes()[o..o + 4].try_into().expect("four bytes")
+        };
         assert_eq!(
-            pixel,
+            pixel(4, 4),
+            [255, 255, 0, 255],
+            "hosted row background stays visible above the card surface"
+        );
+        assert_ne!(
+            pixel(0, 4),
+            [255, 255, 0, 255],
+            "the ring paints above the row fill at the card edge"
+        );
+        assert_ne!(
+            pixel(0, 4),
             [0, 255, 0, 255],
-            "overlay rounded chrome covers the background image and overlay fill"
+            "the edge is the ring, not the bare card surface"
         );
     }
 
@@ -979,6 +1007,8 @@ mod tests {
             }],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
@@ -1048,6 +1078,8 @@ mod tests {
                 rect: crate::geometry::RectPx::new(0, 0, 4, 4),
                 color: [0, 0, 255, 255],
             }],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
             overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],

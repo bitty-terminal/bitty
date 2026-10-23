@@ -408,11 +408,7 @@ impl StorageRootSelection {
         if !base.is_dir() {
             return Err(StorageHostError::Confinement);
         }
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.lexical_root) {
-            if metadata.file_type().is_symlink() {
-                return Err(StorageHostError::Confinement);
-            }
-        }
+        reject_symlink_ancestors(&base, &self.lexical_root)?;
         std::fs::create_dir_all(&self.lexical_root).map_err(|_| StorageHostError::Confinement)?;
         let root =
             std::fs::canonicalize(&self.lexical_root).map_err(|_| StorageHostError::Confinement)?;
@@ -427,6 +423,28 @@ impl StorageRootSelection {
         restrict_to_owner(&root)?;
         Ok(root)
     }
+}
+
+/// Rejects an existing symlink or non-directory on the lexical root path so
+/// `create_dir_all` can never follow a component to an out-of-root target.
+fn reject_symlink_ancestors(base: &Path, lexical_root: &Path) -> Result<(), StorageHostError> {
+    let relative = lexical_root
+        .strip_prefix(base)
+        .map_err(|_| StorageHostError::Confinement)?;
+    let mut current = base.to_path_buf();
+    for part in relative.components() {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Err(StorageHostError::Confinement);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(StorageHostError::Confinement),
+        }
+    }
+    Ok(())
 }
 
 /// Host configuration for one component connection.

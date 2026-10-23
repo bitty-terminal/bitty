@@ -84,6 +84,7 @@ OTHER_FP="$(gen_key "$OTHER_HOME" 'Bitty Release Other (throwaway) <release-othe
 ARMORED="$(GNUPGHOME="$KEY_HOME" gpg --batch --armor --export-secret-keys "$KEY_FP")"
 PUBLIC_ARMORED="$(GNUPGHOME="$KEY_HOME" gpg --batch --armor --export "$KEY_FP")"
 BASE64="$(printf '%s' "$ARMORED" | base64 --wrap=0)"
+BINARY_BASE64="$(GNUPGHOME="$KEY_HOME" gpg --batch --export-secret-keys "$KEY_FP" | base64 --wrap=0)"
 ESCAPED="$(printf '%s' "$ARMORED" | awk 'BEGIN { ORS = "" } { print $0 "\\n" }')"
 
 [[ "$ARMORED" == *"-----BEGIN PGP PRIVATE KEY BLOCK-----"* ]] ||
@@ -131,6 +132,20 @@ else
   fail "escaped-newline key is not listed as a secret key"
 fi
 assert_no_key_material "escaped-newline import" "$out"
+
+# --- 3b. base64 of the binary export ---------------------------------------
+out=""
+if out="$(run_import "$TMP/home-binary-base64" "$BINARY_BASE64" --fingerprint "$KEY_FP" 2>&1)"; then
+  pass "base64-encoded binary key imports"
+else
+  fail "base64-encoded binary key import failed: $out"
+fi
+if has_secret_fpr "$TMP/home-binary-base64" "$KEY_FP"; then
+  pass "base64-encoded binary key verifies as a secret key"
+else
+  fail "base64-encoded binary key is not listed as a secret key"
+fi
+assert_no_key_material "base64 binary import" "$out"
 
 # --- 4. wrong fingerprint ---------------------------------------------------
 out=""

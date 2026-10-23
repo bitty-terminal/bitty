@@ -101,22 +101,12 @@ mkdir -p "$gnupg_home"
 chmod 700 "$gnupg_home"
 export GNUPGHOME="$gnupg_home"
 
-# Normalize literal "\n" escapes, then offer a base64 decoding of the
-# whitespace-stripped material. Armored input is rejected by base64, so the
-# candidate list stays small and deterministic.
+# Normalize literal "\n" escapes and carriage returns. Base64 is decoded
+# directly to a file (below) so binary payloads survive NUL bytes that command
+# substitution would drop.
 literal_newlines="${material//\\n/$'\n'}"
 normalized="${literal_newlines//$'\r'/}"
 compact="$(printf '%s' "$normalized" | tr -d '[:space:]')"
-decoded=""
-if [[ -n "$compact" && "$compact" != *"-----BEGIN"* ]]; then
-  if decoded_candidate="$(printf '%s' "$compact" | base64 --decode 2>/dev/null)" &&
-    [[ -n "$decoded_candidate" ]]; then
-    decoded="$decoded_candidate"
-  fi
-fi
-
-candidates=("$material" "$literal_newlines" "$normalized")
-[[ -n "$decoded" ]] && candidates+=("$decoded")
 
 secret_fingerprints() {
   gpg --batch --with-colons --list-secret-keys 2>/dev/null |
@@ -124,19 +114,33 @@ secret_fingerprints() {
 }
 
 imported=0
-for candidate in "${candidates[@]}"; do
-  [[ -n "$candidate" ]] || continue
-  printf '%s' "$candidate" >"$tmp/key"
+try_import() {
   if gpg --batch --quiet --import "$tmp/key" 2>"$tmp/import.err"; then
     imported=1
     while IFS= read -r fpr; do
       if [[ "$fpr" == "$EXPECTED_FP" ]]; then
         echo "imported and verified secret APT signing key ${EXPECTED_FP}"
-        exit 0
+        return 0
       fi
     done < <(secret_fingerprints)
   fi
+  return 1
+}
+
+for candidate in "$material" "$literal_newlines" "$normalized"; do
+  [[ -n "$candidate" ]] || continue
+  printf '%s' "$candidate" >"$tmp/key"
+  try_import && exit 0
 done
+
+# Base64 of an armored or binary OpenPGP payload. Decode to a file so NUL
+# bytes in a binary payload are preserved.
+if [[ -n "$compact" && "$compact" != *"-----BEGIN"* ]]; then
+  if printf '%s' "$compact" | base64 --decode >"$tmp/key" 2>/dev/null &&
+    [[ -s "$tmp/key" ]]; then
+    try_import && exit 0
+  fi
+fi
 
 if ((imported)); then
   found="$(secret_fingerprints | sort -u | paste -sd ', ' -)"

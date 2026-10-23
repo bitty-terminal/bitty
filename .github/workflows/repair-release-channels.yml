@@ -112,6 +112,11 @@ jobs:
             echo "::error::no .deb assets found in release ${TAG}" >&2
             exit 1
           fi
+          EXPECTED_DEBS="$(awk '$2 ~ /^\*?.*\.deb$/ { count++ } END { print count + 0 }' SHA256SUMS)"
+          if [ "$EXPECTED_DEBS" -ne "${#DEBS[@]}" ]; then
+            echo "::error::SHA256SUMS lists ${EXPECTED_DEBS} .deb file(s) but ${#DEBS[@]} were downloaded" >&2
+            exit 1
+          fi
           : > "$RUNNER_TEMP/deb.sha256"
           for deb in "${DEBS[@]}"; do
             sum_line="$(awk -v f="$deb" '$2 == f || $2 == "*" f { print }' SHA256SUMS)"
@@ -219,6 +224,11 @@ jobs:
           mapfile -t RPMS < <(find . -maxdepth 1 -type f -name '*.rpm' -printf '%f\n' | sort)
           if [ "${#RPMS[@]}" -eq 0 ]; then
             echo "::error::no .rpm assets found in release ${TAG}" >&2
+            exit 1
+          fi
+          EXPECTED_RPMS="$(awk '$2 ~ /^\*?.*\.rpm$/ { count++ } END { print count + 0 }' SHA256SUMS)"
+          if [ "$EXPECTED_RPMS" -ne "${#RPMS[@]}" ]; then
+            echo "::error::SHA256SUMS lists ${EXPECTED_RPMS} .rpm file(s) but ${#RPMS[@]} were downloaded" >&2
             exit 1
           fi
           : > "$RUNNER_TEMP/rpm.sha256"

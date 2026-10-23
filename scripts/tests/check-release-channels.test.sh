@@ -47,6 +47,24 @@ expect_absent() { # <file> <literal> <label>
 
 [[ -f "$REPAIR" ]] || fail "repair workflow missing: $REPAIR"
 
+# --- 0. Pinned archive key fingerprint -------------------------------------
+IMPORTER="scripts/import-apt-gpg-key.sh"
+KEYRING="packaging/apt/bitty-archive-keyring.gpg"
+KEYRING_FP="$(
+  gpg --batch --with-colons --show-keys "$KEYRING" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }'
+)"
+if [[ -n "$KEYRING_FP" ]]; then
+  expect_contains "$IMPORTER" "PINNED_FINGERPRINT=\"$KEYRING_FP\"" \
+    "importer pins the committed keyring fingerprint"
+  expect_contains "$RELEASE" "APT_GPG_KEY_FINGERPRINT: $KEYRING_FP" \
+    "release.yml pins the committed keyring fingerprint"
+  expect_contains "$REPAIR" "APT_GPG_KEY_FINGERPRINT: $KEYRING_FP" \
+    "repair workflow pins the committed keyring fingerprint"
+else
+  fail "could not read the fingerprint from $KEYRING"
+fi
+
 # --- 1. Copr CLI installation path -----------------------------------------
 COPR_BLOCK="$(
   awk '/^  copr:/{ inside = 1 } inside && /^  apt:/{ exit } inside' "$RELEASE"
@@ -96,6 +114,8 @@ expect_contains "$RELEASE" "bash scripts/tests/import-apt-gpg-key.test.sh" \
   "release.yml validates the APT key importer"
 expect_contains "$RELEASE" "bash scripts/tests/check-release-channels.test.sh" \
   "release.yml validates the release-channel wiring"
+expect_contains "$RELEASE" "gh workflow run repair-release-channels.yml" \
+  "release.yml points failed channels at the emergency repair workflow"
 
 # --- 3. Emergency repair workflow ------------------------------------------
 expect_contains "$REPAIR" "workflow_dispatch:" \

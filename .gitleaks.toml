@@ -17,3 +17,10 @@ regexes = [
   '''ghp_abcdefgh12345678''',
   '''abcdefgh12345678''',
 ]
+
+[[allowlists]]
+description = "CTX-1481 public Bitty APT archive key fingerprint (packaging/apt/bitty-archive-keyring.gpg); a public key identifier, not a credential"
+targetRules = ["generic-api-key"]
+regexes = [
+  '''BCB87D7B489A64168080D900DF4751B6EA711CB8''',
+]

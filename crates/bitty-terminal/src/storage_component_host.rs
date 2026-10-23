@@ -33,26 +33,27 @@
 //!   error poisons the connection so a caller cannot silently retry into a
 //!   state the component may already have applied.
 //!
-//! # Pin state and re-pin
+//! # Pin state
 //!
-//! `bitty-storage` PR #18 is **not merged**. Its current head
-//! `5b5f19eb` is pinned only as the optional `bitty-storage-component`
-//! dependency; the linked model stays on `7bf5177`. A follow-up to PR #18 adds
-//! `Uncertain = 11` (keeping `Internal = 10`) and adjusts cached-open/eviction
-//! behavior, so the host must not be enabled or repinned to a merged SHA yet.
+//! `bitty-storage` PR #18 merged at `502c7f5`, so the optional
+//! `bitty-storage-component` dependency now pins a commit reachable from the
+//! storage `main` branch; the linked model stays on `7bf5177`. The merged
+//! contract adds `Uncertain = 11` (keeping `Internal = 10`) and evicts cached
+//! namespace handles after an uncertain commit/read, so the host must reopen
+//! and reread the revision before any retry.
 //!
-//! After the follow-up lands:
+//! The component remains default-off: no startup wiring, user-facing enable,
+//! or first-run migration is added here. When that follow-up lands:
 //!
-//! 1. Change the `bitty-storage-component` `rev` in
-//!    `crates/bitty-terminal/Cargo.toml` to the new PR head (or the merge
-//!    commit on `main` once #18 is merged).
+//! 1. Confirm the `bitty-storage-component` `rev` still names the release
+//!    commit used for the component artifact.
 //! 2. Run `cargo check -p bitty-terminal --features storage-component` to
 //!    refresh `Cargo.lock` for both storage pins.
 //! 3. Re-read [`StorageComponentFault::from_wire_code`] and confirm the
-//!    reserved `11 = Uncertain` row plus the mutation-poison rule still match
-//!    the component. The table is the only error-code mapping in this module.
+//!    `10 = Internal`, `11 = Uncertain`, and unknown-code rules still match
+//!    the component contract.
 //! 4. Only then wire the injectable gate into the composition root and add a
-//!    user-facing enable. Until that point this module stays default-off.
+//!    user-facing enable.
 //!
 //! Unknown error codes are always classified as
 //! [`StorageComponentFault::Unknown`] (a generic component failure), never as a
@@ -186,9 +187,9 @@ pub enum StorageComponentFault {
     Io,
     /// Internal component failure.
     Internal,
-    /// Commit outcome is unknown. Reserved for the pending storage PR #18
-    /// follow-up (`Uncertain = 11`); a committed mutation with this result is
-    /// never replayed.
+    /// Commit/read outcome is unknown (code 11). The component evicted its
+    /// cached handle; reopen the namespace and reread the revision before any
+    /// retry. A submitted mutation with this result is never replayed.
     Uncertain,
     /// A code this host does not know. Treated as a generic component failure.
     Unknown,
@@ -210,8 +211,8 @@ impl StorageComponentFault {
             8 => Self::CorruptState,
             9 => Self::Io,
             10 => Self::Internal,
-            // Reserved by the pending storage PR #18 follow-up. Confirm this
-            // row when the new head is re-pinned (see the module docs).
+            // Reserved stable wire code; confirmed by the merged storage#18
+            // contract. Unknown codes stay generic component failures.
             11 => Self::Uncertain,
             _ => Self::Unknown,
         }
@@ -1051,6 +1052,8 @@ mod enabled {
 
         /// Restore the previous revision as a new revision. Like
         /// [`Self::commit_batch`], a submitted rollback is never replayed.
+        /// An `Uncertain` result means the cached handle was evicted; reopen
+        /// the namespace and reread before deciding whether to retry.
         ///
         /// # Errors
         ///
@@ -1494,8 +1497,8 @@ mod enabled {
     /// namespace keys (hashed); no path travels on the wire.
     ///
     /// `session_file`/`session_file_for` return `None` on purpose: startup
-    /// discovery and migration are deferred until storage PR #18 merges and is
-    /// pinned, and the linked backend remains the default.
+    /// discovery and migration are deferred until the enable/migration task
+    /// lands, and the linked backend remains the default.
     #[derive(Debug)]
     pub struct StorageComponentSessionBackend {
         client: Arc<StorageComponentClient>,
@@ -2059,6 +2062,13 @@ mod tests {
             StorageComponentFault::from_wire_code(255),
             StorageComponentFault::Unknown
         );
+        #[cfg(feature = "storage-component")]
+        {
+            use bitty_storage_component::component::protocol::ErrorKind;
+            assert_eq!(ErrorKind::from_code(10), Some(ErrorKind::Internal));
+            assert_eq!(ErrorKind::from_code(11), Some(ErrorKind::Uncertain));
+            assert_eq!(ErrorKind::from_code(12), None);
+        }
     }
 
     #[test]

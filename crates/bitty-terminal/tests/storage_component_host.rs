@@ -490,36 +490,39 @@ fn handshake_and_wire_faults_fail_closed() {
 }
 
 fn mutation_errors_poison_and_never_replay() {
-    let scratch = Scratch::new("mutation-error");
-    let install_root = scratch.subdir("extensions");
-    let base = scratch.subdir("state");
-    install(&install_root, Some("error-stale"));
-    let client = connect(&install_root, &base);
-    client.open_namespace("sessions", DEADLINE).expect("open");
-    let error = client
-        .commit_batch(
-            "sessions",
-            0,
-            vec![StorageRow {
-                key: "alpha".to_owned(),
-                value: b"one".to_vec(),
-            }],
-            Vec::new(),
-            DEADLINE,
-        )
-        .expect_err("stale revision");
-    assert_eq!(
-        error,
-        StorageHostError::Component(StorageComponentFault::StaleRevision)
-    );
-    assert!(client.commit_was_submitted());
-    assert!(!client.is_running());
-    assert_eq!(
-        client
-            .open_namespace("sessions", DEADLINE)
-            .expect_err("poisoned"),
-        StorageHostError::Poisoned
-    );
+    for (mode, expected) in [
+        ("error-stale", StorageComponentFault::StaleRevision),
+        ("error-uncertain", StorageComponentFault::Uncertain),
+    ] {
+        let scratch = Scratch::new(mode);
+        let install_root = scratch.subdir("extensions");
+        let base = scratch.subdir("state");
+        install(&install_root, Some(mode));
+        let client = connect(&install_root, &base);
+        client.open_namespace("sessions", DEADLINE).expect("open");
+        let error = client
+            .commit_batch(
+                "sessions",
+                0,
+                vec![StorageRow {
+                    key: "alpha".to_owned(),
+                    value: b"one".to_vec(),
+                }],
+                Vec::new(),
+                DEADLINE,
+            )
+            .expect_err(mode);
+        assert_eq!(error, StorageHostError::Component(expected), "{mode}");
+        assert!(client.commit_was_submitted());
+        assert!(!client.is_running());
+        assert_eq!(
+            client
+                .open_namespace("sessions", DEADLINE)
+                .expect_err("poisoned"),
+            StorageHostError::Poisoned,
+            "{mode}"
+        );
+    }
 }
 
 fn component_session_and_kv_backends_match_the_linked_model() {

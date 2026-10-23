@@ -194,7 +194,7 @@ const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
 ];
 
 /// Rust identifiers for source-restricted seam crates. The component client
-/// uses a Cargo alias so its unmerged protocol pin can coexist with the
+/// uses a Cargo alias so its separate component pin can coexist with the
 /// linked model pin; that alias is fenced just as deliberately as the package
 /// identifier.
 const SOURCE_SEAM_IDENTIFIERS: &[(&str, &[&str])] = &[

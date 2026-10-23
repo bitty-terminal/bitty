@@ -18,6 +18,7 @@
 //! - `empty-page-loop`: answer every snapshot read with an empty non-final
 //!   page so the host page bound must fail closed.
 //! - `error-stale`: answer `CommitBatch` with `StaleRevision`.
+//! - `error-uncertain`: answer `CommitBatch` with `Uncertain`.
 //! - `unknown-error`: answer the first request with an unknown error code.
 //!
 //! Every mode is test-only: release bundles ship only the `bitty` binary.
@@ -83,6 +84,7 @@ pub fn run(root: PathBuf) -> u8 {
         "stderr-noise" => stderr_noise(),
         "empty-page-loop" => custom_loop("empty-page-loop"),
         "error-stale" => custom_loop("error-stale"),
+        "error-uncertain" => custom_loop("error-uncertain"),
         "unknown-error" => custom_loop("unknown-error"),
         other => {
             eprintln!("bitty-storage-component-fixture: unknown mode '{other}'");
@@ -274,6 +276,14 @@ fn custom_loop(mode: &str) -> u8 {
                     request,
                     kind: ErrorKind::StaleRevision,
                     message: "revision conflict".to_owned(),
+                },
+            ),
+            ("error-uncertain", Message::CommitBatch { request, .. }) => frame(
+                &mut out,
+                &Message::Error {
+                    request,
+                    kind: ErrorKind::Uncertain,
+                    message: "storage outcome uncertain; reopen namespace".to_owned(),
                 },
             ),
             (_, Message::Shutdown) => {

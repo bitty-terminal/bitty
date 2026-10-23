@@ -54,11 +54,11 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "949367
 # Core gate, never Core importing the extension).
 bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "7bf5177" }
 # CTX-1479 / bitty#2495: the storage component host is deliberately opt-in
-# while bitty-storage PR #18 is still under a protocol follow-up.  The
-# component pin is the current PR head (`5b5f19eb`), kept separate from the
-# linked model pin above so default builds link no component code.
+# while the enable/migration task is still open.  The component pin is the
+# merged storage#18 merge commit (`502c7f5`), kept separate from the linked
+# model pin above so default builds link no component code.
 # Re-pin instructions live in `src/storage_component_host.rs`.
-bitty-storage-component = { package = "bitty-storage", git = "https://github.com/bitty-terminal/bitty-storage", rev = "5b5f19eb", optional = true }
+bitty-storage-component = { package = "bitty-storage", git = "https://github.com/bitty-terminal/bitty-storage", rev = "502c7f5", optional = true }
 bitty-package = { version = "0.0.27", path = "../bitty-package" }
 # CTX-0981 (W-110): the composition root owns the extracted observability
 # contract. This is the ONLY crate in the workspace that may depend on
@@ -91,8 +91,8 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 default = []
 # CTX-1479 / bitty#2495: explicit architecture seam for the storage component
 # host.  This does not change startup wiring, migrate existing XDG state, or
-# remove the linked adapter, and stays default-off until bitty-storage PR #18
-# merges and is re-pinned.
+# remove the linked adapter, and stays default-off until the enable/migration
+# task lands.
 storage-component = ["dep:bitty-storage-component"]
 # Enables `bitty dev capture|synthesize|dump|overlay` (CTX-0922): developer
 # headless captures, dumps, and overlay proofs stay out of release builds.

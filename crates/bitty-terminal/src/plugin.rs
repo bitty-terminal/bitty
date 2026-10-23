@@ -10422,6 +10422,10 @@ mod tests {
             !record.granted.contains(&capability),
             "a profile cannot resurrect the denied capability"
         );
+        assert!(
+            !record.enabled,
+            "an unmet denied capability keeps the plugin disabled"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

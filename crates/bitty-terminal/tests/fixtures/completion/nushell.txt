@@ -1037,6 +1037,7 @@ extern "bitty plugin" [
     --yes
     --force
     --cap: string
+    --profile: string
     --help(-h)
     --version(-V)
     --verbose
@@ -1053,7 +1054,6 @@ extern "bitty plugin" [
     --layout: string
     --focus: string
     --config: string
-    --profile: string
     --theme: string
     --font-family: string
     --font-size: string
@@ -1625,6 +1625,7 @@ extern "bitty plugin disable" []
 extern "bitty plugin info" []
 extern "bitty plugin explain" []
 extern "bitty plugin revoke" []
+extern "bitty plugin grant" []
 extern "bitty plugin doctor" []
 extern "bitty plugin config show" []
 extern "bitty plugin config scaffold" []

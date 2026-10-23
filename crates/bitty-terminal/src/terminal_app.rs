@@ -4348,6 +4348,10 @@ impl TerminalApp {
                 // reap wake armed so the last-panel exit never depends on an
                 // unrelated event; `None` once every exit is observed.
                 let shell_exit = self.shell_exit_poll_deadline();
+                // Issue #2470: a pointer held at the selection edge wakes for
+                // the next bounded one-line auto-scroll step; `None` when no
+                // drag is at an edge, so idle unchanged.
+                let selection_auto = self.runtime.selection_autoscroll_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -4358,6 +4362,7 @@ impl TerminalApp {
                     timers,
                     parked,
                     shell_exit,
+                    selection_auto,
                 ]
                 .into_iter()
                 .flatten()

@@ -8,9 +8,39 @@
 //! one [`ViewId`] whose grid they address, and every reader resolves that
 //! owner's live grid before touching a snapshot. There is at most one live
 //! selection; pressing in another `View` replaces it.
+//!
+//! Ownership of multi-page selection (issue #2470): the mechanism lives here,
+//! in Core — combined-buffer identity, prune-drift resolution, history paging
+//! while a drag is active, pointer edge auto-scroll, and the mouse/PTY capture
+//! precedence. The copy-mode plugin stays a bounded, point-in-time snapshot
+//! policy over the public history and selection surfaces; it gains no viewport
+//! cursor and no private channel. Both paths therefore share one selection
+//! algebra and one clipboard gate, and "refresh a page" means resolving the
+//! same stable identities, never trusting a row index.
 use super::input::key_inspect_label;
 use super::*;
 use bitty_ui::selection::BufferPos;
+use std::time::{Duration, Instant};
+
+/// Cadence of one-line pointer-drag edge auto-scroll (issue #2470).
+///
+/// Issue #2470: a drag held in the top or bottom painted row must scroll the
+/// transcript into the next page instead of capping the range at the visible
+/// rows. The step is exactly one line and never runs faster than this
+/// interval, so a stationary pointer at the edge cannot bank unbounded
+/// scrolling; the runtime arms a wake at
+/// [`Runtime::selection_autoscroll_deadline`] for the next step so the
+/// behavior works under `ControlFlow::Wait`.
+pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// One armed pointer-drag edge auto-scroll (issue #2470).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectionAutoscroll {
+    /// `1` scrolls up into history, `-1` scrolls down toward live.
+    pub(crate) direction: i8,
+    /// Earliest instant the next one-line step may run.
+    pub(crate) due: Instant,
+}
 
 /// The single live selection plus the `View` that owns it (CTX-0803, D1;
 /// CTX-1021 scrolled viewport for issue #1807).
@@ -73,6 +103,24 @@ pub(crate) struct SelectionState {
     /// (issue #2470). Stays fixed while the pointer/viewport scroll, so drag
     /// extension always grows from the original anchor.
     pub(crate) press_buffer: Option<BufferPos>,
+    /// `State::buffer_epoch()` when [`Self::buffer`] was bound.
+    ///
+    /// A geometry change (resize/reflow) or `ED 3` reassigns buffer
+    /// identities; a history-anchored range from before such a change fails
+    /// closed instead of resolving onto unrelated lines.
+    pub(crate) epoch: u64,
+    /// `State::scrollback_evicted_total()` when [`Self::buffer`] was bound.
+    ///
+    /// Pruning shifts every combined-buffer row down by the eviction delta.
+    /// Readers subtract the drift so a selection survives ordinary pruning
+    /// and denies only when an endpoint was actually evicted (issue #2470).
+    pub(crate) evicted_at: u64,
+    /// `State::buffer_epoch()` when [`Self::press_buffer`] was captured.
+    pub(crate) press_epoch: u64,
+    /// `State::scrollback_evicted_total()` when [`Self::press_buffer`] was
+    /// captured. Drag extension rebases the press row with this baseline so a
+    /// prune between pointer events cannot silently move the anchor.
+    pub(crate) press_evicted_at: u64,
     /// Whether a pointer drag is currently extending `selection`.
     pub(crate) dragging: bool,
     /// Whether `selection` is a deliberately selected single cell
@@ -436,24 +484,131 @@ impl Runtime {
 
     /// The live selection together with its owner's grid, fail-closed.
     ///
-    /// `None` when no selection exists or the owner no longer resolves to a
-    /// live grid in the active layout. Readers must not reach for
-    /// `self.state` (the primary grid) on their own: that is the #1476 bug.
-    pub(super) fn selection_owner_state(&self) -> Option<(&SelectionState, &State)> {
-        let sel = self.selection_state.as_ref()?;
+    /// `None` when no selection exists, the owner no longer resolves to a live
+    /// grid in the active layout, or the buffer-anchored range went stale
+    /// (pruned endpoints, or a geometry/identity change that reassigned the
+    /// selected history lines). Readers must not reach for `self.state` (the
+    /// primary grid) on their own: that is the #1476 bug.
+    ///
+    /// The returned selection is re-expressed against the owner's *current*
+    /// combined buffer (issue #2470): pruning drift is subtracted, so callers
+    /// never see a row index that silently slid onto different content.
+    pub(super) fn selection_owner_state(&self) -> Option<(SelectionState, &State)> {
+        let sel = *self.selection_state.as_ref()?;
         let state = self.live_view_state(sel.owner)?;
-        Some((sel, state))
+        let resolved = self.resolve_selection_state(sel, state)?;
+        Some((resolved, state))
+    }
+
+    /// The live selection re-expressed against its owner's current buffer.
+    ///
+    /// Internal copy of [`Self::selection_owner_state`] for mutation paths
+    /// (drag extension, scroll tracking, release) that must install the
+    /// resolved press row instead of a stale one.
+    pub(super) fn resolved_selection(&self) -> Option<SelectionState> {
+        let sel = *self.selection_state.as_ref()?;
+        let state = self.live_view_state(sel.owner)?;
+        self.resolve_selection_state(sel, state)
+    }
+
+    /// Re-expresses one selection's buffer range against `state` (issue #2470).
+    ///
+    /// Pruning shifts every retained combined-buffer row down by the eviction
+    /// delta since the range was bound; subtracting that delta keeps the range
+    /// on its original lines and denies only when an endpoint was actually
+    /// evicted. A `buffer_epoch` change reassigns history identities
+    /// (resize/reflow, `ED 3`), so a range touching history fails closed while
+    /// a live-grid-only range survives as long as both endpoints are still
+    /// live content.
+    ///
+    /// Returns `None` when the range is stale: every reader (text, paint,
+    /// clipboard, persistence handles) then reports no selection instead of
+    /// copying different lines.
+    fn resolve_selection_state(
+        &self,
+        sel: SelectionState,
+        state: &State,
+    ) -> Option<SelectionState> {
+        let Some(pers) = sel.buffer else {
+            return Some(sel);
+        };
+        let sb_len = state.scrollback_len();
+        let epoch_changed = state.buffer_epoch() != sel.epoch;
+        let drift = if epoch_changed {
+            if pers.anchor_line_id.is_some()
+                || pers.focus_line_id.is_some()
+                || pers.anchor.buffer_row < sb_len
+                || pers.focus.buffer_row < sb_len
+            {
+                return None;
+            }
+            0usize
+        } else {
+            usize::try_from(
+                state
+                    .scrollback_evicted_total()
+                    .checked_sub(sel.evicted_at)?,
+            )
+            .ok()?
+        };
+        let shift = |pos: BufferPos| -> Option<BufferPos> {
+            pos.buffer_row
+                .checked_sub(drift)
+                .map(|row| BufferPos::new(row, pos.col))
+        };
+        let anchor = shift(pers.anchor)?;
+        let focus = shift(pers.focus)?;
+        let press_buffer = match sel.press_buffer {
+            Some(press) => {
+                // A drag press is only meaningful on the identity it was
+                // captured on: a reflow/reset invalidates it, a prune rebases
+                // it with its own eviction baseline.
+                if state.buffer_epoch() != sel.press_epoch {
+                    return None;
+                }
+                let press_drift = usize::try_from(
+                    state
+                        .scrollback_evicted_total()
+                        .checked_sub(sel.press_evicted_at)?,
+                )
+                .ok()?;
+                Some(
+                    press
+                        .buffer_row
+                        .checked_sub(press_drift)
+                        .map(|row| BufferPos::new(row, press.col))?,
+                )
+            }
+            None => None,
+        };
+        Some(SelectionState {
+            buffer: Some(PersistentSelection {
+                anchor,
+                focus,
+                ..pers
+            }),
+            press_buffer,
+            // The returned copy is current: re-basing the clocks keeps a
+            // subsequent install from applying the same drift twice.
+            epoch: state.buffer_epoch(),
+            evicted_at: state.scrollback_evicted_total(),
+            press_epoch: state.buffer_epoch(),
+            press_evicted_at: state.scrollback_evicted_total(),
+            ..sel
+        })
     }
 
     /// Drops the live selection unconditionally (single clear funnel).
     ///
     /// Every clear — pointer, keyboard, copy mode, search, lifecycle
     /// invalidation — goes through here so the owner, the range, the drag
-    /// pin, and the drag flag can never be cleared apart.
+    /// pin, the drag flag, and any armed edge auto-scroll can never be
+    /// cleared apart.
     pub(super) fn drop_selection(&mut self) {
         if self.selection_state.is_some() {
             self.selection_state = None;
         }
+        self.selection_autoscroll = None;
         self.pending_full_redraw = true;
     }
 
@@ -463,6 +618,10 @@ impl Runtime {
     /// (live) or viewport composite (scrolled, CTX-1021). D1: at most one
     /// live selection, so a press in another `View` replaces the previous
     /// one rather than stacking.
+    ///
+    /// Issue #2470: the install stamps the owner grid's buffer epoch and
+    /// eviction clock, the baselines every later read uses to detect pruned
+    /// or re-expressed range endpoints.
     pub(super) fn install_selection(
         &mut self,
         owner: ViewId,
@@ -470,6 +629,9 @@ impl Runtime {
         anchor_press: Option<CellPos>,
         dragging: bool,
     ) {
+        let (epoch, evicted_at) = self.live_view_state(owner).map_or((0, 0), |state| {
+            (state.buffer_epoch(), state.scrollback_evicted_total())
+        });
         self.selection_state = Some(SelectionState {
             owner,
             selection,
@@ -477,6 +639,10 @@ impl Runtime {
             press_boundary: None,
             buffer: None,
             press_buffer: None,
+            epoch,
+            evicted_at,
+            press_epoch: epoch,
+            press_evicted_at: evicted_at,
             dragging,
             single_cell: false,
         });
@@ -505,10 +671,13 @@ impl Runtime {
     /// projection simply slides with the content. No-op when no selection
     /// exists or `owner` does not own it.
     pub(super) fn shift_selection_for_scroll(&mut self, owner: ViewId, delta_rows: isize) {
-        if delta_rows == 0 {
+        if delta_rows == 0 || self.selection_state.is_none() {
             return;
         }
-        let Some(sel) = self.selection_state else {
+        // Resolve before shifting: prune drift between pointer events must be
+        // subtracted from the stored press row, never folded into the span.
+        let Some(sel) = self.resolved_selection() else {
+            self.drop_selection();
             return;
         };
         if sel.owner != owner {
@@ -705,6 +874,156 @@ impl Runtime {
             self.install_selection(sel.owner, next, pin, false);
             self.restore_selection_meta(press_boundary, single_cell, None, None);
         }
+    }
+
+    /// Earliest instant a pending pointer-drag edge auto-scroll may run.
+    ///
+    /// The embedder arms one `set_wait_until` wake at this deadline so a
+    /// stationary pointer at the edge keeps scrolling under
+    /// `ControlFlow::Wait` (issue #2470). `None` when nothing is armed.
+    #[must_use]
+    pub fn selection_autoscroll_deadline(&self) -> Option<Instant> {
+        self.selection_autoscroll.map(|armed| armed.due)
+    }
+
+    /// Arms (or re-arms) one-line pointer-drag edge auto-scroll (issue #2470).
+    ///
+    /// `direction` is `1` for up into history and `-1` for down toward live;
+    /// `0` disarms. Arming requires an in-flight drag and remaining room in
+    /// that direction, so reaching either end of the transcript simply stops
+    /// the scroll instead of pinning the loop. Re-arming while the pointer
+    /// stays at the same edge keeps the earliest pending deadline, so pointer
+    /// jitter inside the edge row cannot starve the next step.
+    pub(super) fn arm_selection_autoscroll(&mut self, direction: i8, now: Instant) {
+        if direction == 0 || !self.is_selection_dragging() || !self.selection_can_scroll(direction)
+        {
+            self.selection_autoscroll = None;
+            return;
+        }
+        let due = now + SELECTION_AUTOSCROLL_INTERVAL;
+        match self.selection_autoscroll {
+            Some(mut armed) if armed.direction == direction => {
+                armed.due = armed.due.min(due);
+                self.selection_autoscroll = Some(armed);
+            }
+            _ => {
+                self.selection_autoscroll = Some(SelectionAutoscroll { direction, due });
+            }
+        }
+    }
+
+    /// Disarms pointer-drag edge auto-scroll (pointer left the edge, drag
+    /// ended, or the owner has no room left).
+    pub(super) fn clear_selection_autoscroll(&mut self) {
+        self.selection_autoscroll = None;
+    }
+
+    /// Arms edge auto-scroll from a live pointer position (issue #2470).
+    ///
+    /// The pointer is in the top painted row (`direction 1`) or the bottom one
+    /// (`-1`); anywhere else disarms. Uses the painted frame row rather than
+    /// the owner-grid row so a grid taller than its frame (cursor-follow
+    /// window) still detects the visible edge.
+    pub(super) fn arm_selection_edge_at(
+        &mut self,
+        owner: ViewId,
+        pos: bitty_platform::CursorPosition,
+        now: Instant,
+    ) {
+        let direction = self.pointer_frame_row(owner, pos).map_or(0, |(row, rows)| {
+            if row == 0 {
+                1
+            } else if rows > 0 && row >= rows - 1 {
+                -1
+            } else {
+                0
+            }
+        });
+        self.arm_selection_autoscroll(direction, now);
+    }
+
+    /// Runs at most one pending edge auto-scroll step (issue #2470).
+    ///
+    /// Called from the tick before the time gates and idle short-circuit, so
+    /// the frame that shows the newly revealed rows presents even when no
+    /// other activity woke the runtime. One line per
+    /// [`SELECTION_AUTOSCROLL_INTERVAL`]; the wake is re-armed for the next
+    /// step while the pointer stays at the edge and room remains.
+    pub(super) fn advance_selection_autoscroll(&mut self, now: Instant) {
+        let Some(mut armed) = self.selection_autoscroll else {
+            return;
+        };
+        if now < armed.due {
+            return;
+        }
+        if !self.is_selection_dragging() {
+            self.selection_autoscroll = None;
+            return;
+        }
+        if !self.selection_can_scroll(armed.direction) {
+            self.selection_autoscroll = None;
+            return;
+        }
+        if self.scroll_selection_owner_one_line(armed.direction) {
+            armed.due = now + SELECTION_AUTOSCROLL_INTERVAL;
+            self.selection_autoscroll = self.selection_can_scroll(armed.direction).then_some(armed);
+        } else {
+            self.selection_autoscroll = None;
+        }
+    }
+
+    /// Whether the selection owner can scroll one more line in `direction`.
+    fn selection_can_scroll(&self, direction: i8) -> bool {
+        let Some(owner) = self.selection_owner() else {
+            return false;
+        };
+        let Some(state) = self.live_view_state(owner) else {
+            return false;
+        };
+        // The alternate screen owns no scrollback view (mirrors the wheel
+        // path's #1338 fail-closed rule).
+        if state.alt_screen_active() {
+            return false;
+        }
+        let max = state.scrollback_len();
+        let offset = self.view_scroll_offset(owner).min(max);
+        if direction > 0 {
+            offset < max
+        } else {
+            offset > 0
+        }
+    }
+
+    /// Scrolls the selection owner one line and tracks the range across it.
+    ///
+    /// Scrolling the owner (not necessarily the focused pane) keeps a
+    /// `Shift`-started drag in a split/float extending where the user selected.
+    /// The viewport delta is handed to [`Self::shift_selection_for_scroll`],
+    /// which pins the press endpoint and moves the pointer endpoint into the
+    /// newly revealed row.
+    fn scroll_selection_owner_one_line(&mut self, direction: i8) -> bool {
+        let Some(owner) = self.selection_owner() else {
+            return false;
+        };
+        let Some(state) = self.live_view_state(owner) else {
+            return false;
+        };
+        if state.alt_screen_active() {
+            return false;
+        }
+        let max = state.scrollback_len();
+        let old_offset = self.view_scroll_offset(owner);
+        let Some(view) = self.find_view_mut(owner) else {
+            return false;
+        };
+        view.scroll_by(if direction > 0 { 1 } else { -1 }, max);
+        let new_offset = self.view_scroll_offset(owner);
+        if new_offset == old_offset {
+            return false;
+        }
+        self.shift_selection_for_scroll(owner, new_offset as isize - old_offset as isize);
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Restores the caret/buffer metadata after [`Self::install_selection`]
@@ -1270,7 +1589,11 @@ impl Runtime {
         focus: CellPos,
         boundary: SelectionBoundary,
     ) {
-        let Some(sel) = self.selection_state else {
+        if self.selection_state.is_none() {
+            return;
+        }
+        let Some(sel) = self.resolved_selection() else {
+            self.drop_selection();
             return;
         };
         if !sel.dragging {
@@ -1405,7 +1728,12 @@ impl Runtime {
     /// (press and release at the same caret) is a click and clears, matching
     /// the previous release semantics.
     pub(super) fn end_boundary_selection(&mut self, focus: CellPos, boundary: SelectionBoundary) {
-        let Some(sel) = self.selection_state else {
+        if self.selection_state.is_none() {
+            return;
+        }
+        let Some(sel) = self.resolved_selection() else {
+            self.drop_selection();
+            self.click_tracker.reset();
             return;
         };
         if !sel.dragging {
@@ -1685,6 +2013,9 @@ impl Runtime {
         if !sel.dragging {
             return;
         }
+        // Issue #2470: no pointer is tracked to extend from any more, so a
+        // pending edge auto-scroll must not keep scrolling.
+        self.selection_autoscroll = None;
         // A collapsed range without the one-cell flag was a click, not a
         // selection: leaving the window must not leave a painted cell behind
         // (issue #2480 review).
@@ -1717,7 +2048,10 @@ impl Runtime {
     /// position.
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {
-        let sel = self.selection_state.as_ref()?;
+        // Issue #2470: the resolved view applies prune drift and denies a
+        // range whose identity is gone, so every read path fails closed
+        // through one guard.
+        let (sel, state) = self.selection_owner_state()?;
         // Pointer selections read the combined buffer (issue #2470): the
         // range can span pages, so a viewport snapshot would truncate it.
         if let Some(pers) = sel.buffer {
@@ -1726,7 +2060,6 @@ impl Runtime {
             if pers.anchor == pers.focus && !sel.single_cell {
                 return None;
             }
-            let state = self.live_view_state(sel.owner)?;
             let text = pers.text(state)?;
             return if text.is_empty() { None } else { Some(text) };
         }
@@ -1737,7 +2070,6 @@ impl Runtime {
             let text = sel.selection.text(&viewport);
             return if text.is_empty() { None } else { Some(text) };
         }
-        let (sel, state) = self.selection_owner_state()?;
         let snap = state.snapshot();
         let text = sel.selection.text(&snap);
         if text.is_empty() { None } else { Some(text) }

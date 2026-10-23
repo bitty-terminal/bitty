@@ -1971,6 +1971,25 @@ impl Runtime {
         Some(bitty_ui::snap_to_leading(&snap, cell))
     }
 
+    /// Frame-local row of `pos` inside `owner`'s content frame plus the frame
+    /// row count, clamped to the frame (issue #2470 edge auto-scroll).
+    ///
+    /// A live grid taller than its content frame paints through a
+    /// cursor-follow window, so the owner-grid cell row is not the screen
+    /// row. Edge detection needs the painted row: `0` is the top row and
+    /// `rows - 1` the bottom one. `None` when `owner` has no present frame or
+    /// the cell metrics are degenerate.
+    pub(super) fn pointer_frame_row(
+        &self,
+        owner: ViewId,
+        pos: CursorPosition,
+    ) -> Option<(u16, u16)> {
+        let frames = self.present_frames();
+        let frame = frames.iter().find(|frame| frame.view == owner)?;
+        let local = self.clamped_frame_cell(frame, pos)?;
+        Some((local.row, frame.rows))
+    }
+
     /// Maps a physical cursor position into a cell of `owner`'s grid, clamped
     /// to `owner`'s content frame (CTX-0803, the #1433 drag fix; CTX-1021
     /// scrolled viewport for issue #1807).

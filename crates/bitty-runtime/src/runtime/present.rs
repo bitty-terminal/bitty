@@ -2118,6 +2118,11 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // Issue #2470: apply at most one pending pointer-drag edge auto-scroll
+        // step before the time gates and idle short-circuit, so a stationary
+        // pointer at the viewport edge keeps extending the selection while the
+        // app wakes at `selection_autoscroll_deadline`.
+        self.advance_selection_autoscroll(now);
         // CTX-1361: drive native-component lifecycle (handshake deadlines,
         // request deadlines, idle stop, crash backoff) on the same owner
         // thread that owns the runtime and its broker.

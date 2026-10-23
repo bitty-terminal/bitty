@@ -43,6 +43,38 @@ You can also enable system-wide trusted substitution:
 cachix use bitty
 ```
 
+### Known Issue: `v0.0.27` Flake Lock
+
+The published `v0.0.27` tag cannot be evaluated directly: its `flake.lock`
+carries a stale nixpkgs `narHash`, so Nix aborts with
+`NAR hash mismatch in input 'github:NixOS/nixpkgs/5adc5083...'` and the
+`Publish Nix Flake (Cachix)` release job failed before publishing a closure.
+The tag is immutable and stays exactly as published; the corrected lock ships
+with `v0.0.28` (see <https://github.com/bitty-terminal/bitty/issues/2568>).
+
+Until `v0.0.28`, override the nixpkgs input with the revision the tag already
+pins, which makes Nix compute the hash instead of trusting the lock entry:
+
+```sh
+nix run --override-input nixpkgs github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473 github:bitty-terminal/bitty/v0.0.27
+```
+
+```sh
+nix profile install --override-input nixpkgs github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473 github:bitty-terminal/bitty/v0.0.27
+```
+
+Flake consumers can bypass the broken node with `follows` instead:
+
+```nix
+inputs.bitty = {
+  url = "github:bitty-terminal/bitty/v0.0.27";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+No Cachix closure exists for `v0.0.27`, so either workaround builds Bitty from
+source (the nixpkgs dependencies still substitute from `cache.nixos.org`).
+
 ### NixOS System Configuration
 
 Add Bitty to your flake inputs:
@@ -68,6 +100,26 @@ Add Bitty to your flake inputs:
   };
 }
 ```
+
+## Verifying the Flake Lock
+
+`flake.lock` pins every input to an exact revision together with its NAR hash
+and commit metadata. A stale hash or `lastModified` is only detected when Nix
+resolves the lock, and the release job does that after the tag already exists,
+so a broken lock can reach a release unopposed. Contributors who touch
+`flake.nix` or `flake.lock` run:
+
+```sh
+just nix-lock-check
+```
+
+The gate resolves every locked input (`nix flake metadata`), evaluates
+`.#packages.x86_64-linux.bitty` without building it — the evaluation is what
+makes Nix verify every locked `narHash` and `lastModified` — and fails if
+resolving the flake rewrites `flake.lock`. `just nix-lock-test` covers the
+guard itself with a stub Nix and runs as part of `just check`. CI runs the same
+check inside `Quality gates` whenever `flake.nix` or `flake.lock` changes; it
+installs Nix, never builds the package, and never pushes to Cachix.
 
 ## Continuous Delivery Pipeline
 

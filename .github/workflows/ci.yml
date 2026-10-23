@@ -73,6 +73,38 @@ jobs:
           sudo apt-get clean
           df -h /
 
+      # #2568: v0.0.27 shipped a flake.lock whose nixpkgs narHash (and every
+      # github input's lastModified) did not match the pinned revisions. The
+      # Cachix publish job only runs on release tags, so PR CI never resolved
+      # the lock and the release job failed with "NAR hash mismatch in input".
+      # Resolve the lock and evaluate the package graph (no build, no cache
+      # push) whenever the flake changes; unrelated PRs pay nothing.
+      - name: Detect flake changes
+        if: matrix.shard == 1
+        id: flake
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [[ -n "${BASE_SHA:-}" && ! "$BASE_SHA" =~ ^0+$ ]]; then
+            if git fetch --no-tags --depth=1 origin "$BASE_SHA"; then
+              run=false
+              if git diff --name-only "$BASE_SHA" HEAD | grep -qE '^(flake\.nix|flake\.lock)$'; then
+                run=true
+              fi
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix (flake lock check)
+        if: matrix.shard == 1 && steps.flake.outputs.run == 'true'
+        uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
+
+      - name: Verify flake.lock resolves
+        if: matrix.shard == 1 && steps.flake.outputs.run == 'true'
+        run: ./scripts/check-nix-lock.sh
+
       # CTX-0971 R4: scope the sccache GHA namespace to the Cargo.lock hash so
       # dep bumps invalidate stale dep units (mirrors the rust-cache key,
       # which appends Cargo.lock automatically). Set after checkout via

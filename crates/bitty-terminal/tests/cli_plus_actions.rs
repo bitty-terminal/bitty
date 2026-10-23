@@ -360,10 +360,21 @@ fn show_config_attributes_profile_and_policy_rows() {
     assert_eq!(json_string_field(profile_row, "value"), "work");
     assert_eq!(json_string_field(profile_row, "type"), "string");
     assert_eq!(json_string_field(profile_row, "layer"), "profile");
+    // Compare canonical path equality, not the rendered path string: Windows
+    // may render the profile path in 8.3 short form in the envelope while the
+    // fixture holds the long form. Canonicalizing both resolves the spelling
+    // difference without weakening the assertion to a file name.
+    let source = json_string_field(profile_row, "source");
+    let source_path = source
+        .strip_prefix("profile: ")
+        .unwrap_or_else(|| panic!("profile source must start with 'profile: ': {source}"));
+    let decoded = std::fs::canonicalize(source_path)
+        .unwrap_or_else(|err| panic!("decoded profile path {source_path:?} must exist: {err}"));
+    let expected = std::fs::canonicalize(&profile)
+        .unwrap_or_else(|err| panic!("fixture profile path {:?} must exist: {err}", profile));
     assert_eq!(
-        json_string_field(profile_row, "source"),
-        format!("profile: {}", profile.display()),
-        "profile row must use the loaded profile path: {profile_row}"
+        decoded, expected,
+        "profile row source must canonicalize to the fixture profile path: {profile_row}"
     );
     let contrast_row = json_row(&text, "theme.contrast");
     assert_eq!(json_string_field(contrast_row, "value"), "pass");

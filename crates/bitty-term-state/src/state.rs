@@ -700,14 +700,15 @@ impl State {
     /// Kitty placements follow the primary content shift and are clipped
     /// when they no longer fit; alt-screen placements are only clipped.
     ///
-    /// Cursor-detach edge (#2543): when non-blank content exists below the
-    /// cursor and the requested shrink exceeds the absorbable bottom padding,
-    /// the cursor's own row is part of the pushed prefix. Its content is
-    /// preserved in scrollback, but the cursor cannot stay attached to a row
-    /// the viewport no longer contains, so it clamps to row 0 (the top of the
-    /// remaining content). Keeping the cursor attached would require dropping
-    /// newer rows, which violates the never-drop-newest contract. Callers
-    /// that need attachment must leave at least `cursor_row + 1` rows.
+    /// Cursor-detach edge (#2543): the cursor detaches only when
+    /// `new_rows < used_rows - cursor_row`: after every absorbable padding
+    /// row below the used height is gone, the remaining push is large enough
+    /// to move the cursor's own row into scrollback. Its content is preserved
+    /// there, but the cursor cannot stay attached to a row the viewport no
+    /// longer contains, so it clamps to row 0 (the top of the remaining
+    /// content). Attachment requires at least `used_rows - cursor_row` rows
+    /// (the cursor row plus every used row below it); keeping fewer would
+    /// drop newer rows, violating the never-drop-newest contract.
     ///
     /// Returns the signed row shift applied to the primary content (negative
     /// on a push, positive on a history pull, `0` when nothing moved).

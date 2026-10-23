@@ -455,6 +455,47 @@ fn shrink_past_cursor_row_keeps_content_and_clamps_cursor() {
     );
 }
 
+/// #2543 "only when" direction: a shrink that leaves enough rows for the
+/// cursor row plus every used row below it keeps the cursor attached, so it
+/// shifts with its materialized row instead of clamping to row 0.
+#[test]
+fn shrink_that_keeps_cursor_row_attaches_cursor_to_shifted_content() {
+    let mut s = State::new();
+    let mut lines = Vec::new();
+    for i in 0..12 {
+        let line = format!("body-{i:02}");
+        prints(&mut s, &line);
+        newline(&mut s);
+        lines.push(line);
+    }
+    // Cursor on row 4; used = 12, so attachment needs 12 - 4 = 8 rows.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(5),
+        col: Col(1),
+    });
+    assert_eq!(s.cursor().position.row, 4);
+
+    // 10 >= 8 rows: absorb the 12 padding rows, push 2, and move the cursor
+    // with its row (4 -> 2) instead of clamping it.
+    s.resize(80, 10);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(s.scrollback_len(), 2);
+    assert_eq!(
+        s.cursor().position.row,
+        2,
+        "an attached cursor shifts with its content"
+    );
+    let after = addressable_text(&s);
+    assert_each_once_in_order(&after, &lines);
+    let snap = s.snapshot();
+    let start = 2 * snap.width;
+    assert_eq!(
+        row_text(&snap.cells[start..start + snap.width]),
+        "body-04",
+        "the cursor's row must still hold its own content"
+    );
+}
+
 /// #2543 bounded-memory tradeoff: a 1-column reflow repacks every printable
 /// cell into its own physical row. The scrollback cap then prunes the oldest
 /// rows exactly like normal scroll-under pruning: bounded memory, no panic,
@@ -475,6 +516,7 @@ fn one_column_reflow_enforces_scrollback_cap_without_corruption() {
 
     // 1-column pass: ~50 cells per line become ~50 rows, far beyond CAP.
     s.resize(1, 24);
+    assert_eq!((s.width(), s.height()), (1, 24));
     assert!(s.check_invariants().is_ok());
     assert_eq!(
         s.scrollback_len(),
@@ -491,6 +533,8 @@ fn one_column_reflow_enforces_scrollback_cap_without_corruption() {
     // the newest full line is still present exactly once and wide invariants
     // hold across the rebuilt rows.
     s.resize(80, 24);
+    assert_eq!((s.width(), s.height()), (80, 24));
+    assert_eq!(s.snapshot().cells.len(), 80 * 24);
     assert!(s.check_invariants().is_ok());
     assert_no_orphan_wides(&s);
     let restored = addressable_text(&s);

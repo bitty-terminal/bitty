@@ -9,14 +9,19 @@
 //! - Shape: `bitty list <kind> [--format table|json|jsonl] [--socket PATH]
 //!   [--instance ID] [--no-color]` and alias `bitty ls <kind> ...` (same
 //!   executable, envelope `command` names the invoked spelling).
-//! - Kinds (task-required): `themes`, `plugins`, `instances`, `actions`,
-//!   `keymaps` (singular `theme|plugin|instance|action|keymap` accepted as
-//!   convenience, same result). Unknown kinds are `UsageError` (exit 2)
-//!   naming the valid set. RFC candidates (`fonts|commands|protocols`) are
-//!   not invented here: they fail closed as unknown kinds until their owning
-//!   slice lands.
-//! - Class: `themes`, `plugins`, `actions`, and `keymaps` are local (no
-//!   instance, safe-mode clean, no plugin VM loaded). `instances` is runtime
+//! - Kinds: `themes`, `colors`, `fonts`, `plugins`, `instances`, `actions`,
+//!   `keymaps`, `services` (singular spellings accepted as convenience, same
+//!   result; `colours` is accepted for `colors`). Unknown kinds are
+//!   `UsageError` (exit 2) naming the valid set. RFC candidates
+//!   (`commands|protocols`) are not invented here: they fail closed as
+//!   unknown kinds until their owning slice lands. `colors`/`fonts` landed
+//!   with the CTX-1467 helper aliases; `bitty +list-*` is a spelling alias,
+//!   never a second catalog.
+//! - Class: `themes`, `colors`, `fonts`, `plugins`, `actions`, and `keymaps`
+//!   are local (no instance, safe-mode clean, no plugin VM loaded).
+//!   `colors` reads the same merged config startup does (and `--safe` selects
+//!   the built-in safe palette); `fonts` uses the renderer's fontdb scan and
+//!   never opens a socket or a subprocess. `instances` is runtime
 //!   discovery (registry scan, live endpoint probe) but fetches no terminal
 //!   content.
 //!   Unix scans `$XDG_RUNTIME_DIR/bitty/*.sock` (plus the `BITTY_SOCKET`
@@ -40,7 +45,13 @@
 //! # Read-only surface (no new authority)
 //!
 //! - Themes reuse `bitty-config::theme` registry including built-in dark from
-//!   CTX-0147 (`BITTY_DARK`, `DEFAULT_THEME_NAME`, alias `dark`). No file I/O.
+//!   CTX-0147 (`BITTY_DARK`, `DEFAULT_THEME_NAME`, alias `dark`). Local files
+//!   come from the accepted bounded loader; `--safe` skips them.
+//! - Colors reuse `bitty-config::theme::contrast_checks` (the same policy
+//!   `bitty config check` prints) over the effective theme, so the catalog can
+//!   never invent a parallel contrast rule. Fonts reuse the renderer's shared
+//!   `fontdb` scan ([`bitty_render::font_catalog`]); neither opens a socket,
+//!   spawns a process, or loads a plugin VM.
 //! - Plugins reuse `bitty-plugin-host::bundled` static catalog (staged but
 //!   disabled by default per Default Distribution RFC). No VM is loaded; help
 //!   and listing come from static manifests only.
@@ -120,7 +131,7 @@ pub const EXIT_PERM: i32 = 7;
 // Bounds
 // ---------------------------------------------------------------------------
 
-/// Maximum bytes for a kind token (plenty for `themes|plugins|instances|actions|keymaps|services`).
+/// Maximum bytes for a kind token (plenty for `themes|colors|fonts|plugins|instances|actions|keymaps|services`).
 pub const MAX_LIST_KIND_LEN: usize = 32;
 /// Maximum bytes for a `--format` value.
 pub const MAX_LIST_FORMAT_LEN: usize = 16;
@@ -140,6 +151,10 @@ pub const MAX_LIST_INSTANCES: usize = 128;
 pub enum ListKind {
     /// Built-in theme presets (`bitty-config::theme`).
     Themes,
+    /// Effective theme colors with resolved contrast (`+list-colors`).
+    Colors,
+    /// Discovered system font faces (`+list-fonts`).
+    Fonts,
     /// Static bundled plugin catalog (no VM).
     Plugins,
     /// Live socket discovery (no content fetch).
@@ -158,6 +173,8 @@ impl ListKind {
     /// completion).
     pub const NAMES: &[&str] = &[
         "themes",
+        "colors",
+        "fonts",
         "plugins",
         "instances",
         "actions",
@@ -174,6 +191,8 @@ impl ListKind {
         }
         match raw.trim().to_ascii_lowercase().as_str() {
             "themes" | "theme" => Some(Self::Themes),
+            "colors" | "color" | "colours" | "colour" => Some(Self::Colors),
+            "fonts" | "font" => Some(Self::Fonts),
             "plugins" | "plugin" => Some(Self::Plugins),
             "instances" | "instance" => Some(Self::Instances),
             "actions" | "action" => Some(Self::Actions),
@@ -188,6 +207,8 @@ impl ListKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Themes => "themes",
+            Self::Colors => "colors",
+            Self::Fonts => "fonts",
             Self::Plugins => "plugins",
             Self::Instances => "instances",
             Self::Actions => "actions",
@@ -204,6 +225,8 @@ impl ListKind {
     pub fn command_id(self) -> &'static str {
         match self {
             Self::Themes => "core.list.themes",
+            Self::Colors => "core.list.colors",
+            Self::Fonts => "core.list.fonts",
             Self::Plugins => "core.list.plugins",
             Self::Instances => "core.list.instances",
             Self::Actions => "core.list.actions",
@@ -283,13 +306,13 @@ impl ListRequest {
         let kind_token = kind_raw.ok_or_else(|| {
             format!(
                 "{}\n{}",
-                "bitty list: missing <kind> (want themes|plugins|instances|actions|keymaps|services)",
+                "bitty list: missing <kind> (want themes|colors|fonts|plugins|instances|actions|keymaps|services)",
                 list_usage()
             )
         })?;
         let kind = ListKind::parse(kind_token).ok_or_else(|| {
             format!(
-                "bitty list: unknown kind {kind_token:?} (want themes|plugins|instances|actions|keymaps|services)\n{}",
+                "bitty list: unknown kind {kind_token:?} (want themes|colors|fonts|plugins|instances|actions|keymaps|services)\n{}",
                 list_usage()
             )
         })?;
@@ -364,7 +387,7 @@ fn validate_instance_value(value: &str) -> Result<(), String> {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn list_usage() -> String {
-    "usage: bitty list <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in presets plus local theme files (no network)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)\n  services   registered extension interfaces, no VM (local, safe-mode clean)"
+    "usage: bitty list <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in presets plus local theme files (no network)\n  colors     effective 16 ANSI + UI tokens with measured contrast (local)\n  fonts      discovered system font faces: family, style, source (local, no network)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)\n  actions    chrome actions + core commands catalog (local, safe-mode clean)\n  keymaps    resolved chord to action table, shipped defaults (local, safe-mode clean)\n  services   registered extension interfaces, no VM (local, safe-mode clean)"
         .to_string()
 }
 
@@ -374,7 +397,7 @@ pub fn list_help_text(invoked_as: &str) -> String {
     format!(
         "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
-          Usage: bitty {invoked_as} <themes|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
+          Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
            themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
@@ -382,6 +405,15 @@ pub fn list_help_text(invoked_as: &str) -> String {
                       accepted local files from <config>/bitty/themes (*.toml), selectable\n  \
                       as local:<name>. Local class: no instance, no network; reads local\n  \
                       theme files unless --safe keeps the catalog built-in-only.\n  \
+           colors     Effective palette for the selected theme: all 16 ANSI entries\n  \
+                      plus the UI roles (foreground, cursor, selection, derived chrome)\n  \
+                      with the measured WCAG contrast, floor, pass flag, and any\n  \
+                      documented exemption. Local class: reads the same merged config\n  \
+                      startup uses (--safe selects the built-in safe palette).\n  \
+            fonts      Discovered system font faces (family, style, source) using the\n  \
+                      renderer's fontdb scan: no network, no process spawn, no VM.\n  \
+                      Sorted, deduplicated, capped at 512 rows; unsupported platforms\n  \
+                      report supported=false with an empty list. Headless safe.\n  \
            plugins    Static bundled plugin catalog (bitty-terminal.*), staged disabled by default.\n  \
                       Local class: manifest metadata only, no plugin VM loaded, safe-mode clean.\n  \
             instances  Live instance discovery (instance, socket, live). Runtime class:\n  \
@@ -430,6 +462,12 @@ pub fn list_help_text(invoked_as: &str) -> String {
            themes result keys: kind, count, themes (array of {{\"name\",\"aliases\",\"category\",\n  \
            \"source\",\"provenance\",\"license\",\"background\",\"foreground\",\"cursor\",\"selection\"}});\n  \
            source is builtin|local and provenance is the optional upstream URL.\n  \
+           colors result keys: kind, theme, background, count, colors (array of {{\"token\",\"value\",\n  \
+           \"contrast\",\"floor\",\"passed\",\"advisory\",\"exemption\"}}); 16 ANSI slots plus\n  \
+           UI roles, measured by the shared theme contrast policy.\n  \
+           fonts result keys: kind, supported, count, total, truncated, fonts\n  \
+           (array of {{\"family\",\"style\",\"source\"}}); sorted, deduplicated, capped\n  \
+           at 512 rows, no path or network data.\n  \
            actions result keys: kind, count (actions plus commands), actions\n  \
            (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"binding\",\"mouse\",\"kind\":\"chrome\"}}),\n  \
            commands (array of {{\"id\",\"description\",\"class\",\"requires_runtime\",\"binding\",\"kind\",\"scopes\",\"owner\"}}).\n  \
@@ -462,6 +500,9 @@ pub fn list_help_text(invoked_as: &str) -> String {
          \n\
          Examples:\n  \
            bitty list themes\n  \
+           bitty list colors --format json\n  \
+           bitty list fonts\n  \
+           bitty +list-keybinds --format json\n  \
            bitty list plugins --format json\n  \
            bitty list instances\n  \
            bitty list instances --format jsonl\n  \
@@ -564,6 +605,268 @@ pub fn list_themes_with_local() -> (Vec<ThemeInfo>, Vec<bitty_config::LocalTheme
         });
     }
     (rows, catalog.diagnostics)
+}
+
+// ---------------------------------------------------------------------------
+// Effective color catalog (`bitty list colors`, CTX-1467)
+// ---------------------------------------------------------------------------
+
+/// Maximum color rows emitted by the catalog. The contrast policy owns 23
+/// roles (foreground + 16 ANSI + 6 UI); the cap is defense in depth, not a
+/// truncation point today.
+pub const MAX_LIST_COLORS: usize = 32;
+
+/// One effective color token with its measured contrast.
+///
+/// Rows come from [`bitty_config::theme::contrast_checks`], the same policy
+/// `bitty config check` prints and the catalog test enforces, so the CLI can
+/// never invent a parallel contrast rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorInfo {
+    /// Stable token label (`foreground`, `ansi2.text`, `chrome.help-ring`, ...).
+    pub token: String,
+    /// Resolved color as `#rrggbb`.
+    pub value: String,
+    /// Measured WCAG contrast ratio against the role's reference surface.
+    pub contrast: f64,
+    /// Floor that applies to this role.
+    pub floor: f64,
+    /// Whether the measurement clears the floor or carries an exemption.
+    pub passed: bool,
+    /// Advisory rows are reported but never gate a theme.
+    pub advisory: bool,
+    /// Explicit upstream exemption reason, when one applies.
+    pub exemption: Option<String>,
+}
+
+/// Resolves the color for one contrast role from the effective theme.
+fn color_for_role(
+    theme: &bitty_config::theme::Theme,
+    role: bitty_config::theme::ContrastRole,
+) -> [u8; 3] {
+    use bitty_config::theme::{ContrastRole, banner_text, help_ring_source};
+    match role {
+        ContrastRole::Foreground => theme.foreground,
+        ContrastRole::AnsiText(index) | ContrastRole::AnsiSurface(index) => theme.ansi_entry(index),
+        ContrastRole::Cursor => theme.cursor,
+        ContrastRole::SelectionText => theme.foreground,
+        ContrastRole::SelectionSurface => theme.selection,
+        ContrastRole::CursorSelection => theme.cursor,
+        ContrastRole::HelpRing => {
+            let candidates = [
+                theme.ansi_entry(12),
+                theme.ansi_entry(4),
+                theme.ansi_entry(6),
+                theme.foreground,
+            ];
+            candidates[help_ring_source(theme)]
+        }
+        ContrastRole::BannerText => banner_text(theme.ansi_entry(3)),
+    }
+}
+
+/// Enumerates the effective color tokens with resolved contrast.
+///
+/// Pure over the supplied theme: no file I/O, no environment reads, no
+/// network. The returned order is the stable policy order from
+/// [`bitty_config::theme::contrast_checks`]. Capped at [`MAX_LIST_COLORS`].
+#[must_use]
+pub fn list_colors(theme: &bitty_config::theme::Theme) -> Vec<ColorInfo> {
+    bitty_config::theme::contrast_checks(theme)
+        .into_iter()
+        .take(MAX_LIST_COLORS)
+        .map(|row| ColorInfo {
+            token: row.role.label().to_string(),
+            value: rgb_to_hex(color_for_role(theme, row.role)),
+            contrast: row.ratio,
+            floor: row.floor,
+            passed: row.passed,
+            advisory: row.advisory,
+            exemption: row.exemption.map(str::to_string),
+        })
+        .collect()
+}
+
+/// Formats the color catalog as a human table.
+#[must_use]
+pub fn format_colors_table(background: &str, colors: &[ColorInfo], no_color: bool) -> String {
+    let color = color_enabled(no_color);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}\n",
+        bold("TOKEN VALUE CONTRAST FLOOR RESULT", color)
+    ));
+    let canvas = if color {
+        format!("{}{}\u{1b}[0m", swatch_bg(background), background)
+    } else {
+        background.to_string()
+    };
+    out.push_str(&format!("background {canvas} - - canvas\n"));
+    for row in colors {
+        let verdict = if row.advisory {
+            "advisory"
+        } else if row.passed {
+            "pass"
+        } else {
+            "FAIL"
+        };
+        let value = if color {
+            format!("{}{}\u{1b}[0m", swatch_bg(&row.value), row.value)
+        } else {
+            row.value.clone()
+        };
+        out.push_str(&format!(
+            "{} {} {:.2}:1 {:.1}:1 {}\n",
+            row.token, value, row.contrast, row.floor, verdict
+        ));
+    }
+    out
+}
+
+/// Renders the `bitty list colors` success envelope.
+///
+/// Stable keys: `kind`, `theme`, `background`, `count`, `colors` (array of
+/// `{"token","value","contrast","floor","passed","advisory","exemption"}`).
+#[must_use]
+pub fn format_colors_envelope(
+    spelling: &str,
+    theme: &str,
+    background: &str,
+    colors: &[ColorInfo],
+) -> String {
+    let mut out = String::with_capacity(1024);
+    let _ = write!(
+        out,
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"colors\",\"theme\":\"{}\",\"background\":\"{}\",\"count\":{},\"colors\":[",
+        json_escape(spelling),
+        json_escape(theme),
+        json_escape(background),
+        colors.len()
+    );
+    for (index, row) in colors.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let exemption = row.exemption.as_deref().map_or_else(
+            || "null".to_string(),
+            |reason| format!("\"{}\"", json_escape(reason)),
+        );
+        let _ = write!(
+            out,
+            "{{\"token\":\"{}\",\"value\":\"{}\",\"contrast\":{:.2},\"floor\":{:.2},\"passed\":{},\"advisory\":{},\"exemption\":{exemption}}}",
+            json_escape(&row.token),
+            json_escape(&row.value),
+            row.contrast,
+            row.floor,
+            row.passed,
+            row.advisory
+        );
+    }
+    out.push_str("]}}");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Font catalog (`bitty list fonts`, CTX-1467)
+// ---------------------------------------------------------------------------
+
+/// Maximum font rows in one response (bounded JSON/table).
+pub const MAX_LIST_FONTS: usize = bitty_render::font_catalog::MAX_CATALOG_FACES;
+
+/// User font roots used to classify a face as `user` without exposing paths.
+///
+/// Standard XDG/macOS locations only; no host-specific literals.
+fn user_font_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(data_home).join("fonts"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".local/share/fonts"));
+        roots.push(home.join(".fonts"));
+        #[cfg(target_os = "macos")]
+        roots.push(home.join("Library/Fonts"));
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        // Per-user fonts installed for the current account (standard Windows
+        // location; no machine-specific literal).
+        roots.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+    }
+    roots
+}
+
+/// Discovers system font faces through the renderer's shared scan.
+///
+/// No network, no process spawn, no plugin VM. Missing fontconfig or a
+/// headless session yields an empty/partial catalog, never a panic.
+#[must_use]
+pub fn list_fonts() -> bitty_render::font_catalog::FaceCatalog {
+    bitty_render::font_catalog::system_face_catalog(MAX_LIST_FONTS, &user_font_roots())
+}
+
+/// Formats the font catalog as a human table.
+#[must_use]
+pub fn format_fonts_table(
+    catalog: &bitty_render::font_catalog::FaceCatalog,
+    no_color: bool,
+) -> String {
+    let color = color_enabled(no_color);
+    if !catalog.supported {
+        return String::from("(font discovery unavailable on this platform)\n");
+    }
+    let mut out = format!("{}\n", bold("FAMILY STYLE SOURCE", color));
+    if catalog.faces.is_empty() {
+        out.push_str("(no fonts found)\n");
+        return out;
+    }
+    for face in &catalog.faces {
+        out.push_str(&format!("{} {} {}\n", face.family, face.style, face.source));
+    }
+    if catalog.truncated {
+        out.push_str(&format!(
+            "(showing {} of {} faces; raise the platform font set or filter externally)\n",
+            catalog.faces.len(),
+            catalog.total
+        ));
+    }
+    out
+}
+
+/// Renders the `bitty list fonts` success envelope.
+///
+/// Stable keys: `kind`, `supported`, `count`, `total`, `truncated`, `fonts`
+/// (array of `{"family","style","source"}`).
+#[must_use]
+pub fn format_fonts_envelope(
+    spelling: &str,
+    catalog: &bitty_render::font_catalog::FaceCatalog,
+) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = write!(
+        out,
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"fonts\",\"supported\":{},\"count\":{},\"total\":{},\"truncated\":{},\"fonts\":[",
+        json_escape(spelling),
+        catalog.supported,
+        catalog.faces.len(),
+        catalog.total,
+        catalog.truncated
+    );
+    for (index, face) in catalog.faces.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"family\":\"{}\",\"style\":\"{}\",\"source\":\"{}\"}}",
+            json_escape(&face.family),
+            json_escape(&face.style),
+            json_escape(&face.source)
+        );
+    }
+    out.push_str("]}}");
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,6 +2213,17 @@ pub fn format_success_envelope(
             }
             out.push(']');
         }
+        ListKind::Colors => {
+            // Dedicated dispatcher uses `format_colors_envelope`; keep the
+            // shared envelope total over every kind.
+            out.push_str(",\"theme\":\"\",\"count\":0,\"colors\":[]");
+        }
+        ListKind::Fonts => {
+            // Dedicated dispatcher uses `format_fonts_envelope`.
+            out.push_str(
+                ",\"supported\":true,\"count\":0,\"total\":0,\"truncated\":false,\"fonts\":[]",
+            );
+        }
         ListKind::Plugins => {
             let _ = write!(out, ",\"count\":{},\"plugins\":[", plugins.len());
             for (i, p) in plugins.iter().enumerate() {
@@ -2477,6 +2791,54 @@ pub fn run_list_with_effective(
     safe_mode: bool,
 ) -> i32 {
     match request.kind {
+        ListKind::Colors => {
+            // Same merged config startup reads; `--safe` already selected the
+            // built-in safe palette in the loader, so no local theme file or
+            // plugin VM participates. `effective_theme_for` folds inline and
+            // local palettes into the resolved theme.
+            let theme = effective.effective_theme_for(false);
+            let theme_label = effective
+                .appearance
+                .theme
+                .clone()
+                .unwrap_or_else(|| bitty_config::theme::DEFAULT_THEME_NAME.to_string());
+            let background = rgb_to_hex(theme.background);
+            let colors = list_colors(&theme);
+            match request.format {
+                ListFormat::Table => {
+                    print!(
+                        "{}",
+                        format_colors_table(&background, &colors, request.no_color)
+                    );
+                }
+                ListFormat::Json | ListFormat::Jsonl => {
+                    println!(
+                        "{}",
+                        format_colors_envelope(
+                            &request.spelling,
+                            &theme_label,
+                            &background,
+                            &colors
+                        )
+                    );
+                }
+            }
+            EXIT_OK
+        }
+        ListKind::Fonts => {
+            // Host discovery is config-free and VM-free. `--safe` changes
+            // nothing: no network, no user config, and no plugin code runs.
+            let catalog = list_fonts();
+            match request.format {
+                ListFormat::Table => {
+                    print!("{}", format_fonts_table(&catalog, request.no_color));
+                }
+                ListFormat::Json | ListFormat::Jsonl => {
+                    println!("{}", format_fonts_envelope(&request.spelling, &catalog));
+                }
+            }
+            EXIT_OK
+        }
         ListKind::Themes => {
             // CTX-2464: normal listing includes accepted local files; `--safe`
             // keeps the catalog built-in-only (no external config reads), so
@@ -2683,7 +3045,7 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
                 args.safe,
             )
         }
-        ListKind::Actions | ListKind::Keymaps => {
+        ListKind::Actions | ListKind::Keymaps | ListKind::Colors => {
             let effective = effective_for_catalog(args);
             run_list_with_effective(&request, &effective, args.safe)
         }
@@ -2701,6 +3063,9 @@ mod tests {
         assert_eq!(ListKind::parse("themes"), Some(ListKind::Themes));
         assert_eq!(ListKind::parse("Theme"), Some(ListKind::Themes));
         assert_eq!(ListKind::parse(" THEMES "), Some(ListKind::Themes));
+        assert_eq!(ListKind::parse("colors"), Some(ListKind::Colors));
+        assert_eq!(ListKind::parse("colour"), Some(ListKind::Colors));
+        assert_eq!(ListKind::parse("fonts"), Some(ListKind::Fonts));
         assert_eq!(ListKind::parse("plugins"), Some(ListKind::Plugins));
         assert_eq!(ListKind::parse("plugin"), Some(ListKind::Plugins));
         assert_eq!(ListKind::parse("instances"), Some(ListKind::Instances));
@@ -2712,9 +3077,87 @@ mod tests {
         assert_eq!(ListKind::parse("services"), Some(ListKind::Services));
         assert_eq!(ListKind::parse("Service"), Some(ListKind::Services));
         assert_eq!(ListKind::Services.name(), "services");
-        assert_eq!(ListKind::parse("fonts"), None);
+        assert_eq!(ListKind::parse("fonts"), Some(ListKind::Fonts));
+        assert_eq!(ListKind::parse("commands"), None);
         assert_eq!(ListKind::parse(""), None);
         assert_eq!(ListKind::parse("themes;rm"), None);
+    }
+
+    #[test]
+    fn colors_cover_ansi_and_ui_tokens_with_bounded_contrast() {
+        let theme = bitty_config::theme::default_theme();
+        let colors = list_colors(theme);
+        assert_eq!(colors.len(), 23, "16 ANSI + foreground + 6 UI roles");
+        let ansi: Vec<&ColorInfo> = colors
+            .iter()
+            .filter(|row| row.token.starts_with("ansi"))
+            .collect();
+        assert_eq!(ansi.len(), 16, "every ANSI slot is present");
+        assert!(
+            colors
+                .iter()
+                .any(|row| row.token == "foreground" && row.passed)
+        );
+        for row in &colors {
+            assert!(
+                row.contrast.is_finite() && row.contrast >= 0.0,
+                "{} contrast must be finite",
+                row.token
+            );
+            assert!(row.floor > 0.0, "{} floor", row.token);
+            assert!(
+                row.value.starts_with('#') && row.value.len() == 7,
+                "{} value {:?}",
+                row.token,
+                row.value
+            );
+        }
+        let parsed = parse_hex_rgb(&colors[0].value).expect("hex");
+        assert_eq!(rgb_to_hex(parsed), colors[0].value);
+    }
+
+    #[test]
+    fn colors_track_a_custom_palette() {
+        let mut effective = bitty_config::EffectiveConfig::default();
+        effective.appearance.colors = Some(bitty_config::CustomPalette {
+            background: [1, 2, 3],
+            foreground: [250, 250, 250],
+            cursor: [255, 0, 0],
+            selection: [40, 40, 40],
+            ansi: [[9, 9, 9]; 16],
+            border_focused: None,
+            border_idle: None,
+            category: None,
+        });
+        let colors = list_colors(&effective.effective_theme_for(false));
+        assert_eq!(
+            colors
+                .iter()
+                .find(|row| row.token == "foreground")
+                .map(|row| row.value.as_str()),
+            Some("#fafafa")
+        );
+    }
+
+    #[test]
+    fn font_catalog_is_sorted_unique_and_bounded() {
+        let catalog = list_fonts();
+        assert!(catalog.faces.len() <= MAX_LIST_FONTS);
+        assert_eq!(catalog.truncated, catalog.total > catalog.faces.len());
+        let mut sorted = catalog.faces.clone();
+        sorted.sort();
+        assert_eq!(sorted, catalog.faces);
+        for face in &catalog.faces {
+            assert!(!face.family.is_empty());
+            assert!(face.family.len() <= 128);
+            assert!(face.style.len() <= 128);
+            assert!(!face.family.chars().any(char::is_control));
+            assert!(
+                matches!(face.source.as_str(), "user" | "system" | "embedded"),
+                "unexpected source {:?}",
+                face.source
+            );
+        }
     }
 
     #[test]

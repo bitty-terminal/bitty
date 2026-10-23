@@ -24,6 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use bitty_lua::LuaValue;
 use bitty_plugin_host::manifest::PluginId;
 
+use super::fs::FileSystem;
 use super::manifest_toml::parse_manifest;
 use super::store::{encode_json, parse_json};
 use super::{
@@ -118,18 +119,15 @@ pub fn load_index_with_fs(
     if !fs.exists(&path) {
         return Ok(Vec::new());
     }
-    let len = fs
-        .metadata_len(&path)
-        .map_err(|error| PluginRuntimeError::Io(format!("plugin index metadata: {error}")))?;
-    if len as usize > PLUGIN_INDEX_MAX_BYTES {
+    let text = fs
+        .read_bounded_to_string(&path, PLUGIN_INDEX_MAX_BYTES)
+        .map_err(|error| PluginRuntimeError::Io(format!("plugin index read: {error}")))?;
+    if text.len() > PLUGIN_INDEX_MAX_BYTES {
         return Err(integrity(
             "current.json",
             "plugin index exceeds the byte ceiling",
         ));
     }
-    let text = fs
-        .read_to_string(&path)
-        .map_err(|error| PluginRuntimeError::Io(format!("plugin index read: {error}")))?;
     parse_index(&text)
 }
 
@@ -264,18 +262,8 @@ pub fn resolve_record_with_hosts(
 
     let module_root = module_root_for(&package_root);
     let manifest_path = package_root.join("bitty-plugin.toml");
-    let metadata =
-        std::fs::metadata(&manifest_path).map_err(|error| PluginRuntimeError::NotFound {
-            plugin: plugin.clone(),
-            detail: format!("manifest body missing: {error}"),
-        })?;
-    if metadata.len() as usize > PLUGIN_MANIFEST_MAX_BYTES {
-        return Err(integrity(
-            &plugin,
-            "manifest body exceeds the 256 KiB ceiling",
-        ));
-    }
-    let bytes = std::fs::read(&manifest_path)
+    let bytes = super::fs::NativeFileSystem
+        .read_bounded_bytes(&manifest_path, PLUGIN_MANIFEST_MAX_BYTES)
         .map_err(|error| PluginRuntimeError::Io(format!("manifest read: {error}")))?;
     let manifest = parse_manifest(&bytes).map_err(|detail| PluginRuntimeError::Manifest {
         plugin: plugin.clone(),

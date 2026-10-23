@@ -1483,28 +1483,129 @@ fn resolve_state_path(
         })
 }
 
-fn load_state(path: &Path) -> Result<PluginState, PluginFailure> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PluginState::new());
+#[derive(Debug)]
+enum BoundedReadError {
+    NotFound,
+    Unsafe(String),
+    Io(String),
+    TooLarge,
+}
+
+#[cfg(unix)]
+fn open_bounded_file(path: &Path) -> Result<std::fs::File, BoundedReadError> {
+    let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })
+        .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::CurDir
+            ) {
+                continue;
+            }
+            return Err(BoundedReadError::Unsafe(
+                "parent or prefix path component".to_string(),
+            ));
+        };
+        let final_component = components.peek().is_none();
+        let flags = if final_component {
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_NONBLOCK
+                | nix::fcntl::OFlag::O_CLOEXEC
+        } else {
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC
+        };
+        let fd = nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+            .map_err(|error| {
+                if error == nix::errno::Errno::ENOENT {
+                    BoundedReadError::NotFound
+                } else if error == nix::errno::Errno::ELOOP {
+                    BoundedReadError::Unsafe("symlink path component".to_string())
+                } else {
+                    BoundedReadError::Io(error.to_string())
+                }
+            })?;
+        directory = std::fs::File::from(fd);
+        if final_component {
+            return Ok(directory);
         }
-        Err(error) => {
+    }
+    Err(BoundedReadError::Unsafe(
+        "path has no file name".to_string(),
+    ))
+}
+
+/// Read a regular file from a stable descriptor, refusing symlinked path
+/// components and special files. The descriptor is capped before allocation.
+fn read_bounded_regular_file(
+    path: &Path,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, BoundedReadError> {
+    #[cfg(unix)]
+    let file = open_bounded_file(path)?;
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    BoundedReadError::NotFound
+                } else {
+                    BoundedReadError::Io(error.to_string())
+                }
+            })?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file =
+        std::fs::File::open(path).map_err(|error| BoundedReadError::Io(error.to_string()))?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(BoundedReadError::Unsafe("not a regular file".to_string()));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(BoundedReadError::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+    if bytes.len() > limit || bytes.len() as u64 != metadata.len() {
+        return Err(BoundedReadError::TooLarge);
+    }
+    Ok(Some(bytes))
+}
+
+fn load_state(path: &Path) -> Result<PluginState, PluginFailure> {
+    let bytes = match read_bounded_regular_file(path, MAX_STATE_FILE_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(BoundedReadError::NotFound) => return Ok(PluginState::new()),
+        Err(BoundedReadError::TooLarge) => {
+            return Err(PluginFailure::plugin(
+                "StateInvalid",
+                format!(
+                    "bitty plugin: '{}' exceeds {MAX_STATE_FILE_BYTES} bytes",
+                    path.display()
+                ),
+            ));
+        }
+        Err(BoundedReadError::Unsafe(reason)) | Err(BoundedReadError::Io(reason)) => {
             return Err(PluginFailure::generic(
                 "IoError",
-                format!("bitty plugin: cannot read '{}': {error}", path.display()),
+                format!("bitty plugin: cannot read '{}': {reason}", path.display()),
             ));
         }
     };
-    if bytes.len() > MAX_STATE_FILE_BYTES {
-        return Err(PluginFailure::plugin(
-            "StateInvalid",
-            format!(
-                "bitty plugin: '{}' exceeds {MAX_STATE_FILE_BYTES} bytes",
-                path.display()
-            ),
-        ));
-    }
     let text = std::str::from_utf8(&bytes).map_err(|error| {
         PluginFailure::plugin(
             "StateInvalid",
@@ -2176,7 +2277,12 @@ fn load_store_index(
 fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRecord) -> PluginRow {
     let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record);
     let manifest = root.as_deref().and_then(|root| {
-        let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
+        let bytes = read_bounded_regular_file(
+            &root.join(package::MANIFEST_FILE_NAME),
+            PLUGIN_MANIFEST_MAX_BYTES,
+        )
+        .ok()
+        .flatten()?;
         manifest_toml::parse_manifest(&bytes).ok()
     });
     let broken = manifest.is_none()
@@ -2257,7 +2363,12 @@ fn read_store_manifest(
     record: &bitty_runtime::plugin_runtime::PluginRecord,
 ) -> Option<PluginManifest> {
     let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record)?;
-    let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
+    let bytes = read_bounded_regular_file(
+        &root.join(package::MANIFEST_FILE_NAME),
+        PLUGIN_MANIFEST_MAX_BYTES,
+    )
+    .ok()
+    .flatten()?;
     manifest_toml::parse_manifest(&bytes).ok()
 }
 
@@ -2290,6 +2401,91 @@ fn row_for_id(
                 format!("bitty plugin: unknown plugin '{id}' (see `bitty plugin list`)"),
             )
         })
+}
+
+/// Resolve explain input from an actual manifest, never from a display row.
+/// Store and ledger records are evidence only after identity, version, hash,
+/// and entry-point checks agree with the runtime resolver.
+fn explain_row_for_id(
+    state: &PluginState,
+    store_root: Option<&Path>,
+    id: &str,
+) -> Result<PluginRow, PluginFailure> {
+    let row = row_for_id(state, store_root, id)?;
+    if row.bundled {
+        return Ok(row);
+    }
+    let Some(store_root) = store_root else {
+        return Err(PluginFailure::plugin(
+            "PluginUnusable",
+            format!("bitty plugin: '{id}' has no installed manifest"),
+        ));
+    };
+    let record = load_store_index(store_root)?
+        .into_iter()
+        .find(|record| record.plugin_id == id)
+        .ok_or_else(|| {
+            PluginFailure::plugin(
+                "PluginUnusable",
+                format!("bitty plugin: '{id}' has no installed manifest"),
+            )
+        })?;
+    let package = bitty_runtime::plugin_runtime::resolution::resolve_record(store_root, &record)
+        .map_err(|error| {
+            PluginFailure::plugin(
+                "PluginUnusable",
+                format!(
+                    "bitty plugin: installed record for '{id}' failed runtime resolution: {error}"
+                ),
+            )
+        })?;
+    let requested = package.manifest.capabilities.all_ids().map_err(|error| {
+        PluginFailure::plugin(
+            "PluginUnusable",
+            format!("bitty plugin: installed manifest for '{id}' is invalid: {error}"),
+        )
+    })?;
+    let granted = record
+        .granted
+        .iter()
+        .map(|raw| {
+            CapabilityId::parse(raw).map_err(|error| {
+                PluginFailure::plugin(
+                    "PluginUnusable",
+                    format!("bitty plugin: installed grant for '{id}' is invalid: {error}"),
+                )
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(PluginRow {
+        id: package.manifest.id().as_str().to_string(),
+        name: package.manifest.identity.name.clone(),
+        version: package.manifest.identity.version.clone(),
+        description: package.manifest.identity.description.clone(),
+        bundled: false,
+        source: record.source_class.as_str().to_string(),
+        state: if record.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        enabled: record.enabled,
+        recorded: false,
+        pin_ok: Some(true),
+        requested,
+        granted,
+        denied: BTreeSet::new(),
+        commands: package
+            .manifest
+            .lazy
+            .commands
+            .iter()
+            .map(|command| command.id.as_str().to_string())
+            .collect(),
+        manifest_hash: Some(record.manifest_hash.clone()),
+        settings: package.manifest.settings.clone(),
+        repair: None,
+    })
 }
 
 fn pin_label(pin_ok: Option<bool>) -> &'static str {
@@ -2590,76 +2786,37 @@ fn load_policy_scope(
     path: &Path,
     provenance: PolicyProvenance,
 ) -> Result<Option<CapabilityScope>, PluginFailure> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
+    let bytes = match read_bounded_regular_file(path, MAX_POLICY_FILE_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(BoundedReadError::NotFound) => return Ok(None),
+        Err(BoundedReadError::TooLarge) => {
+            return Err(PluginFailure::plugin(
+                "PolicyTooLarge",
+                format!(
+                    "bitty plugin: policy file '{}' exceeds {MAX_POLICY_FILE_BYTES} bytes",
+                    path.display()
+                ),
+            ));
+        }
+        Err(BoundedReadError::Unsafe(reason)) => {
+            return Err(PluginFailure::plugin(
+                "PolicyUnsafe",
+                format!(
+                    "bitty plugin: policy file '{}' is unsafe ({reason})",
+                    path.display()
+                ),
+            ));
+        }
+        Err(BoundedReadError::Io(reason)) => {
             return Err(PluginFailure::generic(
                 "PolicyUnreadable",
                 format!(
-                    "bitty plugin: policy file '{}' is unreadable: {error}",
+                    "bitty plugin: policy file '{}' could not be read: {reason}",
                     path.display()
                 ),
             ));
         }
     };
-    if metadata.file_type().is_symlink() {
-        return Err(PluginFailure::plugin(
-            "PolicyUnsafe",
-            format!(
-                "bitty plugin: policy file '{}' is a symlink; replace it with a regular file",
-                path.display()
-            ),
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(PluginFailure::plugin(
-            "PolicyUnsafe",
-            format!(
-                "bitty plugin: policy path '{}' is not a regular file",
-                path.display()
-            ),
-        ));
-    }
-    if metadata.len() > MAX_POLICY_FILE_BYTES as u64 {
-        return Err(PluginFailure::plugin(
-            "PolicyTooLarge",
-            format!(
-                "bitty plugin: policy file '{}' exceeds {MAX_POLICY_FILE_BYTES} bytes",
-                path.display()
-            ),
-        ));
-    }
-    let file = std::fs::File::open(path).map_err(|error| {
-        PluginFailure::generic(
-            "PolicyUnreadable",
-            format!(
-                "bitty plugin: policy file '{}' could not be opened: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    let mut bytes = Vec::new();
-    file.take((MAX_POLICY_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            PluginFailure::generic(
-                "PolicyUnreadable",
-                format!(
-                    "bitty plugin: policy file '{}' could not be read: {error}",
-                    path.display()
-                ),
-            )
-        })?;
-    if bytes.len() > MAX_POLICY_FILE_BYTES {
-        return Err(PluginFailure::plugin(
-            "PolicyTooLarge",
-            format!(
-                "bitty plugin: policy file '{}' exceeds {MAX_POLICY_FILE_BYTES} bytes",
-                path.display()
-            ),
-        ));
-    }
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         PluginFailure::plugin(
             "PolicyInvalid",
@@ -2812,15 +2969,23 @@ fn build_explain_report(
             task_row.blocks = true;
             task_row.detail = "grant bound to a different manifest hash".to_string();
         }
-        explanation.allowed = false;
-        explanation.first_denying_layer = Some(EffectiveLayer::TaskGrant);
-        explanation.denial_kind = Some(DenialKind::PolicyConflict);
-        explanation.reason_chain = vec![format!(
+        let stale_reason = format!(
             "task-grant: manifest hash pin mismatch (recorded {}, current manifest differs); \
              re-install with `bitty plugin install {} --yes` to re-consent",
             row.manifest_hash.as_deref().unwrap_or("unrecorded"),
             row.id
-        )];
+        );
+        let prior_first_layer = explanation.first_denying_layer;
+        explanation.allowed = false;
+        if prior_first_layer.is_none() {
+            explanation.first_denying_layer = Some(EffectiveLayer::TaskGrant);
+            explanation.denial_kind = Some(DenialKind::PolicyConflict);
+        } else if prior_first_layer == Some(EffectiveLayer::TaskGrant) {
+            // The empty task scope above is only the stale-pin guard. Report
+            // its typed conflict rather than the generic missing-grant denial.
+            explanation.denial_kind = Some(DenialKind::PolicyConflict);
+        }
+        explanation.reason_chain.push(stale_reason);
         explanation.effective.caps.clear();
     }
 
@@ -2884,7 +3049,7 @@ fn explain_remediation(
     stale_pin: bool,
 ) -> Vec<String> {
     let mut hints: Vec<String> = Vec::new();
-    if stale_pin {
+    if stale_pin && explanation.first_denying_layer == Some(EffectiveLayer::TaskGrant) {
         hints.push(format!(
             "Re-consent to the current manifest: bitty plugin install {} --yes",
             row.id
@@ -2951,17 +3116,42 @@ fn explain_remediation(
 }
 
 /// Render the explain report as a bounded human table.
+fn table_cell(raw: &str) -> String {
+    const MAX_TABLE_CELL_CHARS: usize = 256;
+    let mut result = String::new();
+    for character in raw.chars().take(MAX_TABLE_CELL_CHARS) {
+        match character {
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            character if character.is_control() => {
+                let _ = write!(result, "\\u{{{:x}}}", character as u32);
+            }
+            character => result.push(character),
+        }
+    }
+    if raw.chars().count() > MAX_TABLE_CELL_CHARS {
+        result.push_str("...");
+    }
+    result
+}
+
 fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
     let color = color_enabled(no_color);
     let mut out = String::new();
-    let _ = writeln!(out, "{}", bold(&format!("plugin {}", report.id), color));
+    let _ = writeln!(
+        out,
+        "{}",
+        bold(&format!("plugin {}", table_cell(&report.id)), color)
+    );
     let risk = if report.high_risk { " (high risk)" } else { "" };
     let _ = writeln!(
         out,
         "  capability:   {}{risk} — {}",
-        report.capability, report.effect
+        table_cell(&report.capability),
+        table_cell(report.effect)
     );
-    let _ = writeln!(out, "  source:       {}", report.source);
+    let _ = writeln!(out, "  source:       {}", table_cell(&report.source));
     let _ = writeln!(out, "  state:        {}", report.state);
     let _ = writeln!(
         out,
@@ -2975,7 +3165,7 @@ fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
             "  enforcement:  {} ({}) — {}",
             enforcement.kind.as_str(),
             enforcement.class.as_str(),
-            enforcement.owner
+            table_cell(enforcement.owner)
         );
     }
     let _ = writeln!(
@@ -3019,7 +3209,13 @@ fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
         if report.explanation.pins.is_empty() {
             "none".to_string()
         } else {
-            report.explanation.pins.join(", ")
+            report
+                .explanation
+                .pins
+                .iter()
+                .map(|pin| table_cell(pin))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     let _ = writeln!(
@@ -3040,14 +3236,14 @@ fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
             "    {:<18} {:<6} {} — {}",
             layer.layer.label(),
             layer.state.as_str(),
-            layer.source,
-            layer.detail
+            table_cell(&layer.source),
+            table_cell(&layer.detail)
         );
     }
     if !report.explanation.reason_chain.is_empty() {
         out.push_str("  reason chain:\n");
         for step in &report.explanation.reason_chain {
-            let _ = writeln!(out, "    - {step}");
+            let _ = writeln!(out, "    - {}", table_cell(step));
         }
     }
     if report.policy_advisory {
@@ -3056,7 +3252,7 @@ fn format_explain_table(report: &ExplainReport, no_color: bool) -> String {
     if !report.remediation.is_empty() {
         out.push_str("  remediation:\n");
         for hint in &report.remediation {
-            let _ = writeln!(out, "    - {hint}");
+            let _ = writeln!(out, "    - {}", table_cell(hint));
         }
     }
     out
@@ -4018,7 +4214,7 @@ pub fn run_plugin_subcommand(
                 .capability
                 .as_deref()
                 .expect("explain requires a capability");
-            match row_for_id(&state, store_root.as_deref(), id) {
+            match explain_row_for_id(&state, store_root.as_deref(), id) {
                 Ok(row) => match build_explain_report(&row, capability, context) {
                     Ok(report) => finish_explain(&report, request.format, no_color, output),
                     Err(failure) => fail_read_only(&request, &failure, output),
@@ -8019,6 +8215,145 @@ mod tests {
         assert!(out.contains("denial kind:  policy-conflict"), "{out}");
         assert!(out.contains("manifest hash pin mismatch"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_table_escapes_hostile_dynamic_cells_without_color() {
+        let escaped = table_cell("/tmp/evil\x1b[31m\r\nnext");
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(escaped.contains("\\u{1b}"));
+        assert!(escaped.contains("\\r\\n"));
+    }
+
+    #[test]
+    fn long_unicode_policy_path_fails_closed_without_panicking() {
+        let dir = scratch_dir("explain-unicode-policy");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+        let tag = "é".repeat(90);
+        let xdg = scratch_dir(&tag);
+        let policy_dir = xdg.join("bitty");
+        std::fs::create_dir_all(&policy_dir).expect("policy dir");
+        std::fs::write(policy_dir.join("capabilities.conf"), "allow ui.rich\n").expect("policy");
+        let xdg_text = xdg.display().to_string();
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            Some(&xdg_text),
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("first denying layer: user-policy"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_symlinks_and_special_files() {
+        let dir = scratch_dir("explain-bounded-reader");
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, "allow ui.rich\n").expect("target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        #[cfg(unix)]
+        assert!(matches!(
+            read_bounded_regular_file(&link, MAX_POLICY_FILE_BYTES),
+            Err(BoundedReadError::Unsafe(_))
+        ));
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("fifo");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("fifo");
+            assert!(matches!(
+                read_bounded_regular_file(&fifo, MAX_POLICY_FILE_BYTES),
+                Err(BoundedReadError::Unsafe(_))
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_reader_rejects_replaced_symlink_without_mutating_target() {
+        let dir = scratch_dir("explain-state-symlink");
+        let target = dir.join("real.toml");
+        let link = dir.join(STATE_FILE_NAME);
+        std::fs::write(&target, "state_version = 1\n").expect("target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        #[cfg(unix)]
+        assert!(load_state(&link).is_err());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target readable"),
+            "state_version = 1\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_rejects_ledger_only_records_before_using_grants() {
+        let capability = CapabilityId::parse(EXPLAIN_CAP).expect("capability");
+        let state = PluginState::from_records(
+            std::iter::once((
+                "third.party".to_string(),
+                PluginRecord {
+                    source: "registry".to_string(),
+                    manifest_hash: "a".repeat(64),
+                    enabled: true,
+                    granted: [capability].into_iter().collect(),
+                    denied: BTreeSet::new(),
+                },
+            ))
+            .collect(),
+        );
+        let error = explain_row_for_id(&state, None, "third.party")
+            .expect_err("ledger-only grants cannot authorize explain");
+        assert_eq!(error.code, "PluginUnusable");
+    }
+
+    #[test]
+    fn stale_pin_does_not_replace_an_earlier_policy_denial() {
+        let dir = scratch_dir("explain-stale-policy");
+        let config = dir.join("init.lua").display().to_string();
+        let (code, out, _) = run(&["install", EXPLAIN_PLUGIN, "--yes"], Some(&config), "");
+        assert_eq!(code, EXIT_OK, "{out}");
+        let xdg = scratch_dir("explain-stale-policy-xdg");
+        let policy_dir = xdg.join("bitty");
+        std::fs::create_dir_all(&policy_dir).expect("policy dir");
+        std::fs::write(policy_dir.join("capabilities.conf"), "allow ui.rich\n").expect("policy");
+        let file = state_path(&dir);
+        let text = std::fs::read_to_string(&file).expect("state");
+        let stale = "0".repeat(64);
+        std::fs::write(
+            &file,
+            text.lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("manifest_hash = ") {
+                        format!("\tmanifest_hash = \"{stale}\"")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("stale state");
+        let xdg_text = xdg.display().to_string();
+        let (code, out) = run_with_env(
+            &["explain", EXPLAIN_PLUGIN, EXPLAIN_CAP],
+            &config,
+            Some(&xdg_text),
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.contains("first denying layer: user-policy"), "{out}");
+        assert!(out.contains("manifest hash pin mismatch"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     #[test]

@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read as _};
+use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,6 +42,23 @@ pub trait FileSystem: Send + Sync + Debug {
     /// Read an entire file into a string.
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
 
+    /// Read at most `limit + 1` bytes from a stable regular-file descriptor.
+    fn read_bounded_bytes(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        Ok(self.read_bounded_to_string(path, limit)?.into_bytes())
+    }
+
+    /// Read at most `limit + 1` bytes, rejecting special files and races.
+    fn read_bounded_to_string(&self, path: &Path, limit: usize) -> io::Result<String> {
+        let text = self.read_to_string(path)?;
+        if text.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds byte ceiling",
+            ));
+        }
+        Ok(text)
+    }
+
     /// Query the length of a file in bytes.
     fn metadata_len(&self, path: &Path) -> io::Result<u64>;
 
@@ -52,6 +69,101 @@ pub trait FileSystem: Send + Sync + Debug {
 /// Standard native filesystem implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeFileSystem;
+
+#[cfg(unix)]
+fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir | Component::CurDir) {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "parent or prefix path component",
+            ));
+        };
+        let final_component = components.peek().is_none();
+        let file = if final_component {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let fd = rustix::fs::openat(
+                    &directory,
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )?;
+                std::fs::File::from(fd)
+            }
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                let fd = nix::fcntl::openat(
+                    &directory,
+                    name,
+                    nix::fcntl::OFlag::O_RDONLY
+                        | nix::fcntl::OFlag::O_NOFOLLOW
+                        | nix::fcntl::OFlag::O_NONBLOCK
+                        | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )?;
+                std::fs::File::from(fd)
+            }
+        } else {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let fd = rustix::fs::openat(
+                    &directory,
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )?;
+                std::fs::File::from(fd)
+            }
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                let fd = nix::fcntl::openat(
+                    &directory,
+                    name,
+                    nix::fcntl::OFlag::O_RDONLY
+                        | nix::fcntl::OFlag::O_NOFOLLOW
+                        | nix::fcntl::OFlag::O_DIRECTORY
+                        | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )?;
+                std::fs::File::from(fd)
+            }
+        };
+        directory = file;
+        if final_component {
+            return Ok(directory);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "path has no file name",
+    ))
+}
 
 impl FileSystem for NativeFileSystem {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -79,6 +191,49 @@ impl FileSystem for NativeFileSystem {
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
+    }
+
+    fn read_bounded_bytes(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        #[cfg(unix)]
+        let file = open_bounded_regular_file(path)?;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        )))]
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not a regular file",
+            ));
+        }
+        if metadata.len() > limit as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds byte ceiling",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit || bytes.len() as u64 != metadata.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file changed while reading",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn read_bounded_to_string(&self, path: &Path, limit: usize) -> io::Result<String> {
+        String::from_utf8(self.read_bounded_bytes(path, limit)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not UTF-8"))
     }
 
     fn metadata_len(&self, path: &Path) -> io::Result<u64> {

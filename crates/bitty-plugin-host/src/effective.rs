@@ -475,7 +475,14 @@ impl CapabilityScope {
 /// Clamp source attribution to a bounded length (fail-closed at validate).
 fn bounded_source(source: String) -> String {
     if source.len() > MAX_RAW_DECLARATION_BYTES {
-        source[..MAX_RAW_DECLARATION_BYTES].to_string()
+        let end = source
+            .char_indices()
+            .take_while(|(index, _)| *index < MAX_RAW_DECLARATION_BYTES)
+            .map(|(index, character)| index + character.len_utf8())
+            .take_while(|end| *end <= MAX_RAW_DECLARATION_BYTES)
+            .last()
+            .unwrap_or(0);
+        source[..end].to_string()
     } else {
         source
     }
@@ -1083,7 +1090,10 @@ pub fn explain_capability(
         chain: invalid.chain,
     })?;
     request.validate(kind)?;
-    if !request.scope.caps.contains(capability) || request.scope.denied.contains(capability) {
+    if request.scope.caps.len() != 1
+        || !request.scope.caps.contains(capability)
+        || request.scope.denied.contains(capability)
+    {
         return Err(EffectiveDenial::invalid(
             kind,
             "explained capability is not the request voice (exactly one allowed entry required)",
@@ -1099,7 +1109,7 @@ pub fn explain_capability(
     // the level's admitted domains denies before any intersection math and is
     // attributed to host admission (the level is a host property).
     if let Some(level) = level {
-        if let Err(error) = level.check_family(capability.family()) {
+        if let Err(error) = check_trust_gate(request, kind, level) {
             if let Some(host) = layers
                 .iter_mut()
                 .find(|row| row.layer == EffectiveLayer::HostCeiling)
@@ -1970,6 +1980,36 @@ mod tests {
         let chain = explanation.reason_chain.join("\n");
         assert!(chain.contains("external-tool"), "{chain}");
         assert!(chain.contains("host-ceiling"), "{chain}");
+    }
+
+    #[test]
+    fn explain_rejects_multi_capability_requests_like_public_contract() {
+        let mut stack = EffectiveStack::unconstrained();
+        stack.task = scope_with("task", &["fs.read:~/docs/*.md", "process.spawn:tool"]);
+        stack.task.closed = true;
+        let request = AgentRequest {
+            scope: scope_with("request", &["fs.read:~/docs/*.md", "process.spawn:tool"]),
+            raw_wide: Vec::new(),
+        };
+        let error = explain_capability(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            Some(TrustLevel::ThirdPartyLua),
+            &cap("fs.read:~/docs/*.md"),
+        )
+        .expect_err("explain must reject a multi-capability request");
+        assert!(error.reason_chain().join(" ").contains("exactly one"));
+    }
+
+    #[test]
+    fn source_truncation_stays_on_a_utf8_boundary() {
+        let source = format!("{}é", "a".repeat(MAX_RAW_DECLARATION_BYTES - 1));
+        let scope = CapabilityScope::unconstrained(source);
+        assert!(scope.source.is_char_boundary(scope.source.len()));
+        assert!(scope.source.len() <= MAX_RAW_DECLARATION_BYTES);
+        assert!(scope.source.ends_with('a'));
     }
 
     #[test]

@@ -6,10 +6,12 @@
 
 use bitty_platform::PhysicalSize;
 use bitty_runtime::Runtime;
-use bitty_ui::ViewId;
+use bitty_ui::{CellPos, ViewId};
 
 #[cfg(unix)]
 use bitty_runtime::{LayoutNode, SplitAxis, View};
+#[cfg(unix)]
+use bitty_ui::Selection;
 
 #[test]
 fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
@@ -249,4 +251,176 @@ fn two_pane_height_resize_roundtrips_pane_content() {
         "height round-trip must restore every pane line without merging or loss"
     );
     assert!(rt.state().check_invariants().is_ok());
+}
+
+/// #2543: a held (non-buffer) selection must follow height-driven content
+/// movement instead of keeping stale grid coordinates. The width is held at
+/// 80 columns so this exercises the height-only path (a divider drag), not a
+/// width reflow.
+#[test]
+fn height_resize_keeps_held_selection_on_its_content() {
+    // Content grid 80x24: window cells 83x26 -> frame inset (13 px/side)
+    // leaves 80x24 at 9x19 cells. The window padding adds 8 px/side.
+    let full = PhysicalSize::new(83 * 9 + 16, 26 * 19 + 16);
+    let short = PhysicalSize::new(83 * 9 + 16, 7 * 19 + 16);
+
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    for i in 0..23 {
+        rt.handle_pty_bytes(format!("row{i:02}\r\n").as_bytes());
+    }
+    assert_eq!(rt.snapshot().height, 24);
+    rt.start_selection(CellPos::new(20, 0));
+    rt.end_selection(CellPos::new(20, 4));
+    assert_eq!(rt.selection_text().as_deref(), Some("row20"));
+    let hits_before = rt.search_case_sensitive("row20");
+    assert_eq!(hits_before.len(), 1);
+
+    rt.handle_resize(short).expect("height-only shrink");
+    assert_eq!(rt.snapshot().width, 80, "shrink must not reflow the width");
+    let new_rows = rt.snapshot().height;
+    assert!(new_rows < 24, "test needs a real height shrink: {new_rows}");
+    // Content (and the cursor on row 23) fills all 24 rows, so nothing is
+    // absorbed as padding: every row above the new height moves by the full
+    // shrink delta.
+    let expected_row = 20 - (24 - new_rows);
+    let sel = rt.selection().expect("selection stays live");
+    assert_eq!(sel.anchor.row, expected_row as u16);
+    assert_eq!(sel.focus.row, expected_row as u16);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("row20"),
+        "copied text identity must not change under a height move"
+    );
+    let hits_after = rt.search_case_sensitive("row20");
+    assert_eq!(hits_after.len(), 1);
+    assert_eq!(hits_after[0].matched_text, "row20");
+    assert_eq!(
+        hits_after[0].buffer_row, hits_before[0].buffer_row,
+        "search identity is the combined-buffer row, unchanged by a height move"
+    );
+
+    // Grow back: the newest history rows re-enter and the selection returns
+    // to its original grid row with the same text.
+    rt.handle_resize(full).expect("height-only grow");
+    assert_eq!(rt.snapshot().height, 24);
+    let sel = rt.selection().expect("selection survives the grow");
+    assert_eq!(sel.anchor.row, 20);
+    assert_eq!(rt.selection_text().as_deref(), Some("row20"));
+}
+
+/// #2543: when a height shrink pushes a selection endpoint into scrollback,
+/// the grid coordinates no longer describe the original content. The
+/// selection is dropped (fail closed) instead of silently re-anchoring.
+#[test]
+fn height_shrink_drops_selection_pushed_into_scrollback() {
+    let short = PhysicalSize::new(83 * 9 + 16, 7 * 19 + 16);
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    for i in 0..23 {
+        rt.handle_pty_bytes(format!("row{i:02}\r\n").as_bytes());
+    }
+    rt.start_selection(CellPos::new(5, 0));
+    rt.end_selection(CellPos::new(5, 4));
+    assert_eq!(rt.selection_text().as_deref(), Some("row05"));
+
+    rt.handle_resize(short).expect("height-only shrink");
+    assert!(
+        rt.snapshot().height < 6,
+        "fixture needs the selection row pushed out: {} rows",
+        rt.snapshot().height
+    );
+    assert!(
+        !rt.has_selection(),
+        "an unmappable selection must not keep stale coordinates"
+    );
+}
+
+/// #2543: a pane-owned (non-buffer) selection follows a height-only pane
+/// resize, not just the primary grid. A vertical divider drag only changes
+/// heights, so the selected row must move with its pane content.
+#[cfg(unix)]
+#[test]
+fn pane_height_resize_remaps_pane_owned_selection() {
+    fn two_pane_vertical(ratio: f32) -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            ratio,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        )
+    }
+    fn pane_rows(rt: &Runtime) -> Vec<String> {
+        let snap = rt.pane_snapshot(&ViewId::new(2)).expect("pane 2 frame");
+        (0..snap.height)
+            .map(|row| {
+                let start = row * snap.width;
+                snap.cells[start..start + snap.width]
+                    .iter()
+                    .map(|cell| if cell.spacer { ' ' } else { cell.glyph })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    rt.set_layout(two_pane_vertical(0.5));
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == ViewId::new(2))
+        .expect("bottom pane frame");
+    rt.spawn_shell_for_view(
+        ViewId::new(2),
+        "/bin/sh",
+        &["-c", "exec sleep 30"],
+        frame.cols,
+        frame.rows,
+    )
+    .expect("spawn pane shell");
+    for i in 0..40 {
+        rt.handle_pane_bytes(ViewId::new(2), format!("pane-{i:02}\r\n").as_bytes());
+    }
+
+    let before = pane_rows(&rt);
+    let old_rows = before.len();
+    let sel_row = before
+        .iter()
+        .rposition(|row| row.starts_with("pane-"))
+        .expect("pane content row");
+    let text = before[sel_row].clone();
+    assert!(
+        rt.set_view_selection(
+            ViewId::new(2),
+            Selection::simple(
+                CellPos::new(sel_row as u16, 0),
+                CellPos::new(sel_row as u16, text.len().saturating_sub(1) as u16),
+            ),
+        ),
+        "pane selection installs against the pane grid"
+    );
+    assert_eq!(rt.selection_owner(), Some(ViewId::new(2)));
+    assert_eq!(rt.selection_text().as_deref(), Some(text.as_str()));
+
+    // Drag the divider: the bottom pane shrinks, all its content shifts up,
+    // and the cursor (on the last row) keeps the pane bottom-full so every
+    // removed row is pushed.
+    rt.set_layout(two_pane_vertical(0.7));
+    let after = pane_rows(&rt);
+    assert!(after.len() < old_rows, "pane must shrink: {after:?}");
+    let expected = sel_row as i32 - (old_rows - after.len()) as i32;
+    assert!(
+        expected >= 0,
+        "fixture must keep the selected row: {after:?}"
+    );
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some(text.as_str()),
+        "pane selection must keep its content across a height move"
+    );
+    assert_eq!(rt.selection_owner(), Some(ViewId::new(2)));
+    assert_eq!(
+        rt.selection().expect("selection").anchor.row,
+        expected as u16
+    );
 }

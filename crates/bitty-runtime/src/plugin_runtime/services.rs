@@ -65,6 +65,7 @@ use super::fs_list::{FsListBackend, FsListEntry};
 use super::overlay::{
     DEFAULT_RELEASE_REASON, OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture, is_owner_release_reason,
 };
+use super::presentation_overlay::PresentationOverlay;
 use super::store::{self, PluginStore};
 
 /// Maximum characters of a provider failure message relayed to the consumer
@@ -1850,6 +1851,12 @@ pub struct PluginServices {
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
     overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
+    /// Runtime-shared presentation-only overlay session (CTX-1431, #2406).
+    ///
+    /// `None` until the runtime wires the shared state; every show then
+    /// fails closed with `E_UI_UNAVAILABLE`. Presentation is paint-only: it
+    /// never claims capture and never sets the modal authority.
+    presentation_overlay: RefCell<Option<Rc<RefCell<PresentationOverlay>>>>,
     overlay_peers: RefCell<Option<OverlayPeers>>,
     /// Handles this generation mounted through spec acquire (CTX-0941).
     ///
@@ -2091,6 +2098,7 @@ impl PluginServices {
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
             overlay_capture: RefCell::new(None),
+            presentation_overlay: RefCell::new(None),
             overlay_peers: RefCell::new(None),
             spec_overlay_handles: RefCell::new(BTreeSet::new()),
             target_registry: RefCell::new(None),
@@ -2492,6 +2500,23 @@ impl PluginServices {
         *self.overlay_capture.borrow_mut() = Some(capture);
     }
 
+    /// Attach the runtime-shared presentation-only overlay session
+    /// (CTX-1431, `bitty` #2406).
+    ///
+    /// One session spans every generation so the one-surface-per-window rule
+    /// holds across plugins and reload. A generation whose services were
+    /// built without wiring keeps `None` and every show fails closed with
+    /// `E_UI_UNAVAILABLE`. Hide stays available without the shared state so
+    /// cleanup can never fail spuriously.
+    pub fn set_presentation_overlay(&self, overlay: Rc<RefCell<PresentationOverlay>>) {
+        *self.presentation_overlay.borrow_mut() = Some(overlay);
+    }
+
+    /// The shared presentation session, if one was wired.
+    fn presentation_overlay(&self) -> Option<Rc<RefCell<PresentationOverlay>>> {
+        self.presentation_overlay.borrow().clone()
+    }
+
     /// The shared capture manager, if one was wired.
     fn overlay_capture(&self) -> Option<Rc<RefCell<OverlayCapture>>> {
         self.overlay_capture.borrow().clone()
@@ -2617,6 +2642,42 @@ impl PluginServices {
             ));
         }
         Ok(())
+    }
+
+    /// The presentation-only overlay gate (CTX-1431, `bitty` #2406).
+    ///
+    /// Deny-by-default on the two v1 mount grants: a block mounted into the
+    /// `overlay` slot already needed `ui.rich` + `ui.overlay`, and the
+    /// presentation path deliberately does **not** require or imply
+    /// `ui.overlay.focus` (no capture). Safe mode never presents a plugin
+    /// surface, and a host without the shared session fails closed with
+    /// `E_UI_UNAVAILABLE`.
+    fn require_presentation_overlay(
+        &self,
+    ) -> Result<Rc<RefCell<PresentationOverlay>>, BridgeError> {
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "presentation overlay is unavailable in safe mode",
+            ));
+        }
+        {
+            let access = self.ui_access.borrow();
+            if !access.rich {
+                return Err(BridgeError::capability_denied("ui.rich"));
+            }
+            if !access.overlay {
+                return Err(BridgeError::capability_denied("ui.overlay"));
+            }
+        }
+        self.presentation_overlay().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no presentation-only overlay surface",
+            )
+        })
     }
 
     /// Attach the runtime-shared targeting mechanism state (W-29, CTX-0942).
@@ -4028,6 +4089,52 @@ impl HostServices for PluginServices {
             component,
             Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS),
         )
+    }
+
+    fn ui_overlay_show_with_expiry(
+        &self,
+        handle: i64,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        // Check-then-act: never admit a surface after the call deadline.
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let overlay = self.require_presentation_overlay()?;
+        // Only a block this generation mounted into the `overlay` slot can
+        // be presented; a foreign or non-overlay handle is typed. The block
+        // check also rejects a handle from a previous generation (epoch
+        // handles never alias across a reload).
+        let is_overlay = self
+            .ui_blocks
+            .borrow()
+            .get(handle)
+            .is_some_and(|block| block.ui_slot() == UiSlot::Overlay);
+        if !is_overlay {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_NOT_OWNER,
+                "handle is not a mounted overlay block of this generation",
+            ));
+        }
+        overlay.borrow_mut().show(&self.plugin_id, handle)
+    }
+
+    fn ui_overlay_show(&self, handle: i64) -> Result<bool, BridgeError> {
+        self.ui_overlay_show_with_expiry(
+            handle,
+            Instant::now() + Duration::from_millis(OVERLAY_CAPTURE_TIMEOUT_MS),
+        )
+    }
+
+    fn ui_overlay_hide(&self, handle: i64) -> Result<bool, BridgeError> {
+        // Release-style cleanup path: no grant or safe-mode gate, so a
+        // surface whose grant was revoked mid-session can still be removed.
+        // No shared state means there is nothing this host could have shown.
+        let Some(overlay) = self.presentation_overlay() else {
+            return Ok(false);
+        };
+        Ok(overlay.borrow_mut().hide(&self.plugin_id, handle))
     }
 
     fn ui_overlay_release(&self, handle: i64) -> Result<bool, BridgeError> {

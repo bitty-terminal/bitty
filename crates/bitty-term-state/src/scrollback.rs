@@ -1,13 +1,21 @@
-//! Bounded, append-only scrollback (RFC invariant 4).
+//! Bounded scrollback with oldest-first pruning (RFC invariant 4).
 //!
-//! Lines enter scrollback only via scroll-under-region operations; pruning
-//! removes oldest first; contents are immutable once written. The single
-//! exception is wholesale removal by `ED 3` / `FullReset`, which truncates
-//! the buffer without rewriting any line. Capacity is per-buffer: the
-//! default is [`SCROLLBACK_DEFAULT_LINES`] and every capacity is clamped to
-//! the hard cap [`SCROLLBACK_MAX_LINES`] (RFC invariant 4 bounded memory per
-//! threat T-01). See the crate documentation for the constant register and
-//! RFC references.
+//! Lines enter the buffer from scroll-under-region operations, from a
+//! height-only primary shrink that moves the oldest viewport rows out whole
+//! with their soft-wrap flags, and from the width-reflow rebuild (which
+//! drains retained lines through `pop_front_line` and re-pushes the rewrapped
+//! physical rows with fresh monotonic ids). Pruning removes oldest first and
+//! every capacity is clamped to [`SCROLLBACK_MAX_LINES`] (bounded memory per
+//! threat T-01). Per-buffer capacity defaults to
+//! [`SCROLLBACK_DEFAULT_LINES`]; see the crate documentation for the constant
+//! register and RFC references.
+//!
+//! A pushed line's cells are immutable. The crate-internal exceptions adjust
+//! membership or wrap metadata, never glyph content: `clear_last_wrap` breaks
+//! the newest line's soft-wrap continuation when a height grow inserts blank
+//! filler above re-entered history, `pop_back_line` removes that newest line
+//! when the history re-enters the viewport, and `clear` (the `ED 3` /
+//! `FullReset` exception) removes every retained line.
 
 use std::collections::VecDeque;
 

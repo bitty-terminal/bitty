@@ -49,6 +49,21 @@ pub const QUEUED_WRITE_MAX_BYTES: usize = 128 * 1024;
 // submit reported as accepted would be dropped instead of written.
 const _: () = assert!(QUEUED_WRITE_MAX_BYTES > MAX_PRODUCER_FRAME_BYTES);
 
+/// Stack reservation for one queued-writer thread.
+///
+/// The writer loop is non-recursive: it parks on a condition variable, drains
+/// one command, and calls `write`/`flush` on the PTY sink. The default Rust
+/// thread stack (2 MiB) is therefore pure virtual-address overhead multiplied
+/// by the live pane count (one writer per pane since bitty#2446).
+///
+/// 128 KiB is well above the loop's observed frame use (a few KiB), while
+/// keeping the per-pane virtual-address reservation bounded. Spawn failure
+/// is not fatal: when
+/// [`PtyWriter::new_queued`] cannot create the thread it keeps the historical
+/// direct (blocking) writer, so a refused 128 KiB stack can never remove the
+/// input path.
+const WRITER_THREAD_STACK_BYTES: usize = 128 * 1024;
+
 /// Maximum queued commands (data chunks plus flush/shutdown markers).
 ///
 /// Each command carries at most the caller's buffer, so this bound only
@@ -255,6 +270,18 @@ pub struct PtyWriter {
     sink: Sink,
 }
 
+/// Builder for the production queued-writer thread.
+///
+/// Single spawn funnel: [`PtyWriter::new_queued`] is the only caller, and the
+/// regression test measures the stack this builder actually creates so
+/// dropping [`stack_size`](std::thread::Builder::stack_size) fails loudly
+/// instead of only changing a pinned literal.
+fn writer_thread_builder() -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name("bitty-pty-writer".to_owned())
+        .stack_size(WRITER_THREAD_STACK_BYTES)
+}
+
 impl PtyWriter {
     pub(crate) fn new(inner: Box<dyn io::Write + Send>) -> Self {
         PtyWriter {
@@ -263,6 +290,19 @@ impl PtyWriter {
     }
 
     /// Wrap `inner` in a bounded queue drained by a named writer thread.
+    ///
+    /// The thread is spawned eagerly, once per pane, so a child that stops
+    /// reading its stdin can never park the event loop in `write(2)`
+    /// (bitty#2446). That is also the per-pane cost behind issue #2524's
+    /// memory report: on glibc each thread can reserve a 64 MiB malloc arena
+    /// on its first allocation, and the default 2 MiB stack is virtual-address
+    /// overhead per pane. This spawn uses [`writer_thread_builder`], which
+    /// pins the stack to [`WRITER_THREAD_STACK_BYTES`]; the arena reservation
+    /// is outside this crate's control (it is unused address space, not
+    /// resident memory). `scripts/mem-probe-headless.sh` reports both
+    /// `rss_kb` and `vsize_kb` so the two are never conflated, and lazily
+    /// starting this thread on first queued write remains a separately
+    /// reviewed follow-up rather than a silent behavior change here.
     ///
     /// If the thread cannot be spawned the handle falls back to direct
     /// writes rather than failing the PTY: thread exhaustion is already a
@@ -276,17 +316,15 @@ impl PtyWriter {
         let slot = Arc::new(Mutex::new(Some(inner)));
         let thread_slot = Arc::clone(&slot);
         let thread_queue = Arc::clone(&queue);
-        let spawned = std::thread::Builder::new()
-            .name("bitty-pty-writer".to_owned())
-            .spawn(move || {
-                let inner = thread_slot
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(inner) = inner {
-                    writer_loop(inner, thread_queue);
-                }
-            });
+        let spawned = writer_thread_builder().spawn(move || {
+            let inner = thread_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(inner) = inner {
+                writer_loop(inner, thread_queue);
+            }
+        });
         match spawned {
             Ok(_) => PtyWriter {
                 sink: Sink::Queued(queue),
@@ -381,6 +419,82 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn writer_thread_stack_stays_bounded() {
+        // Measure process VmSize while a live worker is parked. The same
+        // closure and channel allocations are used for both cases; only the
+        // stack reservation differs. A default Builder is the negative
+        // control. Removing `.stack_size(...)` makes the deltas equal and
+        // fails the test.
+        let control_release = std::sync::mpsc::channel();
+        let bounded_release = std::sync::mpsc::channel();
+        let control_ready = std::sync::mpsc::channel();
+        let bounded_ready = std::sync::mpsc::channel();
+        let baseline = process_vsize_kib();
+        let control = spawn_parked_thread(
+            std::thread::Builder::new(),
+            control_ready.0,
+            control_release.1,
+        );
+        control_ready
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("default-stack control ready");
+        let with_control = process_vsize_kib();
+        let bounded =
+            spawn_parked_thread(writer_thread_builder(), bounded_ready.0, bounded_release.1);
+        bounded_ready
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded writer thread ready");
+        let with_both = process_vsize_kib();
+        let control_kib = with_control.saturating_sub(baseline);
+        let bounded_kib = with_both.saturating_sub(with_control);
+        control_release.0.send(()).expect("release control");
+        bounded_release.0.send(()).expect("release bounded");
+        control.join().expect("join control");
+        bounded.join().expect("join bounded");
+        assert!(
+            control_kib >= 1536,
+            "negative-control VmSize delta {control_kib} KiB is unexpectedly small"
+        );
+        assert!(
+            bounded_kib + 1024 <= control_kib,
+            "writer-thread VmSize delta {bounded_kib} KiB is not at least 1 MiB below default {control_kib} KiB"
+        );
+    }
+
+    /// Reads process virtual size from procfs on Linux.
+    #[cfg(target_os = "linux")]
+    fn process_vsize_kib() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("status readable")
+            .lines()
+            .find_map(|line| {
+                let value = line.strip_prefix("VmSize:")?;
+                value.split_whitespace().next()?.parse().ok()
+            })
+            .expect("VmSize present")
+    }
+
+    /// Spawns an otherwise identical parked worker so VmSize deltas isolate
+    /// the requested Builder stack reservation.
+    #[cfg(target_os = "linux")]
+    fn spawn_parked_thread(
+        builder: std::thread::Builder,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        builder
+            .spawn(move || {
+                let _marker = 0u8;
+                let _ = ready.send(());
+                let _ = release.recv();
+            })
+            .expect("measured thread spawn")
+    }
 
     /// `io::Write` sink that records every byte written into shared state.
     #[derive(Clone)]

@@ -7,6 +7,14 @@ use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
 use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
+/// Minimum focused-frame width (cells) for a legible presentation overlay.
+///
+/// The presentation surface is informational and non-modal, so a frame too
+/// narrow to read is left unpainted instead of drawing a truncated sliver;
+/// the session stays live and a later resize paints it. The capture modal
+/// keeps its own fail-open rule (it holds the keyboard while up).
+pub(super) const PRESENTATION_OVERLAY_MIN_COLS: u16 = 10;
+
 /// Deterministic headless rasterizer: no font stack required, bit-identical
 /// on every platform and on both Linux and Windows CI.
 ///
@@ -1395,6 +1403,12 @@ impl Runtime {
         // it. The atlas-reject path intentionally bypasses this function and
         // keeps a pending deferral armed.
         self.coalesced_pending = false;
+        self.coalesced_deadline = None;
+        // bitty#2486: a commit closes the PTY burst it was waiting on. The
+        // next consumed byte starts a fresh settle window (and a fresh
+        // `PRESENT_SETTLE_MAX` hold budget).
+        self.settle_input_at = None;
+        self.settle_burst_at = None;
     }
 
     /// Minimum interval between presented frames (CTX-1231, #2093).
@@ -1416,60 +1430,127 @@ impl Runtime {
         self.min_present_interval = interval;
     }
 
-    /// Frames dropped by the coalescing gate with damage retained
-    /// (CTX-1231). Monotonic, saturating; idle ticks never count.
+    /// PTY-quiescence settle window for presentation (bitty#2486).
+    ///
+    /// `ZERO` (default) presents on every dirty tick. A non-zero value holds
+    /// a dirty present until PTY output has been quiet for this long, so a
+    /// screen repaint split across several PTY reads is applied whole before
+    /// the frame snapshot is taken. See [`Self::set_present_settle`].
+    #[must_use]
+    pub fn present_settle(&self) -> std::time::Duration {
+        self.present_settle
+    }
+
+    /// Sets the PTY-quiescence settle window (bitty#2486).
+    ///
+    /// The embedder arms this (the real-GUI startup path does) and calls
+    /// [`Self::note_present_input`] whenever it consumed PTY output. `ZERO`
+    /// disables the gate; a pending deferral is released on the next tick
+    /// because the gate reads the live value.
+    pub fn set_present_settle(&mut self, settle: std::time::Duration) {
+        self.present_settle = settle;
+    }
+
+    /// Records that the embedder just consumed PTY output (bitty#2486).
+    ///
+    /// Starts (or extends) the input burst the settle gate waits out. No-op
+    /// while [`Self::present_settle`] is `ZERO`, so headless callers that
+    /// drive `handle_pty_bytes` directly keep deterministic behavior.
+    pub fn note_present_input(&mut self) {
+        self.note_present_input_at(std::time::Instant::now());
+    }
+
+    /// [`Self::note_present_input`] against an explicit clock.
+    ///
+    /// Hidden seam for deterministic tests: the settle gate compares the same
+    /// `Instant` domain the embedder passes to [`Self::tick_at`].
+    #[doc(hidden)]
+    pub fn note_present_input_at(&mut self, now: std::time::Instant) {
+        if self.present_settle.is_zero() {
+            return;
+        }
+        if self.settle_burst_at.is_none() {
+            self.settle_burst_at = Some(now);
+        }
+        self.settle_input_at = Some(now);
+    }
+
+    /// Frames dropped by a present gate with damage retained (CTX-1231
+    /// cadence and the bitty#2486 PTY-quiescence settle). Monotonic,
+    /// saturating; idle ticks never count.
     #[must_use]
     pub fn presents_coalesced(&self) -> u64 {
         self.presents_coalesced
     }
 
-    /// Wake deadline for a deferred coalesced frame, if any (CTX-1231).
+    /// Wake deadline for a deferred frame, if any (CTX-1231, bitty#2486).
     ///
-    /// `Some(last_present + interval)` while a deferred frame holds
-    /// un-presented damage; `None` otherwise (gate off, nothing deferred,
-    /// or already presented). The app arms `set_wait_until` at it so a
-    /// burst followed by quiet still presents the latest frame on time
-    /// instead of holding it until unrelated activity (frame-on-demand
-    /// liveness). `checked_add` fail-closed: an unrepresentable deadline
-    /// reports `None` and the next dirty tick presents immediately.
+    /// `Some(open_at)` while a deferred frame holds un-presented damage:
+    /// `last_present + interval` for the cadence gate, the PTY-quiescence
+    /// deadline for the settle gate, or `sync_defer_since +
+    /// SYNC_UPDATE_DEFER_TIMEOUT` while `DECSET 2026` holds the frame. `None`
+    /// otherwise (no gate, nothing deferred, or already presented). The app
+    /// arms `set_wait_until` at it so a burst followed by quiet still presents
+    /// the latest frame on time instead of holding it until unrelated activity
+    /// (frame-on-demand liveness); the sync arm also bounds a hung producer
+    /// that never resets the mode.
     #[must_use]
     pub fn present_coalescing_deadline(&self) -> Option<std::time::Instant> {
         if !self.coalesced_pending {
             return None;
         }
-        let last = self.last_present_at?;
-        last.checked_add(self.min_present_interval)
+        self.coalesced_deadline
     }
 
-    /// Present-latest coalescing gate (CTX-1231, #2093).
+    /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
+    /// settle (bitty#2486).
     ///
-    /// Returns `true` when this dirty tick must skip its present because
-    /// the last presented frame is younger than `min_present_interval`.
-    /// Damage is retained (the caller returns `None` without marking
-    /// presented), so the next tick past the deadline presents the
-    /// accumulated latest state: intermediate frames are dropped, never
-    /// torn-presented, and the final frame matches an uncoalesced run at
-    /// the same clock (same snapshots, same time-driven animation state;
-    /// only surface commits are skipped). The first frame always presents
-    /// (`last_present_at` is `None`), and a zero interval disables the
-    /// gate entirely.
+    /// Returns `true` when this dirty tick must skip its present. Damage is
+    /// retained (the caller returns `None` without marking presented), so a
+    /// later tick presents the accumulated latest state: intermediate frames
+    /// are dropped, never torn-presented, and the final frame matches an
+    /// uncoalesced run at the same clock.
+    ///
+    /// Two independent holds compose; a present happens only once both are
+    /// open:
+    ///
+    /// - cadence: the last presented frame is younger than
+    ///   `min_present_interval` (`ZERO` disables it; a missing prior present
+    ///   never holds the first frame);
+    /// - settle: PTY output arrived less than `present_settle` ago, capped at
+    ///   [`super::PRESENT_SETTLE_MAX`] since the burst began so a continuous
+    ///   producer still presents (`ZERO` disables it).
+    ///
+    /// Deadlines use `checked_add`; an unrepresentable one fails closed: that
+    /// gate does not defer, so the frame presents immediately instead of
+    /// waiting for a wake that can never fire.
     fn defer_coalesced_present(&mut self, now: std::time::Instant) -> bool {
-        if self.min_present_interval.is_zero() {
-            return false;
-        }
-        let Some(last) = self.last_present_at else {
-            return false;
+        let cadence_open = if self.min_present_interval.is_zero() {
+            None
+        } else {
+            self.last_present_at
+                .and_then(|last| last.checked_add(self.min_present_interval))
         };
-        // CTX-1231 review: an unrepresentable wake deadline must never
-        // defer without a wake — present immediately instead (fail-closed
-        // liveness; only fires for absurd intervals near `Instant::MAX`).
-        if last.checked_add(self.min_present_interval).is_none() {
-            return false;
-        }
-        if now.saturating_duration_since(last) >= self.min_present_interval {
+        let settle_open = if self.present_settle.is_zero() {
+            None
+        } else {
+            self.settle_input_at.and_then(|input| {
+                let quiet = input.checked_add(self.present_settle)?;
+                let burst = self.settle_burst_at.unwrap_or(input);
+                let capped = burst.checked_add(super::PRESENT_SETTLE_MAX)?;
+                Some(quiet.min(capped))
+            })
+        };
+        let open_at = match (cadence_open, settle_open) {
+            (None, None) => return false,
+            (Some(open), None) | (None, Some(open)) => open,
+            (Some(cadence), Some(settle)) => cadence.max(settle),
+        };
+        if now >= open_at {
             return false;
         }
         self.coalesced_pending = true;
+        self.coalesced_deadline = Some(open_at);
         self.presents_coalesced = self.presents_coalesced.saturating_add(1);
         true
     }
@@ -2074,6 +2155,10 @@ impl Runtime {
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
         self.paint_chrome_bands(basis.pad_px, &mut layers);
+        // CTX-1431 (#2406): the presentation-only panel paints above chrome
+        // and below the focusable capture surface, matching its accepted
+        // `OverlayTier::Popup` admission. It is paint-only: no input routing.
+        self.paint_presentation_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_target_annotations(basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
@@ -2203,6 +2288,14 @@ impl Runtime {
         if self.synchronized_update_active() {
             let since = *self.sync_defer_since.get_or_insert(now);
             if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT {
+                // Keep the app wake at the sync bound, replacing any earlier
+                // settle/cadence deadline. A settle deferral may have armed a
+                // deadline that this gate has now outlived; leaving it in
+                // place makes the embedder's `set_wait_until` fire immediately
+                // on every loop turn until the 100 ms bound elapses (a spin,
+                // not a present). The frame itself stays deferred here.
+                self.coalesced_pending = true;
+                self.coalesced_deadline = since.checked_add(SYNC_UPDATE_DEFER_TIMEOUT);
                 return true;
             }
             // Bound reached: commit this frame, then open a fresh window so
@@ -2380,6 +2473,21 @@ impl Runtime {
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).
         if !pending_full && !origins_changed && last != u64::MAX {
+            // bitty#2486 (review): an idle tick still consumed the PTY burst
+            // that produced no damage (a terminal query answered with a reply
+            // only). Nothing is being held, so close the settle window here;
+            // keeping its timestamps would leave the next burst's
+            // `PRESENT_SETTLE_MAX` cap in the past and let that repaint present
+            // on its first read — exactly the half-applied frame this gate
+            // exists to prevent.
+            self.settle_input_at = None;
+            self.settle_burst_at = None;
+            // A synchronized-update deferral also arms the coalesced wake
+            // (the sync gate owns it while it holds). If the mode exited
+            // without damage, nothing is pending and a kept deadline would
+            // fire immediately.
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
             return None;
         }
 
@@ -4225,6 +4333,54 @@ impl Runtime {
         let Some(overlay) = self.plugin_overlay.clone() else {
             return;
         };
+        let anchor = self.plugin_overlay_anchor;
+        self.paint_overlay_surface(&overlay, anchor, 0, allocations, pad_px, layers);
+    }
+
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// Paints the live `overlay`-slot block of the one presentation session.
+    /// Same flattening walk and v1 scene budgets as the capture surface, but
+    /// always centered over the focused view (never anchored, never modal),
+    /// clipped to that frame, and left unpainted below
+    /// [`PRESENTATION_OVERLAY_MIN_COLS`] so a tiny frame never shows an
+    /// illegible sliver. No hit-testing, no pointer capture: clicks pass
+    /// through to the grid beneath. No-op with no surface.
+    fn paint_presentation_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        let Some(overlay) = self.presentation_overlay.clone() else {
+            return;
+        };
+        self.paint_overlay_surface(
+            &overlay,
+            None,
+            PRESENTATION_OVERLAY_MIN_COLS,
+            allocations,
+            pad_px,
+            layers,
+        );
+    }
+
+    /// Shared row-stack paint for the capture surface and the presentation
+    /// surface (CTX-0943, CTX-1431).
+    ///
+    /// `anchor` is the hover-band placement used by the non-modal tooltip
+    /// path (`None` = centered). `min_frame_cols` refuses a frame too narrow
+    /// for the surface's legibility rule; `0` keeps the capture modal's
+    /// pre-existing fail-open chrome.
+    fn paint_overlay_surface(
+        &mut self,
+        overlay: &BandContent,
+        anchor: Option<band_host::BandOverlayAnchor>,
+        min_frame_cols: u16,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
         let rows = Self::overlay_scene_rows(&overlay.root);
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
@@ -4237,7 +4393,7 @@ impl Runtime {
         let Some(frame) = frame else {
             return;
         };
-        if frame.rows == 0 || frame.cols == 0 {
+        if frame.rows == 0 || frame.cols == 0 || frame.cols < min_frame_cols {
             return;
         }
         let full_w = px_span(frame.cols, live.width);
@@ -4259,7 +4415,7 @@ impl Runtime {
             })
             .max()
             .unwrap_or(0);
-        let anchored = self.plugin_overlay_anchor.and_then(|anchor| {
+        let anchored = anchor.and_then(|anchor| {
             if window.width == 0 || window.height == 0 || self.band_geometry_violated() {
                 return None;
             }
@@ -5818,7 +5974,7 @@ mod present_origin_tests {
 
 #[cfg(test)]
 mod plugin_overlay_paint_tests {
-    use super::{FrameLayers, centered_tooltip_x};
+    use super::{FrameLayers, PRESENTATION_OVERLAY_MIN_COLS, centered_tooltip_x};
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
     use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
@@ -5859,6 +6015,22 @@ mod plugin_overlay_paint_tests {
             content: RectPx::new(8, 8, 704, 344),
             cols: 80,
             rows: 24,
+            border: 1,
+            radius: 0,
+            tier: None,
+            style: crate::config::RuntimeViewStyle::default(),
+        }
+    }
+
+    /// One frame at an explicit content origin/size (focus-follow tests).
+    fn frame_for(view: u64, content_x: i32, cols: u16, rows: u16) -> PresentFrame {
+        use bitty_render::geometry::RectPx;
+        PresentFrame {
+            view: bitty_ui::ViewId::new(view),
+            frame: RectPx::new(content_x - 8, 0, 720, 360),
+            content: RectPx::new(content_x, 8, 704, 344),
+            cols,
+            rows,
             border: 1,
             radius: 0,
             tier: None,
@@ -6464,6 +6636,116 @@ mod plugin_overlay_paint_tests {
             [accent[0], accent[1], accent[2], 0xFF],
             "root fg resolves through the closed token table"
         );
+    }
+
+    #[test]
+    fn presentation_overlay_paints_centered_over_the_focused_frame() {
+        // CTX-1431: the presentation surface is Core-centered in the focused
+        // frame, painted as fills plus glyphs on the overlay layer.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let frame = frame_for(1, 100, 60, 20);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert_eq!(layers.combined_overlay.len(), 1, "one row, one pill");
+        assert!(!layers.combined_glyphs.is_empty(), "text paints glyphs");
+        assert!(layers.any_needs_draw);
+        let (cell_w, _) = rt.live_cell_size();
+        let expected = 8
+            + 100
+            + i32::try_from((u32::from(frame.cols) - 5) * cell_w / 2).expect("center offset fits");
+        assert_eq!(
+            layers.combined_overlay[0].rect.x, expected,
+            "the five-cell row centers in the focused frame"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_follows_focus_without_dismissing() {
+        // A focus switch re-centers the panel; it never dismisses it.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let first = frame_for(1, 100, 60, 20);
+        let second = frame_for(2, 600, 60, 20);
+        rt.focus_mut().set(first.view);
+        let mut before = FrameLayers::default();
+        rt.paint_presentation_overlay(&[first, second], 8, &mut before);
+        rt.focus_mut().set(second.view);
+        let mut after = FrameLayers::default();
+        rt.paint_presentation_overlay(&[first, second], 8, &mut after);
+        assert!(
+            after.combined_overlay[0].rect.x > before.combined_overlay[0].rect.x,
+            "the surface follows the focused view's frame"
+        );
+        assert!(
+            rt.presentation_overlay().is_some(),
+            "a focus switch must not dismiss the presentation"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_tiny_view_skips_paint_and_keeps_state() {
+        // Below the legibility floor the panel refuses to paint; the session
+        // survives for a later resize.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let tiny = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS - 1, 20);
+        rt.focus_mut().set(tiny.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[tiny], 8, &mut layers);
+        assert!(
+            layers.combined_overlay.is_empty(),
+            "a too-narrow frame paints nothing"
+        );
+        assert!(!layers.any_needs_draw);
+        assert!(rt.presentation_overlay().is_some(), "the state stays live");
+
+        let wide = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS, 20);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[wide], 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay.len(),
+            1,
+            "the same state paints after a resize"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_clips_width_and_row_tail_to_the_frame() {
+        // Wide rows clip to the focused frame; rows past the frame bottom
+        // disappear instead of painting outside it.
+        let long = "x".repeat(200);
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_rows(&[&long, "two", "three", "four"])));
+        let frame = frame_for(1, 100, 12, 3);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert_eq!(layers.combined_overlay.len(), 3, "only fitting rows paint");
+        let (cell_w, _) = rt.live_cell_size();
+        let frame_left = 8 + 100;
+        let frame_width = u32::from(frame.cols) * cell_w;
+        let first = &layers.combined_overlay[0];
+        assert_eq!(
+            first.rect.width, frame_width,
+            "the over-wide row clips to the frame"
+        );
+        assert_eq!(
+            first.rect.x, frame_left,
+            "a full-width row starts at the frame"
+        );
+        for fill in &layers.combined_overlay {
+            assert!(
+                fill.rect.x >= frame_left,
+                "no row starts left of the focused frame"
+            );
+            assert!(
+                fill.rect.x + i32::try_from(fill.rect.width).expect("width fits")
+                    <= frame_left + i32::try_from(frame_width).expect("frame width fits"),
+                "no row paints past the focused frame"
+            );
+        }
     }
 }
 

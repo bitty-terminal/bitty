@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Presentation-only plugin overlays (#2406):** a plugin can now present an
+  `overlay`-slot block without becoming modal. `bitty.ui.overlay.show(handle)`
+  and `bitty.ui.overlay.hide(handle)` require only `ui.rich` + `ui.overlay`
+  (never `ui.overlay.focus`), start no keyboard or pointer capture, and paint
+  one non-modal `Popup` surface centered on the focused view and clipped to
+  its frame. A second plugin's `show` fails closed with `E_UI_UNAVAILABLE`;
+  owner re-show replaces, `hide` is idempotent, and a bare `Esc` hides the
+  panel without consuming the press (the focused PTY still receives it) while
+  queueing one `overlay.dismissed` observation. Paste, workspace-close, and
+  view/window-close confirmation gates keep their consume.
+- **Read-only `bitty plugin explain <id> <capability>` (#2471):** prints the
+  capability decision chain for one capability declared by a plugin's
+  manifest. Each layer (host ceiling, user policy, project policy, parent
+  delegation, task grant, agent request) reports `allow`/`deny`/`empty`; the
+  report names the first denying layer, the typed `DenialKind`, the engine's
+  bounded reason chain, the resolved trust level, the enforcement record,
+  pins/conflicts, the effective grant, a static resource-budget envelope, and
+  minimal remediation hints. Unknown ids/capabilities, malformed identifiers,
+  and unreadable/malformed/symlinked policy files fail closed; a denied
+  capability exits 4 after the report. `--format table|json|jsonl` and
+  `--no-color` match the other read-only plugin commands. No plugin code runs,
+  no VM is created, no network is used, and no state is mutated.
+
 ### Fixed
 
 - **Hover tooltip formatting, centering, and refresh (#2530):** the
@@ -30,6 +55,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line height and descent, forcing the legacy 3/4 baseline. The backend now
   sizes the face with one probe glyph at the requested size before
   measuring, restoring the metric-aware baseline.
+
+### Added
+
+- **Headless memory probe and resize/zoom regression (#2524):**
+  `scripts/mem-probe-headless.sh` samples RSS, PSS, VmSize, threads, and fds
+  for an isolated `--test-mode` session at a chosen pane count, scrollback,
+  and optional Kitty image; its optional budget gate reads resident memory
+  only. `crates/bitty-runtime/tests/memory_resize_regression.rs` pins repeated
+  grow/shrink and zoom passes to a byte-stable `workspace_memory_report()`.
+
+### Changed
+
+- **Bounded queued-writer stack (#2524):** the eagerly spawned per-pane PTY
+  writer thread (bitty#2446) uses a 128 KiB stack instead of Rust's default
+  stack reservation. The non-recursive I/O loop needs only a few KiB in the
+  measured workload; a refused spawn still falls back to the direct writer.
+  In the measured comparison, six panes reclaimed about 11.25 MiB of `VmSize`
+  from the writer stack reservations. This bounds stack virtual address space;
+  it does not fix resident-memory growth.
+  On glibc, an idle writer thread can retain a reserved 64 MiB malloc-arena
+  mapping after its first allocation; that reservation is virtual and is not
+  equivalent to 64 MiB of RSS.
 
 ## [0.0.26] - 2026-10-22
 

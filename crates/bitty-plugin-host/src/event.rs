@@ -192,6 +192,17 @@ pub enum EventKind {
     /// carries no input bytes, only the drain nudge. Any subscriber may
     /// observe it; no phase may intercept or veto it.
     OverlayInputAvailable,
+    /// Presentation-only overlay dismissal observation (CTX-1431, #2406).
+    ///
+    /// Additive v2 growth: when Core dismisses a plugin's presentation-only
+    /// `overlay`-slot surface (no capture grant), it delivers this
+    /// observation-only bus event with payload `{ owner, handle, reason }`
+    /// (`owner` and `reason` text, `handle` the opaque block handle). The
+    /// first reason is `"escape"` for the non-consuming `Esc` dismissal. The
+    /// event is queued to the owner's event path on the cold tick, never a
+    /// synchronous callback on the input path. Any subscriber may observe it;
+    /// no phase may intercept or veto it.
+    OverlayDismissed,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -223,6 +234,7 @@ impl EventKind {
             "workspace.changed" => Ok(Self::WorkspaceChanged),
             "overlay.released" => Ok(Self::OverlayReleased),
             "overlay.input.available" => Ok(Self::OverlayInputAvailable),
+            "overlay.dismissed" => Ok(Self::OverlayDismissed),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -255,6 +267,7 @@ impl EventKind {
             Self::WorkspaceChanged => "workspace.changed",
             Self::OverlayReleased => "overlay.released",
             Self::OverlayInputAvailable => "overlay.input.available",
+            Self::OverlayDismissed => "overlay.dismissed",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -285,7 +298,8 @@ impl EventKind {
             | Self::WorkspaceFocused
             | Self::WorkspaceChanged
             | Self::OverlayReleased
-            | Self::OverlayInputAvailable => EventClass::Observation,
+            | Self::OverlayInputAvailable
+            | Self::OverlayDismissed => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -359,6 +373,7 @@ impl EventKind {
             | Self::WorkspaceChanged
             | Self::OverlayReleased
             | Self::OverlayInputAvailable
+            | Self::OverlayDismissed
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,
@@ -1834,5 +1849,23 @@ mod tests {
         assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
         assert!(EventKind::parse("overlay.input").is_err());
         assert!(EventKind::parse("overlay.input.available.extra").is_err());
+    }
+
+    #[test]
+    fn overlay_dismissed_kind_contract() {
+        // CTX-1431 (#2406): the presentation-overlay dismissal observation is
+        // its own registered kind: it parses, round-trips, observes (never
+        // intercepts), and never coalesces, so one press maps to one
+        // observation. Payload stays ungated (`owner`, `handle`, `reason`, no
+        // input bytes or terminal content).
+        let kind = EventKind::parse("overlay.dismissed").expect("known kind");
+        assert_eq!(kind, EventKind::OverlayDismissed);
+        assert_eq!(kind.as_str(), "overlay.dismissed");
+        assert_eq!(kind.class(), EventClass::Observation);
+        assert!(!kind.is_interception());
+        assert!(!kind.is_coalescable());
+        assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
+        assert!(EventKind::parse("overlay.dismiss").is_err());
+        assert!(EventKind::parse("overlay.dismissed.extra").is_err());
     }
 }

@@ -240,7 +240,10 @@ impl Runtime {
         // fail-closed.
         if let Some(rule) = matched_rule.as_ref() {
             if rule.width.is_some() || rule.height.is_some() {
-                self.state.resize(cols as usize, rows as usize);
+                let (_, report) = self.state.resize_with_report(cols as usize, rows as usize);
+                if let Some(owner) = self.primary_view {
+                    self.remap_selection_for_resize(owner, true, report);
+                }
             }
             if let Some(owner) = self.primary_view {
                 self.stamp_rule_fixed_size(owner, rule, cols, rows);
@@ -953,13 +956,15 @@ impl Runtime {
                 None => (frame.cols.max(1), frame.rows.max(1)),
             };
             let (pixel_width, pixel_height) = self.pty_pixel_span(cols, rows);
+            let mut resize_report = None;
             if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {
                 if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
                     // CTX-0312: a single resize preserves visible content;
                     // trailing blank viewport rows absorb the height shrink
                     // before any bottom-align into scrollback, so the former
                     // two-phase workaround is gone.
-                    let _ = sess.state.resize(cols as usize, rows as usize);
+                    let (_, report) = sess.state.resize_with_report(cols as usize, rows as usize);
+                    resize_report = Some(report);
                 }
                 // Issue #2373: keep the winsize honest even when the grid
                 // already matches (spawn after a layout sync, or a lost
@@ -972,6 +977,11 @@ impl Runtime {
                         .pty
                         .resize_pixels(cols, rows, pixel_width, pixel_height);
                 }
+            }
+            // #2543: a height-only pane resize moves its rows; keep a held
+            // grid-coordinate selection on the same content.
+            if let Some(report) = resize_report {
+                self.remap_selection_for_resize(frame.view, false, report);
             }
         }
     }

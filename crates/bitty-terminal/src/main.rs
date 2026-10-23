@@ -745,12 +745,16 @@ fn main() {
         let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
         let home = std::env::var("HOME").ok();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string());
         let context = plugin::PluginContext {
             config_path: args.config_path.as_deref(),
             bitty_config_env: bitty_config_env.as_deref(),
             xdg_config_home: xdg_config_home.as_deref(),
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
+            cwd: cwd.as_deref(),
             pre_format: args.plugin_format.as_deref(),
             pre_no_color: args.plugin_no_color,
         };
@@ -947,6 +951,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // bitty#2486: real-GUI runs present only after PTY output has been quiet
+    // for one settle window. A full-screen TUI repaint can arrive as several
+    // PTY reads (the tty delivers well under one screen per read); presenting
+    // between them commits a half-applied selector. The window is bounded by
+    // `PRESENT_SETTLE_MAX` inside the runtime, so continuous producers still
+    // present. Headless and test-mode runs keep deterministic every-dirty-tick
+    // behavior.
+    if !args.headless && !args.test_mode {
+        runtime.set_present_settle(crate::terminal_app::PRESENT_SETTLE);
+    }
     // CTX-1080: install declarative panel spawn rules from the effective
     // config so PTY spawn and view initialization evaluate them.
     runtime.set_panel_spawn_rules(app_config.effective.panel_rules.clone());

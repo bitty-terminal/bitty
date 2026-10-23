@@ -415,6 +415,133 @@ fn image_placement_follows_height_and_clears_on_width_reflow() {
     assert!(s.kitty_placements().get(9, 0).is_some());
 }
 
+/// #2543 cursor-detach edge: a shrink larger than the absorbable padding
+/// pushes the cursor's own row into scrollback. The content is preserved, but
+/// the cursor clamps to row 0 because its row is no longer in the viewport
+/// (keeping it attached would require dropping newer rows).
+#[test]
+fn shrink_past_cursor_row_keeps_content_and_clamps_cursor() {
+    let mut s = State::new();
+    let mut lines = Vec::new();
+    for i in 0..12 {
+        let line = format!("body-{i:02}");
+        prints(&mut s, &line);
+        newline(&mut s);
+        lines.push(line);
+    }
+    // Park the cursor on row 4 with non-blank rows 5..11 below it.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(5),
+        col: Col(1),
+    });
+    assert_eq!(s.cursor().position.row, 4);
+    assert_each_once_in_order(&addressable_text(&s), &lines);
+
+    // used = 12 rows, so 24 -> 5 absorbs 12 blank rows and pushes 7 content
+    // rows; the cursor row is inside that pushed prefix.
+    s.resize(80, 5);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(s.scrollback_len(), 7);
+    assert_eq!(
+        s.cursor().position.row,
+        0,
+        "a pushed cursor row clamps to the viewport top"
+    );
+    let after = addressable_text(&s);
+    assert_each_once_in_order(&after, &lines);
+    assert!(
+        after.contains("body-11"),
+        "newest content must stay in the viewport: {after:?}"
+    );
+}
+
+/// #2543 "only when" direction: a shrink that leaves enough rows for the
+/// cursor row plus every used row below it keeps the cursor attached, so it
+/// shifts with its materialized row instead of clamping to row 0.
+#[test]
+fn shrink_that_keeps_cursor_row_attaches_cursor_to_shifted_content() {
+    let mut s = State::new();
+    let mut lines = Vec::new();
+    for i in 0..12 {
+        let line = format!("body-{i:02}");
+        prints(&mut s, &line);
+        newline(&mut s);
+        lines.push(line);
+    }
+    // Cursor on row 4; used = 12, so attachment needs 12 - 4 = 8 rows.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(5),
+        col: Col(1),
+    });
+    assert_eq!(s.cursor().position.row, 4);
+
+    // 10 >= 8 rows: absorb the 12 padding rows, push 2, and move the cursor
+    // with its row (4 -> 2) instead of clamping it.
+    s.resize(80, 10);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(s.scrollback_len(), 2);
+    assert_eq!(
+        s.cursor().position.row,
+        2,
+        "an attached cursor shifts with its content"
+    );
+    let after = addressable_text(&s);
+    assert_each_once_in_order(&after, &lines);
+    let snap = s.snapshot();
+    let start = 2 * snap.width;
+    assert_eq!(
+        row_text(&snap.cells[start..start + snap.width]),
+        "body-04",
+        "the cursor's row must still hold its own content"
+    );
+}
+
+/// #2543 bounded-memory tradeoff: a 1-column reflow repacks every printable
+/// cell into its own physical row. The scrollback cap then prunes the oldest
+/// rows exactly like normal scroll-under pruning: bounded memory, no panic,
+/// no orphan wide halves, and the retained suffix reflows back losslessly.
+#[test]
+fn one_column_reflow_enforces_scrollback_cap_without_corruption() {
+    const CAP: usize = 64;
+    let mut s = State::with_scrollback_lines(CAP);
+    let mut lines = Vec::new();
+    for i in 0..500 {
+        let line = format!("line-{i:03}-{}", "x".repeat(40));
+        prints(&mut s, &line);
+        newline(&mut s);
+        lines.push(line);
+    }
+    assert_eq!(s.scrollback_len(), CAP);
+    assert!(s.check_invariants().is_ok());
+
+    // 1-column pass: ~50 cells per line become ~50 rows, far beyond CAP.
+    s.resize(1, 24);
+    assert_eq!((s.width(), s.height()), (1, 24));
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        s.scrollback_len(),
+        CAP,
+        "the line cap bounds the 1-column repack"
+    );
+    for line in s.scrollback() {
+        assert_eq!(line.cells.len(), 1, "1-column rows are exactly one cell");
+        assert!(!line.cells[0].spacer, "no orphan wide spacer at width 1");
+        assert!(line.cells[0].width <= 1, "wide leads narrow at width 1");
+    }
+
+    // Widening back must reconstruct the retained suffix without corruption:
+    // the newest full line is still present exactly once and wide invariants
+    // hold across the rebuilt rows.
+    s.resize(80, 24);
+    assert_eq!((s.width(), s.height()), (80, 24));
+    assert_eq!(s.snapshot().cells.len(), 80 * 24);
+    assert!(s.check_invariants().is_ok());
+    assert_no_orphan_wides(&s);
+    let restored = addressable_text(&s);
+    let newest = lines.last().expect("fixture line");
+    assert_each_once_in_order(&restored, std::slice::from_ref(newest));
+}
+
 #[test]
 fn alt_screen_resize_stays_bounded_and_keeps_primary_history() {
     let mut s = State::new();

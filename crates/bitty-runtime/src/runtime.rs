@@ -103,7 +103,9 @@ use bitty_render::{
     grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
-use bitty_term_state::{Cell, Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
+use bitty_term_state::{
+    Cell, Damage, DamageRect, DamagedRegion, ResizeReport, Snapshot, State, TerminalAction,
+};
 use bitty_ui::{
     CellPos, FloatStore, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
     PinnedStore, Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View,
@@ -375,6 +377,21 @@ pub const DEFAULT_PASTE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Durati
 /// buggy process can never stall presentation indefinitely.
 pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Upper bound on how long presentation may be held for PTY output to go
+/// quiet (bitty#2486, [`Runtime::set_present_settle`]).
+///
+/// A full-screen TUI writes one screen repaint per logical frame, but the tty
+/// delivers it as several reads. Presenting between them commits a
+/// half-applied selector (an old row beside its replacement), which reads as
+/// ghosting or flicker under rapid cursor movement. The settle gate holds a
+/// dirty present until the stream has been quiet for the configured window,
+/// so the whole repaint applies before the frame snapshot is taken.
+///
+/// Continuous producers (a `yes` flood, a streaming log) must still present:
+/// past this bound since the burst began, the latest state commits even
+/// though bytes keep arriving.
+pub const PRESENT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
 ///
@@ -562,6 +579,28 @@ pub struct Runtime {
     /// consumes damage). While set, `present_coalescing_deadline` arms the
     /// app wake so a quiet window still presents the latest frame on time.
     coalesced_pending: bool,
+    /// Wake deadline of the deferred frame, if any (CTX-1231, bitty#2486).
+    ///
+    /// The later of the cadence and PTY-quiescence opening times computed on
+    /// the deferring tick; `present_coalescing_deadline` reports it so the
+    /// embedder can arm one wait instead of polling. Stored rather than
+    /// recomputed: the settle gate also needs the burst start to apply its
+    /// [`PRESENT_SETTLE_MAX`] cap.
+    coalesced_deadline: Option<std::time::Instant>,
+    /// PTY-quiescence settle window for presentation (bitty#2486).
+    ///
+    /// `ZERO` (default) presents on every dirty tick, unchanged. A non-zero
+    /// window holds a dirty present until PTY input has been quiet for this
+    /// long (bounded by [`PRESENT_SETTLE_MAX`] since the burst began), so a
+    /// multi-read screen repaint is applied whole before the frame snapshot
+    /// is taken. See [`Runtime::set_present_settle`].
+    present_settle: std::time::Duration,
+    /// Arrival time of the most recent PTY output consumed by the embedder,
+    /// if any (`Runtime::note_present_input`). Cleared on every present.
+    settle_input_at: Option<std::time::Instant>,
+    /// Arrival time of the first byte in the current PTY output burst,
+    /// cleared on every present (the [`PRESENT_SETTLE_MAX`] cap base).
+    settle_burst_at: Option<std::time::Instant>,
     /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
     /// Geometry-only layout changes (tree edits via `layout_mut`,
@@ -709,6 +748,14 @@ pub struct Runtime {
     /// `None` with no capture, so the present path is byte-identical to the
     /// pre-overlay frame. Presentation-only: never grid truth.
     plugin_overlay: Option<BandContent>,
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// Populated from the plugin runtime's live presentation session each
+    /// tick. Paint-only and non-modal: no hit-testing, no pointer capture, no
+    /// input routing, and never the modal authority. Painted below the
+    /// focusable capture surface and above the chrome bands, centered on the
+    /// focused view and clipped to its frame. `None` with no session.
+    presentation_overlay: Option<BandContent>,
     /// Present-time target annotation batch (W-29 successor, issue #2253).
     ///
     /// Populated from `PluginRuntime::target_annotations()` each tick and
@@ -1823,6 +1870,10 @@ impl Runtime {
             last_present_at: None,
             presents_coalesced: 0,
             coalesced_pending: false,
+            coalesced_deadline: None,
+            present_settle: std::time::Duration::ZERO,
+            settle_input_at: None,
+            settle_burst_at: None,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,
@@ -2008,6 +2059,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            presentation_overlay: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2107,6 +2159,10 @@ impl Runtime {
             last_present_at: None,
             presents_coalesced: 0,
             coalesced_pending: false,
+            coalesced_deadline: None,
+            present_settle: std::time::Duration::ZERO,
+            settle_input_at: None,
+            settle_burst_at: None,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
             layout,
@@ -2292,6 +2348,7 @@ impl Runtime {
                 right: Vec::new(),
             },
             plugin_overlay: None,
+            presentation_overlay: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2576,6 +2633,40 @@ impl Runtime {
         if self.plugin_overlay.is_none() {
             self.plugin_overlay_anchor = None;
         }
+        if changed {
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
+    ///
+    /// The live `overlay`-slot block of the one plugin holding the
+    /// presentation session, or `None`. Paint-only: the surface has no
+    /// hit-testing, no pointer capture, and no input routing, and it never
+    /// touches the modal authority. Follows the focused view; a focus switch
+    /// re-centers it and never dismisses it.
+    #[must_use]
+    pub fn presentation_overlay(&self) -> Option<&BandContent> {
+        self.presentation_overlay.as_ref()
+    }
+
+    /// Updates the presentation-only overlay surface (CTX-1431).
+    ///
+    /// Marks a full redraw only when the surface actually changes (appears,
+    /// clears, or the retained block's version/content moves), so ticks stay
+    /// idle while an unchanged panel is up. `None` clears the surface.
+    pub fn set_presentation_overlay(&mut self, overlay: Option<BandContent>) {
+        let changed = match (&self.presentation_overlay, &overlay) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(current), Some(next)) => {
+                current.plugin_id != next.plugin_id
+                    || current.slot != next.slot
+                    || current.version != next.version
+                    || current.root != next.root
+            }
+        };
+        self.presentation_overlay = overlay;
         if changed {
             self.pending_full_redraw = true;
         }

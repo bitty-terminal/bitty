@@ -2888,6 +2888,21 @@ impl TerminalApp {
                 if is_modifier_key(key) {
                     return false;
                 }
+                // CTX-1431 (`bitty` #2406): an `Esc` press dismisses the
+                // presentation-only overlay before normal routing. The press
+                // is NOT consumed here: it continues to the confirmation
+                // gates, user keymap, and terminal encoding below, so a
+                // fullscreen app still receives it unless a real gate owns
+                // the consume (then the gate and the overlay drop together).
+                // A focusable capture session owns `Esc` while active, so the
+                // presentation surface waits for that session to end.
+                if !key.is_synthetic
+                    && matches!(&key.logical_key, LogicalKey::Named(NamedKey::Escape))
+                    && !self.overlay_capture_active()
+                    && self.presentation_overlay_active()
+                {
+                    self.dismiss_presentation_overlay();
+                }
                 if let Some(keyref) = key_ref_from_event(key, &self.chrome.app_mods) {
                     // Still physically held from a consumed chord press: stay
                     // swallowed even when the mirror decayed (release cascade).

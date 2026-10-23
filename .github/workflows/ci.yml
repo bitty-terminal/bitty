@@ -204,6 +204,7 @@ jobs:
           bash scripts/check-pkgbuild-bin.sh
           bash scripts/check-spec.sh
           bash scripts/tests/check-package-manifests.test.sh
+          bash scripts/tests/check-release-smoke-fail-closed.test.sh
           bash scripts/tests/check-aur-bin-render.test.sh
           bash scripts/tests/check-apt-repo.test.sh
           bash scripts/tests/check-nix-flake.test.sh

@@ -254,6 +254,7 @@ mod prefix_dispatch;
 mod profile;
 mod runtime_inspect;
 mod storage_backends;
+mod storage_component_host;
 mod version;
 
 mod list;

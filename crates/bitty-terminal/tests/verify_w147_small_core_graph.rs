@@ -16,7 +16,10 @@
 //!   `bitty-observability-core`, `bitty-network`, `bitty-net`) must have no
 //!   normal dependency edge and no Core source identifier; `bitty-storage` is
 //!   the single composition-root mechanics seam, linked only by
-//!   `bitty-terminal` and named only in `storage_backends.rs`.
+//!   `bitty-terminal` and named only in `storage_backends.rs` plus the
+//!   default-off component host and its hermetic fixture
+//!   (`crates/bitty-terminal/src/storage_component_host.rs`,
+//!   `crates/bitty-terminal/src/bin/bitty-storage-component-fixture.rs`).
 //!   `bitty-a11y` is the deliberate accessibility snapshot-model/component
 //!   seam (CTX-1362 / CTX-1466 / #2257 / #2496): linked only by `bitty-ui` and
 //!   named only in `crates/bitty-ui/src/a11y_host.rs` (`SOURCE_SEAM_FILES`).
@@ -153,8 +156,7 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
 /// tracks the remainder in #2163. This module is a designated contract naming
 /// point rather than an import site.
 const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
-
-/// Seam crates whose Core source references are restricted to explicit files.
+/// Crates whose Core source references are restricted to explicit files.
 ///
 /// `bitty-a11y` is a model/protocol seam, not a general-purpose contract Core
 /// anywhere: exactly `crates/bitty-ui/src/a11y_host.rs` implements
@@ -167,6 +169,10 @@ const GRAPHICS_SOURCE_SEAM: &str = "crates/bitty-rich/src/kitty_seam.rs";
 /// `GRAPHICS_SOURCE_SEAM`; its composition-root binding has no separate open
 /// task, with `bitty-graphics#17` as the extension-side gate and #2163 as the
 /// Core tracker.
+/// `bitty-storage` is the composition-root mechanics seam: the linked adapter
+/// (`storage_backends.rs`) and the default-off component host
+/// (`storage_component_host.rs`) plus its hermetic fixture binary are the only
+/// files allowed to name either storage pin (CTX-1479 / bitty#2495).
 const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
     ("bitty-a11y", &["crates/bitty-ui/src/a11y_host.rs"]),
     (
@@ -179,6 +185,14 @@ const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
         ],
     ),
     ("bitty-graphics", &[GRAPHICS_SOURCE_SEAM]),
+    (
+        "bitty-storage",
+        &[
+            "crates/bitty-terminal/src/storage_backends.rs",
+            "crates/bitty-terminal/src/storage_component_host.rs",
+            "crates/bitty-terminal/src/bin/bitty-storage-component-fixture.rs",
+        ],
+    ),
 ];
 
 /// Rust identifiers for source-restricted seam crates. The component client
@@ -189,6 +203,10 @@ const SOURCE_SEAM_IDENTIFIERS: &[(&str, &[&str])] = &[
     ("bitty-a11y", &["bitty_a11y", "bitty_a11y_component"]),
     ("bitty-execution", &["bitty_execution"]),
     ("bitty-graphics", &["bitty_graphics"]),
+    (
+        "bitty-storage",
+        &["bitty_storage", "bitty_storage_component"],
+    ),
 ];
 
 /// Crates published from the bitty-terminal org that are intentionally not
@@ -1243,26 +1261,18 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Source-level fence violations: Core library sources may not name an
 /// implementation crate. Seam crates are legal by design, except a source
 /// seam restricted by [`SOURCE_SEAM_FILES`]; `bitty-storage` is legal only in
-/// its composition-root seam file. The graphics entry is a source seam with no
-/// dependency edge, so it is legal only in [`GRAPHICS_SOURCE_SEAM`].
+/// its composition-root adapter, default-off host, and hermetic fixture. The
+/// graphics entry is a source seam with no dependency edge, so it is legal only
+/// in [`GRAPHICS_SOURCE_SEAM`].
 fn extension_source_violations(root: &Path) -> Vec<String> {
     let members = workspace_members(root);
-    let storage_seam = root
-        .join("crates")
-        .join("bitty-terminal")
-        .join("src")
-        .join("storage_backends.rs");
     let mut violations = Vec::new();
     for extension in EXTENSION_CRATES {
-        let is_storage = *extension == "bitty-storage";
         let source_seam = SOURCE_SEAM_FILES
             .iter()
             .find(|(seam, _)| seam == extension)
             .map(|(_, paths)| paths.iter().map(|path| root.join(path)).collect::<Vec<_>>());
-        if !is_storage
-            && source_seam.is_none()
-            && SEAM_CRATES.iter().any(|(seam, _)| seam == extension)
-        {
+        if source_seam.is_none() && SEAM_CRATES.iter().any(|(seam, _)| seam == extension) {
             continue;
         }
         let identifiers: Vec<String> = SOURCE_SEAM_IDENTIFIERS
@@ -1280,12 +1290,9 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
             let mut files = Vec::new();
             rust_files(&src, &mut files);
             for file in files {
-                // The storage composition-root seam and a source-restricted
-                // model seam are the only files that may name their
+                // A source-restricted seam (storage, a11y, execution, or
+                // graphics) is the only place allowed to name its own
                 // implementation; every other identifier is banned everywhere.
-                if is_storage && file == storage_seam {
-                    continue;
-                }
                 if source_seam
                     .as_ref()
                     .is_some_and(|paths| paths.contains(&file))
@@ -1344,7 +1351,9 @@ fn core_library_sources_never_name_extension_impls() {
     // (audit CTX-1085 F10), so this scan rejects the Rust identifiers directly.
     // The composition-root exception is `storage_backends.rs`, which may name
     // `bitty_storage` to implement the Core-owned backends behind Core
-    // validation; every other crate reaches persistence through the
+    // validation; the default-off component host and its hermetic fixture are
+    // the only other storage naming points (CTX-1479 / bitty#2495). Every
+    // other crate reaches persistence through the
     // `SessionFileBackend` / `KvCommitBackend` traits. Seam crates
     // (`bitty-ipc`, `bitty-network-wire`, `bitty-network-publication`,
     // `bitty-observability-api`, `bitty-platform-services`,

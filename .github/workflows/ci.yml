@@ -47,6 +47,18 @@ jobs:
       # DWARF. Keep symbols for backtraces, drop the bulk.
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      # #2561: one target tree per runner. Shard 2 also builds the pinned
+      # bitty-perf suite from `external/bitty-perf`; without an absolute
+      # CARGO_TARGET_DIR that invocation allocates its own full
+      # `external/bitty-perf/target` debug tree beside this workspace's, and
+      # the duplicate product graph exhausted the hosted disk (ld SIGBUS,
+      # then ENOSPC). Absolute so the bench step's working directory cannot
+      # fork it. The same dir serves the M1 compat-lab suites in the platform
+      # jobs below.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # CI compiles each unit once, so incremental state is dead weight in
+      # target/debug/incremental (multi-GB) and only adds disk churn.
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -318,6 +330,13 @@ jobs:
         if: matrix.shard == 1
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # #2561: the bench build shares this job's target dir, so report the
+      # budget before it starts and fail with an infrastructure signal when it
+      # cannot fit, instead of letting `ld` die on an mmap write.
+      - name: Report bench disk budget (perf suite, quality shard 2)
+        if: matrix.shard == 2
+        run: ./scripts/ci-disk-budget.sh --label "before pinned bitty-perf benches (quality)" --min-free-mib 6144
+
       # CTX-0847: the previous `cargo test --all-targets` also executed the
       # bitty-perf benches; nextest runs none of them, so that coverage is
       # kept explicitly here, now executed in the pinned external bitty-perf
@@ -327,7 +346,27 @@ jobs:
       - name: Run benches (pinned bitty-perf suite)
         if: matrix.shard == 2
         working-directory: external/bitty-perf
+        env:
+          # #2561: each bench binary statically links the whole product graph,
+          # so bound concurrent rustc/link jobs to keep the peak predictable.
+          CARGO_BUILD_JOBS: "2"
         run: cargo test --benches --locked
+
+      # #2561: peak footprint of the bench build, and proof that it compiled
+      # into the shared workspace target dir instead of a second tree.
+      - name: Report bench disk usage (perf suite, quality shard 2)
+        if: always() && matrix.shard == 2
+        run: ./scripts/ci-disk-budget.sh --label "after pinned bitty-perf benches (quality)"
+
+      # #2561: the bench graph lives in the shared workspace target dir, so
+      # there is no separate perf tree to free. Keep the removal as a fail-safe
+      # against a stale tree restored from cache or reintroduced by a
+      # step-level CARGO_TARGET_DIR (see the linux-x11 reclaim step).
+      - name: Reclaim perf build directory (quality shard 2)
+        if: matrix.shard == 2
+        run: |
+          rm -rf external/bitty-perf/target
+          df -h "$GITHUB_WORKSPACE"
 
       # CTX-0922: the default nextest run only covers the compiled-out
       # `bitty dev` paths; rerun the CLI suite and the `dev::` unit tests
@@ -349,6 +388,14 @@ jobs:
       - name: Check M1 matrix driver (fixture test)
         if: matrix.shard == 1
         run: bash scripts/tests/m1-matrix.test.sh
+
+      # #2561: the pinned perf suite must compile into the shared workspace
+      # target dir (one target tree per runner), keep its defensive reclaim
+      # step, and bracket the bench step with disk breadcrumbs.
+      - name: Check perf-suite disk guard (fixture test)
+        if: matrix.shard == 1
+        run: bash scripts/tests/perf-disk.test.sh
+
       # M1-11 / CTX-0576: the committed parser-throughput baseline guards the
       # compatibility-milestone performance requirement (no pathological
       # regression versus plain-text throughput). The check is bounded
@@ -540,9 +587,33 @@ jobs:
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.
       BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
+      # #2561: one target tree for the whole job. The pinned bitty-perf bench
+      # build, and the M1 compat-lab suites this job runs through
+      # scripts/m1-matrix.sh, all compile into this workspace's target dir
+      # instead of allocating their own full debug tree beside it (ld SIGBUS,
+      # then ENOSPC; see the quality job comment).
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      # #2561 / #2448: the bench binaries statically link the whole product
+      # graph, so full DWARF dominated their footprint. Line tables keep
+      # file:line in panic output at a fraction of the disk, the same policy
+      # the quality and compat jobs already apply.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # #2561: the hosted image ships multi-GB SDKs this Rust workspace never
+      # uses. Reclaim them before the caches restore and the build starts, the
+      # same step the quality job runs since #2448; this is the headroom the
+      # shared-target bench build below is measured against.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
 
       # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality so
       # the three ubuntu jobs share dep units.
@@ -646,6 +717,11 @@ jobs:
       - name: Run harness=false platform entry points (X11)
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # #2561: report the budget before the bench build and fail with an
+      # infrastructure signal when it cannot fit (see the quality job step).
+      - name: Report bench disk budget (X11)
+        run: ./scripts/ci-disk-budget.sh --label "before pinned bitty-perf benches (X11)" --min-free-mib 6144
+
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so that coverage is kept
       # explicitly here (headless, opt-in benches exit 0 with UNMEASURED
@@ -655,14 +731,27 @@ jobs:
       # repository (own CI).
       - name: Run benches (X11, pinned bitty-perf suite)
         working-directory: external/bitty-perf
+        env:
+          # #2561: each bench binary statically links the whole product graph,
+          # so bound concurrent rustc/link jobs to keep the peak predictable.
+          CARGO_BUILD_JOBS: "2"
         run: cargo test --benches --locked
 
-      # #2448: free the perf graph now that its only consumer (the benches
-      # above) is done, before M1 builds the second external graph
-      # (bitty-compat-lab). The runner was within 5 MB of full at this point;
-      # one external graph on disk at a time is the budget.
+      # #2561: peak footprint of the bench build, and proof that it compiled
+      # into the shared workspace target dir instead of a second tree.
+      - name: Report bench disk usage (X11)
+        if: always()
+        run: ./scripts/ci-disk-budget.sh --label "after pinned bitty-perf benches (X11)"
+
+      # #2448 / #2561: the bench graph now lives in the shared workspace
+      # target dir, so M1 below reuses it and there is no separate perf tree to
+      # free. Keep the removal as a fail-safe: it drops a stale tree restored
+      # from cache or reintroduced by a step-level CARGO_TARGET_DIR, so one
+      # runner never holds two product graphs again.
       - name: Reclaim perf build directory
-        run: rm -rf external/bitty-perf/target
+        run: |
+          rm -rf external/bitty-perf/target
+          df -h "$GITHUB_WORKSPACE"
 
       # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
@@ -703,9 +792,25 @@ jobs:
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.
       BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
+      # #2561: same single-target-tree rule as linux-x11 (see that job).
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # #2561: the hosted image ships multi-GB SDKs this Rust workspace never
+      # uses. Reclaim them before the caches restore and the build starts, the
+      # same step the quality job runs since #2448; this is the headroom the
+      # shared-target bench build below is measured against.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
 
       # CTX-0971 R4: same Cargo.lock-scoped sccache namespace as quality so
       # the three ubuntu jobs share dep units.
@@ -808,6 +913,11 @@ jobs:
       - name: Run harness=false platform entry points (Wayland)
         run: cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
+      # #2561: report the budget before the bench build and fail with an
+      # infrastructure signal when it cannot fit (see the linux-x11 step).
+      - name: Report bench disk budget (Wayland)
+        run: ./scripts/ci-disk-budget.sh --label "before pinned bitty-perf benches (Wayland)" --min-free-mib 6144
+
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so that coverage is kept
       # explicitly here, executed in the pinned external bitty-perf checkout
@@ -815,13 +925,24 @@ jobs:
       # extraction to the independent bitty-ipc repository (own CI).
       - name: Run benches (Wayland, pinned bitty-perf suite)
         working-directory: external/bitty-perf
+        env:
+          # #2561: each bench binary statically links the whole product graph,
+          # so bound concurrent rustc/link jobs to keep the peak predictable.
+          CARGO_BUILD_JOBS: "2"
         run: cargo test --benches --locked
 
-      # #2448: free the perf graph now that its only consumer (the benches
-      # above) is done, before M1 builds the second external graph
-      # (bitty-compat-lab); see the linux-x11 reclaim step.
+      # #2561: peak footprint of the bench build, and proof that it compiled
+      # into the shared workspace target dir instead of a second tree.
+      - name: Report bench disk usage (Wayland)
+        if: always()
+        run: ./scripts/ci-disk-budget.sh --label "after pinned bitty-perf benches (Wayland)"
+
+      # #2448 / #2561: see the linux-x11 reclaim step (stale-tree fail-safe;
+      # M1 reuses the shared workspace target dir).
       - name: Reclaim perf build directory
-        run: rm -rf external/bitty-perf/target
+        run: |
+          rm -rf external/bitty-perf/target
+          df -h "$GITHUB_WORKSPACE"
 
       # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
       # suites are display-independent; the Wayland env above only proves the
@@ -1099,6 +1220,11 @@ jobs:
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.
       BITTY_COMPAT_LAB_DIR: external/bitty-compat-lab
+      # #2561: the pinned perf bench build shares the workspace target dir
+      # here too, so this job holds one product graph instead of two. The
+      # macOS runner has more disk headroom than the Linux one, so it keeps
+      # the default profile debuginfo and build parallelism.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1195,6 +1321,12 @@ jobs:
       - name: Check install scripts live legs (fake-CDN fixture test)
         run: bash scripts/tests/install-scripts.test.sh
 
+      # #2561: report the budget around the bench build; macOS keeps the
+      # default profile and parallelism (more disk headroom than Linux), so
+      # this step is diagnostics only.
+      - name: Report bench disk budget (macOS ARM64)
+        run: ./scripts/ci-disk-budget.sh --label "before pinned bitty-perf benches (macOS ARM64)"
+
       # CTX-0847: the previous `--all-targets` run also executed the bitty-perf
       # benches; nextest runs none of them, so that coverage is kept
       # explicitly here, executed in the pinned external bitty-perf checkout
@@ -1202,7 +1334,21 @@ jobs:
       # extraction to the independent bitty-ipc repository (own CI).
       - name: Run benches (macOS ARM64, pinned bitty-perf suite)
         working-directory: external/bitty-perf
+        env:
+          # #2561: bound concurrent rustc/link jobs so the peak stays flat.
+          CARGO_BUILD_JOBS: "2"
         run: cargo test --benches --locked
+
+      - name: Report bench disk usage (macOS ARM64)
+        if: always()
+        run: ./scripts/ci-disk-budget.sh --label "after pinned bitty-perf benches (macOS ARM64)"
+
+      # #2561: the bench build shares the workspace target dir, so this only
+      # drops a stale tree if one reappears (see the linux-x11 reclaim step).
+      - name: Reclaim perf build directory
+        run: |
+          rm -rf external/bitty-perf/target
+          df -h "$GITHUB_WORKSPACE"
 
       # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
       # suites are headless and free of window/font/GPU dependencies, so the

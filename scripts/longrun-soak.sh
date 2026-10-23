@@ -331,11 +331,15 @@ start_app() {
   export XDG_CACHE_HOME="$ROOT/cache"
   export DISPLAY=":$DISPLAY_NUM"
   unset WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE
-  # Clear inherited Bitty overrides so an agent shell cannot redirect the
-  # run's config/profile/plugins or force headless/demo/elevated behavior.
-  # `BITTY_PLUGIN_DIR` comes back only through the explicit --plugin-dir.
-  unset BITTY_CONFIG BITTY_PROFILE BITTY_PLUGIN_DIR BITTY_COMPONENTS_DIR \
-    BITTY_COMPONENT_STATE_DIR BITTY_HEADLESS BITTY_DEMO_PUMP BITTY_CTL_ELEVATE
+  # Clear every inherited Bitty override so an agent shell cannot redirect
+  # the run's config/profile/plugins/socket/components/logging or force
+  # headless/demo/elevated behavior. `BITTY_PLUGIN_DIR` comes back only
+  # through the explicit --plugin-dir, and the required watchdog exports are
+  # set below this loop.
+  local inherited
+  for inherited in $(compgen -e | grep '^BITTY_' || true); do
+    unset "$inherited"
+  done
   export SHELL="$SHELL_BIN"
   export BITTY_INSTANCE_ID="soak$DISPLAY_NUM"
   export BITTY_STALL_WATCHDOG=1

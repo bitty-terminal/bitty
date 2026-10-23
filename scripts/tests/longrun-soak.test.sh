@@ -64,19 +64,15 @@ expect_exit 2 "$SOAK" --dry-run --binary /nonexistent/bitty
 # A plan that would exceed the sample cap fails closed instead of truncating.
 expect_exit 2 "$SOAK" --dry-run --duration-secs 86400 --interval-secs 1
 
-# Issue #2497: the live launcher clears inherited Bitty overrides. The
-# headless contract cannot start the app, so assert the exact unset list.
-UNSET_BLOCK="$(sed -n '/^  unset BITTY_CONFIG /,/BITTY_CTL_ELEVATE$/p' "$SOAK")"
-for var in BITTY_CONFIG BITTY_PROFILE BITTY_PLUGIN_DIR BITTY_COMPONENTS_DIR \
-  BITTY_COMPONENT_STATE_DIR BITTY_HEADLESS BITTY_DEMO_PUMP BITTY_CTL_ELEVATE; do
-  case "$UNSET_BLOCK" in
-  *"$var"*) ;;
-  *)
-    echo "FAIL: launcher does not clear inherited $var" >&2
-    FAIL=1
-    ;;
-  esac
-done
+# Issue #2497: the live launcher clears every inherited BITTY_* override. The
+# headless contract cannot start the app, so assert the dynamic unset loop.
+UNSET_LOOP="$(sed -n '/^  local inherited$/,/^  done$/p' "$SOAK")"
+if ! grep -qF 'compgen -e' <<<"$UNSET_LOOP" ||
+  ! grep -qF "grep '^BITTY_'" <<<"$UNSET_LOOP" ||
+  ! grep -qF 'unset "$inherited"' <<<"$UNSET_LOOP"; then
+  echo "FAIL: launcher does not clear inherited BITTY_* variables" >&2
+  FAIL=1
+fi
 
 # Default plan math and the bounded knobs are visible before any process runs.
 expect_stdout "samples=61" "$SOAK" --dry-run --binary /bin/true

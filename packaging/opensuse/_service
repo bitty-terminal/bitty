@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OBS source service for the openSUSE package (CTX-1474, #2514).
+
+  Every service is declared mode="disabled" so an in-tree run never touches the
+  network: `osc service disabledrun` regenerates bitty-<version>.tar.gz by hand
+  when a release is prepared, and the OBS project enables the services
+  explicitly before the first build. See README.md for the operator steps.
+
+  tar_scm checks out the release tag from git (submodules included, the docs
+  submodule ships the reference documentation), recompress produces the gzip
+  tarball named after the spec's Source0, and set_version keeps the spec's
+  Version field aligned with the tarball when the service is enabled.
+
+  cargo_vendor stays commented out until the project switches to offline
+  builds: enabling it emits vendor.tar.zst plus a cargo config that the spec
+  would then have to unpack (see README.md, "Offline and vendored builds").
+-->
+<services>
+  <service name="tar_scm" mode="disabled">
+    <param name="url">https://github.com/bitty-terminal/bitty.git</param>
+    <param name="scm">git</param>
+    <param name="revision">v0.0.27</param>
+    <param name="filename">bitty</param>
+    <param name="versionformat">@PARENT_TAG@</param>
+    <param name="versionrewrite-pattern">v(.*)</param>
+    <param name="versionrewrite-replacement">\1</param>
+    <param name="submodules">enable</param>
+    <param name="changesgenerate">enable</param>
+  </service>
+  <service name="recompress" mode="disabled">
+    <param name="file">*.tar</param>
+    <param name="compression">gz</param>
+  </service>
+  <service name="set_version" mode="disabled">
+    <param name="basename">bitty</param>
+  </service>
+  <!--
+  <service name="cargo_vendor" mode="disabled">
+    <param name="srcdir">bitty</param>
+    <param name="compression">zst</param>
+  </service>
+  -->
+</services>

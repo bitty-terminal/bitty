@@ -181,6 +181,16 @@ const SOURCE_SEAM_FILES: &[(&str, &[&str])] = &[
     ("bitty-graphics", &[GRAPHICS_SOURCE_SEAM]),
 ];
 
+/// Rust identifiers for source-restricted seam crates. The component client
+/// uses a Cargo alias so its unmerged protocol pin can coexist with the
+/// linked model pin; that alias is fenced just as deliberately as the package
+/// identifier.
+const SOURCE_SEAM_IDENTIFIERS: &[(&str, &[&str])] = &[
+    ("bitty-a11y", &["bitty_a11y", "bitty_a11y_component"]),
+    ("bitty-execution", &["bitty_execution"]),
+    ("bitty-graphics", &["bitty_graphics"]),
+];
+
 /// Crates published from the bitty-terminal org that are intentionally not
 /// extension crates: `phodopus` is the Lua VM linked by `bitty-lua`, not an
 /// extracted extension.
@@ -1255,7 +1265,13 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
         {
             continue;
         }
-        let ident = extension.replace('-', "_");
+        let identifiers: Vec<String> = SOURCE_SEAM_IDENTIFIERS
+            .iter()
+            .find(|(seam, _)| *seam == *extension)
+            .map_or_else(
+                || vec![extension.replace('-', "_")],
+                |(_, ids)| ids.iter().map(|id| (*id).to_owned()).collect(),
+            );
         for member in &members {
             let src = root.join("crates").join(member).join("src");
             if !src.is_dir() {
@@ -1277,8 +1293,10 @@ fn extension_source_violations(root: &Path) -> Vec<String> {
                     continue;
                 }
                 let text = std::fs::read_to_string(&file).expect("read rs file");
-                if names_crate(&text, &ident) {
-                    violations.push(format!("{} names `{ident}`", file.display()));
+                for ident in &identifiers {
+                    if names_crate(&text, ident) {
+                        violations.push(format!("{} names `{ident}`", file.display()));
+                    }
                 }
             }
         }

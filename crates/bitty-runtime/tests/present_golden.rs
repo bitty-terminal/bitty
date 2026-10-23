@@ -52,6 +52,12 @@
 //! preedit ground) instead of fixed Bitty Dark constants, so a live theme
 //! switch recolors them with the terminal. Geometry, text, and stats are
 //! unchanged; only fill/glyph colors moved.
+//!
+//! The `help_shown` digest was re-recorded under CTX-1477 (#2468): the help
+//! card is now a rounded SDF surface plus a one-physical-pixel muted ring
+//! (theme idle outline) painted on the overlay-rounded layer, instead of a
+//! full-cell ANSI 12 border. This is an explicit behavior change: geometry
+//! inside the panel, text, and the hidden-frame digest are unchanged.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -215,7 +221,9 @@ fn golden_help_overlay_shown_then_hidden() {
     ]);
     assert!(rt.toggle_help(), "help toggles on");
     let shown = rt.tick().expect("overlay present");
-    assert_digest("help_shown", &rt, &shown, 0xedde_b201_53a9_7109);
+    // Re-recorded under CTX-1477 (#2468): thin muted rounded card replaces
+    // the full-cell accent border; the hidden frame is unchanged.
+    assert_digest("help_shown", &rt, &shown, 0x7b04_a8bf_d5c7_7485);
     assert!(!rt.toggle_help(), "help toggles off");
     let hidden = rt.tick().expect("dismissal present");
     assert_digest("help_hidden", &rt, &hidden, 0xa769_7a2c_a636_3963);

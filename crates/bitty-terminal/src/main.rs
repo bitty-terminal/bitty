@@ -301,15 +301,16 @@ use terminal_app::window_title_for_theme;
 
 #[cfg(test)]
 use init::{
-    InitAnswers, InitEnv, InitKeyPreset, InitOverrides, InitPreview, InitProfilePreset,
-    InitWriteError, PROFILE_LIGHT_THEME, init_apply_overrides, init_bundled_plugin_components,
-    init_clean_shell, init_detect_shell_for_handoff, init_lua_escape,
-    init_parse_close_confirm_answer, init_parse_decoration_answer, init_parse_font_family_answer,
-    init_parse_font_size_answer, init_parse_plugins_answer, init_parse_plugins_flag,
-    init_parse_preset_answer, init_parse_scrollback_answer, init_parse_shell_answer,
-    init_parse_theme_answer, init_parse_yes_no_answer, init_preset_answers, init_shell_candidates,
-    init_shell_init_line, init_shell_name_from_path, init_shell_source_hint, init_usage,
-    init_yes_defaults, render_init_lua, render_minimal_profile_lua, run_init_interactive,
+    DEFAULT_PROFILE_NAME, InitAnswers, InitEnv, InitKeyPreset, InitOverrides, InitPreview,
+    InitProfilePreset, InitWriteError, PROFILE_LIGHT_THEME, init_apply_overrides,
+    init_bundled_plugin_components, init_clean_shell, init_detect_shell_for_handoff,
+    init_lua_escape, init_parse_close_confirm_answer, init_parse_decoration_answer,
+    init_parse_font_family_answer, init_parse_font_size_answer, init_parse_plugins_answer,
+    init_parse_plugins_flag, init_parse_preset_answer, init_parse_scrollback_answer,
+    init_parse_shell_answer, init_parse_theme_answer, init_parse_yes_no_answer,
+    init_preset_answers, init_shell_candidates, init_shell_init_line, init_shell_name_from_path,
+    init_shell_source_hint, init_usage, init_yes_defaults, render_init_lua,
+    render_minimal_profile_lua, render_selector_lua, run_init_interactive,
     run_init_interactive_with_preview, run_init_subcommand_with_io, write_init_config,
 };
 

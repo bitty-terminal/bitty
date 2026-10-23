@@ -757,91 +757,706 @@ pub(crate) fn init_lua_escape(raw: &str) -> String {
     out
 }
 
+/// Appends one generated Lua line at `indent` spaces.
+fn init_line(out: &mut String, indent: usize, text: &str) {
+    out.push_str(&" ".repeat(indent));
+    out.push_str(text);
+    out.push('\n');
+}
+
+/// Indents a generated Lua snippet by `indent` spaces.
+///
+/// Snippets carry their own relative indentation (four spaces per nesting
+/// level). With `commented`, `-- ` is inserted after the indent so a whole
+/// example block can be uncommented verbatim; the commented form therefore
+/// stays valid Lua and stays covered by the template tests.
+fn init_block(code: &str, indent: usize, commented: bool) -> String {
+    let mut out = String::with_capacity(code.len() + indent);
+    for line in code.trim_end_matches('\n').lines() {
+        out.push_str(&" ".repeat(indent));
+        if commented {
+            out.push_str("-- ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+// Commented schema examples shared by the generated profile and the
+// `config edit` starter. Every snippet is valid Lua when its leading `-- `
+// is removed, so the examples cannot drift from the accepted schema.
+
+const INIT_EXAMPLE_ANIMATIONS: &str = concat!(
+    "animations = {\n",
+    "    enabled = true, -- master switch\n",
+    "    reduced_motion = \"auto\", -- never | always | auto\n",
+    "    duration_ms = {\n",
+    "        open = 150, close = 120, focus = 100, workspace = 200, -- 0..=500 ms\n",
+    "        move = 150, resize = 120, drag = 150, -- 0..=500 ms\n",
+    "    },\n",
+    "    easing = {\n",
+    "        open = \"ease_out\", close = \"ease_in\", focus = \"ease_in_out\",\n",
+    "        workspace = \"ease_in_out\", move = \"ease_in_out\",\n",
+    "        resize = \"ease_in_out\", drag = \"ease_out\", -- linear | ease_in | ease_out | ease_in_out | spring\n",
+    "    },\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_WINDOW: &str = concat!(
+    "window = {\n",
+    "    opacity = 1.0, -- 0.0..=1.0\n",
+    "    padding = 8, -- 0..=64 logical px\n",
+    "    radius_px = 0, -- 0..=24; parsed no-op today\n",
+    "    blur_radius = 0, -- only 0 is accepted (OQ-038)\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_LAYOUT: &str = concat!(
+    "layout = {\n",
+    "    gaps_in = 0, -- 0..=16 cells; 0 = edge-to-edge\n",
+    "    gaps_out = 0, -- 0..=16 cells\n",
+    "    resize_step = 0.05, -- 0.01..=0.20 split ratio per keypress\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_SELECTION: &str = concat!(
+    "selection = {\n",
+    "    auto_copy = false, -- copy-on-select; Ctrl+Shift+C always copies\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_MOUSE: &str = concat!(
+    "mouse = {\n",
+    "    focus_follows_mouse = true, -- false = click-to-focus\n",
+    "    focus_follows_mouse_delay_ms = 0, -- 0..=2000 ms\n",
+    "    right = \"none\", -- \"none\" or a keymap action\n",
+    "    middle = \"paste_from_primary\", -- shipped default\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_WORKSPACE: &str = concat!(
+    "workspace = {\n",
+    "    layout = \"dwindle\", -- default provider for new workspaces\n",
+    "    show_bar = true, -- bar-plugin input\n",
+    "    bar = {\n",
+    "        edge = \"bottom\", -- top | bottom\n",
+    "    },\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_SCROLLBAR: &str = concat!(
+    "scrollbar = {\n",
+    "    mode = \"auto\", -- auto | always | hidden\n",
+    "    width = 8, -- 1..=32 logical px\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_VIEWS: &str = concat!(
+    "views = {\n",
+    "    [\"*\"] = { border_color_focused = \"#33CCFF\" },\n",
+    "    [\"ws:2\"] = { border_width_idle = 1 },\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_INPUT: &str = concat!(
+    "input = {\n",
+    "    leader = \"ctrl+b\", -- default: alt+space (ctrl+space on Windows)\n",
+    "    timeout_len = 1000, -- 100..=60000 ms\n",
+    "},\n",
+);
+
+const INIT_EXAMPLE_FONT_OPTIONAL: &str = concat!(
+    "line_height = 1.375, -- 1.0..=2.0\n",
+    "letter_spacing = 2.0, -- 0.0..=8.0 px\n",
+    "disable_ligatures = \"never\", -- never | cursor | always\n",
+    "fallback = { \"Noto Sans Symbols 2\" }, -- up to 8 families\n",
+    "features = { \"calt\", \"ss01\" }, -- up to 32 OpenType tags\n",
+);
+
+const INIT_EXAMPLE_DECORATION_OPTIONAL: &str = concat!(
+    "content_inset = 6, -- 0..=32 px\n",
+    "border_color_focused = \"#33CCFF\", -- #RRGGBB or #RRGGBBAA\n",
+    "border_color_idle = \"#595959AA\", -- #RRGGBB or #RRGGBBAA\n",
+    "border_width_focused = 2, -- 0..=16 px\n",
+    "border_width_idle = 1, -- 0..=16 px\n",
+);
+
+const INIT_EXAMPLE_TERMINAL_OPTIONAL: &str = concat!(
+    "scroll_lines_per_notch = 3, -- 1..=32\n",
+    "scroll_pixels_per_notch = 16, -- 1..=256\n",
+    "page_scroll_percent = 75, -- 10..=100\n",
+    "cursor_style = \"default\", -- default | blinking_block | steady_block | blinking_underline | steady_underline | blinking_bar | steady_bar\n",
+    "bell = \"visual\", -- off | visual | audible | both\n",
+);
+
+const INIT_EXAMPLE_KEYMAPS: &str = concat!(
+    "keymaps = {\n",
+    "    { chord = \"ctrl+shift+p\", action = \"toggle_palette\", context = \"global\" },\n",
+    "},\n",
+);
+
+const INIT_FONT_DEFAULTS: &str = concat!(
+    "font = {\n",
+    "    family = \"JetBrainsMono Nerd Font\",\n",
+    "    size = 12,\n",
+    "    line_height = 1.375,\n",
+    "    letter_spacing = 2.0,\n",
+    "    disable_ligatures = \"never\",\n",
+    "},\n",
+);
+
+const INIT_DECORATION_DEFAULTS: &str = concat!(
+    "decoration = {\n",
+    "    gaps_in = 6,\n",
+    "    gaps_out = 6,\n",
+    "    border = 1,\n",
+    "    radius = 6,\n",
+    "    content_inset = 6,\n",
+    "},\n",
+);
+
+const INIT_TERMINAL_DEFAULTS: &str = concat!(
+    "terminal = {\n",
+    "    scrollback = 10000,\n",
+    "    scroll_lines_per_notch = 3,\n",
+    "    scroll_pixels_per_notch = 16,\n",
+    "    page_scroll_percent = 75,\n",
+    "    cursor_style = \"default\",\n",
+    "    bell = \"visual\",\n",
+    "},\n",
+);
+
+/// Appearance section shared by the profile and starter templates.
+///
+/// The manual (`bitty-manual/en/configuration/themes.md`) documents exactly
+/// this nested shape; the flat top-level `theme` alias stays accepted for
+/// compatibility but is never generated.
+pub(crate) fn init_render_appearance_section(theme: &str) -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Appearance: a built-in theme preset (`bitty list themes` prints the",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- catalog) or a local theme file (`local:<name>`). Unknown names fail closed.",
+    );
+    init_line(&mut out, 4, "appearance = {");
+    init_line(
+        &mut out,
+        8,
+        &format!("theme = \"{}\",", init_lua_escape(theme)),
+    );
+    init_line(
+        &mut out,
+        8,
+        "-- Panel animations use the RFC-0002 defaults (durations 0..=500 ms).",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_ANIMATIONS, 8, true));
+    init_line(&mut out, 4, "},");
+    out
+}
+
+/// Font section for the generated profile: the wizard answers plus the
+/// optional schema leaves as commented examples.
+fn init_render_font_section(answers: &InitAnswers) -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Font: `family` and `size` are required together; size is in points",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- (0 < size <= 128). Optional keys default to the shipped values.",
+    );
+    init_line(&mut out, 4, "font = {");
+    init_line(
+        &mut out,
+        8,
+        &format!("family = \"{}\",", init_lua_escape(&answers.font_family)),
+    );
+    init_line(&mut out, 8, &format!("size = {},", answers.font_size));
+    out.push_str(&init_block(INIT_EXAMPLE_FONT_OPTIONAL, 8, true));
+    init_line(&mut out, 4, "},");
+    out
+}
+
+/// Decoration section for the generated profile.
+fn init_render_decoration_section(answers: &InitAnswers) -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Decoration: Core-owned view frames in logical px. Defaults are gaps",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- 6/6, border 1, radius 6, content inset 6; safe mode uses 0/0/1/0/0.",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Bounds: gaps/content_inset 0..=32, border 0..=8, radius 0..=16.",
+    );
+    init_line(&mut out, 4, "decoration = {");
+    init_line(&mut out, 8, &format!("gaps_in = {},", answers.gaps_in));
+    init_line(&mut out, 8, &format!("gaps_out = {},", answers.gaps_out));
+    init_line(&mut out, 8, &format!("border = {},", answers.border));
+    init_line(&mut out, 8, &format!("radius = {},", answers.radius));
+    out.push_str(&init_block(INIT_EXAMPLE_DECORATION_OPTIONAL, 8, true));
+    init_line(&mut out, 4, "},");
+    out
+}
+
+/// Terminal section for the generated profile.
+fn init_render_terminal_section(answers: &InitAnswers) -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Terminal: scrollback 0..=100000 lines (default 10000) and an optional",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- shell argv[0] (omit for $SHELL or /bin/sh). Wheel/page scroll, cursor",
+    );
+    init_line(&mut out, 4, "-- shape, and bell are restart-required.");
+    init_line(&mut out, 4, "terminal = {");
+    init_line(
+        &mut out,
+        8,
+        &format!("scrollback = {},", answers.scrollback),
+    );
+    if let Some(shell) = &answers.shell {
+        init_line(
+            &mut out,
+            8,
+            &format!("shell = \"{}\",", init_lua_escape(shell)),
+        );
+    } else {
+        out.push_str(&init_block("shell = \"/bin/fish\",\n", 8, true));
+    }
+    out.push_str(&init_block(INIT_EXAMPLE_TERMINAL_OPTIONAL, 8, true));
+    init_line(&mut out, 4, "},");
+    out
+}
+
 /// Renders the one-click vim preset block FROM the shipped defaults
 /// ([`bitty_config::keymap::DEFAULT_KEYMAPS`], CTX-0178) so the preset and
 /// the binary defaults cannot drift: any future default change flows into
 /// the wizard output automatically, and
 /// `init_vim_preset_agrees_with_shipped_defaults` pins the agreement.
 pub(crate) fn init_render_vim_keymaps() -> String {
-    let mut out = String::from("    keymaps = {\n");
+    let mut out = String::new();
+    init_line(&mut out, 4, "keymaps = {");
     for (chord, action) in bitty_config::keymap::DEFAULT_KEYMAPS {
-        out.push_str(&format!(
-            "        {{ chord = \"{chord}\", action = \"{action}\", context = \"global\" }},\n"
-        ));
+        init_line(
+            &mut out,
+            8,
+            &format!("{{ chord = \"{chord}\", action = \"{action}\", context = \"global\" }},"),
+        );
     }
-    out.push_str("    },\n");
+    init_line(&mut out, 4, "},");
+    out
+}
+
+/// Commented `window` example shared by both templates.
+pub(crate) fn init_documented_window() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Window: whole-window opacity 0.0..=1.0 (default 1.0) and padding",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- 0..=64 logical px (default 8). radius_px 0..=24 is parsed but is a",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- no-op today; blur_radius accepts only 0 until OQ-038 lands.",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Background images use window.background_image, background_fit",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- (fill | fit | center | tile | stretch), background_opacity 0.0..=1.0,",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- and background_position; roots come from decoration.background_image_roots.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_WINDOW, 4, true));
+    out
+}
+
+/// Commented `layout` example shared by both templates.
+pub(crate) fn init_documented_layout() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Layout: tiled pane gaps in character cells (0 = edge-to-edge; both",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- default 0) and the split-ratio delta per resize keypress.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_LAYOUT, 4, true));
+    out
+}
+
+/// Commented `selection` example shared by both templates.
+pub(crate) fn init_documented_selection() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Selection: copy-on-select is off by default (kitty/ghostty parity);",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Ctrl+Shift+C always copies the committed selection.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_SELECTION, 4, true));
+    out
+}
+
+/// Commented `mouse` example shared by both templates.
+pub(crate) fn init_documented_mouse() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Mouse: hover focus is on by default; false preserves click-to-focus.",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Buttons take \"none\" or any keymap action; panes that capture mouse",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- reporting always receive protocol bytes instead of a host action.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_MOUSE, 4, true));
+    out
+}
+
+/// Commented `workspace` example shared by both templates.
+pub(crate) fn init_documented_workspace() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Workspace: `layout` names the default tiled provider for new",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- workspaces (omit to preserve the current tree). show_bar and bar.edge",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- are reserved Core inputs consumed by the bar plugin.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_WORKSPACE, 4, true));
+    out
+}
+
+/// Commented `scrollbar` example shared by both templates.
+pub(crate) fn init_documented_scrollbar() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Scrollbar: auto reveals the overlay on hover; always pins it visible;",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- hidden disables it. Width is 1..=32 logical px.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_SCROLLBAR, 4, true));
+    out
+}
+
+/// Commented `views` example shared by both templates.
+pub(crate) fn init_documented_views() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Views: per-view appearance overrides. Selectors are \"*\"; a content",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- type (empty | terminal | rich | browser); \"ws:1\"..\"ws:16\"; or",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- \"view:<id>\". Tiers apply * < content < ws < view, per field.",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Accepted fields are the outline colors/widths, background image/fit,",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- glow color/width, and background tint/strength.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_VIEWS, 4, true));
+    out
+}
+
+/// Commented `input` example shared by both templates.
+pub(crate) fn init_documented_input() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Input: Leader chord and pending-window timeout. The top-level",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- leader_key/leader_timeout_ms aliases stay accepted for compatibility.",
+    );
+    out.push_str(&init_block(INIT_EXAMPLE_INPUT, 4, true));
+    out
+}
+
+/// Commented `close_confirm` example shared by both templates.
+pub(crate) fn init_documented_close_confirm() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Close safety: always | when_busy (default) | never.",
+    );
+    init_line(&mut out, 4, "-- close_confirm = \"when_busy\",");
+    out
+}
+
+/// Commented keymap summary and example shared by the profile default and
+/// starter.
+pub(crate) fn init_documented_keymaps() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Chrome keys: the shipped Alt-as-Mod defaults apply (Alt+h/j/k/l or",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Alt+arrows move focus, Alt+1..9 jump to workspace N, Alt+u/i page,",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Shift+Alt+h/j/k/l split, Shift+Ctrl+h/j/k/l resize, Alt+w close,",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Alt+z/m/f zoom, Ctrl+Tab cycle, Ctrl+Shift+C/V copy/paste). Set",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- mod_key = \"super\" at top level to flip the shipped map.",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- Keymaps: context + chord identifies a binding, so an entry replaces",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- the shipped binding with the same identity. For example (the palette",
+    );
+    init_line(&mut out, 4, "-- action requires the palette plugin):");
+    out.push_str(&init_block(INIT_EXAMPLE_KEYMAPS, 4, true));
+    out
+}
+
+/// Commented full font defaults for the `config edit` starter.
+pub(crate) fn init_documented_font_defaults() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Font: `family` and `size` are required together; size is in points",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- (0 < size <= 128). Optional keys carry their shipped defaults.",
+    );
+    out.push_str(&init_block(INIT_FONT_DEFAULTS, 4, true));
+    out
+}
+
+/// Commented full decoration defaults for the `config edit` starter.
+pub(crate) fn init_documented_decoration_defaults() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Decoration: Core-owned view frames in logical px (defaults shown);",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- safe mode forces gaps/radius/inset 0 and border 1.",
+    );
+    out.push_str(&init_block(INIT_DECORATION_DEFAULTS, 4, true));
+    out
+}
+
+/// Commented full terminal defaults for the `config edit` starter.
+pub(crate) fn init_documented_terminal_defaults() -> String {
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        4,
+        "-- Terminal: scrollback and wheel/page-scroll defaults shown; `shell`",
+    );
+    init_line(
+        &mut out,
+        4,
+        "-- is omitted so startup uses $SHELL or /bin/sh. cursor_style and bell",
+    );
+    init_line(&mut out, 4, "-- are restart-required.");
+    out.push_str(&init_block(INIT_TERMINAL_DEFAULTS, 4, true));
     out
 }
 
 /// Renders wizard answers as an `init.lua` return table. The output always
 /// parses via `bitty-config::file::parse_lua_config` (pinned by
-/// `init_rendered_config_parses_and_merges_to_effective`): `theme`, the
-/// `font` pair, and the `decoration`/`terminal`/`close_confirm` basics are
-/// always present with shipped keys only, and the `keymaps` section appears
-/// only for the vim preset.
+/// `init_rendered_config_parses_and_merges_to_effective`): the nested
+/// `appearance.theme`, `font` pair, and the `decoration`/`terminal`/
+/// `close_confirm` basics are always present with shipped keys only, and the
+/// `keymaps` section appears only for the vim preset.
 pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
-    let mut out = String::from(
-        "-- bitty profile defaults (Lua, wezterm-style), written by `bitty init`.\n\
-         -- This file is a profile, not the active selector; override values in\n\
-         -- init.lua or extend this profile from another named profile.\n\
-         -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
-         -- Unknown keys fail closed; validate with `bitty config check`.\n\
-         return {\n",
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        0,
+        "-- bitty profile defaults (Lua, wezterm-style), written by `bitty init`.",
     );
-    out.push_str(&format!(
-        "    theme = \"{}\",\n",
-        init_lua_escape(&answers.theme)
-    ));
-    out.push_str(&format!(
-        "    font = {{ family = \"{}\", size = {} }},\n",
-        init_lua_escape(&answers.font_family),
-        answers.font_size,
-    ));
-    out.push_str(&format!(
-        "    decoration = {{ gaps_in = {}, gaps_out = {}, border = {}, radius = {} }},\n",
-        answers.gaps_in, answers.gaps_out, answers.border, answers.radius,
-    ));
-    match &answers.shell {
-        Some(shell) => out.push_str(&format!(
-            "    terminal = {{ scrollback = {}, shell = \"{}\" }},\n",
-            answers.scrollback,
-            init_lua_escape(shell),
-        )),
-        None => out.push_str(&format!(
-            "    terminal = {{ scrollback = {} }},\n",
-            answers.scrollback,
-        )),
-    }
-    out.push_str(&format!(
-        "    close_confirm = \"{}\",\n",
-        answers.close_confirm.as_str()
-    ));
+    init_line(
+        &mut out,
+        0,
+        "-- This file is a profile, not the active selector; override values in",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- init.lua or extend this profile from another named profile.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Unknown keys fail closed; validate with `bitty config check`.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Commented lines and blocks are schema examples: uncomment what you need;",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- every uncommented value is a shipped default or a wizard answer.",
+    );
+    init_line(&mut out, 0, "return {");
+    out.push_str(&init_render_appearance_section(&answers.theme));
+    out.push_str(&init_render_font_section(answers));
+    out.push_str(&init_documented_window());
+    out.push_str(&init_documented_layout());
+    out.push_str(&init_render_decoration_section(answers));
+    out.push_str(&init_render_terminal_section(answers));
+    out.push_str(&init_documented_selection());
+    out.push_str(&init_documented_mouse());
+    out.push_str(&init_documented_workspace());
+    out.push_str(&init_documented_scrollbar());
+    out.push_str(&init_documented_views());
+    out.push_str(&init_documented_input());
+    init_line(
+        &mut out,
+        4,
+        "-- Close safety: always | when_busy (default) | never.",
+    );
+    init_line(
+        &mut out,
+        4,
+        &format!("close_confirm = \"{}\",", answers.close_confirm.as_str()),
+    );
     match answers.key_preset {
         InitKeyPreset::Default => {
-            out.push_str(
-                "    -- Chrome keys: the shipped Alt-as-Mod defaults apply (Alt+h/j/k/l move,\n\
-                 -- Alt+1..9 jump to view N, Alt+u/i page up/down, Shift+Alt+h/j/k/l split,\n\
-                 -- Shift+Ctrl+h/j/k/l resize, Alt+w close, Alt+z/m/f zoom, Ctrl+Tab cycle,\n\
-                 -- Ctrl+Shift+C/V copy/paste). Re-run `bitty init` and pick the vim preset\n\
-                 -- to pin this map explicitly here.\n",
-            );
+            out.push_str(&init_documented_keymaps());
         }
         InitKeyPreset::Vim => {
-            out.push_str(
-                "    -- Chrome keys: one-click vim preset (Alt+h/j/k/l move, Alt+1..9 jump,\n\
-                 -- Alt+u/i page, Shift+Alt+h/j/k/l split, Alt+w close, Alt+z zoom).\n\
-                 -- This is the map the binary ships; entries here replace defaults by\n\
-                 -- context + chord identity, so tweak freely.\n",
+            init_line(
+                &mut out,
+                4,
+                "-- Chrome keys: one-click vim preset (Alt+h/j/k/l move, Alt+1..9",
+            );
+            init_line(
+                &mut out,
+                4,
+                "-- jump, Alt+u/i page, Shift+Alt+h/j/k/l split, Alt+w close, Alt+z",
+            );
+            init_line(
+                &mut out,
+                4,
+                "-- zoom). This is the map the binary ships; entries here replace",
+            );
+            init_line(
+                &mut out,
+                4,
+                "-- defaults by context + chord identity, so tweak freely.",
             );
             out.push_str(&init_render_vim_keymaps());
         }
     }
-    out.push_str("}\n");
+    init_line(&mut out, 0, "}");
     out
 }
 
-/// Renders the `minimal` preset: the smallest seeded profile is one `theme`
-/// key, and value blocks appear only for flags the caller explicitly set.
+/// Renders the `minimal` preset: the smallest seeded profile is one nested
+/// `appearance.theme`, and value blocks appear only for flags the caller
+/// explicitly set.
 ///
 /// The output always parses via `bitty-config::file::parse_lua_config`; it
 /// never invents keys and never writes font/decoration/terminal/close_confirm
@@ -851,47 +1466,79 @@ pub(crate) fn render_minimal_profile_lua(
     answers: &InitAnswers,
     overrides: &InitOverrides,
 ) -> String {
-    let mut out = String::from(
-        "-- bitty minimal profile, written by `bitty init --profile minimal`.\n\
-         -- Everything not listed here uses the shipped defaults; add overrides\n\
-         -- freely. Evaluated in the bitty-lua sandbox (same budgets as plugins;\n\
-         -- no io/os). Unknown keys fail closed; validate with `bitty config check`.\n\
-         return {\n",
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        0,
+        "-- bitty minimal profile, written by `bitty init --profile minimal`.",
     );
-    out.push_str(&format!(
-        "    theme = \"{}\",\n",
-        init_lua_escape(&answers.theme)
-    ));
+    init_line(
+        &mut out,
+        0,
+        "-- Everything not listed here uses the shipped defaults; add overrides",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- freely. Evaluated in the bitty-lua sandbox (same budgets as plugins;",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- no io/os). Unknown keys fail closed; validate with `bitty config check`.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- A larger, fully commented reference is written by `bitty init`.",
+    );
+    init_line(&mut out, 0, "return {");
+    init_line(&mut out, 4, "appearance = {");
+    init_line(
+        &mut out,
+        8,
+        &format!("theme = \"{}\",", init_lua_escape(&answers.theme)),
+    );
+    init_line(&mut out, 4, "},");
     if overrides.font_family.is_some() || overrides.font_size.is_some() {
-        out.push_str(&format!(
-            "    font = {{ family = \"{}\", size = {} }},\n",
-            init_lua_escape(&answers.font_family),
-            answers.font_size,
-        ));
+        init_line(&mut out, 4, "font = {");
+        init_line(
+            &mut out,
+            8,
+            &format!("family = \"{}\",", init_lua_escape(&answers.font_family)),
+        );
+        init_line(&mut out, 8, &format!("size = {},", answers.font_size));
+        init_line(&mut out, 4, "},");
     }
     if overrides.gaps_in.is_some()
         || overrides.gaps_out.is_some()
         || overrides.border.is_some()
         || overrides.radius.is_some()
     {
-        out.push_str(&format!(
-            "    decoration = {{ gaps_in = {}, gaps_out = {}, border = {}, radius = {} }},\n",
-            answers.gaps_in, answers.gaps_out, answers.border, answers.radius,
-        ));
+        init_line(&mut out, 4, "decoration = {");
+        init_line(&mut out, 8, &format!("gaps_in = {},", answers.gaps_in));
+        init_line(&mut out, 8, &format!("gaps_out = {},", answers.gaps_out));
+        init_line(&mut out, 8, &format!("border = {},", answers.border));
+        init_line(&mut out, 8, &format!("radius = {},", answers.radius));
+        init_line(&mut out, 4, "},");
     }
     if overrides.scrollback.is_some() {
-        out.push_str(&format!(
-            "    terminal = {{ scrollback = {} }},\n",
-            answers.scrollback,
-        ));
+        init_line(&mut out, 4, "terminal = {");
+        init_line(
+            &mut out,
+            8,
+            &format!("scrollback = {},", answers.scrollback),
+        );
+        init_line(&mut out, 4, "},");
     }
     if overrides.close_confirm.is_some() {
-        out.push_str(&format!(
-            "    close_confirm = \"{}\",\n",
-            answers.close_confirm.as_str()
-        ));
+        init_line(
+            &mut out,
+            4,
+            &format!("close_confirm = \"{}\",", answers.close_confirm.as_str()),
+        );
     }
-    out.push_str("}\n");
+    init_line(&mut out, 0, "}");
     out
 }
 
@@ -903,21 +1550,55 @@ pub(crate) fn render_minimal_profile_lua(
 /// path. User overrides belong beside the selector keys in this same return
 /// table and win over the selected profile (`file > profile`).
 pub(crate) fn render_selector_lua(profile: &str) -> String {
-    format!(
-        "-- bitty user configuration selector, written by `bitty init`.\n\
-         -- The selected profile holds the generated defaults; add your overrides\n\
-         -- here (for example: window = {{ opacity = 0.95, padding = 8 }}).\n\
-         -- Switch profiles explicitly with `bitty config profile use NAME`.\n\
-         -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
-         -- Unknown keys fail closed; validate with `bitty config check`.\n\
-         return {{\n\
-         \x20   format = \"{}\",\n\
-         \x20   profile = \"{}\",\n\
-         \x20   -- overrides go here\n\
-         }}\n",
-        bitty_config::file::PROFILE_SELECTOR_FORMAT,
-        init_lua_escape(profile),
-    )
+    let mut out = String::new();
+    init_line(
+        &mut out,
+        0,
+        "-- bitty user configuration selector, written by `bitty init`.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- The selected profile holds the generated defaults; add your overrides",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- in this table. For example, uncomment the window line inside it.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Switch profiles explicitly with `bitty config profile use NAME`.",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).",
+    );
+    init_line(
+        &mut out,
+        0,
+        "-- Unknown keys fail closed; validate with `bitty config check`.",
+    );
+    init_line(&mut out, 0, "return {");
+    init_line(
+        &mut out,
+        4,
+        &format!(
+            "format = \"{}\",",
+            bitty_config::file::PROFILE_SELECTOR_FORMAT
+        ),
+    );
+    init_line(
+        &mut out,
+        4,
+        &format!("profile = \"{}\",", init_lua_escape(profile)),
+    );
+    init_line(&mut out, 4, "-- overrides go here");
+    init_line(&mut out, 4, "-- window = { opacity = 0.95, padding = 8 },");
+    init_line(&mut out, 0, "}");
+    out
 }
 
 /// Wizard line-editing escape outcome: one parsed `ESC`-led sequence mapped

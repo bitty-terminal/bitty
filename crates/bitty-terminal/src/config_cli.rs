@@ -714,91 +714,40 @@ pub(crate) fn expand_home_path_with(
 
 /// Starter `init.lua` written by `config edit` only when the file is missing.
 /// Never used to overwrite existing content.
-pub(crate) fn starter_init_lua() -> &'static str {
-    "-- bitty user configuration (Lua, wezterm-style).\n\
-     -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
-     -- Unknown keys fail closed; validate with `bitty config check`.\n\
-     -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
-      -- consumed by its action and never reaches the shell; unbound keys\n\
-      -- (Tab, arrows, plain letters) always go to the shell. Alt is the Mod\n\
-      -- (Hyprland keeps Super; bitty uses Alt). Flip one setting to rebind\n\
-      -- the shipped map to Super (Alt+h/j/k/l -> Super+h/j/k/l, ...):\n\
-      -- mod_key = \"super\",\n\
-      -- Shipped defaults:\n\
-     --   Alt+h/j/k/l or Alt+arrows + Ctrl+Alt+arrows  move focus (vim hjkl)\n\
-     --   Alt+1..9                       jump to view id N\n\
-     --   Alt+u / Alt+i                  page up / down (less-like)\n\
-     --   Shift+Alt+h/j/k/l or Shift+Alt+arrows  split focused pane\n\
-     --   Shift+Ctrl+h/j/k/l or Shift+Ctrl+arrows  resize focused pane (vim hjkl)\n\
-     --   Alt+w                          close focused pane\n\
-     --   Alt+z / Alt+m / Alt+f          toggle single-pane zoom\n\
-     --   Ctrl+Tab / Ctrl+Shift+Tab      focus next / previous\n\
-     --   Ctrl+Shift+C/V                 copy/paste (fish never sees the chord);\n\
-     --   Shift+Alt+PageUp/PageDown      jump to previous / next shell prompt (OSC 133)\n\
-     --   Alt+o                          select last command output\n\
-     -- uncomment to override (context + chord identity replaces the default):\n\
-     --\n\
-     -- Mouse select auto-copies to the clipboard by default (ghostty-class\n\
-     -- copy-on-select, syncs primary on Linux). Uncomment to opt out: the\n\
-     \x20\x20-- Highlight stays and only Ctrl+Shift+C copies.\n\
-     -- selection = { auto_copy = false },\n\
-     \x20\x20-- Page scroll (Alt+u / Alt+i) moves 75% of the viewport by\n\
-     \x20\x20-- default so context stays visible; 10..=100 keeps more or\n\
-     \x20\x20-- pages a full screen. `terminal` also needs `scrollback`.\n\
-     \x20\x20-- terminal = { scrollback = 10000, page_scroll_percent = 75 },\n\
-     return {\n\
-     \x20\x20theme = \"dark\",\n\
-     \x20\x20-- Hyprland-like panel gaps in cells (0 = edge-to-edge tiling).\n\
-     \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
-     \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
-     \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
-     \x20\x20-- Core-owned workspace decoration in logical px: gaps between/\n\
-     \x20\x20-- around views (unified 6/6 so panel-panel matches panel-\n\
-     \x20\x20-- terminal), border inside each View frame, corner radius, and\n\
-     \x20\x20-- content_inset padding between the border and the text.\n\
-     \x20\x20-- Defaults 6/6/1/6/6; safe mode forces 0/0/1/0/0.\n\
-     \x20\x20-- decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6, content_inset = 6 },\n\
-     \x20\x20-- Focused/idle outline colors (CTX-0340): '#RRGGBB' or\n\
-     \x20\x20-- '#RRGGBBAA'. border_color sets both states; the focused/idle\n\
-     \x20\x20-- keys override it per state. Defaults #33CCFF / #595959AA.\n\
-     \x20\x20-- decoration = { border_color_focused = \"#33CCFF\", border_color_idle = \"#595959AA\" },\n\
-     \x20\x20-- Focused/idle outline width in logical px (0..=16). The base\n\
-     \x20\x20-- inherits decoration.border; focused/idle override it. A\n\
-     \x20\x20-- focused width >= idle + 1 supplies a non-color focus cue.\n\
-     \x20\x20-- decoration = { border_width = 2, border_width_focused = 3, border_width_idle = 1 },\n\
-     \x20\x20-- Per-View appearance overrides (RFC-0001/OQ-041). Selector is\n\
-     \x20\x20-- \"*\", a content type (empty/terminal/rich/browser), \"ws:1..16\",\n\
-     \x20\x20-- or \"view:<ViewId>\"; tiers apply * < content < ws < view per\n\
-     \x20\x20-- field. Accepted fields: border_color[_focused|_idle],\n\
-     \x20\x20-- border_width[_focused|_idle], background_image, background_fit.\n\
-     \x20\x20-- views = { [\"*\"] = { border_color_focused = \"#33CCFF\" }, [\"ws:2\"] = { border_width_idle = 1 } },\n\
-      \x20\x20-- Overlay scrollback scrollbar (auto by default: transparent at rest,\n\
-      \x20\x20-- revealed on mouse proximity/hover). Uncomment to pin it visible,\n\
-      \x20\x20-- or set mode = \"hidden\" to disable: scrollbar = { mode = \"always\", width = 8 },\n\
-     \x20\x20-- Hover activation (off by default: click-to-focus preserved).\n\
-     \x20\x20-- Uncomment to opt in; the optional delay in milliseconds makes\n\
-     \x20\x20-- the pointer dwell in a pane before focus moves (0 = immediate,\n\
-     \x20\x20-- max 2000). Alt+drag moves a floating pane where the layout\n\
-     \x20\x20-- model permits.\n\
-     \x20\x20-- mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 },\n\
-     \x20\x20-- Mouse buttons: \"none\" or any keymap action name. The shipped\n\
-     \x20\x20-- defaults are right = \"none\" (inert) and middle =\n\
-     \x20\x20-- \"paste_from_primary\"; panes that capture mouse reporting\n\
-     \x20\x20-- always receive protocol bytes instead of a host action.\n\
-     \x20\x20-- mouse = { right = \"none\", middle = \"paste_from_primary\" },\n\
-     \x20\x20-- Workspace switcher bar (on by default: lists workspaces,\n\
-     \x20\x20-- click/keyboard switching). Uncomment to opt out:\n\
-     \x20\x20-- workspace = { show_bar = false },\n\
-     \x20\x20-- The bar reserves its own row (bottom by default) so it never\n\
-     \x20\x20-- covers terminal content. Uncomment to move it to the top:\n\
-     \x20\x20-- workspace = { bar = { edge = \"top\" } },\n\
-     \x20\x20-- keymaps = {\n\
-     \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
-     \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
-     \x20\x20--     { chord = \"alt+u\", action = \"scroll_page_up\", context = \"global\" },\n\
-     \x20\x20--     { chord = \"alt+z\", action = \"toggle_zoom\", context = \"global\" },\n\
-     \x20\x20-- },\n\
-     }\n"
+///
+/// The body is assembled from the same documented sections as the generated
+/// profile, so the two templates cannot disagree on nested shape, comments,
+/// defaults, or indentation.
+pub(crate) fn starter_init_lua() -> String {
+    let mut out = String::new();
+    out.push_str("-- bitty user configuration (Lua, wezterm-style).\n");
+    out.push_str("-- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n");
+    out.push_str("-- Unknown keys fail closed; validate with `bitty config check`.\n");
+    out.push_str("-- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n");
+    out.push_str("-- consumed by its action and never reaches the shell; unbound keys (Tab,\n");
+    out.push_str("-- arrows, plain letters) always go to the shell. The shipped map uses Alt\n");
+    out.push_str("-- as Mod; set mod_key = \"super\" at top level to rebind it.\n");
+    out.push_str("-- Commented lines and blocks are schema examples: uncomment what you need;\n");
+    out.push_str("-- every uncommented value is a shipped default.\n");
+    out.push_str("return {\n");
+    out.push_str(&crate::init::init_render_appearance_section(
+        bitty_config::theme::DARK_THEME_ALIAS,
+    ));
+    out.push_str(&crate::init::init_documented_font_defaults());
+    out.push_str(&crate::init::init_documented_window());
+    out.push_str(&crate::init::init_documented_layout());
+    out.push_str(&crate::init::init_documented_decoration_defaults());
+    out.push_str(&crate::init::init_documented_terminal_defaults());
+    out.push_str(&crate::init::init_documented_selection());
+    out.push_str(&crate::init::init_documented_mouse());
+    out.push_str(&crate::init::init_documented_workspace());
+    out.push_str(&crate::init::init_documented_scrollbar());
+    out.push_str(&crate::init::init_documented_views());
+    out.push_str(&crate::init::init_documented_input());
+    out.push_str(&crate::init::init_documented_close_confirm());
+    out.push_str(&crate::init::init_documented_keymaps());
+    out.push_str("}\n");
+    out
 }
 
 /// Formats one `config check` row: `dotted.key = value (source)`.

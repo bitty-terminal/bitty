@@ -5833,35 +5833,189 @@ fn resolve_editor_prefers_visual_then_editor_then_vi() {
     assert_eq!(resolve_editor_with_env(Some(""), Some(" ")), "vi");
 }
 
+/// Asserts every generated line uses a multiple of four leading spaces and
+/// no tabs, and that no key starts at the legacy two-space indent.
+fn assert_four_space_indent(name: &str, text: &str) {
+    assert!(!text.contains('\t'), "{name} contains a tab");
+    for (index, line) in text.lines().enumerate() {
+        let spaces = line.len() - line.trim_start_matches(' ').len();
+        assert_eq!(
+            spaces % 4,
+            0,
+            "{name}:{} uses {spaces}-space indentation: {line:?}",
+            index + 1
+        );
+        assert!(
+            !line.starts_with("  ")
+                || !line[2..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'),
+            "{name}:{} starts a key at two spaces: {line:?}",
+            index + 1
+        );
+    }
+}
+
+/// Asserts the generated nested appearance shape and the absence of the flat
+/// top-level `theme` alias (accepted for compatibility, never generated).
+fn assert_nested_appearance(name: &str, text: &str, theme: &str) {
+    assert!(
+        text.contains("appearance = {"),
+        "{name} has nested appearance"
+    );
+    assert!(
+        text.contains(&format!("        theme = \"{theme}\",")),
+        "{name} keeps theme under appearance:\n{text}"
+    );
+    assert!(
+        !text.lines().any(|line| line.starts_with("    theme =")),
+        "{name} must not emit the flat theme alias"
+    );
+}
+
+/// Uncomments one generated `-- <marker>` block, using brace depth so nested
+/// tables (for example `workspace.bar`) uncomment as a unit.
+fn uncomment_lua_block(text: &str, marker: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    let mut depth = 0i32;
+    for line in text.lines() {
+        if !inside {
+            let trimmed = line.trim_start();
+            let code = trimmed.strip_prefix("-- ").unwrap_or(trimmed);
+            if trimmed.starts_with("-- ") && code.trim_start() == marker {
+                inside = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+        }
+        let pos = line.find("-- ").expect("commented block line");
+        out.push_str(&line[..pos]);
+        out.push_str(&line[pos + 3..]);
+        out.push('\n');
+        let code = &line[pos + 3..];
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+        if depth == 0 {
+            inside = false;
+        }
+    }
+    assert!(!inside, "unterminated commented block {marker}");
+    out
+}
+
+/// Uncomments individual commented keys inside already-emitted tables (the
+/// optional `font`, `decoration`, and `terminal` examples).
+fn uncomment_commented_keys(text: &str, keys: &[&str]) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let uncomment = trimmed.strip_prefix("-- ").is_some_and(|rest| {
+            let code = rest.trim_start();
+            keys.iter().any(|key| code.starts_with(key))
+        });
+        if uncomment {
+            let pos = line.find("-- ").expect("commented key line");
+            out.push_str(&line[..pos]);
+            out.push_str(&line[pos + 3..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[test]
 fn starter_init_lua_is_valid_config() {
     use bitty_config::file::parse_lua_config;
     use bitty_config::plan::{ConfigSource, LayerKind};
+    let starter = starter_init_lua();
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
-    let plan = parse_lua_config(starter_init_lua(), &src).expect("starter valid");
-    assert_eq!(plan.appearance.unwrap().theme.as_deref(), Some("dark"));
+    let plan = parse_lua_config(&starter, &src).expect("starter valid");
+    assert_eq!(
+        plan.appearance.as_ref().and_then(|a| a.theme.as_deref()),
+        Some("dark")
+    );
+    assert_nested_appearance("starter", &starter, "dark");
+    assert_four_space_indent("starter", &starter);
+
     // CTX-0191: starter leaves `selection` unset (commented example only)
     // so new installs ride the default-on without a file override.
     assert!(plan.selection.is_none());
-    assert!(starter_init_lua().contains("auto_copy"));
+    assert!(starter.contains("auto_copy"));
     // CTX-0177: starter leaves `layout` unset (commented example only)
     // so new installs ride edge-to-edge without a file override.
     assert!(plan.layout.is_none());
-    assert!(starter_init_lua().contains("gaps_in"));
-    assert!(starter_init_lua().contains("gaps_out"));
+    assert!(starter.contains("gaps_in"));
+    assert!(starter.contains("gaps_out"));
     // CTX-0181/CTX-0362: starter leaves `scrollbar` unset (commented
     // example only) so new installs ride the auto overlay without a file
     // override.
     assert!(plan.scrollbar.is_none());
-    assert!(starter_init_lua().contains("scrollbar"));
+    assert!(starter.contains("scrollbar"));
     // CTX-0260: starter leaves `mouse` unset (commented example only)
-    // so new installs ride click-to-focus without a file override.
+    // so new installs ride the shipped hover-focus default without a file
+    // override.
     assert!(plan.mouse.is_none());
-    assert!(starter_init_lua().contains("focus_follows_mouse"));
-    assert!(starter_init_lua().contains("focus_follows_mouse_delay_ms"));
+    assert!(starter.contains("focus_follows_mouse"));
+    assert!(starter.contains("focus_follows_mouse_delay_ms"));
     // CTX-0873: starter documents the bar edge as a commented example only.
     assert!(plan.workspace.is_none());
-    assert!(starter_init_lua().contains(r#"workspace = { bar = { edge = "top" } }"#));
+    assert!(starter.contains("bar = {"));
+    assert!(starter.contains("edge = \"bottom\""));
+    // Every other major section is a commented example only.
+    assert!(plan.font.is_none());
+    assert!(plan.window.is_none());
+    assert!(plan.decoration.is_none());
+    assert!(plan.terminal.is_none());
+    assert!(plan.views.is_none());
+    assert!(plan.leader_key.is_none());
+    assert!(plan.leader_timeout_ms.is_none());
+    assert!(plan.close_confirm.is_none());
+    assert!(plan.keymaps.is_none());
+    for section in [
+        "font",
+        "window",
+        "layout",
+        "decoration",
+        "terminal",
+        "selection",
+        "mouse",
+        "workspace",
+        "scrollbar",
+        "views",
+        "input",
+        "keymaps",
+    ] {
+        assert!(
+            starter.contains(&format!("-- {section} = {{")),
+            "starter documents {section}"
+        );
+    }
+
+    // The commented scalar example also parses when uncommented.
+    let with_close = uncomment_commented_keys(&starter, &["close_confirm ="]);
+    let close_plan =
+        parse_lua_config(&with_close, &src).expect("starter close_confirm example parses");
+    assert_eq!(
+        close_plan.close_confirm,
+        Some(bitty_config::CloseConfirm::WhenBusy)
+    );
+}
+
+#[test]
+fn selector_commented_override_parses() {
+    use bitty_config::file::parse_lua_config;
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let selector = render_selector_lua(DEFAULT_PROFILE_NAME);
+    let with_override = uncomment_commented_keys(&selector, &["window ="]);
+    let plan = parse_lua_config(&with_override, &src).expect("selector override parses");
+    assert!(plan.selector.is_some(), "the envelope stays intact");
+    let window = plan.window.expect("window override applies");
+    assert_eq!(window.opacity, 0.95);
+    assert_eq!(window.padding, 8);
 }
 
 // -- `bitty init` wizard (CTX-0149, #243) --------------------------------
@@ -8625,19 +8779,24 @@ fn init_pending_recap_matches_written_file() {
 fn init_render_default_and_vim() {
     let base = init_yes_defaults(Some("/bin/bash"));
     let lua = render_init_lua(&base);
-    assert!(lua.contains("theme = \"dark\""));
+    assert_nested_appearance("profile default", &lua, "dark");
+    assert_four_space_indent("profile default", &lua);
     assert!(lua.contains("JetBrainsMono Nerd Font"));
     assert!(lua.contains("shell = \"/bin/bash\""));
     assert!(lua.contains("scrollback = 10000"));
+    assert!(lua.contains("gaps_in = 6"));
     assert!(lua.contains("close_confirm = \"when_busy\""));
-    assert!(lua.contains("decoration = { gaps_in = 6, gaps_out = 6, border = 1, radius = 6 }"));
-    assert!(!lua.contains("keymaps = {"));
+    assert!(!lua.lines().any(|line| line.starts_with("    keymaps = {")));
+    assert!(lua.contains("-- keymaps = {"));
 
-    // No shell: the terminal table still carries scrollback.
+    // No shell: the terminal table still carries scrollback and documents
+    // the shell key as a commented example.
     let noshell = init_yes_defaults(None);
     let lua = render_init_lua(&noshell);
-    assert!(lua.contains("terminal = { scrollback = 10000 }"));
-    assert!(!lua.contains("shell ="));
+    assert!(lua.contains("terminal = {"));
+    assert!(lua.contains("scrollback = 10000"));
+    assert!(!lua.contains("        shell ="));
+    assert!(lua.contains("        -- shell = \"/bin/fish\","));
 
     // A custom font family flows through verbatim.
     let family = InitAnswers {
@@ -8653,7 +8812,7 @@ fn init_render_default_and_vim() {
         ..base
     };
     let lua = render_init_lua(&vim);
-    assert!(lua.contains("keymaps = {"));
+    assert!(lua.contains("    keymaps = {"));
     for (chord, action) in bitty_config::keymap::DEFAULT_KEYMAPS {
         assert!(
             lua.contains(&format!("chord = \"{chord}\"")),
@@ -8811,6 +8970,193 @@ fn init_vim_preset_agrees_with_shipped_defaults() {
 }
 
 #[test]
+fn generated_templates_are_nested_and_documented() {
+    use bitty_config::file::parse_lua_config;
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let full = render_init_lua(&init_yes_defaults(Some("/bin/bash")));
+    let vim = render_init_lua(&InitAnswers {
+        key_preset: InitKeyPreset::Vim,
+        ..init_yes_defaults(None)
+    });
+    let minimal = render_minimal_profile_lua(
+        &init_preset_answers(InitProfilePreset::Minimal),
+        &InitOverrides::default(),
+    );
+    let starter = starter_init_lua();
+    let selector = render_selector_lua(DEFAULT_PROFILE_NAME);
+
+    for (name, text) in [
+        ("profile default", &full),
+        ("profile vim", &vim),
+        ("minimal", &minimal),
+        ("starter", &starter),
+        ("selector", &selector),
+    ] {
+        assert_four_space_indent(name, text);
+        let plan = parse_lua_config(text, &src)
+            .unwrap_or_else(|err| panic!("{name} parses: {err}\n{text}"));
+        assert!(
+            plan.undeclared_fields.is_empty(),
+            "{name} declares only schema keys: {:?}",
+            plan.undeclared_fields
+        );
+    }
+
+    assert_nested_appearance("profile default", &full, "dark");
+    assert_nested_appearance("profile vim", &vim, "dark");
+    assert_nested_appearance("minimal", &minimal, "dark");
+    assert_nested_appearance("starter", &starter, "dark");
+
+    // The selector stays a thin, documented envelope with no values of its
+    // own beyond `format` and `profile`.
+    let selector_plan = parse_lua_config(&selector, &src).expect("selector parses");
+    assert!(selector_plan.selector.is_some());
+    assert!(selector_plan.font.is_none());
+    assert!(selector_plan.appearance.is_none());
+    assert!(!selector.contains("theme ="));
+
+    // The full profile documents every major section with a commented
+    // example; the starter additionally carries the shipped defaults for the
+    // sections the profile writes uncommented.
+    for section in [
+        "animations = {",
+        "window = {",
+        "layout = {",
+        "selection = {",
+        "mouse = {",
+        "workspace = {",
+        "scrollbar = {",
+        "views = {",
+        "input = {",
+        "keymaps = {",
+    ] {
+        assert!(
+            full.contains(&format!("-- {section}")),
+            "full profile documents {section}"
+        );
+    }
+    for section in ["font = {", "decoration = {", "terminal = {"] {
+        assert!(
+            starter.contains(&format!("-- {section}")),
+            "starter documents {section}"
+        );
+    }
+}
+
+#[test]
+fn generated_commented_blocks_parse_when_uncommented() {
+    use bitty_config::file::parse_lua_config;
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let templates = [
+        (
+            "profile default",
+            render_init_lua(&init_yes_defaults(Some("/bin/bash"))),
+        ),
+        (
+            "profile vim",
+            render_init_lua(&InitAnswers {
+                key_preset: InitKeyPreset::Vim,
+                ..init_yes_defaults(None)
+            }),
+        ),
+        (
+            "minimal",
+            render_minimal_profile_lua(
+                &init_preset_answers(InitProfilePreset::Minimal),
+                &InitOverrides::default(),
+            ),
+        ),
+        ("starter", starter_init_lua()),
+    ];
+    for (name, text) in templates {
+        for marker in [
+            "font = {",
+            "window = {",
+            "layout = {",
+            "decoration = {",
+            "terminal = {",
+            "selection = {",
+            "mouse = {",
+            "workspace = {",
+            "scrollbar = {",
+            "views = {",
+            "input = {",
+            "animations = {",
+            "keymaps = {",
+        ] {
+            if !text.contains(&format!("-- {marker}")) {
+                continue;
+            }
+            let uncommented = uncomment_lua_block(&text, marker);
+            assert_ne!(uncommented, text, "{name} uncomments {marker}");
+            parse_lua_config(&uncommented, &src).unwrap_or_else(|err| {
+                panic!("{name} {marker} block parses after uncommenting: {err}\n{uncommented}")
+            });
+        }
+    }
+}
+
+#[test]
+fn generated_optional_keys_parse_when_uncommented() {
+    use bitty_config::file::parse_lua_config;
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let full = render_init_lua(&init_yes_defaults(None));
+    let uncommented = uncomment_commented_keys(
+        &full,
+        &[
+            "line_height =",
+            "letter_spacing =",
+            "disable_ligatures =",
+            "fallback =",
+            "features =",
+            "content_inset =",
+            "border_color_focused =",
+            "border_color_idle =",
+            "border_width_focused =",
+            "border_width_idle =",
+            "shell =",
+            "scroll_lines_per_notch =",
+            "scroll_pixels_per_notch =",
+            "page_scroll_percent =",
+            "cursor_style =",
+            "bell =",
+        ],
+    );
+    let plan = parse_lua_config(&uncommented, &src).expect("optional examples parse");
+
+    let font = plan.font.expect("font table");
+    assert_eq!(font.line_height, 1.375);
+    assert_eq!(font.letter_spacing, 2.0);
+    assert_eq!(
+        font.disable_ligatures,
+        bitty_config::types::LigaturePolicy::Never
+    );
+    assert_eq!(font.fallback, vec!["Noto Sans Symbols 2".to_string()]);
+    assert_eq!(font.features, vec!["calt".to_string(), "ss01".to_string()]);
+
+    let decoration = plan.decoration.expect("decoration table");
+    assert_eq!(decoration.content_inset, 6);
+    assert!(decoration.border_color_focused.is_some());
+    assert!(decoration.border_color_idle.is_some());
+    assert_eq!(decoration.border_width_focused, Some(2));
+    assert_eq!(decoration.border_width_idle, Some(1));
+
+    let terminal = plan.terminal.expect("terminal table");
+    assert_eq!(terminal.shell.as_deref(), Some("/bin/fish"));
+    assert_eq!(terminal.scroll_lines_per_notch, 3);
+    assert_eq!(terminal.scroll_pixels_per_notch, 16);
+    assert_eq!(terminal.page_scroll_percent, 75);
+    assert_eq!(
+        terminal.cursor_style,
+        bitty_config::types::CursorStyle::Default
+    );
+    assert_eq!(terminal.bell, bitty_config::types::BellMode::Visual);
+}
+
+#[test]
 fn init_write_new_refuse_force_backup_idempotent() {
     let dir = init_test_dir("write");
     let target = dir.join("init.lua");
@@ -8931,7 +9277,8 @@ fn init_minimal_profile_renders_smallest_config() {
         rendered.len(),
         full.len()
     );
-    assert!(rendered.contains("theme = \"dark\""));
+    assert_nested_appearance("minimal", &rendered, "dark");
+    assert_four_space_indent("minimal", &rendered);
     for absent in [
         "font =",
         "decoration =",
@@ -8978,12 +9325,16 @@ fn init_minimal_profile_renders_smallest_config() {
     let mut answers = init_preset_answers(InitProfilePreset::Minimal);
     init_apply_overrides(&mut answers, &overrides);
     let rendered = render_minimal_profile_lua(&answers, &overrides);
+    assert!(rendered.contains("font = {"));
     assert!(rendered.contains(&format!(
-        "font = {{ family = \"{}\", size = 15 }}",
+        "        family = \"{}\",",
         bitty_config::types::DEFAULT_FONT_FAMILY
     )));
-    assert!(rendered.contains("terminal = { scrollback = 9000 }"));
+    assert!(rendered.contains("        size = 15,"));
+    assert!(rendered.contains("terminal = {"));
+    assert!(rendered.contains("        scrollback = 9000,"));
     assert!(!rendered.contains("decoration ="));
+    assert_four_space_indent("minimal overrides", &rendered);
     bitty_config::file::parse_lua_config(&rendered, &source)
         .expect("minimal profile with overrides parses");
 }
@@ -9141,7 +9492,7 @@ fn init_dispatch_yes_force_idempotent() {
     let profile = dir.join("profiles").join("default.lua");
     let written_profile = std::fs::read_to_string(&profile).expect("profile written");
     assert!(written_profile.contains("shell = \"/bin/bash\""));
-    assert!(written_profile.contains("theme = \"dark\""));
+    assert_nested_appearance("dispatch profile", &written_profile, "dark");
     assert!(written_profile.contains("close_confirm = \"when_busy\""));
     let written_selector = std::fs::read_to_string(&target).expect("selector written");
     assert!(written_selector.contains("format = \"bitty-profile-v1\""));
@@ -9329,9 +9680,13 @@ fn init_dispatch_yes_value_flags_apply_and_fail_closed() {
     );
     let written =
         std::fs::read_to_string(dir.join("profiles").join("default.lua")).expect("written");
-    assert!(written.contains("theme = \"tokyo-night\""));
-    assert!(written.contains("family = \"Fira Code\", size = 14"));
-    assert!(written.contains("decoration = { gaps_in = 2, gaps_out = 4, border = 1, radius = 0 }"));
+    assert_nested_appearance("flag profile", &written, "tokyo-night");
+    assert!(written.contains("family = \"Fira Code\","));
+    assert!(written.contains("size = 14,"));
+    assert!(written.contains("gaps_in = 2,"));
+    assert!(written.contains("gaps_out = 4,"));
+    assert!(written.contains("border = 1,"));
+    assert!(written.contains("radius = 0,"));
     assert!(written.contains("close_confirm = \"always\""));
     assert!(written.contains("scrollback = 50000"));
 

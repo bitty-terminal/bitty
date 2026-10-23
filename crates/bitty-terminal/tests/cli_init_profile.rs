@@ -79,6 +79,38 @@ fn assert_ok(output: &Output, label: &str) {
     );
 }
 
+/// Asserts the generated nested appearance shape and the absence of the flat
+/// top-level `theme` alias.
+fn assert_nested_appearance(body: &str, theme: &str) {
+    assert!(
+        body.contains("appearance = {"),
+        "nested appearance missing:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("        theme = \"{theme}\",")),
+        "theme is not nested under appearance:\n{body}"
+    );
+    assert!(
+        !body.lines().any(|line| line.starts_with("    theme =")),
+        "flat theme alias emitted:\n{body}"
+    );
+}
+
+/// Asserts every generated line uses a multiple of four leading spaces and
+/// no tabs.
+fn assert_four_space_indent(body: &str) {
+    assert!(!body.contains('\t'), "generated config contains a tab");
+    for (index, line) in body.lines().enumerate() {
+        let spaces = line.len() - line.trim_start_matches(' ').len();
+        assert_eq!(
+            spaces % 4,
+            0,
+            "line {} uses {spaces}-space indentation: {line:?}",
+            index + 1
+        );
+    }
+}
+
 #[test]
 fn bare_init_creates_profile_and_thin_selector() {
     let root = scratch_root("fresh");
@@ -94,8 +126,8 @@ fn bare_init_creates_profile_and_thin_selector() {
     assert!(!selector.contains("decoration ="));
 
     let profile = std::fs::read_to_string(profile_path(&root, "default")).expect("profile");
-    assert!(profile.contains("theme = \"dark\""));
-    assert!(profile.contains("font = { family ="));
+    assert_nested_appearance(&profile, "dark");
+    assert!(profile.contains("font = {"));
     assert!(profile.contains("scrollback ="));
 
     let check = run_bitty(&root, &["config", "check"]);
@@ -109,6 +141,55 @@ fn bare_init_creates_profile_and_thin_selector() {
         row(&text, "font.family").starts_with('"')
             && row(&text, "font.family").contains("(profile: "),
         "generated values come from the profile, output:\n{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn generated_templates_parse_and_match_the_manual_shape() {
+    use bitty_config::file::parse_lua_config;
+    use bitty_config::plan::{ConfigSource, LayerKind};
+
+    let root = scratch_root("manual-shape");
+    assert_ok(&run_bitty(&root, &["init", "--yes"]), "fresh init");
+    let profile = std::fs::read_to_string(profile_path(&root, "default")).expect("profile");
+    let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
+
+    assert_nested_appearance(&profile, "dark");
+    assert_four_space_indent(&profile);
+    let profile_source = ConfigSource::new(
+        LayerKind::Profile,
+        Some(profile_path(&root, "default").display().to_string()),
+    );
+    let profile_plan =
+        parse_lua_config(&profile, &profile_source).expect("generated profile parses");
+    assert!(
+        profile_plan.undeclared_fields.is_empty(),
+        "generated profile declares only schema keys: {:?}",
+        profile_plan.undeclared_fields
+    );
+    assert_eq!(
+        profile_plan
+            .appearance
+            .as_ref()
+            .and_then(|appearance| appearance.theme.as_deref()),
+        Some("dark")
+    );
+
+    assert_four_space_indent(&selector);
+    let selector_source = ConfigSource::new(
+        LayerKind::User,
+        Some(init_path(&root).display().to_string()),
+    );
+    let selector_plan =
+        parse_lua_config(&selector, &selector_source).expect("generated selector parses");
+    assert!(selector_plan.selector.is_some());
+    assert!(selector_plan.appearance.is_none());
+    assert!(
+        selector.contains("format = \"bitty-profile-v1\"")
+            && selector.contains("profile = \"default\""),
+        "selector envelope stays stable:\n{selector}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -482,7 +563,7 @@ fn migrate_after_default_profile_seed_has_a_safe_path() {
         "seed default profile",
     );
     let seeded = std::fs::read_to_string(profile_path(&root, "default")).expect("seeded profile");
-    assert!(seeded.contains("theme = \"dark\""));
+    assert_nested_appearance(&seeded, "dark");
     assert_ne!(seeded, legacy);
 
     // Without --force the migration refuses, but the refusal names the
@@ -703,10 +784,8 @@ fn preset_profiles_seed_without_prompts_or_activation() {
         );
 
         let body = std::fs::read_to_string(profile_path(&root, name)).expect("preset profile body");
-        assert!(
-            body.contains(&format!("theme = \"{want_theme}\"")),
-            "preset {name} seeds theme {want_theme}:\n{body}"
-        );
+        assert_nested_appearance(&body, want_theme);
+        assert_four_space_indent(&body);
         if name == "minimal" {
             assert!(!body.contains("font ="), "minimal omits font:\n{body}");
             assert!(
@@ -718,11 +797,7 @@ fn preset_profiles_seed_without_prompts_or_activation() {
                 "minimal omits terminal:\n{body}"
             );
         } else {
-            assert!(body.contains("font = { family ="), "{body}");
-            assert!(
-                body.contains(&format!("theme = \"{want_theme}\"")),
-                "{body}"
-            );
+            assert!(body.contains("font = {"), "{body}");
         }
         lengths.push(body.len());
 

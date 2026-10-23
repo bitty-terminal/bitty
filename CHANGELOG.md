@@ -189,15 +189,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every outcome (`delivered`, `helper-failed`, `timed-out`, `spawn-failed`,
   `evidence-failed`) in a bounded companion slot
   (`bitty/stall-watchdog-delivery.log`) and in the next stall report, so a
-  failed evidence write is never silent. Each attempt stages to a
-  generation-named temp file under a locked sequence file; a timed-out attempt
-  has its temp removed and a stale commit is discarded, so a late helper can
-  never replace newer evidence. `BITTY_WATCHDOG_STATE_PATH` is honored only
-  when it repeats the XDG-derived slot, temp files use `O_EXCL` (no-follow)
-  semantics, and symlinked, hard-linked, foreign-owned, group/world-writable,
-  or special-file slots are rejected. Helper spawn, stdin, kill, reap, and
-  abandoned-child tracking are single-flight and bounded across repeated
-  stalls. Existing unread-stderr and atomic-write behavior is unchanged.
+  failed evidence write is never silent. An evidence failure still retries
+  through a no-slot helper so stderr receives the report, and both attempts are
+  recorded. Each attempt stages to a generation-named temp file under a locked
+  sequence file (`flock` on Unix, a bounded `O_EXCL` gate on Windows); a
+  timed-out attempt has its temp removed and a stale commit is discarded, so a
+  late helper can never replace newer evidence. `BITTY_WATCHDOG_STATE_PATH` is
+  honored only when it repeats the XDG-derived slot, temp files use `O_EXCL`
+  (no-follow) semantics, and symlinked, hard-linked, foreign-owned,
+  group/world-writable, or special-file slots are rejected. Helper spawn,
+  stdin, kill, reap, and abandoned-child tracking are single-flight and bounded
+  across repeated stalls, and a rejected late child is killed and reaped by
+  the thread that spawned it. Existing unread-stderr and atomic-write behavior
+  is unchanged.
 
 - **Hyprland present retry and crash evidence (#2570):** a failed GPU present
   now retains damage, backs off, and retries without a tick storm; surface

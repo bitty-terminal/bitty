@@ -334,14 +334,11 @@ fn wide_and_combining_glyphs_survive_odd_width_roundtrip() {
         assert_no_orphan_wides(&s);
     }
     let text = logical_text(&s);
+    let expected = format!("{}́", "中".repeat(40));
     assert_eq!(
-        text.chars().filter(|c| *c == '中').count(),
-        40,
-        "all wide glyphs must survive the width round-trip: {text:?}"
-    );
-    assert!(
-        text.contains('́'),
-        "the combining mark must stay attached to its base: {text:?}"
+        text.lines().next(),
+        Some(expected.as_str()),
+        "wide glyphs and their combining marks must survive exactly: {text:?}"
     );
 }
 
@@ -539,28 +536,32 @@ fn wide_reflow_is_exact_for_cjk_repeated_cycles() {
 #[test]
 fn wide_margin_padding_is_not_content_but_real_spaces_are() {
     // No printed space: "AAAA中" wraps with a synthetic pad after AAAA.
-    let mut s = State::new();
-    s.resize(5, 24);
-    prints(&mut s, "AAAA中");
-    newline(&mut s);
-    s.resize(80, 24);
-    assert_eq!(
-        logical_text(&s).lines().next(),
-        Some("AAAA中"),
-        "synthetic wide-margin padding must not materialize as a space"
-    );
+    for width in [4usize, 5, 6] {
+        let mut s = State::new();
+        s.resize(width, 24);
+        prints(&mut s, "AAAA中");
+        newline(&mut s);
+        s.resize(80, 24);
+        assert_eq!(
+            logical_text(&s).lines().next(),
+            Some("AAAA中"),
+            "synthetic wide-margin padding at width {width} must not materialize"
+        );
+    }
 
     // A real space in the last column before the wide glyph must survive.
-    let mut s = State::new();
-    s.resize(5, 24);
-    prints(&mut s, "AAAA 中");
-    newline(&mut s);
-    s.resize(80, 24);
-    assert_eq!(
-        logical_text(&s).lines().next(),
-        Some("AAAA 中"),
-        "a printed space at the wrap boundary is content"
-    );
+    for width in [4usize, 5, 6] {
+        let mut s = State::new();
+        s.resize(width, 24);
+        prints(&mut s, "AAAA 中");
+        newline(&mut s);
+        s.resize(80, 24);
+        assert_eq!(
+            logical_text(&s).lines().next(),
+            Some("AAAA 中"),
+            "a printed space at width {width} must remain content"
+        );
+    }
 }
 
 /// Emoji (width 2), mixed ASCII, and meaningful runs of real spaces must be

@@ -3727,10 +3727,11 @@ fn kitty_delete_selector(keys: &KittyControlKeys) -> Option<KittyDeleteSelector>
 }
 
 /// Collects a physical row's content as grapheme leads, trimming trailing
-/// blanks. Spacers (wide trailing halves) are skipped: the lead carries the
-/// glyph, style, hyperlink, and combining buffer as one atomic unit, so
-/// reflow never splits mid-grapheme. Uses stored `width`, reusing the
-/// existing width logic.
+/// layout padding. Spacers (wide trailing halves) are skipped: the lead
+/// carries the glyph, style, hyperlink, and combining buffer as one atomic
+/// unit, so reflow never splits mid-grapheme. Printed spaces are content and
+/// remain in the lead list; only cells marked [`Cell::padding`] are removed.
+/// Uses stored `width`, reusing the existing width logic.
 fn trim_row_to_leads(cells: &[Cell]) -> Vec<Cell> {
     let mut leads = Vec::new();
     for cell in cells {
@@ -3739,13 +3740,16 @@ fn trim_row_to_leads(cells: &[Cell]) -> Vec<Cell> {
         }
         leads.push(*cell);
     }
-    while leads.last().is_some_and(Cell::is_blank) {
+    while leads
+        .last()
+        .is_some_and(|cell| cell.padding && cell.is_blank())
+    {
         leads.pop();
     }
     leads
 }
 
-/// Rewraps one logical line (leads, no spacers, trimmed) into physical rows
+/// Rewraps one logical line (leads, no spacers, layout-padding trimmed) into physical rows
 /// of `new_cols` columns, padded with `erase`. Wide leads (`width == 2`)
 /// are atomic: when a single column remains, the row is padded with one
 /// blank and the wide starts the next row (mirrors `print`'s margin rule).

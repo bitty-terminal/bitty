@@ -202,12 +202,12 @@ dependencies = [
 [[package]]
 name = "bitty-a11y"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=7edf5e7#7edf5e70b5c9928935c9b1b595940d048acb2571"
+source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=8e02ab5#8e02ab5fe3cf1984fe181c91f08c3e3d81292fda"
 
 [[package]]
 name = "bitty-a11y"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=8e02ab5#8e02ab5fe3cf1984fe181c91f08c3e3d81292fda"
+source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=f7e57091ae12d4e179b059798cc234f074bfb111#f7e57091ae12d4e179b059798cc234f074bfb111"
 
 [[package]]
 name = "bitty-config"
@@ -486,8 +486,8 @@ version = "0.0.26"
 name = "bitty-ui"
 version = "0.0.26"
 dependencies = [
- "bitty-a11y 0.0.1 (git+https://github.com/bitty-terminal/bitty-a11y?rev=7edf5e7)",
  "bitty-a11y 0.0.1 (git+https://github.com/bitty-terminal/bitty-a11y?rev=8e02ab5)",
+ "bitty-a11y 0.0.1 (git+https://github.com/bitty-terminal/bitty-a11y?rev=f7e57091ae12d4e179b059798cc234f074bfb111)",
  "bitty-rich",
  "bitty-term-state",
  "bitty-vt",

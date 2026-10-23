@@ -138,7 +138,9 @@ pub struct SurfaceTelemetrySnapshot {
     pub resize_zero_skipped: u64,
     /// Headless CPU composites (CI path or a headless fake surface).
     pub headless_present: u64,
-    /// Failed real-GPU presents that armed a retry.
+    /// Real-GPU presents that failed and armed a retry. Counts failed
+    /// presents only: a backoff re-armed without a present attempt (the tick
+    /// produced no frame) is not a failure and is not counted here.
     pub retry_failures: u64,
     /// Present attempts made after a backoff deadline elapsed.
     pub retry_attempts: u64,
@@ -236,9 +238,21 @@ pub(crate) fn headless_present() {
     record(LastEvent::HeadlessPresent, Some(HEADLESS_PRESENT));
 }
 
-/// A failed real-GPU present armed the bounded retry.
+/// A real-GPU present failed and armed the bounded retry.
+///
+/// Bumps `retry_failures`, which therefore counts failed *presents* only -
+/// the no-frame backoff re-arm reports through [`retry_rearmed`] instead.
 pub fn retry_armed(delay_ms: u64) {
-    bump(RETRY_FAILURES);
+    record(LastEvent::RetryArmed, Some(RETRY_FAILURES));
+    COUNTERS[RETRY_LAST_DELAY_MS].store(delay_ms, Ordering::Relaxed);
+}
+
+/// The backoff deadline elapsed and was re-armed without a present attempt
+/// (the tick produced no frame).
+///
+/// Deliberately does not bump `retry_failures`: nothing presented, so nothing
+/// failed. Only the armed delay and the last event are refreshed.
+pub fn retry_rearmed(delay_ms: u64) {
     COUNTERS[RETRY_LAST_DELAY_MS].store(delay_ms, Ordering::Relaxed);
     LAST_EVENT.store(LastEvent::RetryArmed as u8, Ordering::Relaxed);
 }
@@ -299,6 +313,7 @@ mod tests {
         acquire_ok();
         present_ok();
         retry_armed(100);
+        retry_rearmed(200);
         retry_attempt();
         retry_recovered();
 
@@ -317,7 +332,9 @@ mod tests {
         assert!(after.retry_failures > before.retry_failures);
         assert!(after.retry_attempts > before.retry_attempts);
         assert!(after.retry_recoveries > before.retry_recoveries);
-        assert_eq!(after.retry_last_delay_ms, 100);
+        // `retry_rearmed` ran last: it refreshes the armed delay but is not a
+        // failed present, so it must not be what moves `retry_failures`.
+        assert_eq!(after.retry_last_delay_ms, 200);
         assert!(!after.last_event.is_empty());
     }
 

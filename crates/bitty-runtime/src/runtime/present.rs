@@ -2163,11 +2163,44 @@ impl Runtime {
         if stats.is_none() {
             if let Some(deadline) = self.surface_retry.deadline {
                 if now >= deadline {
-                    self.arm_surface_retry(now);
+                    // No present ran: this is a backoff re-arm, not a failed
+                    // present, so it must not count as `retry_failures`.
+                    let delay = self.arm_surface_retry(now);
+                    bitty_render::telemetry::retry_rearmed(delay.as_millis() as u64);
                 }
             }
+            // Review (PR #2588): every `None` return above skipped the only
+            // paths that clear a deferred frame, so a deferral pending when
+            // the present failed keeps the coalesced wake in the past.
+            self.align_coalesced_wake_with_retry();
         }
         stats
+    }
+
+    /// Re-points a pending coalesced wake at the surface-retry deadline
+    /// (review PR #2588).
+    ///
+    /// [`Self::tick_at_inner`] returns before `collect_tick_basis` and
+    /// [`Self::defer_coalesced_present`] while a backoff is pending, and both
+    /// of those are on the only paths that clear `coalesced_pending`
+    /// ([`Self::mark_frame_presented`] and the idle short-circuit). A frame
+    /// deferred before the failing present therefore stays pending with a
+    /// deadline already in the past, and the embedder's `set_wait_until` on
+    /// that past deadline re-enters the loop immediately on every turn - a
+    /// 100% CPU spin for as long as the presents keep failing, made worse by
+    /// how cheap the gated iterations are.
+    ///
+    /// Nothing can present before the retry deadline anyway, so aiming the
+    /// coalesced wake there keeps one bounded wake per backoff step; the
+    /// retry attempt itself clears the flag when it presents (or re-arms and
+    /// re-points here when it does not).
+    fn align_coalesced_wake_with_retry(&mut self) {
+        if !self.coalesced_pending {
+            return;
+        }
+        if let Some(deadline) = self.surface_retry.deadline {
+            self.coalesced_deadline = Some(deadline);
+        }
     }
 
     /// Tick body behind [`Self::tick_at`] (kept separate so every early
@@ -2197,7 +2230,10 @@ impl Runtime {
         // Issue #2570 review: while the retry backoff is pending, do not
         // rebuild the retained frame on every tick. Damage stays in
         // `pending_full_redraw` and the per-origin rings; the deadline wake
-        // rebuilds once and retries the present.
+        // rebuilds once and retries the present. This return (like every
+        // other one) skips the only paths that clear a deferred frame, so
+        // `tick_at` re-points the coalesced wake at the retry deadline
+        // afterwards via `align_coalesced_wake_with_retry`.
         if let Some(deadline) = self.surface_retry.deadline {
             if now < deadline {
                 return None;
@@ -5569,11 +5605,18 @@ impl Runtime {
     /// string. The first [`GPU_PRESENT_LOG_BURST`] failures log individually,
     /// then every [`GPU_PRESENT_LOG_EVERY`]th; the aggregate count is always
     /// carried in the line and in the surface telemetry.
-    fn note_surface_present_failure(&mut self, error: &RenderError) {
+    ///
+    /// `next_delay` is the delay the caller actually armed
+    /// ([`Self::arm_surface_retry`]'s return value), so the logged value is
+    /// the deadline that will fire - not one doubling step past it.
+    fn note_surface_present_failure(
+        &mut self,
+        error: &RenderError,
+        next_delay: std::time::Duration,
+    ) {
         self.gpu_present_failures = self.gpu_present_failures.saturating_add(1);
         if should_log_present_failure(self.gpu_present_failures) {
             let consecutive = self.surface_retry.failures;
-            let next_delay = surface_retry_delay(consecutive.saturating_add(1));
             eprintln!(
                 "bitty: gpu present failed ({error}); retained damage and queued a retry (failures={}, consecutive={}, next_delay={} ms)",
                 self.gpu_present_failures,
@@ -5583,12 +5626,17 @@ impl Runtime {
         }
     }
 
-    /// Arms the next bounded retry after a failed present.
-    fn arm_surface_retry(&mut self, now: std::time::Instant) {
+    /// Arms the next bounded retry after a failed present and returns the
+    /// armed delay.
+    ///
+    /// Scheduling only: it neither logs nor touches the telemetry counters, so
+    /// the no-frame re-arm in [`Self::tick_at`] and a real failed present are
+    /// counted separately by their callers.
+    fn arm_surface_retry(&mut self, now: std::time::Instant) -> std::time::Duration {
         self.surface_retry.failures = self.surface_retry.failures.saturating_add(1);
         let delay = surface_retry_delay(self.surface_retry.failures);
         self.surface_retry.deadline = Some(now + delay);
-        bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
+        delay
     }
 
     /// Clears the retry state after a successful present.
@@ -5810,12 +5858,14 @@ impl Runtime {
             #[cfg(test)]
             if test_present == Some(false) {
                 // Simulate the real-GPU failure path without an adapter: arm
-                // the retry first (so the log line carries the next delay),
-                // then retain the frame for the recovery attempt.
-                self.arm_surface_retry(now);
-                self.note_surface_present_failure(&RenderError::SurfaceAcquire(String::from(
-                    "test-injected present failure",
-                )));
+                // the retry first (so the log line carries the delay actually
+                // armed), then retain the frame for the recovery attempt.
+                let delay = self.arm_surface_retry(now);
+                bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
+                self.note_surface_present_failure(
+                    &RenderError::SurfaceAcquire(String::from("test-injected present failure")),
+                    delay,
+                );
                 self.pending_full_redraw = true;
                 return None;
             }
@@ -5831,13 +5881,20 @@ impl Runtime {
                     }
                     Err(err) => {
                         // Issue #2570: a failed real-GPU present must not be
-                        // papered over by an invisible CPU composite that then
-                        // consumes the frame's damage. Retain the damage,
+                        // papered over by a CPU composite. Retain the damage,
                         // report the failure under the bounded log policy, and
                         // retry on a bounded backoff so the window recovers when
                         // the compositor releases the swap chain again.
-                        self.arm_surface_retry(now);
-                        self.note_surface_present_failure(&err);
+                        //
+                        // Review PR #2588: the pre-#2570 fallback did not
+                        // consume the frame's damage - `headless_present`
+                        // hard-errors on a real surface, so that path already
+                        // returned with the damage retained and the retry
+                        // unbounded. What this fixes is the per-tick retry
+                        // storm and the silence, not a damaged-frame bug.
+                        let delay = self.arm_surface_retry(now);
+                        bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
+                        self.note_surface_present_failure(&err, delay);
                         self.pending_full_redraw = true;
                         return None;
                     }
@@ -8376,6 +8433,77 @@ mod surface_retry_tests {
         assert!(!rt.pending_full_redraw);
         assert_eq!(stats.generation, rt.last_presented_generation);
         assert_ne!(rt.last_presented_generation, before);
+    }
+
+    /// The wake the app's `AboutToWait` would arm from the runtime-owned
+    /// session deadlines: the coalesced-present wake and the surface retry.
+    /// The other folded deadlines (hover, animation, bell, capture, kitty
+    /// workers, plugin timers) are all `None` on a quiet runtime.
+    fn wake_min(rt: &Runtime) -> Option<std::time::Instant> {
+        [
+            rt.present_coalescing_deadline(),
+            rt.surface_retry_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    #[test]
+    fn backoff_never_leaves_a_past_due_coalesced_wake() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        // Arm a PTY-quiescence deferral: the dirty tick at `t0` is held with
+        // `coalesced_pending` and a wake at the settle deadline.
+        rt.set_present_settle(std::time::Duration::from_millis(30));
+        rt.note_present_input_at(t0);
+        rt.pending_full_redraw = true;
+        assert!(
+            rt.tick_at(t0).is_none(),
+            "the settle window holds the frame"
+        );
+        let open_at = rt
+            .present_coalescing_deadline()
+            .expect("a deferred frame arms the coalesced wake");
+        assert!(open_at > t0);
+
+        // The deferral opens and that present fails, arming the 50 ms retry.
+        // `defer_coalesced_present` returns `false` at the open time without
+        // clearing the flag, so the coalesced wake is now in the past.
+        rt.enable_test_present(1);
+        assert!(rt.tick_at(open_at).is_none(), "the injected present fails");
+        let retry = rt.surface_retry_deadline().expect("failure arms a retry");
+        assert_eq!(retry, open_at + std::time::Duration::from_millis(50));
+        assert!(
+            rt.coalesced_pending,
+            "the pre-failure deferral survived the failing present"
+        );
+
+        // Regression (review PR #2588): while the backoff holds presentation,
+        // the deadline handed back to the event loop must never be earlier
+        // than `now`. A past-due coalesced wake makes `set_wait_until` re-enter
+        // the loop immediately on every turn, a 100% CPU spin at the cheap
+        // gated iterations. Assert the wake minimum, not the attempt counter:
+        // the attempt cap was already satisfied by the old code.
+        for step in 1..=49u64 {
+            let now = open_at + std::time::Duration::from_millis(step);
+            assert!(rt.tick_at(now).is_none(), "the backoff gates the present");
+            let wake = wake_min(&rt);
+            assert!(
+                wake >= Some(now),
+                "wake {wake:?} must never be in the past at {now:?}"
+            );
+            assert_eq!(
+                wake,
+                Some(retry),
+                "the coalesced wake is re-pointed at the retry deadline"
+            );
+        }
+        assert_eq!(
+            rt.test_present_attempts(),
+            1,
+            "no present attempts while the backoff is pending"
+        );
     }
 
     #[test]

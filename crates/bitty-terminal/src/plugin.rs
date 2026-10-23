@@ -1104,8 +1104,8 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --profile editor-like --yes\n\
-     \x20 bitty plugin grant xuepoo.hello --profile panel-like\n\
-     \x20 bitty plugin grant xuepoo.hello --cap network.connect:example.com:443\n\
+     \x20 bitty plugin grant bitty-terminal.shell-integration --profile panel-like\n\
+     \x20 bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read\n\
      \x20 bitty plugin install bitty-terminal.bar --yes   (official catalog id)\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
@@ -7189,14 +7189,9 @@ fn op_install(
     // never do (deny-loop guard). A profile only preselects additions, so it
     // never clears a denial: only a full `install` re-consent does.
     let denied: BTreeSet<CapabilityId> = match (&existing, &profile_plan) {
-        (Some(record), Some(plan)) => record
-            .denied
-            .iter()
-            .filter(|capability| {
-                requested.contains(*capability) && !plan.selected.contains(*capability)
-            })
-            .cloned()
-            .collect(),
+        // A profile never clears a denial, including one outside the current
+        // manifest request set.
+        (Some(record), Some(_)) => record.denied.clone(),
         (Some(record), None) => record.denied.difference(&requested).cloned().collect(),
         (None, _) => BTreeSet::new(),
     };
@@ -8364,6 +8359,18 @@ mod tests {
         let help = plugin_help_text();
         assert!(help.contains("explain <id> <capability>"), "{help}");
         assert!(help.contains("capability decision chain"), "{help}");
+        assert!(
+            help.contains(
+                "bitty plugin grant bitty-terminal.shell-integration --profile panel-like"
+            ),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read"
+            ),
+            "{help}"
+        );
         let usage = plugin_usage();
         assert!(usage.contains("explain <id> <capability>"), "{usage}");
     }
@@ -10363,8 +10370,12 @@ mod tests {
         let id = PROFILE_PLUGIN;
         let manifest = bundled_manifest(id).expect("bundled");
         let capability = CapabilityId::parse("terminal.semantic-read").expect("known");
+        let unrelated_capability = CapabilityId::parse("ui.rich").expect("known");
         let mut denied = BTreeSet::new();
         denied.insert(capability.clone());
+        // Keep a denial for a capability that this manifest does not request.
+        // A later manifest update may request it, so profiles must not drop it.
+        denied.insert(unrelated_capability.clone());
         let mut state = PluginState::new();
         state.insert(
             id.to_string(),
@@ -10403,6 +10414,10 @@ mod tests {
         let state = load_state(&state_path(&dir)).expect("state readable");
         let record = state.get(id).expect("record kept");
         assert!(record.denied.contains(&capability), "profile keeps denial");
+        assert!(
+            record.denied.contains(&unrelated_capability),
+            "profile keeps denials outside the current request set"
+        );
         assert!(record.granted.is_empty(), "profile grants nothing denied");
 
         // `install --profile` is also a preselect, not a denial reset.
@@ -10417,6 +10432,10 @@ mod tests {
         assert!(
             record.denied.contains(&capability),
             "install --profile keeps the denial"
+        );
+        assert!(
+            record.denied.contains(&unrelated_capability),
+            "install --profile keeps denials outside the current request set"
         );
         assert!(
             !record.granted.contains(&capability),

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capability consent profiles (#2472):** bundled plugin installs and grants
+  accept a versioned `--profile minimal|editor-like|panel-like|agent-like`
+  preselect, plus `bitty plugin grant <id> --profile <name>` and
+  `--cap <capability>` for explicit per-item consent. A diff/review screen
+  lists additions, already-granted capabilities, non-selected requests, and
+  explicit denials before anything is written. Profiles are not a new
+  authority layer: they only preselect individual, visible, revocable grants,
+  can never exceed the manifest's requested set, and never include exec,
+  network, agent/MCP/AI, clipboard-read, environment, terminal input/raw
+  read, debug, browser, or device-control heads; home-rooted or absolute
+  filesystem patterns also need explicit per-item consent. Profile contents
+  are validated against the live capability catalog, so an unknown or removed
+  head fails closed. Store packages reject `--profile` because their install
+  transaction owns the full grant set.
 - **Presentation-only plugin overlays (#2406):** a plugin can now present an
   `overlay`-slot block without becoming modal. `bitty.ui.overlay.show(handle)`
   and `bitty.ui.overlay.hide(handle)` require only `ui.rich` + `ui.overlay`

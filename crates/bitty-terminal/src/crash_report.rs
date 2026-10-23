@@ -152,6 +152,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static PHASE: AtomicU8 = AtomicU8::new(Phase::Startup as u8);
 static LAST_LIFECYCLE: AtomicU8 = AtomicU8::new(Lifecycle::Startup as u8);
 static EXIT_REASON: AtomicU8 = AtomicU8::new(ExitReason::Unknown as u8);
+static EXIT_RECORDED: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_COUNTS: [AtomicU64; Lifecycle::COUNT] =
     [const { AtomicU64::new(0) }; Lifecycle::COUNT];
 
@@ -211,14 +212,22 @@ pub(crate) fn lifecycle(event: Lifecycle) {
 /// slot, so a panic and a clean exit stay distinguishable.
 pub(crate) fn record_exit(reason: ExitReason) {
     EXIT_REASON.store(reason as u8, Ordering::Relaxed);
-    lifecycle(Lifecycle::Exit);
-    if !ENABLED.load(Ordering::Relaxed) {
+    // The first exit path is the specific one (shell-exit, close-view,
+    // route-event); the event loop then returns and `main` would otherwise
+    // overwrite it with the generic `event-loop-returned`.
+    if EXIT_RECORDED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let line = render_exit_line(reason);
-    if let Some(path) = state_path(EXIT_FILE_NAME) {
-        let _ = write_slot(&path, &line, MAX_EXIT_BYTES);
+    if ENABLED.load(Ordering::Relaxed) {
+        let line = render_exit_line(reason);
+        if let Some(path) = state_path(EXIT_FILE_NAME) {
+            let _ = write_slot(&path, &line, MAX_EXIT_BYTES);
+        }
     }
+    // Mark the exit after the line is rendered: the report's `lifecycle` field
+    // then names the last real window event (close-requested/closed) rather
+    // than the exit marker itself.
+    lifecycle(Lifecycle::Exit);
 }
 
 /// The last recorded lifecycle event name (bounded, static).

@@ -5,9 +5,14 @@
 //! selection guard used to drop every press inside one: mouse selection and
 //! its highlight never worked there. These tests prove the float grid is a
 //! first-class selection owner while the tiled panes keep their behavior.
+//!
+//! The two scrolled-selection tests are Unix-only because their session-backed
+//! grids require a POSIX shell and PTY; the live float test is cross-platform.
 
+#[cfg(unix)]
+use bitty_platform::ScrollDelta;
 use bitty_platform::{
-    CursorPosition, MouseButton, MouseEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
+    CursorPosition, MouseButton, MouseEvent, PressState, WindowEventKind, WindowId,
 };
 use bitty_runtime::{
     LayoutNode, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
@@ -103,6 +108,7 @@ fn assert_selection_adds_fills(rt: &mut Runtime, context: &str) {
 }
 
 /// Two-pane runtime whose second pane owns a real PTY grid with scrollback.
+#[cfg(unix)]
 fn session_runtime() -> Runtime {
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless runtime builds");
     install(&mut rt, two_pane());
@@ -126,6 +132,7 @@ fn session_runtime() -> Runtime {
 
 /// Selects the first five cells of the pane's top visible row and returns the
 /// copied text.
+#[cfg(unix)]
 fn drag_top_row(rt: &mut Runtime, view: ViewId) -> String {
     let frame = frame_of(rt, view);
     let start = at(rt, &frame, 0, 0);
@@ -176,6 +183,7 @@ fn detached_float_supports_pointer_selection_and_paint() {
     assert!(rt.pointer_over_selectable_text());
 }
 
+#[cfg(unix)]
 #[test]
 fn scrolled_detached_float_paints_history_selection() {
     bitty_test_support::require_pty!();
@@ -203,6 +211,7 @@ fn scrolled_detached_float_paints_history_selection() {
     assert_selection_adds_fills(&mut rt, "scrolled detached float selection");
 }
 
+#[cfg(unix)]
 #[test]
 fn scrolled_pinned_leaf_paints_history_selection() {
     bitty_test_support::require_pty!();

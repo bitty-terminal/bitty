@@ -1103,9 +1103,10 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
-     \x20 bitty plugin install bitty-terminal.shell-integration --profile editor-like --yes\n\
-     \x20 bitty plugin grant bitty-terminal.shell-integration --profile panel-like\n\
+     \x20 bitty plugin install bitty-terminal.shell-integration --profile panel-like --yes\n\
+     \x20 bitty plugin grant bitty-terminal.shell-integration --profile editor-like\n\
      \x20 bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read\n\
+     \x20 bitty plugin enable bitty-terminal.shell-integration   (grant does not enable it)\n\
      \x20 bitty plugin install bitty-terminal.bar --yes   (official catalog id)\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
@@ -8361,13 +8362,25 @@ mod tests {
         assert!(help.contains("capability decision chain"), "{help}");
         assert!(
             help.contains(
-                "bitty plugin grant bitty-terminal.shell-integration --profile panel-like"
+                "bitty plugin install bitty-terminal.shell-integration --profile panel-like --yes"
+            ),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "bitty plugin grant bitty-terminal.shell-integration --profile editor-like"
             ),
             "{help}"
         );
         assert!(
             help.contains(
                 "bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read"
+            ),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "bitty plugin enable bitty-terminal.shell-integration   (grant does not enable it)"
             ),
             "{help}"
         );

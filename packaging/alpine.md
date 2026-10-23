@@ -78,4 +78,3 @@ which does not exist until the release tag is pushed, so `pkgver` is bumped in
 the release PR and the checksum is committed with that tag. Running
 `abuild checksum` against an unreleased `pkgver` fails closed on the 404
 instead of pinning a hash for a tarball that may never be published.
-

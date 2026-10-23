@@ -220,6 +220,8 @@ jobs:
           bash scripts/tests/check-release-smoke-fail-closed.test.sh
           bash scripts/tests/check-aur-bin-render.test.sh
           bash scripts/tests/check-apt-repo.test.sh
+          bash scripts/tests/import-apt-gpg-key.test.sh
+          bash scripts/tests/check-release-channels.test.sh
           bash scripts/tests/check-nix-flake.test.sh
 
       - name: Check terminfo shipping decision (034 item 6)

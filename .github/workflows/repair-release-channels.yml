@@ -1,0 +1,395 @@
+name: Repair release channels
+
+# Emergency, manual repair path for already-published stable tags whose
+# package channels failed after the tag was created. The tag and GitHub
+# Release are read-only inputs: this workflow never moves, deletes, or
+# re-uploads a tag/release asset. It rebuilds channel state from the published
+# release assets and re-publishes only the derived channel repositories.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published stable tag to repair (for example v0.0.27)"
+        required: true
+        default: "v0.0.27"
+        type: string
+      channels:
+        description: "Channel(s) to repair"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - apt
+          - copr
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repair-release-channels-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  # Keep in sync with release.yml; single pinned Wrangler CLI for R2 jobs.
+  WRANGLER_VERSION: 4.135.0
+  # Fingerprint of packaging/apt/bitty-archive-keyring.gpg.
+  APT_GPG_KEY_FINGERPRINT: BCB87D7B489A64168080D900DF4751B6EA711CB8
+
+jobs:
+  validate:
+    name: Validate repair target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Validate tag and published release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag must be a stable vX.Y.Z tag, got: $TAG" >&2
+            exit 1
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease > release.json
+          python3 - release.json <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          if release.get("isDraft"):
+              raise SystemExit("refusing to repair a draft release")
+          if release.get("isPrerelease"):
+              raise SystemExit("refusing to repair a prerelease")
+          print(f"repair target: {release['tagName']}")
+          PY
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  apt:
+    name: Repair APT repository (R2)
+    needs: validate
+    if: inputs.channels == 'all' || inputs.channels == 'apt'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Check out release tag (assets and generator metadata)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          path: source
+          persist-credentials: false
+      - name: Check out repair tooling from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tooling
+          persist-credentials: false
+      - name: Download published .deb assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern '*.deb' --pattern 'SHA256SUMS'
+          test -f release/SHA256SUMS
+          ls -l release
+      - name: Verify published .deb checksums
+        run: |
+          set -euo pipefail
+          cd release
+          mapfile -t DEBS < <(find . -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort)
+          if [ "${#DEBS[@]}" -eq 0 ]; then
+            echo "::error::no .deb assets found in release ${TAG}" >&2
+            exit 1
+          fi
+          EXPECTED_DEBS="$(awk '$2 ~ /^\*?.*\.deb$/ { count++ } END { print count + 0 }' SHA256SUMS)"
+          if [ "$EXPECTED_DEBS" -ne "${#DEBS[@]}" ]; then
+            echo "::error::SHA256SUMS lists ${EXPECTED_DEBS} .deb file(s) but ${#DEBS[@]} were downloaded" >&2
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/deb.sha256"
+          for deb in "${DEBS[@]}"; do
+            sum_line="$(awk -v f="$deb" '$2 == f || $2 == "*" f { print }' SHA256SUMS)"
+            if [ -z "$sum_line" ]; then
+              echo "::error::${deb} is missing from SHA256SUMS" >&2
+              exit 1
+            fi
+            printf '%s\n' "$sum_line" >> "$RUNNER_TEMP/deb.sha256"
+          done
+          sha256sum -c "$RUNNER_TEMP/deb.sha256"
+      - name: Install Wrangler
+        run: |
+          set -euo pipefail
+          npm install -g "wrangler@${WRANGLER_VERSION}"
+          wrangler --version
+      - name: Import APT signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GNUPGHOME: ${{ runner.temp }}/apt-gnupg
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$GNUPGHOME"
+          tooling/scripts/import-apt-gpg-key.sh --fingerprint "$APT_GPG_KEY_FINGERPRINT"
+      - name: Generate and sign APT repository
+        env:
+          GNUPGHOME: ${{ runner.temp }}/apt-gnupg
+        run: |
+          set -euo pipefail
+          mkdir -p stage apt_repo
+          find release -maxdepth 1 -name '*.deb' -exec cp -t stage {} +
+          python3 tooling/scripts/generate-apt-repo.py \
+            --dist-dir stage \
+            --repo-dir apt_repo \
+            --assets-dir source/packaging/apt \
+            --gpg-key "$APT_GPG_KEY_FINGERPRINT"
+          KEYRING="$PWD/source/packaging/apt/bitty-archive-keyring.gpg"
+          gpgv --keyring "$KEYRING" apt_repo/dists/stable/InRelease
+          gpgv --keyring "$KEYRING" apt_repo/dists/stable/Release.gpg apt_repo/dists/stable/Release
+      - name: Upload APT repository to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Cloudflare credentials not set; cannot upload to R2" >&2
+            exit 1
+          fi
+          cd apt_repo
+          {
+            find . -type f -not -path './dists/*'
+            find . -type f -path './dists/*' ! -name Release ! -name Release.gpg ! -name InRelease
+            find . -type f -path './dists/*' \( -name Release -o -name Release.gpg -o -name InRelease \)
+          } | while IFS= read -r FILE; do
+            REL_PATH="${FILE#./}"
+            KEY="bitty/apt/${REL_PATH}"
+            if [[ "$REL_PATH" == pool/* ]]; then
+              CACHE="public, max-age=31536000, immutable"
+            else
+              CACHE="public, max-age=300, must-revalidate"
+            fi
+            echo "Uploading ${REL_PATH} -> ${KEY} (${CACHE})"
+            wrangler r2 object put "$KEY" --file "$REL_PATH" --remote --cache-control "$CACHE"
+          done
+      - name: Verify APT repository read-back
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          wrangler r2 object get "bitty/apt/dists/stable/Release" --remote --pipe | cmp - apt_repo/dists/stable/Release
+          wrangler r2 object get "bitty/apt/dists/stable/InRelease" --remote --pipe | cmp - apt_repo/dists/stable/InRelease
+          wrangler r2 object get "bitty/apt/dists/stable/Release.gpg" --remote --pipe | cmp - apt_repo/dists/stable/Release.gpg
+          echo "verified R2 APT repository indices (byte-identical)"
+
+  copr:
+    name: Repair Fedora Copr
+    needs: validate
+    if: inputs.channels == 'all' || inputs.channels == 'copr'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          persist-credentials: false
+      - name: Download published .rpm assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern '*.rpm' --pattern 'SHA256SUMS'
+          test -f release/SHA256SUMS
+          ls -l release
+      - name: Verify published .rpm checksums
+        run: |
+          set -euo pipefail
+          cd release
+          mapfile -t RPMS < <(find . -maxdepth 1 -type f -name '*.rpm' -printf '%f\n' | sort)
+          if [ "${#RPMS[@]}" -eq 0 ]; then
+            echo "::error::no .rpm assets found in release ${TAG}" >&2
+            exit 1
+          fi
+          EXPECTED_RPMS="$(awk '$2 ~ /^\*?.*\.rpm$/ { count++ } END { print count + 0 }' SHA256SUMS)"
+          if [ "$EXPECTED_RPMS" -ne "${#RPMS[@]}" ]; then
+            echo "::error::SHA256SUMS lists ${EXPECTED_RPMS} .rpm file(s) but ${#RPMS[@]} were downloaded" >&2
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/rpm.sha256"
+          for rpm in "${RPMS[@]}"; do
+            sum_line="$(awk -v f="$rpm" '$2 == f || $2 == "*" f { print }' SHA256SUMS)"
+            if [ -z "$sum_line" ]; then
+              echo "::error::${rpm} is missing from SHA256SUMS" >&2
+              exit 1
+            fi
+            printf '%s\n' "$sum_line" >> "$RUNNER_TEMP/rpm.sha256"
+          done
+          sha256sum -c "$RUNNER_TEMP/rpm.sha256"
+      - name: Install copr-cli in a virtual environment
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/copr-cli"
+          "$RUNNER_TEMP/copr-cli/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/copr-cli/bin/pip" install copr-cli
+          echo "$RUNNER_TEMP/copr-cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/copr-cli/bin/copr-cli" --version
+      - name: Upload RPMs to the configured Copr project
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+          COPR_PROJECT: ${{ vars.COPR_PROJECT || 'xuepoo/bitty-terminal' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COPR_CONFIG:-}" ]; then
+            echo "::error::Copr repair requires COPR_CONFIG" >&2
+            exit 1
+          fi
+
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+
+          RPM_X64="$(find release -maxdepth 1 -name '*.rpm' -print | sort | grep -E 'x86_64|amd64' | head -n1 || true)"
+          RPM_ARM="$(find release -maxdepth 1 -name '*.rpm' -print | sort | grep -E 'aarch64|arm64' | head -n1 || true)"
+
+          echo "Querying enabled chroots for ${COPR_PROJECT}..."
+          PROJECT_INFO="$(copr-cli get "$COPR_PROJECT")"
+          CHROOTS_X64="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-x86_64:/{print $1}' | tr -d ':')"
+          CHROOTS_ARM="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-aarch64:/{print $1}' | tr -d ':')"
+
+          if [ -z "$CHROOTS_X64" ] && [ -z "$CHROOTS_ARM" ]; then
+            echo "::error::No enabled chroots found for project ${COPR_PROJECT}" >&2
+            exit 1
+          fi
+
+          UPLOADED=0
+          if [ -n "$CHROOTS_X64" ]; then
+            if [ -z "$RPM_X64" ] || [ ! -f "$RPM_X64" ]; then
+              echo "::error::Missing x86_64 RPM asset for Copr repair" >&2
+              exit 1
+            fi
+            ARGS_X64=()
+            for chroot in $CHROOTS_X64; do
+              ARGS_X64+=(-r "$chroot")
+            done
+            echo "Uploading $RPM_X64 to x86_64 chroots: $CHROOTS_X64"
+            copr-cli uploadrpm "${ARGS_X64[@]}" "$COPR_PROJECT" "$RPM_X64"
+            UPLOADED=$((UPLOADED + 1))
+          fi
+
+          if [ -n "$CHROOTS_ARM" ]; then
+            if [ -z "$RPM_ARM" ] || [ ! -f "$RPM_ARM" ]; then
+              echo "::error::Missing aarch64 RPM asset for Copr repair" >&2
+              exit 1
+            fi
+            ARGS_ARM=()
+            for chroot in $CHROOTS_ARM; do
+              ARGS_ARM+=(-r "$chroot")
+            done
+            echo "Uploading $RPM_ARM to aarch64 chroots: $CHROOTS_ARM"
+            copr-cli uploadrpm "${ARGS_ARM[@]}" "$COPR_PROJECT" "$RPM_ARM"
+            UPLOADED=$((UPLOADED + 1))
+          fi
+
+          if [ "$UPLOADED" -eq 0 ]; then
+            echo "::error::No packages published to Copr" >&2
+            exit 1
+          fi
+
+  nix:
+    name: Repair Nix flake lock (optional)
+    needs: validate
+    if: inputs.channels == 'all'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          submodules: false
+      - uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: bitty
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - name: Adopt a newer validated flake.lock from the default branch
+        id: lock
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          echo "adopt=false" >> "$GITHUB_OUTPUT"
+
+          TAG_LOCK_DATE="$(git log -1 --format=%ct HEAD -- flake.lock)"
+          git fetch --no-tags --depth=1 origin "$DEFAULT_BRANCH"
+          MAIN_LOCK_DATE="$(git log -1 --format=%ct FETCH_HEAD -- flake.lock)"
+
+          if git diff --quiet HEAD FETCH_HEAD -- flake.lock; then
+            echo "::notice::flake.lock is identical to ${DEFAULT_BRANCH}; skipping Nix repair"
+            exit 0
+          fi
+          if ((MAIN_LOCK_DATE <= TAG_LOCK_DATE)); then
+            echo "::notice::flake.lock on ${DEFAULT_BRANCH} (${MAIN_LOCK_DATE}) is not newer than ${TAG} (${TAG_LOCK_DATE}); skipping Nix repair"
+            exit 0
+          fi
+
+          git show FETCH_HEAD:flake.lock > "$RUNNER_TEMP/flake.lock.candidate"
+          if ! python3 - "$RUNNER_TEMP/flake.lock.candidate" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          lock = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          if lock.get("version") != 7 or not lock.get("nodes"):
+              raise SystemExit("flake.lock candidate is not a v7 lock graph")
+          if lock.get("root") not in lock["nodes"]:
+              raise SystemExit("flake.lock candidate root is missing from nodes")
+          if "nixpkgs" not in lock["nodes"]:
+              raise SystemExit("flake.lock candidate has no nixpkgs node")
+          PY
+          then
+            echo "::warning::newer flake.lock from ${DEFAULT_BRANCH} is not a valid v7 lock graph; skipping Nix repair"
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/flake.lock.candidate" flake.lock
+          if ! nix flake metadata --json . >/dev/null; then
+            echo "::warning::newer flake.lock from ${DEFAULT_BRANCH} did not validate; restoring ${TAG} lock and skipping Nix repair"
+            git checkout -- flake.lock
+            exit 0
+          fi
+
+          echo "adopted newer validated flake.lock from ${DEFAULT_BRANCH}"
+          echo "adopt=true" >> "$GITHUB_OUTPUT"
+      - name: Build and push Nix package to Cachix
+        if: steps.lock.outputs.adopt == 'true'
+        run: nix build .#bitty --print-build-logs
+      - name: Verify build artifact
+        if: steps.lock.outputs.adopt == 'true'
+        run: |
+          set -euo pipefail
+          test -x result/bin/bitty
+          scripts/check-version-output.sh "${TAG#v}" result/bin/bitty

@@ -423,6 +423,17 @@ package-manifests-test:
 release-smoke-test:
     ./scripts/tests/check-release-smoke-fail-closed.test.sh
 
+# Pin the 0.0.27 release-channel repairs (CTX-1481): Copr CLI comes from a
+# Python venv (never apt), and the APT secret is importer-verified against the
+# pinned archive fingerprint; also guards the emergency repair workflow.
+release-channels-test:
+    ./scripts/tests/check-release-channels.test.sh
+
+# Hermetic importer coverage for the APT signing secret: armored, base64,
+# escaped-newline, wrong fingerprint, public-only, and unparseable material.
+apt-gpg-import-test:
+    ./scripts/tests/import-apt-gpg-key.test.sh
+
 # Regression gate for the AUR bitty-bin publish assertion (#2417): render the
 # template with a version and digest, assert the exact source_x86_64/.SRCINFO,
 # and prove the pre-fix literal asset-name needle cannot match it.
@@ -467,7 +478,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

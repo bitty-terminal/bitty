@@ -13,17 +13,17 @@ and is labeled as such below.
 
 ## Formats
 
-| Format    | File                                                     | Distro                                                     |
-| --------- | -------------------------------------------------------- | ---------------------------------------------------------- |
-| deb       | `nfpm.yaml` + `deb` packager                             | Ubuntu 24.04 (verified); Debian 12 best-effort             |
-| rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort         |
-| rpm (OBS) | `packaging/opensuse/bitty.spec` + `_service`             | openSUSE Tumbleweed and Leap 15.6 best-effort (zypper)     |
-| apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`) |
-| archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated            |
-| apk (aports) | `packaging/alpine/APKBUILD`                     | In-tree aports recipe, not published to aports; best-effort |
-| ebuild    | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`) | In-tree overlay, not in the gentoo tree; best-effort        |
-| xbps      | `packaging/void/srcpkgs/bitty/template`         | In-tree template, not in void-packages; best-effort         |
-| freebsd   | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported  |
+| Format       | File                                                     | Distro                                                      |
+| ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
+| deb          | `nfpm.yaml` + `deb` packager                             | Ubuntu 24.04 (verified); Debian 12 best-effort              |
+| rpm          | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort          |
+| rpm (OBS)    | `packaging/opensuse/bitty.spec` + `_service`             | openSUSE Tumbleweed and Leap 15.6 best-effort (zypper)      |
+| apk          | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`)  |
+| archlinux    | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated             |
+| apk (aports) | `packaging/alpine/APKBUILD`                              | In-tree aports recipe, not published to aports; best-effort |
+| ebuild       | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`)     | In-tree overlay, not in the gentoo tree; best-effort        |
+| xbps         | `packaging/void/srcpkgs/bitty/template`                  | In-tree template, not in void-packages; best-effort         |
+| freebsd      | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported   |
 
 The upstream distro recipes (Alpine aports, Gentoo overlay, Void `xbps-src`,
 FreeBSD Ports) are in-tree drafts: nothing is published to `alpine/aports`,
@@ -35,6 +35,26 @@ the release tag is pushed. `bash scripts/tests/check-distro-recipes.test.sh`
 recipes internally consistent and version-agnostic.
 
 Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE consumes RPMs two ways: the release `nfpm` RPM passes `rpm -qip` and a local `zypper install` check, and `packaging/opensuse/bitty.spec` is the OBS source recipe that publishes a zypper repository (see `packaging/opensuse/README.md` and `packaging/opensuse.md`). No release `verify-install` leg covers OpenSUSE, so both stay best-effort, not supported. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
+
+## Repairing a published channel
+
+When a release tag is already public but a derived channel failed (for example
+the 0.0.27 APT and Copr jobs), dispatch the manual repair workflow instead of
+moving the tag:
+
+```sh
+gh workflow run repair-release-channels.yml \
+  --ref main -f tag=v0.0.27 -f channels=all
+```
+
+`channels` is `all`, `apt`, or `copr`. The workflow downloads the published
+`.deb`/`.rpm` assets plus `SHA256SUMS` from the GitHub Release, verifies every
+checksum, republishes only the derived channel state, and reads the APT indices
+back from R2. It never moves a tag, edits a release, or re-uploads an asset.
+The optional Nix leg (`channels=all`) adopts a newer, validated `flake.lock`
+from the default branch only when it is newer than the tag's lock and passes
+`nix flake metadata`; otherwise it skips with a notice, leaving the published
+tag untouched.
 
 ## Install smoke
 

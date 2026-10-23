@@ -37,7 +37,9 @@ The release workflow (`.github/workflows/release.yml`) builds `.rpm` packages
 via `nfpm` for both `x86_64` and `aarch64`. Once built and verified through
 the install smoke gate (`scripts/install-smoke.sh --distro fedora`), the
 `copr` job publishes the artifacts directly to the Copr project using
-`copr-cli uploadrpm` under `environment: release`:
+`copr-cli uploadrpm` under `environment: release`. `copr-cli` is installed
+into a per-run Python virtual environment (`python3 -m venv`) because Ubuntu
+24.04 does not package it:
 
 ```sh
 copr-cli uploadrpm -r <chroot> xuepoo/bitty-terminal <path-to-rpm>

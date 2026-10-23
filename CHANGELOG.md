@@ -128,8 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presented frame without stale rows, and kitty images in a panel survive
   entering and leaving a full-screen TUI.
 - **Memory and resize/zoom stability (#2524):** the per-pane writer thread uses
-  a 128 KiB stack, removing the large VSZ/arena increase; resident memory and
-  resize/zoom frame times are at parity with 0.0.25.
+  a 128 KiB stack, reducing the per-thread virtual stack reservation; measured
+  resident memory and resize/zoom frame times are at parity with 0.0.25. An
+  idle writer thread can still retain a glibc malloc-arena mapping (see
+  Changed).
 - **Release smoke checks (#2504):** post-release version checks fail closed on
   missing, empty, multiline, wrong-channel, or prerelease output across Linux,
   macOS, Windows, Scoop, Homebrew, Nix, and the Unix bundle.

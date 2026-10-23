@@ -25,11 +25,18 @@ clippy:
 # here; its harness-side coverage runs in that repository.)
 # The perf bench gate below runs the pinned external bitty-perf checkout
 # (BITTY_PERF_DIR, default ../bitty-perf; see validation-pins.env).
+#
+# #2561: that gate compiles into this checkout's target dir. Without an
+# explicit CARGO_TARGET_DIR the `--manifest-path` invocation defaults to
+# <bitty-perf>/target, a second full debug tree beside this one; on hosted
+# runners the duplicate product graph exhausted the disk (ld SIGBUS, then
+# ENOSPC). CI sets the same variable job-wide, so local and remote runs share
+# one target tree and reuse each other's dependency artifacts.
 test:
     cargo nextest run --workspace --locked
     cargo test --workspace --doc --locked
     cargo test -p bitty-platform --test headless_run --test winit_window --locked
-    cargo test --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --benches --locked
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(pwd)/target}" cargo test --manifest-path "${BITTY_PERF_DIR:-../bitty-perf}/Cargo.toml" --benches --locked
     cargo test -p bitty-terminal --features dev-tools --test cli_dev --locked
     cargo test -p bitty-terminal --features dev-tools --bin bitty --locked dev::
 
@@ -210,6 +217,13 @@ compat-freshness:
 
 compat-freshness-test:
     ./scripts/tests/check-compat-fixture-freshness.test.sh
+
+# #2561: static guard that every CI job running the pinned bitty-perf suite
+# compiles it into the shared workspace target dir (one target tree per
+# runner), keeps the defensive reclaim step, and brackets the bench step with
+# disk breadcrumbs. Also fixture-tests scripts/ci-disk-budget.sh.
+perf-disk-test:
+    bash scripts/tests/perf-disk.test.sh
 
 # Regenerate the embedded official plugin catalog from bitty-plugins
 # (registry/official/*.toml + plugins/* gitlinks). Resolution order:
@@ -453,7 +467,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test m1-matrix-test compat-matrix-test compat-freshness-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test catalog-check
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

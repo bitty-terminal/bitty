@@ -39,9 +39,11 @@
 //!   generation under the same lock immediately before renaming, and the
 //!   supervisor removes a timed-out attempt's temp; a late helper can
 //!   therefore never replace newer evidence. The lock is `flock` on Unix and a
-//!   bounded `O_EXCL` gate on Windows (no advisory lock exists there in this
-//!   crate's safe API surface); both serialize the generation check with the
-//!   rename.
+//!   bounded token-checked gate on Windows (no advisory lock exists there in
+//!   this crate's safe API surface): stale leases are reclaimed by a
+//!   single-owner recovery claim plus an atomic quarantine rename, release is
+//!   ownership-checked, and a displaced holder cannot enter the critical
+//!   section.
 //! - **Confined paths.** The slot is derived from `XDG_STATE_HOME`/`HOME`;
 //!   `BITTY_WATCHDOG_STATE_PATH` is only honored when it repeats that derived
 //!   path, and symlinked, hard-linked, foreign-owned, group/world-writable, or
@@ -184,6 +186,12 @@ const HELPER_LOCK_WAIT: Duration = Duration::from_secs(1);
 /// shorter than this lease, so no delivery reclaims another delivery's gate.
 #[cfg(any(windows, test))]
 const PORTABLE_GATE_STALE: Duration = Duration::from_secs(5);
+/// Hard cap when reading a gate owner token.
+///
+/// Tokens are a fixed-shape process/sequence/timestamp string; a larger file
+/// at the gate path is not ours and is rejected instead of read unbounded.
+#[cfg(any(windows, test))]
+const MAX_GATE_TOKEN_BYTES: usize = 128;
 /// Maximum killed-but-unreaped helper children retained across stalls.
 const MAX_ABANDONED_CHILDREN: usize = 4;
 /// Maximum identifier characters rendered per plugin id.
@@ -1406,6 +1414,12 @@ impl StateSlot {
                 }
             }
         };
+        if !lock.verify() {
+            // The portable gate was reclaimed as stale between acquisition
+            // and entry; never allocate a generation out of order.
+            lock.release();
+            return Ok(None);
+        }
         let next = match read_attempt(lock.file_mut()) {
             Ok(current) => current.saturating_add(1),
             Err(error) => {
@@ -1452,6 +1466,14 @@ impl StateSlot {
             }
         };
         let result = (|| {
+            if !lock.verify() {
+                // A stale reclaim displaced this holder; refuse to publish
+                // under a gate another process now owns.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "evidence lock was reclaimed",
+                ));
+            }
             if read_attempt(lock.file_mut())? > attempt {
                 return Ok(CommitOutcome::Stale);
             }
@@ -1613,6 +1635,22 @@ impl SlotLock {
         &mut self.inner
     }
 
+    /// Whether this lock still holds the generation gate.
+    ///
+    /// Always true on Unix, where the advisory lock cannot be stolen. On
+    /// Windows a token-checked gate can be reclaimed as stale; a displaced
+    /// holder must not enter (or finish) the critical section.
+    fn verify(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.gate.as_ref().is_some_and(PortableGate::still_owned)
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     /// Release the lock without ever panicking on an unlock error.
     fn release(self) {
         #[cfg(unix)]
@@ -1627,9 +1665,12 @@ impl SlotLock {
         #[cfg(windows)]
         {
             // Remove the gate entry, then close the sequence file. No explicit
-            // unlock exists for the portable gate.
+            // unlock exists for the portable gate; the release itself is
+            // token-checked, and a displaced holder does not touch the path.
             if let Some(gate) = self.gate {
-                gate.release();
+                if gate.still_owned() {
+                    gate.release();
+                }
             }
             drop(self.inner);
         }
@@ -1643,24 +1684,35 @@ impl SlotLock {
 /// Portable generation gate for platforms without an advisory file lock in
 /// this crate's safe API surface.
 ///
-/// The entry is created atomically (`create_new`) and removed on release. A
-/// waiter retries until its own deadline; the gate is a marker only, so the
-/// handle is closed immediately and removal is portable. A holder killed
-/// between create and remove leaves a lease, which [`PORTABLE_GATE_STALE`]
-/// reclaims after a window far longer than any bounded critical section. The
-/// reclaim is a bounded fallback, not a normal path: both the monitor and the
-/// helper give up long before the lease expires, so a live holder is only
-/// displaced if it truly stalls for seconds inside stage+rename.
+/// The entry is created atomically (`create_new`) with a unique owner token
+/// written inside. Stale reclaims are serialized by a single-owner recovery
+/// claim, then the stale entry is renamed atomically to a token-unique
+/// quarantine path: only one recoverer can move the source, so only one can
+/// win the steal. The winner verifies the quarantined token before publishing
+/// its own gate, and release (or a displaced holder) only removes an entry
+/// whose token matches the one this gate wrote.
+///
+/// A holder killed between create and remove leaves a lease, which
+/// [`PORTABLE_GATE_STALE`] reclaims after a window far longer than any bounded
+/// critical section. The reclaim is a bounded fallback, not a normal path:
+/// both the monitor and the helper give up long before the lease expires, so a
+/// live holder is only displaced if it truly stalls for seconds inside
+/// stage+rename.
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug)]
 struct PortableGate {
     path: PathBuf,
+    /// Unique owner token written into the gate entry.
+    token: String,
 }
 
 #[cfg(any(windows, test))]
 impl PortableGate {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            token: fresh_gate_token(),
+        }
     }
 
     /// Try to take the gate without blocking.
@@ -1673,14 +1725,49 @@ impl PortableGate {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        if !self.expired()? {
-            return Ok(false);
-        }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Quick rejection: a fresh gate cannot be stolen.
+        match self.expired() {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         }
+        // Serialize stealers: only the single recovery-claim owner may move a
+        // stale gate. Without this, two waiters could each rename a gate the
+        // other just published, and both would believe they had won.
+        let Some(_claim) = RecoveryClaim::take(self.recovery_path())? else {
+            return Ok(false);
+        };
+        // Re-inspect under the claim: the holder may have released or a new
+        // gate may have replaced the lease while the claim was taken.
+        let observed = match read_gate_token(&self.path) {
+            Ok(token) => token,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match self.expired() {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        // The rename is the single-winner claim: a unique destination plus an
+        // atomic rename means exactly one waiter can move this source entry.
+        let quarantine = self.quarantine_path();
+        match std::fs::rename(&self.path, &quarantine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let moved = read_gate_token(&quarantine).unwrap_or_default();
+        if moved != observed {
+            // The stale entry was replaced between inspection and the rename:
+            // this is not the lease we judged stale. Put the displaced entry
+            // back when nobody took the slot, and never claim ownership.
+            restore_or_remove(&quarantine, &self.path);
+            return Ok(false);
+        }
+        let _ = std::fs::remove_file(&quarantine);
         match self.create() {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -1688,40 +1775,213 @@ impl PortableGate {
         }
     }
 
-    /// Create the gate entry atomically and close the marker handle.
+    /// Create the gate entry atomically with this gate's owner token.
     fn create(&self) -> std::io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(&self.path)?;
-        drop(file);
-        Ok(())
+        create_token_file(&self.path, &self.token)
     }
 
     /// Whether an existing gate entry is a stale lease.
     fn expired(&self) -> std::io::Result<bool> {
-        let meta = std::fs::symlink_metadata(&self.path)?;
-        // A symlinked or special gate entry is never reclaimed here; the
-        // caller fails closed through `prepare`/the bounded retry instead.
-        check_owned_regular_file(&meta)?;
-        let Ok(modified) = meta.modified() else {
-            return Ok(false);
-        };
-        let Ok(age) = modified.elapsed() else {
-            return Ok(false);
-        };
-        Ok(age >= PORTABLE_GATE_STALE)
+        lease_expired(&self.path)
     }
 
-    /// Remove the gate entry. A waiter that creates a fresh entry afterwards
-    /// is not affected by this release.
-    fn release(&self) {
-        let _ = std::fs::remove_file(&self.path);
+    /// Unique quarantine destination for one steal attempt.
+    fn quarantine_path(&self) -> PathBuf {
+        self.sibling_path(&format!(".stale.{}", self.token))
     }
+
+    /// Single-owner recovery claim used to serialize stale reclaims.
+    fn recovery_path(&self) -> PathBuf {
+        self.sibling_path(".recover")
+    }
+
+    /// Path next to the gate with `suffix` appended to its file name.
+    fn sibling_path(&self, suffix: &str) -> PathBuf {
+        sibling_path(&self.path, suffix)
+    }
+
+    /// Whether this gate's token is still the entry at the gate path.
+    fn still_owned(&self) -> bool {
+        read_gate_token(&self.path)
+            .ok()
+            .is_some_and(|token| token == self.token)
+    }
+
+    /// Remove the gate entry only if it still carries this owner's token.
+    ///
+    /// The rename makes the check and the removal refer to one moved entry;
+    /// a displaced holder that moves a newer gate restores it instead of
+    /// deleting it.
+    fn release(&self) {
+        let quarantine = self.quarantine_path();
+        if std::fs::rename(&self.path, &quarantine).is_err() {
+            return;
+        }
+        match read_gate_token(&quarantine) {
+            Ok(token) if token == self.token => {
+                let _ = std::fs::remove_file(&quarantine);
+            }
+            _ => restore_or_remove(&quarantine, &self.path),
+        }
+    }
+}
+
+/// Age of one gate-era entry; `None` when the filesystem cannot report it.
+///
+/// Rejects a symlinked or special entry before it can be judged stale, so a
+/// planted path never gets reclaimed or followed.
+#[cfg(any(windows, test))]
+fn lease_age(path: &Path) -> std::io::Result<Option<Duration>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    check_owned_regular_file(&meta)?;
+    let Ok(modified) = meta.modified() else {
+        return Ok(None);
+    };
+    Ok(modified.elapsed().ok())
+}
+
+/// Single-owner claim that serializes stale reclaim attempts.
+///
+/// Only the process that creates `.recover` (atomically) may move a stale
+/// gate. The claim is removed on drop on every path, and a claim left by a
+/// crashed recoverer is itself reclaimed only after the lease window.
+#[cfg(any(windows, test))]
+struct RecoveryClaim {
+    path: PathBuf,
+    token: String,
+}
+
+#[cfg(any(windows, test))]
+impl RecoveryClaim {
+    /// Take the recovery claim, or `None` when another recoverer owns it.
+    fn take(path: PathBuf) -> std::io::Result<Option<Self>> {
+        let token = fresh_gate_token();
+        match create_token_file(&path, &token) {
+            Ok(()) => return Ok(Some(Self { path, token })),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        if !lease_expired(&path)? {
+            return Ok(None);
+        }
+        // The rename is the single-winner claim for a crashed recoverer too.
+        let quarantine = sibling_path(&path, &format!(".stale.{token}"));
+        match std::fs::rename(&path, &quarantine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        if !lease_expired(&quarantine)? {
+            // A fresh claim replaced the stale one in the window; put it back.
+            restore_or_remove(&quarantine, &path);
+            return Ok(None);
+        }
+        let _ = std::fs::remove_file(&quarantine);
+        match create_token_file(&path, &token) {
+            Ok(()) => Ok(Some(Self { path, token })),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for RecoveryClaim {
+    fn drop(&mut self) {
+        // Ownership-checked: a displaced recoverer must not delete a newer
+        // claim.
+        if read_gate_token(&self.path).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Create one atomically exclusive file carrying `token`.
+#[cfg(any(windows, test))]
+fn create_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if let Err(error) = file.write_all(token.as_bytes()) {
+        drop(file);
+        // We created this entry and own it; do not leave a tokenless marker.
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    drop(file);
+    Ok(())
+}
+
+/// Path next to `path` with `suffix` appended to its file name.
+#[cfg(any(windows, test))]
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path.file_name().map_or_else(
+        || String::from("gate"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    path.with_file_name(format!("{name}{suffix}"))
+}
+
+/// Whether a gate-era entry is older than the reclaim lease.
+#[cfg(any(windows, test))]
+fn lease_expired(path: &Path) -> std::io::Result<bool> {
+    match lease_age(path) {
+        Ok(Some(age)) => Ok(age >= PORTABLE_GATE_STALE),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Put a quarantined entry back when the gate slot is free, else drop it.
+///
+/// Used when a holder discovers it moved an entry it does not own. The restore
+/// is best-effort: if another owner already created a gate, the moved entry
+/// must not replace it.
+#[cfg(any(windows, test))]
+fn restore_or_remove(quarantine: &Path, gate: &Path) {
+    if std::fs::symlink_metadata(gate).is_err() {
+        let _ = std::fs::rename(quarantine, gate);
+    } else {
+        let _ = std::fs::remove_file(quarantine);
+    }
+}
+
+/// Generate a unique gate owner token (process, sequence, wall clock).
+#[cfg(any(windows, test))]
+fn fresh_gate_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{nanos}", std::process::id(), next_sidecar_sequence())
+}
+
+/// Read a bounded gate owner token without following a symlink.
+#[cfg(any(windows, test))]
+fn read_gate_token(path: &Path) -> std::io::Result<String> {
+    let meta = std::fs::symlink_metadata(path)?;
+    check_owned_regular_file(&meta)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    let file = options.open(path)?;
+    let limit = u64::try_from(MAX_GATE_TOKEN_BYTES).unwrap_or(u64::MAX) + 1;
+    let mut buffer = Vec::new();
+    file.take(limit).read_to_end(&mut buffer)?;
+    if buffer.len() > MAX_GATE_TOKEN_BYTES {
+        return Err(invalid_input("gate token is too large"));
+    }
+    String::from_utf8(buffer).map_err(|_| invalid_input("gate token is not UTF-8"))
 }
 
 /// Acquire the slot lock without blocking; `Err` returns the file to retry.
@@ -2015,6 +2275,10 @@ struct HelperRuntime {
     spawns: u32,
     #[cfg(test)]
     writers: u32,
+    /// Deliveries that kept the pinned writer and handed the helper an empty
+    /// stdin instead of spawning a second writer.
+    #[cfg(test)]
+    writers_skipped: u32,
 }
 
 /// Disposition of one killed-but-unreaped helper.
@@ -2353,6 +2617,10 @@ fn start_stdin_writer(child: &mut Child, line: &str, runtime: &mut HelperRuntime
     };
     if runtime.writer_in_flight() {
         drop(stdin);
+        #[cfg(test)]
+        {
+            runtime.writers_skipped = runtime.writers_skipped.saturating_add(1);
+        }
         return;
     }
     let bytes = line.as_bytes().to_vec();
@@ -2965,6 +3233,19 @@ mod tests {
         );
     }
 
+    /// Age one gate entry into the stale-lease window (test fixture).
+    #[cfg(any(windows, test))]
+    fn age_gate(path: &Path) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("gate file");
+        file.set_modified(
+            std::time::SystemTime::now() - PORTABLE_GATE_STALE - Duration::from_secs(1),
+        )
+        .expect("age the lease");
+    }
+
     #[test]
     fn portable_gate_is_exclusive_and_reusable() {
         let dir = test_dir("portable-gate");
@@ -2989,7 +3270,6 @@ mod tests {
 
     #[test]
     fn portable_gate_reclaims_only_an_expired_lease() {
-        use std::time::SystemTime;
         let dir = test_dir("portable-gate-stale");
         let path = dir.join(".stall-watchdog.log.gate");
         let gate = PortableGate::new(path.clone());
@@ -2998,13 +3278,7 @@ mod tests {
             !gate.try_acquire().expect("fresh lease"),
             "a fresh lease must not be reclaimed"
         );
-        let file = std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .expect("gate file");
-        file.set_modified(SystemTime::now() - PORTABLE_GATE_STALE - Duration::from_secs(1))
-            .expect("age the lease");
-        drop(file);
+        age_gate(&path);
         assert!(
             gate.try_acquire().expect("reclaim"),
             "an expired lease must be reclaimed"
@@ -3027,6 +3301,155 @@ mod tests {
             "a symlinked gate must fail closed, never be removed or followed"
         );
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_gate_release_is_ownership_checked() {
+        // A holder displaced by a newer reclaim must not delete the newer
+        // gate: release verifies the owner token of the entry it moves.
+        let dir = test_dir("portable-gate-owner");
+        let path = dir.join(".stall-watchdog.log.gate");
+        let owner = PortableGate::new(path.clone());
+        assert!(owner.try_acquire().expect("owner"));
+        assert!(owner.still_owned());
+        age_gate(&path);
+        let newer = PortableGate::new(path.clone());
+        assert!(newer.try_acquire().expect("reclaim"), "stale lease");
+        assert!(!owner.still_owned(), "the displaced holder lost the gate");
+        assert!(newer.still_owned());
+        owner.release();
+        assert!(path.exists(), "a displaced holder must not delete the gate");
+        assert_eq!(
+            read_gate_token(&path).expect("newer token"),
+            newer.token,
+            "the newer owner must still hold the gate"
+        );
+        newer.release();
+        assert!(!path.exists(), "the owner's release must remove its gate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_stale_reclaim_has_one_winner() {
+        // Race several waiters against one stale lease. The quarantine rename
+        // is the single-winner claim: exactly one thread may acquire, and the
+        // displaced/losing holders' releases must not delete the winner.
+        use std::sync::{Arc, Barrier};
+        const RACERS: usize = 6;
+        let dir = test_dir("portable-gate-race");
+        let path = dir.join(".stall-watchdog.log.gate");
+        let seed = PortableGate::new(path.clone());
+        assert!(seed.try_acquire().expect("seed gate"));
+        age_gate(&path);
+        let barrier = Arc::new(Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let gate = PortableGate::new(path);
+                    barrier.wait();
+                    let acquired = gate.try_acquire().expect("reclaim race");
+                    (gate, acquired)
+                })
+            })
+            .collect();
+        let mut winner = None;
+        let mut losers = Vec::new();
+        for handle in handles {
+            let (gate, acquired) = handle.join().expect("race thread");
+            if acquired {
+                assert!(winner.is_none(), "only one racer may win the reclaim");
+                winner = Some(gate);
+            } else {
+                losers.push(gate);
+            }
+        }
+        let winner = winner.expect("exactly one stale reclaim must win");
+        // Every losing/displaced holder releases: none may remove the winner.
+        for gate in &losers {
+            gate.release();
+        }
+        seed.release();
+        assert!(path.exists(), "a loser must not delete the winner's gate");
+        assert_eq!(
+            read_gate_token(&path).expect("winner token"),
+            winner.token,
+            "the winner must still own the gate"
+        );
+        winner.release();
+        assert!(!path.exists(), "the winner's release must remove its gate");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("state dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".stale."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "quarantine entries leaked: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn displaced_stale_holder_cannot_publish_after_newer_evidence() {
+        // Allocate and publish newer evidence first, then model a holder that
+        // was displaced from the portable gate. Its older attempt must not
+        // overwrite the newer slot: on Unix the generation check rejects it as
+        // `Stale`; on Windows the newer gate keeps it out of the critical
+        // section entirely.
+        let dir = test_dir("displaced-publish");
+        let slot = state_slot_in(&dir);
+        slot.prepare().expect("state dir");
+        let stale = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        let newer = slot
+            .next_attempt(Instant::now() + Duration::from_millis(100))
+            .expect("lock")
+            .expect("generation");
+        assert!(newer > stale);
+        slot.commit(newer, "newer\n").expect("newer evidence");
+
+        let old_gate = PortableGate::new(slot.gate_path());
+        assert!(old_gate.try_acquire().expect("old gate"));
+        age_gate(&slot.gate_path());
+        let new_gate = PortableGate::new(slot.gate_path());
+        assert!(
+            new_gate.try_acquire().expect("reclaim"),
+            "the stale holder must be displaceable"
+        );
+        let late = slot.commit(stale, "stale\n");
+        if cfg!(windows) {
+            assert!(
+                late.is_err(),
+                "a displaced holder must not enter the newer gate"
+            );
+        } else {
+            assert_eq!(
+                late.expect("commit outcome"),
+                CommitOutcome::Stale,
+                "the generation check must reject the older attempt"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&slot.path).expect("state slot"),
+            "newer\n",
+            "a stale holder must never replace newer evidence"
+        );
+        old_gate.release();
+        assert!(
+            slot.gate_path().exists(),
+            "a displaced holder must not delete the newer gate"
+        );
+        assert_eq!(
+            read_gate_token(&slot.gate_path()).expect("newer gate token"),
+            new_gate.token
+        );
+        new_gate.release();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3738,7 +4161,7 @@ mod tests {
         for attempt in 0..ATTEMPTS {
             let (reader, writer) = nix::unistd::pipe().expect("OS pipe");
             let writers_before = runtime.writers;
-            let pinned_before = runtime.writer_in_flight();
+            let skips_before = runtime.writers_skipped;
             let outcome = supervise_helper(HelperRun {
                 command: shell_helper("sleep 5"),
                 line: &line,
@@ -3760,23 +4183,31 @@ mod tests {
                 "attempt {attempt}: no spawn thread may survive a delivery"
             );
             // `stdin` is a single optional handle, so at most one writer can
-            // survive; a pinned writer must block the next spawn (above).
+            // survive. Use the decisions `start_stdin_writer` actually made
+            // during this delivery: exactly one spawn or one skip, never both
+            // and never neither. This is race-free even when `reap_finished`
+            // joins a previously pinned writer first.
+            let spawned = runtime.writers == writers_before + 1;
+            let skipped = runtime.writers_skipped == skips_before + 1;
+            assert!(
+                spawned ^ skipped,
+                "attempt {attempt}: exactly one stdin decision expected \
+                 (writers {}->{}, skipped {}->{})",
+                writers_before,
+                runtime.writers,
+                skips_before,
+                runtime.writers_skipped,
+            );
+            if skipped {
+                assert!(
+                    runtime.stdin.is_some(),
+                    "attempt {attempt}: a skip implies the pinned writer handle"
+                );
+            }
             assert!(
                 abandoned <= MAX_ABANDONED_CHILDREN,
                 "attempt {attempt}: abandoned={abandoned}"
             );
-            if pinned_before {
-                assert_eq!(
-                    runtime.writers, writers_before,
-                    "attempt {attempt}: a second writer must not be spawned while one is pinned"
-                );
-            } else {
-                assert_eq!(
-                    runtime.writers,
-                    writers_before + 1,
-                    "attempt {attempt}: the delivery must start exactly one writer"
-                );
-            }
             drop(reader);
         }
         assert!(
@@ -3788,6 +4219,11 @@ mod tests {
             runtime.writers <= ATTEMPTS,
             "stdin writers must not grow past one per delivery: {}",
             runtime.writers
+        );
+        assert!(
+            runtime.writers_skipped <= ATTEMPTS,
+            "stdin skips must not grow past one per delivery: {}",
+            runtime.writers_skipped
         );
         assert!(
             runtime.abandoned.len() <= MAX_ABANDONED_CHILDREN,

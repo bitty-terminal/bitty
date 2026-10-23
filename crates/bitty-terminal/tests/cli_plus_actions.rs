@@ -1,4 +1,4 @@
-//! `bitty +<action>` helper aliases end-to-end proofs (CTX-1446, issue #2464).
+//! `bitty +<action>` helper aliases end-to-end proofs (CTX-1467, issue #2464).
 //!
 //! These tests drive the built `bitty` binary via `CARGO_BIN_EXE_bitty`. Every
 //! case isolates XDG/HOME into a scratch directory so the developer's config,
@@ -43,6 +43,14 @@ impl Fixture {
     fn write_config(&self, content: &str) {
         std::fs::create_dir_all(self.config_dir()).expect("config dir");
         std::fs::write(self.config_path(), content).expect("write config");
+    }
+
+    fn write_profile(&self, name: &str, content: &str) -> PathBuf {
+        let dir = self.config_dir().join("profiles");
+        std::fs::create_dir_all(&dir).expect("profile dir");
+        let path = dir.join(format!("{name}.lua"));
+        std::fs::write(&path, content).expect("write profile");
+        path
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -280,6 +288,38 @@ fn invalid_config_is_reported_and_exits_nonzero() {
 }
 
 #[test]
+fn show_config_attributes_profile_and_policy_rows() {
+    let fixture = Fixture::new("profile-attr");
+    fixture.write_config("return {}\n");
+    let profile = fixture.write_profile(
+        "work",
+        "return { font = { family = \"JetBrains Mono\", size = 14 } }\n",
+    );
+    let out = fixture.run(&["+show-config", "--profile", "work", "--format", "json"]);
+    assert_success(&out, "+show-config --profile work");
+    let text = stdout(&out);
+    assert!(text.contains("\"profile\":\"work\""), "{text}");
+    let profile_source = format!(
+        "{{\"key\":\"profile\",\"value\":\"work\",\"type\":\"string\",\"layer\":\"profile\",\"source\":\"profile: {}\"}}",
+        profile.display()
+    );
+    assert!(
+        text.contains(&profile_source),
+        "profile row must use the loaded profile path: {text}"
+    );
+    assert!(
+        text.contains(
+            "{\"key\":\"theme.contrast\",\"value\":\"pass\",\"type\":\"string\",\"layer\":\"policy\",\"source\":\"policy\"}"
+        ),
+        "derived contrast row must be attributed to policy: {text}"
+    );
+    assert!(
+        text.contains("\"font.size\",\"value\":14"),
+        "profile value must reach the projection: {text}"
+    );
+}
+
+#[test]
 fn safe_mode_matches_the_canonical_listing() {
     let fixture = Fixture::new("safe");
     for (alias, canonical) in [("+list-themes", "themes"), ("+list-colors", "colors")] {
@@ -357,7 +397,7 @@ fn missing_editor_fails_closed_without_touching_config() {
     fixture.write_config(original);
     let out = fixture
         .command(&["+edit-config"])
-        .env("EDITOR", "/nonexistent/bitty-editor")
+        .env("EDITOR", "bitty-no-such-editor-2464")
         .output()
         .expect("spawn bitty");
     assert_eq!(out.status.code(), Some(1), "stderr={}", stderr(&out));
@@ -375,13 +415,73 @@ fn missing_editor_fails_closed_without_touching_config() {
 
 #[cfg(unix)]
 #[test]
+fn edit_config_rejects_safe_mode_before_touching_the_file() {
+    let fixture = Fixture::new("edit-safe");
+    let original = "return { font = { family = \"JetBrains Mono\", size = 13 } }\n";
+    fixture.write_config(original);
+    let out = fixture
+        .command(&["+edit-config", "--safe"])
+        .env("EDITOR", "true")
+        .output()
+        .expect("spawn bitty");
+    assert_eq!(out.status.code(), Some(2), "stderr={}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--safe is not supported"),
+        "stderr={}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.config_path()).expect("read config"),
+        original,
+        "rejected --safe must not edit or rewrite the file"
+    );
+
+    let json = fixture
+        .command(&["+edit-config", "--safe", "--format", "json"])
+        .env("EDITOR", "true")
+        .output()
+        .expect("spawn bitty");
+    assert_eq!(json.status.code(), Some(2));
+    let text = stdout(&json);
+    assert!(text.contains("\"ok\":false"), "{text}");
+    assert!(text.contains("\"code\":\"E_SAFE_UNSUPPORTED\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn editor_failure_is_exit_one_with_a_typed_envelope() {
+    let fixture = Fixture::new("editor-failure");
+    fixture.write_config("return {}\n");
+    let out = fixture
+        .command(&["+edit-config", "--format", "json"])
+        .env("EDITOR", "false")
+        .output()
+        .expect("spawn bitty");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "editor failure must normalize to exit 1: stderr={}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("editor 'false' exited with status 1"),
+        "stderr={}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("\"ok\":false"), "{text}");
+    assert!(text.contains("\"code\":\"E_EDITOR_FAILED\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
 fn edit_config_validates_after_editing_without_corrupting_the_file() {
     let fixture = Fixture::new("edit-validate");
     let broken = "return { font = }\n";
     fixture.write_config(broken);
     let out = fixture
         .command(&["+edit-config"])
-        .env("EDITOR", "/bin/true")
+        .env("EDITOR", "true")
         .output()
         .expect("spawn bitty");
     assert_eq!(
@@ -405,13 +505,13 @@ fn edit_config_validates_after_editing_without_corrupting_the_file() {
     fixture.write_config("return { font = { family = \"JetBrains Mono\", size = 13 } }\n");
     let ok = fixture
         .command(&["+edit-config", "--format", "json"])
-        .env("EDITOR", "/bin/true")
+        .env("EDITOR", "true")
         .output()
         .expect("spawn bitty");
     assert_eq!(ok.status.code(), Some(0), "stderr={}", stderr(&ok));
     let text = stdout(&ok);
     assert!(text.contains("\"valid\":true"), "{text}");
-    assert!(text.contains("\"editor\":\"/bin/true\""), "{text}");
+    assert!(text.contains("\"editor\":\"true\""), "{text}");
 }
 
 #[test]

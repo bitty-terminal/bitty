@@ -1,5 +1,5 @@
 //! Bounded system font discovery for `bitty list fonts` / `bitty +list-fonts`
-//! (CTX-1446, issue #2464).
+//! (CTX-1467, issue #2464).
 //!
 //! The catalog reuses the process-wide `fontdb` scan the shaped rasterizer
 //! already owns ([`crate::shaped`]) instead of introducing a second discovery

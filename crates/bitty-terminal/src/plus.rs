@@ -1,4 +1,4 @@
-//! Ghostty-style `bitty +<action>` helper aliases (CTX-1446, issue #2464).
+//! Ghostty-style `bitty +<action>` helper aliases (CTX-1467, issue #2464).
 //!
 //! Every action is an alias over an existing implementation; this module owns
 //! only the name table and help text. The parser maps each action onto the
@@ -126,7 +126,7 @@ impl PlusAction {
             Self::ShowConfig | Self::ValidateConfig => {
                 &["--format", "--config", "--profile", "--safe"]
             }
-            Self::EditConfig => &["--config", "--profile", "--safe"],
+            Self::EditConfig => &["--config", "--profile", "--format"],
         }
     }
 
@@ -159,7 +159,7 @@ impl PlusAction {
                 "Usage: bitty +validate-config [--format table|json|jsonl] [--config PATH] [--profile NAME] [--safe]"
             }
             Self::EditConfig => {
-                "Usage: bitty +edit-config [--format table|json|jsonl] [--config PATH] [--profile NAME] [--safe]"
+                "Usage: bitty +edit-config [--format table|json|jsonl] [--config PATH] [--profile NAME]"
             }
         };
         let canonical = match self {

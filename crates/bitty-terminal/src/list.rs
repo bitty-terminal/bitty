@@ -15,7 +15,7 @@
 //!   `UsageError` (exit 2) naming the valid set. RFC candidates
 //!   (`commands|protocols`) are not invented here: they fail closed as
 //!   unknown kinds until their owning slice lands. `colors`/`fonts` landed
-//!   with the CTX-1446 helper aliases; `bitty +list-*` is a spelling alias,
+//!   with the CTX-1467 helper aliases; `bitty +list-*` is a spelling alias,
 //!   never a second catalog.
 //! - Class: `themes`, `colors`, `fonts`, `plugins`, `actions`, and `keymaps`
 //!   are local (no instance, safe-mode clean, no plugin VM loaded).
@@ -608,7 +608,7 @@ pub fn list_themes_with_local() -> (Vec<ThemeInfo>, Vec<bitty_config::LocalTheme
 }
 
 // ---------------------------------------------------------------------------
-// Effective color catalog (`bitty list colors`, CTX-1446)
+// Effective color catalog (`bitty list colors`, CTX-1467)
 // ---------------------------------------------------------------------------
 
 /// Maximum color rows emitted by the catalog. The contrast policy owns 23
@@ -767,7 +767,7 @@ pub fn format_colors_envelope(
 }
 
 // ---------------------------------------------------------------------------
-// Font catalog (`bitty list fonts`, CTX-1446)
+// Font catalog (`bitty list fonts`, CTX-1467)
 // ---------------------------------------------------------------------------
 
 /// Maximum font rows in one response (bounded JSON/table).
@@ -787,6 +787,12 @@ fn user_font_roots() -> Vec<PathBuf> {
         roots.push(home.join(".fonts"));
         #[cfg(target_os = "macos")]
         roots.push(home.join("Library/Fonts"));
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        // Per-user fonts installed for the current account (standard Windows
+        // location; no machine-specific literal).
+        roots.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
     }
     roots
 }

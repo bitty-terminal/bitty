@@ -984,13 +984,14 @@ extern "bitty +validate-config" [
 extern "bitty +edit-config" [
     --config: string
     --profile: string
-    --safe
+    --format: string
     --help(-h)
     --version(-V)
     --verbose
     --log-level: string
     --headless
     --test-mode
+    --safe
     --fail-loud
     --no-splash
     --split
@@ -1003,7 +1004,6 @@ extern "bitty +edit-config" [
     --font-family: string
     --font-size: string
     --opacity: string
-    --format: string
     --socket: string
     --instance: string
     --no-color

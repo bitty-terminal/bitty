@@ -650,6 +650,7 @@ pub(crate) fn config_usage() -> String {
      \x20 show      load + validate; same rows, JSON carries layer attribution\n\
      \x20 validate  load + validate only; exit 2 when invalid, no key dump\n\
      \x20 edit      open the file in $VISUAL/$EDITOR (vi fallback), then validate\n\
+     \x20           (--safe is rejected: safe mode never reads the edited file)\n\
      \x20 profile   manage named profiles (list|show|use|path NAME)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
@@ -823,6 +824,26 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
             return 2;
         }
     };
+    // `config edit --safe` would edit a file that safe mode then ignores:
+    // validation would silently check the built-in config instead of the
+    // edited bytes. Reject it rather than report a false success.
+    if cmd == ConfigCommand::Edit && args.safe {
+        let message = "bitty config edit: --safe is not supported (safe mode never reads the edited file; run without --safe)";
+        if format == ConfigFormat::Json {
+            println!(
+                "{}",
+                config_error_envelope(
+                    &config_command_spelling(args, ConfigCommand::Edit),
+                    args,
+                    "E_SAFE_UNSUPPORTED",
+                    message,
+                    false
+                )
+            );
+        }
+        eprintln!("{message}");
+        return 2;
+    }
     // `show`/`check` keep the exact text path below; JSON goes through the
     // bounded typed projection (same loader, same attribution).
     if matches!(cmd, ConfigCommand::Check | ConfigCommand::Show) && format != ConfigFormat::Table {
@@ -1587,7 +1608,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// `bitty config show|validate|edit` machine surface (CTX-1446, issue #2464)
+// `bitty config show|validate|edit` machine surface (CTX-1467, issue #2464)
 // ---------------------------------------------------------------------------
 
 /// Maximum bytes for a `config --format` value (matches `list`).
@@ -1717,7 +1738,8 @@ fn config_layer(merged: &bitty_config::MergedConfig, field: &str) -> String {
 /// Values come straight from the same `MergedConfig` the text path prints;
 /// attribution uses the shared [`layer_source_label`]. The projection is a
 /// deliberately bounded core-key set (30 rows), not a second validator.
-fn config_rows(loaded: &LoadedConfig) -> Vec<ConfigRow> {
+/// Returns the rows plus whether the bound truncated an over-large set.
+fn config_rows(loaded: &LoadedConfig) -> (Vec<ConfigRow>, bool) {
     let merged = &loaded.merged;
     let effective = &merged.effective;
     let file_path = loaded
@@ -1730,6 +1752,27 @@ fn config_rows(loaded: &LoadedConfig) -> Vec<ConfigRow> {
         layer_source_label(merged, field, file_path.as_deref(), profile_path.as_deref())
     };
     let mut rows: Vec<ConfigRow> = Vec::with_capacity(32);
+    // `profile` is loader state, not a merged config field: attribute it from
+    // `LoadedConfig` so a selected profile is never reported as a default.
+    let (profile_layer, profile_source) = match (&loaded.profile_name, &loaded.profile_path) {
+        (Some(_), Some(path)) => (
+            String::from("profile"),
+            format!("profile: {}", path.display()),
+        ),
+        (Some(_), None) => (String::from("profile"), String::from("profile")),
+        _ => (String::from("core-defaults"), String::from("default")),
+    };
+    rows.push(ConfigRow {
+        key: "profile",
+        value: loaded
+            .profile_name
+            .as_deref()
+            .map_or(ConfigValue::Null, |name| {
+                ConfigValue::Text(name.to_string())
+            }),
+        layer: profile_layer,
+        source: profile_source,
+    });
     let mut push = |field: &'static str, value: ConfigValue| {
         rows.push(ConfigRow {
             key: field,
@@ -1739,15 +1782,6 @@ fn config_rows(loaded: &LoadedConfig) -> Vec<ConfigRow> {
         });
     };
 
-    push(
-        "profile",
-        loaded
-            .profile_name
-            .as_deref()
-            .map_or(ConfigValue::Null, |name| {
-                ConfigValue::Text(name.to_string())
-            }),
-    );
     push(
         "appearance.theme",
         effective
@@ -1874,16 +1908,20 @@ fn config_rows(loaded: &LoadedConfig) -> Vec<ConfigRow> {
     );
     let theme = effective.effective_theme_for(startup_prefer_light());
     let violations = bitty_config::theme::contrast_violations(&theme).len();
-    push(
-        "theme.contrast",
-        ConfigValue::Text(if violations == 0 {
+    // Derived readability policy, not an attributed config key.
+    rows.push(ConfigRow {
+        key: "theme.contrast",
+        value: ConfigValue::Text(if violations == 0 {
             String::from("pass")
         } else {
             format!("{violations} violation(s)")
         }),
-    );
+        layer: String::from("policy"),
+        source: String::from("policy"),
+    });
+    let truncated = rows.len() > MAX_CONFIG_ROWS;
     rows.truncate(MAX_CONFIG_ROWS);
-    rows
+    (rows, truncated)
 }
 
 /// Renders one path/profile pair for an envelope.
@@ -1901,7 +1939,7 @@ fn config_path_json(path: Option<&std::path::Path>) -> String {
 
 /// Renders the `config show` success envelope.
 fn config_show_envelope(command: &str, loaded: &LoadedConfig) -> String {
-    let rows = config_rows(loaded);
+    let (rows, truncated) = config_rows(loaded);
     let file_path = loaded
         .probed
         .as_ref()
@@ -1911,14 +1949,15 @@ fn config_show_envelope(command: &str, loaded: &LoadedConfig) -> String {
     let _ = std::fmt::Write::write_fmt(
         &mut out,
         format_args!(
-            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"count\":{},\"truncated\":false,\"keys\":[",
+            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"count\":{},\"truncated\":{},\"keys\":[",
             crate::list::json_escape(command),
             config_path_json(file_path),
             loaded.profile_name.as_deref().map_or_else(
                 || String::from("null"),
                 |name| format!("\"{}\"", crate::list::json_escape(name))
             ),
-            rows.len()
+            rows.len(),
+            truncated
         ),
     );
     for (index, row) in rows.iter().enumerate() {
@@ -2071,7 +2110,16 @@ fn execute_config_edit(args: &Args) -> Result<(std::path::PathBuf, String), (i32
     let editor = resolve_editor();
     match std::process::Command::new(&editor).arg(&target).status() {
         Ok(status) if status.success() => Ok((target, editor)),
-        Ok(status) => Err((status.code().unwrap_or(1), String::new())),
+        Ok(status) => {
+            let detail = status.code().map_or_else(
+                || String::from("terminated by a signal"),
+                |code| format!("status {code}"),
+            );
+            Err((
+                1,
+                format!("bitty config edit: editor '{editor}' exited with {detail}"),
+            ))
+        }
         Err(err) => Err((
             1,
             format!("bitty config edit: cannot run editor '{editor}': {err}"),
@@ -2093,9 +2141,16 @@ fn run_config_edit(args: &Args, format: ConfigFormat) -> i32 {
                 eprintln!("{message}");
             }
             if format == ConfigFormat::Json {
+                // Exit 2 is the no-config-root class (a path problem, not an
+                // editor failure); every editor failure is exit 1.
+                let error_code = if code == 2 {
+                    "E_CONFIG_PATH"
+                } else {
+                    "E_EDITOR_FAILED"
+                };
                 println!(
                     "{}",
-                    config_error_envelope(&command, args, "E_EDITOR_FAILED", &message, false)
+                    config_error_envelope(&command, args, error_code, &message, false)
                 );
             }
             return code;

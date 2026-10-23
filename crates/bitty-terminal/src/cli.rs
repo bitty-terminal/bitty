@@ -120,10 +120,10 @@ pub(crate) struct Args {
     pub(crate) config_word: bool,
     /// Unexpected extra positionals in subcommand mode (dispatch errors).
     pub(crate) config_args: Vec<String>,
-    /// `--format` shape for `bitty config show|validate` (CTX-1446).
+    /// `--format` shape for `bitty config show|validate` (CTX-1467).
     /// Raw on purpose: validated fail-closed at config dispatch.
     pub(crate) config_format: Option<String>,
-    /// Ghostty-style `+<action>` alias (CTX-1446, issue #2464). Only the
+    /// Ghostty-style `+<action>` alias (CTX-1467, issue #2464). Only the
     /// parsed identity is stored; dispatch always reuses the canonical
     /// `list`/`config`/`extension` fields set beside it.
     pub(crate) plus_action: Option<crate::plus::PlusAction>,
@@ -402,9 +402,9 @@ pub(crate) enum ConfigCommand {
     /// Load + validate and print per-key sources (the testing hook).
     Check,
     /// Load + validate and print the effective config with layer sources
-    /// (`--format json` emits the stable envelope; CTX-1446).
+    /// (`--format json` emits the stable envelope; CTX-1467).
     Show,
-    /// Load + validate only; nonzero on invalid (CTX-1446).
+    /// Load + validate only; nonzero on invalid (CTX-1467).
     Validate,
     /// Open the file in `$VISUAL`/`$EDITOR` (never overwrites existing).
     Edit,
@@ -731,7 +731,7 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
-/// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1446);
+/// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1467);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
 ///   class, safe mode); a program literally named `inspect` needs
@@ -1678,7 +1678,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     continue;
                 }
 
-                // Ghostty-style `+<action>` helper aliases (CTX-1446, issue
+                // Ghostty-style `+<action>` helper aliases (CTX-1467, issue
                 // #2464). Each alias maps onto the canonical `list`, `config`,
                 // or `extension` fields, so dispatch runs the same code path
                 // (never a parallel implementation). Unknown `+` tokens keep

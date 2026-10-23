@@ -2175,9 +2175,10 @@ pub trait HostServices {
     /// `context`, and the optional `title`/`command`). The host must never
     /// add a configuration path, raw user text, argv, environment value, URL,
     /// terminal content, clipboard content, plugin store value, or host
-    /// diagnostic. Plugin-suggested bindings are included only when they are
-    /// actually dispatchable; today the plugin-binding layer is not live, so
-    /// they are omitted instead of advertised.
+    /// diagnostic. Plugin-suggested bindings dispatch through the
+    /// `DispatchPriority::Plugin` slot backed by `SuggestedBindingDirectory`,
+    /// but `bitty.keymaps.list()` intentionally exposes only the resolved
+    /// user/default registry and omits suggestions.
     ///
     /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
     /// host without a keymap source grants no ambient registry read.

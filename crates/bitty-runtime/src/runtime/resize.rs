@@ -527,7 +527,7 @@ impl Runtime {
                     .unwrap_or(fallback)
             }
         };
-        let _damage = self.state.resize(cols, rows);
+        let (_damage, primary_resize) = self.state.resize_with_report(cols, rows);
         self.cols = cols;
         self.rows = rows;
         // Clamp any leaf View scroll offsets to its own backing store
@@ -549,7 +549,79 @@ impl Runtime {
         // CTX-0176: the container moved, so every pane session's grid +
         // PTY winsize follows its leaf (primary state/PTY handled below).
         self.sync_pane_geometry();
+        // #2543: move a held grid-coordinate selection with the primary
+        // content before clamping it to the new bounds. Pane owners were
+        // already remapped by `sync_pane_geometry`.
+        if let Some(owner) = self.primary_view {
+            self.remap_selection_for_resize(owner, true, primary_resize);
+        }
         self.clamp_view_bindings_to_geometry();
+    }
+
+    /// Keeps a held selection on the same content across a height-only
+    /// resize.
+    ///
+    /// A `Selection` installed without a buffer anchor (`start_selection` and
+    /// friends) stores live grid coordinates. A height shrink/grow moves the
+    /// primary rows by [`ResizeReport::row_shift`], so applying that shift
+    /// preserves the copied text and search identity. A width-changing
+    /// reflow is not a constant shift, so it keeps the existing geometry
+    /// clamp path; an endpoint pushed out of the grid into scrollback drops
+    /// the selection instead of silently re-anchoring to different content.
+    ///
+    /// Buffer-anchored pointer selections carry combined-buffer rows and are
+    /// re-projected by [`Self::clamp_view_bindings_to_geometry`], so they are
+    /// left to that path. `is_primary_state` distinguishes the runtime-global
+    /// primary grid from a pane session that may shadow the same `owner`.
+    pub(super) fn remap_selection_for_resize(
+        &mut self,
+        owner: ViewId,
+        is_primary_state: bool,
+        report: ResizeReport,
+    ) {
+        if report.width_changed || report.row_shift == 0 {
+            return;
+        }
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if sel.owner != owner {
+            return;
+        }
+        let owner_is_primary_state =
+            self.primary_view == Some(owner) && !self.pane_sessions.contains_key(&owner);
+        if owner_is_primary_state != is_primary_state {
+            return;
+        }
+        if sel.buffer.is_some() || self.is_viewport_scrolled(owner) {
+            return;
+        }
+        let shift = report.row_shift;
+        let shifted = |pos: CellPos| -> Option<CellPos> {
+            let row = i32::from(pos.row).checked_add(shift)?;
+            u16::try_from(row)
+                .ok()
+                .map(|row| CellPos::new(row, pos.col))
+        };
+        let (Some(anchor), Some(focus)) =
+            (shifted(sel.selection.anchor), shifted(sel.selection.focus))
+        else {
+            self.drop_selection();
+            return;
+        };
+        let pin = sel.anchor_press.and_then(shifted);
+        let selection = Selection {
+            anchor,
+            focus,
+            ..sel.selection
+        };
+        self.install_selection(owner, selection, pin, sel.dragging);
+        self.restore_selection_meta(
+            sel.press_boundary,
+            sel.single_cell,
+            sel.buffer,
+            sel.press_buffer,
+        );
     }
 
     /// Re-clamps the live selection and search matches after a geometry

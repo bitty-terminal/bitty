@@ -6,7 +6,7 @@
 
 use bitty_platform::PhysicalSize;
 use bitty_runtime::Runtime;
-use bitty_ui::ViewId;
+use bitty_ui::{CellPos, ViewId};
 
 #[cfg(unix)]
 use bitty_runtime::{LayoutNode, SplitAxis, View};
@@ -249,4 +249,85 @@ fn two_pane_height_resize_roundtrips_pane_content() {
         "height round-trip must restore every pane line without merging or loss"
     );
     assert!(rt.state().check_invariants().is_ok());
+}
+
+/// #2543: a held (non-buffer) selection must follow height-driven content
+/// movement instead of keeping stale grid coordinates. The width is held at
+/// 80 columns so this exercises the height-only path (a divider drag), not a
+/// width reflow.
+#[test]
+fn height_resize_keeps_held_selection_on_its_content() {
+    // Content grid 80x24: window cells 83x26 -> frame inset (13 px/side)
+    // leaves 80x24 at 9x19 cells. The window padding adds 8 px/side.
+    let full = PhysicalSize::new(83 * 9 + 16, 26 * 19 + 16);
+    let short = PhysicalSize::new(83 * 9 + 16, 7 * 19 + 16);
+
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    for i in 0..23 {
+        rt.handle_pty_bytes(format!("row{i:02}\r\n").as_bytes());
+    }
+    assert_eq!(rt.snapshot().height, 24);
+    rt.start_selection(CellPos::new(20, 0));
+    rt.end_selection(CellPos::new(20, 4));
+    assert_eq!(rt.selection_text().as_deref(), Some("row20"));
+    let hits_before = rt.search_case_sensitive("row20");
+    assert_eq!(hits_before.len(), 1);
+
+    rt.handle_resize(short).expect("height-only shrink");
+    assert_eq!(rt.snapshot().width, 80, "shrink must not reflow the width");
+    let new_rows = rt.snapshot().height;
+    assert!(new_rows < 24, "test needs a real height shrink: {new_rows}");
+    // Content (and the cursor on row 23) fills all 24 rows, so nothing is
+    // absorbed as padding: every row above the new height moves by the full
+    // shrink delta.
+    let expected_row = 20 - (24 - new_rows);
+    let sel = rt.selection().expect("selection stays live");
+    assert_eq!(sel.anchor.row, expected_row as u16);
+    assert_eq!(sel.focus.row, expected_row as u16);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("row20"),
+        "copied text identity must not change under a height move"
+    );
+    let hits_after = rt.search_case_sensitive("row20");
+    assert_eq!(hits_after.len(), 1);
+    assert_eq!(hits_after[0].matched_text, "row20");
+    assert_eq!(
+        hits_after[0].buffer_row, hits_before[0].buffer_row,
+        "search identity is the combined-buffer row, unchanged by a height move"
+    );
+
+    // Grow back: the newest history rows re-enter and the selection returns
+    // to its original grid row with the same text.
+    rt.handle_resize(full).expect("height-only grow");
+    assert_eq!(rt.snapshot().height, 24);
+    let sel = rt.selection().expect("selection survives the grow");
+    assert_eq!(sel.anchor.row, 20);
+    assert_eq!(rt.selection_text().as_deref(), Some("row20"));
+}
+
+/// #2543: when a height shrink pushes a selection endpoint into scrollback,
+/// the grid coordinates no longer describe the original content. The
+/// selection is dropped (fail closed) instead of silently re-anchoring.
+#[test]
+fn height_shrink_drops_selection_pushed_into_scrollback() {
+    let short = PhysicalSize::new(83 * 9 + 16, 7 * 19 + 16);
+    let mut rt = Runtime::with_defaults().expect("defaults");
+    for i in 0..23 {
+        rt.handle_pty_bytes(format!("row{i:02}\r\n").as_bytes());
+    }
+    rt.start_selection(CellPos::new(5, 0));
+    rt.end_selection(CellPos::new(5, 4));
+    assert_eq!(rt.selection_text().as_deref(), Some("row05"));
+
+    rt.handle_resize(short).expect("height-only shrink");
+    assert!(
+        rt.snapshot().height < 6,
+        "fixture needs the selection row pushed out: {} rows",
+        rt.snapshot().height
+    );
+    assert!(
+        !rt.has_selection(),
+        "an unmappable selection must not keep stale coordinates"
+    );
 }

@@ -226,7 +226,10 @@ impl Runtime {
         if cols == self.state.width() && rows == self.state.height() {
             return;
         }
-        let _ = self.state.resize(cols, rows);
+        let (_damage, report) = self.state.resize_with_report(cols, rows);
+        if let Some(owner) = self.primary_view {
+            self.remap_selection_for_resize(owner, true, report);
+        }
     }
 
     /// Resizes the primary grid and PTY winsize to the primary owner leaf's

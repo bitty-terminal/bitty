@@ -4155,7 +4155,14 @@ impl TerminalApp {
             self.watchdog_phase(Phase::Shutdown);
             self.save_session_best_effort("exit");
             self.runtime.shutdown();
-            crash_report::record_exit(crash_report::ExitReason::RouteEvent);
+            let reason = match &event {
+                PlatformEvent::Window {
+                    kind: WindowEventKind::CloseRequested | WindowEventKind::Closed,
+                    ..
+                } => crash_report::ExitReason::WindowClose,
+                _ => crash_report::ExitReason::RouteEvent,
+            };
+            crash_report::record_exit(reason);
             ctx.exit();
             return;
         }

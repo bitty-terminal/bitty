@@ -127,7 +127,8 @@ pub(crate) enum ExitReason {
     LoopExiting = 4,
     EventLoopReturned = 5,
     DisplayFallback = 6,
-    Unknown = 7,
+    WindowClose = 7,
+    Unknown = 8,
 }
 
 impl ExitReason {
@@ -140,6 +141,7 @@ impl ExitReason {
             Self::LoopExiting => "loop-exiting",
             Self::EventLoopReturned => "event-loop-returned",
             Self::DisplayFallback => "display-fallback",
+            Self::WindowClose => "window-close",
             Self::Unknown => "unknown",
         }
     }
@@ -513,6 +515,7 @@ mod tests {
             ExitReason::LoopExiting,
             ExitReason::EventLoopReturned,
             ExitReason::DisplayFallback,
+            ExitReason::WindowClose,
             ExitReason::Unknown,
         ] {
             assert!(!reason.as_str().is_empty());

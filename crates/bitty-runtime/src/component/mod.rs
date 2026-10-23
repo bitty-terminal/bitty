@@ -123,7 +123,7 @@ pub use inventory::{
     ComponentSource, ComponentSummary, InstalledVersion, SYSTEM_COMPONENTS_DIR_DEFAULT,
     SYSTEM_COMPONENTS_DIR_ENV, SearchedComponent, component_search_roots_for, discover_components,
     incompatible_component_hint, missing_component_hint, resolve_search,
-    system_components_root_for, version_satisfies_caret,
+    resolve_search_for_protocol, system_components_root_for, version_satisfies_caret,
 };
 pub use policy::{CrashTracker, DeadlineStrikes, SpawnGate, SupervisionPolicy};
 pub use stderr::{StderrRing, stderr_log_tail};

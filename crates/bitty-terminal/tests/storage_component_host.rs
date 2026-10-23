@@ -433,6 +433,11 @@ fn component_session_and_kv_backends_match_the_linked_model() {
     let component_session =
         StorageComponentSessionBackend::new(Arc::clone(&client), &session_dir, DEADLINE)
             .expect("session backend");
+    assert!(
+        component_session.session_file().is_none()
+            && component_session.session_file_for(None, None).is_none(),
+        "component discovery stays off until the linked path is migrated by an explicit task"
+    );
     component_session
         .commit_session_bytes(&session_path, &bytes)
         .expect("component commit");

@@ -368,7 +368,7 @@ fn strip_source_path(line: &str) -> String {
     };
     let head = &line[..index + 4];
     let tail = &line[index + 4..];
-    let file = tail.rsplit('/').next().unwrap_or(tail);
+    let file = tail.rsplit(['/', '\\']).next().unwrap_or(tail);
     format!("{head}{file}")
 }
 
@@ -567,6 +567,10 @@ mod tests {
         let stripped = strip_source_path(relative);
         assert!(stripped.contains("at main.rs:42:5"), "{stripped}");
         assert!(!stripped.contains("worktrees"), "{stripped}");
+        let windows = "             at C:\\checkout\\src\\main.rs:42:5";
+        let stripped = strip_source_path(windows);
+        assert!(stripped.contains("at main.rs:42:5"), "{stripped}");
+        assert!(!stripped.contains("checkout"), "{stripped}");
         assert_eq!(
             strip_source_path("  no source path here"),
             "  no source path here"

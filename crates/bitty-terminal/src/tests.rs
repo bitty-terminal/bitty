@@ -11798,6 +11798,91 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
 
 #[test]
 #[cfg(unix)]
+fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
+    // CTX-1460 / #2531: the primary owner can be one of the hidden leaves in
+    // an inactive zoom backup. Reap must restore that backup before removing
+    // the dead owner, then re-home primary ownership to the active workspace
+    // rather than leaving the dead id or a session-less backup proxy behind.
+    require_pty!();
+    let mut app = editor_test_app();
+
+    let primary = ViewId::new(1);
+    let survivor = ViewId::new(2);
+    let survivor_script =
+        write_fake_editor("sleep-primary-zoom-survivor-1460", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn survivor");
+    let primary_script = write_fake_editor(
+        "exit-primary-inactive-zoom-1460",
+        "#!/bin/sh\nread -r _; exit 0\n",
+    );
+    let primary_arg = primary_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_with_args("/bin/sh", &["-c", primary_arg.as_str()])
+        .expect("spawn primary");
+    assert_eq!(app.runtime.primary_view(), Some(primary));
+    assert!(app.runtime.set_focus(primary));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
+    assert_eq!(
+        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        Some(vec![primary, survivor])
+    );
+
+    // Deliver exit to the zoom proxy, then leave the workspace inactive
+    // before the reap pass runs.
+    assert!(app.runtime.push_input_bytes(b"exit-primary\r"));
+    app.runtime.workspace_new().expect("second workspace");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert!(!app.runtime.has_pane_session(&primary));
+    assert!(app.runtime.has_pane_session(&survivor));
+    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+    assert_eq!(
+        app.runtime.primary_view(),
+        Some(ViewId::new(3)),
+        "dead primary ownership must re-home to the active workspace"
+    );
+    assert!(app.runtime.has_pane_session(&ViewId::new(3)));
+
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_ne!(
+        app.runtime.primary_view(),
+        Some(primary),
+        "switching back must never restore the dead primary owner"
+    );
+    assert!(app.runtime.has_pane_session(&survivor));
+    assert!(
+        app.runtime
+            .push_input_bytes(b"echo primary-owner-survivor\r")
+    );
+    let _ = app.drive_tick();
+
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&survivor_script);
+    let _ = std::fs::remove_file(&primary_script);
+}
+
+#[test]
+#[cfg(unix)]
 fn reap_exited_pane_in_inactive_workspace_prunes_emptied_workspace() {
     require_pty!();
     // Issue #2525: the inactive-workspace twin of the pane prune path. A

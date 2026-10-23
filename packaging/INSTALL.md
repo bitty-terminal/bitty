@@ -73,6 +73,7 @@ What each script installs:
 - **Debian / Ubuntu (APT)**: `curl -fsSL https://cdn.bitty.run/apt/setup.sh | sudo bash && sudo apt install -y bitty`; see `packaging/debian.md`.
 - **Fedora / EPEL (Copr)**: `sudo dnf copr enable -y xuepoo/bitty-terminal && sudo dnf install -y bitty`; see `packaging/fedora.md`.
 - **Nix / NixOS (Flake & Cachix)**: `nix run github:bitty-terminal/bitty` with binary cache `https://bitty.cachix.org`; see `packaging/nix.md`.
+- **AppImage (Universal Portable Linux)**: download `bitty-<target>.AppImage`, `chmod +x`, and execute; see `packaging/appimage.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`.
 - **openSUSE**: best-effort, not supported (no release `verify-install`

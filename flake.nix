@@ -13,16 +13,13 @@
   };
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
@@ -33,25 +30,10 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        rustToolchain = pkgs.rust-bin.stable."1.98.1".minimal.override {
-          targets = [ "x86_64-unknown-linux-gnu" ];
-        };
-
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Filter source to keep bounded - only include necessary files, no unbounded.
-        src = pkgs.lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            let
-              baseName = baseNameOf (toString path);
-            in
-              !(pkgs.lib.hasSuffix ".git" baseName) &&
-              !(baseName == "target") &&
-              !(baseName == ".worktrees") &&
-              !(baseName == "dist") &&
-              !(baseName == "result");
-        };
+        src = craneLib.cleanCargoSource ./.;
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         version = cargoToml.workspace.package.version or "0.0.26";
@@ -78,9 +60,7 @@
 
         bitty = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          # Only build bitty-terminal binary, keep bounded.
           cargoExtraArgs = "-p bitty-terminal";
-          # No unsafe - already denied via workspace lints.
         });
       in
       {
@@ -89,9 +69,17 @@
           bitty = bitty;
         };
 
+        apps = {
+          default = flake-utils.lib.mkApp {
+            drv = bitty;
+          };
+          bitty = flake-utils.lib.mkApp {
+            drv = bitty;
+          };
+        };
+
         checks = {
           inherit bitty;
-          # flake check will build bitty and ensure no extra checks fail.
         };
 
         devShells.default = craneLib.devShell {
@@ -101,8 +89,6 @@
             pkg-config
             fontconfig
             freetype
-            # For nfpm validation in dev shell
-            # nfpm is Go-based, not Nix - handled via CI matrix
           ];
         };
 

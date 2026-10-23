@@ -21,6 +21,10 @@ concurrency:
 env:
   # Single pin for the Cloudflare Wrangler CLI used by release-time R2 jobs.
   WRANGLER_VERSION: 4.135.0
+  # Pinned fingerprint of packaging/apt/bitty-archive-keyring.gpg. The APT
+  # publisher imports the release secret and verifies this fingerprint before
+  # it signs anything (scripts/import-apt-gpg-key.sh).
+  APT_GPG_KEY_FINGERPRINT: BCB87D7B489A64168080D900DF4751B6EA711CB8
 
 # Channel source policy (CTX-1413, #1847): the package-manager publishers
 # (`aur-bin`, `homebrew`, `scoop`) prefer the R2-backed CDN at
@@ -89,6 +93,10 @@ jobs:
       - name: Validate APT repository generator and deb822 integration
         run: |
           bash scripts/tests/check-apt-repo.test.sh
+      - name: Validate release-channel key import and Copr CLI wiring
+        run: |
+          bash scripts/tests/import-apt-gpg-key.test.sh
+          bash scripts/tests/check-release-channels.test.sh
       - name: Validate Nix Flake and Cachix binary cache integration
         run: |
           bash scripts/tests/check-nix-flake.test.sh
@@ -1725,8 +1733,11 @@ jobs:
             exit 1
           fi
 
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq copr-cli
+          python3 -m venv "$RUNNER_TEMP/copr-cli"
+          "$RUNNER_TEMP/copr-cli/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/copr-cli/bin/pip" install copr-cli
+          export PATH="$RUNNER_TEMP/copr-cli/bin:$PATH"
+          copr-cli --version
 
           mkdir -p ~/.config
           printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
@@ -1805,19 +1816,20 @@ jobs:
           set -euo pipefail
           npm install -g "wrangler@${WRANGLER_VERSION}"
           wrangler --version
-      - name: Generate and sign APT repository
+      - name: Import APT signing key
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GNUPGHOME: ${{ runner.temp }}/apt-gnupg
         run: |
           set -euo pipefail
-          if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
-            echo "::error::APT publishing is enabled but APT_GPG_PRIVATE_KEY is not set" >&2
-            exit 1
-          fi
+          install -d -m 0700 "$GNUPGHOME"
+          scripts/import-apt-gpg-key.sh --fingerprint "$APT_GPG_KEY_FINGERPRINT"
 
-          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
-          GPG_KEY="BCB87D7B489A64168080D900DF4751B6EA711CB8"
-
+      - name: Generate and sign APT repository
+        env:
+          GNUPGHOME: ${{ runner.temp }}/apt-gnupg
+        run: |
+          set -euo pipefail
           mkdir -p stage/dist apt_repo
           find dist/x86_64 dist/aarch64 -name '*.deb' -exec cp -t stage/dist {} +
 
@@ -1831,7 +1843,7 @@ jobs:
             --dist-dir stage/dist \
             --repo-dir apt_repo \
             --assets-dir packaging/apt \
-            --gpg-key "$GPG_KEY"
+            --gpg-key "$APT_GPG_KEY_FINGERPRINT"
 
           KEYRING="$PWD/packaging/apt/bitty-archive-keyring.gpg"
           gpgv --keyring "$KEYRING" apt_repo/dists/stable/InRelease

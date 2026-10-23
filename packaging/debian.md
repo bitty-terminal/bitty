@@ -80,6 +80,9 @@ and:
 1. Organizes packages into standard Debian pool layout (`pool/main/b/bitty/bitty_<version>_<arch>.deb`).
 2. Generates architecture-specific `Packages` and `Packages.gz` via `scripts/generate-apt-repo.sh`.
 3. Creates the `Release` manifest, computes checksums, and signs `InRelease` and `Release.gpg`
-   using the secret `APT_GPG_PRIVATE_KEY`.
+   using the secret `APT_GPG_PRIVATE_KEY`. The `scripts/import-apt-gpg-key.sh`
+   helper accepts armored, base64-encoded, and literal-`\n` escaped secret forms
+   and fails closed unless the imported secret-key fingerprint matches
+   `BCB87D7B489A64168080D900DF4751B6EA711CB8` before anything is signed.
 4. Uploads the repository tree, keyring, deb822 source file, and setup script to Cloudflare R2
    at `bitty/apt/` via `wrangler r2 object put`.

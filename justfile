@@ -515,7 +515,8 @@ real-render-soak-test:
     bash scripts/tests/real-render-soak.test.sh
 
 # Long-run stability soak (issue #2483, CTX-2466). Isolated Xvfb display and
-# XDG roots, opt-in stall watchdog, liveness probe every sample, bounded
+# XDG roots, stall watchdog (`BITTY_STALL_WATCHDOG` is the required switch; the
+# harness sets it), liveness probe every sample, bounded
 # output/image/input/resize stages. `--stall-probe` reproduces the blocking
 # PTY-write class (issue #2457). Evidence stays in gitignored recording/.
 longrun-soak *args:

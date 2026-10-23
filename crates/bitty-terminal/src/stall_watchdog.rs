@@ -10,8 +10,9 @@
 //!
 //! - **Observability only.** The watchdog never changes routing, timing, or
 //!   state. It marks phases and, on a stall, writes a bounded report.
-//! - **Opt-in.** `BITTY_STALL_WATCHDOG` enables the monitor thread; CI,
-//!   headless smoke runs, and normal sessions stay quiet by default.
+//! - **Opt-in.** `BITTY_STALL_WATCHDOG` is the required enable switch for the
+//!   monitor thread; CI, headless smoke runs, and normal sessions stay quiet
+//!   by default. A threshold variable never enables the watchdog on its own.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
 //!   second, and the monitor thread touches `/proc` only after a stall.
@@ -19,7 +20,11 @@
 //!   report count/interval limit per stall; repeated stalls cannot grow the
 //!   log without bound. The latest stall report also lands in one truncated
 //!   XDG state slot (`bitty/stall-watchdog.log`), so a terminated session
-//!   still leaves evidence behind.
+//!   still leaves evidence behind. The state slot is persisted *before* the
+//!   stderr write; a closed stderr pipe must never take the evidence with it.
+//! - **Shutdown-clean.** Dropping the handle wakes and joins the monitor, so
+//!   no detached thread survives app shutdown and no report is written once
+//!   shutdown completed.
 //! - **No host paths.** Reports name phases, ids, counts, thread states, and
 //!   kernel wait channels; never a checkout, home, or config path.
 //!
@@ -28,8 +33,8 @@
 //! - `BITTY_STALL_WATCHDOG=1` (or `true`/`on`) enables the watchdog with the
 //!   default 2000 ms threshold.
 //! - `BITTY_STALL_WATCHDOG=<milliseconds>` enables it with that threshold.
-//! - `BITTY_STALL_WATCHDOG_MS=<milliseconds>` enables it and overrides the
-//!   threshold (clamped to `50..=600000`).
+//! - `BITTY_STALL_WATCHDOG_MS=<milliseconds>` overrides the threshold
+//!   (clamped to `50..=600000`) but does not enable the watchdog by itself.
 //! - `0`/`false`/`off` leaves it disabled; invalid values stay disabled.
 //!
 //! The idle state is explicit: after the event loop arms `ControlFlow::Wait`
@@ -40,7 +45,8 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::logging;
@@ -318,7 +324,7 @@ struct ThreadRow {
     comm: String,
     state: char,
     wchan: String,
-    syscall: String,
+    syscall_number: String,
 }
 
 /// Process totals sampled alongside the thread rows.
@@ -473,36 +479,96 @@ impl Shared {
     }
 }
 
+/// Monitor wake-up signal.
+///
+/// A plain sleep would make shutdown wait up to one poll interval; the
+/// condition variable wakes the monitor as soon as the stop flag is set.
+struct StopSignal {
+    stopped: AtomicBool,
+    waiter: Mutex<()>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            stopped: AtomicBool::new(false),
+            waiter: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn request(&self) {
+        // Hold the waiter lock so a monitor between the check and the wait
+        // cannot miss the notification.
+        let _guard = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Wait up to `timeout` for a stop request; `true` means stop now.
+    fn wait(&self, timeout: Duration) -> bool {
+        if self.is_stopped() {
+            return true;
+        }
+        let guard = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (guard, _) = self
+            .wake
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(guard);
+        self.is_stopped()
+    }
+}
+
 /// Opt-in main-loop watchdog handle.
 ///
-/// `Drop` stops the monitor; the thread handle is deliberately detached so a
-/// wedged stderr sink can never block application shutdown.
+/// `Drop` requests a stop and joins the monitor: shutdown leaves no detached
+/// thread behind and no report is written once `Drop` returns. Sink writes
+/// ignore errors, so a closed stderr pipe cannot panic the monitor or strand
+/// the join. A sink blocked forever on a full pipe still delays shutdown; the
+/// state slot is written first, so the evidence survives a later termination.
 pub(crate) struct StallWatchdog {
     shared: Arc<Shared>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
+    monitor: Option<JoinHandle<()>>,
+    /// Set by the monitor thread right before it exits (test observability).
+    #[cfg(test)]
+    finished: Arc<AtomicBool>,
 }
 
 impl StallWatchdog {
     /// Start the watchdog when the environment opts in.
     pub(crate) fn from_env() -> Option<Self> {
         config_from_env().map(|config| {
-            Self::start(
-                config,
-                Box::new(|line: &str| {
-                    let redacted = crate::observability::redact_text_for_stderr(line);
-                    eprintln!("{redacted}");
-                    persist_state_file(&redacted);
-                }),
-            )
+            let mut sink = ReportSink {
+                state_path: state_file_path(),
+                stderr: std::io::stderr(),
+            };
+            Self::start(config, Box::new(move |line| sink.emit(line)))
         })
     }
 
     /// Start a watchdog with an explicit configuration and sink.
     fn start(config: WatchdogConfig, mut sink: Box<dyn FnMut(&str) + Send>) -> Self {
         let shared = Arc::new(Shared::new());
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::new());
+        #[cfg(test)]
+        let finished = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_stop = Arc::clone(&stop);
+        #[cfg(test)]
+        let thread_finished = Arc::clone(&finished);
         let threshold = config.threshold;
         let poll_interval = std::cmp::max(
             MIN_POLL_INTERVAL,
@@ -518,13 +584,29 @@ impl StallWatchdog {
                     poll_interval,
                     &mut sink,
                 );
+                #[cfg(test)]
+                thread_finished.store(true, Ordering::SeqCst);
             });
-        if let Err(error) = spawn {
-            logging::warn(|| {
-                format!("bitty: stall watchdog thread unavailable ({error}); diagnostics stay off")
-            });
+        let monitor = match spawn {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                logging::warn(|| {
+                    format!(
+                        "bitty: stall watchdog thread unavailable ({error}); diagnostics stay off"
+                    )
+                });
+                #[cfg(test)]
+                finished.store(true, Ordering::SeqCst);
+                None
+            }
+        };
+        Self {
+            shared,
+            stop,
+            monitor,
+            #[cfg(test)]
+            finished,
         }
-        Self { shared, stop }
     }
 
     /// Mark the loop active in `phase` and advance the heartbeat.
@@ -555,27 +637,32 @@ impl StallWatchdog {
         }
     }
 
-    /// Stop the monitor and wait for it to observe the flag.
+    /// Request monitor shutdown and wait for the thread to exit.
+    fn shutdown(&mut self) -> std::thread::Result<()> {
+        self.stop.request();
+        match self.monitor.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the monitor and assert the thread actually exited (tests).
     #[cfg(test)]
-    fn stop_and_join(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // The monitor samples at most `poll_interval`, which the test
-        // configurations keep small; a short bounded wait is enough.
-        std::thread::sleep(MIN_POLL_INTERVAL);
+    fn stop_and_join(mut self) -> std::thread::Result<()> {
+        self.shutdown()
     }
 }
 
 impl Drop for StallWatchdog {
     fn drop(&mut self) {
-        // Detach: a wedged stderr sink must never delay process shutdown.
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.shutdown();
     }
 }
 
 /// Monitor thread body.
 fn monitor_loop(
     shared: &Shared,
-    stop: &AtomicBool,
+    stop: &StopSignal,
     threshold: Duration,
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) + Send),
@@ -585,10 +672,9 @@ fn monitor_loop(
         ..MonitorState::default()
     };
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.wait(poll_interval) {
             return;
         }
-        std::thread::sleep(poll_interval);
         let now = Instant::now();
         let progress = shared.progress.load(Ordering::Relaxed);
         let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
@@ -609,9 +695,18 @@ fn monitor_loop(
                     threads: totals_snapshot.0,
                     totals: totals_snapshot.1,
                 };
-                sink(&render_report(&report));
+                let rendered = render_report(&report);
+                // Sampling /proc and rendering takes time; never emit once
+                // shutdown was requested.
+                if stop.is_stopped() {
+                    return;
+                }
+                sink(&rendered);
             }
             MonitorAction::Recovered { stalled_for } => {
+                if stop.is_stopped() {
+                    return;
+                }
                 sink(&format!(
                     "bitty: main-loop stall recovered after {} ms (phase={})",
                     stalled_for.as_millis(),
@@ -619,6 +714,9 @@ fn monitor_loop(
                 ));
             }
             MonitorAction::Suppressed => {
+                if stop.is_stopped() {
+                    return;
+                }
                 sink(&format!(
                     "bitty: main-loop stall still active after {} reports; further reports suppressed",
                     MAX_REPORTS_PER_STALL
@@ -671,15 +769,15 @@ fn linux_thread_snapshot() -> (Vec<ThreadRow>, ProcessTotals) {
             let wchan = read_proc_text(&format!("{base}/wchan"), 128)
                 .map(|text| sanitize_kernel_token(&text))
                 .unwrap_or_else(|| String::from("?"));
-            let syscall = read_proc_text(&format!("{base}/syscall"), 128)
-                .map(|text| syscall_name(&text))
+            let syscall_number = read_proc_text(&format!("{base}/syscall"), 128)
+                .map(|text| syscall_number(&text))
                 .unwrap_or_else(|| String::from("?"));
             rows.push(ThreadRow {
                 tid,
                 comm,
                 state,
                 wchan,
-                syscall,
+                syscall_number,
             });
         }
     }
@@ -721,9 +819,9 @@ fn stat_state(stat: &str) -> char {
         .unwrap_or('?')
 }
 
-/// Keep only the syscall name (never its argument registers/pointers).
+/// Keep only the syscall number (never its argument registers/pointers).
 #[cfg(target_os = "linux")]
-fn syscall_name(raw: &str) -> String {
+fn syscall_number(raw: &str) -> String {
     let name = raw.split_whitespace().next().unwrap_or_default();
     if name.is_empty() || name == "running" || name.starts_with('-') {
         String::from("-")
@@ -805,8 +903,8 @@ fn render_report(report: &StallReport) -> String {
             let marker = if row.tid == main_tid { "[main] " } else { "" };
             let _ = writeln!(
                 out,
-                "  {marker}tid={} state={} wchan={} syscall={} comm={}",
-                row.tid, row.state, row.wchan, row.syscall, row.comm,
+                "  {marker}tid={} state={} wchan={} syscall_number={} comm={}",
+                row.tid, row.state, row.wchan, row.syscall_number, row.comm,
             );
         }
     }
@@ -843,21 +941,41 @@ fn truncate_report(mut report: String) -> String {
     report
 }
 
-/// Production sink: stderr through the same emission-time redaction gate as
-/// every other app diagnostic, plus one bounded state slot.
+/// Report sink used in production: one bounded state slot, then stderr.
 ///
 /// The owner's report had no captured log because the graphical launcher's
 /// stderr was lost and the process was terminated. Persisting the latest stall
 /// report under the XDG state directory makes the next occurrence readable
 /// after the fact; it is a single truncated slot, never an append log.
-fn persist_state_file(line: &str) {
+///
+/// Ordering is deliberate: the state slot is written first, so a broken stderr
+/// pipe cannot lose the evidence. The stderr write runs through the same
+/// emission-time redaction gate as every other app diagnostic and drops every
+/// write error instead of panicking the monitor thread.
+struct ReportSink<W: std::io::Write> {
+    state_path: Option<PathBuf>,
+    stderr: W,
+}
+
+impl<W: std::io::Write> ReportSink<W> {
+    fn emit(&mut self, line: &str) {
+        let redacted = crate::observability::redact_text_for_stderr(line);
+        persist_state_file_at(self.state_path.as_deref(), &redacted);
+        // `writeln!` on stderr returns an error for EPIPE/EBADF instead of
+        // panicking (`eprintln!` would panic and kill the monitor thread).
+        let _ = writeln!(self.stderr, "{redacted}");
+    }
+}
+
+/// Persist a stall report to `path` before it reaches stderr.
+fn persist_state_file_at(path: Option<&std::path::Path>, line: &str) {
     if !line.starts_with(STALL_REPORT_PREFIX) {
         return;
     }
-    let Some(path) = state_file_path() else {
+    let Some(path) = path else {
         return;
     };
-    write_state_slot(&path, line);
+    write_state_slot(path, line);
 }
 
 /// Write (truncate) the single state slot, best-effort.
@@ -1121,11 +1239,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn syscall_name_never_keeps_arguments() {
-        assert_eq!(syscall_name("futex 0x7f 0x81 0 0"), "futex");
-        assert_eq!(syscall_name("running"), "-");
-        assert_eq!(syscall_name(""), "-");
-        assert_eq!(syscall_name("-1 0 0 0"), "-");
+    fn syscall_number_never_keeps_arguments() {
+        assert_eq!(syscall_number("202 0x7f 0x81 0 0"), "202");
+        assert_eq!(syscall_number("running"), "-");
+        assert_eq!(syscall_number(""), "-");
+        assert_eq!(syscall_number("-1 0 0 0"), "-");
     }
 
     #[cfg(target_os = "linux")]
@@ -1139,7 +1257,7 @@ mod tests {
                 comm: "worker".to_string(),
                 state: 'S',
                 wchan: "futex_wait_queue".to_string(),
-                syscall: "futex".to_string(),
+                syscall_number: "202".to_string(),
             });
         }
         rows.truncate(MAX_THREAD_ROWS);
@@ -1190,6 +1308,209 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("recovery line must arrive");
         assert!(recovered.contains("stall recovered"), "{recovered}");
-        watchdog.stop_and_join();
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// Deterministic temp directory for one hermetic monitor test.
+    fn test_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-watchdog-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Stderr stand-in that fails exactly like a closed pipe.
+    struct BrokenStderr {
+        state_path: PathBuf,
+        saw_state_before_write: Arc<AtomicBool>,
+    }
+
+    impl std::io::Write for BrokenStderr {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            // Record whether the state evidence already existed when this
+            // write arrived; that is the ordering the fix guarantees.
+            if self.state_path.exists() {
+                self.saw_state_before_write.store(true, Ordering::SeqCst);
+            }
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn report_sink_persists_state_before_a_broken_stderr_write() {
+        let dir = test_dir("sink-order");
+        let path = dir.join(STATE_FILE_NAME);
+        let saw_state = Arc::new(AtomicBool::new(false));
+        let mut sink = ReportSink {
+            state_path: Some(path.clone()),
+            stderr: BrokenStderr {
+                state_path: path.clone(),
+                saw_state_before_write: Arc::clone(&saw_state),
+            },
+        };
+        let line = concat!(
+            "bitty: main-loop stall detected: no progress for 2000 ms ",
+            "(threshold 2000 ms, phase=plugin-timers, app_uptime 10 ms, progress=3)\n",
+            "  thread-state snapshot\n"
+        );
+        sink.emit(line);
+
+        assert!(
+            saw_state.load(Ordering::SeqCst),
+            "the state slot must exist before stderr is written"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        // Recovery lines share the sink but never overwrite the evidence.
+        sink.emit("bitty: main-loop stall recovered after 2000 ms (phase=idle)");
+        assert_eq!(std::fs::read_to_string(&path).expect("state slot"), line);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn monitor_soak_with_broken_stderr_keeps_phase_and_thread_evidence() {
+        let dir = test_dir("soak");
+        let state_path = dir.join(STATE_FILE_NAME);
+        let writes = Arc::new(AtomicU64::new(0));
+        let saw_state = Arc::new(AtomicBool::new(false));
+        let sink_path = state_path.clone();
+        let sink_writes = Arc::clone(&writes);
+        let sink_saw_state = Arc::clone(&saw_state);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(45),
+            Box::new(move |line| {
+                let mut sink = ReportSink {
+                    state_path: Some(sink_path.clone()),
+                    stderr: BrokenStderr {
+                        state_path: sink_path.clone(),
+                        saw_state_before_write: Arc::clone(&sink_saw_state),
+                    },
+                };
+                sink.emit(line);
+                sink_writes.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        watchdog.enter(Phase::PluginTimers);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let evidence = loop {
+            if let Ok(text) = std::fs::read_to_string(&state_path) {
+                if text.contains("phase=plugin-timers") {
+                    break text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "monitor never persisted a stall report"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(evidence.starts_with(STALL_REPORT_PREFIX), "{evidence}");
+        assert!(evidence.contains("phase=plugin-timers"), "{evidence}");
+        assert!(evidence.contains("threads="), "{evidence}");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(evidence.contains("tid="), "{evidence}");
+            assert!(evidence.contains("[main]"), "{evidence}");
+            assert!(evidence.contains("state="), "{evidence}");
+        }
+        assert!(
+            saw_state.load(Ordering::SeqCst),
+            "evidence must be on disk before the failing stderr write"
+        );
+
+        // The broken stderr must not panic the monitor: join succeeds and the
+        // thread records its own exit.
+        let finished = Arc::clone(&watchdog.finished);
+        let writes_deadline = Instant::now() + Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < writes_deadline,
+                "sink never observed the persisted report"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let writes_at_stop = writes.load(Ordering::SeqCst);
+        watchdog
+            .stop_and_join()
+            .expect("broken stderr must not panic the monitor");
+        assert!(finished.load(Ordering::SeqCst), "monitor must exit");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            writes_at_stop,
+            "no report may be written after shutdown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).expect("state slot"),
+            evidence,
+            "state evidence must survive shutdown unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_joins_the_monitor_and_stops_writing() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (drop_started_tx, drop_started_rx) = mpsc::channel::<()>();
+        let (drop_done_tx, drop_done_rx) = mpsc::channel::<()>();
+        let writes = Arc::new(AtomicU64::new(0));
+        let sink_writes = Arc::clone(&writes);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(30),
+            Box::new(move |_line| {
+                let _ = entered_tx.send(());
+                // Hold the monitor inside the sink until the test releases it.
+                let _ = release_rx.recv();
+                sink_writes.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        watchdog.enter(Phase::RuntimeTick);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first stall report must enter the sink");
+
+        let finished = Arc::clone(&watchdog.finished);
+        let dropper = std::thread::spawn(move || {
+            let _ = drop_started_tx.send(());
+            drop(watchdog);
+            let _ = drop_done_tx.send(());
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drop thread must start");
+        // The sink is still blocked. A detached monitor returns from Drop
+        // immediately; a joining Drop must stay blocked here.
+        assert!(
+            drop_done_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "Drop must join the monitor thread, not detach it"
+        );
+        release_tx.send(()).expect("release the sink");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Drop must return after the monitor exits");
+        dropper.join().expect("drop thread");
+        assert!(finished.load(Ordering::SeqCst), "monitor must exit");
+
+        let writes_at_drop = writes.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            writes_at_drop,
+            "a stopped monitor must not write"
+        );
     }
 }

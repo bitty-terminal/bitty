@@ -16,7 +16,10 @@
 #
 # Every sample measures `bitty ctl view list` latency, RSS, thread count, and
 # fd count, and counts watchdog stall reports. Evidence stays under --out-dir
-# (gitignored scratch) and carries counts, never host paths.
+# (gitignored scratch) and carries counts, never host paths. The watchdog is
+# enabled explicitly: `BITTY_STALL_WATCHDOG` is the required switch, while
+# `BITTY_STALL_WATCHDOG_MS` only sets the threshold. Inherited `BITTY_*`
+# overrides are cleared before launch so the harness owns the whole run.
 #
 # `--stall-probe` additionally reproduces the blocking-PTY-write class: it
 # starts a child that stops reading stdin, then sends bounded input bursts.
@@ -85,6 +88,7 @@ STALL_REPORTS=0
 LIVENESS_TIMEOUTS=0
 PROBE_RESULT="skip"
 APP_EXITED=0
+CLEANUP_DONE=0
 
 usage() {
   awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
@@ -283,6 +287,9 @@ start_xvfb() {
 
 cleanup() {
   local status=$?
+  # One-shot: the EXIT trap may re-enter while `exit` unwinds.
+  [ "$CLEANUP_DONE" -eq 0 ] || return 0
+  CLEANUP_DONE=1
   set +e
   if [ -n "$APP_PGID" ]; then
     kill -TERM -- "-$APP_PGID" 2>/dev/null || kill -TERM "$APP_PID" 2>/dev/null
@@ -294,6 +301,13 @@ cleanup() {
   fi
   if [ -n "$XVFB_PID" ]; then
     kill -TERM "$XVFB_PID" 2>/dev/null
+    local xvfb_deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$xvfb_deadline" ] && kill -0 "$XVFB_PID" 2>/dev/null; do
+      sleep 0.1
+    done
+    # TERM is not guaranteed to land (stuck X server): bound the wait and
+    # escalate to KILL instead of hanging cleanup.
+    kill -KILL "$XVFB_PID" 2>/dev/null
     wait "$XVFB_PID" 2>/dev/null
   fi
   if [ -n "$ROOT" ] && [ -d "$ROOT" ]; then
@@ -317,6 +331,11 @@ start_app() {
   export XDG_CACHE_HOME="$ROOT/cache"
   export DISPLAY=":$DISPLAY_NUM"
   unset WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE
+  # Clear inherited Bitty overrides so an agent shell cannot redirect the
+  # run's config/profile/plugins or force headless/demo/elevated behavior.
+  # `BITTY_PLUGIN_DIR` comes back only through the explicit --plugin-dir.
+  unset BITTY_CONFIG BITTY_PROFILE BITTY_PLUGIN_DIR BITTY_COMPONENTS_DIR \
+    BITTY_COMPONENT_STATE_DIR BITTY_HEADLESS BITTY_DEMO_PUMP BITTY_CTL_ELEVATE
   export SHELL="$SHELL_BIN"
   export BITTY_INSTANCE_ID="soak$DISPLAY_NUM"
   export BITTY_STALL_WATCHDOG=1

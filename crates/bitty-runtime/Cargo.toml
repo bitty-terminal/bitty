@@ -54,6 +54,27 @@ path = "src/bin/bitty-ai-helper-fixture.rs"
 test = false
 doc = false
 
+# bitty#2494: hermetic execution-component fixture. Serves the execution
+# component wire protocol v2 by delegating to the pinned
+# `bitty_execution::component::server` (the same server the installable
+# `bitty-execution` binary ships), with fault-injection modes for the Core
+# host client's malformed/oversized-frame, crash, and handshake paths. Never
+# installed or packaged (the release bundles only ship the `bitty` binary).
+[[bin]]
+name = "bitty-execution-component-fixture"
+path = "src/bin/bitty-execution-component-fixture.rs"
+test = false
+doc = false
+
+# bitty#2494: hermetic child for execution parity tests (stdout/stderr, exit
+# status, sleep, large output). Keeping it a binary avoids libtest output on
+# the child's stdout, which the execution component protocol would reject.
+[[bin]]
+name = "bitty-execution-job-fixture"
+path = "src/bin/bitty-execution-job-fixture.rs"
+test = false
+doc = false
+
 [dependencies]
 bitty-config = { version = "0.0.26", path = "../bitty-config" }
 bitty-vt = { version = "0.0.26", path = "../bitty-vt" }
@@ -78,10 +99,13 @@ bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-
 # a real job identity, lifecycle, cancellation, and bounded output instead of
 # a Core-local one-shot supervisor. The pin carries the host
 # `SpawnPreparer` seam Core uses for CTX-1151 Landlock exec confinement and
-# the `bitty-ipc` revision shared with this workspace. Core's
-# `bitty-runtime::execution_jobs` is the only module allowed to name the
-# extension implementation (W-147 seam exception).
-bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "b2137be" }
+# the `bitty-ipc` revision shared with this workspace. bitty#2494 adds the
+# executable component protocol/server. Core's
+# `bitty-runtime::execution_jobs` and `bitty-runtime::execution_component`
+# are the only modules allowed to name the extension implementation (W-147
+# seam exception). Re-pin to the merged #2494 component commit before this
+# workspace merges it; until then the revision is the component PR tip.
+bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "36404ab" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of
@@ -138,16 +162,19 @@ bitty-platform-services = { version = "0.0.1", git = "https://github.com/bitty-t
 # of the adapter's single audited unsafe block.
 rustix = { workspace = true, features = ["fs", "pipe", "std"] }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
-nix = { workspace = true, features = ["fs"] }
-
 # CTX-1373: the single audited pre-exec hook (`ai_publication_launch/unix.rs`)
 # duplicates the inherited child descriptors with `fcntl`/`dup2`/`close`. Same
 # workspace `libc` line already linked by bitty-pty/bitty-sandbox; no new crate
 # version. Optional: only the `publication-control` feature compiles the
 # adapter that uses it.
+#
+# bitty#2494: `nix` is also the safe Unix process-group signal surface for the
+# execution component host client (own group on spawn, group kill on loss).
+# `fs` serves the BSD/macOS activation record opener; `signal` provides
+# `killpg` without adding an `unsafe` block.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true, optional = true }
+nix = { workspace = true, features = ["fs", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

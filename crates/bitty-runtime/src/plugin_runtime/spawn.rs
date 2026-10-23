@@ -174,6 +174,7 @@ use bitty_plugin_host::tools::{
 };
 use bitty_pty::TreeBackend;
 
+use crate::execution_component::ComponentGateConfig;
 use crate::execution_jobs::{
     DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised,
     truncate_to_budget_tail,
@@ -991,6 +992,26 @@ impl SpawnService {
     #[must_use]
     pub fn new(authorizer: Box<dyn SpawnAuthorizer>) -> Self {
         Self::with_policy(authorizer, SpawnMechanicsPolicy::core_defaults())
+    }
+
+    /// Opt into the installable `execution` component for mediated spawns.
+    ///
+    /// The default [`SpawnService::new`] path stays on the linked
+    /// `bitty-execution` registry. `Preferred` falls back to it only when the
+    /// component was never entered (absent, incompatible, or no connection);
+    /// `Required` fails closed instead. Safe mode denies the component path
+    /// before any install resolution or spawn.
+    ///
+    /// Admitted `[tools.*]` spawns always stay on the linked path in this
+    /// release: Core's Landlock `EXECUTE` preparer runs in the linked
+    /// registry's child, and protocol v2 has no field for carrying that
+    /// ruleset to the component. `Preferred` therefore falls back for those
+    /// spawns and `Required` refuses them; non-tool commands remain eligible
+    /// for the component.
+    #[must_use]
+    pub fn with_execution_component(mut self, config: ComponentGateConfig) -> Self {
+        self.supervisor = ToolJobSupervisor::with_component(config);
+        self
     }
 
     /// Service with the registry-backed provider, `authorizer` routing, and
@@ -3740,9 +3761,8 @@ mod tests {
             violations.is_empty(),
             "spawn.rs production path violates the registry delegation: {violations:?}"
         );
-        // `execution_jobs.rs` has no inline test module; its test-only
-        // constructors are `#[cfg(test)]` methods and contain no spawn/kill
-        // call, so scan the whole module.
+        // `execution_jobs.rs` keeps its gate tests in an inline module and
+        // contains no direct spawn/kill call, so scan the whole module.
         let jobs_prod = include_str!("../execution_jobs.rs");
         for needle in [".spawn()", ".kill()", "pkill", "killall", "libc::kill"] {
             assert!(

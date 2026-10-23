@@ -924,7 +924,7 @@ fn render_report(report: &StallReport) -> String {
             let surface = &context.surface;
             let _ = writeln!(
                 out,
-                "  surface: last={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} lifecycle={}",
+                "  surface: last={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} lifecycle={}",
                 surface.last_event,
                 surface.configure_err,
                 surface.acquire_ok,
@@ -937,6 +937,10 @@ fn render_report(report: &StallReport) -> String {
                 surface.resize,
                 surface.resize_zero_skipped,
                 surface.headless_present,
+                surface.retry_failures,
+                surface.retry_attempts,
+                surface.retry_recoveries,
+                surface.retry_last_delay_ms,
                 context.lifecycle,
             );
         }
@@ -1333,11 +1337,16 @@ fn state_file_path() -> Option<PathBuf> {
     state_file_path_for(STATE_FILE_NAME)
 }
 
-/// Resolve a named state file under the XDG state directory.
+/// Resolve a named state file under the platform state directory.
+///
+/// Order: `XDG_STATE_HOME`, then `HOME/.local/state`, then `LOCALAPPDATA`
+/// (Windows has no XDG/HOME by default, so the crash/exit report would
+/// otherwise have no durable location).
 pub(crate) fn state_file_path_for(name: &str) -> Option<PathBuf> {
     state_file_path_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
         name,
     )
 }
@@ -1346,11 +1355,13 @@ pub(crate) fn state_file_path_for(name: &str) -> Option<PathBuf> {
 fn state_file_path_from(
     xdg_state: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
     name: &str,
 ) -> Option<PathBuf> {
     let base = xdg_state
         .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".local").join("state")))?;
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local").join("state")))
+        .or_else(|| local_app_data.map(PathBuf::from))?;
     Some(base.join("bitty").join(name))
 }
 
@@ -1595,16 +1606,40 @@ mod tests {
     fn state_path_follows_xdg_then_home() {
         use std::ffi::OsStr;
         assert_eq!(
-            state_file_path_from(Some(OsStr::new("/example/state")), None, STATE_FILE_NAME),
+            state_file_path_from(
+                Some(OsStr::new("/example/state")),
+                None,
+                None,
+                STATE_FILE_NAME
+            ),
             Some(PathBuf::from("/example/state/bitty/stall-watchdog.log"))
         );
         assert_eq!(
-            state_file_path_from(None, Some(OsStr::new("/example/home")), STATE_FILE_NAME),
+            state_file_path_from(
+                None,
+                Some(OsStr::new("/example/home")),
+                None,
+                STATE_FILE_NAME
+            ),
             Some(PathBuf::from(
                 "/example/home/.local/state/bitty/stall-watchdog.log"
             ))
         );
-        assert_eq!(state_file_path_from(None, None, STATE_FILE_NAME), None);
+        assert_eq!(
+            state_file_path_from(
+                None,
+                None,
+                Some(OsStr::new("/example/localappdata")),
+                STATE_FILE_NAME
+            ),
+            Some(PathBuf::from(
+                "/example/localappdata/bitty/stall-watchdog.log"
+            ))
+        );
+        assert_eq!(
+            state_file_path_from(None, None, None, STATE_FILE_NAME),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]

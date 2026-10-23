@@ -11,6 +11,16 @@ use bitty_rich::kitty_seam::KittyRasterBackend as _;
 const SURFACE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// Retry-delay ceiling: a permanently lost surface retries once per second.
 const SURFACE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+/// First failed real-GPU presents that log individually (issue #2570).
+const GPU_PRESENT_LOG_BURST: u64 = 8;
+/// After the burst, log every Nth failure: a permanently lost surface cannot
+/// flood stderr at the retry cadence forever.
+const GPU_PRESENT_LOG_EVERY: u64 = 60;
+
+/// Bounded total log policy for failed real-GPU presents.
+fn should_log_present_failure(total: u64) -> bool {
+    total <= GPU_PRESENT_LOG_BURST || total % GPU_PRESENT_LOG_EVERY == 0
+}
 
 /// Bounded exponential backoff for a failed real-GPU present.
 ///
@@ -2183,6 +2193,15 @@ impl Runtime {
         self.age_ime_commit_key_claim(now);
         if self.tick_time_gates(now) {
             return None;
+        }
+        // Issue #2570 review: while the retry backoff is pending, do not
+        // rebuild the retained frame on every tick. Damage stays in
+        // `pending_full_redraw` and the per-origin rings; the deadline wake
+        // rebuilds once and retries the present.
+        if let Some(deadline) = self.surface_retry.deadline {
+            if now < deadline {
+                return None;
+            }
         }
         let basis = self.collect_tick_basis(now)?;
         // CTX-1231: present-latest coalescing — drop this intermediate
@@ -5543,15 +5562,23 @@ impl Runtime {
         self.surface_retry.deadline
     }
 
-    /// Records one failed real-GPU present and reports it (rate-limited).
+    /// Records one failed real-GPU present and reports it under the bounded
+    /// total log policy.
     ///
     /// Never logs a host path: the render error is a driver/surface class
-    /// string.
+    /// string. The first [`GPU_PRESENT_LOG_BURST`] failures log individually,
+    /// then every [`GPU_PRESENT_LOG_EVERY`]th; the aggregate count is always
+    /// carried in the line and in the surface telemetry.
     fn note_surface_present_failure(&mut self, error: &RenderError) {
-        if let Some(suppressed) = self.gpu_present_log.admit_now() {
-            let suffix = log_throttle::suppressed_suffix(suppressed);
+        self.gpu_present_failures = self.gpu_present_failures.saturating_add(1);
+        if should_log_present_failure(self.gpu_present_failures) {
+            let consecutive = self.surface_retry.failures;
+            let next_delay = surface_retry_delay(consecutive.saturating_add(1));
             eprintln!(
-                "bitty: gpu present failed ({error}); retained damage and queued a retry{suffix}"
+                "bitty: gpu present failed ({error}); retained damage and queued a retry (failures={}, consecutive={}, next_delay={} ms)",
+                self.gpu_present_failures,
+                consecutive,
+                next_delay.as_millis(),
             );
         }
     }
@@ -5561,11 +5588,31 @@ impl Runtime {
         self.surface_retry.failures = self.surface_retry.failures.saturating_add(1);
         let delay = surface_retry_delay(self.surface_retry.failures);
         self.surface_retry.deadline = Some(now + delay);
+        bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
     }
 
     /// Clears the retry state after a successful present.
     fn clear_surface_retry(&mut self) {
+        if self.surface_retry.failures > 0 {
+            bitty_render::telemetry::retry_recovered();
+        }
         self.surface_retry = SurfaceRetry::default();
+    }
+
+    /// Test-only seam: force the real-GPU route and inject `failures`
+    /// consecutive present failures before the next success.
+    #[cfg(test)]
+    pub(crate) fn enable_test_present(&mut self, failures: usize) {
+        self.test_present = Some(TestPresentSeam {
+            failures_left: failures,
+            attempts: 0,
+        });
+    }
+
+    /// Test-only: number of present attempts observed after the backoff gate.
+    #[cfg(test)]
+    pub(crate) fn test_present_attempts(&self) -> usize {
+        self.test_present.as_ref().map_or(0, |seam| seam.attempts)
     }
 
     /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
@@ -5590,6 +5637,18 @@ impl Runtime {
         } = basis;
         self.pending_full_redraw = false;
         self.pending_paint_redraw = false;
+
+        // Issue #2570 review: a pending backoff gates present attempts. The
+        // frame is not marked presented, so its damage and full-redraw request
+        // survive to the single retry the deadline arms. `AboutToWait` wakes
+        // on that deadline; early frame-producing ticks do not touch the
+        // surface.
+        if let Some(deadline) = self.surface_retry.deadline {
+            if now < deadline {
+                self.pending_full_redraw = true;
+                return None;
+            }
+        }
 
         if !layers.any_needs_draw
             && layers.combined_fills.is_empty()
@@ -5730,26 +5789,72 @@ impl Runtime {
 
         let atlas_texels = self.renderer.atlas_texels().to_vec();
         let dims = self.renderer.atlas_dims();
-        let stats = if let Some(gpu) = self.gpu.as_ref() {
-            match self
-                .surface
-                .present_draw_list(gpu, &combined_list, Some((&atlas_texels, dims)))
-            {
-                Ok(s) => {
-                    self.clear_surface_retry();
-                    s
+        let retrying = self.surface_retry.deadline.is_some();
+        if retrying {
+            bitty_render::telemetry::retry_attempt();
+        }
+        #[cfg(test)]
+        let test_present = self.test_present.as_mut().map(|seam| {
+            seam.attempts = seam.attempts.saturating_add(1);
+            if seam.failures_left > 0 {
+                seam.failures_left -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        let gpu_route = self.gpu.is_some();
+        #[cfg(test)]
+        let gpu_route = gpu_route || test_present.is_some();
+        let stats = if gpu_route {
+            #[cfg(test)]
+            if test_present == Some(false) {
+                // Simulate the real-GPU failure path without an adapter: arm
+                // the retry first (so the log line carries the next delay),
+                // then retain the frame for the recovery attempt.
+                self.arm_surface_retry(now);
+                self.note_surface_present_failure(&RenderError::SurfaceAcquire(String::from(
+                    "test-injected present failure",
+                )));
+                self.pending_full_redraw = true;
+                return None;
+            }
+            if let Some(gpu) = self.gpu.as_ref() {
+                match self.surface.present_draw_list(
+                    gpu,
+                    &combined_list,
+                    Some((&atlas_texels, dims)),
+                ) {
+                    Ok(s) => {
+                        self.clear_surface_retry();
+                        s
+                    }
+                    Err(err) => {
+                        // Issue #2570: a failed real-GPU present must not be
+                        // papered over by an invisible CPU composite that then
+                        // consumes the frame's damage. Retain the damage,
+                        // report the failure under the bounded log policy, and
+                        // retry on a bounded backoff so the window recovers when
+                        // the compositor releases the swap chain again.
+                        self.arm_surface_retry(now);
+                        self.note_surface_present_failure(&err);
+                        self.pending_full_redraw = true;
+                        return None;
+                    }
                 }
-                Err(err) => {
-                    // Issue #2570: a failed real-GPU present must not be
-                    // papered over by an invisible CPU composite that then
-                    // consumes the frame's damage. Retain the damage, report
-                    // the failure (rate-limited), and retry on a bounded
-                    // backoff so the window recovers when the compositor
-                    // releases the swap chain again.
-                    self.note_surface_present_failure(&err);
-                    self.arm_surface_retry(now);
-                    self.pending_full_redraw = true;
-                    return None;
+            } else {
+                // Test-only recovery route: no adapter is attached, so the
+                // retained frame is committed through the headless fake and
+                // the retry state clears exactly as a real success would.
+                match self
+                    .surface
+                    .headless_present(&combined_list, Some((&atlas_texels, dims)))
+                {
+                    Ok(stats) => {
+                        self.clear_surface_retry();
+                        stats
+                    }
+                    Err(_) => return None,
                 }
             }
         } else {
@@ -8181,5 +8286,151 @@ mod unicode_run_union_tests {
         assert_eq!(surface_retry_delay(9), SURFACE_RETRY_MAX);
         assert_eq!(surface_retry_delay(u32::MAX), SURFACE_RETRY_MAX);
         assert!(surface_retry_delay(0) >= SURFACE_RETRY_INITIAL);
+    }
+}
+
+/// Deterministic retry/recovery regressions for issue #2570 (review B1).
+///
+/// The test seam forces the real-GPU route and injects a fixed number of
+/// failures, so these tests exercise the same arm/gate/clear branches without
+/// an adapter. Each fails if the retry logic is removed:
+///
+/// - failures would present instead of returning `None` and would clear the
+///   retry state (no deadline, no retained damage);
+/// - a future deadline would still call the present path (attempt counter
+///   advances, tick storm);
+/// - recovery would not clear the retry state or would not mark the retained
+///   frame presented.
+#[cfg(test)]
+mod surface_retry_tests {
+    use super::*;
+    use crate::runtime::RuntimeConfig;
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    fn arm_first_failure(
+        rt: &mut Runtime,
+        failures: usize,
+        now: std::time::Instant,
+    ) -> std::time::Instant {
+        rt.enable_test_present(failures);
+        rt.pending_full_redraw = true;
+        assert!(
+            rt.tick_at(now).is_none(),
+            "injected failure must not present"
+        );
+        assert_eq!(rt.test_present_attempts(), 1);
+        assert!(rt.pending_full_redraw, "damage must be retained");
+        rt.surface_retry_deadline()
+            .expect("failure must arm a retry")
+    }
+
+    #[test]
+    fn repeated_failures_retain_damage_and_rearm() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        let before = rt.last_presented_generation;
+        let first = arm_first_failure(&mut rt, 2, t0);
+        assert!(first > t0);
+        assert_eq!(rt.last_presented_generation, before);
+
+        // The frame-producing tick before the deadline must not attempt a
+        // present and must keep the same deadline.
+        assert!(
+            rt.tick_at(t0 + std::time::Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(rt.test_present_attempts(), 1);
+        assert_eq!(rt.surface_retry_deadline(), Some(first));
+        assert_eq!(rt.last_presented_generation, before);
+
+        // At the deadline the second injected failure re-arms with a longer
+        // backoff and still leaves the frame un-presented.
+        assert!(rt.tick_at(first).is_none());
+        assert_eq!(rt.test_present_attempts(), 2);
+        let second = rt.surface_retry_deadline().expect("second failure re-arms");
+        assert!(second > first);
+        assert_eq!(rt.last_presented_generation, before);
+        assert!(rt.pending_full_redraw);
+    }
+
+    #[test]
+    fn recovery_clears_retry_and_presents_the_retained_frame() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        let before = rt.last_presented_generation;
+        let deadline = arm_first_failure(&mut rt, 1, t0);
+
+        let stats = rt
+            .tick_at(deadline)
+            .expect("the retained frame must present on the retry tick");
+        assert_eq!(rt.test_present_attempts(), 2);
+        assert_eq!(
+            rt.surface_retry_deadline(),
+            None,
+            "recovery clears the retry"
+        );
+        assert!(!rt.pending_full_redraw);
+        assert_eq!(stats.generation, rt.last_presented_generation);
+        assert_ne!(rt.last_presented_generation, before);
+    }
+
+    #[test]
+    fn pending_backoff_does_not_tick_storm() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        let deadline = arm_first_failure(&mut rt, 1, t0);
+        // The first backoff is 50 ms; exercise every millisecond before it.
+        for step in 1..=40u64 {
+            assert!(
+                rt.tick_at(t0 + std::time::Duration::from_millis(step))
+                    .is_none(),
+                "no frame may present before the backoff deadline"
+            );
+        }
+        assert_eq!(
+            rt.test_present_attempts(),
+            1,
+            "no present attempt may run while the backoff is pending"
+        );
+        assert_eq!(rt.surface_retry_deadline(), Some(deadline));
+        assert!(rt.pending_full_redraw);
+    }
+
+    #[test]
+    fn past_due_retry_without_a_frame_rearms_without_spinning() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        // Establish a presented frame, then leave no damage for the retry
+        // tick: the wrapper must push the past-due deadline out instead of
+        // returning an immediate `AboutToWait` wake.
+        rt.pending_full_redraw = true;
+        let _ = rt.tick_at(t0);
+        rt.surface_retry.failures = 1;
+        rt.surface_retry.deadline = Some(t0);
+        assert!(
+            rt.tick_at(t0 + std::time::Duration::from_millis(1))
+                .is_none(),
+            "idle tick produces no frame"
+        );
+        let next = rt
+            .surface_retry_deadline()
+            .expect("past-due retry is re-armed");
+        assert!(next > t0 + std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn present_failure_log_policy_is_bounded() {
+        for total in 1..=GPU_PRESENT_LOG_BURST {
+            assert!(should_log_present_failure(total), "burst total {total}");
+        }
+        assert!(!should_log_present_failure(GPU_PRESENT_LOG_BURST + 1));
+        assert!(should_log_present_failure(GPU_PRESENT_LOG_EVERY));
+        assert!(!should_log_present_failure(GPU_PRESENT_LOG_EVERY + 1));
+        assert!(should_log_present_failure(GPU_PRESENT_LOG_EVERY * 2));
+        assert!(!should_log_present_failure(u64::MAX - 1));
     }
 }

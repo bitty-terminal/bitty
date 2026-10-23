@@ -70,12 +70,11 @@ pub(crate) enum Lifecycle {
     Unfocused = 9,
     CloseRequested = 10,
     Closed = 11,
-    SurfaceRetry = 12,
-    Exit = 13,
+    Exit = 12,
 }
 
 impl Lifecycle {
-    const COUNT: usize = 14;
+    const COUNT: usize = 13;
 
     fn from_u8(raw: u8) -> Self {
         match raw {
@@ -90,8 +89,7 @@ impl Lifecycle {
             9 => Self::Unfocused,
             10 => Self::CloseRequested,
             11 => Self::Closed,
-            12 => Self::SurfaceRetry,
-            13 => Self::Exit,
+            12 => Self::Exit,
             _ => Self::Startup,
         }
     }
@@ -110,7 +108,6 @@ impl Lifecycle {
             Self::Unfocused => "unfocused",
             Self::CloseRequested => "close-requested",
             Self::Closed => "closed",
-            Self::SurfaceRetry => "surface-retry",
             Self::Exit => "exit",
         }
     }
@@ -386,7 +383,7 @@ fn render_lifecycle(last: Lifecycle) -> String {
 
 fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -> String {
     format!(
-        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={}",
+        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={}",
         surface.last_event,
         surface.configure_ok,
         surface.configure_err,
@@ -400,6 +397,10 @@ fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -
         surface.resize,
         surface.resize_zero_skipped,
         surface.headless_present,
+        surface.retry_failures,
+        surface.retry_attempts,
+        surface.retry_recoveries,
+        surface.retry_last_delay_ms,
     )
 }
 
@@ -459,14 +460,22 @@ fn state_path(name: &str) -> Option<PathBuf> {
 
 /// Atomically replace one report slot, capped at `max_bytes`.
 fn write_slot(path: &Path, text: &str, max_bytes: usize) -> std::io::Result<()> {
+    // Cap before and after scrubbing: a replacement can grow the text, so the
+    // durable file must still honour the 8 KiB / 1 KiB bound.
     let bounded = truncate(text.to_string(), max_bytes);
-    let redacted = crate::observability::redact_text_for_stderr(&bounded).into_owned();
+    let redacted = truncate(
+        crate::observability::redact_text_for_stderr(&bounded).into_owned(),
+        max_bytes,
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
+    // A stale temp may be a symlink: remove the link (never follow it) before
+    // creating the new slot with O_EXCL.
+    let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -522,6 +531,7 @@ mod tests {
         }
         let line = render_exit_line(ExitReason::ShellExit);
         assert!(line.contains("reason=shell-exit"));
+        assert!(line.contains("retry_failures="));
         assert!(line.len() <= MAX_EXIT_BYTES);
     }
 
@@ -535,6 +545,7 @@ mod tests {
         assert!(report.contains("location=main.rs:42:7"));
         assert!(report.contains("phase="));
         assert!(report.contains("surface=last="));
+        assert!(report.contains("retry_failures="));
         assert!(report.contains("lifecycle=last="));
         assert!(report.contains("backtrace:"));
         assert!(report.contains("report truncated"));
@@ -597,6 +608,45 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_slot_stays_bounded_after_redaction() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-crash-redact-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("crash-report.log");
+        let source = format!("GITHUB_TOKEN={}\n{}", "A".repeat(2048), "B".repeat(2048));
+        write_slot(&path, &source, 256).expect("write");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert!(len <= 256, "post-redaction size {len} exceeds 256");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_slot_does_not_follow_a_stale_temp_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-crash-symlink-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("crash-report.log");
+        let target = dir.join("target");
+        std::fs::write(&target, b"untouched").expect("target");
+        symlink(&target, path.with_extension("tmp")).expect("symlink");
+        write_slot(&path, "bitty: crash report\n", MAX_CRASH_BYTES).expect("write");
+        assert_eq!(std::fs::read(&target).expect("target read"), b"untouched");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("slot read")
+                .contains("crash report")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

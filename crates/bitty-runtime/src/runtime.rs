@@ -484,6 +484,16 @@ struct SurfaceRetry {
     deadline: Option<std::time::Instant>,
 }
 
+/// Test-only present-failure seam (issue #2570 B1).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestPresentSeam {
+    /// Failures still to inject before the next present succeeds.
+    pub(crate) failures_left: usize,
+    /// Present attempts observed after the backoff gate.
+    pub(crate) attempts: usize,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -1193,14 +1203,20 @@ pub struct Runtime {
     kitty_log: log_throttle::LogThrottle,
     /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
     spawn_log: log_throttle::LogThrottle,
-    /// Rate-limited diagnostics for failed GPU presents (issue #2570).
+    /// Total failed real-GPU presents (issue #2570).
     ///
-    /// A present failure used to fall back to the CPU compositor silently and
-    /// then consume the frame's damage, leaving the window stale. The failure
-    /// is now loud (bounded) and the frame is retried.
-    gpu_present_log: log_throttle::LogThrottle,
+    /// Drives the bounded log policy: the first [`GPU_PRESENT_LOG_BURST`]
+    /// failures log individually, then only every [`GPU_PRESENT_LOG_EVERY`]th
+    /// one, so a permanently lost surface cannot flood stderr at 1 Hz forever.
+    gpu_present_failures: u64,
     /// Bounded retry state after a failed GPU present (issue #2570).
     surface_retry: SurfaceRetry,
+    /// Test-only present-failure seam (issue #2570 B1).
+    ///
+    /// Forces the real-GPU branch and injects a bounded number of failures so
+    /// the retry/recovery/damage behaviour is deterministic without an adapter.
+    #[cfg(test)]
+    test_present: Option<TestPresentSeam>,
     pending_activation_gesture: Option<ActivationGesture>,
     /// Exact URI bound to [`Self::pending_activation_gesture`] at mint time
     /// (CTX-0577); consumed together with it so the live consumer never
@@ -1991,11 +2007,10 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
-            gpu_present_log: log_throttle::LogThrottle::new(
-                log_throttle::LOG_THROTTLE_WINDOW,
-                log_throttle::LOG_THROTTLE_BURST,
-            ),
+            gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
+            #[cfg(test)]
+            test_present: None,
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,
@@ -2287,11 +2302,10 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
-            gpu_present_log: log_throttle::LogThrottle::new(
-                log_throttle::LOG_THROTTLE_WINDOW,
-                log_throttle::LOG_THROTTLE_BURST,
-            ),
+            gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
+            #[cfg(test)]
+            test_present: None,
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Number of tracked counters; must match the field order in
 /// [`SurfaceTelemetrySnapshot`].
-const COUNTER_SLOTS: usize = 12;
+const COUNTER_SLOTS: usize = 16;
 
 const CONFIGURE_OK: usize = 0;
 const CONFIGURE_ERR: usize = 1;
@@ -39,6 +39,10 @@ const PRESENT_ERR: usize = 8;
 const RESIZE: usize = 9;
 const RESIZE_ZERO_SKIPPED: usize = 10;
 const HEADLESS_PRESENT: usize = 11;
+const RETRY_FAILURES: usize = 12;
+const RETRY_ATTEMPTS: usize = 13;
+const RETRY_RECOVERIES: usize = 14;
+const RETRY_LAST_DELAY_MS: usize = 15;
 
 /// Last surface event recorded, stored as one byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +61,9 @@ enum LastEvent {
     Resize = 10,
     ResizeZeroSkipped = 11,
     HeadlessPresent = 12,
+    RetryArmed = 13,
+    RetryAttempt = 14,
+    RetryRecovered = 15,
 }
 
 impl LastEvent {
@@ -74,6 +81,9 @@ impl LastEvent {
             10 => Self::Resize,
             11 => Self::ResizeZeroSkipped,
             12 => Self::HeadlessPresent,
+            13 => Self::RetryArmed,
+            14 => Self::RetryAttempt,
+            15 => Self::RetryRecovered,
             _ => Self::None,
         }
     }
@@ -93,6 +103,9 @@ impl LastEvent {
             Self::Resize => "resize",
             Self::ResizeZeroSkipped => "resize-zero-skipped",
             Self::HeadlessPresent => "headless-present",
+            Self::RetryArmed => "retry-armed",
+            Self::RetryAttempt => "retry-attempt",
+            Self::RetryRecovered => "retry-recovered",
         }
     }
 }
@@ -125,6 +138,14 @@ pub struct SurfaceTelemetrySnapshot {
     pub resize_zero_skipped: u64,
     /// Headless CPU composites (CI path or a headless fake surface).
     pub headless_present: u64,
+    /// Failed real-GPU presents that armed a retry.
+    pub retry_failures: u64,
+    /// Present attempts made after a backoff deadline elapsed.
+    pub retry_attempts: u64,
+    /// Retries that ended in a successful present.
+    pub retry_recoveries: u64,
+    /// Most recent retry delay in milliseconds.
+    pub retry_last_delay_ms: u64,
     /// Last recorded event name, stable for reports.
     pub last_event: &'static str,
 }
@@ -144,6 +165,10 @@ impl Default for SurfaceTelemetrySnapshot {
             resize: 0,
             resize_zero_skipped: 0,
             headless_present: 0,
+            retry_failures: 0,
+            retry_attempts: 0,
+            retry_recoveries: 0,
+            retry_last_delay_ms: 0,
             last_event: "none",
         }
     }
@@ -211,6 +236,23 @@ pub(crate) fn headless_present() {
     record(LastEvent::HeadlessPresent, Some(HEADLESS_PRESENT));
 }
 
+/// A failed real-GPU present armed the bounded retry.
+pub fn retry_armed(delay_ms: u64) {
+    bump(RETRY_FAILURES);
+    COUNTERS[RETRY_LAST_DELAY_MS].store(delay_ms, Ordering::Relaxed);
+    LAST_EVENT.store(LastEvent::RetryArmed as u8, Ordering::Relaxed);
+}
+
+/// The backoff deadline elapsed and a retry present is being attempted.
+pub fn retry_attempt() {
+    record(LastEvent::RetryAttempt, Some(RETRY_ATTEMPTS));
+}
+
+/// A retry present succeeded and cleared the retry state.
+pub fn retry_recovered() {
+    record(LastEvent::RetryRecovered, Some(RETRY_RECOVERIES));
+}
+
 /// Copy the process-wide surface telemetry slot.
 #[must_use]
 pub fn snapshot() -> SurfaceTelemetrySnapshot {
@@ -227,6 +269,10 @@ pub fn snapshot() -> SurfaceTelemetrySnapshot {
         resize: COUNTERS[RESIZE].load(Ordering::Relaxed),
         resize_zero_skipped: COUNTERS[RESIZE_ZERO_SKIPPED].load(Ordering::Relaxed),
         headless_present: COUNTERS[HEADLESS_PRESENT].load(Ordering::Relaxed),
+        retry_failures: COUNTERS[RETRY_FAILURES].load(Ordering::Relaxed),
+        retry_attempts: COUNTERS[RETRY_ATTEMPTS].load(Ordering::Relaxed),
+        retry_recoveries: COUNTERS[RETRY_RECOVERIES].load(Ordering::Relaxed),
+        retry_last_delay_ms: COUNTERS[RETRY_LAST_DELAY_MS].load(Ordering::Relaxed),
         last_event: LastEvent::from_u8(LAST_EVENT.load(Ordering::Relaxed)).as_str(),
     }
 }
@@ -252,6 +298,9 @@ mod tests {
         headless_present();
         acquire_ok();
         present_ok();
+        retry_armed(100);
+        retry_attempt();
+        retry_recovered();
 
         let after = snapshot();
         assert!(after.configure_ok > before.configure_ok);
@@ -265,12 +314,16 @@ mod tests {
         assert!(after.headless_present > before.headless_present);
         assert!(after.acquire_ok > before.acquire_ok);
         assert!(after.present_ok > before.present_ok);
+        assert!(after.retry_failures > before.retry_failures);
+        assert!(after.retry_attempts > before.retry_attempts);
+        assert!(after.retry_recoveries > before.retry_recoveries);
+        assert_eq!(after.retry_last_delay_ms, 100);
         assert!(!after.last_event.is_empty());
     }
 
     #[test]
     fn every_event_has_a_stable_name() {
-        for raw in 0u8..=12 {
+        for raw in 0u8..=15 {
             let event = LastEvent::from_u8(raw);
             assert_eq!(event as u8, raw);
             assert!(!event.as_str().is_empty());

@@ -1348,8 +1348,10 @@ fn main() {
         );
     }
     // Issue #2570: capture the next silent disappearance with a bounded
-    // panic report even when the opt-in stall watchdog is off. Installed only
-    // for the interactive event loop (headless smoke stays quiet).
+    // panic report even when the opt-in stall watchdog is off. Installed for
+    // the interactive event loop; a `DisplayUnavailable` fallback still records
+    // its own exit reason before running headless smoke, while a normal
+    // `--headless` run returns before this point and never installs.
     crash_report::install();
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => {

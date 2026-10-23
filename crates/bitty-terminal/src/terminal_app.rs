@@ -636,6 +636,9 @@ pub(crate) struct TerminalApp {
     /// Phase marks are observability only: they never alter routing, timing,
     /// or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
+    /// Test-only override for the surface-retry wake (issue #2570 B1).
+    #[cfg(test)]
+    pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
     /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
     pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -809,6 +812,8 @@ impl TerminalApp {
             _pty_thread: None,
             presented_frames: 0,
             stall_watchdog: StallWatchdog::from_env(),
+            #[cfg(test)]
+            test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -856,6 +861,8 @@ impl TerminalApp {
             _pty_thread: Some(handle),
             presented_frames: 0,
             stall_watchdog: StallWatchdog::from_env(),
+            #[cfg(test)]
+            test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -974,6 +981,15 @@ impl TerminalApp {
 
     /// Tell the watchdog the loop is parked in `ControlFlow::Wait`, so a quiet
     /// window is not a stall.
+    /// Surface-retry wake, with a test override for the AboutToWait wiring.
+    fn surface_retry_wake(&self) -> Option<std::time::Instant> {
+        #[cfg(test)]
+        if let Some(deadline) = self.test_surface_retry_deadline {
+            return Some(deadline);
+        }
+        self.runtime.surface_retry_deadline()
+    }
+
     fn watchdog_idle(&self) {
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
             watchdog.idle();
@@ -4468,7 +4484,7 @@ impl TerminalApp {
                 // Issue #2570: a failed real-GPU present retains damage and
                 // arms a bounded retry; without this wake a quiet window would
                 // never retry and could stay stale after a workspace switch.
-                let surface_retry = self.runtime.surface_retry_deadline();
+                let surface_retry = self.surface_retry_wake();
                 let wake = [
                     hover,
                     animation,

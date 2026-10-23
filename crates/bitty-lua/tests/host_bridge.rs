@@ -941,6 +941,8 @@ fn committed_mutation_is_not_reported_as_timeout() {
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
+    vm.set_host_call_deadline_ms(DEFAULT_HOST_DEADLINE_MS)
+        .expect("normal registration deadline");
     let registration = vm
         .execute_bounded(
             r#"
@@ -970,8 +972,6 @@ fn committed_mutation_is_not_reported_as_timeout() {
     // tighten the live bridge cell to the requested 1 ms before the slow
     // mutation. This removes compile/scheduling overhead from the diagnosis
     // without changing the production deadline or the regression stimulus.
-    vm.set_host_call_deadline_ms(DEFAULT_HOST_DEADLINE_MS)
-        .expect("warm-up deadline");
     let warmup = vm
         .call_function(&run, &[LuaValue::String("warmup".to_string())])
         .expect("warm-up commit probe");

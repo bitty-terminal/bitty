@@ -559,11 +559,10 @@ mod tests {
 
     #[test]
     fn backtrace_source_paths_keep_only_the_file_name() {
-        let line =
-            "  12: bitty_terminal::main\n             at /mnt/data/checkout/src/main.rs:42:5";
+        let line = "  12: bitty_terminal::main\n             at /example/checkout/src/main.rs:42:5";
         let stripped = strip_source_path(line);
         assert!(stripped.contains("at main.rs:42:5"), "{stripped}");
-        assert!(!stripped.contains("/mnt/data"), "{stripped}");
+        assert!(!stripped.contains("/example/checkout"), "{stripped}");
         let relative = "             at ./bitty/.worktrees/ctx-1/src/main.rs:42:5";
         let stripped = strip_source_path(relative);
         assert!(stripped.contains("at main.rs:42:5"), "{stripped}");

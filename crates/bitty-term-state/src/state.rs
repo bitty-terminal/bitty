@@ -773,6 +773,11 @@ impl State {
     /// [`State::resize`] and consumed by [`State::reflow_primary`], so a
     /// width resize collects exactly once (CTX-0469).
     ///
+    /// Trailing layout/erase padding (`Cell::padding`) is dropped from every
+    /// physical segment, while printed spaces (`padding == false`) stay
+    /// content — the distinction that keeps wide-glyph margin padding from
+    /// turning into spaces across repeated reflows (#2529).
+    ///
     /// Unlike a borrowing collect, scrollback boxes are DRAINED (moved out,
     /// oldest first) instead of cloned while the originals stay live: a
     /// full-scrollback reflow otherwise peaks at three resident generations
@@ -793,18 +798,18 @@ impl State {
         scrollback: &mut Scrollback,
         old_rows: usize,
     ) -> (Vec<Vec<Cell>>, Vec<(usize, usize)>) {
-        /// Drops wide spacers from a physical segment. `trim_trailing` is
-        /// false for soft-wrapped segments: spaces at a wrap boundary are
-        /// real content (they separate the words on the continuation row),
-        /// so trimming them would merge words when the line is unwrapped
-        /// again on a wider grid (#2529). Only a logical line's final
-        /// segment may drop its trailing padding.
-        fn trim_owned(cells: &mut Vec<Cell>, trim_trailing: bool) {
+        /// Drops wide spacers and trailing layout/erase padding. A printed
+        /// space carries `padding == false` and therefore survives reflow,
+        /// while the synthetic blank `rewrap_one_logical` inserts when a
+        /// width-2 glyph straddles the margin (`padding == true`) is removed
+        /// before the logical line is rebuilt (#2529).
+        fn trim_owned(cells: &mut Vec<Cell>) {
             cells.retain(|cell| !cell.spacer);
-            if trim_trailing {
-                while cells.last().is_some_and(Cell::is_blank) {
-                    cells.pop();
-                }
+            while cells
+                .last()
+                .is_some_and(|cell| cell.padding && cell.is_blank())
+            {
+                cells.pop();
             }
         }
         let sb_len = scrollback.len();
@@ -828,7 +833,7 @@ impl State {
                 };
                 (row_cells, w)
             };
-            trim_owned(&mut segment, !wrapped);
+            trim_owned(&mut segment);
             row_map.push((logicals.len(), cur.len()));
             cur.append(&mut segment);
             if !wrapped {
@@ -1094,6 +1099,7 @@ impl State {
                                 style: blank,
                                 width: 2,
                                 spacer: false,
+                                padding: false,
                                 hyperlink: None,
                                 zerowidth: Zerowidth::new(),
                             });
@@ -1107,6 +1113,7 @@ impl State {
                         style: blank,
                         width: 1,
                         spacer: false,
+                        padding: false,
                         hyperlink: None,
                         zerowidth: Zerowidth::new(),
                     }),
@@ -1885,6 +1892,7 @@ impl State {
                 style,
                 width: glyph_width,
                 spacer: false,
+                padding: false,
                 hyperlink: link,
                 zerowidth: Zerowidth::new(),
             },
@@ -1969,6 +1977,7 @@ impl State {
                 style,
                 width: 1,
                 spacer: false,
+                padding: false,
                 hyperlink: link,
                 zerowidth: Zerowidth::new(),
             },
@@ -3740,6 +3749,9 @@ fn trim_row_to_leads(cells: &[Cell]) -> Vec<Cell> {
 /// of `new_cols` columns, padded with `erase`. Wide leads (`width == 2`)
 /// are atomic: when a single column remains, the row is padded with one
 /// blank and the wide starts the next row (mirrors `print`'s margin rule).
+/// Filler cells are [`Cell::erased`] (`padding == true`), so the next unwrap
+/// drops them instead of materializing them as spaces; a space printed by
+/// the application is copied verbatim and stays content (#2529).
 /// Returns `(padded_row_cells, wrapped)` per physical row: all but the last
 /// wrap (`true`), the last is a hard break (`false`). Empty input yields one
 /// blank row.

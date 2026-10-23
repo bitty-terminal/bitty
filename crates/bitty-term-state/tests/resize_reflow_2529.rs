@@ -80,7 +80,18 @@ fn logical_text(state: &State) -> String {
     let mut out = String::new();
     let mut line = String::new();
     for (cells, wrapped) in physical_rows(state) {
-        for cell in cells.iter() {
+        // Layout/erase padding is not text: mirror the production unwrap
+        // and drop trailing padding cells from each physical row.
+        let mut end = cells.len();
+        while end > 0 {
+            let cell = &cells[end - 1];
+            if cell.padding && cell.is_blank() {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        for cell in &cells[..end] {
             if !cell.spacer {
                 line.push(cell.glyph);
                 for mark in cell.zerowidth.iter() {
@@ -495,4 +506,81 @@ fn hyperlink_spans_survive_width_reflow() {
         s.hyperlink_entry(id),
         Some((None, "https://example.com/a/long/linked/path"))
     );
+}
+
+/// #2529 review blocker: a wide glyph that straddles the right margin gets a
+/// synthetic padding blank during rewrap. That blank must never become a
+/// content space on the next unwrap, or repeated width cycles insert spaces
+/// into CJK/emoji text.
+#[test]
+fn wide_reflow_is_exact_for_cjk_repeated_cycles() {
+    let paragraph = "这是一段很长的中文段落，用来检查窗口宽度变化时是否会在字符之间插入多余的空格，从而破坏可复制文本。";
+    let mut s = State::new();
+    prints(&mut s, paragraph);
+    newline(&mut s);
+    let before = logical_text(&s);
+    assert_eq!(before.lines().next(), Some(paragraph));
+
+    for _ in 0..5 {
+        s.resize(37, 24);
+        assert!(s.check_invariants().is_ok());
+        s.resize(80, 24);
+        assert!(s.check_invariants().is_ok());
+    }
+    assert_eq!(
+        logical_text(&s),
+        before,
+        "37<->80 cycles must not insert spaces between wide glyphs"
+    );
+}
+
+/// One-step forms: the synthetic margin pad disappears, while a real space
+/// printed in the last column survives exactly.
+#[test]
+fn wide_margin_padding_is_not_content_but_real_spaces_are() {
+    // No printed space: "AAAA中" wraps with a synthetic pad after AAAA.
+    let mut s = State::new();
+    s.resize(5, 24);
+    prints(&mut s, "AAAA中");
+    newline(&mut s);
+    s.resize(80, 24);
+    assert_eq!(
+        logical_text(&s).lines().next(),
+        Some("AAAA中"),
+        "synthetic wide-margin padding must not materialize as a space"
+    );
+
+    // A real space in the last column before the wide glyph must survive.
+    let mut s = State::new();
+    s.resize(5, 24);
+    prints(&mut s, "AAAA 中");
+    newline(&mut s);
+    s.resize(80, 24);
+    assert_eq!(
+        logical_text(&s).lines().next(),
+        Some("AAAA 中"),
+        "a printed space at the wrap boundary is content"
+    );
+}
+
+/// Emoji (width 2), mixed ASCII, and meaningful runs of real spaces must be
+/// byte-exact across boundary widths, repeated cycles, and a 1-column pass.
+#[test]
+fn wide_emoji_and_mixed_spaces_survive_repeated_cycles() {
+    let text = "mixed 😀 text  中文字符 with  real  spaces  and emoji 😀😀 end";
+    let mut s = State::new();
+    prints(&mut s, text);
+    newline(&mut s);
+    let before = logical_text(&s);
+    assert_eq!(before.lines().next(), Some(text));
+
+    for width in [37usize, 39, 40, 41, 5, 80, 1, 80, 37, 80] {
+        s.resize(width, 24);
+        assert!(s.check_invariants().is_ok(), "invariants at width {width}");
+        assert_eq!(
+            logical_text(&s),
+            before,
+            "width {width} must preserve the exact logical text"
+        );
+    }
 }

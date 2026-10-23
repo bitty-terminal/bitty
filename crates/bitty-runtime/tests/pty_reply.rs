@@ -292,6 +292,70 @@ fn kitty_font_query_unknown_or_malformed_answers_nothing() {
     }
 }
 
+/// Decodes one `ESC P 1+r <key>=<hex> ESC \` font reply into `(key, value)`.
+///
+/// This mirrors what fastfetch's `scanf` pattern consumes
+/// (`"\eP1+r%*[^=]=%511[^\e]\e\\"`): the exact introducer, the `=` separator,
+/// hex payload, and the `ESC \` terminator. Any deviation makes the detector
+/// silently drop the answer, so the test fails on framing, not only on text.
+fn decode_font_reply(reply: &[u8]) -> (String, String) {
+    let rest = reply
+        .strip_prefix(b"\x1bP1+r")
+        .unwrap_or_else(|| panic!("missing ESC P 1+r introducer: {reply:?}"));
+    let rest = rest
+        .strip_suffix(b"\x1b\\")
+        .unwrap_or_else(|| panic!("missing ESC \\ terminator: {reply:?}"));
+    let eq = rest
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or_else(|| panic!("missing key=value separator: {reply:?}"));
+    let key = std::str::from_utf8(&rest[..eq]).expect("key is ASCII");
+    let hex = std::str::from_utf8(&rest[eq + 1..]).expect("hex is ASCII");
+    assert_eq!(hex.len() % 2, 0, "odd hex payload: {hex}");
+    let value: Vec<u8> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(text, 16).expect("valid lowercase hex")
+        })
+        .collect();
+    (
+        key.to_string(),
+        String::from_utf8(value).expect("font identity is UTF-8"),
+    )
+}
+
+#[test]
+fn kitty_font_query_matches_fastfetch_framing_at_size_11() {
+    // #2520 exact owner config: DejaVu Sans Mono at 11pt. fastfetch's
+    // `detectKitty` scan requires the family answer first, then the size
+    // answer, with `ESC P 1+r key=<hex> ESC \` framing for both.
+    let cfg = bitty_runtime::RuntimeConfig {
+        font_family: "DejaVu Sans Mono".to_string(),
+        font_size: 11.0,
+        ..bitty_runtime::RuntimeConfig::default()
+    };
+    let mut rt = Runtime::new(cfg).expect("build");
+    rt.handle_pty_bytes(FASTFETCH_FONT_QUERY);
+
+    let replies = rt.take_replies();
+    assert_eq!(
+        replies.len(),
+        2,
+        "fastfetch expects exactly one answer per key"
+    );
+    let (first_key, first_value) = decode_font_reply(&replies[0]);
+    let (second_key, second_value) = decode_font_reply(&replies[1]);
+    assert_eq!(first_key, "kitty-query-font_family");
+    assert_eq!(first_value, "DejaVu Sans Mono");
+    assert_eq!(second_key, "kitty-query-font_size");
+    assert_eq!(second_value, "11");
+    // No trailing third frame and nothing queued for a later drain: the
+    // scanner's two-frame pattern would otherwise take the wrong answer.
+    assert!(rt.take_replies().is_empty());
+}
+
 #[test]
 fn real_pty_kitty_font_query_writes_once() {
     let mut rt = Runtime::with_defaults().expect("build");

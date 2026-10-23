@@ -122,7 +122,7 @@ impl Runtime {
         if self.scrollbar_drag.is_some() {
             return true;
         }
-        if self.scrollbar_cursor_left {
+        if self.cursor_left_window {
             return false;
         }
         let Some((_, track, _)) = self.scrollbar_track_thumb() else {

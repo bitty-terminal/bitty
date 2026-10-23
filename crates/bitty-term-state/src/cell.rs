@@ -240,6 +240,12 @@ pub struct Cell {
     /// `true` only for the trailing half of a wide character whose leading
     /// half lives at the previous column of the same row.
     pub spacer: bool,
+    /// `true` when this cell is layout/erase padding rather than printed
+    /// content: blank cells synthesized by erase, grid growth, or rewrap
+    /// fill. Reflow drops trailing padding instead of materializing it as
+    /// spaces, while a space printed by the application (`padding == false`)
+    /// stays content (#2529).
+    pub padding: bool,
     /// Hyperlink span reference, if any.
     pub hyperlink: Option<HyperlinkId>,
     /// Combining scalars attached to [`Cell::glyph`], in arrival order.
@@ -258,6 +264,7 @@ impl Cell {
             style,
             width: 1,
             spacer: false,
+            padding: true,
             hyperlink: None,
             zerowidth: Zerowidth::new(),
         }
@@ -271,6 +278,7 @@ impl Cell {
             style,
             width: 2,
             spacer: true,
+            padding: true,
             hyperlink: None,
             zerowidth: Zerowidth::new(),
         }

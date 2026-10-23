@@ -83,6 +83,12 @@ impl Runtime {
         if Some(sel.owner) != self.keyboard_view() {
             return None;
         }
+        // Pointer selections already carry a combined-buffer range (issue
+        // #2470); keep it instead of re-expressing a possibly scrolled
+        // viewport range against the live grid.
+        if let Some(pers) = sel.buffer {
+            return Some(pers);
+        }
         Some(PersistentSelection::from_grid_selection(
             sel.selection,
             state,
@@ -108,6 +114,10 @@ impl Runtime {
         if let Some((view, sel)) = restored {
             let pin = if sel.active { Some(sel.anchor) } else { None };
             self.install_selection(view, sel, pin, sel.active);
+            if let Some(state) = self.selection_state.as_mut() {
+                state.buffer = Some(pers);
+                state.press_buffer = sel.active.then_some(pers.anchor);
+            }
             true
         } else {
             // Buffer is either pruned or now in history: clear live selection.

@@ -131,7 +131,7 @@ impl GlyphRasterizer for FakeRasterizer {
     }
 
     fn font_metrics(
-        &self,
+        &mut self,
         _font: FontId,
         _point_size: f32,
     ) -> Result<Option<crate::glyph::FontMetrics>, RenderError> {

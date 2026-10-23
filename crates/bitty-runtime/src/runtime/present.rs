@@ -296,22 +296,6 @@ struct RingFrameContext {
     workspace_factor: f32,
     now: std::time::Instant,
     pad_px: i32,
-    /// CTX-1280 (#2168): a detached float is presented this frame, so
-    /// background leaves suppress their Core-owned chrome (clean backdrop).
-    /// Read with the leaf tier inside the push helpers; the float itself
-    /// and higher tiers (Popup/Messages foreground UI) are exempt.
-    detached_float_up: bool,
-}
-
-impl RingFrameContext {
-    /// Whether a leaf on `tier` hides its Core-owned chrome (shadow, glow,
-    /// ring) while a detached float is up (CTX-1280). Only background tiers
-    /// hide: `None` tiled leaves and `Editor` base chrome, both strictly
-    /// below `Float` (`Option` ordering puts `None` first). The float keeps
-    /// its own chrome and higher-tier foreground UI is untouched.
-    fn suppress_backdrop_chrome(&self, tier: Option<OverlayTier>) -> bool {
-        self.detached_float_up && tier < Some(OverlayTier::Float)
-    }
 }
 
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
@@ -862,6 +846,102 @@ fn clip_span_to_window(
     ))
 }
 
+/// Selection highlight rectangles for one painted frame (issues #2523, #2470).
+///
+/// Unlike [`bitty_render::grid::selection_fill_rects_in`], this paints by
+/// selection kind:
+///
+/// - `Block` fills the same column window on every row (a rectangle);
+/// - the other kinds fill row-major (first row from the anchor column, last
+///   row through the focus column, body rows full width).
+///
+/// Wide leaders ending at the right edge extend by one cell so a 2-cell
+/// glyph is never half-tinted. `row_offset` maps a frame row to the snapshot
+/// row (the cursor-follow window for a live grid; zero for a viewport
+/// composite). Total: clamps every coordinate, never panics, bounded by the
+/// frame height.
+#[allow(clippy::too_many_arguments)]
+fn selection_row_rects(
+    palette: &bitty_render::grid::ThemePalette,
+    kind: SelectionKind,
+    start: CellPos,
+    end: CellPos,
+    frame_cols: u16,
+    frame_rows: u16,
+    cells: &[Cell],
+    cells_width: usize,
+    cells_height: usize,
+    row_offset: usize,
+    cell: CellMetrics,
+) -> Vec<bitty_render::grid::FillRect> {
+    if frame_cols == 0 || frame_rows == 0 || cell.width == 0 || cell.height == 0 {
+        return Vec::new();
+    }
+    let (start, end) = if (start.row, start.col) <= (end.row, end.col) {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let max_row = frame_rows - 1;
+    let max_col = frame_cols - 1;
+    let first_row = start.row.min(max_row);
+    let last_row = end.row.min(max_row);
+    let block = kind == SelectionKind::Block;
+    let (block_col0, block_col1) = (start.col.min(end.col), start.col.max(end.col));
+    let mut rects = Vec::with_capacity(usize::from(last_row.saturating_sub(first_row)) + 1);
+    for row in first_row..=last_row {
+        let (mut col0, mut col1) = if block {
+            (block_col0, block_col1)
+        } else {
+            (
+                if row == start.row { start.col } else { 0 },
+                if row == end.row { end.col } else { max_col },
+            )
+        };
+        col0 = col0.min(max_col);
+        col1 = col1.min(max_col);
+        if col1 < col0 {
+            continue;
+        }
+        // Wide-glyph coverage: never leave half of a 2-cell glyph unshaded.
+        let snapshot_row = row_offset.saturating_add(usize::from(row));
+        if snapshot_row < cells_height && cells_width > 0 {
+            let at = |col: u16| -> Option<&Cell> {
+                cells.get(snapshot_row.saturating_mul(cells_width) + usize::from(col))
+            };
+            if let Some(cell) = at(col0) {
+                if cell.spacer && col0 > 0 {
+                    col0 -= 1;
+                }
+            }
+            if let Some(cell) = at(col1) {
+                if cell.width == 2 && !cell.spacer && col1 < max_col {
+                    col1 += 1;
+                }
+            }
+        }
+        let span = u64::from(col1 - col0 + 1);
+        let x = i32::try_from(
+            u64::from(col0)
+                .saturating_mul(u64::from(cell.width))
+                .min(u64::from(i32::MAX as u32)),
+        )
+        .unwrap_or(i32::MAX);
+        let y = i32::try_from(
+            u64::from(row)
+                .saturating_mul(u64::from(cell.height))
+                .min(u64::from(i32::MAX as u32)),
+        )
+        .unwrap_or(i32::MAX);
+        let width = u32::try_from(span.saturating_mul(u64::from(cell.width))).unwrap_or(u32::MAX);
+        rects.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(x, y, width, cell.height),
+            color: bitty_render::grid::selection_fill_in(palette),
+        });
+    }
+    rects
+}
+
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
 ///
 /// When the requested size matches the snapshot the snapshot is returned
@@ -1398,10 +1478,13 @@ impl Runtime {
     /// inner content clip for its glyphs (CTX-0311, moved verbatim from the
     /// leaf loop under CTX-0386 so a reused retained leaf still owns a live
     /// ring). `border == 0` paints nothing; the returned clip is `None` for
-    /// square or zero-size frames. A background-tier leaf under
-    /// `suppress_backdrop_chrome` (CTX-1280) skips the ring push but still
-    /// returns the clip, so it keeps glyph clipping while painting no
-    /// outline.
+    /// square or zero-size frames.
+    ///
+    /// Issue #2522: every leaf on every tier paints its own ring. The retired
+    /// CTX-1280 backdrop suppression hid the tiled leaves' chrome whenever a
+    /// detached float was presented, which erased the outlines of panels the
+    /// float did not cover; the float's opaque cover (CTX-1271) already owns
+    /// occlusion of the area it actually covers.
     fn push_leaf_ring(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1440,7 +1523,7 @@ impl Runtime {
                     .width_idle
                     .map_or(frame.border, |w| self.outline_width_physical(w))
             };
-            if ring_border > 0 && !ctx.suppress_backdrop_chrome(frame.tier) {
+            if ring_border > 0 {
                 let outline_color = if is_focused_view {
                     view_outline.focused
                 } else {
@@ -1515,9 +1598,7 @@ impl Runtime {
             }
             // The content clip is tied to the geometry border (not the
             // outline width) so the content grid and glyph clipping are
-            // unchanged by a focused/idle width override — and by a
-            // CTX-1280 suppression: the ring push above is skipped but the
-            // clip still applies, so suppressed leaves keep glyph clipping.
+            // unchanged by a focused/idle width override.
             frame_clip =
                 bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
         }
@@ -1576,9 +1657,7 @@ impl Runtime {
     /// background blits composite above. Paint-only:
     /// cell metrics, insets, and clip rects are untouched. Returns whether a
     /// shadow was pushed. An unset shadow color pushes nothing, so unstyled
-    /// configs present exactly as before. A background-tier leaf under
-    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
-    /// `false`.
+    /// configs present exactly as before.
     fn push_leaf_shadow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1591,9 +1670,6 @@ impl Runtime {
             return false;
         };
         if frame.frame.width == 0 || frame.frame.height == 0 {
-            return false;
-        }
-        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let color = bitty_render::grid::scale_alpha(
@@ -1642,9 +1718,7 @@ impl Runtime {
     /// envelope, so the default pulse envelope differs from the styled one
     /// exactly by its style contribution. With no style halo and no live
     /// pulse nothing is pushed, so unstyled steady-state configs present
-    /// exactly as before. A background-tier leaf under
-    /// `suppress_backdrop_chrome` (CTX-1280) pushes nothing and returns
-    /// `false`.
+    /// exactly as before.
     fn push_leaf_glow(
         &self,
         frame: &layout_focus::PresentFrame,
@@ -1655,9 +1729,6 @@ impl Runtime {
         combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
     ) -> bool {
         if frame.frame.width == 0 || frame.frame.height == 0 {
-            return false;
-        }
-        if ctx.suppress_backdrop_chrome(frame.tier) {
             return false;
         }
         let mut motion_factor = 1.0f32;
@@ -2375,30 +2446,18 @@ impl Runtime {
             .animation_progress(AnimationKind::Workspace, None, now)
             .map(|p| p.clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        // CTX-1280 (#2168): a detached float owns the backdrop. While one is
-        // presented, the tiled leaves behind it paint no Core-owned chrome
-        // (shadow/glow/ring): the surface already clears to theme background
-        // in the gap bands, so suppressing chrome leaves a clean backdrop
-        // instead of divider/outline bands around the float. HIDE, not dim:
-        // no new primitive, no alpha policy, and tiled text stays live. The
-        // float keeps its own chrome; the gate is detached-only
-        // (`FloatStore`, not the pinned store): pinned overlays share the
-        // Float tier but must not restyle the workspace they annotate.
-        // Empty float frames never trigger, and the tiled baseline (no
-        // detached float) is unchanged. Loop-invariant, so it rides in the
-        // ring context; the push helpers pair it with the leaf tier.
-        let detached_float_up = allocations.iter().any(|frame| {
-            frame.tier == Some(OverlayTier::Float)
-                && frame.frame.width > 0
-                && frame.frame.height > 0
-                && self.floats.contains(frame.view)
-        });
+        // Issue #2522: the retired CTX-1280 backdrop suppression hid every
+        // background-tier leaf's chrome (shadow/glow/ring) whenever a detached
+        // float was presented, which erased the outlines of tiled panels the
+        // float did not cover. Tiled chrome now always paints; the float's
+        // opaque frame cover (parsed in `build_leaf_primitives`, CTX-1271)
+        // still owns occlusion of the area the float actually covers, and the
+        // stable tier sort keeps every float's chrome above the tiled base.
         let ring_ctx = RingFrameContext {
             focused_id: self.focus.focused(),
             workspace_factor,
             now,
             pad_px,
-            detached_float_up,
         };
 
         // CTX-0367: recompute the IME caret for this frame; `paint_cursor`
@@ -3259,7 +3318,7 @@ impl Runtime {
         // geometry transition. Their logical state and hit-testing remain
         // final.
         let paint = basis.painted_allocations();
-        self.paint_selection_highlight(paint, &basis.view_map, basis.pad_px, layers);
+        self.paint_selection_highlight(paint, basis.pad_px, layers);
         self.paint_plaintext_hover(paint, basis.pad_px, layers);
         self.paint_ime_preedit(layers);
         self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
@@ -3369,7 +3428,6 @@ impl Runtime {
     fn paint_selection_highlight(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        view_map: &std::collections::HashMap<ViewId, View>,
         pad_px: i32,
         layers: &mut FrameLayers,
     ) {
@@ -3387,72 +3445,114 @@ impl Runtime {
         // the selection addresses the viewport composite, so it paints
         // directly in frame-local coordinates (the inverse of the scrolled
         // pointer mapping) instead of being suppressed.
-        let Some(owner) = self.selection_owner() else {
+        let Some((selection_state, state)) = self.selection_owner_state() else {
             return;
         };
-        let Some(sel) = self.selection() else {
-            return;
-        };
-        if sel.is_empty() {
+        let owner = selection_state.owner;
+        let sel = selection_state.selection;
+        // Issue #2480: a caret drag over exactly one cell is a real
+        // selection even though the inclusive range is collapsed. A pointer
+        // press installs a collapsed buffer range immediately, so a collapsed
+        // buffer without the one-cell flag is still just a click and must not
+        // paint.
+        let buffer_selected = selection_state
+            .buffer
+            .is_some_and(|pers| pers.anchor != pers.focus);
+        if sel.is_empty() && !selection_state.single_cell && !buffer_selected {
             return;
         }
-        let scrolled = view_map
-            .get(&owner)
-            .is_some_and(|view| view.scroll_offset() != 0)
-            && self.is_viewport_scrolled(owner);
+        // Resolve the owner's scroll state through the shared owner lookup:
+        // detached floats and pinned leaves are not `view_map` layout leaves,
+        // so a map-only check read offset 0 and painted their scrolled range
+        // against the live grid (issue #2523 review).
+        let scrolled = self.is_viewport_scrolled(owner);
         let Some(frame) = allocations.iter().find(|frame| frame.view == owner) else {
             return;
         };
-        if scrolled {
-            // Viewport selection is already frame-local: paint it directly,
-            // clipped to the frame by the fill builder below.
-            let norm = sel.normalized();
-            let start = (norm.start.row, norm.start.col);
-            let end = (norm.end.row, norm.end.col);
-            let live = self.live_cell_metrics();
-            let rects = bitty_render::grid::selection_fill_rects_in(
-                &self.config.theme,
-                start,
-                end,
-                usize::from(frame.cols),
-                usize::from(frame.rows),
-                live,
-            );
-            if rects.is_empty() {
+        let live = self.live_cell_metrics();
+        // Issue #2470: pointer selections paint from their buffer anchors so
+        // a range spanning several scrollback pages stays continuous.
+        let (snapshot, row_offset, start, end) = if let Some(pers) = selection_state.buffer {
+            // Match `selection_text`: a pruned or drifted buffer range has no
+            // text, so it must not paint stale rows either (issue #2523
+            // review).
+            if !pers.is_valid(state) {
                 return;
             }
-            let origin_px_x = px_add(pad_px, frame.content.x);
-            let origin_px_y = px_add(pad_px, frame.content.y);
-            for mut fill in rects {
-                fill.rect.x = px_add(fill.rect.x, origin_px_x);
-                fill.rect.y = px_add(fill.rect.y, origin_px_y);
-                layers.combined_overlay.push(fill);
-            }
-            layers.any_needs_draw = true;
-            return;
-        }
-        let Some(state) = self.live_view_state(owner) else {
-            return;
+            let (paint_start, snapshot, row_offset) = if scrolled {
+                let Some(window) = self.selection_window(owner) else {
+                    return;
+                };
+                let Some(viewport) = self.viewport_snapshot_for(owner) else {
+                    return;
+                };
+                (window.start, viewport, 0usize)
+            } else {
+                let window_start = self.owner_row_window_start(owner, frame.rows);
+                let snap = state.snapshot();
+                (
+                    state.scrollback_len().saturating_add(window_start),
+                    snap,
+                    window_start,
+                )
+            };
+            let Some((start, end)) =
+                self.project_persistent_to_frame(&pers, paint_start, frame.rows, frame.cols)
+            else {
+                return;
+            };
+            (snapshot, row_offset, start, end)
+        } else if scrolled {
+            let norm = sel.normalized();
+            let Some(viewport) = self.viewport_snapshot_for(owner) else {
+                return;
+            };
+            (viewport, 0, norm.start, norm.end)
+        } else {
+            let window_start = self.owner_row_window_start(owner, frame.rows);
+            let norm = sel.normalized();
+            let (start, end) = if sel.kind == SelectionKind::Block {
+                // Block keeps its column window on every visible row; a
+                // text-flow clip would widen the first visible row to the
+                // frame edge and reintroduce the zigzag (issue #2523).
+                let window_end = window_start.saturating_add(usize::from(frame.rows));
+                let start_row = usize::from(norm.start.row);
+                let end_row = usize::from(norm.end.row);
+                if end_row < window_start || start_row >= window_end {
+                    return;
+                }
+                let local_start = start_row.saturating_sub(window_start);
+                let local_end = end_row
+                    .saturating_sub(window_start)
+                    .min(usize::from(frame.rows - 1));
+                (
+                    CellPos::new(local_start as u16, norm.start.col),
+                    CellPos::new(local_end as u16, norm.end.col),
+                )
+            } else {
+                // Frame-local span: the inverse of the pointer mapping. The
+                // part of the span above or below the painted window is
+                // clipped away.
+                let Some((start, end)) =
+                    clip_span_to_window(norm.start, norm.end, window_start, frame.rows, frame.cols)
+                else {
+                    return;
+                };
+                (CellPos::new(start.0, start.1), CellPos::new(end.0, end.1))
+            };
+            (state.snapshot(), window_start, start, end)
         };
-        let grid_w = state.width();
-        let grid_h = state.height();
-        let window_start = self.owner_row_window_start(owner, frame.rows);
-        let norm = sel.normalized();
-        // Frame-local span: the inverse of the pointer mapping. The part of
-        // the span above or below the painted window is clipped away; the
-        // fill builder clips columns to the frame below.
-        let Some((start, end)) =
-            clip_span_to_window(norm.start, norm.end, window_start, frame.rows, frame.cols)
-        else {
-            return;
-        };
-        let live = self.live_cell_metrics();
-        let rects = bitty_render::grid::selection_fill_rects_in(
+        let rects = selection_row_rects(
             &self.config.theme,
+            sel.kind,
             start,
             end,
-            grid_w.min(usize::from(frame.cols)),
-            grid_h.min(usize::from(frame.rows)),
+            frame.cols,
+            frame.rows,
+            &snapshot.cells,
+            snapshot.width,
+            snapshot.height,
+            row_offset,
             live,
         );
         if rects.is_empty() {
@@ -7277,7 +7377,7 @@ mod clip_width_cells_tests {
 
 #[cfg(test)]
 mod unicode_run_union_tests {
-    use super::{mask_uncovered_unicode_pixels, unicode_rect_union, unicode_rects_cover_union};
+    use super::*;
     use bitty_rich::geometry::RectPx;
 
     #[test]
@@ -7305,6 +7405,111 @@ mod unicode_run_union_tests {
             &[RectPx::new(0, 0, 4, 4)]
         ));
         assert!(!unicode_rects_cover_union(union, &[]));
+    }
+
+    #[test]
+    fn selection_row_rects_are_rectangular_for_block() {
+        // Issue #2523: block selections used the text-flow shape (first row
+        // to the right edge, last row from the left edge) and looked like a
+        // zigzag. Every block row must cover the same column window.
+        use bitty_term_state::Style;
+        let width = 6usize;
+        let cells = vec![Cell::erased(Style::default()); width * 3];
+        let metrics = CellMetrics {
+            width: 9,
+            height: 19,
+        };
+        let rects = selection_row_rects(
+            &bitty_render::grid::ThemePalette::bitty_dark(),
+            SelectionKind::Block,
+            CellPos::new(0, 1),
+            CellPos::new(2, 3),
+            width as u16,
+            3,
+            &cells,
+            width,
+            3,
+            0,
+            metrics,
+        );
+        assert_eq!(rects.len(), 3, "one rect per spanned row");
+        for (row, fill) in rects.iter().enumerate() {
+            assert_eq!(fill.rect.x, 9, "block row {row} starts at column 1");
+            assert_eq!(fill.rect.width, 27, "block row {row} covers columns 1..=3");
+            assert_eq!(fill.rect.y, row as i32 * 19);
+        }
+    }
+
+    #[test]
+    fn selection_row_rects_follow_text_flow_for_simple() {
+        // First row from the anchor column, middle rows full width, last row
+        // through the focus column.
+        use bitty_term_state::Style;
+        let width = 6usize;
+        let cells = vec![Cell::erased(Style::default()); width * 3];
+        let metrics = CellMetrics {
+            width: 9,
+            height: 19,
+        };
+        let rects = selection_row_rects(
+            &bitty_render::grid::ThemePalette::bitty_dark(),
+            SelectionKind::Simple,
+            CellPos::new(0, 1),
+            CellPos::new(2, 3),
+            width as u16,
+            3,
+            &cells,
+            width,
+            3,
+            0,
+            metrics,
+        );
+        assert_eq!(rects.len(), 3);
+        assert_eq!((rects[0].rect.x, rects[0].rect.width), (9, 45));
+        assert_eq!((rects[1].rect.x, rects[1].rect.width), (0, 54));
+        assert_eq!((rects[2].rect.x, rects[2].rect.width), (0, 36));
+    }
+
+    #[test]
+    fn selection_row_rects_cover_wide_glyph_trailing_cell() {
+        // Issue #2523: ending on a wide leader must tint its spacer too, and
+        // a block row ending there must extend by one cell.
+        use bitty_term_state::{Style, Zerowidth};
+        let width = 6usize;
+        let mut cells = vec![Cell::erased(Style::default()); width * 2];
+        cells[1] = Cell {
+            glyph: '中',
+            style: Style::default(),
+            width: 2,
+            spacer: false,
+            padding: false,
+            hyperlink: None,
+            zerowidth: Zerowidth::new(),
+        };
+        cells[2] = Cell::wide_spacer(Style::default());
+        let metrics = CellMetrics {
+            width: 9,
+            height: 19,
+        };
+        let rects = selection_row_rects(
+            &bitty_render::grid::ThemePalette::bitty_dark(),
+            SelectionKind::Simple,
+            CellPos::new(0, 1),
+            CellPos::new(0, 1),
+            width as u16,
+            2,
+            &cells,
+            width,
+            2,
+            0,
+            metrics,
+        );
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].rect.x, 9);
+        assert_eq!(
+            rects[0].rect.width, 18,
+            "the wide leader and its spacer are one glyph"
+        );
     }
 
     #[test]

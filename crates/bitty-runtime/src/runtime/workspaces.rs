@@ -1756,6 +1756,63 @@ impl Runtime {
             + self.inactive_workspaces_leaf_count()
     }
 
+    /// Slot index that owns `view` as a live panel, active slot first.
+    ///
+    /// Issue #2525: the shell-exit reap path must know which workspace a
+    /// dead panel belonged to before deciding whether to close the leaf
+    /// (multi-panel workspace) or prune the emptied workspace (last panel).
+    /// The active slot is read from the live layout/floats because its
+    /// stashed copy is refreshed only on switch-away; every inactive slot is
+    /// authoritative as stashed. Pins and the scratchpad are window-global
+    /// and own no slot, so they never match here. Time O(w + l) over `w`
+    /// workspaces and `l` leaves in the active layout; space O(1).
+    #[must_use]
+    pub fn workspace_index_of_view(&self, view: &ViewId) -> Option<usize> {
+        if self.layout.leaf_ids().contains(view) || self.floats.ids().contains(view) {
+            return Some(self.active_workspace);
+        }
+        self.workspaces
+            .iter()
+            .enumerate()
+            .find(|(index, slot)| {
+                *index != self.active_workspace
+                    && (slot.layout.leaf_ids().contains(view) || slot.floats.ids().contains(view))
+            })
+            .map(|(index, _)| index)
+    }
+
+    /// Live panel counts `(tiled leaves, detached floats)` of one slot.
+    ///
+    /// The active slot uses the live layout/floats; inactive slots use their
+    /// stashed copy. Pins and the scratchpad are window-global and excluded,
+    /// matching [`Self::workspace_index_of_view`]. Returns `None` for an
+    /// out-of-range index. Time O(l) for the active slot, O(1) otherwise.
+    ///
+    /// The layout half is the *stashed* layout for an inactive slot, which is
+    /// the single-leaf zoom proxy while that workspace is zoomed; callers
+    /// deciding whether a workspace is a singleton must substitute the
+    /// app-side zoom backup (issue #2525 review). This split exists so that
+    /// substitution keeps the float count intact.
+    #[must_use]
+    pub fn workspace_panel_counts(&self, index: usize) -> Option<(usize, usize)> {
+        if index == self.active_workspace {
+            return Some((self.layout.leaf_ids().len(), self.floats.len()));
+        }
+        self.workspaces
+            .get(index)
+            .map(|slot| (slot.layout.leaf_ids().len(), slot.floats.len()))
+    }
+
+    /// Live panel count (tiled leaves plus detached floats) of one slot.
+    ///
+    /// See [`Self::workspace_panel_counts`] for the stashed-zoom-proxy caveat.
+    /// Returns `None` for an out-of-range index.
+    #[must_use]
+    pub fn workspace_panel_count(&self, index: usize) -> Option<usize> {
+        self.workspace_panel_counts(index)
+            .map(|(tiled, floats)| tiled + floats)
+    }
+
     /// Kill every pane session owned by workspace `index`'s leaves.
     /// Returns the number torn down.
     ///
@@ -5009,6 +5066,30 @@ mod tests {
             vec![first],
             "no ghost tile may survive the switch back"
         );
+    }
+
+    #[test]
+    fn workspace_panel_counts_and_view_owner_cover_active_and_stashed_slots() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("active leaf");
+        assert_eq!(rt.workspace_panel_counts(0), Some((1, 0)));
+        assert_eq!(rt.workspace_index_of_view(&first), Some(0));
+        rt.workspace_new().expect("second workspace");
+        let second = rt.focused_view().expect("fresh active leaf");
+        assert_eq!(rt.workspace_panel_counts(1), Some((1, 0)));
+        assert_eq!(
+            rt.workspace_index_of_view(&first),
+            Some(0),
+            "stashed leaf resolves to its slot"
+        );
+        assert_eq!(rt.workspace_index_of_view(&second), Some(1));
+        assert_eq!(
+            rt.workspace_index_of_view(&ViewId::new(404)),
+            None,
+            "unknown view owns no slot"
+        );
+        assert_eq!(rt.workspace_panel_counts(9), None, "out of range");
+        assert_eq!(rt.workspace_panel_count(0), Some(1));
     }
 
     #[test]

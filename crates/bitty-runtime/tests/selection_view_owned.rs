@@ -116,6 +116,21 @@ fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition
     }
 }
 
+/// Physical cursor position on a cell's vertical edge, row centre.
+///
+/// Issue #2480: pointer drags are caret-to-caret horizontally, so a drag that
+/// means the inclusive range `col..=col` presses on the leading edge and
+/// releases on the trailing edge.
+fn cell_edge(rt: &Runtime, view: ViewId, row: u16, col_edge: u16) -> CursorPosition {
+    let frame = frame_of(rt, view);
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.content.x) + f64::from(col_edge) * f64::from(cw),
+        y: pad + f64::from(frame.content.y) + f64::from(row) * f64::from(ch) + f64::from(ch) / 2.0,
+    }
+}
+
 /// Physical cursor position inside the window-padding band (top-left corner),
 /// which belongs to no present frame.
 fn padding_band(rt: &Runtime) -> CursorPosition {
@@ -154,8 +169,8 @@ fn set_shift(rt: &mut Runtime, shift: bool) {
 /// Press at `(from_row, from_col)` of `from`, drag to `(to_row, to_col)` of
 /// `to`, and release there.
 fn drag_between(rt: &mut Runtime, from: (ViewId, u16, u16), to: (ViewId, u16, u16)) {
-    let start = cell_center(rt, from.0, from.1, from.2);
-    let end = cell_center(rt, to.0, to.1, to.2);
+    let start = cell_edge(rt, from.0, from.1, from.2);
+    let end = cell_edge(rt, to.0, to.1, to.2.saturating_add(1));
     rt.handle_cursor_moved(start);
     press(rt);
     rt.handle_cursor_moved(end);
@@ -261,10 +276,7 @@ fn press_in_a_non_origin_pane_anchors_at_that_pane_own_origin() {
     let mut rt = primary_on_the_right();
 
     let pos = cell_center(&rt, PRIMARY, 0, 0);
-    rt.handle_cursor_moved(pos);
-    press(&mut rt);
-    rt.handle_cursor_moved(cell_center(&rt, PRIMARY, 0, 4));
-    release(&mut rt);
+    drag_between(&mut rt, (PRIMARY, 0, 0), (PRIMARY, 0, 4));
 
     assert_eq!(rt.selection_owner(), Some(PRIMARY));
     let sel = rt.selection().expect("the drag must leave a selection");
@@ -295,7 +307,14 @@ fn drag_from_the_non_origin_primary_into_the_left_pane_stays_in_the_primary() {
     bitty_test_support::require_pty!();
     let mut rt = primary_on_the_right();
 
-    drag_between(&mut rt, (PRIMARY, 0, 4), (PANE, 0, 0));
+    // Backward drag: start at the trailing edge of column 4 so the inclusive
+    // range through it is selected when the pointer clamps at the owner edge.
+    let start = cell_edge(&rt, PRIMARY, 0, 5);
+    let end = cell_edge(&rt, PANE, 0, 0);
+    rt.handle_cursor_moved(start);
+    press(&mut rt);
+    rt.handle_cursor_moved(end);
+    release(&mut rt);
 
     assert_eq!(rt.selection_owner(), Some(PRIMARY));
     assert_eq!(

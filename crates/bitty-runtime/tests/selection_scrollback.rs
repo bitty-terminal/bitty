@@ -49,6 +49,21 @@ fn frame_of(rt: &Runtime, view: ViewId) -> PresentFrame {
         .unwrap_or_else(|| panic!("{view:?} must be presented"))
 }
 
+/// Physical cursor position at a vertical cell edge, row centre.
+///
+/// Issue #2480: pointer drags are caret-to-caret horizontally, so tests that
+/// mean "select this exact cell range" press on the leading edge and release
+/// on the trailing edge instead of relying on inclusive cell rounding.
+fn cell_edge(rt: &Runtime, view: ViewId, row: u16, col_edge: u16) -> CursorPosition {
+    let frame = frame_of(rt, view);
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.content.x) + f64::from(col_edge) * f64::from(cw),
+        y: pad + f64::from(frame.content.y) + f64::from(row) * f64::from(ch) + f64::from(ch) / 2.0,
+    }
+}
+
 /// Physical cursor position at the centre of frame-local cell `(row, col)`.
 fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition {
     let frame = frame_of(rt, view);
@@ -62,6 +77,25 @@ fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition
 
 fn press(rt: &mut Runtime) {
     rt.handle_mouse_input(MouseEvent::new(MouseButton::Left, PressState::Pressed));
+}
+
+/// Asserts the active selection adds at least one fill versus the same frame
+/// with the selection cleared (issue #2523 review: background fills make a
+/// bare `fills > 0` vacuous).
+fn assert_selection_adds_fills(rt: &mut Runtime, context: &str) {
+    let selected = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: selection must force a present"))
+        .fills;
+    rt.clear_selection();
+    let cleared = rt
+        .tick()
+        .unwrap_or_else(|| panic!("{context}: clearing must force a present"))
+        .fills;
+    assert!(
+        selected > cleared,
+        "{context}: selection must add fills (selected {selected}, cleared {cleared})"
+    );
 }
 
 fn release(rt: &mut Runtime) {
@@ -84,15 +118,20 @@ fn scrolled_viewport_drag_selects_visible_text() {
         rt.state().scrollback_len()
     );
     // Scroll up 6 lines (two default notches of 3) into history.
+    // Present once first: the first frame reflows the leaf to its content
+    // extent, and pointer mapping must match the geometry the highlight
+    // paints into.
+    rt.tick().expect("the warm-up frame must present");
     rt.handle_wheel(ScrollDelta::Lines(0.0, 2.0));
     assert_eq!(scroll_offset(&rt), 6, "wheel must scroll into history");
 
     let id = view_id(&rt);
     let visible = visible_rows(&rt);
     assert!(!visible.is_empty(), "viewport must show history");
-    // Drag the first five columns of the top visible row.
-    let start = cell_center(&rt, id, 0, 0);
-    let end = cell_center(&rt, id, 0, 4);
+    // Drag the first five columns of the top visible row: leading edge of
+    // column 0 through the trailing edge of column 4.
+    let start = cell_edge(&rt, id, 0, 0);
+    let end = cell_edge(&rt, id, 0, 5);
     rt.handle_cursor_moved(start);
     press(&mut rt);
     rt.handle_cursor_moved(end);
@@ -139,28 +178,30 @@ fn scrolled_viewport_drag_selects_visible_text() {
         "must not select live-bottom text while scrolled"
     );
     // The highlight must actually paint while scrolled (previously suppressed).
-    let stats = rt.tick().expect("selection must force a present");
-    assert!(stats.fills > 0, "scrolled highlight must paint fills");
+    assert_selection_adds_fills(&mut rt, "scrolled viewport selection");
 }
 
 #[test]
-fn scroll_while_selecting_tracks_anchor() {
+fn scroll_while_dragging_pins_the_press_endpoint_pointer_driven() {
+    // Issue #2470 + #2480 review: a real pointer drag, wheel-scrolled while
+    // held. Only the press-side endpoint moves with the viewport; the
+    // pointer-side endpoint stays under the cursor, and the range keeps
+    // growing from the original anchor.
     let mut rt = make_runtime();
     feed_lines(&mut rt, 60);
-    let id = view_id(&rt);
     assert_eq!(scroll_offset(&rt), 0, "must start live");
+    let id = view_id(&rt);
 
-    // Press at frame-local (5, 2) and hold (no release): anchor == focus.
-    // (Live-grid rows include the cursor-follow window offset, so record the
-    // actual press cell instead of assuming frame-local == grid.)
-    let at = cell_center(&rt, id, 5, 2);
-    rt.handle_cursor_moved(at);
+    let press_pos = cell_edge(&rt, id, 10, 2);
+    rt.handle_cursor_moved(press_pos);
     press(&mut rt);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 12, 4));
     assert!(rt.is_selection_dragging(), "press arms a drag");
-    let before = rt.selection().expect("press selects");
+    let before = rt.selection().expect("drag selects").normalized();
     assert_eq!(
-        before.anchor, before.focus,
-        "press without motion is collapsed, got {before:?}"
+        before.end.row,
+        before.start.row + 2,
+        "two rows of pointer travel, before {before:?}"
     );
 
     // Wheel up one notch (3 lines) mid-drag with no cursor motion.
@@ -170,42 +211,97 @@ fn scroll_while_selecting_tracks_anchor() {
         rt.is_selection_dragging(),
         "scrolling must not end the drag"
     );
-    let sel = rt.selection().expect("drag survives scroll");
-    // The anchor stays pinned to its buffer line, so it sits 3 viewport rows
-    // lower; the focus stays at the cursor's frame-local cell.
+    let sel = rt.selection().expect("drag survives scroll").normalized();
+    // The press line is pinned in the buffer, so it sits 3 viewport rows
+    // lower; the pointer line stays at its screen row.
     assert_eq!(
-        sel.anchor.row,
-        before.anchor.row + 3,
-        "anchor tracks its buffer line across the scroll, before {before:?} got {sel:?}"
+        sel.end.row,
+        before.start.row + 3,
+        "press endpoint tracks its buffer line, before {before:?} got {sel:?}"
     );
     assert_eq!(
-        sel.anchor.col, before.anchor.col,
-        "anchor column is unchanged, before {before:?} got {sel:?}"
+        sel.start.row, 12,
+        "pointer endpoint stays on its screen row, before {before:?} got {sel:?}"
     );
-    assert_eq!(
-        sel.focus, before.focus,
-        "focus stays at the cursor while scrolling, before {before:?} got {sel:?}"
-    );
-    // Extend after the scroll, then release: the anchor stays pinned while the
-    // focus follows the new cursor viewport.
-    let tracked_anchor = sel.anchor;
-    let to = cell_center(&rt, id, 6, 4);
-    rt.handle_cursor_moved(to);
+
+    // Extend after the scroll, then release: the press endpoint stays pinned
+    // while the pointer endpoint follows the new cursor cell.
+    let press_row = sel.end.row;
+    rt.handle_cursor_moved(cell_edge(&rt, id, 14, 5));
     release(&mut rt);
     assert!(!rt.is_selection_dragging());
-    let sel = rt.selection().expect("scroll-tracked drag commits");
+    let sel = rt
+        .selection()
+        .expect("scroll-tracked drag commits")
+        .normalized();
     assert_eq!(
-        sel.anchor, tracked_anchor,
-        "anchor stays pinned through the post-scroll motion, got {sel:?}"
+        sel.end.row, press_row,
+        "press anchor stays pinned through the post-scroll motion, got {sel:?}"
     );
     assert_eq!(
-        sel.focus,
-        CellPos::new(6, 4),
-        "focus follows the scrolled viewport cursor, got {sel:?}"
+        sel.start.row, 14,
+        "pointer endpoint follows the scrolled viewport cursor, got {sel:?}"
     );
     assert!(
         rt.selection_text().is_some(),
-        "tracked drag must yield visible text"
+        "tracked drag must yield text across the scroll"
+    );
+}
+
+#[test]
+fn drag_can_span_multiple_scrollback_pages_while_held() {
+    // Issue #2470/#2523: hold a drag, wheel up several notches, then extend
+    // into the revealed page and release. The committed range must contain
+    // more rows than one viewport and copy every line in between.
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 80);
+    let id = view_id(&rt);
+    let rows = usize::from(rt.layout().find_leaf(id).expect("leaf").rows());
+
+    // Press near the bottom of the live viewport.
+    let press_pos = cell_edge(&rt, id, 20, 0);
+    rt.handle_cursor_moved(press_pos);
+    press(&mut rt);
+    let press_row = rt.selection().expect("press").anchor.row;
+    // Scroll up two notches (6 lines) with the button still held.
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 2.0));
+    assert_eq!(scroll_offset(&rt), 6);
+    assert!(rt.is_selection_dragging());
+    // Extend to the top visible row, now in history.
+    rt.handle_cursor_moved(cell_edge(&rt, id, 0, 0));
+    release(&mut rt);
+
+    let sel = rt.selection().expect("multi-page drag commits");
+    assert!(!rt.is_selection_dragging());
+    assert_eq!(
+        sel.normalized().start.row,
+        0,
+        "pointer endpoint is the visible top row"
+    );
+    assert_eq!(
+        sel.normalized().end.row,
+        (press_row + 6).min(rows as u16 - 1),
+        "press endpoint stays pinned to its buffer line"
+    );
+    let text = rt.selection_text().expect("multi-page selection text");
+    assert!(
+        text.lines().count() > rows,
+        "selection must span more than one viewport page, got {} lines for {rows} rows",
+        text.lines().count()
+    );
+    assert!(
+        text.starts_with("srow"),
+        "history text must be the lines under the drag, got {:?}",
+        text.chars().take(8).collect::<String>()
+    );
+
+    // Scrolling further after the commit keeps the copied text stable.
+    let before = text;
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 3.0));
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some(before.as_str()),
+        "buffer-anchored text survives later scrolling"
     );
 }
 
@@ -290,5 +386,64 @@ fn committed_scrolled_selection_tracks_on_wheel() {
         rt.selection_text().as_deref(),
         Some(before_text.as_str()),
         "buffer-pinned text survives the scroll"
+    );
+}
+
+#[test]
+fn pruned_buffer_selection_is_not_painted() {
+    // Issue #2523 review: a buffer range whose scrollback lines were pruned
+    // must not paint stale rows; the paint path applies the same `is_valid`
+    // rule as `selection_text`.
+    let mut rt = Runtime::new(RuntimeConfig {
+        scrollback: 8,
+        ..RuntimeConfig::default()
+    })
+    .expect("bounded-scrollback runtime must build");
+    rt.force_headless_clipboard();
+    feed_lines(&mut rt, 60);
+    let id = view_id(&rt);
+    assert_eq!(rt.state().scrollback_len(), 8, "scrollback must be full");
+    // Settle the presented geometry before pointer mapping.
+    rt.tick().expect("the warm-up frame must present");
+
+    // Scroll into history and select only scrollback rows (line-id anchored).
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 1.0));
+    let start = cell_edge(&rt, id, 0, 0);
+    let end = cell_edge(&rt, id, 0, 5);
+    rt.handle_cursor_moved(start);
+    press(&mut rt);
+    rt.handle_cursor_moved(end);
+    release(&mut rt);
+    let pers = rt
+        .persistent_selection()
+        .expect("the drag installs a buffer range");
+    assert!(
+        pers.anchor_line_id.is_some() && pers.focus_line_id.is_some(),
+        "the selected rows must be scrollback lines with stable ids, got {pers:?}"
+    );
+    assert!(
+        rt.is_persistent_selection_valid(&pers),
+        "the fresh history selection must be valid"
+    );
+    assert!(rt.selection_text().is_some(), "history selection must read");
+
+    // Evict every selected line from the bounded scrollback.
+    for _ in 0..40 {
+        rt.handle_pty_bytes(b"prune\r\n");
+    }
+    assert!(
+        !rt.is_persistent_selection_valid(&pers),
+        "pruning must invalidate the stored line ids"
+    );
+    assert!(
+        rt.selection_text().is_none(),
+        "a pruned buffer selection reports no text"
+    );
+    let selected = rt.tick().map_or(0, |stats| stats.fills);
+    rt.clear_selection();
+    let cleared = rt.tick().map_or(0, |stats| stats.fills);
+    assert_eq!(
+        selected, cleared,
+        "a pruned buffer selection must not paint fills"
     );
 }

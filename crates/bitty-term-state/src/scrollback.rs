@@ -182,6 +182,26 @@ impl Scrollback {
         self.lines.pop_front()
     }
 
+    /// Removes and returns the newest retained line, if any.
+    ///
+    /// Height-only primary grow primitive (#2529): the viewport grows upward,
+    /// so the newest history rows re-enter the grid top instead of staying
+    /// detached from the live content.
+    pub(crate) fn pop_back_line(&mut self) -> Option<ScrollbackLine> {
+        self.lines.pop_back()
+    }
+
+    /// Breaks a soft-wrap continuation out of the newest retained line.
+    ///
+    /// Used when a height grow inserts blank filler above rows pulled back
+    /// into the viewport (#2529): the line before the pulled block can no
+    /// longer continue into its new neighbour.
+    pub(crate) fn clear_last_wrap(&mut self) {
+        if let Some(last) = self.lines.back_mut() {
+            last.wrapped = false;
+        }
+    }
+
     /// Owned heap retained by this buffer (CTX-1026).
     ///
     /// Ring-buffer capacity plus every boxed line's cells. Each

@@ -2007,7 +2007,17 @@ impl Runtime {
     /// window, no tracked cursor, owner lost its frame): the range stays as
     /// last extended and becomes inactive, exactly like a release in place.
     pub(super) fn end_selection_drag_in_place(&mut self) {
-        let Some(sel) = self.selection_state else {
+        if self.selection_state.is_none() {
+            return;
+        }
+        // Issue #2470 review: resolve *before* committing. Installing the raw
+        // range would stamp the current eviction clock onto rows captured
+        // before a prune, so the stored rows would silently name lines that
+        // drifted into their place (zero drift on the next read). A range
+        // that no longer resolves has no text worth keeping: fail closed.
+        let Some(sel) = self.resolved_selection() else {
+            self.drop_selection();
+            self.click_tracker.reset();
             return;
         };
         if !sel.dragging {

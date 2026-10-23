@@ -1959,6 +1959,11 @@ impl Runtime {
             // present-only ghost clears on the next frame and the layout is
             // still the pre-drag tree.
             self.cancel_tiled_drag();
+            // Issue #2470 review: an armed edge auto-scroll must not keep
+            // scrolling a window the user is no longer interacting with. The
+            // held drag itself stays (the pointer may still be down); the
+            // next pointer move inside the edge row re-arms the wake.
+            self.clear_selection_autoscroll();
         }
         if self.focused == focused {
             return;

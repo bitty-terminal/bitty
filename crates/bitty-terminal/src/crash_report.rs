@@ -146,7 +146,9 @@ impl ExitReason {
 }
 
 static INSTALLED: Once = Once::new();
-static ENABLED: AtomicBool = AtomicBool::new(true);
+/// Enabled only after [`install`] runs in the real binary; tests and headless
+/// runs never write crash/exit slots into the user's state directory.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 static PHASE: AtomicU8 = AtomicU8::new(Phase::Startup as u8);
 static LAST_LIFECYCLE: AtomicU8 = AtomicU8::new(Lifecycle::Startup as u8);
 static EXIT_REASON: AtomicU8 = AtomicU8::new(ExitReason::Unknown as u8);
@@ -180,6 +182,7 @@ pub(crate) fn install() {
         return;
     }
     INSTALLED.call_once(|| {
+        ENABLED.store(true, Ordering::Relaxed);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             write_panic_report(info);

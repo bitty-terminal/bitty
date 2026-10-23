@@ -266,7 +266,7 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     // Simulate winit event flow: cursor moved, then mouse down, drag, up.
     // CTX-0223: cell_pos includes the window padding inset.
     let start = cell_pos(0, 0);
-    let end = cell_pos(4, 0);
+    let end = cell_pos(5, 0);
     // Move to start before press (last_cursor needed)
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
@@ -343,7 +343,7 @@ fn multiline_mouse_drag_selects_row_range_with_newlines() {
     let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "line1\r\nline2\r\nline3");
     // Drag from row 0 col 0 down to row 2 col 4.
-    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(2, 1), cell_pos(4, 2)]);
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(2, 1), cell_pos(5, 2)]);
     assert!(!rt.is_selection_dragging());
     let range = rt.selection().expect("selection").normalized();
     assert_eq!(range.start, CellPos::new(0, 0));
@@ -365,7 +365,7 @@ fn multiline_mouse_drag_respects_partial_columns() {
     feed_text(&mut rt, "abcdef\r\nghijkl");
     // Drag from row 0 col 2 to row 1 col 3: first row runs to the edge
     // (padding trimmed), last row ends exactly at col 3.
-    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(3, 1)]);
+    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(4, 1)]);
     let range = rt.selection().expect("selection").normalized();
     assert_eq!(range.start, CellPos::new(0, 2));
     assert_eq!(range.end, CellPos::new(1, 3));
@@ -378,7 +378,7 @@ fn multiline_mouse_drag_upward_normalizes() {
     let mut rt = make_runtime();
     feed_text(&mut rt, "abcdef\r\nghijkl");
     // Press on the lower row, drag upward: same range as downward.
-    mouse_drag(&mut rt, cell_pos(3, 1), &[cell_pos(2, 0)]);
+    mouse_drag(&mut rt, cell_pos(4, 1), &[cell_pos(2, 0)]);
     let range = rt.selection().expect("selection").normalized();
     assert_eq!(range.start, CellPos::new(0, 2));
     assert_eq!(range.end, CellPos::new(1, 3));
@@ -392,14 +392,14 @@ fn multiline_mouse_drag_with_wide_chars_keeps_columns() {
     // Row 1: 'c' col0, '好' lead col1 + spacer col2, 'd' col3.
     feed_text(&mut rt, "a\u{4e2d}b\r\nc\u{597d}d");
     // Full two-row drag: wide glyphs emitted once, no split pairs.
-    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 1)]);
     assert_eq!(
         rt.selection_text().as_deref(),
         Some("a\u{4e2d}b\nc\u{597d}d")
     );
     // Drag starting on a spacer snaps to its leader, per row.
     rt.clear_selection();
-    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(0, 1)]);
+    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(1, 1)]);
     let range = rt.selection().expect("selection").normalized();
     assert_eq!(range.start, CellPos::new(0, 1));
     assert_eq!(range.end, CellPos::new(1, 0));
@@ -416,7 +416,7 @@ fn multiline_selection_pastes_through_repeat_confirm_gate() {
         bitty_config::ChromeAction::PasteFromClipboard,
     ));
     feed_text(&mut rt, "line1\r\nline2\r\nline3");
-    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 2)]);
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(5, 2)]);
     assert_eq!(rt.clipboard().headless_contents(), "line1\nline2\nline3");
     // Issue #2474: the button only queues the configured action; the app
     // dispatches it. Here we play the dispatcher role explicitly.
@@ -446,7 +446,7 @@ fn multiline_selection_pastes_through_repeat_confirm_gate() {
 fn multiline_primary_pastes_through_repeat_confirm_gate() {
     let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "alpha\r\nbeta");
-    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 1)]);
     // Auto-copy synced the primary selection (ghostty copy-on-select).
     assert_eq!(rt.primary_contents(), "alpha\nbeta");
     // Middle-click queues the shipped primary-paste action; the dispatcher

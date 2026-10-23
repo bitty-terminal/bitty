@@ -3221,6 +3221,27 @@ impl TerminalApp {
         }
     }
 
+    /// Real panel count for workspace `index`, with the app-side zoom backup
+    /// substituted for a stashed zoom proxy (issue #2525 review).
+    ///
+    /// While a workspace is zoomed its layout is a single-leaf proxy and the
+    /// real tree lives in `ChromeState::zoom` keyed by workspace sequence.
+    /// An inactive zoomed workspace therefore reports one panel from
+    /// [`Runtime::workspace_panel_counts`] even when a hidden live pane
+    /// exists in the backup. Prune decisions must read the backup, or a
+    /// screen switch followed by the zoomed pane's shell exit would close a
+    /// workspace that still owns a live pane. Floats are stored per slot and
+    /// are unaffected by zoom, so they are added unchanged.
+    pub(crate) fn workspace_real_panel_count(&self, index: usize) -> Option<usize> {
+        let (stashed_tiled, floats) = self.runtime.workspace_panel_counts(index)?;
+        let tiled = self
+            .runtime
+            .workspace_seq_at(index)
+            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .map_or(stashed_tiled, |ids| ids.len());
+        Some(tiled + floats)
+    }
+
     /// Checks for exited shell processes across both split pane sessions and
     /// the primary session, reaping exited children and closing their panels.
     ///
@@ -3312,6 +3333,40 @@ impl TerminalApp {
                     closed_any = true;
                     continue;
                 }
+                // Issue #2525: a shell that exits in the last panel of a
+                // workspace is a panel close, exactly like the close-view
+                // gesture (CTX-1297). Prune the emptied workspace and let
+                // focus follow a surviving workspace instead of keeping a
+                // session-less tile that silently drops input. A pinned
+                // panel is window-global and keeps the workspace meaningful
+                // (CTX-1337), and a detached float still owns the slot
+                // (CTX-1336), so both keep the existing leaf handling.
+                self.restore_zoom();
+                if let Some(workspace) = self.runtime.workspace_index_of_view(&view) {
+                    let sole_panel = self.workspace_real_panel_count(workspace) == Some(1);
+                    if sole_panel
+                        && self.runtime.workspace_count() > 1
+                        && self.runtime.floated_count() == 0
+                        && self.runtime.pinned_count() == 0
+                    {
+                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: pane shell {view:?} exited — empty workspace pruned"
+                                )
+                            });
+                        } else {
+                            crate::logging::warn(|| {
+                                String::from(
+                                    "bitty: could not prune empty workspace after pane exit",
+                                )
+                            });
+                        }
+                        self.push_pending_exit(view.0, status.code());
+                        closed_any = true;
+                        continue;
+                    }
+                }
                 // CTX-1039 (#1843): the last leaf of the active workspace
                 // with panels elsewhere. Keep the emptied workspace
                 // selected and leave its tile session-less instead of
@@ -3319,7 +3374,6 @@ impl TerminalApp {
                 if self.runtime.layout().leaf_ids().contains(&view)
                     && self.runtime.leaf_count() <= 1
                 {
-                    self.restore_zoom();
                     // CTX-1337 (#2222): a pinned panel survives outside the
                     // live layout, so the exited last tiled pane must not
                     // keep its session-less leaf focused. Retire the leaf
@@ -3405,6 +3459,22 @@ impl TerminalApp {
                     )
                 });
                 self.restore_zoom();
+                // Issue #2525: the primary shell exiting in the last panel
+                // of a workspace is the same panel close as the close-view
+                // gesture (CTX-1297). `close_focused_leaf` refuses a
+                // singleton layout, so without this branch the dead primary
+                // tile stays focused and drops input while other workspaces
+                // keep running. Prune the emptied workspace instead; the
+                // float/pin cases are handled first and keep their behavior.
+                let primary_sole_workspace = self
+                    .runtime
+                    .workspace_index_of_view(&primary_view)
+                    .filter(|workspace| {
+                        self.workspace_real_panel_count(*workspace) == Some(1)
+                            && self.runtime.workspace_count() > 1
+                            && self.runtime.floated_count() == 0
+                            && self.runtime.pinned_count() == 0
+                    });
                 // Issue #2141: the primary owner may sit on a detached
                 // float (it keeps primary while detached). Layout surgery
                 // cannot remove it, so discard the floating view instead.
@@ -3412,6 +3482,20 @@ impl TerminalApp {
                     || self.runtime.pinned_views().contains(&primary_view)
                 {
                     self.runtime.discard_floating_view(primary_view);
+                } else if let Some(workspace) = primary_sole_workspace {
+                    if self.runtime.workspace_close_at(workspace).is_ok() {
+                        crate::logging::info(|| {
+                            format!(
+                                "bitty: primary shell {primary_view:?} exited — empty workspace pruned"
+                            )
+                        });
+                    } else {
+                        crate::logging::warn(|| {
+                            String::from(
+                                "bitty: could not prune empty workspace after primary exit",
+                            )
+                        });
+                    }
                 } else if self.runtime.pinned_count() > 0
                     && self.runtime.floated_count() == 0
                     && self
@@ -3550,25 +3634,42 @@ impl TerminalApp {
         }
     }
 
-    /// Syncs the OS pointer with hover-vs-`OSC 22` precedence (issues #1759/#1762).
+    /// Syncs the OS pointer with the full shape precedence (issue #2480,
+    /// extending #1759/#1762).
     ///
-    /// Hover wins: either hyperlink hover (OSC 8 in #1759 or Ctrl-gated
-    /// plaintext in #1760) forces `Pointer`. Otherwise the focused pane's
-    /// `OSC 22` icon applies, failing open to `Default` for an empty stack,
-    /// unknown focus, or a pane exit, so a focus move or `RIS` (`FullReset`)
-    /// resets the pointer on the next tick without extra plumbing. Called
-    /// once per tick after the IME sync and after mouse events. Change-gated
-    /// through [`Self::apply_cursor_icon`].
+    /// Order, highest first:
+    /// 1. outside the window or over an overlay (capture or modal panel):
+    ///    `Default`, so a shape never sticks after leave or behind a modal;
+    /// 2. a hovered hyperlink/plaintext URL: `Pointer`;
+    /// 3. an explicit focused-pane `OSC 22` shape: that shape (terminal
+    ///    applications keep control of their pointer);
+    /// 4. selectable terminal text: `Text` (the I-beam this issue adds);
+    /// 5. everything else: `Default`.
+    ///
+    /// Called once per tick after the IME sync and after mouse events.
+    /// Change-gated through [`Self::apply_cursor_icon`], so steady hover over
+    /// text costs no OS call.
     pub(crate) fn sync_cursor_icon(&mut self) {
         // CTX-0943: while a focusable overlay capture holds, the modal
-        // obscures the grid — never show an underlying URL pointer.
-        let hovered = !self.overlay_capture_active()
+        // obscures the grid — never show an underlying URL pointer. Issue
+        // #2480 extends the same rule to modal panel overlays and to a
+        // pointer that left the window.
+        let overlay_active = self.overlay_capture_active() || self.runtime.overlay_modal_active();
+        let inside = self.runtime.cursor_inside_window();
+        let hovered = inside
+            && !overlay_active
             && (self.runtime.hovered_hyperlink_span().is_some()
                 || self.runtime.hovered_plaintext_span().is_some());
-        let icon = if hovered {
+        let icon = if !inside || overlay_active {
+            bitty_platform::CursorIcon::Default
+        } else if hovered {
             bitty_platform::CursorIcon::Pointer
+        } else if let Some(shape) = self.runtime.focused_pointer_shape() {
+            bitty_runtime::runtime::pointer::cursor_icon_for_shape(shape)
+        } else if self.runtime.pointer_over_selectable_text() {
+            bitty_platform::CursorIcon::Text
         } else {
-            self.runtime.cursor_icon_for_focused()
+            bitty_platform::CursorIcon::Default
         };
         self.apply_cursor_icon(icon);
     }

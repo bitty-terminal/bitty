@@ -86,6 +86,37 @@ fn show_font_prints_built_in_default_without_explicit_family() {
 }
 
 #[test]
+fn show_font_owner_config_matches_fastfetch_prop_keys() {
+    // #2520: the owner's exact font. Detectors read the stable
+    // `font_family: ` / `font_size: ` prefixes (fastfetch's
+    // `ffParsePropLines`), so the bytes must stay parseable even for an
+    // integer-valued fractional-capable size.
+    let fixture = Fixture::new(
+        "owner-2520",
+        "return { theme = 'ayu-mirage', font = { family = 'DejaVu Sans Mono', size = 11 } }\n",
+    );
+    let out = run(&["+show-font"], &fixture.config());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert_eq!(
+        text, "font_family: DejaVu Sans Mono\nfont_size: 11\n",
+        "the probe must emit exactly the fastfetch-fallback lines"
+    );
+    let family = text
+        .lines()
+        .find_map(|line| line.strip_prefix("font_family: "));
+    let size = text
+        .lines()
+        .find_map(|line| line.strip_prefix("font_size: "));
+    assert_eq!(family, Some("DejaVu Sans Mono"));
+    assert_eq!(size, Some("11"));
+}
+
+#[test]
 fn show_font_lists_fallback_family() {
     let fixture = Fixture::new(
         "fallback",

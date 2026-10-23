@@ -2614,10 +2614,10 @@ ui.overlay.focus = true
         "overlay capture must clear the plaintext hover on tick"
     );
     app.sync_cursor_icon();
-    assert_ne!(
+    assert_eq!(
         app.window.last_applied_cursor,
-        Some(bitty_platform::CursorIcon::Pointer),
-        "overlay capture must not show a URL pointer"
+        Some(bitty_platform::CursorIcon::Default),
+        "overlay capture must not show a URL pointer or an underlying I-beam"
     );
 
     // Ctrl+press+release over the URL mints at Runtime level (which does
@@ -3135,6 +3135,100 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
         app.window.last_applied_cursor,
         Some(bitty_platform::CursorIcon::Default),
         "empty OSC 22 stack with no hover must restore default"
+    );
+}
+
+#[test]
+fn pointer_over_terminal_text_uses_the_text_cursor() {
+    // Issue #2480: the OS pointer must be an I-beam over selectable grid
+    // text, while OSC 22 shapes still win, mouse-capturing panes stay the
+    // arrow, and leaving the window restores it.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_cursor_sink(Box::new(RecordingCursorSink {
+        icons: std::sync::Arc::clone(&recorded),
+    }));
+    app.runtime.handle_pty_bytes(b"selectable text");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    let frame = *app
+        .runtime
+        .present_frames()
+        .first()
+        .expect("primary frame must present");
+    let (cw, ch) = app.runtime.live_cell_size();
+    let pad = f64::from(app.runtime.window_padding_physical());
+    let text_pos = bitty_platform::CursorPosition {
+        x: pad + f64::from(frame.content.x) + 1.5 * f64::from(cw),
+        y: pad + f64::from(frame.content.y) + 0.5 * f64::from(ch),
+    };
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(text_pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Text),
+        "grid text must request the I-beam"
+    );
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        [bitty_platform::CursorIcon::Text]
+    );
+
+    // `OSC 22` still owns the pointer when a terminal app sets one.
+    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Wait),
+        "OSC 22 must win over the automatic text cursor"
+    );
+
+    // Window padding is chrome: the arrow returns.
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "padding must not show the I-beam"
+    );
+
+    // A capturing pane returns the arrow even over its text.
+    app.runtime.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(text_pos),
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "a mouse-capturing pane owns its pointer"
+    );
+
+    // Leaving the window restores the platform arrow even with OSC 22 set.
+    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorLeft,
+    });
+    app.sync_cursor_icon();
+    assert_eq!(
+        app.window.last_applied_cursor,
+        Some(bitty_platform::CursorIcon::Default),
+        "leaving must not leave the pane shape stuck"
     );
 }
 
@@ -10779,12 +10873,13 @@ fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
 
 #[test]
 #[cfg(unix)]
-fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
+fn reap_exited_last_leaf_of_workspace_prunes_the_workspace() {
     require_pty!();
-    // CTX-1044: the reap session-less branch. With two single-panel
-    // workspaces, the active leaf exiting must close the pane session and
-    // leave its tile session-less, never exit the app. The emptied
-    // workspace stays selected and presents safe (erased tile).
+    // Issue #2525 (CTX-1044 residual): a shell exiting in the last panel of
+    // a workspace is a panel close, exactly like the close-view gesture
+    // (CTX-1297). With two single-panel workspaces the emptied workspace is
+    // pruned and focus follows the survivor; keeping a session-less tile
+    // stranded focus on a dead panel that silently dropped input.
     let maps =
         bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
@@ -10801,6 +10896,17 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
     assert_eq!(app.runtime.active_workspace_index(), 1);
     assert_eq!(app.runtime.leaf_count(), 1);
     assert_eq!(app.effective_window_leaf_count(), 2);
+
+    // Keep a live shell on the surviving workspace so the prune leaves a
+    // usable window with a real input path behind the survivor.
+    assert!(app.runtime.workspace_switch(0));
+    let survivor_view = app.runtime.focused_view().expect("survivor leaf");
+    let survivor_script = write_fake_editor("sleep-survivor-2525", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor_view, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn survivor shell");
+    assert!(app.runtime.workspace_switch(1));
     let active_view = app.runtime.focused_view().expect("active leaf focused");
 
     let script = write_fake_editor("exit-ws-last", "#!/bin/sh\nexit 0\n");
@@ -10824,44 +10930,127 @@ fn reap_exited_last_leaf_of_workspace_keeps_workspace_session_less() {
     assert_eq!(
         outcome,
         terminal_app::ShellExitOutcome::PaneClosed,
-        "exiting last leaf with panels elsewhere must close the pane, never the app"
+        "exiting the last leaf must close the pane, never the app"
     );
-    assert_eq!(app.runtime.workspace_count(), 2, "emptied workspace stays");
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "emptied workspace is pruned like the close-view gesture"
+    );
     assert_eq!(
         app.runtime.active_workspace_index(),
-        1,
-        "emptied workspace stays selected"
+        0,
+        "focus follows the surviving workspace"
     );
-    assert_eq!(app.runtime.leaf_count(), 1, "workspace keeps its tile");
+    assert_eq!(app.runtime.leaf_count(), 1, "survivor keeps its panel");
     assert_eq!(
         app.effective_window_leaf_count(),
-        2,
-        "no panel lost window-wide"
+        1,
+        "the surviving workspace owns the remaining panel"
     );
     assert!(
         !app.runtime.has_pane_session(&active_view),
-        "exited tile must be session-less"
+        "exited pane session must be torn down"
+    );
+    let survivor = app.runtime.focused_view().expect("survivor leaf focused");
+    assert_eq!(
+        survivor, survivor_view,
+        "focus must leave the pruned dead tile for the live survivor"
+    );
+    assert!(
+        app.runtime.has_pane_session(&survivor_view),
+        "the live survivor keeps its shell"
+    );
+
+    // The surviving workspace still presents and stays usable.
+    let _ = app.drive_tick();
+    assert_eq!(app.runtime.workspace_count(), 1);
+    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    app.runtime.close_pane_session(&survivor_view);
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&survivor_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_primary_last_leaf_of_workspace_prunes_workspace() {
+    require_pty!();
+    // Issue #2525: the primary shell is the sole panel of its workspace
+    // while a split pane stays live on another. On exit the singleton
+    // layout refuses `close_focused_leaf`, which used to strand the dead
+    // primary tile. The emptied workspace must be pruned instead.
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.workspace_count(), 2);
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    let pane_view = app.runtime.focused_view().expect("active leaf focused");
+
+    // Keep a live pane on the surviving workspace.
+    let pane_script = write_fake_editor("sleep-pane-2525", "#!/bin/sh\nsleep 10\n");
+    let pane_arg = pane_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(pane_view, pane_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn live pane shell");
+    assert!(app.runtime.has_pane_session(&pane_view));
+
+    // Attach the exiting primary to workspace 1's sole leaf (the primary
+    // owner is chosen from the focused leaf at attach time).
+    assert!(app.runtime.workspace_switch(0), "switch to workspace 1");
+    let primary_view = app.runtime.focused_view().expect("primary leaf focused");
+    assert_eq!(primary_view, ViewId::new(1));
+    let primary_script = write_fake_editor("exit-primary-2525", "#!/bin/sh\nexit 0\n");
+    let primary_arg = primary_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell(primary_arg.as_str())
+        .expect("spawn primary shell");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the emptied primary workspace is pruned"
     );
     assert_eq!(
-        app.runtime.focused_view(),
-        Some(active_view),
-        "focus stays in the emptied workspace"
+        app.runtime.active_workspace_index(),
+        0,
+        "the surviving workspace keeps focus"
     );
-
-    // Present path stays safe on the session-less tile (erased, no panic).
+    assert!(
+        app.runtime.has_pane_session(&pane_view),
+        "the live pane survives the prune"
+    );
+    assert_ne!(
+        app.runtime.primary_view(),
+        Some(primary_view),
+        "the dead primary owner must be replaced"
+    );
+    assert_eq!(app.runtime.focused_view(), Some(pane_view));
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.leaf_count(), 1);
 
-    // The other workspace still holds its panel: switching back proves no
-    // unrelated workspace (or its bookkeeping) died on the reap path.
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.leaf_count(), 1);
-    assert!(app.runtime.focused_view().is_some());
-    assert!(app.runtime.workspace_switch(1));
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    assert_eq!(app.runtime.focused_view(), Some(active_view));
-    let _ = std::fs::remove_file(&script);
+    app.runtime.close_pane_session(&pane_view);
+    let _ = std::fs::remove_file(&pane_script);
+    let _ = std::fs::remove_file(&primary_script);
 }
 
 #[test]
@@ -11343,6 +11532,157 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
 /// session-less tile focused. The old path tore the primary session down
 /// but kept its leaf, so the empty focused leaf painted a cursor ghost in
 /// the vacated region and swallowed keyboard input until `ctrl+tab`.
+#[test]
+#[cfg(unix)]
+fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
+    require_pty!();
+    // Issue #2525 review: an inactive workspace stashes its zoom proxy as
+    // its layout while the real tree lives in the app-side zoom backup. The
+    // zoomed pane exiting must not read as "sole panel" and prune the
+    // workspace while the hidden live pane remains.
+    let mut app = editor_test_app();
+    let hidden = ViewId::new(1);
+    let exiting = ViewId::new(2);
+
+    let hidden_script = write_fake_editor("sleep-hidden-2525", "#!/bin/sh\nsleep 10\n");
+    let hidden_arg = hidden_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(hidden, hidden_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn hidden live pane");
+    let exit_script = write_fake_editor("exit-zoomed-2525", "#!/bin/sh\nexit 0\n");
+    let exit_arg = exit_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn exiting zoomed pane");
+    assert!(app.runtime.set_focus(exiting));
+    app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
+    assert_eq!(app.runtime.leaf_count(), 1, "zoomed proxy is one leaf");
+    let seq = app.runtime.workspace_seq_at(0).expect("workspace seq");
+    assert_eq!(
+        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        Some(vec![hidden, exiting]),
+        "the app-side backup owns the real tree"
+    );
+
+    // Switch to a second workspace; the zoom entry (and its backup) survives
+    // the stash, so ws1 is now an inactive zoomed workspace.
+    app.runtime.workspace_new().expect("second workspace opens");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert_eq!(
+        app.workspace_real_panel_count(0),
+        Some(2),
+        "prune decisions must read the backup, not the stashed proxy"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        outcome,
+        terminal_app::ShellExitOutcome::PaneClosed,
+        "the zoomed exit is a pane close"
+    );
+    assert_eq!(
+        app.runtime.workspace_count(),
+        2,
+        "the workspace still owns a hidden live pane"
+    );
+    assert_eq!(
+        app.runtime.active_workspace_index(),
+        1,
+        "the active workspace is unchanged"
+    );
+    assert!(
+        app.runtime.has_pane_session(&hidden),
+        "the hidden live pane survives"
+    );
+    assert!(
+        !app.runtime.has_pane_session(&exiting),
+        "the exited zoomed pane is torn down"
+    );
+    assert!(
+        app.chrome
+            .zoom
+            .backup_leaf_ids_for_seq(seq)
+            .is_some_and(|ids| ids.contains(&hidden)),
+        "the hidden leaf stays in the real tree"
+    );
+
+    app.runtime.close_pane_session(&hidden);
+    let _ = std::fs::remove_file(&hidden_script);
+    let _ = std::fs::remove_file(&exit_script);
+}
+
+#[test]
+#[cfg(unix)]
+fn reap_exited_pane_in_inactive_workspace_prunes_emptied_workspace() {
+    require_pty!();
+    // Issue #2525: the inactive-workspace twin of the pane prune path. A
+    // shell exiting in the sole panel of a background workspace prunes that
+    // workspace and leaves the active workspace's live pane untouched.
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    let exiting = app.runtime.focused_view().expect("ws1 leaf");
+    let exit_script = write_fake_editor("exit-inactive-2525", "#!/bin/sh\nexit 0\n");
+    let exit_arg = exit_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn exiting background shell");
+
+    app.runtime.workspace_new().expect("second workspace opens");
+    let survivor = app.runtime.focused_view().expect("ws2 leaf");
+    let survivor_script = write_fake_editor("sleep-survivor-ws2", "#!/bin/sh\nsleep 10\n");
+    let survivor_arg = survivor_script.to_string_lossy().into_owned();
+    app.runtime
+        .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
+        .expect("spawn active survivor shell");
+    assert_eq!(app.runtime.active_workspace_index(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut outcome = terminal_app::ShellExitOutcome::NoExit;
+    while std::time::Instant::now() < deadline {
+        let _ = app.poll_pty_pump();
+        outcome = app.reap_exited_shells();
+        if outcome != terminal_app::ShellExitOutcome::NoExit {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
+    assert_eq!(
+        app.runtime.workspace_count(),
+        1,
+        "the emptied background workspace is pruned"
+    );
+    assert_eq!(app.runtime.active_workspace_index(), 0);
+    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert!(
+        app.runtime.has_pane_session(&survivor),
+        "the active workspace's live pane survives"
+    );
+    assert!(!app.runtime.has_pane_session(&exiting));
+
+    app.runtime.close_pane_session(&survivor);
+    let _ = std::fs::remove_file(&exit_script);
+    let _ = std::fs::remove_file(&survivor_script);
+}
+
 #[test]
 #[cfg(unix)]
 fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {

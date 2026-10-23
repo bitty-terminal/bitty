@@ -1317,7 +1317,9 @@ impl Runtime {
                     // addresses the primary grid. A press outside every
                     // frame (padding / gap band) falls back to the focused
                     // View with the clamped mapping.
-                    let Some((owner, cell)) = self.selection_press_target(pos) else {
+                    let Some((owner, cell, boundary)) =
+                        self.selection_press_target_with_boundary(pos)
+                    else {
                         // No live grid under (or focused behind) the pointer:
                         // select nothing rather than the primary grid.
                         self.clear_selection();
@@ -1341,7 +1343,10 @@ impl Runtime {
                     } else {
                         SelectionKind::Simple
                     };
-                    self.start_view_selection(owner, kind, cell);
+                    // Issue #2480: Simple/Block pointer drags are caret-to-
+                    // caret, so one cell of travel selects one cell (word/
+                    // line gestures keep their cell expansion).
+                    self.start_view_selection_from_pointer(owner, kind, cell, boundary);
                 } else if self.selection_state.is_some() {
                     // CTX-0166: click without cursor tracking still dismisses
                     // the highlight (no stale rect when `last_cursor` is None).
@@ -1353,16 +1358,32 @@ impl Runtime {
                 // content frame, clamped. The mapping is total inside the
                 // owner, so a release over a sibling panel commits at the
                 // owner's edge instead of leaking a foreign cell (#1433).
-                let release_cell = self
-                    .last_cursor
-                    .zip(self.selection_owner())
-                    .and_then(|(pos, owner)| self.cursor_to_owner_cell(owner, pos));
-                match release_cell {
-                    Some(cell) => self.end_selection(cell),
-                    // No tracked cursor, no selection, or the owner lost its
-                    // present frame: end the drag in place (the owner-stale
-                    // case is dropped by the read guard).
-                    None => self.end_selection_drag_in_place(),
+                // Issue #2480: pointer Simple/Block drags commit in caret
+                // space; word/line and direct cell selections keep the
+                // inclusive-cell release path.
+                let boundary_drag = self
+                    .selection_state
+                    .is_some_and(|state| state.press_boundary.is_some());
+                let release = self.last_cursor.zip(self.selection_owner());
+                if boundary_drag {
+                    match release
+                        .and_then(|(pos, owner)| self.cursor_to_owner_cell_and_boundary(owner, pos))
+                    {
+                        Some((cell, boundary)) => self.end_boundary_selection(cell, boundary),
+                        // No tracked cursor or the owner lost its present
+                        // frame: end the drag in place (the owner-stale case
+                        // is dropped by the read guard).
+                        None => self.end_selection_drag_in_place(),
+                    }
+                } else {
+                    let release_cell =
+                        release.and_then(|(pos, owner)| self.cursor_to_owner_cell(owner, pos));
+                    match release_cell {
+                        Some(cell) => self.end_selection(cell),
+                        // No tracked cursor, no selection, or the owner lost
+                        // its present frame: end the drag in place.
+                        None => self.end_selection_drag_in_place(),
+                    }
                 }
                 // Copy-on-select is opt-in (CTX-0191/CTX-0371; default off,
                 // matching kitty/ghostty): when enabled, a committed drag
@@ -1425,7 +1446,7 @@ impl Runtime {
         // cannot coexist — the press routed exclusively). Otherwise an
         // `auto` visibility transition repaints exactly once; steady
         // hover costs no present.
-        self.scrollbar_cursor_left = false;
+        self.cursor_left_window = false;
         if self.scrollbar_drag_to(pos) {
             self.clear_hover_pending();
             return;
@@ -1439,14 +1460,25 @@ impl Runtime {
             // frame, clamped, so a drag that leaves the owning panel stops at
             // its edge and never selects a sibling's cell. An owner that lost
             // its present frame ends the drag and drops the selection.
-            match self
-                .selection_owner()
-                .and_then(|owner| self.cursor_to_owner_cell(owner, pos))
-            {
+            //
+            // Issue #2480: pointer Simple/Block drags extend caret-to-caret
+            // so one cell of pointer travel selects exactly one cell.
+            let boundary_drag = self
+                .selection_state
+                .is_some_and(|state| state.press_boundary.is_some());
+            let owner = self.selection_owner();
+            if boundary_drag {
+                match owner.and_then(|owner| self.cursor_to_owner_cell_and_boundary(owner, pos)) {
+                    Some((cell, boundary)) => self.update_boundary_selection(cell, boundary),
+                    // The owner lost its present frame mid-drag: end the drag
+                    // and drop the selection rather than extend it against a
+                    // frame that is no longer painted (fail closed).
+                    None => self.clear_selection(),
+                }
+                return;
+            }
+            match owner.and_then(|owner| self.cursor_to_owner_cell(owner, pos)) {
                 Some(cell) => self.update_selection(cell),
-                // The owner lost its present frame mid-drag: end the drag and
-                // drop the selection rather than extend it against a frame
-                // that is no longer painted (fail closed).
                 None => self.clear_selection(),
             }
             return;
@@ -2105,6 +2137,81 @@ impl Runtime {
     #[must_use]
     pub fn last_cursor(&self) -> Option<CursorPosition> {
         self.last_cursor
+    }
+
+    /// Whether the pointer is currently inside the window (issue #2480).
+    ///
+    /// `false` after `CursorLeft` until the next `CursorMoved`, even though
+    /// [`Self::last_cursor`] retains its last value for selection-release
+    /// meaning. The app uses this to restore the platform arrow when the
+    /// pointer leaves instead of keeping the last grid shape.
+    #[must_use]
+    pub fn cursor_inside_window(&self) -> bool {
+        !self.cursor_left_window
+    }
+
+    /// Whether the pointer currently rests on selectable terminal text
+    /// (issue #2480).
+    ///
+    /// This is the "I-beam" predicate the app uses as the default pointer
+    /// shape over a terminal grid. It is deliberately narrower than "inside
+    /// a present frame":
+    ///
+    /// - the pointer must be inside the window and inside the hit frame's
+    ///   **content** rectangle (the border ring, decoration bands, panel gap
+    ///   bands, and split dividers stay the platform arrow);
+    /// - the hit `View` must own a live grid (panel/browser surfaces without
+    ///   one stay the arrow);
+    /// - the overlay scrollbar and plugin chrome bands own their pixels;
+    /// - copy mode, the search overlay, and a modal panel overlay consume the
+    ///   pointer, so the underlying grid is not selectable there;
+    /// - a pane whose app tracks the mouse captures the pointer (unless Shift
+    ///   is held for the selection escape), so it also stays the arrow.
+    ///
+    /// `OSC 22` shapes and hyperlink hover are resolved by the caller before
+    /// this fallback; this method never overrides an explicit shape.
+    #[must_use]
+    pub fn pointer_over_selectable_text(&self) -> bool {
+        if self.cursor_left_window
+            || self.copy_mode.is_some()
+            || self.search_mode
+            || self.overlay_modal_active()
+        {
+            return false;
+        }
+        let Some(pos) = self.last_cursor else {
+            return false;
+        };
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return false;
+        }
+        // Chrome above the grid owns its pixels even though the frame
+        // solver/hit test would otherwise reach the cells beneath it.
+        if self.scrollbar_hit_at(pos) || self.plugin_band_row_hit(pos).is_some() {
+            return false;
+        }
+        let frames = self.present_frames();
+        let Some((view, _)) = self.present_cell_in(&frames, pos) else {
+            return false;
+        };
+        let Some(frame) = frames.iter().find(|frame| frame.view == view) else {
+            return false;
+        };
+        // Content-only containment: a pointer on the frame's border ring or
+        // on the Core decoration around it is chrome, not text.
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad;
+        let y = pos.y - pad;
+        let content = frame.content;
+        let right = f64::from(content.x) + f64::from(content.width);
+        let bottom = f64::from(content.y) + f64::from(content.height);
+        if x < f64::from(content.x) || x >= right || y < f64::from(content.y) || y >= bottom {
+            return false;
+        }
+        if self.live_view_state(view).is_none() {
+            return false;
+        }
+        self.shift_pressed || !self.view_tracks_mouse(view)
     }
 }
 

@@ -51,7 +51,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// `output_on_mark_row` per zone record plus the `last_output_print`
 /// anchor. The flag decides whether a `D` row joins the select-output
 /// range, so states differing only in it select different rows.
-pub const CANONICAL_HASH_VERSION: u32 = 11;
+/// v12 adds `Cell::padding` (`#2529`): reflow treats marked blanks as layout
+/// padding rather than content, so states differing only in that marker can
+/// produce different future terminal text.
+pub const CANONICAL_HASH_VERSION: u32 = 12;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -172,6 +175,7 @@ pub(crate) fn write_cell(out: &mut CanonicalHasher, cell: &Cell) {
     write_style(out, &cell.style);
     out.u8(cell.width);
     out.boolean(cell.spacer);
+    out.boolean(cell.padding);
     out.u32(cell.zerowidth.len() as u32);
     for mark in &cell.zerowidth {
         out.char(*mark);
@@ -215,6 +219,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 11);
+        assert_eq!(CANONICAL_HASH_VERSION, 12);
     }
 }

@@ -721,8 +721,8 @@ jobs:
           fi
           OUT="$("$APP_BIN" --version)"
           echo "arm64 launch: $OUT"
-          if [[ "$OUT" != *"$VERSION"* ]]; then
-            echo "::error::arm64 version mismatch: $OUT"
+          if [[ "$OUT" != "bitty ${VERSION} "* ]]; then
+            echo "::error::arm64 version mismatch: $OUT (want ${VERSION})"
             exit 1
           fi
           if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
@@ -730,8 +730,8 @@ jobs:
           fi
           OUT="$(arch -x86_64 "$APP_BIN" --version)"
           echo "x86_64 (Rosetta) launch: $OUT"
-          if [[ "$OUT" != *"$VERSION"* ]]; then
-            echo "::error::x86_64 version mismatch: $OUT"
+          if [[ "$OUT" != "bitty ${VERSION} "* ]]; then
+            echo "::error::x86_64 version mismatch: $OUT (want ${VERSION})"
             exit 1
           fi
 
@@ -836,11 +836,14 @@ jobs:
             throw "archive contents mismatch: $($actual -join ', ')"
           }
           $exe = Join-Path $dest 'bitty.exe'
-          $output = & $exe --version
-          if ($LASTEXITCODE -ne 0) { throw "bitty --version exited $LASTEXITCODE" }
+          $output = (& $exe --version | Out-String).Trim()
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "bitty --version exited $code" }
           Write-Host "bitty --version => $output"
-          if ("$output" -notmatch [regex]::Escape($version)) {
-            throw "version mismatch: archive $version, binary $output"
+          # Anchored on `bitty <version> ` so a wrong-version binary can never
+          # match as a substring (0.0.27 must not accept 0.0.270).
+          if ($output -cnotmatch ('^bitty ' + [regex]::Escape($version) + ' ')) {
+            throw "version mismatch: archive $version, binary '$output'"
           }
 
   # Windows x64 setup installer (CTX-1064 / #1810): Inno Setup 6 wizard
@@ -1051,11 +1054,14 @@ jobs:
           }
           $exe = Join-Path $installDir 'bitty.exe'
           if (-not (Test-Path $exe -PathType Leaf)) { throw "bitty.exe missing after install: $exe" }
-          $output = & $exe --version
-          if ($LASTEXITCODE -ne 0) { throw "bitty --version exited $LASTEXITCODE" }
+          $output = (& $exe --version | Out-String).Trim()
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "bitty --version exited $code" }
           Write-Host "bitty --version => $output"
-          if ("$output" -notmatch [regex]::Escape($version)) {
-            throw "version mismatch: setup $version, binary $output"
+          # Anchored on `bitty <version> ` so a wrong-version binary can never
+          # match as a substring (0.0.27 must not accept 0.0.270).
+          if ($output -cnotmatch ('^bitty ' + [regex]::Escape($version) + ' ')) {
+            throw "version mismatch: setup $version, binary '$output'"
           }
           foreach ($f in @('LICENSE', 'README.md', 'CHANGELOG.md')) {
             if (-not (Test-Path (Join-Path $installDir $f) -PathType Leaf)) { throw "payload missing after install: $f" }
@@ -1074,8 +1080,12 @@ jobs:
           }
           if (-not $entry) { throw 'registry uninstall entry missing (DisplayName Bitty)' }
           Write-Host "uninstall entry OK: $($entry.DisplayName) $($entry.DisplayVersion)"
-          if ("$($entry.DisplayVersion)" -notmatch [regex]::Escape($version)) {
-            throw "uninstall version mismatch: $($entry.DisplayVersion) vs $version"
+          # Inno Setup writes AppVersion verbatim, but Windows may re-pad the
+          # uninstall DisplayVersion with trailing zero components. Accept only
+          # the exact version (optionally zero-padded), never a substring.
+          $display = "$($entry.DisplayVersion)".Trim()
+          if ($display -cnotmatch ('^' + [regex]::Escape($version) + '(\.0+)*$')) {
+            throw "uninstall version mismatch: '$display' vs $version"
           }
           if (-not $entry.UninstallString) { throw 'uninstall entry missing UninstallString' }
           $unins = "$($entry.UninstallString)"
@@ -1254,7 +1264,9 @@ jobs:
               x86_64-unknown-linux-gnu)
                 output="$("$exe" --version)"
                 echo "bitty --version => $output"
-                if [[ "$output" != *"${version}"* ]]; then
+                # Anchored on `bitty <version> ` (not a substring): a bundle
+                # named for the release must carry a binary that reports it.
+                if [[ "$output" != "bitty ${version} "* ]]; then
                   echo "::error::version mismatch: bundle ${version}, binary ${output}" >&2
                   exit 1
                 fi
@@ -1585,6 +1597,8 @@ jobs:
             --sha-arm "$SHA_ARM" >homebrew-tap/Formula/bitty.rb
           # The rendered formula must carry the R2/CDN host and the verified
           # digests, not just whichever values the renderer happened to get.
+          grep -qF "version \"${VERSION}\"" homebrew-tap/Formula/bitty.rb ||
+            { echo "rendered formula lost the release version" >&2; exit 1; }
           grep -qF "url \"${BASE_URL}/${INTEL_ASSET}\"" homebrew-tap/Formula/bitty.rb ||
             { echo "rendered formula lost the R2/CDN Intel URL" >&2; exit 1; }
           grep -qF "url \"${BASE_URL}/${ARM_ASSET}\"" homebrew-tap/Formula/bitty.rb ||
@@ -1653,6 +1667,8 @@ jobs:
             --sha-arm64 "$SHA_ARM64" >scoop-bucket/bucket/bitty.json
           # The rendered manifest must carry the R2/CDN host and the verified
           # digests, not just whichever values the renderer happened to get.
+          grep -qF "\"version\": \"${VERSION}\"" scoop-bucket/bucket/bitty.json ||
+            { echo "rendered manifest lost the release version" >&2; exit 1; }
           grep -qF "\"url\": \"${BASE_URL}/${X64_ASSET}\"" scoop-bucket/bucket/bitty.json ||
             { echo "rendered manifest lost the R2/CDN x64 URL" >&2; exit 1; }
           grep -qF "\"url\": \"${BASE_URL}/${ARM64_ASSET}\"" scoop-bucket/bucket/bitty.json ||
@@ -1873,9 +1889,20 @@ jobs:
       - name: Build and push Nix package to Cachix
         run: nix build .#bitty --print-build-logs
       - name: Verify build artifact
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           test -x result/bin/bitty
-          result/bin/bitty --version
+          output="$(result/bin/bitty --version)"
+          echo "bitty --version => ${output}"
+          # The job only runs on tag pushes; assert the built binary reports the
+          # tagged version instead of printing it and moving on (fail closed).
+          version="${TAG#v}"
+          if [[ "$output" != "bitty ${version} "* ]]; then
+            echo "::error::version mismatch: tag ${version}, binary ${output}" >&2
+            exit 1
+          fi
 
   # CTX-1413 (#1847): the immutable mirror is the preferred download source
   # for the AUR bitty-bin, Homebrew, and Scoop publishers above. Those jobs
@@ -2228,6 +2255,12 @@ jobs:
             echo "all package channels succeeded"
           fi
 
+  # CTX-2504 (#2504): every leg asserts the installed binary reports EXACTLY
+  # the release version. A bare `bitty --version | grep -F "<version>"` (or a
+  # `Select-String` that prints nothing) exits 0 when the string is missing, and
+  # the 0.0.26 literals went stale the moment the next tag was cut. The expected
+  # version is derived from the tag that triggered the run, so the tag stays the
+  # single source of truth and no leg carries its own version literal.
   post-release-smoke:
     name: Post-release E2E (${{ matrix.channel }})
     needs: [channel-summary, r2-stable]
@@ -2242,30 +2275,74 @@ jobs:
             os: ubuntu-latest
             run: |
               curl -fsSL https://cdn.bitty.run/install/install.sh | bash
-              ~/.local/bin/bitty --version | grep -F "0.0.26"
+              out="$(~/.local/bin/bitty --version)"
+              echo "bitty --version => ${out}"
+              if [[ "$out" != "bitty ${RELEASE_VERSION} "* ]]; then
+                echo "::error::unexpected bitty version: ${out} (want ${RELEASE_VERSION})" >&2
+                exit 1
+              fi
           - channel: "macOS Homebrew (R2)"
             os: macos-latest
             run: |
               brew tap bitty-terminal/homebrew-tap
               brew trust bitty-terminal/homebrew-tap
               brew install bitty
-              bitty --version | grep -F "0.0.26"
+              out="$(bitty --version)"
+              echo "bitty --version => ${out}"
+              if [[ "$out" != "bitty ${RELEASE_VERSION} "* ]]; then
+                echo "::error::unexpected bitty version: ${out} (want ${RELEASE_VERSION})" >&2
+                exit 1
+              fi
           - channel: "Windows install.ps1 (R2)"
             os: windows-latest
             run: |
+              $expected = $env:RELEASE_VERSION
+              if (-not $expected) { throw 'RELEASE_VERSION is not set' }
               irm https://cdn.bitty.run/install/install.ps1 | iex
-              $v = & (Join-Path $env:LocalAppData "bitty\bin\bitty.exe") --version
-              if ($v -notmatch '^bitty 0\.0\.26 ') { throw "unexpected bitty version: $v" }
+              $exe = Join-Path $env:LocalAppData 'bitty\bin\bitty.exe'
+              $out = (& $exe --version | Out-String).Trim()
+              $code = $LASTEXITCODE
+              Write-Host "bitty --version => $out"
+              if ($code -ne 0) { throw "bitty --version exited $code" }
+              if ($out -cnotmatch ('^bitty ' + [regex]::Escape($expected) + ' ')) {
+                throw "unexpected bitty version: '$out' (want $expected)"
+              }
           - channel: "Windows Scoop (R2)"
             os: windows-latest
             run: |
+              $expected = $env:RELEASE_VERSION
+              if (-not $expected) { throw 'RELEASE_VERSION is not set' }
               Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
               irm get.scoop.sh | iex
               scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
               scoop install bitty
-              $v = & (scoop which bitty) --version
-              if ($v -notmatch '^bitty 0\.0\.26 ') { throw "unexpected bitty version: $v" }
+              $shim = (scoop which bitty | Select-Object -First 1)
+              if (-not $shim) { throw 'scoop which bitty returned no path' }
+              $shim = $shim.Trim()
+              $out = (& $shim --version | Out-String).Trim()
+              $code = $LASTEXITCODE
+              Write-Host "bitty --version => $out"
+              if ($code -ne 0) { throw "bitty --version exited $code" }
+              if ($out -cnotmatch ('^bitty ' + [regex]::Escape($expected) + ' ')) {
+                throw "unexpected bitty version: '$out' (want $expected)"
+              }
     steps:
+      # The tag is the only version input: `vX.Y.Z` -> `X.Y.Z`, exported to
+      # every leg through $GITHUB_ENV. An unexpected tag shape fails here
+      # instead of turning into an unmatched (and therefore failing) assertion.
+      - name: Resolve expected release version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::unexpected release tag: ${TAG}" >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=${version}" >>"$GITHUB_ENV"
+          echo "expected bitty version: ${version}"
       - name: Test installation from CDN (Unix)
         if: matrix.os != 'windows-latest'
         shell: bash

@@ -383,6 +383,20 @@ jobs:
           done
           ls -lh dist/
 
+      # Universal Linux AppImage bundle (CTX-1468, #2555)
+      - name: Package (AppImage) - Linux only
+        if: contains(matrix.packagers, 'deb')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(bash scripts/check-release-version.sh --print)"
+          scripts/make-appimage.sh \
+            --version "$VERSION" \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/bitty" \
+            --output "dist/bitty-${{ matrix.target }}.AppImage"
+          ls -lh "dist/bitty-${{ matrix.target }}.AppImage"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

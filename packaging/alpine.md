@@ -64,3 +64,18 @@ The template adheres to Alpine aports packaging standards:
   `RUSTFLAGS="-C target-feature=-crt-static"` for shared musl linkage.
 - Installs the binary, AppStream metadata, `.desktop` launcher, Hicolor icon
   hierarchy, and compiled terminfo database (`tic -x`).
+- Splits the documentation into `bitty-doc` through an explicit `doc()`
+  function, so `abuild validate` finds a split function for every declared
+  subpackage.
+- Declares `license="MIT OR Apache-2.0"`, matching `Cargo.toml`, the AUR
+  recipes, the RPM spec, and `nfpm.yaml`.
+
+## Release timing
+
+Source and checksum steps run **at tag time**. `abuild checksum` fetches
+`https://github.com/bitty-terminal/bitty/archive/refs/tags/v$pkgver.tar.gz`,
+which does not exist until the release tag is pushed, so `pkgver` is bumped in
+the release PR and the checksum is committed with that tag. Running
+`abuild checksum` against an unreleased `pkgver` fails closed on the 404
+instead of pinning a hash for a tarball that may never be published.
+

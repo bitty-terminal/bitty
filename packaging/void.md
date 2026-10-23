@@ -32,6 +32,12 @@ cp /path/to/bitty/packaging/void/srcpkgs/bitty/template srcpkgs/bitty/template
 ./xbps-src pkg bitty
 ```
 
+Source and checksum steps run **at tag time**: the template ships
+`checksum="SKIP"` because its distfile is the GitHub tag archive, which only
+exists once the release tag is pushed. `xbps-src xgensum` replaces `SKIP` with
+the real sha256 for `version`. A template submitted to `void-packages` must
+carry that digest, never `SKIP`; the in-tree copy is a draft until then.
+
 ### 4. Install the package
 
 ```sh

@@ -6,12 +6,17 @@ build_style=cargo
 make_install_args="--path crates/bitty-terminal --bin bitty"
 hostmakedepends="pkg-config cargo ncurses"
 makedepends="fontconfig-devel freetype-devel"
-short_desc="GPU-accelerated terminal emulator with built-in pane multiplexer and Lua extensions"
+short_desc="GPU-accelerated terminal emulator with panes and Lua extensions"
 maintainer="Xuepo <xuepo@bitty.run>"
-license="Apache-2.0"
+license="MIT OR Apache-2.0"
 homepage="https://bitty.run"
 changelog="https://raw.githubusercontent.com/bitty-terminal/bitty/main/CHANGELOG.md"
 distfiles="https://github.com/bitty-terminal/bitty/archive/refs/tags/v${version}.tar.gz"
+# checksum=SKIP is deliberate for the in-tree draft: the distfile is the
+# GitHub tag archive, which does not exist until the release tag is pushed.
+# At tag time replace SKIP with the value printed by
+# `./xbps-src xgensum -a bitty` (see packaging/void.md); a template submitted
+# to void-packages must carry the real sha256, never SKIP.
 checksum="SKIP"
 
 post_install() {

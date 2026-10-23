@@ -12,24 +12,24 @@ SRC_URI="
 	arm64? ( https://cdn.bitty.run/releases/v${PV}/bitty-${PV}-aarch64-unknown-linux-gnu.tar.zst )
 "
 
-LICENSE="Apache-2.0"
+LICENSE="MIT OR Apache-2.0"
 SLOT="0"
 KEYWORDS="-* ~amd64 ~arm64"
 IUSE=""
 
+# Direct NEEDED sonames only, aligned with packaging/linux/runtime-deps.toml:
+# libfontconfig.so.1 and libfreetype.so.6. libgcc_s.so.1 comes from the
+# sys-devel/gcc in @system, libc/libm from the base system. The X11, Wayland,
+# and Vulkan backends are dlopen()ed at runtime and are not NEEDED entries, so
+# they are documented in packaging/gentoo.md instead of over-declared here.
 RDEPEND="
-	media-libs/fontconfig
-	media-libs/freetype
-	sys-libs/ncurses:0=
-	sys-libs/zlib
-	x11-libs/libX11
-	x11-libs/libxkbcommon
-	dev-libs/wayland
+	media-libs/fontconfig:=
+	media-libs/freetype:=
 	!x11-terms/bitty
 "
 BDEPEND="
 	app-arch/zstd
-	sys-apps/tic
+	sys-libs/ncurses
 "
 
 QA_PREBUILT="usr/bin/bitty"

@@ -5,7 +5,7 @@ pkgrel=0
 pkgdesc="GPU-accelerated terminal emulator with built-in pane multiplexer and Lua extensions"
 url="https://bitty.run"
 arch="x86_64 aarch64"
-license="Apache-2.0"
+license="MIT OR Apache-2.0"
 depends="fontconfig freetype"
 makedepends="cargo cargo-auditable rust pkgconf fontconfig-dev freetype-dev ncurses"
 subpackages="$pkgname-doc"
@@ -49,4 +49,11 @@ package() {
 	install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 	install -Dm644 README.md "$pkgdir"/usr/share/doc/$pkgname/README.md
 	install -Dm644 CHANGELOG.md "$pkgdir"/usr/share/doc/$pkgname/CHANGELOG.md
+}
+
+# Split function for the $pkgname-doc subpackage declared above; abuild's
+# validate step fails on a subpackage without one.
+doc() {
+	mkdir -p "$subpkgdir"/usr/share/doc
+	mv "$pkgdir"/usr/share/doc/"$pkgname" "$subpkgdir"/usr/share/doc/
 }

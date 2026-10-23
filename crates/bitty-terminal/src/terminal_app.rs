@@ -3221,6 +3221,27 @@ impl TerminalApp {
         }
     }
 
+    /// Real panel count for workspace `index`, with the app-side zoom backup
+    /// substituted for a stashed zoom proxy (issue #2525 review).
+    ///
+    /// While a workspace is zoomed its layout is a single-leaf proxy and the
+    /// real tree lives in `ChromeState::zoom` keyed by workspace sequence.
+    /// An inactive zoomed workspace therefore reports one panel from
+    /// [`Runtime::workspace_panel_counts`] even when a hidden live pane
+    /// exists in the backup. Prune decisions must read the backup, or a
+    /// screen switch followed by the zoomed pane's shell exit would close a
+    /// workspace that still owns a live pane. Floats are stored per slot and
+    /// are unaffected by zoom, so they are added unchanged.
+    pub(crate) fn workspace_real_panel_count(&self, index: usize) -> Option<usize> {
+        let (stashed_tiled, floats) = self.runtime.workspace_panel_counts(index)?;
+        let tiled = self
+            .runtime
+            .workspace_seq_at(index)
+            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .map_or(stashed_tiled, |ids| ids.len());
+        Some(tiled + floats)
+    }
+
     /// Checks for exited shell processes across both split pane sessions and
     /// the primary session, reaping exited children and closing their panels.
     ///
@@ -3312,6 +3333,40 @@ impl TerminalApp {
                     closed_any = true;
                     continue;
                 }
+                // Issue #2525: a shell that exits in the last panel of a
+                // workspace is a panel close, exactly like the close-view
+                // gesture (CTX-1297). Prune the emptied workspace and let
+                // focus follow a surviving workspace instead of keeping a
+                // session-less tile that silently drops input. A pinned
+                // panel is window-global and keeps the workspace meaningful
+                // (CTX-1337), and a detached float still owns the slot
+                // (CTX-1336), so both keep the existing leaf handling.
+                self.restore_zoom();
+                if let Some(workspace) = self.runtime.workspace_index_of_view(&view) {
+                    let sole_panel = self.workspace_real_panel_count(workspace) == Some(1);
+                    if sole_panel
+                        && self.runtime.workspace_count() > 1
+                        && self.runtime.floated_count() == 0
+                        && self.runtime.pinned_count() == 0
+                    {
+                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: pane shell {view:?} exited — empty workspace pruned"
+                                )
+                            });
+                        } else {
+                            crate::logging::warn(|| {
+                                String::from(
+                                    "bitty: could not prune empty workspace after pane exit",
+                                )
+                            });
+                        }
+                        self.push_pending_exit(view.0, status.code());
+                        closed_any = true;
+                        continue;
+                    }
+                }
                 // CTX-1039 (#1843): the last leaf of the active workspace
                 // with panels elsewhere. Keep the emptied workspace
                 // selected and leave its tile session-less instead of
@@ -3319,7 +3374,6 @@ impl TerminalApp {
                 if self.runtime.layout().leaf_ids().contains(&view)
                     && self.runtime.leaf_count() <= 1
                 {
-                    self.restore_zoom();
                     // CTX-1337 (#2222): a pinned panel survives outside the
                     // live layout, so the exited last tiled pane must not
                     // keep its session-less leaf focused. Retire the leaf
@@ -3405,6 +3459,22 @@ impl TerminalApp {
                     )
                 });
                 self.restore_zoom();
+                // Issue #2525: the primary shell exiting in the last panel
+                // of a workspace is the same panel close as the close-view
+                // gesture (CTX-1297). `close_focused_leaf` refuses a
+                // singleton layout, so without this branch the dead primary
+                // tile stays focused and drops input while other workspaces
+                // keep running. Prune the emptied workspace instead; the
+                // float/pin cases are handled first and keep their behavior.
+                let primary_sole_workspace = self
+                    .runtime
+                    .workspace_index_of_view(&primary_view)
+                    .filter(|workspace| {
+                        self.workspace_real_panel_count(*workspace) == Some(1)
+                            && self.runtime.workspace_count() > 1
+                            && self.runtime.floated_count() == 0
+                            && self.runtime.pinned_count() == 0
+                    });
                 // Issue #2141: the primary owner may sit on a detached
                 // float (it keeps primary while detached). Layout surgery
                 // cannot remove it, so discard the floating view instead.
@@ -3412,6 +3482,20 @@ impl TerminalApp {
                     || self.runtime.pinned_views().contains(&primary_view)
                 {
                     self.runtime.discard_floating_view(primary_view);
+                } else if let Some(workspace) = primary_sole_workspace {
+                    if self.runtime.workspace_close_at(workspace).is_ok() {
+                        crate::logging::info(|| {
+                            format!(
+                                "bitty: primary shell {primary_view:?} exited — empty workspace pruned"
+                            )
+                        });
+                    } else {
+                        crate::logging::warn(|| {
+                            String::from(
+                                "bitty: could not prune empty workspace after primary exit",
+                            )
+                        });
+                    }
                 } else if self.runtime.pinned_count() > 0
                     && self.runtime.floated_count() == 0
                     && self

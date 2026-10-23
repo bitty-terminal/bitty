@@ -3043,6 +3043,7 @@ fn ascii_fast_path_emission_matches_per_cell_glyphs() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3087,6 +3088,7 @@ fn ascii_fast_path_clips_dirty_and_skips_spaces() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3115,6 +3117,7 @@ fn ascii_fast_path_clips_dirty_and_skips_spaces() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3146,6 +3149,7 @@ fn ascii_fast_path_empty_dirty_emits_nothing() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };

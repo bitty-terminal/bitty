@@ -1852,6 +1852,10 @@ pub struct DrawList {
     /// Overlay fills painted above the background image and below glyphs
     /// (CTX-0347: the selection highlight and cursor fill).
     pub overlay_fills: Vec<FillRect>,
+    /// Rounded overlay chrome painted after [`Self::overlay_fills`] and before
+    /// glyphs (CTX-1477: opaque help/which-key cards that must stay above the
+    /// selection highlight while keeping the SDF corner mask).
+    pub overlay_rounded_fills: Vec<RoundedFill>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
     /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
@@ -1866,6 +1870,7 @@ impl DrawList {
             || !self.rounded_fills.is_empty()
             || !self.backgrounds.is_empty()
             || !self.overlay_fills.is_empty()
+            || !self.overlay_rounded_fills.is_empty()
             || !self.glyphs.is_empty()
             || !self.images.is_empty()
     }
@@ -2960,6 +2965,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // present path (CTX-0347); grid truth carries neither.
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             // Grid truth carries no images; the runtime present path pushes
             // placed Kitty blits onto the combined list (CTX-0248).
@@ -3021,6 +3027,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan: plan.clone(),
@@ -3757,6 +3764,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan,
@@ -3800,6 +3808,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan: plan.clone(),

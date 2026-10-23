@@ -4017,7 +4017,7 @@ impl Runtime {
             allocations,
             view_map,
             pad_px,
-            &mut layers.combined_rounded,
+            &mut layers.combined_overlay_rounded,
             &mut layers.combined_glyphs,
         ) {
             layers.any_needs_draw = true;
@@ -5698,6 +5698,7 @@ impl Runtime {
                     rounded_fills: Vec::new(),
                     backgrounds: Vec::new(),
                     overlay_fills: Vec::new(),
+                    overlay_rounded_fills: Vec::new(),
                     glyphs: Vec::new(),
                     images: Vec::new(),
                 });
@@ -5710,6 +5711,7 @@ impl Runtime {
             tmp_list.rounded_fills = layers.combined_rounded;
             tmp_list.backgrounds = layers.combined_backgrounds;
             tmp_list.overlay_fills = layers.combined_overlay;
+            tmp_list.overlay_rounded_fills = layers.combined_overlay_rounded;
             tmp_list.glyphs = layers.combined_glyphs;
             tmp_list.images = layers.combined_images;
             let plan_extent = self.present_plan_extent();
@@ -5952,6 +5954,9 @@ struct FrameLayers {
     combined_backgrounds: Vec<bitty_render::grid::ImageBlit>,
     /// Overlay fills (cursor, selection, banners, scrollbar).
     combined_overlay: Vec<bitty_render::grid::FillRect>,
+    /// Overlay rounded chrome (CTX-1477: the help/which-key card), painted
+    /// after overlay fills and before glyphs.
+    combined_overlay_rounded: Vec<bitty_render::grid::RoundedFill>,
     /// Combined glyph instances (leaf plus overlay text).
     combined_glyphs: Vec<bitty_render::grid::GlyphInstance>,
     /// CTX-0248 kitty image blits.
@@ -6911,6 +6916,31 @@ mod plugin_overlay_paint_tests {
                 .all(|glyph| glyph.clip == Some(clip)),
             "every overlay glyph carries the card's SDF corner mask"
         );
+    }
+
+    #[test]
+    fn help_card_uses_the_overlay_rounded_layer() {
+        // CTX-1477: the help card must paint above the selection/cursor
+        // overlay fills, so it goes to the overlay-rounded layer rather than
+        // the leaf decoration layer.
+        let mut rt = runtime();
+        let frame = one_frame();
+        rt.focus_mut().set(frame.view);
+        rt.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
+        assert!(rt.toggle_help());
+        let mut layers = FrameLayers::default();
+        rt.paint_help_overlay(&[frame], &std::collections::HashMap::new(), 8, &mut layers);
+        assert_eq!(
+            layers.combined_overlay_rounded.len(),
+            2,
+            "help surface plus ring on the overlay-rounded layer"
+        );
+        assert!(
+            layers.combined_overlay.is_empty(),
+            "help chrome no longer competes with plain overlay fills"
+        );
+        assert!(!layers.combined_glyphs.is_empty());
+        assert!(layers.any_needs_draw);
     }
 
     #[test]

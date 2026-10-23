@@ -497,6 +497,10 @@ impl SurfaceRgba {
 /// topmost), preserving vector order. Atlas instances sample
 /// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
 ///
+/// Overlay rounded chrome (CTX-1477) paints after plain overlay fills and
+/// before glyphs, so an opaque help card stays above the selection highlight
+/// while retaining the SDF corner mask.
+///
 /// # Errors
 ///
 /// [`RenderError::InvalidInput`] when an atlas instance exists but no atlas
@@ -526,6 +530,9 @@ pub fn draw_list_onto(
     // CTX-0347: selection/cursor overlays stay visible above the image.
     for fill in &list.overlay_fills {
         surface.fill_rect(fill.rect, fill.color);
+    }
+    for fill in &list.overlay_rounded_fills {
+        surface.fill_rounded_rect(fill);
     }
     for glyph in &list.glyphs {
         match &glyph.source {
@@ -897,6 +904,48 @@ mod tests {
     }
 
     #[test]
+    fn overlay_rounded_chrome_paints_above_overlay_fills() {
+        // CTX-1477: the help card is an opaque rounded overlay, so it must
+        // cover the selection/cursor overlay fills that paint before it and
+        // stay below the glyphs that paint after it.
+        use crate::grid::{DrawList, FillRect, RoundedFill};
+        let mut surface = SurfaceRgba::try_new(4, 4).unwrap();
+        surface.clear([0, 0, 0, 255]);
+        let list = DrawList {
+            generation: 1,
+            atlas_epoch: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(4, 4),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 4, 4)],
+            },
+            fills: vec![],
+            rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![FillRect {
+                rect: crate::geometry::RectPx::new(0, 0, 4, 4),
+                color: [255, 0, 0, 255],
+            }],
+            overlay_rounded_fills: vec![RoundedFill {
+                frame: crate::geometry::RectPx::new(0, 0, 4, 4),
+                border: 0,
+                radius: 1,
+                color: [0, 255, 0, 255],
+            }],
+            glyphs: vec![],
+            images: vec![],
+        };
+        draw_list_onto(&list, None, &mut surface).unwrap();
+        let offset = (4 + 1) * 4;
+        let pixel = &surface.as_bytes()[offset..offset + 4];
+        assert_eq!(
+            pixel,
+            [0, 255, 0, 255],
+            "overlay rounded chrome covers the earlier overlay fill"
+        );
+    }
+
+    #[test]
     fn draw_list_paints_rounded_fills_after_plain_fills() {
         use crate::grid::{DrawList, FillRect, GlyphSource, RoundedFill};
         let mut surface = SurfaceRgba::try_new(8, 8).unwrap();
@@ -924,6 +973,7 @@ mod tests {
             }],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -992,6 +1042,7 @@ mod tests {
                 rect: crate::geometry::RectPx::new(0, 0, 4, 4),
                 color: [0, 0, 255, 255],
             }],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };

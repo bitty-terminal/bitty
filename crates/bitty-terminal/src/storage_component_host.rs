@@ -2075,15 +2075,16 @@ mod tests {
 
     #[test]
     fn root_selection_rejects_invalid_profiles_and_relative_bases() {
-        assert!(StorageRootSelection::under("/tmp", "default").is_ok());
-        assert!(StorageRootSelection::under("/tmp", "../default").is_err());
+        let absolute = std::env::temp_dir();
+        assert!(StorageRootSelection::under(&absolute, "default").is_ok());
+        assert!(StorageRootSelection::under(&absolute, "../default").is_err());
         assert!(StorageRootSelection::under("relative", "default").is_err());
-        assert!(StorageRootSelection::under("/tmp", "Upper").is_err());
+        assert!(StorageRootSelection::under(&absolute, "Upper").is_err());
     }
 
     #[test]
     fn component_config_defaults_off_with_standard_deadlines() {
-        let root = StorageRootSelection::under("/tmp", "default").expect("root");
+        let root = StorageRootSelection::under(std::env::temp_dir(), "default").expect("root");
         let config = StorageComponentConfig::disabled(root);
         assert_eq!(config.gate, StorageComponentGate::DISABLED);
         assert_eq!(config.operation_deadline, DEFAULT_OPERATION_DEADLINE);

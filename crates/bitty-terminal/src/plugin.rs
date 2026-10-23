@@ -9,7 +9,7 @@
 //!
 //! # Contract (implemented)
 //!
-//! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|info|config`
+//! - Shape: `bitty plugin list|install|remove|enable|disable|revoke|grant|info|config`
 //!   with `list`/`info`/`config show` accepting `--format table|json|jsonl`
 //!   (default table) and `--no-color`; `doctor` also accepts `--no-color`.
 //! - `install <id>` resolves an exact id against the **bundled** catalog or
@@ -59,6 +59,20 @@
 //!   dropping the record: a full revoke clears the granted set and disables,
 //!   a `--cap` revoke drops one capability and remembers it as an explicit
 //!   denial (no silent re-prompt); re-grant goes through `install` consent.
+//! - `install <bundled-id> --profile <name>` and
+//!   `grant <id> --profile <name>` apply a versioned category preselect
+//!   (`minimal`, `editor-like`, `panel-like`, `agent-like`). A profile is
+//!   only a set of individual grants drawn from the manifest's requested
+//!   set, never a new authority layer: the diff/review screen runs before
+//!   apply, every grant stays visible and revocable one by one, sensitive
+//!   heads (exec, network, agent/MCP/AI, clipboard read, environment,
+//!   terminal input/raw read, debug, browser, device control) are excluded
+//!   and need explicit `grant --cap` consent, and an unknown/removed head
+//!   fails closed against the live catalog. Store packages reject `--profile`
+//!   because their install transaction owns the full grant set.
+//! - `grant <id> --cap <capability>` is the explicit per-item consent path;
+//!   it cannot exceed the manifest's requested set and never clears an
+//!   explicit denial (`install` re-consent does).
 //! - `list` shows every bundled plugin, every embedded official catalog entry
 //!   (`available`, or `incompatible` when the declared range excludes this
 //!   host), and any recorded or installed extra, with source, state
@@ -131,8 +145,10 @@
 //!   `bitty-plugin-host`'s closed capability grammar
 //!   ([`CapabilityId`]); filesystem requests expand to
 //!   `fs.read:PARAM`/`fs.write:PARAM` exactly as the host does.
-//! - Nothing is granted implicitly: the recorded grant set is exactly the
-//!   manifest's requested set at approval time, bound to the manifest hash.
+//! - Nothing is granted implicitly: the recorded grant set is always a
+//!   subset of the manifest's requested set at approval time, bound to the
+//!   manifest hash. A profile only preselects that subset; it cannot add
+//!   authority, bypass the six-layer intersection, or resurrect a denial.
 //! - No ambient authority is created by the CLI: it cannot load plugins, it
 //!   cannot widen a grant without a fresh consent, and it never executes
 //!   package code (P0-AC-027).
@@ -168,6 +184,9 @@ use std::path::{Path, PathBuf};
 use bitty_config::plugin_file::PLUGINS_DIR_NAME;
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
+use bitty_plugin_host::consent_profile::{
+    CONSENT_PROFILE_VERSION, ConsentProfile, ProfileSelection,
+};
 use bitty_plugin_host::effective::{
     AgentRequest, CapabilityExplanation, CapabilityScope, DenialKind, ENFORCEMENT_MAP,
     EffectiveLayer, EffectiveStack, EnforcementEntry, LayerState, MAX_POLICY_FILE_BYTES,
@@ -289,6 +308,8 @@ pub enum PluginVerb {
     Explain,
     /// `revoke <id> [--cap <capability>]`: drop grants (durable denial).
     Revoke,
+    /// `grant <id> --profile <name> | --cap <capability>`: add reviewed grants.
+    Grant,
     /// `config [show|scaffold] <id>`: inspect or scaffold per-plugin settings.
     Config,
     /// `doctor [--repair]`: diagnose store/ledger health and optionally repair.
@@ -330,6 +351,7 @@ impl PluginVerb {
         ("info", Self::Info),
         ("explain", Self::Explain),
         ("revoke", Self::Revoke),
+        ("grant", Self::Grant),
         ("config", Self::Config),
         ("doctor", Self::Doctor),
     ];
@@ -355,6 +377,7 @@ impl PluginVerb {
             Self::Info => "info",
             Self::Explain => "explain",
             Self::Revoke => "revoke",
+            Self::Grant => "grant",
             Self::Config => "config",
             Self::Doctor => "doctor",
         }
@@ -384,6 +407,8 @@ pub struct PluginRequest {
     pub force: bool,
     /// `revoke --cap <capability>`: revoke one capability instead of all.
     pub cap: Option<String>,
+    /// `install`/`grant --profile <name>`: reviewed capability preselect.
+    pub profile: Option<String>,
     /// `--no-color` (accepted for parity; tables are plain text).
     pub no_color: bool,
     /// `config` action (`show` default, `scaffold` via the verb or `--init`).
@@ -431,6 +456,7 @@ pub fn parse_plugin_request(
     let mut yes = false;
     let mut force = false;
     let mut cap: Option<String> = None;
+    let mut profile: Option<String> = None;
     let mut no_color = false;
     let mut config_action: Option<ConfigAction> = None;
     let mut init = false;
@@ -488,6 +514,27 @@ pub fn parse_plugin_request(
                 index += 2;
                 continue;
             }
+            "--profile" => {
+                let Some(value) = raw.get(index + 1) else {
+                    return Err(PluginParseError::Usage(
+                        "bitty plugin: --profile needs a value (minimal|editor-like|panel-like|agent-like)"
+                            .to_string(),
+                    ));
+                };
+                if !bare_token_ok(value) {
+                    return Err(PluginParseError::Usage(format!(
+                        "bitty plugin: --profile value is empty, contains NUL, or exceeds {MAX_PLUGIN_TOKEN_BYTES} bytes"
+                    )));
+                }
+                if profile.is_some() {
+                    return Err(PluginParseError::Usage(
+                        "bitty plugin: duplicate --profile".to_string(),
+                    ));
+                }
+                profile = Some(value.clone());
+                index += 2;
+                continue;
+            }
             "--no-color" => {
                 no_color = true;
                 index += 1;
@@ -520,6 +567,21 @@ pub fn parse_plugin_request(
             index += 1;
             continue;
         }
+        if let Some(value) = token.strip_prefix("--profile=") {
+            if !bare_token_ok(value) {
+                return Err(PluginParseError::Usage(format!(
+                    "bitty plugin: --profile value is empty, contains NUL, or exceeds {MAX_PLUGIN_TOKEN_BYTES} bytes"
+                )));
+            }
+            if profile.is_some() {
+                return Err(PluginParseError::Usage(
+                    "bitty plugin: duplicate --profile".to_string(),
+                ));
+            }
+            profile = Some(value.to_string());
+            index += 1;
+            continue;
+        }
         if token == "--format" {
             // Pair form: consume the next token as the value; a missing
             // value is usage (fail closed before dispatch).
@@ -548,7 +610,7 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info|explain|revoke|config|doctor)"
+                         (want list|install|remove|enable|disable|info|explain|revoke|grant|config|doctor)"
                     )));
                 }
             }
@@ -579,7 +641,7 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|explain|revoke|config|doctor)"
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|explain|revoke|grant|config|doctor)"
                 .to_string(),
         )
     })?;
@@ -615,17 +677,46 @@ pub fn parse_plugin_request(
             verb.name()
         )));
     }
-    if yes && verb != PluginVerb::Install {
+    if yes && !matches!(verb, PluginVerb::Install | PluginVerb::Grant) {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --yes only applies to `install` (got `{}`)",
+            "bitty plugin: --yes only applies to `install` and `grant` (got `{}`)",
             verb.name()
         )));
     }
-    if cap.is_some() && verb != PluginVerb::Revoke {
+    if cap.is_some() && !matches!(verb, PluginVerb::Revoke | PluginVerb::Grant) {
         return Err(PluginParseError::Usage(format!(
-            "bitty plugin: --cap only applies to `revoke` (got `{}`)",
+            "bitty plugin: --cap only applies to `revoke` and `grant` (got `{}`)",
             verb.name()
         )));
+    }
+    if profile.is_some() && !matches!(verb, PluginVerb::Install | PluginVerb::Grant) {
+        return Err(PluginParseError::Usage(format!(
+            "bitty plugin: --profile only applies to `install` and `grant` (got `{}`)",
+            verb.name()
+        )));
+    }
+    if let Some(name) = profile.as_deref() {
+        if ConsentProfile::parse(name).is_none() {
+            return Err(PluginParseError::Usage(format!(
+                "bitty plugin: unknown --profile {name:?} (want minimal|editor-like|panel-like|agent-like)"
+            )));
+        }
+    }
+    if verb == PluginVerb::Grant {
+        match (profile.is_some(), cap.is_some()) {
+            (true, true) => {
+                return Err(PluginParseError::Usage(
+                    "bitty plugin: `grant` takes one of --profile or --cap, not both".to_string(),
+                ));
+            }
+            (false, false) => {
+                return Err(PluginParseError::Usage(
+                    "bitty plugin: `grant` needs --profile <name> or --cap <capability>"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
     }
     if format != PluginFormat::Table
         && !matches!(
@@ -715,6 +806,7 @@ pub fn parse_plugin_request(
         yes,
         force,
         cap,
+        profile,
         no_color,
         config_action,
         repair,
@@ -725,7 +817,8 @@ pub fn parse_plugin_request(
 #[must_use]
 pub fn plugin_usage() -> String {
     "usage: bitty plugin list [--format table|json|jsonl] [--no-color]\n\
-     \x20      bitty plugin install <id> [--yes]   (bundled id or official catalog id)\n\
+     \x20      bitty plugin install <id> [--yes] [--profile <name>]   (bundled id)\n\
+     \x20      bitty plugin install <id> [--yes]   (official catalog id)\n\
      \x20      bitty plugin install <path> [--yes] [--force]   (local directory package)\n\
      \x20      bitty plugin install <git-url> [--yes] [--force]   (https://<host>/<path>.git | git+https://... | git@<host>:<path>)\n\
      \x20      bitty plugin install <archive> [--yes] [--force]   (.tar.gz/.tgz/.tar.zst/.zip file)\n\
@@ -734,10 +827,14 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin revoke <id> [--cap <capability>]\n\
+     \x20      bitty plugin grant <id> --profile <name> [--yes]\n\
+     \x20      bitty plugin grant <id> --cap <capability> [--yes]\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin explain <id> <capability> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config show <id> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config scaffold <id> [--force]\n\
+     \x20      profiles (preselect only; review before apply): minimal | editor-like |\n\
+     \x20      panel-like | agent-like. Sensitive caps stay explicit per-item consent.\n\
      \n\
      Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.toml\n\
      (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
@@ -771,7 +868,9 @@ pub fn plugin_help_text() -> String {
      \x20                             Incompatible entries are refused with the\n\
      \x20                             exact declared range before any fetch.\n\
      \x20                             Capabilities need explicit consent; --yes\n\
-     \x20                             approves without a prompt.\n\
+     \x20                             approves without a prompt. Add\n\
+     \x20                             --profile <name> for a bundled id to\n\
+     \x20                             preselect a reviewed subset (see flags).\n\
      \x20 install <path> [--yes]      Install or update an external package from\n\
      \x20                             a local directory containing\n\
      \x20                             bitty-plugin.toml (lua/ module root). The\n\
@@ -828,6 +927,26 @@ pub fn plugin_help_text() -> String {
      \x20                             one capability is dropped and remembered\n\
      \x20                             as explicitly denied (no silent re-prompt).\n\
      \x20                             Re-grant with `install` (explicit consent).\n\
+     \x20 grant <id> --profile <name> [--yes]\n\
+     \x20                             Apply one category profile to a bundled\n\
+     \x20                             record. The profile only preselects\n\
+     \x20                             individual grants the manifest already\n\
+     \x20                             requests; a diff/review screen lists\n\
+     \x20                             additions, already-granted, non-selected,\n\
+     \x20                             explicitly denied, and sensitive heads\n\
+     \x20                             that need per-item consent. It never\n\
+     \x20                             enables the plugin, revokes, or clears a\n\
+     \x20                             denial. Profiles: minimal | editor-like |\n\
+     \x20                             panel-like | agent-like.\n\
+     \x20 grant <id> --cap <capability> [--yes]\n\
+     \x20                             Explicitly grant one requested\n\
+     \x20                             capability. This is the per-item path for\n\
+     \x20                             exec/network/agent/clipboard-read/env and\n\
+     \x20                             every other sensitive head; naming it is\n\
+     \x20                             the consent action. It cannot add a\n\
+     \x20                             capability the manifest does not request,\n\
+     \x20                             and it never clears an explicit denial\n\
+     \x20                             (re-run `install` to re-consent).\n\
      \x20 info <id>                   Manifest + recorded state, with the plain-\
      \x20                             language effect per capability.\n\
      \x20 explain <id> <capability>    Read-only capability decision chain for one\n\
@@ -867,8 +986,10 @@ pub fn plugin_help_text() -> String {
      \x20 --json                      Alias for --format json.\n\
      \x20 --no-color                  list/info/explain/config/doctor output (tables\n\
      \x20                             are plain text; this also honors NO_COLOR).\n\
-     \x20 --yes                       install only: approve capability consent and\n\
-     \x20                             an orphan/same-version repair prompt.\n\
+     \x20 --yes                       install/grant: approve capability consent and\n\
+     \x20                             an orphan/same-version repair prompt. With\n\
+     \x20                             --profile it approves only the reviewed\n\
+     \x20                             preselected set, never sensitive heads.\n\
      \x20 --force                     install/remove/config scaffold: install\n\
      \x20                             replaces an orphaned or same-version tree\n\
      \x20                             without the repair prompt; remove confirms\n\
@@ -877,7 +998,19 @@ pub fn plugin_help_text() -> String {
      \x20 --repair                    doctor only: quarantine/rebuild the store\n\
      \x20                             and ledger.\n\
      \x20 --init                      config only: alias for `config scaffold`.\n\
-     \x20 --cap <capability>          revoke only: revoke one capability.\n\
+     \x20 --cap <capability>          revoke/grant only: revoke one granted\n\
+     \x20                             capability, or explicitly grant one\n\
+     \x20                             manifest-requested capability.\n\
+     \x20 --profile <name>            install (bundled ids)/grant only: apply a\n\
+     \x20                             versioned category preselect (minimal,\n\
+     \x20                             editor-like, panel-like, agent-like).\n\
+     \x20                             Profiles never include exec, network,\n\
+     \x20                             agent/MCP/AI, clipboard read, environment,\n\
+     \x20                             terminal input/raw read, debug, browser,\n\
+     \x20                             or device control; grant those one at a\n\
+     \x20                             time with --cap. Store packages reject\n\
+     \x20                             --profile: their install transaction owns\n\
+     \x20                             the full grant set.\n\
      \n\
      download consent:\n\
      \x20 Capability grants use explicit confirm: --yes approves\n\
@@ -886,7 +1019,11 @@ pub fn plugin_help_text() -> String {
      \x20 answer); `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
      \x20 A decline or EOF exits 1 with nothing changed. Unchanged or\n\
      \x20 narrowed capability sets carry forward silently; added\n\
-     \x20 capabilities always need fresh consent. Native extension downloads\n\
+     \x20 capabilities always need fresh consent. Capability profiles are\n\
+     \x20 only a preselection over individual grants: the review/diff screen\n\
+     \x20 runs before apply, every selected capability is recorded and\n\
+     \x20 revocable one by one, and the six-layer intersection plus every\n\
+     \x20 existing denial path is unchanged. Native extension downloads\n\
      \x20 (`bitty extension install`) follow the same levels: the builtin\n\
      \x20 installer egress cdn.bitty.run:443 needs no extra grant, while\n\
      \x20 third-party hosts stay consent-gated and fail closed.\n\
@@ -966,6 +1103,9 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
+     \x20 bitty plugin install bitty-terminal.shell-integration --profile editor-like --yes\n\
+     \x20 bitty plugin grant xuepoo.hello --profile panel-like\n\
+     \x20 bitty plugin grant xuepoo.hello --cap network.connect:example.com:443\n\
      \x20 bitty plugin install bitty-terminal.bar --yes   (official catalog id)\n\
      \x20 bitty plugin install ./my-plugin --yes\n\
      \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
@@ -1228,7 +1368,7 @@ impl PluginState {
     pub fn render(&self) -> String {
         let mut out = String::from(
             "# bitty managed plugin manifest — machine-generated by `bitty plugin`.\n\
-             # Do not edit by hand; use bitty plugin list|install|remove|enable|disable|revoke.\n",
+             # Do not edit by hand; use bitty plugin list|install|remove|enable|disable|revoke|grant.\n",
         );
         let _ = writeln!(out, "state_version = {STATE_VERSION}");
         for (id, record) in &self.records {
@@ -1862,8 +2002,8 @@ pub(crate) fn init_install_bundled_with_consent(
     output: &mut dyn std::io::Write,
 ) -> Result<String, String> {
     let mut state = load_state(state_path).map_err(|failure| failure.message)?;
-    let result =
-        op_install(&mut state, id.trim(), yes, input, output).map_err(|failure| failure.message)?;
+    let result = op_install(&mut state, id.trim(), yes, None, input, output)
+        .map_err(|failure| failure.message)?;
     let summary = result.summary.clone();
     if result.changed {
         save_state(state_path, &state).map_err(|failure| failure.message)?;
@@ -4246,6 +4386,9 @@ pub fn run_plugin_subcommand(
             // directory in the cwd cannot shadow an official id; a local
             // package with that name is still reachable as `./<name>`.
             if let Some(entry) = official_plugin_for(operand) {
+                if request.profile.is_some() {
+                    return reject_store_profile(operand, output);
+                }
                 return install_official(
                     &request,
                     entry,
@@ -4256,6 +4399,9 @@ pub fn run_plugin_subcommand(
                 );
             }
             if is_source_operand(operand) {
+                if request.profile.is_some() {
+                    return reject_store_profile(operand, output);
+                }
                 return install_source(
                     &request,
                     operand,
@@ -4265,7 +4411,11 @@ pub fn run_plugin_subcommand(
                     output,
                 );
             }
-            match op_install(&mut state, operand, request.yes, input, output) {
+            let profile = request
+                .profile
+                .as_deref()
+                .map(|name| ConsentProfile::parse(name).expect("parser validates --profile"));
+            match op_install(&mut state, operand, request.yes, profile, input, output) {
                 Ok(result) => {
                     let code = finish_mutation(&path, state, result, output);
                     if code == EXIT_OK {
@@ -4356,6 +4506,47 @@ pub fn run_plugin_subcommand(
             }
             match op_revoke(&mut state, id, request.cap.as_deref()) {
                 Ok(result) => finish_mutation(&path, state, result, output),
+                Err(failure) => {
+                    eprintln!("{}", failure.message);
+                    failure.exit
+                }
+            }
+        }
+        PluginVerb::Grant => {
+            let id = request.id.as_deref().expect("grant requires an id");
+            if !is_managed_operand(&state, id) {
+                eprintln!(
+                    "bitty plugin: `grant {id}` needs a managed record (bundled plugin); \
+                     installed packages change grants only by `bitty plugin remove {id} --force` \
+                     followed by a reviewed `bitty plugin install <source>`"
+                );
+                return EXIT_PLUGIN;
+            }
+            let profile = request
+                .profile
+                .as_deref()
+                .map(|name| ConsentProfile::parse(name).expect("parser validates --profile"));
+            match op_grant(
+                &mut state,
+                id,
+                profile,
+                request.cap.as_deref(),
+                request.yes,
+                input,
+                output,
+            ) {
+                Ok(result) => {
+                    let already_enabled = state.get(id).is_some_and(|record| record.enabled);
+                    let code = finish_mutation(&path, state, result, output);
+                    if code == EXIT_OK && !already_enabled {
+                        let _ = writeln!(
+                            output,
+                            "bitty plugin: '{id}' remains disabled; review `bitty plugin info {id}` \
+                             and run `bitty plugin enable {id}` once every requested capability is granted"
+                        );
+                    }
+                    code
+                }
                 Err(failure) => {
                     eprintln!("{}", failure.message);
                     failure.exit
@@ -6891,6 +7082,7 @@ fn op_install(
     state: &mut PluginState,
     id: &str,
     yes: bool,
+    profile: Option<ConsentProfile>,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> Result<OpOutput, PluginFailure> {
@@ -6900,6 +7092,7 @@ fn op_install(
     let requested = requested_capabilities(&manifest)?;
     let existing = state.get(id).cloned();
     let now = now_unix_secs();
+    let catalog = bitty_package::CapabilityCatalog::core();
 
     // P0-AC-030 pattern: only capabilities absent from the recorded grant
     // need consent; unchanged/narrowed sets carry forward silently.
@@ -6910,7 +7103,67 @@ fn op_install(
         None => requested.clone(),
     };
 
-    let approved = if needed.is_empty() {
+    let profile_plan = match profile {
+        None => None,
+        Some(profile) => {
+            let empty = BTreeSet::new();
+            let granted = existing
+                .as_ref()
+                .map(|record| record.granted.clone())
+                .unwrap_or_else(|| empty.clone());
+            let denied = existing
+                .as_ref()
+                .map(|record| record.denied.clone())
+                .unwrap_or_else(|| empty.clone());
+            let plan =
+                ProfileSelection::resolve(profile, &catalog, &requested, &granted, &denied)
+                    .map_err(|error| {
+                        PluginFailure::plugin(
+                            "CapabilityProfile",
+                            format!(
+                                "bitty plugin: capability profile '{}' failed validation: {error} — nothing changed",
+                                profile.name()
+                            ),
+                        )
+                    })?;
+            print_profile_review(output, id, &manifest_hash, &plan);
+            if !plan.selected.is_empty() {
+                let approved = if yes {
+                    let _ = writeln!(
+                        output,
+                        "bitty plugin: --yes applied profile '{}' v{CONSENT_PROFILE_VERSION} for '{id}': {} capabilit{}",
+                        profile.name(),
+                        plan.selected.len(),
+                        if plan.selected.len() == 1 { "y" } else { "ies" }
+                    );
+                    true
+                } else {
+                    ask_yes_no(
+                        input,
+                        output,
+                        &format!(
+                            "Apply profile '{}' (grant {} capabilit{})? [y/N] ",
+                            profile.name(),
+                            plan.selected.len(),
+                            if plan.selected.len() == 1 { "y" } else { "ies" }
+                        ),
+                    )?
+                };
+                if !approved {
+                    return Err(PluginFailure::generic(
+                        "ConsentDeclined",
+                        format!(
+                            "bitty plugin: capability profile '{}' for '{id}' was not approved — nothing changed",
+                            profile.name()
+                        ),
+                    ));
+                }
+            }
+            Some(plan)
+        }
+    };
+
+    let approved = if profile_plan.is_some() || needed.is_empty() {
         true
     } else if yes {
         let _ = writeln!(
@@ -6933,10 +7186,35 @@ fn op_install(
 
     // Explicit consent is the re-grant action: requested capabilities leave
     // the denial set. Only consent clears denials; enable/disable/revoke
-    // never do (deny-loop guard).
-    let denied: BTreeSet<CapabilityId> = match &existing {
-        Some(record) => record.denied.difference(&requested).cloned().collect(),
-        None => BTreeSet::new(),
+    // never do (deny-loop guard). A profile only preselects additions, so it
+    // never clears a denial: only a full `install` re-consent does.
+    let denied: BTreeSet<CapabilityId> = match (&existing, &profile_plan) {
+        (Some(record), Some(plan)) => record
+            .denied
+            .iter()
+            .filter(|capability| {
+                requested.contains(*capability) && !plan.selected.contains(*capability)
+            })
+            .cloned()
+            .collect(),
+        (Some(record), None) => record.denied.difference(&requested).cloned().collect(),
+        (None, _) => BTreeSet::new(),
+    };
+
+    let (granted, enabled) = match &profile_plan {
+        Some(plan) => {
+            let mut base = existing
+                .as_ref()
+                .map(|record| record.granted.clone())
+                .unwrap_or_default();
+            // Never preserve a grant the current manifest no longer requests.
+            base.retain(|capability| requested.contains(capability));
+            let granted = plan.granted_after(&base);
+            let enabled = requested.is_subset(&granted)
+                && existing.as_ref().is_none_or(|record| record.enabled);
+            (granted, enabled)
+        }
+        None => (requested.clone(), true),
     };
 
     // Manifest-hash changes commit through the grant engine so the P0-AC-030
@@ -6956,7 +7234,7 @@ fn op_install(
                     &plugin_id,
                     &record.manifest_hash,
                     &manifest_hash,
-                    &requested,
+                    &granted,
                     true,
                     now,
                 )
@@ -6972,8 +7250,8 @@ fn op_install(
     let changed = match &existing {
         Some(record) => {
             record.manifest_hash != manifest_hash
-                || !record.enabled
-                || record.granted != requested
+                || record.enabled != enabled
+                || record.granted != granted
                 || record.denied != denied
         }
         None => true,
@@ -6984,8 +7262,8 @@ fn op_install(
             PluginRecord {
                 source: "bundled".to_string(),
                 manifest_hash: manifest_hash.clone(),
-                enabled: true,
-                granted: requested.clone(),
+                enabled,
+                granted: granted.clone(),
                 denied,
             },
         );
@@ -6995,16 +7273,31 @@ fn op_install(
         Some(_) if !changed => "already installed",
         Some(_) => "updated",
     };
-    Ok(OpOutput {
-        summary: format!(
-            "bitty plugin: {action} '{id}' (version {}, manifest {}, {} capabilit{} granted, enabled)",
-            manifest.identity.version,
-            short_hash(&manifest_hash),
-            requested.len(),
-            if requested.len() == 1 { "y" } else { "ies" }
-        ),
-        changed,
-    })
+    let state_word = if enabled {
+        "enabled"
+    } else if requested.is_subset(&granted) {
+        "disabled"
+    } else {
+        "disabled until every requested capability is explicitly granted"
+    };
+    let mut summary = format!(
+        "bitty plugin: {action} '{id}' (version {}, manifest {}, {} of {} capabilit{} granted, {state_word})",
+        manifest.identity.version,
+        short_hash(&manifest_hash),
+        granted.len(),
+        requested.len(),
+        if requested.len() == 1 { "y" } else { "ies" }
+    );
+    if let Some(plan) = &profile_plan {
+        let _ = write!(
+            summary,
+            "; profile '{}' v{} selected {}",
+            plan.profile.name(),
+            plan.profile_version,
+            plan.selected.len()
+        );
+    }
+    Ok(OpOutput { summary, changed })
 }
 
 fn op_enable(state: &mut PluginState, id: &str) -> Result<OpOutput, PluginFailure> {
@@ -7190,6 +7483,344 @@ fn op_revoke(
         },
         changed: true,
     })
+}
+
+/// Add reviewed grants to a recorded bundled plugin.
+///
+/// This is the apply path for `--profile`; `--cap` is the explicit per-item
+/// path for sensitive capabilities. Neither path enables the plugin, removes
+/// existing grants, clears an explicit per-capability denial, or widens the
+/// manifest's requested set. Only a full `install` re-consent clears denials.
+fn op_grant(
+    state: &mut PluginState,
+    id: &str,
+    profile: Option<ConsentProfile>,
+    capability: Option<&str>,
+    yes: bool,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> Result<OpOutput, PluginFailure> {
+    resolve_plugin_id(id)?;
+    let manifest = bundled_manifest(id)?;
+    let manifest_hash = manifest.manifest_hash();
+    let record = state.get(id).cloned().ok_or_else(|| not_installed(id))?;
+    if record.manifest_hash != manifest_hash {
+        return Err(PluginFailure::plugin(
+            "PinMismatch",
+            format!(
+                "bitty plugin: '{id}' manifest changed since consent (pin {}, current {}); \
+                 review with `bitty plugin info {id}` and re-run `bitty plugin install {id}`",
+                short_hash(&record.manifest_hash),
+                short_hash(&manifest_hash)
+            ),
+        ));
+    }
+    let requested = requested_capabilities(&manifest)?;
+    let catalog = bitty_package::CapabilityCatalog::core();
+
+    if let Some(profile) = profile {
+        let plan = ProfileSelection::resolve(
+            profile,
+            &catalog,
+            &requested,
+            &record.granted,
+            &record.denied,
+        )
+        .map_err(|error| {
+            PluginFailure::plugin(
+                "CapabilityProfile",
+                format!(
+                    "bitty plugin: capability profile '{}' failed validation: {error} — nothing changed",
+                    profile.name()
+                ),
+            )
+        })?;
+        print_profile_review(output, id, &manifest_hash, &plan);
+        if plan.selected.is_empty() {
+            return Ok(OpOutput {
+                summary: format!(
+                    "bitty plugin: profile '{}' v{} grants nothing new for '{id}' \
+                     ({} already granted, {} require explicit per-item consent, {} not selected, {} denied)",
+                    profile.name(),
+                    plan.profile_version,
+                    plan.already_granted.len(),
+                    plan.excluded_sensitive.len(),
+                    plan.not_selected.len(),
+                    plan.denied.len()
+                ),
+                changed: false,
+            });
+        }
+        let approved = if yes {
+            let _ = writeln!(
+                output,
+                "bitty plugin: --yes applied profile '{}' v{CONSENT_PROFILE_VERSION} for '{id}': {} capabilit{}",
+                profile.name(),
+                plan.selected.len(),
+                if plan.selected.len() == 1 { "y" } else { "ies" }
+            );
+            true
+        } else {
+            ask_yes_no(
+                input,
+                output,
+                &format!(
+                    "Apply profile '{}' (grant {} capabilit{})? [y/N] ",
+                    profile.name(),
+                    plan.selected.len(),
+                    if plan.selected.len() == 1 { "y" } else { "ies" }
+                ),
+            )?
+        };
+        if !approved {
+            return Err(PluginFailure::generic(
+                "ConsentDeclined",
+                format!(
+                    "bitty plugin: capability profile '{}' for '{id}' was not approved — nothing changed",
+                    profile.name()
+                ),
+            ));
+        }
+        let granted_after = plan.granted_after(&record.granted);
+        let added = plan.selected.len();
+        let entry = state.get_mut(id).expect("checked");
+        entry.granted = granted_after;
+        let complete = requested.is_subset(&entry.granted);
+        return Ok(OpOutput {
+            summary: format!(
+                "bitty plugin: applied profile '{}' v{} to '{id}' (+{added} capabilit{}; {} of {} granted; {})",
+                profile.name(),
+                plan.profile_version,
+                if added == 1 { "y" } else { "ies" },
+                entry.granted.len(),
+                requested.len(),
+                if complete {
+                    format!("re-run `bitty plugin enable {id}` to enable")
+                } else {
+                    format!(
+                        "{} requested capabilit{} still need explicit per-item consent",
+                        requested.difference(&entry.granted).count(),
+                        if requested.difference(&entry.granted).count() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    )
+                }
+            ),
+            changed: true,
+        });
+    }
+
+    let Some(raw) = capability else {
+        return Err(PluginFailure::usage(
+            "bitty plugin: `grant` needs --profile <name> or --cap <capability>".to_string(),
+        ));
+    };
+    let capability = CapabilityId::parse(raw).map_err(|error| {
+        PluginFailure::usage(format!("bitty plugin: invalid capability: {error}"))
+    })?;
+    if !requested.contains(&capability) {
+        return Err(PluginFailure::plugin(
+            "CapabilityNotRequested",
+            format!(
+                "bitty plugin: '{}' is not requested by '{id}' (grants never exceed the manifest; \
+                 review `bitty plugin info {id}`)",
+                capability.as_str()
+            ),
+        ));
+    }
+    if record.granted.contains(&capability) {
+        return Ok(OpOutput {
+            summary: format!(
+                "bitty plugin: '{}' is already granted for '{id}'",
+                capability.as_str()
+            ),
+            changed: false,
+        });
+    }
+    // Preserve the existing denial path: only a full `install` re-consent
+    // clears a durable per-capability denial. `grant --cap` is narrow and
+    // must never become a deny-loop bypass.
+    if record.denied.contains(&capability) {
+        return Err(PluginFailure::plugin(
+            "CapabilityDenied",
+            format!(
+                "bitty plugin: '{}' is explicitly denied for '{id}'; \
+                 re-run `bitty plugin install {id}` and approve the capability to re-grant it",
+                capability.as_str()
+            ),
+        ));
+    }
+    print_capability_review(output, id, &manifest_hash, &capability);
+    let approved = if yes {
+        let _ = writeln!(
+            output,
+            "bitty plugin: --yes granted '{}' for '{id}'",
+            capability.as_str()
+        );
+        true
+    } else {
+        ask_yes_no(
+            input,
+            output,
+            &format!("Grant '{}'? [y/N] ", capability.as_str()),
+        )?
+    };
+    if !approved {
+        return Err(PluginFailure::generic(
+            "ConsentDeclined",
+            format!(
+                "bitty plugin: capability grant for '{}' was not approved — nothing changed",
+                capability.as_str()
+            ),
+        ));
+    }
+    let entry = state.get_mut(id).expect("checked");
+    entry.granted.insert(capability.clone());
+    let complete = requested.is_subset(&entry.granted);
+    Ok(OpOutput {
+        summary: format!(
+            "bitty plugin: granted '{}' for '{id}' ({} of {} granted; {})",
+            capability.as_str(),
+            entry.granted.len(),
+            requested.len(),
+            if complete {
+                format!("re-run `bitty plugin enable {id}` to enable")
+            } else {
+                "remaining requested capabilities still need explicit per-item consent".to_string()
+            }
+        ),
+        changed: true,
+    })
+}
+
+/// Render the profile diff/review screen before anything is applied.
+fn print_profile_review(
+    output: &mut dyn std::io::Write,
+    id: &str,
+    manifest_hash: &str,
+    plan: &ProfileSelection,
+) {
+    let _ = writeln!(
+        output,
+        "bitty plugin: capability profile '{}' v{} for '{id}' — {} (manifest {}):",
+        plan.profile.name(),
+        plan.profile_version,
+        plan.profile.summary(),
+        short_hash(manifest_hash)
+    );
+    let _ = writeln!(output, "  -- review before apply --");
+    if plan.selected.is_empty() {
+        let _ = writeln!(output, "  + will grant: none");
+    } else {
+        let _ = writeln!(output, "  + will grant ({}):", plan.selected.len());
+        for capability in &plan.selected {
+            let _ = writeln!(
+                output,
+                "    + {} — {}",
+                capability.as_str(),
+                effect_statement(capability)
+            );
+        }
+    }
+    if !plan.already_granted.is_empty() {
+        let ids: Vec<&str> = plan
+            .already_granted
+            .iter()
+            .map(CapabilityId::as_str)
+            .collect();
+        let _ = writeln!(
+            output,
+            "  = already granted, unchanged ({}): {}",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+    if !plan.excluded_sensitive.is_empty() {
+        let _ = writeln!(
+            output,
+            "  ! explicit per-item consent required ({}):",
+            plan.excluded_sensitive.len()
+        );
+        for capability in &plan.excluded_sensitive {
+            let _ = writeln!(
+                output,
+                "    ! {} — {}; grant explicitly with `bitty plugin grant {id} --cap {}`",
+                capability.as_str(),
+                effect_statement(capability),
+                capability.as_str()
+            );
+        }
+    }
+    if !plan.not_selected.is_empty() {
+        let ids: Vec<&str> = plan.not_selected.iter().map(CapabilityId::as_str).collect();
+        let _ = writeln!(
+            output,
+            "  - not selected by this profile ({}): {}",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+    if !plan.denied.is_empty() {
+        let ids: Vec<&str> = plan.denied.iter().map(CapabilityId::as_str).collect();
+        let _ = writeln!(
+            output,
+            "  x explicitly denied, profile will not clear ({}): {}",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+    if !plan.completes_requested() {
+        let _ = writeln!(
+            output,
+            "  note: after apply the plugin stays disabled until every requested capability is granted"
+        );
+    }
+}
+
+/// Render the single-capability review screen used by explicit `--cap` grants.
+fn print_capability_review(
+    output: &mut dyn std::io::Write,
+    id: &str,
+    manifest_hash: &str,
+    capability: &CapabilityId,
+) {
+    let risk = if capability.is_high_risk() {
+        " (high risk)"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        output,
+        "bitty plugin: explicit capability grant for '{id}' (manifest {}):",
+        short_hash(manifest_hash)
+    );
+    let _ = writeln!(
+        output,
+        "  + {}{risk} — {}",
+        capability.as_str(),
+        effect_statement(capability)
+    );
+}
+
+/// Refuse `--profile` for store packages (official/local/git/archive installs).
+///
+/// The store package pipeline records the manifest's complete requested set
+/// and owns its own consent/rollback transaction. Profiles are a preselection
+/// over the managed bundled ledger only; pretending to narrow a store grant
+/// here would either be a no-op or bypass that transaction, so it fails
+/// closed instead.
+fn reject_store_profile(operand: &str, output: &mut dyn std::io::Write) -> i32 {
+    let _ = writeln!(
+        output,
+        "bitty plugin: --profile applies to bundled managed plugins only; '{operand}' is a store package"
+    );
+    eprintln!(
+        "bitty plugin: install '{operand}' without --profile to review its full capability set, \
+         or use `bitty plugin grant <bundled-id> --profile <name>` for bundled records"
+    );
+    EXIT_USAGE
 }
 
 /// Ask the interactive capability-consent question (fails closed).
@@ -9509,5 +10140,309 @@ mod tests {
         assert!(!store.join("current.json").exists());
         assert!(!store.join("packages").exists());
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    // ── capability consent profiles (CTX-2467, #2472) ─────────────────────
+
+    const PROFILE_PLUGIN: &str = "bitty-terminal.shell-integration";
+
+    fn profile_state(dir: &Path) -> Option<String> {
+        std::fs::read_to_string(state_path(dir)).ok()
+    }
+
+    #[test]
+    fn parse_profile_flows_and_rejections() {
+        let install = parse_ok(&[
+            "install",
+            PROFILE_PLUGIN,
+            "--profile",
+            "editor-like",
+            "--yes",
+        ]);
+        assert_eq!(install.profile.as_deref(), Some("editor-like"));
+        assert!(install.yes);
+
+        let grant = parse_ok(&["grant", PROFILE_PLUGIN, "--profile=panel-like"]);
+        assert_eq!(grant.verb, PluginVerb::Grant);
+        assert_eq!(grant.profile.as_deref(), Some("panel-like"));
+        assert_eq!(grant.cap, None);
+
+        let grant_cap = parse_ok(&["grant", PROFILE_PLUGIN, "--cap", "clipboard.read"]);
+        assert_eq!(grant_cap.cap.as_deref(), Some("clipboard.read"));
+        assert_eq!(grant_cap.profile, None);
+        assert!(parse_ok(&["grant", PROFILE_PLUGIN, "--cap", "clipboard.read", "--yes"]).yes);
+
+        assert!(
+            parse_error(&["install", PROFILE_PLUGIN, "--profile", "nope"])
+                .contains("unknown --profile")
+        );
+        assert!(parse_error(&["grant", PROFILE_PLUGIN]).contains("needs --profile"));
+        assert!(
+            parse_error(&[
+                "grant",
+                PROFILE_PLUGIN,
+                "--profile",
+                "minimal",
+                "--cap",
+                "clipboard.read"
+            ])
+            .contains("not both")
+        );
+        assert!(
+            parse_error(&["revoke", PROFILE_PLUGIN, "--profile", "minimal"])
+                .contains("only applies to `install` and `grant`")
+        );
+        assert!(
+            parse_error(&["install", PROFILE_PLUGIN, "--cap", "clipboard.read"])
+                .contains("only applies to `revoke` and `grant`")
+        );
+        assert!(
+            parse_error(&["grant", PROFILE_PLUGIN, "--profile", "minimal", "--force"])
+                .contains("--force only applies")
+        );
+    }
+
+    #[test]
+    fn install_profile_grants_only_the_preselected_set() {
+        // editor-like preselects terminal.semantic-read, which the bundled
+        // manifest requests: the fresh install is complete and enabled.
+        let (code, out, dir) = run(
+            &[
+                "install",
+                PROFILE_PLUGIN,
+                "--profile",
+                "editor-like",
+                "--yes",
+            ],
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("capability profile 'editor-like' v1"), "{out}");
+        assert!(out.contains("-- review before apply --"), "{out}");
+        assert!(out.contains("+ will grant (1)"), "{out}");
+        let state = profile_state(&dir).expect("state written");
+        assert!(
+            state.contains("granted = [\"terminal.semantic-read\"]"),
+            "{state}"
+        );
+        assert!(state.contains("enabled = true"), "{state}");
+        assert!(
+            out.contains("1 of 1 capabilit"),
+            "summary must report coverage: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn minimal_profile_grants_nothing_and_keeps_the_plugin_disabled() {
+        let (code, out, dir) = run(
+            &["install", PROFILE_PLUGIN, "--profile", "minimal", "--yes"],
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("capability profile 'minimal' v1"), "{out}");
+        assert!(out.contains("+ will grant: none"), "{out}");
+        assert!(out.contains("stays disabled"), "{out}");
+        let state = profile_state(&dir).expect("state written");
+        assert!(state.contains("granted = []"), "{state}");
+        assert!(state.contains("enabled = false"), "{state}");
+        assert!(
+            !state.contains("terminal.semantic-read"),
+            "minimal must not grant the requested capability: {state}"
+        );
+
+        // Applying editor-like later adds exactly its preselected capability
+        // and does not enable the plugin; no grant beyond the profile appears.
+        let config = state_path(&dir).display().to_string();
+        let (code, out, _) = run(
+            &["grant", PROFILE_PLUGIN, "--profile", "editor-like", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("applied profile 'editor-like' v1"), "{out}");
+        let state = profile_state(&dir).expect("state rewritten");
+        assert_eq!(
+            state.matches("terminal.semantic-read").count(),
+            1,
+            "{state}"
+        );
+        assert!(state.contains("enabled = false"), "{state}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_profile_decline_fails_closed() {
+        let (code, out, dir) = run(
+            &["install", PROFILE_PLUGIN, "--profile", "editor-like"],
+            None,
+            "n\n",
+        );
+        assert_eq!(code, EXIT_GENERIC, "{out}");
+        assert!(out.contains("review before apply"), "{out}");
+        assert!(!state_path(&dir).exists(), "decline must not write state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_cap_grant_is_idempotent_and_rejects_unrequested_caps() {
+        let (code, out, dir) = run(
+            &["install", PROFILE_PLUGIN, "--profile", "minimal", "--yes"],
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        let config = state_path(&dir).display().to_string();
+        let (code, out, _) = run(
+            &[
+                "grant",
+                PROFILE_PLUGIN,
+                "--cap",
+                "terminal.semantic-read",
+                "--yes",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("granted 'terminal.semantic-read'"), "{out}");
+        let state = profile_state(&dir).expect("state written");
+        assert!(
+            state.contains("granted = [\"terminal.semantic-read\"]"),
+            "{state}"
+        );
+        assert!(state.contains("enabled = false"), "{state}");
+
+        // Re-running the same explicit grant is an idempotent no-op.
+        let (code, out, _) = run(
+            &[
+                "grant",
+                PROFILE_PLUGIN,
+                "--cap",
+                "terminal.semantic-read",
+                "--yes",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("already granted"), "{out}");
+
+        // A manifest-unrequested capability can never be granted this way.
+        let (code, out, _) = run(
+            &[
+                "grant",
+                PROFILE_PLUGIN,
+                "--cap",
+                "network.connect:example.com:443",
+                "--yes",
+            ],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.is_empty(), "{out}");
+
+        // Unknown capability names fail closed as usage errors.
+        let (code, out, _) = run(
+            &["grant", PROFILE_PLUGIN, "--cap", "made.up", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        assert!(out.is_empty(), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grant_never_clears_an_explicit_denial() {
+        let dir = scratch_dir("grant-denied");
+        let id = PROFILE_PLUGIN;
+        let manifest = bundled_manifest(id).expect("bundled");
+        let capability = CapabilityId::parse("terminal.semantic-read").expect("known");
+        let mut denied = BTreeSet::new();
+        denied.insert(capability.clone());
+        let mut state = PluginState::new();
+        state.insert(
+            id.to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: manifest.manifest_hash(),
+                enabled: false,
+                granted: BTreeSet::new(),
+                denied: denied.clone(),
+            },
+        );
+        save_state(&state_path(&dir), &state).expect("state saved");
+        let config = state_path(&dir).display().to_string();
+
+        // Explicit `--cap` is narrow consent, not a deny-loop bypass.
+        let (code, out, _) = run(
+            &["grant", id, "--cap", "terminal.semantic-read", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.is_empty(), "{out}");
+        let state = load_state(&state_path(&dir)).expect("state readable");
+        let record = state.get(id).expect("record kept");
+        assert!(record.denied.contains(&capability), "denial must persist");
+        assert!(record.granted.is_empty(), "nothing granted");
+
+        // A profile also reports and preserves the denial.
+        let (code, out, _) = run(
+            &["grant", id, "--profile", "editor-like", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("explicitly denied"), "{out}");
+        let state = load_state(&state_path(&dir)).expect("state readable");
+        let record = state.get(id).expect("record kept");
+        assert!(record.denied.contains(&capability), "profile keeps denial");
+        assert!(record.granted.is_empty(), "profile grants nothing denied");
+
+        // `install --profile` is also a preselect, not a denial reset.
+        let (code, out, _) = run(
+            &["install", id, "--profile", "editor-like", "--yes"],
+            Some(&config),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let state = load_state(&state_path(&dir)).expect("state readable");
+        let record = state.get(id).expect("record kept");
+        assert!(
+            record.denied.contains(&capability),
+            "install --profile keeps the denial"
+        );
+        assert!(
+            !record.granted.contains(&capability),
+            "a profile cannot resurrect the denied capability"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_packages_reject_profiles_and_grant() {
+        let (code, out, dir) = run(
+            &["install", "./my-plugin", "--profile", "editor-like"],
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        assert!(!state_path(&dir).exists());
+
+        let (code, out, dir2) = run(
+            &["grant", "xuepoo.hello", "--profile", "editor-like", "--yes"],
+            None,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(out.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

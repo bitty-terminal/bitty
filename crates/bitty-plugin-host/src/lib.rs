@@ -143,6 +143,7 @@
 pub mod audio;
 pub mod bundled;
 pub mod capability;
+pub mod consent_profile;
 pub mod credential_ref;
 pub mod effective;
 pub mod error;

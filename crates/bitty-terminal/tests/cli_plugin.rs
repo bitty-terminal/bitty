@@ -379,6 +379,113 @@ fn plugin_install_consent_decline_and_eof_fail_closed() {
 }
 
 #[test]
+fn plugin_profile_install_and_grant_flow() {
+    let home = scratch_dir("profile-flow");
+
+    // minimal: review screen, no selected grants, plugin stays disabled.
+    let output = run_in(
+        &home,
+        &["plugin", "install", PLUGIN, "--profile", "minimal", "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("capability profile 'minimal' v1"), "{text}");
+    assert!(text.contains("-- review before apply --"), "{text}");
+    assert!(text.contains("+ will grant: none"), "{text}");
+    let state = std::fs::read_to_string(state_file(&home)).expect("state written");
+    assert!(state.contains("granted = []"), "{state}");
+    assert!(state.contains("enabled = false"), "{state}");
+
+    // grant --profile editor-like adds exactly the one preselected
+    // capability; the plugin remains disabled until `enable`.
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "grant",
+            PLUGIN,
+            "--profile",
+            "editor-like",
+            "--yes",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("applied profile 'editor-like' v1"), "{text}");
+    let state = std::fs::read_to_string(state_file(&home)).expect("state rewritten");
+    assert_eq!(
+        state
+            .matches("granted = [\"terminal.semantic-read\"]")
+            .count(),
+        1,
+        "{state}"
+    );
+    assert_eq!(
+        state.matches("terminal.semantic-read").count(),
+        1,
+        "no duplicate or additional grant: {state}"
+    );
+    assert!(state.contains("enabled = false"), "{state}");
+
+    // Explicit enable is still the only activation transition.
+    let output = run_in(&home, &["plugin", "enable", PLUGIN], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // A profile cannot grant a manifest-unrequested capability by name.
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "grant",
+            PLUGIN,
+            "--cap",
+            "network.connect:example.com:443",
+            "--yes",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_profile_rejects_store_sources_before_touching_state() {
+    let home = scratch_dir("profile-store");
+
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "install",
+            "./my-plugin",
+            "--profile",
+            "editor-like",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(!state_file(&home).exists(), "nothing is written");
+
+    let output = run_in(
+        &home,
+        &[
+            "plugin",
+            "grant",
+            "xuepoo.hello",
+            "--profile",
+            "minimal",
+            "--yes",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(!state_file(&home).exists(), "nothing is written");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn plugin_usage_and_plugin_errors_have_stable_exit_codes() {
     let home = scratch_dir("errors");
 

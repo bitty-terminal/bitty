@@ -333,7 +333,14 @@ pub(crate) fn nodes() -> Vec<Node> {
         &mut nodes,
         "plugin",
         plugin_verbs,
-        &["--format", "--no-color", "--yes", "--force", "--cap"],
+        &[
+            "--format",
+            "--no-color",
+            "--yes",
+            "--force",
+            "--cap",
+            "--profile",
+        ],
         false,
     );
     let config_actions: Vec<&'static str> = ConfigAction::ACTIONS

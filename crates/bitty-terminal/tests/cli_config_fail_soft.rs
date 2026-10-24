@@ -338,3 +338,18 @@ fn denied_roots_clear_lower_layer_images_and_startup_ticks() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn lua_path_normalizes_windows_separators_and_escapes_quotes() {
+    // CTX-1490 Windows CI: `C:\Users\...` inside a Lua string is parsed as an
+    // invalid escape (`\U`). The fixture formatter must emit forward slashes.
+    let windows = lua_path(Path::new(r"C:\Users\owner\wall.png"));
+    assert_eq!(windows, "C:/Users/owner/wall.png");
+    assert!(!windows.contains('\\'), "{windows}");
+
+    let quoted = lua_path(Path::new("/tmp/a\"b.png"));
+    assert!(
+        quoted.contains("\\\""),
+        "quotes must stay escaped: {quoted}"
+    );
+}

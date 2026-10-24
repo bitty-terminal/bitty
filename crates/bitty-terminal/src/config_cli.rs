@@ -208,8 +208,9 @@ fn source_label(source: &bitty_config::ConfigSource) -> String {
 /// drop denies every element the vanished layer might have restricted.
 ///
 /// `keymaps` is intentionally absent: dropping it resolves to the shipped
-/// default map and grants no capability, and the plugin-suggested binding slot
-/// is inert (deny-by-default), so no plugin binding is resurrected.
+/// default map and grants no capability. Plugin-suggested bindings are
+/// published by the plugin host at runtime, not by a config layer, so this
+/// overlay neither adds nor re-enables one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SafeDeny {
     /// No configured plugin is enabled or activated.

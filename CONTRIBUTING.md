@@ -26,6 +26,9 @@ and agent must follow.
   `just setup`
 - `bun` — runs the pinned JavaScript dev tools (commitlint,
   markdownlint-cli2) through `bunx --bun`; no `npm`, `npx`, or `yarn`
+- `bitty-plugins` checkout (optional) — required only by the strict official
+  catalog drift gate, `just check-registry`; `just check` runs without it. See
+  [Official catalog registry](#official-catalog-registry)
 
 ## Setup
 
@@ -57,12 +60,14 @@ consistency; see `specifications/status-drift-gate.md`.
 All checks run through the justfile:
 
 ```bash
-just check              # fmt-check + clippy + test + scratch-path/PTY/status-drift gates + actionlint + markdownlint
+just check              # fmt-check + clippy + test + scratch-path/PTY/status-drift gates + actionlint + markdownlint (no registry checkout needed)
+just check-registry     # strict official-catalog drift gate (needs a bitty-plugins checkout)
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
 just test               # cargo nextest (workspace) + doctests + harness=false platform entry points
 just status-drift       # scripts/check-status-drift.sh (OQ/RFC/crate-count/submodule gate)
 just status-drift-test  # scripts/tests/check-status-drift.test.sh (gate fixture tests)
+just catalog-test       # hermetic official-catalog generator tests (included in just check)
 just markdownlint       # markdownlint-cli2 over the repository Markdown
 ```
 
@@ -93,6 +98,33 @@ commit delta and whether it touches the pinned crate, update every occurrence
 (`rg 'rev = "<old>"' crates`), refresh `Cargo.lock` with `cargo fetch`, and run
 the gates above. A pin that cannot move because upstream broke the pinned
 surface stays at its current revision and is recorded in the owning Issue.
+
+### Official catalog registry
+
+`just check` runs only the hermetic catalog generator tests (`just
+catalog-test`); it never reads a registry checkout, so a plain clone and a task
+worktree stay green without one. The strict drift gate, `just check-registry`,
+compares the checked-in
+`crates/bitty-plugin-host/src/official_catalog.rs` with
+`registry/official/*.toml` plus the `plugins/*` gitlinks of a `bitty-plugins`
+checkout. It requires that registry and fails clearly when a requested path is
+missing.
+
+Provide the registry in one of these ways:
+
+1. `BITTY_PLUGINS_DIR=/path/to/bitty-plugins just check-registry`
+2. `just check-registry --registry /path/to/bitty-plugins`
+3. `$BITTY_WORKSPACE/bitty-plugins` in the workspace layout
+4. a checkout beside this repository (`../bitty-plugins`), including the
+   worktree-relative sibling path
+
+The explicit forms win over discovery (`--registry` over `BITTY_PLUGINS_DIR`),
+and an explicit `--registry` or `BITTY_PLUGINS_DIR` is authoritative: a typo
+fails instead of silently falling back to another checkout. CI checks out the
+registry at the `BITTY_PLUGINS_REV` pin under `external/bitty-plugins` and runs
+the drift check explicitly, so a registry pin bump that does not regenerate the
+catalog fails there. After moving the pin, run `just catalog-generate` and
+commit the regenerated file.
 
 ## Delivery lifecycle
 

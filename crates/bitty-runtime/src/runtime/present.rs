@@ -8128,11 +8128,18 @@ mod scroll_region_copy_tests {
         let contained = bitty_render::grid::GlyphInstance {
             dest: [8, 1],
             size: [8, 8],
-            ..glyph
+            ..glyph.clone()
         };
         assert!(!retained_glyph_requires_full_redraw(
             &contained,
             &[full_row],
+            &[full_row]
+        ));
+
+        let partial_repaint = bitty_render::geometry::RectPx::new(8, 0, 8, 1);
+        assert!(retained_glyph_requires_full_redraw(
+            &glyph,
+            &[partial_repaint],
             &[full_row]
         ));
     }
@@ -8262,19 +8269,32 @@ mod scroll_region_copy_tests {
     fn drive_with_vim_suffix_erase(rt: &mut Runtime, wide: bool, alt: bool) {
         for row in 0..24u8 {
             let line = if wide {
-                format!("row-{row:02} 中OLD-SUFFIX\x1b[2K")
+                format!("\x1b[2Krow-{row:02} 中OLD-SUFFIX")
             } else {
-                format!("row-{row:02} OLD-SUFFIX\x1b[2K")
+                format!("\x1b[2Krow-{row:02} OLD-SUFFIX")
             };
             rt.handle_pty_bytes(format!("\x1b[{};1H{line}", row + 1).as_bytes());
         }
         rt.tick();
         if alt {
             rt.handle_pty_bytes(b"\x1b[?1049h");
-            rt.handle_pty_bytes(b"\x1b[1;1HALT-OLD-SUFFIX");
+            if wide {
+                rt.handle_pty_bytes(b"\x1b[24;1H\x1b[2Krow-23 \xE4\xB8\xadOLD-SUFFIX");
+            } else {
+                rt.handle_pty_bytes(b"\x1b[24;1H\x1b[2Krow-23 OLD-SUFFIX");
+            }
+            rt.tick();
+        }
+        // Erase the retained old row before scrolling it into the exposed
+        // band. The translated partial erase remains eligible for
+        // scroll-copy, so the retained-glyph safety guard, not the out-of-band
+        // fallback, proves the frame is unsafe.
+        if wide {
+            rt.handle_pty_bytes(b"\x1b[24;10H\x1b[KNEW");
+        } else {
+            rt.handle_pty_bytes(b"\x1b[24;8H\x1b[KNEW");
         }
         rt.handle_pty_bytes(b"\x1b[24;1H\n");
-        rt.handle_pty_bytes(b"\x1b[11;1H\x1b[2KNEW");
     }
 
     #[test]

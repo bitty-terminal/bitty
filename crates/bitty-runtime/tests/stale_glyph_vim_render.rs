@@ -33,7 +33,7 @@ fn populate(runtime: &mut Runtime, wide: bool) {
         } else {
             format!("row-{row:02} OLD-SUFFIX")
         };
-        runtime.handle_pty_bytes(format!("\x1b[{};1H{text}\x1b[2K", row + 1).as_bytes());
+        runtime.handle_pty_bytes(format!("\x1b[{};1H\x1b[2K{text}", row + 1).as_bytes());
     }
     runtime.tick().expect("populated frame presents");
 }
@@ -47,6 +47,18 @@ fn drive_rewrite(runtime: &mut Runtime, wide: bool, narrow: bool) {
         _ => "NEW",
     };
     runtime.handle_pty_bytes(replacement.as_bytes());
+}
+
+fn drive_scroll_suffix_erase(runtime: &mut Runtime, wide: bool) {
+    // Erase the old suffix before the bottom-line scroll. The translated
+    // partial erase lands in the exposed band, where it exercises the
+    // retained-glyph safety check instead of the out-of-band fallback.
+    if wide {
+        runtime.handle_pty_bytes(b"\x1b[24;10H\x1b[KNEW");
+    } else {
+        runtime.handle_pty_bytes(b"\x1b[24;8H\x1b[KNEW");
+    }
+    runtime.handle_pty_bytes(b"\x1b[24;1H\n");
 }
 
 fn force_full(runtime: &mut Runtime) {
@@ -137,11 +149,30 @@ fn alternate_screen_erase_does_not_reuse_primary_glyphs() {
     let mut full = runtime();
     populate(&mut full, true);
 
-    let bytes = b"\x1b[?1049h\x1b[1;1H\x1b[2JALT\x1b[?1049l";
-    incremental.handle_pty_bytes(bytes);
-    full.handle_pty_bytes(bytes);
+    incremental.handle_pty_bytes(b"\x1b[?1049h");
+    full.handle_pty_bytes(b"\x1b[?1049h");
+    populate(&mut incremental, true);
+    populate(&mut full, true);
+
+    drive_scroll_suffix_erase(&mut incremental, true);
+    drive_scroll_suffix_erase(&mut full, true);
     force_full(&mut full);
-    incremental.tick().expect("alternate-screen frame presents");
-    full.tick().expect("full alternate-screen frame presents");
+    incremental
+        .tick()
+        .expect("alternate-screen workload frame presents");
+    full.tick()
+        .expect("full alternate-screen workload presents");
+    assert_eq!(
+        incremental.headless_rgba(),
+        full.headless_rgba(),
+        "alternate-screen workload must match while alternate screen is active"
+    );
+
+    let leave = b"\x1b[?1049l";
+    incremental.handle_pty_bytes(leave);
+    full.handle_pty_bytes(leave);
+    force_full(&mut full);
+    incremental.tick().expect("primary-screen frame presents");
+    full.tick().expect("full primary-screen frame presents");
     assert_eq!(incremental.headless_rgba(), full.headless_rgba());
 }

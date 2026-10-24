@@ -724,22 +724,23 @@ pub const DEFAULT_BATCH_EVENTS: usize = 32;
 /// Proposed default batch byte limit (8 KiB, also `BATCH_MAX_BYTES`).
 pub const DEFAULT_BATCH_BYTES: usize = 8 * 1024;
 
-// ── RC-1 / RC-2 open budgets — no VM yet (candidate, OQ-014) ─────────────
+// ── RC-1 / RC-2 host ceilings (enforced by the Lua VM gate) ─────────────
 
-/// RC-1 instruction budget candidate (Open, no VM yet): `10^7` VM instructions.
+/// RC-1 instruction ceiling (host maximum): `10^7` VM instructions per VM.
 ///
-/// Documented for harness parameterization; not enforced until the Lua VM
-/// (`OQ-009` phodopus) exists. Do not describe as normative.
-pub const RC1_INSTRUCTION_BUDGET: u64 = 10_000_000;
+/// This is the compiled ceiling: a manifest `[limits] fuel_instructions` or
+/// user budget file may only tighten it (see [`crate::budgets`]). Enforced
+/// by the `bitty-lua` VM fuel meter, which fails closed on exhaustion.
+pub const RC1_INSTRUCTION_BUDGET: u64 = crate::budgets::HOST_FUEL_INSTRUCTIONS_CEILING;
 
-/// RC-1 wall-clock budget candidate (Open): `50 ms` per callback.
-pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
+/// RC-1 wall-clock ceiling (host maximum): `50 ms` per callback.
+pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = crate::budgets::HOST_WALL_MS_CEILING;
 
-/// RC-1 warning threshold candidate (Open): `8 ms` (candidate warning before hard limit).
-pub const RC1_WARNING_MS: u64 = 8;
+/// RC-1 warning threshold ceiling: `8 ms` (advisory, never suspends).
+pub const RC1_WARNING_MS: u64 = crate::budgets::HOST_WARNING_MS_CEILING;
 
-/// RC-2 per-plugin memory ceiling candidate (Open, no allocator accounting yet): `32 MiB`.
-pub const RC2_MEMORY_PER_PLUGIN_BYTES: usize = 32 * 1024 * 1024;
+/// RC-2 per-plugin memory ceiling (host maximum): `32 MiB` accounted heap.
+pub const RC2_MEMORY_PER_PLUGIN_BYTES: usize = crate::budgets::HOST_MEMORY_BYTES_CEILING;
 
 /// RC-3 aggregate plugin memory candidate (Open): `512 MiB` for all plugins.
 pub const RC2_MEMORY_AGGREGATE_BYTES: usize = 512 * 1024 * 1024;

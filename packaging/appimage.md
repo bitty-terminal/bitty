@@ -18,7 +18,7 @@ page or the official Cloudflare R2 CDN mirror:
 # Example for x86_64
 curl -fsSL -O https://cdn.bitty.run/releases/v0.0.28/bitty-x86_64-unknown-linux-gnu.AppImage
 curl -fsSL -O https://cdn.bitty.run/releases/v0.0.28/bitty-x86_64-unknown-linux-gnu.AppImage.sha256
-sha256sum -c bitty-x86_64-unknown-linux-gnu.AppImage.sha256
+sed 's#  dist/#  #' bitty-x86_64-unknown-linux-gnu.AppImage.sha256 | sha256sum -c -
 ```
 
 ### 2. Make Executable and Run

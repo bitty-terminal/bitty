@@ -2341,9 +2341,9 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
 
     // Attach the primary so workspace creation replays a real pane-session
     // recipe, leaving ws3 with a live session after ws2 is deleted.
-    rt.spawn_shell_with_args("/bin/sh", &[])
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "exec sleep 30"])
         .expect("primary shell must attach headless");
-    rt.spawn_shell_for_view(ViewId::new(1), "/bin/sh", &[], 40, 24)
+    rt.spawn_shell_for_view(ViewId::new(1), "/bin/sh", &["-c", "exec sleep 30"], 40, 24)
         .expect("primary pane shell must attach headless");
 
     assert!(

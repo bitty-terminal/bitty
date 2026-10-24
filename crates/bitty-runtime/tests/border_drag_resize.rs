@@ -60,6 +60,42 @@ fn ratio(rt: &Runtime) -> f32 {
         .expect("two-pane root must expose a ratio")
 }
 
+/// Allocation of one pane, for exact geometry assertions.
+fn pane(rt: &Runtime, id: u64) -> UiRect {
+    rt.layout_allocations()
+        .into_iter()
+        .find(|(leaf, _)| *leaf == ViewId::new(id))
+        .map(|(_, rect)| rect)
+        .unwrap_or_else(|| panic!("p{id} must be allocated"))
+}
+
+/// Every pane stays inside `bounds`, panes never overlap, and the allocation
+/// area equals the container area (zero-gap tiling partitions exactly).
+fn assert_partition(rt: &Runtime, bounds: UiRect) {
+    let alloc = rt.layout_allocations();
+    let area: u64 = alloc
+        .iter()
+        .map(|(_, rect)| u64::from(rect.width) * u64::from(rect.height))
+        .sum();
+    assert_eq!(
+        area,
+        u64::from(bounds.width) * u64::from(bounds.height),
+        "tiled panes must cover the container exactly: {alloc:?}"
+    );
+    for (i, (id, rect)) in alloc.iter().enumerate() {
+        assert!(
+            rect.right() <= bounds.right() && rect.bottom() <= bounds.bottom(),
+            "p{id:?} escapes the container: {rect:?}"
+        );
+        for (other_id, other) in alloc.iter().skip(i + 1) {
+            assert!(
+                rect.intersection(*other).is_none(),
+                "p{id:?} overlaps p{other_id:?}: {rect:?} vs {other:?}"
+            );
+        }
+    }
+}
+
 fn set_modifiers(rt: &mut Runtime, shift: bool, alt: bool) {
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
@@ -141,20 +177,26 @@ fn drag_left_shrinks_first_pane() {
 }
 
 #[test]
-fn overshoot_clamps_fail_closed_and_tree_survives() {
+fn overshoot_clamps_at_minimum_pane_size_and_tree_survives() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
     rt.handle_cursor_moved(cell_pixels(39, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
-    // Far-right teleport clamps at MAX_RATIO instead of breaking the tree.
+    // Far-right teleport clamps at the 10-column minimum for the second
+    // pane instead of breaking the tree (issue #2572).
     rt.handle_cursor_moved(cell_pixels(79, 12));
-    assert!((ratio(&rt) - LayoutNode::MAX_RATIO).abs() < f32::EPSILON);
+    assert!((ratio(&rt) - 0.875).abs() < 1e-6, "70/80 columns");
+    assert_eq!(pane(&rt, 1).width, 70);
+    assert_eq!(pane(&rt, 2).width, 10);
     assert_eq!(rt.leaf_count(), 2);
     assert!(rt.border_drag_active(), "clamped drag stays armed");
-    // Far-left teleport clamps at MIN_RATIO.
+    // Far-left teleport clamps at the 10-column minimum for the first pane.
     rt.handle_cursor_moved(cell_pixels(0, 12));
-    assert!((ratio(&rt) - LayoutNode::MIN_RATIO).abs() < f32::EPSILON);
+    assert!((ratio(&rt) - 0.125).abs() < 1e-6, "10/80 columns");
+    assert_eq!(pane(&rt, 1).width, 10);
+    assert_eq!(pane(&rt, 2).width, 70);
     assert_eq!(rt.leaf_count(), 2);
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
 }
@@ -356,251 +398,171 @@ fn four_pane_grid() -> LayoutNode {
 }
 
 #[test]
-fn corner_drag_grabs_both_perpendicular_splits() {
+fn junction_drag_grabs_cross_with_both_row_segments() {
     let mut rt = make_runtime();
     rt.set_layout(four_pane_grid());
-    // Column 39-40, row 11-12 is near the center corner where splits meet.
-    // Use (39, 11) to ensure we're inside the left child's bounds and can
-    // hit both the horizontal split at x=40 and vertical split at y=12.
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    // Issue #2572: the center gap cell is the four-pane inner junction.
     rt.handle_cursor_moved(cell_pixels(39, 11));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(
         rt.border_drag_active(),
-        "corner press must grab perpendicular splits"
+        "center junction press must grab the cross"
     );
-    // Non-vacuous (issue #1445): a single-edge grab also activates, so
-    // assert the grab holds exactly two perpendicular dividers (one per
-    // axis) for up to four panels — the old single-divider path fails here.
     let splits = rt.border_drag_splits().expect("active drag exposes splits");
     assert_eq!(
         splits.len(),
-        2,
-        "corner press must grab two splits, got {splits:?}"
-    );
-    let mut axes: Vec<_> = splits.iter().map(|(_, axis)| *axis).collect();
-    axes.sort_by_key(|axis| (*axis == SplitAxis::Vertical) as u8);
-    assert_eq!(
-        axes,
-        vec![SplitAxis::Horizontal, SplitAxis::Vertical],
-        "corner grab must span both axes, got {splits:?}"
+        3,
+        "junction must grab the column split plus both row segments, got {splits:?}"
     );
     assert!(
         splits.contains(&(Vec::new(), SplitAxis::Horizontal)),
-        "corner must grab root horizontal split, got {splits:?}"
+        "shared vertical divider (root split), got {splits:?}"
     );
     assert!(
         splits.contains(&(vec![0], SplitAxis::Vertical)),
-        "corner must grab left vertical split [0], got {splits:?}"
+        "left row segment [0], got {splits:?}"
+    );
+    assert!(
+        splits.contains(&(vec![1], SplitAxis::Vertical)),
+        "right row segment [1], got {splits:?}"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "a junction owns no leaf: focus must not move"
+    );
+    assert!(
+        rt.selection().is_none(),
+        "junction press starts no selection"
+    );
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![
+            ViewId::new(1),
+            ViewId::new(2),
+            ViewId::new(3),
+            ViewId::new(4)
+        ],
+        "a resize must never reorder panes"
     );
     rt.handle_mouse_input(release(MouseButton::Left));
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![
+            ViewId::new(1),
+            ViewId::new(2),
+            ViewId::new(3),
+            ViewId::new(4)
+        ],
+        "release must commit the same pane order"
+    );
 }
 
 #[test]
-fn corner_drag_resizes_all_four_adjacent_panels() {
+fn junction_drag_resizes_all_four_panels_on_both_axes() {
     let mut rt = make_runtime();
     rt.set_layout(four_pane_grid());
-    // Grab near the center corner - use (39, 11) to be inside left child's
-    // bounds so we can hit both the horizontal [] and vertical [0] splits.
     rt.handle_cursor_moved(cell_pixels(39, 11));
     rt.handle_mouse_input(press(MouseButton::Left));
     assert!(rt.border_drag_active());
-    // Drag right (+8 cols) and down (+4 rows): resizes horizontally via []
-    // and vertically via [0].
+    // Diagonal drag (+8 columns, +4 rows) from the junction gap cell.
     rt.handle_cursor_moved(cell_pixels(47, 15));
-
-    // Check horizontal resize: left column grows, right column shrinks.
-    // Top-left pane (ViewId 1) should be in a 48-wide column.
-    let top_left = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == ViewId::new(1))
-        .map(|(_, rect)| rect)
-        .expect("top-left pane must be allocated");
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 48, 16), "top-left");
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 16, 48, 8), "bottom-left");
+    assert_eq!(pane(&rt, 3), UiRect::new(48, 0, 32, 16), "top-right");
     assert_eq!(
-        top_left.width, 48,
-        "corner drag right should grow left column (all left panes)"
+        pane(&rt, 4),
+        UiRect::new(48, 16, 32, 8),
+        "bottom-right must move with the shared row line"
     );
-
-    // Check vertical resize: only left column's vertical split [0] resizes.
-    // Top-left grows to 16 rows, bottom-left shrinks to 8 rows.
-    assert_eq!(
-        top_left.height, 16,
-        "corner drag down should grow top-left pane via [0] vertical split"
-    );
-
-    let bottom_left = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == ViewId::new(2))
-        .map(|(_, rect)| rect)
-        .expect("bottom-left pane must be allocated");
-    assert_eq!(
-        bottom_left.height, 8,
-        "corner drag down should shrink bottom-left pane"
-    );
-
-    // Right column (32 wide) keeps its 50/50 vertical split (12 rows each).
-    let top_right = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == ViewId::new(3))
-        .map(|(_, rect)| rect)
-        .expect("top-right pane must be allocated");
-    assert_eq!(
-        top_right.width, 32,
-        "corner drag right should shrink right column"
-    );
-    assert_eq!(
-        top_right.height, 12,
-        "right column's vertical split [1] should be unaffected"
-    );
-
-    rt.handle_mouse_input(release(MouseButton::Left));
-}
-
-#[test]
-fn corner_drag_left_and_up_shrinks_first_quadrant() {
-    let mut rt = make_runtime();
-    rt.set_layout(four_pane_grid());
-    rt.handle_cursor_moved(cell_pixels(39, 11));
-    rt.handle_mouse_input(press(MouseButton::Left));
-    // Drag left (-8 cols) and up (-4 rows).
-    rt.handle_cursor_moved(cell_pixels(31, 7));
-
-    // Horizontal: left column shrinks to 32, right grows to 48.
-    // Vertical: only [0] split in left column resizes.
-    let top_left = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == ViewId::new(1))
-        .map(|(_, rect)| rect)
-        .expect("top-left pane must be allocated");
-    assert_eq!(
-        top_left.width, 32,
-        "corner drag left should shrink left column"
-    );
-    // Dragging from (39, 11) to (31, 7) is a delta of (-8, -4).
-    // The vertical split ratio becomes 0.5 - 4/24 = 1/3 in f32; the
-    // deterministic solver floors 24 * ratio to exactly 7 rows.
-    assert_eq!(
-        top_left.height, 7,
-        "corner drag up should shrink top-left pane to 7 rows"
-    );
-    rt.handle_mouse_input(release(MouseButton::Left));
-}
-
-#[test]
-fn corner_drag_persists_both_ratios_across_reflow() {
-    let mut rt = make_runtime();
-    rt.set_layout(four_pane_grid());
-    rt.handle_cursor_moved(cell_pixels(39, 11));
-    rt.handle_mouse_input(press(MouseButton::Left));
-    rt.handle_cursor_moved(cell_pixels(47, 15));
-    rt.handle_mouse_input(release(MouseButton::Left));
-
-    // Horizontal split [] ratio changed (left column grew).
-    let h_ratio = rt
-        .layout()
-        .split_ratio_at(&[])
-        .expect("root horizontal split must exist");
-    assert!(
-        (h_ratio - 0.6).abs() < 1e-6,
-        "horizontal ratio should be 0.6"
-    );
-
-    // Vertical split [0] in left column changed (top-left grew).
-    let v_ratio_left = rt
-        .layout()
-        .split_ratio_at(&[0])
-        .expect("left vertical split must exist");
-    let expected_v = 16.0 / 24.0; // ~0.667
-    assert!(
-        (v_ratio_left - expected_v).abs() < 1e-6,
-        "left vertical ratio should be ~0.667, got {v_ratio_left}"
-    );
-
-    // Vertical split [1] in right column unchanged (still 0.5).
-    let v_ratio_right = rt
-        .layout()
-        .split_ratio_at(&[1])
-        .expect("right vertical split must exist");
-    assert!(
-        (v_ratio_right - 0.5).abs() < 1e-6,
-        "right vertical ratio should stay 0.5"
-    );
-
-    // Reflow preserves all ratios.
-    rt.reflow_layout();
-    assert_eq!(
-        rt.layout().split_ratio_at(&[]),
-        Some(h_ratio),
-        "horizontal ratio must persist"
-    );
-    assert_eq!(
-        rt.layout().split_ratio_at(&[0]),
-        Some(v_ratio_left),
-        "left vertical ratio must persist"
-    );
-    assert_eq!(
-        rt.layout().split_ratio_at(&[1]),
-        Some(v_ratio_right),
-        "right vertical ratio must persist"
-    );
-}
-
-#[test]
-fn corner_drag_with_gaps_grabs_both_perpendicular_splits() {
-    // Issue #1445: with gaps_in > 0 the gap-intersection square belongs
-    // only to the outer band, so an offset corner press (inside the left
-    // column's inflated inner band and the inflated outer band) must still
-    // grab both perpendicular splits. A dead-center gap press is ambiguous
-    // (both sibling verticals in tolerance) and fails closed (no grab).
-    let mut rt = Runtime::new(RuntimeConfig {
-        gaps_in: 2,
-        gaps_out: 0,
-        ..RuntimeConfig::default()
-    })
-    .expect("gapped config must build");
-    rt.set_layout(four_pane_grid());
-    // Offset corner (38, 12): inside left column, on the inner vertical
-    // band (y 11-13) and within one cell of the outer vertical band
-    // (x 39-41 inflated to 38-42) — grabs both.
-    rt.handle_cursor_moved(cell_pixels(38, 12));
-    rt.handle_mouse_input(press(MouseButton::Left));
-    assert!(
-        rt.border_drag_active(),
-        "gapped offset corner press must grab"
-    );
-    let splits = rt.border_drag_splits().expect("active drag exposes splits");
-    assert_eq!(
-        splits.len(),
-        2,
-        "gapped corner must grab two splits, got {splits:?}"
-    );
-    assert!(splits.contains(&(Vec::new(), SplitAxis::Horizontal)));
-    assert!(splits.contains(&(vec![0], SplitAxis::Vertical)));
-    // Diagonal drag moves both ratios like the gapless corner.
-    rt.handle_cursor_moved(cell_pixels(46, 16));
-    let h_ratio = rt.layout().split_ratio_at(&[]).expect("root split");
-    assert!(
-        (h_ratio - 0.6).abs() < 1e-6,
-        "gapped horizontal ratio should be 0.6, got {h_ratio}"
-    );
-    let v_ratio = rt.layout().split_ratio_at(&[0]).expect("left split");
-    let expected_v = 0.5 + 4.0f32 / 24.0;
-    assert!(
-        (v_ratio - expected_v).abs() < 1e-6,
-        "gapped left vertical ratio should be {expected_v}, got {v_ratio}"
-    );
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
 }
 
 #[test]
-fn corner_drag_with_gaps_center_press_fails_closed() {
-    // Issue #1445: dead-center gap press (40, 12) sits within tolerance of
-    // both sibling vertical dividers — ambiguous which quadrant owns the
-    // corner, so no grab (fail closed, press falls through).
+fn junction_drag_left_and_up_shrinks_both_columns() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Diagonal drag (-8 columns, -4 rows) from the junction gap cell.
+    rt.handle_cursor_moved(cell_pixels(31, 7));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 32, 8), "top-left");
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 8, 32, 16), "bottom-left");
+    assert_eq!(pane(&rt, 3), UiRect::new(32, 0, 48, 8), "top-right");
+    assert_eq!(pane(&rt, 4), UiRect::new(32, 8, 48, 16), "bottom-right");
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn junction_drag_persists_both_ratios_across_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    rt.handle_cursor_moved(cell_pixels(47, 15));
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!((ratio(&rt) - 0.6).abs() < 1e-6, "root ratio 0.6");
+    let expected_v = 16.0f32 / 24.0;
+    for path in [vec![0], vec![1]] {
+        let got = rt.layout().split_ratio_at(&path).expect("row split");
+        assert!(
+            (got - expected_v).abs() < 1e-6,
+            "row split {path:?} ratio should be {expected_v}, got {got}"
+        );
+    }
+    rt.reflow_layout();
+    assert!((ratio(&rt) - 0.6).abs() < 1e-6);
+    for path in [vec![0], vec![1]] {
+        let got = rt.layout().split_ratio_at(&path).expect("row split");
+        assert!((got - expected_v).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn junction_drag_clamps_at_minimum_without_disturbing_the_other_axis() {
+    let mut rt = make_runtime();
+    rt.set_layout(four_pane_grid());
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    // Extreme diagonal: +40 columns would leave an 80-col column; -11 rows
+    // would invert the row. Both clamp to the 10x4 per-pane minimum.
+    rt.handle_cursor_moved(cell_pixels(79, 0));
+    assert_eq!(
+        pane(&rt, 1),
+        UiRect::new(0, 0, 70, 4),
+        "horizontal clamp must not be disturbed by the vertical clamp"
+    );
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 4, 70, 20));
+    assert_eq!(pane(&rt, 3), UiRect::new(70, 0, 10, 4));
+    assert_eq!(pane(&rt, 4), UiRect::new(70, 4, 10, 20));
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
+    // Reverse vertically while horizontal stays clamped: the absolute
+    // press anchor means the row follows immediately (no clamp dead zone).
+    rt.handle_cursor_moved(cell_pixels(79, 11));
+    assert_eq!(
+        pane(&rt, 1),
+        UiRect::new(0, 0, 70, 12),
+        "vertical motion must recover with no dead zone"
+    );
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 12, 70, 12));
+    // Push the other way: vertical clamps at the maximum row, horizontal
+    // stays put.
+    rt.handle_cursor_moved(cell_pixels(79, 23));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 70, 20));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 20, 70, 4));
+    assert_eq!(pane(&rt, 3), UiRect::new(70, 0, 10, 20));
+    assert_eq!(pane(&rt, 4), UiRect::new(70, 20, 10, 4));
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn junction_drag_with_gaps_clamps_each_pane_to_10x4() {
+    // Issue #2572: the drag clamp is gap-aware. `gaps_in = 2` reserves two
+    // cells between siblings before the 10x4 minima are applied.
     let mut rt = Runtime::new(RuntimeConfig {
         gaps_in: 2,
         gaps_out: 0,
@@ -608,13 +570,40 @@ fn corner_drag_with_gaps_center_press_fails_closed() {
     })
     .expect("gapped config must build");
     rt.set_layout(four_pane_grid());
+    // The dead-center gap square used to be the ambiguous no-grab case;
+    // it is now the junction.
     rt.handle_cursor_moved(cell_pixels(40, 12));
     rt.handle_mouse_input(press(MouseButton::Left));
-    assert!(
-        !rt.border_drag_active(),
-        "ambiguous center gap press must not grab"
+    assert!(rt.border_drag_active(), "gapped center junction must grab");
+    let splits = rt.border_drag_splits().expect("active drag exposes splits");
+    assert_eq!(
+        splits.len(),
+        3,
+        "gapped junction is still a cross: {splits:?}"
     );
+    // Extreme diagonal: +39 columns, -12 rows.
+    rt.handle_cursor_moved(cell_pixels(79, 0));
+    // Width: usable 78 -> first 68, gap 2, second 10. Height: usable 22 ->
+    // first 4, gap 2, second 18.
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 68, 4));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 6, 68, 18));
+    assert_eq!(pane(&rt, 3), UiRect::new(70, 0, 10, 4));
+    assert_eq!(pane(&rt, 4), UiRect::new(70, 6, 10, 18));
+    for (id, rect) in rt.layout_allocations() {
+        assert!(
+            rect.width >= bitty_runtime::MIN_PANE_COLS
+                && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+            "p{id:?} below the gap-aware 10x4 minimum: {rect:?}"
+        );
+    }
+    // Vertical clamp at the maximum: first 18, second 4, width unchanged.
+    rt.handle_cursor_moved(cell_pixels(79, 23));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 68, 18));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 20, 68, 4));
+    assert_eq!(pane(&rt, 3), UiRect::new(70, 0, 10, 18));
+    assert_eq!(pane(&rt, 4), UiRect::new(70, 20, 10, 4));
     rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
 }
 
 #[test]

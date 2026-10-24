@@ -2741,7 +2741,7 @@ fn inspect_snapshot() -> bitty_lua::runtime_inspect::RuntimeInspectSnapshot {
             app_version: "0.0.26".to_string(),
             config_file: Some("/cfg/init.lua".to_string()),
             config_dir: Some("/cfg".to_string()),
-            plugin_ledger: Some("/cfg/bitty-plugins.toml".to_string()),
+            plugin_ledger: Some("/cfg/bitty-plugins.lua".to_string()),
             plugin_store: Some("/data/plugins".to_string()),
             extension_user_root: Some("/data/extensions".to_string()),
             extension_system_root: Some("/usr/lib/bitty/extensions".to_string()),

@@ -6,6 +6,7 @@
 #   - Gentoo Linux (live ebuild + prebuilt binary ebuild + overlay config)
 #   - Void Linux (xbps-src template)
 #   - FreeBSD (Ports recipe: Makefile, pkg-plist, pkg-descr, distinfo)
+#   - Solus Linux (ypkg package.yml)
 #   - openSUSE (OBS spec + source service)
 #
 # Version-agnostic on purpose: recipe versions are derived from the files
@@ -304,6 +305,48 @@ else
   fail "Void Linux template not found at ${VOID_TEMPLATE#"$REPO_ROOT"/}"
 fi
 
+# 4b. Solus Linux package recipe (package.yml)
+SOLUS_RECIPE="$REPO_ROOT/packaging/solus/package.yml"
+solus_version=""
+if [[ -f "$SOLUS_RECIPE" ]]; then
+  solus_failures=$FAIL
+  solus_name="$(sed -n 's/^name[[:space:]]*:[[:space:]]*\(.*\)$/\1/p' "$SOLUS_RECIPE")"
+  [[ "$solus_name" == "bitty" ]] || fail "Solus recipe name is '$solus_name', expected bitty"
+
+  solus_version="$(sed -n 's/^version[[:space:]]*:[[:space:]]*\(.*\)$/\1/p' "$SOLUS_RECIPE")"
+  if is_semver "$solus_version"; then
+    pass "Solus recipe version $solus_version is X.Y.Z"
+  else
+    fail "Solus recipe version '$solus_version' is not X.Y.Z"
+  fi
+
+  expect "$SOLUS_RECIPE" '^[[:space:]]*%cargo_build' "Solus recipe uses %cargo_build"
+  expect "$SOLUS_RECIPE" '^[[:space:]]*%cargo_install' "Solus recipe uses %cargo_install"
+  expect "$SOLUS_RECIPE" 'bitty-terminal' "Solus recipe builds bitty-terminal package"
+  expect "$SOLUS_RECIPE" 'run\.bitty\.Bitty\.desktop' "Solus recipe installs the desktop file"
+  expect "$SOLUS_RECIPE" 'tic -x' "Solus recipe compiles terminfo with tic -x"
+
+  solus_checksum_line="$(grep -nE ':[[:space:]]*SKIP' "$SOLUS_RECIPE" | head -1 | cut -d: -f1)"
+  solus_checksum="$(grep -E '^[[:space:]]*-.*https://github.com/bitty-terminal/bitty/archive/.*:' "$SOLUS_RECIPE" | awk -F: '{print $NF}' | tr -d ' ')"
+  if [[ "$solus_checksum" == "SKIP" ]]; then
+    if sed -n "1,${solus_checksum_line:-1}p" "$SOLUS_RECIPE" | grep -Eq '#.*(tag time|release tarball)'; then
+      pass "Solus checksum=SKIP is documented with the tag-time replacement step"
+    else
+      fail "Solus checksum=SKIP without a comment explaining the tag-time step"
+    fi
+  elif [[ "$solus_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+    pass "Solus checksum is a 64-hex digest"
+  else
+    fail "Solus checksum is '$solus_checksum', expected SKIP or a 64-hex sha256"
+  fi
+
+  if [[ "$FAIL" -eq "$solus_failures" ]]; then
+    pass "Solus Linux recipe integrity"
+  fi
+else
+  fail "Solus recipe not found at ${SOLUS_RECIPE#"$REPO_ROOT"/}"
+fi
+
 # 5. FreeBSD ports recipe (x11/bitty)
 FREEBSD_PORT_DIR="$REPO_ROOT/packaging/freebsd/x11/bitty"
 FREEBSD_MAKEFILE="$FREEBSD_PORT_DIR/Makefile"
@@ -424,12 +467,13 @@ fi
 # 6. Recipe versions must agree with one another, and never lag the workspace.
 #    Recipes may lead Cargo.toml by the pending release bump (draft release PR),
 #    so a lead is reported, not failed.
-if [[ -n "$bin_version" && -n "$void_version" && -n "$alpine_pkgver" ]] &&
+if [[ -n "$bin_version" && -n "$void_version" && -n "$alpine_pkgver" && -n "$solus_version" ]] &&
   [[ "$alpine_pkgver" == "$bin_version" ]] &&
-  [[ "$void_version" == "$bin_version" ]]; then
-  pass "Alpine, Gentoo binary, and Void recipes agree on version $bin_version"
+  [[ "$void_version" == "$bin_version" ]] &&
+  [[ "$solus_version" == "$bin_version" ]]; then
+  pass "Alpine, Gentoo binary, Void, and Solus recipes agree on version $bin_version"
 else
-  fail "recipe versions disagree (Alpine '$alpine_pkgver', Gentoo bin '$bin_version', Void '$void_version')"
+  fail "recipe versions disagree (Alpine '$alpine_pkgver', Gentoo bin '$bin_version', Void '$void_version', Solus '$solus_version')"
 fi
 
 if is_semver "$bin_version" && is_semver "$CARGO_VERSION"; then
@@ -446,7 +490,7 @@ if is_semver "$bin_version" && is_semver "$CARGO_VERSION"; then
 fi
 
 # 7. Documentation coverage
-for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/freebsd.md; do
+for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/freebsd.md packaging/solus.md; do
   if [[ -f "$REPO_ROOT/$doc" ]]; then
     pass "Documentation exists: $doc"
     expect "$REPO_ROOT/$doc" 'tag time' "Documentation states tag-time steps: $doc"
@@ -468,8 +512,9 @@ expect "$GENTOO_DOC" 'location = .*packaging/gentoo' \
 if grep -q 'packaging/gentoo.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/void.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/freebsd.md' "$REPO_ROOT/packaging/INSTALL.md" &&
+  grep -q 'packaging/solus.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/alpine/APKBUILD' "$REPO_ROOT/packaging/INSTALL.md"; then
-  pass "INSTALL.md references the Alpine, Gentoo, Void, and FreeBSD recipes"
+  pass "INSTALL.md references the Alpine, Gentoo, Void, Solus, and FreeBSD recipes"
 else
   fail "INSTALL.md missing references to distro recipes"
 fi

@@ -9,7 +9,7 @@
 //! | Section    | Source (cold path, once)                                      |
 //! |------------|---------------------------------------------------------------|
 //! | diagnostics| `AppConfig` (merged effective config + startup paths)         |
-//! | plugins    | managed `bitty-plugins.toml` + bundled catalog + store index  |
+//! | plugins    | managed `bitty-plugins.lua` + bundled catalog + store index   |
 //! | settings   | manifest `[settings]` declarations + per-plugin user files    |
 //! | extensions | two install tiers + the recorded activation projection        |
 //! | profiles   | `profiles/<name>.lua` names under the config root             |
@@ -780,9 +780,40 @@ mod tests {
     }
 
     #[test]
+    fn safe_mode_never_opens_a_present_ledger() {
+        let base = scratch("safe-ledger");
+        let config_dir = base.join("bitty");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let ledger = config_dir.join("bitty-plugins.lua");
+        // A present but invalid ledger would make a non-safe snapshot
+        // unavailable; safe mode must not open it at all.
+        std::fs::write(&ledger, "not a ledger").expect("ledger");
+        let env = InspectEnv {
+            xdg_config_home: Some(base.display().to_string()),
+            home: Some(base.display().to_string()),
+            ..InspectEnv::default()
+        };
+        let context = RuntimeInspectContext::from_app(&app_config(), &env, true);
+        assert!(
+            context.plugin_ledger.is_none(),
+            "safe mode must not name a ledger it would never consult"
+        );
+        let snapshot = build(&context, None);
+        let Section::Available(diagnostics) = &snapshot.diagnostics else {
+            panic!("diagnostics available");
+        };
+        assert!(diagnostics.plugin_ledger.is_none());
+        let Section::Available(plugins) = &snapshot.plugins else {
+            panic!("safe mode plugin section must stay available");
+        };
+        assert!(plugins.rows.iter().all(|row| !row.recorded));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn unreadable_ledger_marks_the_plugin_section_unavailable() {
         let base = scratch("ledger");
-        let ledger = base.join("bitty-plugins.toml");
+        let ledger = base.join("bitty-plugins.lua");
         std::fs::write(&ledger, "not a ledger").expect("write");
         let mut context =
             RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);

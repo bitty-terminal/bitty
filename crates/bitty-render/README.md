@@ -43,6 +43,21 @@ per-OS evidence). See the `Backend selection` section in `src/lib.rs`.
   scrollback viewport rendering, shaping, and subpixel policy remain deferred
   (see `src/lib.rs` and `src/grid.rs`).
 
+## Chrome tokens (CTX-1477)
+
+`src/chrome.rs` is the single Core-owned chrome language for floating
+surfaces: a one-physical-pixel border, six-pixel radius, eight-pixel padding,
+theme-owned muted/focused outlines, and raised/overlay surface elevations.
+Help/which-key, command-palette/presentation overlays, plugin overlay
+surfaces, panel rings, and band chrome resolve through this module; widgets do
+not choose raw border widths or ad-hoc accents. Pixel surfaces use the
+`RoundedFill` SDF ring plus the inner-arc glyph clip as the corner mask, and
+overlay cards paint in three ordered sublayers (card surface, hosted row
+backgrounds, border ring) so plugin row colours stay visible while the ring
+remains above content; one-row bands use rounded box-drawing corners when the
+corner cell is blank, with the documented light-box/square fallback when glyph
+coverage is absent.
+
 ## Layout
 
 - `Cargo.toml` — package metadata, the `sw-fallback` feature, dependencies.
@@ -60,5 +75,7 @@ per-OS evidence). See the `Backend selection` section in `src/lib.rs`.
 - `src/software.rs` — opt-in CPU compositor behind `sw-fallback`.
 - `src/geometry.rs`, `src/hidpi.rs`, `src/window.rs` — rect algebra, scaling,
   and window attachment helpers.
+- `src/chrome.rs` — shared chrome tokens, the rounded frame paint path, and
+  the grid-corner glyph fallback.
 - `src/error.rs` — owned error types.
 - `tests/` — headless pipeline and seam tests.

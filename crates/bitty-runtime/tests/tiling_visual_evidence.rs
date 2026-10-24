@@ -1,5 +1,5 @@
 //! Visual + geometry evidence for the Hyprland tiling fixes (issues #2521,
-//! #2526, #2528).
+//! #2526, #2528) and the 0.0.28 Spiral default (issue #2571).
 //!
 //! Each scenario builds the exact deterministic tree, computes allocations
 //! with the headless solver, asserts the geometry the fix promises, and
@@ -14,15 +14,19 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
 use bitty_runtime::{
-    LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId, drop_plan_for_point, largest_area_leaf,
-    splittable_axis,
+    LayoutNode, PanelLayoutMode, Runtime, SplitAxis, UiRect, View, ViewId, drop_plan_for_point,
+    largest_area_leaf, splittable_axis,
 };
 
 const SCALE: u16 = 10;
 const HEADER: u16 = 34;
 const FOOTER: u16 = 22;
 const CONTAINER: UiRect = UiRect::new(0, 0, 80, 24);
+/// Smallest grid where eight default `Spiral` presses keep all nine panes at
+/// the gap-aware 10x4 minimum (issue #2571).
+const SPIRAL_CONTAINER: UiRect = UiRect::new(0, 0, 160, 64);
 
 fn leaf(id: u64) -> LayoutNode {
     LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
@@ -52,8 +56,22 @@ fn render_svg(
     focus: Option<ViewId>,
     marker: Option<(u16, u16, &str)>,
 ) -> String {
-    let width = CONTAINER.width * SCALE;
-    let height = CONTAINER.height * SCALE + HEADER + FOOTER;
+    render_svg_in(CONTAINER, title, note, tree, allocations, focus, marker)
+}
+
+/// [`render_svg`] with an explicit container grid, for evidence that needs a
+/// larger canvas than the default 80x24 scenario container (issue #2571).
+fn render_svg_in(
+    container: UiRect,
+    title: &str,
+    note: &str,
+    tree: &LayoutNode,
+    allocations: &[(ViewId, UiRect)],
+    focus: Option<ViewId>,
+    marker: Option<(u16, u16, &str)>,
+) -> String {
+    let width = container.width * SCALE;
+    let height = container.height * SCALE + HEADER + FOOTER;
     let mut svg = String::new();
     let _ = writeln!(
         svg,
@@ -134,7 +152,7 @@ fn render_svg(
     let _ = writeln!(
         svg,
         r##"<text x="4" y="{}" fill="#8b949e" font-size="10">{}</text>"##,
-        CONTAINER.height * SCALE + HEADER + 15,
+        container.height * SCALE + HEADER + 15,
         escape(&tree_text)
     );
     svg.push_str("</svg>\n");
@@ -505,10 +523,13 @@ fn issue_2521_2528_eight_new_panels_before_after() {
 }
 
 /// The runtime plan and the pure evidence builder must agree for every
-/// press, so the screenshots cannot drift from the shipped algorithm.
+/// press, so the screenshots cannot drift from the shipped algorithm. The
+/// builder pins the explicit `Balanced` opt-in (issue #2571 moved the default
+/// to `Spiral`), so the scenario stays comparable with the 0.0.27 artifacts.
 #[test]
 fn runtime_plan_matches_balanced_evidence_builder() {
     let mut rt = Runtime::with_defaults().expect("runtime");
+    rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
     let mut tree = leaf(rt.focused_view().expect("focus").0);
     // Seed the runtime with a single leaf and verify each plan/split pair.
     rt.set_layout(tree.clone());
@@ -530,4 +551,175 @@ fn runtime_plan_matches_balanced_evidence_builder() {
         rt.set_focus(ViewId::new(next));
     }
     assert_eq!(tree.leaf_ids(), balanced_eight_panels().leaf_ids());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2572: 2x2 center-junction cross drag
+// ---------------------------------------------------------------------------
+
+/// Cursor pixels landing on container cell (col, row) under the default
+/// headless geometry: 8px window padding, 6px decoration outer inset at
+/// scale 1, 9x19 cells, zero gaps.
+fn junction_pixels(col: u16, row: u16) -> CursorPosition {
+    CursorPosition {
+        x: 8.0 + 6.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 6.0 + f64::from(row) * 19.0 + 9.0,
+    }
+}
+
+fn press_event() -> MouseEvent {
+    MouseEvent::new(MouseButton::Left, PressState::Pressed)
+}
+
+fn release_event() -> MouseEvent {
+    MouseEvent::new(MouseButton::Left, PressState::Released)
+}
+
+/// Exact 2x2 cross: `H[V[1,2], V[3,4]]`.
+fn four_pane_grid() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::split(SplitAxis::Vertical, 0.5, leaf(1), leaf(2)),
+        LayoutNode::split(SplitAxis::Vertical, 0.5, leaf(3), leaf(4)),
+    )
+}
+
+/// Issue #2572 acceptance evidence: a diagonal drag from the exact center
+/// of `H[V[1,2], V[3,4]]` moves the shared vertical divider and both row
+/// segments, resizing all four panes on both axes. The SVGs are the
+/// human-readable screenshots; regenerate with
+/// `TILING_EVIDENCE_UPDATE=1`, then compare byte-exactly.
+#[test]
+fn issue_2572_center_junction_cross_drag_before_after() {
+    let mut rt = Runtime::with_defaults().expect("runtime");
+    let tree = four_pane_grid();
+    rt.set_layout(tree.clone());
+    let before = rt.layout_allocations();
+    assert_eq!(rect_of(&before, 1), UiRect::new(0, 0, 40, 12));
+    assert_eq!(rect_of(&before, 2), UiRect::new(0, 12, 40, 12));
+    assert_eq!(rect_of(&before, 3), UiRect::new(40, 0, 40, 12));
+    assert_eq!(rect_of(&before, 4), UiRect::new(40, 12, 40, 12));
+
+    // The exact layout crossing (40,12) is covered by the pure UI hit
+    // test; the headed center gap maps to the adjacent boundary cell.
+    rt.handle_cursor_moved(junction_pixels(39, 11));
+    rt.handle_mouse_input(press_event());
+    assert!(rt.border_drag_active(), "center junction must grab");
+    let splits = rt.border_drag_splits().expect("active drag exposes splits");
+    assert_eq!(
+        splits.len(),
+        3,
+        "cross must grab the column split and both row segments: {splits:?}"
+    );
+    assert!(splits.contains(&(Vec::new(), SplitAxis::Horizontal)));
+    assert!(splits.contains(&(vec![0], SplitAxis::Vertical)));
+    assert!(splits.contains(&(vec![1], SplitAxis::Vertical)));
+
+    // Diagonal pointer motion (+8 columns, +4 rows).
+    rt.handle_cursor_moved(junction_pixels(47, 15));
+    rt.handle_mouse_input(release_event());
+    assert!(!rt.border_drag_active());
+
+    let after = rt.layout_allocations();
+    assert_eq!(rect_of(&after, 1), UiRect::new(0, 0, 48, 16));
+    assert_eq!(rect_of(&after, 2), UiRect::new(0, 16, 48, 8));
+    assert_eq!(rect_of(&after, 3), UiRect::new(48, 0, 32, 16));
+    assert_eq!(
+        rect_of(&after, 4),
+        UiRect::new(48, 16, 32, 8),
+        "right row segment must follow the shared horizontal line"
+    );
+    assert_eq!(rt.layout().validate_structure(), Ok(4));
+
+    let before_svg = render_svg(
+        "#2572 center junction: before",
+        "H[V[1,2], V[3,4]]; pointer on the four-pane inner junction",
+        &tree,
+        &before,
+        None,
+        Some((39, 11, "junction")),
+    );
+    let after_svg = render_svg(
+        "#2572 center junction: after cross drag",
+        "diagonal drag +8 cols / +4 rows resizes all four panes",
+        rt.layout(),
+        &after,
+        None,
+        Some((47, 15, "pointer")),
+    );
+    let before_path = check_or_update("tiling-2572-before.svg", &before_svg);
+    let after_path = check_or_update("tiling-2572-after.svg", &after_svg);
+    eprintln!(
+        "evidence: {} {}",
+        before_path.display(),
+        after_path.display()
+    );
+}
+
+/// Issue #2571: the fresh-config default is `Spiral`. Drive eight adaptive
+/// presses through the shipped plan on the smallest grid that keeps all nine
+/// panes usable, assert the gap-aware 10x4 minimum, and render the resulting
+/// tree as the human-readable default-layout evidence.
+#[test]
+fn issue_2571_default_spiral_eight_new_panels() {
+    let mut rt = Runtime::with_defaults().expect("runtime");
+    assert_eq!(
+        rt.panel_layout_mode(),
+        PanelLayoutMode::Spiral,
+        "a fresh runtime defaults to Spiral"
+    );
+    rt.set_container(SPIRAL_CONTAINER);
+    let mut tree = leaf(1);
+    rt.set_layout(tree.clone());
+    let mut phases = Vec::new();
+    for next in 2..=9u64 {
+        let plan = rt.panel_split_plan().expect("every spiral split fits");
+        phases.push(plan.spiral_phase);
+        assert!(split(
+            &mut tree,
+            plan.target,
+            plan.axis,
+            ViewId::new(next),
+            plan.place_new_first
+        ));
+        rt.set_layout(tree.clone());
+        rt.set_focus(ViewId::new(next));
+        rt.note_panel_split_created(ViewId::new(next), plan.spiral_phase);
+    }
+    assert_eq!(
+        phases,
+        vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3)
+        ],
+        "eight presses rotate Right -> Down -> Left -> Up twice"
+    );
+    assert_eq!(tree.validate_structure(), Ok(9));
+    let allocations = tree.layout(SPIRAL_CONTAINER);
+    assert_eq!(allocations.len(), 9);
+    for (id, rect) in &allocations {
+        assert!(
+            rect.width >= bitty_runtime::MIN_PANE_COLS
+                && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+            "p{id:?} below the minimum: {rect:?} (all {allocations:?})"
+        );
+    }
+    let svg = render_svg_in(
+        SPIRAL_CONTAINER,
+        "#2571 default Mod+N: Spiral (0.0.28)",
+        "fresh config: clockwise rotation keeps every pane at or above 10x4",
+        &tree,
+        &allocations,
+        None,
+        None,
+    );
+    let path = check_or_update("tiling-2571-default-spiral.svg", &svg);
+    eprintln!("evidence: {}", path.display());
 }

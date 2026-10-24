@@ -225,6 +225,7 @@ use std::sync::Arc;
 use bitty_platform::{App, PlatformError};
 use bitty_runtime::Runtime;
 
+mod candidates;
 mod chrome_keys;
 mod cli;
 mod cmd;
@@ -375,6 +376,14 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     if stall_watchdog::handle_state_writer(&raw) {
         return;
+    }
+    // Hidden completion-candidate helpers (CTX-1486, issue #2575): `bitty
+    // +list-profiles` and `bitty +list-plugins --installed` run before the
+    // normal parser so they never touch config loading or a runtime. They
+    // read local state only, always exit 0 on missing/malformed state, and
+    // never appear in help or the static completion grammar.
+    if let Some(code) = candidates::run_hidden(&raw) {
+        std::process::exit(code);
     }
     let args = parse_args(&raw);
     // CTX-0482 (#763): install the process-wide stderr gate once so startup
@@ -1283,6 +1292,8 @@ fn main() {
     .with_hints_enabled(hints.enabled)
     // CTX-0963 (#1697): the tiled resize step per keypress.
     .with_resize_step(app_config.effective.layout.resize_step)
+    // Issue #2407: plugin-suggested `alt`-bearing chords follow `mod_key`.
+    .with_mod_key(app_config.effective.mod_key)
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)

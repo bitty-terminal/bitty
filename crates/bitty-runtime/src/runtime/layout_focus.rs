@@ -40,7 +40,9 @@ pub struct PanelSplitPlan {
     pub axis: SplitAxis,
     /// Whether the fresh pane becomes the first child (left/top).
     pub place_new_first: bool,
-    /// Spiral phase (`0..4`) used by this split; `None` outside `Spiral`.
+    /// Spiral phase (`0..4`) used by this split; `None` outside `Spiral` and
+    /// for the deterministic Balanced fallback when the focused Spiral target
+    /// cannot host two usable panes (issue #2571 review).
     pub spiral_phase: Option<u8>,
 }
 
@@ -1975,6 +1977,25 @@ impl Runtime {
         Some(bitty_ui::snap_to_leading(&snap, cell))
     }
 
+    /// Frame-local row of `pos` inside `owner`'s content frame plus the frame
+    /// row count, clamped to the frame (issue #2470 edge auto-scroll).
+    ///
+    /// A live grid taller than its content frame paints through a
+    /// cursor-follow window, so the owner-grid cell row is not the screen
+    /// row. Edge detection needs the painted row: `0` is the top row and
+    /// `rows - 1` the bottom one. `None` when `owner` has no present frame or
+    /// the cell metrics are degenerate.
+    pub(super) fn pointer_frame_row(
+        &self,
+        owner: ViewId,
+        pos: CursorPosition,
+    ) -> Option<(u16, u16)> {
+        let frames = self.present_frames();
+        let frame = frames.iter().find(|frame| frame.view == owner)?;
+        let local = self.clamped_frame_cell(frame, pos)?;
+        Some((local.row, frame.rows))
+    }
+
     /// Maps a physical cursor position into a cell of `owner`'s grid, clamped
     /// to `owner`'s content frame (CTX-0803, the #1433 drag fix; CTX-1021
     /// scrolled viewport for issue #1807).
@@ -2933,7 +2954,9 @@ impl Runtime {
     ///
     /// The axis half of [`Self::panel_split_plan`]. [`PanelLayoutMode::Balanced`]
     /// and [`PanelLayoutMode::BisectLargest`] ignore `focused` and use the
-    /// physically largest slot; `Spiral`/`Dwindle` use the focused leaf.
+    /// physically largest slot; `Dwindle` uses the focused leaf. `Spiral` uses
+    /// the focused leaf while it can host two usable children, then falls
+    /// back to the largest-area Balanced target (issue #2571 review).
     /// Falls back to the container when the leaf has no allocation
     /// (fail-closed: never panics, never mutates). Explicit
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
@@ -2953,8 +2976,11 @@ impl Runtime {
     /// #2528).
     ///
     /// Returns the slot to split, the balanced axis, the insertion side, and
-    /// (in `Spiral` mode) the phase used. `None` when no live leaf can host
-    /// two panes at the minimum usable size (or the layout is empty). The
+    /// (in `Spiral` mode) the phase used. In `Spiral` mode the focused slot is
+    /// used while it can host two usable children; otherwise the plan falls
+    /// back deterministically to the largest-area Balanced target and reports
+    /// `spiral_phase: None` (issue #2571 review). `None` when no live leaf can
+    /// host two panes at the minimum usable size (or the layout is empty). The
     /// app layer commits exactly this plan, so the axis and target can never
     /// disagree with [`Self::panel_split_axis`] /
     /// [`Self::panel_bisect_target`].
@@ -2990,13 +3016,23 @@ impl Runtime {
             ),
             PanelLayoutMode::Spiral => {
                 let phase = self.panel_spiral_phase(focused);
-                (
-                    focused,
-                    focused_rect,
-                    splittable_axis(focused_rect, gap_in)?,
-                    phase >= 2,
-                    Some(phase),
-                )
+                match splittable_axis(focused_rect, gap_in) {
+                    Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
+                    None => {
+                        // Issue #2571 review: the focused Spiral slot can
+                        // exhaust on a normal window (80x24 stops after five
+                        // presses) long before the tiling is full. Fall back
+                        // to the deterministic Balanced target -- the
+                        // largest-area leaf, first in solver order on ties --
+                        // so `Mod+N` keeps the 0.0.27 capacity instead of
+                        // dropping the chord. `spiral_phase: None` marks the
+                        // fallback and restarts the chain on the fresh pane;
+                        // the app logs one bounded warning for it. `None`
+                        // here now means no leaf can host two usable panes.
+                        let (target, rect) = largest_area_leaf(&allocations)?;
+                        (target, rect, splittable_axis(rect, gap_in)?, false, None)
+                    }
+                }
             }
         };
         if !splittable_rect(rect, axis, gap_in) {
@@ -3051,7 +3087,8 @@ impl Runtime {
         largest_area_leaf(&allocations).map(|(id, _)| id)
     }
 
-    /// Returns the current panel layout mode for adaptive splits (Balanced vs Spiral vs Dwindle vs BisectLargest).
+    /// Returns the current panel layout mode for adaptive splits
+    /// (Spiral, Balanced, Dwindle, or BisectLargest).
     #[must_use]
     pub fn panel_layout_mode(&self) -> PanelLayoutMode {
         self.panel_layout_mode
@@ -3188,11 +3225,15 @@ impl Runtime {
     }
 
     /// Placement for the fresh pane in an adaptive split (`NewPanel`):
-    /// - `Balanced` (default): always Right or Down (`place_new_first =
-    ///   false`); the fresh pane goes after the bisected largest slot.
-    /// - `Spiral`: 4-way clockwise rotation (Right, Down, Left, Up) that
-    ///   continues only while the pane created by the previous split stays
-    ///   focused; any other active pane restarts at Right (issue #2528).
+    /// - `Spiral` (default): 4-way clockwise rotation (Right, Down, Left,
+    ///   Up) that continues only while the pane created by the previous split
+    ///   stays focused; any other active pane restarts at Right (issues
+    ///   #2528, #2571). When the focused slot can no longer host two usable
+    ///   panes the plan falls back to the largest-area Balanced target
+    ///   (`place_new_first = false`; issue #2571 review).
+    /// - `Balanced`: always Right or Down (`place_new_first = false`); the
+    ///   fresh pane goes after the bisected largest slot (explicit opt-in
+    ///   since 0.0.28).
     /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom,
     ///   `place_new_first = false`).
     /// - `BisectLargest` (CTX-0964, #1698): always Right or Down
@@ -3444,12 +3485,14 @@ mod tests {
         new_id
     }
 
-    /// Issues #2521/#2528: eight default `Mod+N` presses must stay balanced
-    /// and above the minimum pane size instead of nesting ever-smaller
-    /// columns.
+    /// Issues #2521/#2528: eight `Mod+N` presses under the explicit
+    /// `Balanced` opt-in must stay balanced and above the minimum pane size
+    /// instead of nesting ever-smaller columns. `Balanced` stopped being the
+    /// default in 0.0.28 (issue #2571) but remains fully selectable.
     #[test]
     fn eight_balanced_new_panels_keep_usable_geometry() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
         for _ in 0..8 {
             apply_new_panel(&mut rt);
         }
@@ -3473,6 +3516,161 @@ mod tests {
             largest <= smallest * 3,
             "unbalanced tree: smallest {smallest}, largest {largest}: {allocations:?}"
         );
+    }
+
+    /// Issue #2571: a fresh config (no explicit mode) drives eight `Mod+N`
+    /// presses through the default `Spiral` chain. The 160x64 container is
+    /// the smallest cell grid where the clockwise halving keeps all nine
+    /// panes at the gap-aware 10x4 minimum; every press must land, keep the
+    /// tree valid, and rotate the next phase. Closing the created pane or
+    /// moving focus off the chain restarts the phase at Right.
+    #[test]
+    fn default_spiral_eight_new_panels_keep_minimum_geometry_and_reset_phase() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        assert_eq!(
+            rt.panel_layout_mode(),
+            PanelLayoutMode::Spiral,
+            "a fresh runtime defaults to Spiral (issue #2571)"
+        );
+        rt.set_container(UiRect::new(0, 0, 160, 64));
+
+        let mut phases = Vec::new();
+        for _ in 0..8 {
+            let plan = rt.panel_split_plan().expect("every split stays feasible");
+            phases.push(plan.spiral_phase);
+            apply_new_panel(&mut rt);
+            assert_eq!(
+                rt.layout().validate_structure(),
+                Ok(rt.leaf_count()),
+                "the tree stays a valid binary tree after each press"
+            );
+        }
+        assert_eq!(rt.leaf_count(), 9);
+        assert_eq!(
+            phases,
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3)
+            ],
+            "eight presses rotate Right -> Down -> Left -> Up twice"
+        );
+        let allocations = rt.layout_allocations();
+        assert_eq!(allocations.len(), 9);
+        for (id, rect) in &allocations {
+            assert!(
+                rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS,
+                "{id:?} collapsed below the minimum pane size: {rect:?} (all {allocations:?})"
+            );
+        }
+
+        // Close the created pane: the survivor breaks the chain, so the next
+        // press starts again at phase 0 (Right) instead of a stale Left/Top.
+        let focused = rt.focused_view().expect("focus");
+        let survivor = bitty_ui::survivor_after_close(rt.layout(), focused).expect("survivor");
+        let mut layout = rt.layout().clone();
+        assert!(layout.remove_leaf(focused).is_some());
+        rt.set_layout_closing(layout, focused);
+        rt.set_focus(survivor);
+        let plan = rt.panel_split_plan().expect("plan after close");
+        assert_eq!(plan.spiral_phase, Some(0), "a close resets to Right");
+        assert!(!plan.place_new_first);
+
+        // Any focus outside the recorded creation chain resets the phase too.
+        let other = rt
+            .layout()
+            .leaf_ids()
+            .into_iter()
+            .find(|id| *id != survivor)
+            .expect("another leaf survives");
+        assert!(rt.set_focus(survivor));
+        rt.note_panel_split_created(survivor, Some(2));
+        let plan = rt.panel_split_plan().expect("primed plan");
+        assert_eq!(plan.spiral_phase, Some(3));
+        assert!(plan.place_new_first);
+        assert!(rt.set_focus(other));
+        let plan = rt.panel_split_plan().expect("plan after focus move");
+        assert_eq!(
+            plan.spiral_phase,
+            Some(0),
+            "focus outside the chain resets to Right"
+        );
+        assert!(!plan.place_new_first);
+    }
+
+    /// Issue #2571 review: eight adaptive presses at `container` must keep
+    /// `Mod+N` working to the 0.0.27 Balanced capacity. On normal 80x24 and
+    /// 120x40 windows the focused Spiral chain exhausts its slot after five
+    /// or six presses; the default must then use the deterministic
+    /// largest-area Balanced fallback instead of dropping the chord, match
+    /// explicit Balanced's pane count, and keep a valid 10x4-minimum tree.
+    fn assert_default_spiral_keeps_balanced_capacity(container: UiRect) {
+        const PRESSES: usize = 8;
+        let mut spiral = Runtime::with_defaults().expect("headless runtime must build");
+        assert_eq!(spiral.panel_layout_mode(), PanelLayoutMode::Spiral);
+        spiral.set_container(container);
+        let mut fallbacks = 0;
+        for press in 1..=PRESSES {
+            let plan = spiral
+                .panel_split_plan()
+                .unwrap_or_else(|| panic!("press {press} at {container:?} must have a plan"));
+            if plan.spiral_phase.is_none() {
+                fallbacks += 1;
+            }
+            apply_new_panel(&mut spiral);
+            assert_eq!(
+                spiral.leaf_count(),
+                press + 1,
+                "press {press} at {container:?} must land a pane"
+            );
+            assert_eq!(
+                spiral.layout().validate_structure(),
+                Ok(spiral.leaf_count()),
+                "press {press} at {container:?} must keep a valid binary tree"
+            );
+            for (id, rect) in spiral.layout_allocations() {
+                assert!(
+                    rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS,
+                    "{id:?} fell below 10x4 after press {press} at {container:?}: {rect:?}"
+                );
+            }
+        }
+        assert!(
+            fallbacks > 0,
+            "the focused Spiral chain must exhaust its slot at {container:?}"
+        );
+
+        let mut balanced = Runtime::with_defaults().expect("headless runtime must build");
+        balanced.set_panel_layout_mode(PanelLayoutMode::Balanced);
+        balanced.set_container(container);
+        for _ in 0..PRESSES {
+            apply_new_panel(&mut balanced);
+        }
+        assert_eq!(
+            spiral.leaf_count(),
+            balanced.leaf_count(),
+            "default Spiral with fallback must match explicit Balanced capacity at {container:?}"
+        );
+        assert_eq!(spiral.leaf_count(), PRESSES + 1);
+    }
+
+    /// Issue #2571 review: an 80x24 window must not lose `Mod+N` after five
+    /// Spiral presses.
+    #[test]
+    fn default_spiral_keeps_balanced_capacity_on_80x24() {
+        assert_default_spiral_keeps_balanced_capacity(UiRect::new(0, 0, 80, 24));
+    }
+
+    /// Issue #2571 review: a 120x40 window must not lose `Mod+N` after six
+    /// Spiral presses.
+    #[test]
+    fn default_spiral_keeps_balanced_capacity_on_120x40() {
+        assert_default_spiral_keeps_balanced_capacity(UiRect::new(0, 0, 120, 40));
     }
 
     /// Issue #2528: the spiral phase continues only along the active
@@ -3530,10 +3728,11 @@ mod tests {
         let _ = second;
     }
 
-    /// Issue #2521: a layout too small to host two usable panes refuses the
-    /// adaptive split instead of committing a sliver.
+    /// Issue #2521 / #2571 review: a layout where neither the focused Spiral
+    /// target nor the largest-area Balanced fallback can host two usable
+    /// panes refuses the adaptive split instead of committing a sliver.
     #[test]
-    fn balanced_plan_refuses_below_minimum_pane_size() {
+    fn spiral_and_balanced_plans_refuse_below_minimum_pane_size() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
         let seed = rt.focused_view().expect("focus");
         let tiny = ViewId::new(2);
@@ -3908,29 +4107,77 @@ mod tests {
         assert_eq!(rt.panel_bisect_target(), Some(first));
     }
 
-    /// CTX-0964 (#1698) / issues #2521, #2528: `Spiral` and `Dwindle` keep
-    /// focused-leaf semantics; `Balanced` (the new default) and
+    /// Issue #2571 / CTX-0964 (#1698): a fresh runtime defaults to `Spiral`;
+    /// `Balanced`, `Dwindle`, and `BisectLargest` stay selectable. `Spiral`
+    /// and `Dwindle` keep focused-leaf semantics; `Balanced` and
     /// `BisectLargest` target the largest leaf.
     #[test]
-    fn default_mode_is_balanced_and_modes_keep_their_targets() {
+    fn default_mode_is_spiral_and_modes_keep_their_targets() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
         let focused = rt.focused_view().expect("focus");
-        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Balanced);
+        assert_eq!(
+            rt.panel_layout_mode(),
+            PanelLayoutMode::Spiral,
+            "a fresh config selects Spiral (issue #2571)"
+        );
         // Single leaf: every mode agrees on the container axis.
         assert_eq!(
             rt.panel_split_axis(focused),
             bitty_ui::smart_split_axis(rt.container(), 1.0)
         );
-        assert_eq!(rt.panel_bisect_target(), Some(focused));
-        assert!(!rt.panel_split_place_new_first());
-        rt.set_panel_layout_mode(PanelLayoutMode::Dwindle);
-        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Dwindle);
-        assert!(!rt.panel_split_place_new_first());
-        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
         let plan = rt.panel_split_plan().expect("spiral plan");
         assert_eq!(plan.target, focused, "spiral keeps the focused target");
         assert_eq!(plan.spiral_phase, Some(0), "a fresh chain starts at Right");
         assert!(!plan.place_new_first);
+
+        // Explicit opt-in: Balanced still bisects the largest slot.
+        rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
+        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Balanced);
+        assert_eq!(rt.panel_bisect_target(), Some(focused));
+        assert_eq!(
+            rt.panel_split_plan().expect("balanced plan").spiral_phase,
+            None,
+            "balanced carries no spiral phase"
+        );
+        assert!(!rt.panel_split_place_new_first());
+
+        // Explicit opt-in: Dwindle still follows focus right/down.
+        rt.set_panel_layout_mode(PanelLayoutMode::Dwindle);
+        assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Dwindle);
+        assert_eq!(
+            rt.panel_split_plan().expect("dwindle plan").spiral_phase,
+            None,
+            "dwindle carries no spiral phase"
+        );
+        assert!(!rt.panel_split_place_new_first());
+    }
+
+    /// Issue #2571: only the implicit default moved. An explicit
+    /// `RuntimeConfig::panel_layout_mode` still wins, so configs that select
+    /// `Balanced` (or any other mode) keep their policy.
+    #[test]
+    fn explicit_config_panel_layout_mode_wins_over_spiral_default() {
+        assert_eq!(
+            RuntimeConfig::default().panel_layout_mode,
+            PanelLayoutMode::Spiral,
+            "the compiled default is Spiral"
+        );
+        let cfg = RuntimeConfig {
+            panel_layout_mode: PanelLayoutMode::Balanced,
+            ..RuntimeConfig::default()
+        };
+        let rt = Runtime::new(cfg).expect("headless runtime must build");
+        assert_eq!(
+            rt.panel_layout_mode(),
+            PanelLayoutMode::Balanced,
+            "an explicit config mode must not be replaced by the new default"
+        );
+        assert_eq!(
+            rt.panel_split_plan().expect("balanced plan").spiral_phase,
+            None,
+            "the explicit Balanced policy drives the plan"
+        );
+        assert!(!rt.panel_split_place_new_first());
     }
 
     /// CTX-1117 (issue #1900): own IPC socket path for PTY `BITTY_SOCKET`

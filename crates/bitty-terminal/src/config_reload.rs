@@ -251,6 +251,9 @@ pub(crate) struct AppAdoption {
     /// Tiled resize step (`layout.resize_step`, CTX-0963): read at keypress
     /// time, adopted live like the keymaps.
     pub(crate) resize_step: f32,
+    /// Effective `mod_key` slot (issue #2407): plugin-suggested `alt`-bearing
+    /// chords are re-spelled through it at match time.
+    pub(crate) mod_key: bitty_config::ModKey,
     /// Effective `window.opacity` for the platform transparency hint.
     pub(crate) window_opacity: f32,
     /// Resolved theme identity for the window title (CTX-0898): a built-in
@@ -356,6 +359,7 @@ fn resolve_app_adoption(effective: &EffectiveConfig) -> Result<AppAdoption, Stri
         prefix_bindings,
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
+        mod_key: effective.mod_key,
         window_opacity: effective.window.opacity,
         theme_name,
     })
@@ -1162,6 +1166,8 @@ mod tests {
         assert_eq!(runtime.active_background(), expected.background);
         let outline_before_focused = runtime.config().outline_focused;
         let outline_before_idle = runtime.config().outline_idle;
+        let theme_outline_before_focused = runtime.config().theme.border_focused;
+        let theme_outline_before_idle = runtime.config().theme.border_idle;
 
         let mut custom = light.clone();
         let preset = bitty_config::theme::resolve_theme(None);
@@ -1181,10 +1187,23 @@ mod tests {
         };
         custom.appearance.colors = Some(palette);
         apply_live(&mut runtime, &custom).expect("adopt colors");
+        let expected = bitty_runtime::ThemePalette::from_custom(&palette);
+        let live_theme = runtime.config().theme;
         assert_eq!(
-            runtime.config().theme,
-            bitty_runtime::ThemePalette::from_custom(&palette),
-            "every custom role reaches the live renderer palette"
+            live_theme.background, expected.background,
+            "custom background reaches the live renderer palette"
+        );
+        assert_eq!(live_theme.foreground, expected.foreground);
+        assert_eq!(live_theme.cursor, expected.cursor);
+        assert_eq!(live_theme.selection, expected.selection);
+        assert_eq!(live_theme.ansi, expected.ansi);
+        assert_eq!(
+            live_theme.border_focused, theme_outline_before_focused,
+            "custom colors must not rewrite the preset-owned focused outline token"
+        );
+        assert_eq!(
+            live_theme.border_idle, theme_outline_before_idle,
+            "custom colors must not rewrite the preset-owned idle outline token"
         );
         assert_eq!(
             runtime.active_background(),
@@ -1734,6 +1753,59 @@ mod tests {
             "a broken reload must retain the last good plan"
         );
         clear();
+    }
+
+    #[test]
+    fn invalid_config_edit_keeps_the_last_good_plan() {
+        // CTX-1490 (issue #2580): live reload stays strict. An invalid edit
+        // must report `load-error` and keep the last-good plan instead of
+        // silently dropping to defaults through startup salvage.
+        let dir = temp_dir("lastgood-lua");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            "return { font = { family = \"Mono\", size = 13.0 } }\n",
+        )
+        .expect("write valid config");
+        let mut args = crate::cli::Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        let baseline = crate::config_cli::load_app_config(&args)
+            .expect("valid config loads")
+            .effective;
+        let resolver_args = args.clone();
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || {
+                crate::config_cli::load_app_config(&resolver_args).map(|app| app.effective)
+            }),
+            Some(path.clone()),
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "unchanged");
+
+        std::fs::write(&path, "return { window = { opacity = 2.0 } }\n")
+            .expect("write invalid config");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "load-error");
+        assert!(!info.applied);
+        assert!(
+            info.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("window.opacity"),
+            "reload message must name the field: {:?}",
+            info.message
+        );
+        assert_eq!(
+            current_effective(),
+            Some(baseline),
+            "an invalid edit must retain the last good plan"
+        );
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -10207,7 +10207,7 @@ fn init_dispatch_yes_with_plugins_records_and_grants() {
         0
     );
     assert!(target.exists(), "config written");
-    let state_path = dir.join("bitty-plugins.toml");
+    let state_path = dir.join("bitty-plugins.lua");
     assert!(state_path.exists(), "plugin queue recorded");
     let state_text = std::fs::read_to_string(&state_path).expect("state readable");
     assert!(
@@ -10239,7 +10239,7 @@ fn init_dispatch_yes_with_plugins_unknown_fails_closed() {
     );
     assert!(!target.exists(), "usage error writes no config");
     assert!(
-        !dir.join("bitty-plugins.toml").exists(),
+        !dir.join("bitty-plugins.lua").exists(),
         "usage error writes no plugin queue"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -10263,7 +10263,7 @@ fn init_dispatch_interactive_plugins_and_components() {
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
-    let state_path = dir.join("bitty-plugins.toml");
+    let state_path = dir.join("bitty-plugins.lua");
     assert!(state_path.exists(), "interactive selection recorded");
     let printed = String::from_utf8(output).expect("UTF-8");
     assert!(
@@ -13108,11 +13108,57 @@ fn reap_exited_last_tiled_pane_with_pinned_survivor_issue_2222() {
     let _ = std::fs::remove_file(&script);
 }
 
+/// Build a one-plugin runtime whose generation captures an `alt+?`
+/// suggestion (issue #2407 reload-adoption test).
+fn suggestion_plugin_runtime(
+    tag: &str,
+) -> (
+    bitty_runtime::plugin_runtime::PluginRuntime,
+    std::path::PathBuf,
+) {
+    use crate::composer_owner::fixture;
+    const OWNER: &str = "bitty-featured.help-fixture";
+    const COMMAND: &str = "toggle-help";
+    let root = fixture::temp_dir(tag);
+    let plugin = root.join(OWNER);
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            "[plugin]\nid = \"{OWNER}\"\nname = \"Help Fixture\"\nversion = \"0.1.0\"\n\
+             description = \"suggestion reload fixture\"\n\n\
+             [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\n\n\
+             [lazy]\ncommands = [\"{OWNER}:{COMMAND}\"]\nevents = []\n",
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin.join("lua/init.lua"),
+        format!(
+            "bitty.commands.register({{ id = \"{COMMAND}\", title = \"Toggle help\", \
+             run = function() return true end }})\n\
+             bitty.keymaps.suggest({{ chord = \"alt+?\", command = \"{OWNER}:{COMMAND}\" }})\n\
+             return {{}}\n"
+        ),
+    )
+    .expect("init");
+    let mut runtime = fixture::runtime_for(vec![root.clone()]);
+    runtime.discover();
+    let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+    runtime.activate(&id).expect("activate");
+    (runtime, root)
+}
+
 #[test]
 fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // CTX-0898 (#1522): the app half of a live reload swaps the chrome key
     // table, the Leader binding, and the hint switch, cancels a Leader
     // window armed under the old binding, and records the new opacity.
+    // Issue #2407 review B2: the live `mod_key` adoption is covered here via
+    // a live `alt+?` suggestion whose matched chord must flip after the
+    // reload.
+    use bitty_config::{ChromeAction, KeyName, KeyRef, ModKey};
     let base = bitty_config::EffectiveConfig::default();
     let maps = bitty_config::resolve_keymaps(&base).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
@@ -13120,6 +13166,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
     // `bitty.keymaps.list()` never serves a stale registry after a reload.
     let live_keymaps = std::rc::Rc::new(crate::plugin_runtime::LiveKeymaps::default());
     live_keymaps.publish(&maps);
+    let (plugin_runtime, plugin_root) = suggestion_plugin_runtime("suggestion-reload");
     let mut app = TerminalApp::with_theme(
         rt,
         bitty_config::theme::DEFAULT_THEME_NAME,
@@ -13127,8 +13174,30 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         maps.clone(),
         SpawnSpec::default(),
     )
-    .with_live_keymaps(Some(std::rc::Rc::clone(&live_keymaps)));
+    .with_live_keymaps(Some(std::rc::Rc::clone(&live_keymaps)))
+    .with_plugin_runtime(Some(plugin_runtime));
     app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
+
+    let alt_question = KeyRef {
+        key: KeyName::Char('?'),
+        ctrl: false,
+        alt: true,
+        shift: false,
+        super_held: false,
+    };
+    let super_question = KeyRef {
+        key: KeyName::Char('?'),
+        ctrl: false,
+        alt: false,
+        shift: false,
+        super_held: true,
+    };
+    let suggestion = Some(ChromeAction::InvokeCommand(
+        "bitty-featured.help-fixture:toggle-help".to_string(),
+    ));
+    assert_eq!(app.chrome.mod_key, ModKey::Alt);
+    assert_eq!(app.match_plugin_binding(alt_question), suggestion);
+    assert_eq!(app.match_plugin_binding(super_question), None);
 
     let mut edited = base.clone();
     edited.mod_key = bitty_config::ModKey::Super;
@@ -13143,11 +13212,27 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         prefix_bindings: bitty_config::resolve_prefix_bindings(&edited.keymaps).expect("prefixes"),
         hints_enabled: false,
         resize_step: edited.layout.resize_step,
+        mod_key: edited.mod_key,
         window_opacity: 0.6,
         theme_name: bitty_config::theme::DEFAULT_THEME_NAME.to_string(),
     });
     assert_eq!(app.chrome.keymaps, keymaps);
     assert_ne!(app.chrome.keymaps, maps, "mod_key rebound the table");
+    assert_eq!(
+        app.chrome.mod_key,
+        ModKey::Super,
+        "the reloaded mod_key slot must be adopted by the app"
+    );
+    assert_eq!(
+        app.match_plugin_binding(alt_question),
+        None,
+        "the alt spelling must stop matching after the flip"
+    );
+    assert_eq!(
+        app.match_plugin_binding(super_question),
+        suggestion,
+        "the same suggestion must follow the reloaded Mod slot"
+    );
     assert_eq!(
         bitty_runtime::plugin_runtime::KeymapSource::keymaps(&*live_keymaps).expect("rows"),
         keymaps,
@@ -13162,6 +13247,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         "a stale armed Leader window is cancelled"
     );
     assert!((app.window.opacity - 0.6).abs() < f32::EPSILON);
+    let _ = std::fs::remove_dir_all(&plugin_root);
 }
 
 fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_reload::AppAdoption {
@@ -13173,6 +13259,7 @@ fn adoption_from(effective: &bitty_config::EffectiveConfig) -> crate::config_rel
             .expect("prefixes"),
         hints_enabled: bitty_config::resolve_hint_config(effective).enabled,
         resize_step: effective.layout.resize_step,
+        mod_key: effective.mod_key,
         window_opacity: effective.window.opacity,
         theme_name: bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref())
             .name

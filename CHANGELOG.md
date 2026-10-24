@@ -28,6 +28,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`bitty list colors|fonts` canonical kinds (#2464):** the new catalogs are
   available under the canonical `list` spelling as well; the `+list-*`
   spellings are aliases.
+- **Plugin-suggested keybindings are live (#2407):** `bitty.keymaps.suggest`
+  captures now publish into a generation-fenced Core directory and dispatch at
+  the reserved plugin priority slot — after the user/default keymap table and
+  before terminal encoding. Only a command registered by the same generation
+  can be suggested; unqualified, foreign, unregistered, malformed, and
+  prefix-spelled suggestions fail closed. Explicit user and default bindings
+  always win, `alt`-bearing suggestions follow `mod_key`, suspend/unload/crash
+  and reload remove the generation's chords, and colliding suggestions produce
+  bounded warnings naming the deterministic winner and the shadowed command.
+- **Lua plugin ledger and generated per-plugin defaults (#2576):** the
+  machine-managed plugin ledger is now data-only Lua at
+  `$XDG_CONFIG_HOME/bitty/bitty-plugins.lua`; a legacy
+  `bitty-plugins.toml` is migrated once (atomically, 0600, no-clobber) and
+  retained as `bitty-plugins.toml.bak`. The Lua file is parsed without a Lua
+  VM (bounded bytes/lines/keys/strings, UTF-8 only, duplicate keys fail
+  closed), and a hand-edited ledger cannot widen authority: grants for a
+  bundled record are intersected with the manifest declared for its recorded
+  `manifest_hash`, and undeclared grants are dropped with a diagnostic. A
+  successful plugin install or first enable also creates
+  `$XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua` once, containing
+  commented manifest defaults for plugins that declare `[settings]`. Existing
+  files, user edits, legacy `<id>.toml` settings, and settings-less manifests
+  are never touched; `plugin config scaffold --force` remains the explicit
+  overwrite path and `plugin info` points at the canonical file.
+
+### Changed
+
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
+
+- **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
+  next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
+  -> Up around the focused pane) instead of `Balanced` bisect-largest.
+  `Balanced` and `Dwindle` remain explicit opt-ins through
+  `RuntimeConfig::panel_layout_mode` / `Runtime::set_panel_layout_mode`, and
+  `BisectLargest` is unchanged. When the focused Spiral slot can no longer
+  host two 10x4 panes, the plan falls back deterministically to the
+  largest-area `Balanced` target (with one bounded warning) instead of
+  dropping `Mod+N`, so normal windows keep the 0.0.27 pane capacity. Only a
+  grid where no leaf can host two usable 10x4 panes still refuses the chord.
+  Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
+  workspace IDs; the spiral phase resets to Right whenever focus lands on a
+  pane outside the active creation chain or the fallback runs.
+
+### Fixed
+
+- **Lua ledger migration and generated defaults hardening (#2576):** migration
+  now renders capability arrays with bounded per-line wrapping and re-parses
+  the rendered bytes (requiring the same records back) before the atomic
+  commit; a rejected render is a hard error that leaves the legacy TOML in
+  place instead of committing a ledger the next command cannot read. Longer
+  parameterized grant sets no longer exceed the 1024-byte parser line bound.
+  Generated per-plugin defaults also inspect the short-name alias path, so an
+  existing `<name>.lua` user file is never shadowed; `plugin doctor --repair`
+  leaves an already-current Lua ledger byte-identical (no `.bak` churn), and
+  the completion-candidate tests read the Lua ledger.
+- **Copy-mode selection spans scrollback pages (#2470):** a visual selection is
+  no longer capped at the visible page. Wheel and page keys scroll the
+  transcript while a drag is in flight (the selection owns the wheel over PTY
+  mouse reporting; Shift still escapes capture), a pointer held in the top or
+  bottom painted row auto-scrolls one bounded line per interval, and the press
+  endpoint stays pinned by combined-buffer identity. Pruning is resolved by
+  eviction drift, so a committed multi-page range copies every line exactly and
+  denies (instead of silently copying different lines) once its anchored
+  history is gone. The mechanism stays in Core selection/history paging; the
+  copy-mode plugin remains a bounded snapshot policy over the same public
+  surfaces, and no private API is added.
 
 ### Fixed
 

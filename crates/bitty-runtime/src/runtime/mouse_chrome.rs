@@ -65,8 +65,8 @@
 use super::*;
 use bitty_platform::CursorPosition;
 use bitty_ui::{
-    DragMoveSession, DropPlan, DropSpec, Point as UiPoint, RESIZE_HANDLE_CELLS, ResizeEdge,
-    SplitAxis, detect_resize_edge, drop_plan_for_point, resize_floating_rect,
+    DragMoveSession, DropPlan, DropSpec, Gaps, LayoutNode, Point as UiPoint, RESIZE_HANDLE_CELLS,
+    Rect, ResizeEdge, SplitAxis, detect_resize_edge, drop_plan_for_point, resize_floating_rect,
 };
 use std::time::Instant;
 
@@ -186,23 +186,34 @@ pub struct TiledDragState {
 }
 
 /// Active border-drag resize: which split divider(s) are grabbed plus the
-/// press-time anchor in container cells (issue #1348, #1445).
+/// press-time anchor in container cells (issue #1348, #1445, #2572).
 ///
 /// A plain left press on a split handle grabs the divider; motion adjusts
 /// the adjacent split ratio live through the same clamped geometry the
 /// keyboard resize path uses. Corner-drag (issue #1445: Hyprland/Niri
-/// 4-way model) grabs up to two perpendicular splits simultaneously,
-/// resizing all adjacent panels at once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 4-way model) grabs up to two perpendicular axes; cross-drag (issue
+/// #2572) additionally grabs every collinear segment of both crossed
+/// dividers, so a four-pane inner junction moves its whole shared vertical
+/// and horizontal lines and all four adjacent panels resize together.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BorderDragState {
     /// Paths of the grabbed splits (same indexing as
     /// [`LayoutNode::set_split_ratio_at`](bitty_ui::LayoutNode::set_split_ratio_at)).
-    /// Single-edge drag has one entry; corner-drag has two (one per axis).
+    /// Single-edge drag has one entry; a cross has the column split plus
+    /// every collinear row split (and vice versa for nested crosses).
     pub splits: Vec<(Vec<usize>, SplitAxis)>,
-    /// Anchor column (container cells) at grab or last move.
+    /// Anchor column (container cells) at the grabbing press.
     pub anchor_col: i32,
-    /// Anchor row (container cells) at grab or last move.
+    /// Anchor row (container cells) at the grabbing press.
     pub anchor_row: i32,
+    /// Layout at the press: drag targets are computed absolutely from
+    /// these ratios and allocations, so hitting a clamp never introduces a
+    /// dead zone or a single-axis snap on the way back (issue #2572).
+    press_layout: LayoutNode,
+    /// Container at the press (cells), paired with `press_layout`.
+    press_container: Rect,
+    /// Gaps at the press (cells), paired with `press_layout`.
+    press_gaps: Gaps,
 }
 
 /// Rounds a cursor position to physical pixels, fail-closed.
@@ -1255,9 +1266,10 @@ impl Runtime {
     ///
     /// Pure query over [`LayoutNode::hit_test_split_handle`]: returns the
     /// divider axis so a future platform cursor-icon API can show a
-    /// column/row-resize shape on hover. The platform layer currently
-    /// exposes no cursor-icon setter, so no caller sets a shape yet; the
-    /// drag itself works without it.
+    /// column/row-resize shape on hover. A cross intersection reports its
+    /// column axis (the shared vertical divider). The platform layer
+    /// currently exposes no cursor-icon setter, so no caller sets a shape
+    /// yet; the drag itself works without it.
     #[must_use]
     pub fn border_drag_hover_at(&self, pos: CursorPosition) -> Option<SplitAxis> {
         if self.pointer_in_content(pos) {
@@ -1276,34 +1288,38 @@ impl Runtime {
         self.border_drag.is_some()
     }
 
-    /// Grabbed split divider(s) for the active border drag, if any (issue
-    /// #1445 corner-drag test seam).
+    /// Grabbed split divider(s) for the active border drag, if any (issues
+    /// #1445 corner-drag and #2572 cross-drag test seam).
     ///
     /// Returns the divider paths and axes grabbed by
-    /// [`Self::begin_border_drag`]: one entry for a single-edge drag, two
-    /// perpendicular entries for a corner-drag (at most one per axis, so
-    /// up to four adjacent panels). Headless-testable without a window.
+    /// [`Self::begin_border_drag`]: one entry for a single-edge drag, and
+    /// every collinear segment of both crossed lines for a four-pane
+    /// junction (a 2x2 cross yields three entries: the root column split
+    /// plus both row segments). Headless-testable without a window.
     #[must_use]
     pub fn border_drag_splits(&self) -> Option<Vec<(Vec<usize>, SplitAxis)>> {
         self.border_drag.as_ref().map(|drag| drag.splits.clone())
     }
 
     /// Attempts to grab the split divider(s) under the last known cursor for
-    /// a border-drag resize (issue #1348, #1445 corner-drag).
+    /// a border-drag resize (issue #1348, #1445 corner-drag, #2572
+    /// cross-drag).
     ///
     /// Requires a plain press: Shift, Alt, and Super released (those force
     /// the selection, Alt+drag, and Mod tiled-drag paths per the
     /// CTX-0181/CTX-0260/CTX-0966 precedents)
     /// plus a known cursor over a split handle
-    /// ([`LayoutNode::hit_test_split_handles`]). Callers run this after the
-    /// mouse-capture and scrollbar checks, so a mouse-mode app and the
+    /// ([`LayoutNode::hit_test_split_handle_kind`]). Callers run this after
+    /// the mouse-capture and scrollbar checks, so a mouse-mode app and the
     /// scroll thumb keep the pointer. Returns `true` when the drag started
     /// (caller consumes the press and skips selection); `false` leaves all
     /// state untouched so the press falls through to selection.
     ///
-    /// Corner-drag (issue #1445): when the cursor is at the intersection of
-    /// perpendicular splits (e.g., 2x2 grid corner), all intersecting splits
-    /// are grabbed and resized simultaneously (Hyprland/Niri model).
+    /// Cross-drag (issues #1445/#2572): when the cursor is at the
+    /// intersection of perpendicular splits (e.g., a 2x2 grid center), the
+    /// hit test returns every collinear segment of both dividers. All of
+    /// them are grabbed and resized together (Hyprland/Niri model), so the
+    /// whole shared vertical and horizontal lines move with the pointer.
     pub fn begin_border_drag(&mut self) -> bool {
         if self.alt_pressed || self.super_pressed || self.shift_pressed {
             return false;
@@ -1318,43 +1334,30 @@ impl Runtime {
             return false;
         };
         let gaps = self.gaps();
-        let splits = self
+        let Some(handle) = self
             .layout
-            .hit_test_split_handles(self.container, gaps, point);
+            .hit_test_split_handle_kind(self.container, gaps, point)
+        else {
+            return false;
+        };
+        let splits = handle.splits();
         if splits.is_empty() {
             return false;
         }
-        // Bounded corner grab (issue #1445): at most two perpendicular
-        // dividers (one per axis) for up to four panels. The layout hit
-        // test already enforces this, but fail closed here too rather
-        // than driving an unbounded set.
-        if splits.len() > 2 {
+        // Bounded grab: the hit test only returns collinear segments of at
+        // most two perpendicular dividers, so the segment count is bounded
+        // by the tree's leaf count. Fail closed on an impossible oversized
+        // set rather than driving an unbounded drag.
+        if splits.len() > bitty_ui::MAX_VIEWS_PER_WORKSPACE_TREE {
             return false;
-        }
-        {
-            let mut seen_h = false;
-            let mut seen_v = false;
-            for (_, axis) in &splits {
-                match axis {
-                    SplitAxis::Horizontal => {
-                        if seen_h {
-                            return false;
-                        }
-                        seen_h = true;
-                    }
-                    SplitAxis::Vertical => {
-                        if seen_v {
-                            return false;
-                        }
-                        seen_v = true;
-                    }
-                }
-            }
         }
         self.border_drag = Some(BorderDragState {
             splits,
             anchor_col: i32::from(point.x),
             anchor_row: i32::from(point.y),
+            press_layout: self.layout.clone(),
+            press_container: self.container,
+            press_gaps: gaps,
         });
         // A border owns no leaf, so — unlike click-to-focus — the grab
         // moves no focus. A pending hover dwell is dropped: the pointer is
@@ -1364,22 +1367,24 @@ impl Runtime {
     }
 
     /// Moves the active border drag to `pos`, adjusting the grabbed split
-    /// ratio(s) live (issue #1348, #1445 corner-drag).
+    /// ratio(s) live (issue #1348, #1445 corner-drag, #2572 cross-drag).
     ///
-    /// The cell delta since the grab (or last move) along each split axis
-    /// flows through [`LayoutNode::resize_split_by_drag`] — the same
-    /// clamped geometry the keyboard resize path uses — installed via
-    /// [`Runtime::set_layout`] so leaf Views, pane sessions, and the
-    /// primary grid reflow exactly like a keyboard resize (sizes persist
-    /// in the tree per layout). Overshoot clamps fail-closed at
-    /// `[MIN_RATIO, MAX_RATIO]`; a zero delta keeps the drag armed with no
-    /// redraw. When the layout no longer owns the split (pane closed
-    /// mid-drag) the drag ends fail-soft and `false` is returned so the
-    /// motion falls through to normal handling.
+    /// Each grabbed split is driven absolutely from its press-time ratio and
+    /// allocation: the pointer's cell delta since the press moves the
+    /// divider, clamped by [`LayoutNode::drag_split_ratio`] to the
+    /// gap-aware per-pane 10x4 minimum. Axis handling stays independent, so
+    /// a vertical clamp at the minimum never disturbs horizontal motion and
+    /// there is no clamp dead zone or single-axis snap when the pointer
+    /// reverses (issue #2572). The clamped ratios commit immediately
+    /// through [`Runtime::set_layout`], so leaf Views, pane sessions, and
+    /// the primary grid reflow exactly like a keyboard resize (sizes
+    /// persist in the tree per layout). When a grabbed split no longer
+    /// exists (pane closed mid-drag) the drag ends fail-soft and `false` is
+    /// returned so the motion falls through to normal handling.
     ///
-    /// Corner-drag (issue #1445): when multiple splits are grabbed (up to
-    /// two perpendicular splits at a corner), both are resized with their
-    /// respective axis deltas, resizing up to four adjacent panels.
+    /// Cross-drag: a four-pane junction grabs the shared column split plus
+    /// every collinear row split (or vice versa), so all adjacent panels
+    /// resize together on a diagonal pointer motion.
     ///
     /// Returns `true` when a drag was active (caller consumes the motion:
     /// no selection update, no hover-focus, no capture motion encoding).
@@ -1407,20 +1412,42 @@ impl Runtime {
         let mut next = self.layout.clone();
         let mut any_changed = false;
 
-        // Apply delta to each grabbed split along its axis.
+        // Apply the pointer delta to each grabbed split along its axis,
+        // absolutely from the press geometry. A split that refuses the
+        // delta (minimum pane size, degenerate extent) is skipped without
+        // touching the other axis.
         for (path, axis) in &drag.splits {
-            let (raw_delta, total) = match axis {
-                SplitAxis::Horizontal => (delta_col, self.container.width),
-                SplitAxis::Vertical => (delta_row, self.container.height),
+            let raw_delta = match axis {
+                SplitAxis::Horizontal => delta_col,
+                SplitAxis::Vertical => delta_row,
             };
-            if raw_delta == 0 {
-                continue;
+            if next.split_axis_at(path) != Some(*axis) {
+                // Split no longer exists (closed mid-drag): end the drag.
+                self.border_drag = None;
+                return false;
             }
-            // `resize_split_by_drag` narrows to `i16`: clamp the cell delta so
-            // a pointer teleport can never wrap the ratio step.
+            let Some(base_ratio) = drag.press_layout.split_ratio_at(path) else {
+                // Split vanished from the press layout: end the drag.
+                self.border_drag = None;
+                return false;
+            };
+            // `drag_split_ratio` narrows the delta to `i32` cells but the
+            // ratio math is f32; clamp a pointer teleport to i16 so the
+            // cell delta can never overflow the drag arithmetic.
             let delta = raw_delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+            let Some(ratio) = drag.press_layout.drag_split_ratio(
+                drag.press_container,
+                drag.press_gaps,
+                path,
+                base_ratio,
+                delta,
+            ) else {
+                // This axis refuses (min size / degenerate split); the
+                // other axis still applies and the drag stays armed.
+                continue;
+            };
             let before = next.split_ratio_at(path);
-            if !next.resize_split_by_drag(path, delta, total) {
+            if !next.set_split_ratio_at(path, ratio) {
                 // Split no longer exists (closed mid-drag): end the drag.
                 self.border_drag = None;
                 return false;
@@ -1436,15 +1463,10 @@ impl Runtime {
             // transition. The ratios commit immediately (terminal content is
             // never interpolated); only Core-owned chrome fades. `None`
             // because one gesture resizes every adjacent panel at once
-            // (corner-drag touches up to four); repeat updates restart the
-            // bounded transition instead of accumulating.
+            // (cross-drag touches up to four or more); repeat updates
+            // restart the bounded transition instead of accumulating.
             self.trigger_animation(AnimationKind::Resize, None, now);
         }
-        self.border_drag = Some(BorderDragState {
-            splits: drag.splits,
-            anchor_col: i32::from(point.x),
-            anchor_row: i32::from(point.y),
-        });
         true
     }
 

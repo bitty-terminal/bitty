@@ -260,14 +260,6 @@ fn banner_ground(palette: &ThemePalette) -> [u8; 4] {
 }
 
 /// Expected help-panel ring (issue #2333 contract: ANSI 12).
-fn help_ring(palette: &ThemePalette) -> [u8; 4] {
-    // Deliberately independent of the production resolver: the expected ring
-    // for the presets exercised here is the ANSI 12 accent, so the pixel
-    // assertions can catch a regression in the fallback rule instead of
-    // reusing it.
-    opaque(palette.active_index(12))
-}
-
 fn assert_role_probes(rt: &Runtime, rgba: &[u8], palette: &ThemePalette) {
     let probe = Probe::new(rt);
     let rgb = |value: [u8; 4]| [value[0], value[1], value[2], 0xFF];
@@ -544,27 +536,30 @@ fn help_panel_follows_the_theme() {
     let dark = dracula();
     let light = github_light();
 
-    // Locate the opaque ring by its theme color, then probe the ring and the
-    // inner ground directly. A hardcoded indigo/lavender fill (the pre-#2333
-    // behavior) has no ring in the theme color and fails here.
-    let dark_ring = help_ring(&dark);
-    let (x0, y0, x1, y1) = probe
-        .color_bounds(&before, dark_ring)
-        .expect("help ring must use the active theme's ANSI 12 accent");
-    let mid_x = (x0 + x1) / 2;
+    // Locate the opaque panel surface (selection ground), then probe the
+    // one-pixel ring just outside it. CTX-1477 replaced the full-cell accent
+    // border with the theme's muted idle outline; the SDF band composites at
+    // partial coverage, so the assertion is "visible, distinct, and
+    // recoloured", not a fixed raw colour.
+    let (sx0, sy0, sx1, sy1) = probe
+        .color_bounds(&before, dark.selection)
+        .expect("help panel surface must use the active theme's selection fill");
+    let (x0, y0, x1, y1) = (sx0 - 1, sy0 - 1, sx1 + 1, sy1 + 1);
     let mid_y = (y0 + y1) / 2;
-    for (x, y, edge) in [
-        (x0, mid_y, "left"),
-        (x1, mid_y, "right"),
-        (mid_x, y0, "top"),
-        (mid_x, y1, "bottom"),
-    ] {
-        assert_eq!(
-            probe.pixel_at(&before, x, y),
-            dark_ring,
-            "help panel {edge} border must use the theme accent"
-        );
-    }
+    let dark_edge = probe.pixel_at(&before, x0, mid_y);
+    assert_ne!(
+        dark_edge, dark.selection,
+        "help panel left edge must paint a ring above the surface"
+    );
+    assert_ne!(
+        dark_edge, dark.background,
+        "help panel ring must be visible against the ground"
+    );
+    assert_eq!(
+        probe.pixel_at(&before, x0 - 1, mid_y),
+        dark.background,
+        "the thin ring must not bleed outside the frame"
+    );
     // Top inner row, last inner cell: blank underlay, so the pixel is the
     // panel's own opaque ground.
     let ground_x = x1 - probe.cell_w as i32 - probe.cell_w as i32 / 2;
@@ -577,31 +572,22 @@ fn help_panel_follows_the_theme() {
 
     live.set_theme_palette(light);
     let after = frame(&mut live);
-    let light_ring = help_ring(&light);
-    assert_ne!(
-        light_ring, HELP_PANEL_BORDER,
-        "precondition: the switched ring must differ from the pre-#2333 fixed accent"
-    );
     assert_ne!(
         light.selection, HELP_PANEL_BG,
         "precondition: the switched ground must differ from the pre-#2333 fixed fill"
     );
-    assert_ne!(
-        dark_ring, light_ring,
-        "precondition: ring colors must differ"
-    );
-    let light_bounds = probe
-        .color_bounds(&after, light_ring)
-        .expect("switched help ring must use the new theme's ANSI 12 accent");
+    let light_surface = probe
+        .color_bounds(&after, light.selection)
+        .expect("switched help surface must use the new theme's selection fill");
     assert_eq!(
-        light_bounds,
-        (x0, y0, x1, y1),
+        light_surface,
+        (sx0, sy0, sx1, sy1),
         "the theme switch must not move the help panel"
     );
-    assert_eq!(
-        probe.pixel_at(&after, x0, mid_y),
-        light_ring,
-        "the switched theme must recolor the help panel border"
+    let light_edge = probe.pixel_at(&after, x0, mid_y);
+    assert_ne!(
+        dark_edge, light_edge,
+        "the switched theme must recolor the help panel ring"
     );
     assert_eq!(
         probe.pixel_at(&after, ground_x, ground_y),

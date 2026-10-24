@@ -8566,6 +8566,7 @@ fn init_preview_baseline_prefers_loaded_config() {
         bitty_profile: Some("myprof"),
         shell: None,
         xdg_config_home: Some(&prof_root_s),
+        xdg_data_home: None,
         home: None,
         stdin_is_tty: true,
     };
@@ -9852,6 +9853,7 @@ fn init_env<'a>(
         bitty_profile: None,
         shell,
         xdg_config_home,
+        xdg_data_home: None,
         home,
         stdin_is_tty,
     }
@@ -10225,12 +10227,49 @@ fn init_plugins_answer_parses_bundled_ids_offline() {
     assert!(init_parse_plugins_flag("   ").is_err());
 }
 
-// -- `bitty init` plugin multi-select: checkbox rows (#1913 follow-up) ------
+// -- `bitty init` plugin inventory and multi-select (#1913, #2436) ----------
 //
 // The loop is catalog-generic, so these tests inject a three-id list even
 // though the shipped bundled catalog currently holds one id. Keys are
 // injected bytes plus an EOF-terminated wait closure: no real TTY is needed
 // and no terminal mode is touched.
+
+/// Bundled-only inventory for direct prompt/loop tests.
+fn init_plugin_inventory_bundled(ids: &[&str]) -> crate::init::InitPluginInventory {
+    crate::init::InitPluginInventory {
+        bundled: ids.iter().map(|id| (*id).to_string()).collect(),
+        installed: Vec::new(),
+        needs_network: Vec::new(),
+        warning: None,
+    }
+}
+
+/// One installed row for inventory tests.
+fn init_installed(id: &str, version: &str, enabled: bool) -> crate::init::InitInstalledPlugin {
+    crate::init::InitInstalledPlugin {
+        id: id.to_string(),
+        version: version.to_string(),
+        enabled,
+    }
+}
+
+/// One valid store record for pure inventory tests.
+fn init_plugin_record(
+    id: &str,
+    version: &str,
+    enabled: bool,
+) -> bitty_runtime::plugin_runtime::PluginRecord {
+    bitty_runtime::plugin_runtime::PluginRecord {
+        source_class: bitty_runtime::plugin_runtime::SourceClass::Registry,
+        plugin_id: id.to_string(),
+        version: version.to_string(),
+        root: format!("packages/{id}/{version}"),
+        manifest_hash: "a".repeat(64),
+        content_digest: "b".repeat(64),
+        enabled,
+        granted: Vec::new(),
+    }
+}
 
 /// Drives one plugin multi-select headlessly; returns the selected ids plus
 /// everything it printed.
@@ -10239,7 +10278,7 @@ fn drive_plugin_multiselect(
     stdin_bytes: &[u8],
     color: bool,
 ) -> (Result<Vec<String>, String>, String) {
-    let ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    let inventory = init_plugin_inventory_bundled(ids);
     let mut input = std::io::BufReader::new(stdin_bytes);
     let mut output = Vec::new();
     // EOF-terminated: no more bytes means the escape (if any) is bare.
@@ -10249,7 +10288,7 @@ fn drive_plugin_multiselect(
     let result = crate::init::init_multiselect_key_loop(
         &mut input,
         &mut output,
-        &ids,
+        &inventory,
         color,
         false,
         &mut wait,
@@ -10270,8 +10309,12 @@ fn init_plugin_multiselect_toggles_move_and_confirms_in_catalog_order() {
         vec!["alpha.plugin".to_string(), "beta.plugin".to_string()]
     );
     assert!(
-        printed.contains("Plugins (official, offline-safe):"),
+        printed.contains("Plugins (offline-safe; only bundled plugins install without network):"),
         "{printed}"
+    );
+    assert!(
+        printed.contains("  Bundled (install offline, no payload fetch):"),
+        "bundled group, got:\n{printed}"
     );
     assert!(
         printed.contains("> [ ] alpha.plugin"),
@@ -10298,12 +10341,10 @@ fn init_plugin_multiselect_toggles_move_and_confirms_in_catalog_order() {
 #[test]
 fn init_plugin_multiselect_inplace_repaints_with_cursor_up() {
     // In-place frames repaint over the previous frame (cursor-up plus
-    // clear-line) and hide the cursor while looping. Three ids make a
-    // five-line frame: prompt, three rows, hint.
-    let ids: Vec<String> = PLUGIN_MULTISELECT_TEST_IDS
-        .iter()
-        .map(|id| (*id).to_string())
-        .collect();
+    // clear-line) and hide the cursor while looping. The bundled-only frame
+    // is ten lines: prompt, bundled header, three rows, installed header,
+    // empty marker, network header, empty marker, hint.
+    let inventory = init_plugin_inventory_bundled(&PLUGIN_MULTISELECT_TEST_IDS);
     let mut input = std::io::BufReader::new(b"j\r".as_slice());
     let mut output = Vec::new();
     let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
@@ -10312,7 +10353,7 @@ fn init_plugin_multiselect_inplace_repaints_with_cursor_up() {
     let result = crate::init::init_multiselect_key_loop(
         &mut input,
         &mut output,
-        &ids,
+        &inventory,
         false,
         true,
         &mut wait,
@@ -10320,7 +10361,7 @@ fn init_plugin_multiselect_inplace_repaints_with_cursor_up() {
     assert!(result.expect("in-place confirm").is_empty());
     let printed = String::from_utf8(output).expect("multiselect output is UTF-8");
     assert!(
-        printed.contains("\x1b[5A"),
+        printed.contains("\x1b[10A"),
         "cursor-up repaint, got:\n{printed}"
     );
     assert!(
@@ -10402,7 +10443,9 @@ fn init_plugin_multiselect_ctrl_d_aborts() {
 #[test]
 fn init_plugin_prompt_line_fallback_parses_comma_ids() {
     // Non-TTY input keeps the line loop and comma-separated parsing
-    // byte-identical (headless dispatch, scripted tests, `--yes`).
+    // byte-identical (headless dispatch, scripted tests). `--yes` bypasses
+    // this prompt entirely.
+    let inventory = init_plugin_inventory_bundled(&["bitty-terminal.shell-integration"]);
     let mut input = std::io::BufReader::new(
         b" bitty-terminal.shell-integration , bitty-terminal.shell-integration \n".as_slice(),
     );
@@ -10414,6 +10457,7 @@ fn init_plugin_prompt_line_fallback_parses_comma_ids() {
         &mut history,
         false,
         false,
+        &inventory,
     );
     assert_eq!(
         result.expect("comma-separated ids parse"),
@@ -10421,13 +10465,391 @@ fn init_plugin_prompt_line_fallback_parses_comma_ids() {
     );
     let printed = String::from_utf8(output).expect("UTF-8");
     assert!(
-        printed.contains("Plugins (optional first batch, offline-safe):"),
+        printed.contains("Plugins (offline-safe; only bundled plugins install without network):"),
         "{printed}"
     );
     assert!(
-        printed.contains("Plugins [comma-separated ids, empty for none]:"),
+        printed.contains("  Installed (already present locally):"),
         "{printed}"
     );
+    assert!(
+        printed.contains("  Needs network (not shown, nothing is fetched):"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("Plugins [comma-separated bundled ids, empty for none]:"),
+        "{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_inventory_bundled_only_lists_other_official_as_network() {
+    let bundled = vec!["alpha.bundled".to_string()];
+    let inventory = crate::init::init_plugin_inventory(
+        &bundled,
+        Ok(Vec::new()),
+        &["alpha.bundled", "beta.official"],
+    );
+    assert_eq!(inventory.bundled, bundled);
+    assert!(inventory.installed.is_empty());
+    assert_eq!(inventory.needs_network, vec!["beta.official".to_string()]);
+    assert!(inventory.warning.is_none());
+}
+
+#[test]
+fn init_plugin_inventory_installed_only_is_listed_before_network() {
+    let store = vec![init_plugin_record("beta.installed", "0.2.0", false)];
+    let inventory =
+        crate::init::init_plugin_inventory(&[], Ok(store), &["beta.installed", "gamma.official"]);
+    assert!(inventory.bundled.is_empty());
+    assert_eq!(
+        inventory.installed,
+        vec![init_installed("beta.installed", "0.2.0", false)]
+    );
+    assert_eq!(
+        inventory.needs_network,
+        vec!["gamma.official".to_string()],
+        "an installed official plugin must not be advertised as needing network"
+    );
+}
+
+#[test]
+fn init_plugin_inventory_overlap_prefers_bundled_group() {
+    let bundled = vec!["alpha.bundled".to_string()];
+    let store = vec![
+        init_plugin_record("alpha.bundled", "0.1.0", true),
+        init_plugin_record("beta.installed", "0.3.0", true),
+    ];
+    let inventory = crate::init::init_plugin_inventory(
+        &bundled,
+        Ok(store),
+        &["alpha.bundled", "beta.installed"],
+    );
+    assert_eq!(
+        inventory.bundled,
+        vec!["alpha.bundled".to_string()],
+        "the overlap is shown once under the stronger bundled group"
+    );
+    assert_eq!(
+        inventory.installed,
+        vec![init_installed("beta.installed", "0.3.0", true)]
+    );
+    assert!(
+        inventory.needs_network.is_empty(),
+        "both groups cover the whole official catalog"
+    );
+}
+
+#[test]
+fn init_plugin_inventory_empty_state_is_explicit_not_an_error() {
+    let inventory = crate::init::init_plugin_inventory(&[], Ok(Vec::new()), &[]);
+    assert!(inventory.bundled.is_empty());
+    assert!(inventory.installed.is_empty());
+    assert!(inventory.needs_network.is_empty());
+    assert!(inventory.warning.is_none());
+}
+
+#[test]
+fn init_plugin_inventory_store_failure_is_bounded_and_bundled_only() {
+    let detail = format!("line one\nline two\t{}", "x".repeat(400));
+    let inventory = crate::init::init_plugin_inventory(
+        &["alpha.bundled".to_string()],
+        Err(detail),
+        &["alpha.bundled", "beta.official"],
+    );
+    let warning = inventory.warning.as_deref().expect("failure is surfaced");
+    assert!(
+        !warning.contains('\n') && !warning.contains('\t'),
+        "{warning}"
+    );
+    assert!(warning.ends_with("..."), "bounded marker: {warning}");
+    assert!(
+        warning.chars().count() <= crate::init::INIT_PLUGIN_WARNING_MAX_CHARS + 3,
+        "bounded warning: {warning}"
+    );
+    assert_eq!(inventory.bundled, vec!["alpha.bundled".to_string()]);
+    assert!(inventory.installed.is_empty());
+    assert_eq!(
+        inventory.needs_network,
+        vec!["beta.official".to_string()],
+        "bundled + network groups survive the degraded store"
+    );
+}
+
+#[test]
+fn init_plugin_multiselect_skips_installed_and_network_rows() {
+    let inventory = crate::init::InitPluginInventory {
+        bundled: vec!["alpha.plugin".to_string(), "gamma.plugin".to_string()],
+        installed: vec![init_installed("beta.plugin", "0.1.0", true)],
+        needs_network: vec!["delta.official".to_string()],
+        warning: None,
+    };
+    let mut input = std::io::BufReader::new(b"j \r".as_slice());
+    let mut output = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_multiselect_key_loop(
+        &mut input,
+        &mut output,
+        &inventory,
+        false,
+        false,
+        &mut wait,
+    );
+    assert_eq!(
+        result.expect("j moves to gamma, not the installed row"),
+        vec!["gamma.plugin".to_string()]
+    );
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("    - beta.plugin 0.1.0 (enabled)"),
+        "installed row is informational, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("[ ] beta.plugin") && !printed.contains("[x] beta.plugin"),
+        "installed rows are not selectable, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("1 official plugin needs a network install"),
+        "network summary, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_prompt_empty_bundled_states_groups_and_skips() {
+    let inventory = crate::init::InitPluginInventory {
+        bundled: Vec::new(),
+        installed: vec![init_installed("beta.plugin", "0.1.0", true)],
+        needs_network: vec!["gamma.official".to_string()],
+        warning: None,
+    };
+    let mut input = std::io::BufReader::new(b"".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let result = crate::init::init_prompt_plugin_selection(
+        &mut input,
+        &mut output,
+        &mut history,
+        false,
+        false,
+        &inventory,
+    );
+    assert!(
+        result.expect("nothing bundled selects none").is_empty(),
+        "no selectable rows"
+    );
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("  Bundled (install offline, no payload fetch):\n    none"),
+        "explicit empty bundled group, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("    - beta.plugin 0.1.0 (enabled)"),
+        "installed group still shown, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("  No bundled plugins to select; skipping."),
+        "explicit skip, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("Plugins [comma-separated bundled ids"),
+        "no prompt when nothing is selectable, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_prompt_bounds_installed_rows_and_counts_the_rest() {
+    let installed: Vec<_> = (0..10)
+        .map(|index| init_installed(&format!("gamma.installed{index:02}"), "0.1.0", true))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled: vec!["alpha.bundled".to_string()],
+        installed,
+        needs_network: Vec::new(),
+        warning: None,
+    };
+    let mut input = std::io::BufReader::new(b"\n".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let result = crate::init::init_prompt_plugin_selection(
+        &mut input,
+        &mut output,
+        &mut history,
+        false,
+        false,
+        &inventory,
+    );
+    assert!(result.expect("empty answer selects none").is_empty());
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("    - gamma.installed07 0.1.0 (enabled)"),
+        "eighth row is shown, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("gamma.installed08 0.1.0")
+            && !printed.contains("gamma.installed09 0.1.0"),
+        "rows past the bound are counted, not printed, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("    - +2 more installed plugins (bitty plugin list)"),
+        "remainder is explicit, got:\n{printed}"
+    );
+}
+
+#[test]
+fn init_plugin_inventory_for_env_reads_local_store_read_only() {
+    let dir = init_test_dir("inventory-store");
+    let store = dir
+        .join(".local")
+        .join("share")
+        .join("bitty")
+        .join("plugins");
+    std::fs::create_dir_all(&store).expect("store dir");
+    bitty_runtime::plugin_runtime::write_index(
+        &store,
+        &[init_plugin_record("bitty-terminal.bar", "0.1.0", true)],
+    )
+    .expect("write index");
+    let index_before = std::fs::read(store.join("current.json")).expect("index bytes");
+
+    let home = dir.display().to_string();
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let inventory = crate::init::init_plugin_inventory_for_env(&env);
+    assert!(
+        inventory
+            .bundled
+            .contains(&"bitty-terminal.shell-integration".to_string()),
+        "bundled catalog is always listed"
+    );
+    assert_eq!(inventory.installed.len(), 1);
+    assert_eq!(inventory.installed[0].id, "bitty-terminal.bar");
+    assert_eq!(inventory.installed[0].version, "0.1.0");
+    assert!(inventory.installed[0].enabled);
+    assert!(
+        !inventory
+            .needs_network
+            .contains(&"bitty-terminal.bar".to_string()),
+        "installed official plugin is not a network row"
+    );
+    assert!(inventory.warning.is_none());
+    assert_eq!(
+        std::fs::read(store.join("current.json")).expect("index bytes"),
+        index_before,
+        "discovery must never rewrite the store"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_plugin_inventory_for_env_malformed_store_degrades_to_bundled() {
+    let dir = init_test_dir("inventory-broken-store");
+    let store = dir
+        .join(".local")
+        .join("share")
+        .join("bitty")
+        .join("plugins");
+    std::fs::create_dir_all(&store).expect("store dir");
+    std::fs::write(store.join("current.json"), "{not-json").expect("broken index");
+    let home = dir.display().to_string();
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let inventory = crate::init::init_plugin_inventory_for_env(&env);
+    assert!(
+        inventory
+            .bundled
+            .contains(&"bitty-terminal.shell-integration".to_string()),
+        "bundled catalog survives a broken store"
+    );
+    assert!(inventory.installed.is_empty());
+    assert!(inventory.warning.is_some(), "failure is surfaced");
+    assert_eq!(
+        inventory.needs_network.len(),
+        bitty_plugin_host::official::official_plugins().len(),
+        "no installed official entry is subtracted when discovery fails"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_malformed_store_warns_and_still_writes_config() {
+    let dir = init_test_dir("init-malformed-store");
+    let store = dir
+        .join(".local")
+        .join("share")
+        .join("bitty")
+        .join("plugins");
+    std::fs::create_dir_all(&store).expect("store dir");
+    std::fs::write(store.join("current.json"), "{not-json").expect("broken index");
+    let xdg = dir.display().to_string();
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true; // interactive: TTY + no --yes
+    let env = init_env(None, Some("/bin/bash"), Some(&xdg), Some(&home), true);
+    // Eleven lua defaults plus the plugin step (empty = none).
+    let stdin_lines = "\n".repeat(12);
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0,
+        "a read-only discovery failure must never abort init"
+    );
+    assert!(
+        dir.join("bitty").join("init.lua").exists(),
+        "config is written despite the degraded inventory"
+    );
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        printed.contains("warning: installed plugin discovery failed:"),
+        "bounded warning, got:\n{printed}"
+    );
+    assert!(
+        printed.contains("Plugins (offline-safe; only bundled plugins install without network):"),
+        "bundled fallback is shown, got:\n{printed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.join("current.json")).expect("index bytes"),
+        "{not-json",
+        "discovery must not rewrite the broken store"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_yes_never_reads_or_reports_the_plugin_store() {
+    let dir = init_test_dir("init-yes-broken-store");
+    let store = dir
+        .join(".local")
+        .join("share")
+        .join("bitty")
+        .join("plugins");
+    std::fs::create_dir_all(&store).expect("store dir");
+    std::fs::write(store.join("current.json"), "{not-json").expect("broken index");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0,
+        "--yes keeps the offline non-interactive path"
+    );
+    assert!(target.exists());
+    let printed = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        !printed.contains("Plugins (offline-safe; only bundled plugins install"),
+        "--yes never runs the plugin prompt, got:\n{printed}"
+    );
+    assert!(
+        !printed.contains("discovery failed"),
+        "--yes never reads the plugin store, got:\n{printed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

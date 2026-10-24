@@ -100,6 +100,7 @@ jobs:
       - name: Validate Nix Flake and Cachix binary cache integration
         run: |
           bash scripts/tests/check-nix-flake.test.sh
+          bash scripts/tests/check-nix-patch-stub.test.sh
       - name: Validate source PKGBUILD (artifact-install consistency)
         run: |
           bash scripts/check-pkgbuild-source.sh

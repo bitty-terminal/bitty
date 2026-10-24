@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available under the canonical `list` spelling as well; the `+list-*`
   spellings are aliases.
 
+### Fixed
+
+- **Panel delete no longer flashes a stale accent ring at the removed slot
+  (#2577):** closing a focused pane kept its last presented decoration ring
+  as RFC-0002 closing chrome, and that stale ring was composited after every
+  live leaf. For the close duration it painted the deleted pane's full accent
+  rounded rectangle over the sibling that had already expanded into the slot;
+  under `catppuccin-mocha`'s teal focused outline the owner saw a green flash.
+  Closing chrome is now ownership-gated against the painted live allocations
+  (the invariant is live ownership wins over stale chrome), so a vacated slot
+  presents its surviving owner immediately for tiled, stacked, zoomed,
+  floating, and pinned deletes under any theme. Deterministic headless frame
+  regressions compare each close frame with an instant-delete reference in
+  `catppuccin-mocha` and `github-light`.
+
 ## [0.0.27] - 2026-10-23
 
 ### Added

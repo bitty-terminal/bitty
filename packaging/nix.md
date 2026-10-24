@@ -101,6 +101,36 @@ Add Bitty to your flake inputs:
 }
 ```
 
+## Build Model
+
+The flake builds one real-source derivation per system. It does not split a
+dependency-only `cargoArtifacts` layer through crane's dummy source
+(`buildDepsOnly`/`mkDummySrc`): the workspace `Cargo.toml` contains
+
+```toml
+[patch."https://github.com/bitty-terminal/bitty"]
+bitty-pty = { path = "crates/bitty-pty" }
+bitty-plugin-host = { path = "crates/bitty-plugin-host" }
+```
+
+and the external `bitty-execution` dependency resolves those edges through the
+patch. A dummy source replaces every workspace crate with an empty stub, so
+that dependency would compile against a fake `bitty_pty` and fail (or worse,
+link a stub that happens to satisfy the names). `cargoArtifacts = null` is
+therefore load-bearing; omitting it lets `buildPackage` create the stub-source
+cache internally. See
+<https://github.com/bitty-terminal/bitty/issues/2591>.
+
+This keeps the release path reproducible without losing binary caching: each
+release changes the workspace version, so the stub source would not be reused
+between tags either, and Cachix stores the final closure. The guard below fails
+if dummy-source caching returns while the patch paths exist:
+
+```sh
+just nix-patch-check   # static check, no Nix or network needed
+just nix-patch-test    # contract test for the guard, runs in `just check`
+```
+
 ## Verifying the Flake Lock
 
 `flake.lock` pins every input to an exact revision together with its NAR hash

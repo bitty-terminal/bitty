@@ -54,12 +54,41 @@
             libxkbcommon
             wayland
           ];
+          # #2591: the workspace `[patch."https://github.com/bitty-terminal/bitty"]`
+          # table points the external `bitty-execution` dependency's
+          # `bitty-pty`/`bitty-plugin-host` edges at the local crates. A build
+          # tree assembled by crane's dummy-source mode replaces those crates
+          # with empty stubs, so refuse it before cargo sees the graph.
+          postPatch = ''
+            for crate in bitty-pty bitty-plugin-host; do
+              lib="crates/$crate/src/lib.rs"
+              if [ ! -f "$lib" ]; then
+                echo "error: $lib is missing; the workspace [patch] requires real sources (#2591)" >&2
+                exit 1
+              fi
+              if grep -q "unused_extern_crates" "$lib" &&
+                grep -q 'pub fn main() {}' "$lib"; then
+                echo "error: $lib is a crane dummy stub; the workspace [patch] requires real sources (#2591)" >&2
+                exit 1
+              fi
+            done
+          '';
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
+        # #2591: keep this a single real-source derivation. `cargoArtifacts`
+        # must stay explicitly null: crane's buildPackage otherwise creates a
+        # dependency-only derivation from a stubbed workspace, which cannot
+        # compile the external `bitty-execution` dependency against the local
+        # `[patch]` crates. Release tags change the workspace version, so the
+        # stub source never survives between releases anyway; Cachix caches
+        # the final closure. `just nix-patch-test` fails if dummy-source
+        # caching comes back while the patch paths exist.
         bitty = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
+          cargoArtifacts = null;
+          # The 25-minute release job only needs the binary; compiling test
+          # targets in this derivation (`cargo test --no-run`) adds no check
+          # coverage because crane never runs them. The test suites run in CI.
+          doCheck = false;
           cargoExtraArgs = "-p bitty-terminal";
         });
       in

@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available under the canonical `list` spelling as well; the `+list-*`
   spellings are aliases.
 
+### Fixed
+
+- **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
+  failed in the `bitty-deps` derivation because crane's dummy source replaced
+  `crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
+  external `bitty-execution` dependency resolves those crates through the
+  workspace `[patch]` table. The flake now builds a single real-source
+  derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
+  dummy-source caching returns while those patch paths exist.
+
 ## [0.0.27] - 2026-10-23
 
 ### Added

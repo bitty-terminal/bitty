@@ -1122,6 +1122,10 @@ pub struct Runtime {
     band_stats: band_host::BandHostStats,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
+    /// Consumes the repeat and release belonging to the Enter press that
+    /// confirmed a pending paste (CTX-1505). The flag is cleared by that
+    /// physical release so a later Enter is ordinary terminal input.
+    pending_paste_enter_swallow: bool,
     /// Wall time when the current pending paste was gated (CTX-0192).
     ///
     /// Drives the transient banner: full summary for
@@ -1981,6 +1985,7 @@ impl Runtime {
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
+            pending_paste_enter_swallow: false,
             pending_paste_since: None,
             pending_close_confirm: None,
             paste_banner_collapsed: false,
@@ -2276,6 +2281,7 @@ impl Runtime {
             band_stats: band_host::BandHostStats::default(),
             search_state: SearchState::new(),
             pending_paste: None,
+            pending_paste_enter_swallow: false,
             pending_paste_since: None,
             pending_close_confirm: None,
             paste_banner_collapsed: false,

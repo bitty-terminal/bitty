@@ -2,7 +2,7 @@
 
 Bitty is a Rust terminal workspace: a GPU-rendered terminal emulator and
 multi-pane window manager for shell sessions. It is pre-1.0 and pre-alpha; the
-current release line is `v0.0.27`, there is no stable public API, and behavior,
+current release line is `v0.0.28`, there is no stable public API, and behavior,
 configuration keys, and package names may change between releases.
 
 The product site is [bitty.run](https://bitty.run). Release artifacts and
@@ -90,7 +90,7 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
   ```
 
 - **Apple Disk Image (DMG)**:
-  Download `Bitty-<version>-universal.dmg` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.27/).
+  Download `Bitty-<version>-universal.dmg` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.28/).
 
 #### Windows
 
@@ -112,7 +112,7 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
   ```
 
 - **Setup wizard (Inno Setup)**:
-  Download `bitty-<version>-windows-x86_64-setup.exe` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.27/). _(See [`packaging/WINDOWS-SMARTSCREEN.md`](packaging/WINDOWS-SMARTSCREEN.md))_
+  Download `bitty-<version>-windows-x86_64-setup.exe` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.28/). _(See [`packaging/WINDOWS-SMARTSCREEN.md`](packaging/WINDOWS-SMARTSCREEN.md))_
 
 #### BSD
 

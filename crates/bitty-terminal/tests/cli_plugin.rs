@@ -1874,6 +1874,70 @@ fn plugin_ledger_migrates_legacy_toml_once() {
 }
 
 #[test]
+fn plugin_ledger_migrates_long_capabilities_without_corruption() {
+    let home = scratch_dir("ledger-migrate-long-caps");
+    let ledger = state_file(&home);
+    let legacy = legacy_state_file(&home);
+    let long_a = format!("fs.read:{}", "a".repeat(500));
+    let long_b = format!("fs.read:{}", "b".repeat(500));
+    let hash = "0".repeat(64);
+    let body = format!(
+        "state_version = 1\n\n[plugins.\"xuepoo.longcaps\"]\n\
+         source = \"bundled\"\nmanifest_hash = \"{hash}\"\nenabled = true\n\
+         granted = [\"{long_a}\", \"{long_b}\"]\ndenied = []\n"
+    );
+    std::fs::create_dir_all(home.join("bitty")).expect("config dir");
+    std::fs::write(&legacy, &body).expect("legacy ledger");
+
+    // The old inline renderer produced a >1024-byte capability line here;
+    // migration then committed a ledger the parser rejected and moved the
+    // TOML aside. The first post-migration command must now stay healthy.
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(ledger.is_file(), "Lua ledger written");
+    assert!(!legacy.exists(), "legacy TOML moved aside");
+    let backup = home.join("bitty").join("bitty-plugins.toml.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("backup"),
+        body,
+        "legacy bytes retained verbatim"
+    );
+    let migrated = std::fs::read_to_string(&ledger).expect("ledger");
+    for line in migrated.lines() {
+        assert!(
+            line.len() <= 1024,
+            "rendered line exceeds the parser bound: {} bytes",
+            line.len()
+        );
+    }
+    assert!(migrated.contains(&long_a), "{migrated}");
+    assert!(migrated.contains(&long_b), "{migrated}");
+
+    // Parsing is stable on the next command. Doctor reports the unknown
+    // record as a warning (exit 1) but must not quarantine a valid ledger.
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(&home, &["plugin", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("no bundled manifest"),
+        "{}",
+        stdout(&output)
+    );
+    let corrupt = std::fs::read_dir(home.join("bitty"))
+        .expect("config dir")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("bitty-plugins.lua.corrupt-")
+        });
+    assert!(!corrupt, "a valid migrated ledger must not be quarantined");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn plugin_doctor_migrates_a_legacy_ledger_on_repair() {
     let home = scratch_dir("doctor-legacy-ledger");
     let ledger = state_file(&home);
@@ -1913,6 +1977,29 @@ fn plugin_doctor_migrates_a_legacy_ledger_on_repair() {
     let output = run_in(&home, &["plugin", "list"], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(stdout(&output).contains(PLUGIN), "{}", stdout(&output));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_doctor_repair_is_a_noop_for_a_current_ledger() {
+    let home = scratch_dir("doctor-noop-ledger");
+    let output = run_in(&home, &["plugin", "install", PLUGIN, "--yes"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let ledger = state_file(&home);
+    let before = std::fs::read(&ledger).expect("ledger bytes");
+
+    let output = run_in(&home, &["plugin", "doctor", "--repair"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("ledger already consistent"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(std::fs::read(&ledger).expect("ledger bytes"), before);
+    assert!(
+        !home.join("bitty").join("bitty-plugins.lua.bak").exists(),
+        "a healthy ledger must not churn its backup every repair"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2037,6 +2124,34 @@ fn plugin_install_generates_commented_defaults_once() {
     let output = run_in(&home, &["plugin", "install", PLUGIN, "--yes"], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(!config_dir(&home).join(format!("{PLUGIN}.lua")).exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_install_skips_generation_beside_a_short_alias() {
+    let home = scratch_dir("generated-short-alias");
+    let target = config_dir(&home).join("xuepoo.cfg.lua");
+    let alias = config_dir(&home).join("cfg.lua");
+    std::fs::create_dir_all(config_dir(&home)).expect("plugins dir");
+    std::fs::write(&alias, "return { show = false }\n").expect("alias settings");
+    install_config_fixture(&home);
+    assert!(
+        !target.exists(),
+        "the generated canonical file would shadow the alias"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&alias).expect("alias unchanged"),
+        "return { show = false }\n"
+    );
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("lua-alias"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("show") && line.contains("false")),
+        "alias value must remain effective: {text}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 

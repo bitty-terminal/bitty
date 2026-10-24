@@ -8,7 +8,7 @@
 //! - `bitty +list-profiles [--json]` — profile names under
 //!   `$XDG_CONFIG_HOME/bitty/profiles/`.
 //! - `bitty +list-plugins --installed [--json]` — ids of plugins present in
-//!   the managed `bitty-plugins.toml` ledger or the installed XDG plugin
+//!   the managed `bitty-plugins.lua` ledger or the installed XDG plugin
 //!   store. The plain `+list-plugins`/`list plugins` alias keeps its existing
 //!   static-catalog contract; `--installed` is the candidate-only view.
 //!
@@ -29,7 +29,7 @@
 //!   Candidates never carry diagnostics, host paths, or ANSI escapes.
 //! - Bounds: at most [`MAX_CANDIDATES`] candidates, each at most
 //!   [`MAX_CANDIDATE_BYTES`] bytes; the underlying state/store reads keep
-//!   their own byte ceilings (`bitty-plugins.toml` 64 KiB, `current.json`
+//!   their own byte ceilings (`bitty-plugins.lua` 64 KiB, `current.json`
 //!   bounded by the runtime index ceiling).
 //! - Failure: missing or malformed state yields an empty candidate set with
 //!   exit 0 and no stderr, so a broken store can never break the shell.
@@ -293,15 +293,23 @@ mod tests {
     }
 
     fn write_state(path: &Path, ids: &[&str]) {
-        let mut text = String::from("state_version = 1\n");
-        for id in ids {
-            text.push_str(&format!(
-                "[plugins.\"{id}\"]\nsource = \"bundled\"\n\
-                 manifest_hash = \"{}\"\nenabled = true\ngranted = []\n",
-                "a".repeat(64)
-            ));
-        }
-        std::fs::write(path, text).expect("state file");
+        let records: std::collections::BTreeMap<String, crate::plugin::PluginRecord> = ids
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    crate::plugin::PluginRecord {
+                        source: "bundled".to_string(),
+                        manifest_hash: "a".repeat(64),
+                        enabled: true,
+                        granted: std::collections::BTreeSet::new(),
+                        denied: std::collections::BTreeSet::new(),
+                    },
+                )
+            })
+            .collect();
+        let state = crate::plugin::PluginState::from_records(records);
+        std::fs::write(path, state.render()).expect("state file");
     }
 
     fn store_record(id: &str) -> bitty_runtime::plugin_runtime::resolution::PluginRecord {
@@ -400,7 +408,7 @@ mod tests {
     #[test]
     fn plugins_union_state_and_store_sorted() {
         let dir = scratch_dir("plugins");
-        let state = dir.join("bitty-plugins.toml");
+        let state = dir.join("bitty-plugins.lua");
         write_state(&state, &["zeta.bundled", "alpha.bundled"]);
         let store = dir.join("store");
         std::fs::create_dir_all(&store).expect("store dir");
@@ -439,8 +447,8 @@ mod tests {
     #[test]
     fn plugins_malformed_state_and_store_fail_soft() {
         let dir = scratch_dir("plugins-malformed");
-        let state = dir.join("bitty-plugins.toml");
-        std::fs::write(&state, "state_version = 2\n").expect("bad state");
+        let state = dir.join("bitty-plugins.lua");
+        std::fs::write(&state, "return { state_version = 2").expect("bad state");
         let store = dir.join("store");
         std::fs::create_dir_all(&store).expect("store dir");
         std::fs::write(store.join("current.json"), "{not json").expect("bad index");
@@ -450,7 +458,7 @@ mod tests {
     #[test]
     fn plugins_oversized_state_fails_soft() {
         let dir = scratch_dir("plugins-oversized");
-        let state = dir.join("bitty-plugins.toml");
+        let state = dir.join("bitty-plugins.lua");
         std::fs::write(&state, "x".repeat(bitty_plugin_state_ceiling() + 1)).expect("big state");
         assert!(plugin_candidates_from(Some(&state), None).is_empty());
     }

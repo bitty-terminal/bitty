@@ -383,6 +383,34 @@ struct ScrollShift {
     glyphs: Vec<bitty_render::grid::GlyphInstance>,
 }
 
+/// Detects a retained glyph whose pixel bounds intersect a fresh repaint
+/// region without being wholly covered by a full-row repaint.
+///
+/// Grid damage is cell-aligned, but glyph bitmaps may overhang their cell and
+/// are painted after fills. A retained glyph therefore cannot survive any
+/// fresh repaint that intersects its bounds: an erase can repaint the cell's
+/// background without emitting a replacement glyph, leaving the retained
+/// glyph visible over the erased cell. The scroll fast path uses this helper
+/// for companion damage while retaining the unaffected primitives.
+fn retained_glyph_requires_full_redraw(
+    glyph: &bitty_render::grid::GlyphInstance,
+    repaint_regions: &[bitty_render::geometry::RectPx],
+    fullwidth_repaint: &[bitty_render::geometry::RectPx],
+) -> bool {
+    let bounds = bitty_render::geometry::RectPx::new(
+        glyph.dest[0],
+        glyph.dest[1],
+        glyph.size[0],
+        glyph.size[1],
+    );
+    repaint_regions.iter().any(|region| {
+        region.intersection(&bounds).is_some()
+            && !fullwidth_repaint
+                .iter()
+                .any(|fullwidth| fullwidth.contains_rect(&bounds))
+    })
+}
+
 /// Leaf-local grid damage rectangle to window-pixel rectangle (CTX-1207).
 /// Total like the CTX-0253 helpers: `i64` intermediates, clamped into
 /// `i32`/`u32` ranges, so hostile cell metrics cannot wrap.
@@ -1280,10 +1308,10 @@ impl Runtime {
             }
         }
         // Retained primitives inside a companion rect show pre-print
-        // content and are never dropped by the full-width `covered`
-        // rule below, so a stale glyph would paint over the fresh
-        // fill. Only companion damage the band or margin row already
-        // owns may ride the fast path; anything else declines.
+        // content and are not removed by the full-width `covered` rule
+        // below. A translated companion outside the exposed band or its
+        // margin would therefore leave a stale primitive over the fresh
+        // fill; keep the existing fail-closed scroll-copy eligibility rule.
         for rect in &translated {
             let in_band = rect.top >= exposed_top && rect.bottom <= exposed_bottom;
             let on_margin = rect.top == margin_row && rect.bottom == margin_row;
@@ -1302,6 +1330,11 @@ impl Runtime {
         // content adjacency — and kept/fresh overlaps agree, making
         // paint order between them irrelevant.
         let cell = self.live_cell_metrics();
+        let translated_repaint: Vec<bitty_render::geometry::RectPx> = regions
+            .iter()
+            .skip(2)
+            .map(|rect| damage_rect_to_window_px(rect, origin_px, cell))
+            .collect();
         let fullwidth_repaint: Vec<bitty_render::geometry::RectPx> = (exposed_top..=exposed_bottom)
             .chain(std::iter::once(margin_row))
             .map(|row| {
@@ -1317,6 +1350,8 @@ impl Runtime {
                 )
             })
             .collect();
+        let mut repaint_regions = fullwidth_repaint.clone();
+        repaint_regions.extend(translated_repaint.iter().copied());
         let covered = |rect: &bitty_render::geometry::RectPx| {
             fullwidth_repaint
                 .iter()
@@ -1364,7 +1399,21 @@ impl Runtime {
                 kept.size[0],
                 kept.size[1],
             );
+            if retained_glyph_requires_full_redraw(&kept, &repaint_regions, &fullwidth_repaint) {
+                // A partial companion repaint can erase a cell while a
+                // retained glyph overhangs outside that cell. The fresh fill
+                // cannot remove the overhang, so the scroll copy is not
+                // sound for this frame; the caller will render the leaf
+                // completely instead of leaving a stale glyph fragment.
+                return None;
+            }
             if covered(&bounds) || stale(dest_row(glyph.dest[1]), true) {
+                continue;
+            }
+            if translated_repaint
+                .iter()
+                .any(|fresh| fresh.contains_rect(&bounds))
+            {
                 continue;
             }
             glyphs.push(kept);
@@ -8055,6 +8104,39 @@ mod scroll_region_copy_tests {
     use super::*;
     use crate::runtime::AnimationKind;
 
+    #[test]
+    fn retained_glyph_overhang_requires_full_redraw() {
+        let glyph = bitty_render::grid::GlyphInstance {
+            dest: [8, -1],
+            size: [8, 21],
+            uv: [0.0; 4],
+            color: [255; 4],
+            clip: None,
+            source: bitty_render::grid::GlyphSource::Inline {
+                mask: vec![255; 8 * 21],
+                width: 8,
+                height: 21,
+            },
+        };
+        let full_row = bitty_render::geometry::RectPx::new(0, 0, 80, 19);
+        assert!(retained_glyph_requires_full_redraw(
+            &glyph,
+            &[full_row],
+            &[full_row]
+        ));
+
+        let contained = bitty_render::grid::GlyphInstance {
+            dest: [8, 1],
+            size: [8, 8],
+            ..glyph
+        };
+        assert!(!retained_glyph_requires_full_redraw(
+            &contained,
+            &[full_row],
+            &[full_row]
+        ));
+    }
+
     /// Deterministic single-pane runtime: 80x24 leaf, animations instant
     /// (no time-varying alpha between the two compared ticks).
     fn runtime() -> Runtime {
@@ -8172,6 +8254,29 @@ mod scroll_region_copy_tests {
         rt.handle_pty_bytes(b"\n\n\n");
     }
 
+    /// Vim's redraw shape: scroll the full viewport, then move to a row in
+    /// the retained span and erase only the suffix before writing a shorter
+    /// replacement. The erase damage is a partial companion rectangle; a
+    /// retained glyph from the old suffix must not survive over its fresh
+    /// background.
+    fn drive_with_vim_suffix_erase(rt: &mut Runtime, wide: bool, alt: bool) {
+        for row in 0..24u8 {
+            let line = if wide {
+                format!("row-{row:02} 中OLD-SUFFIX\x1b[2K")
+            } else {
+                format!("row-{row:02} OLD-SUFFIX\x1b[2K")
+            };
+            rt.handle_pty_bytes(format!("\x1b[{};1H{line}", row + 1).as_bytes());
+        }
+        rt.tick();
+        if alt {
+            rt.handle_pty_bytes(b"\x1b[?1049h");
+            rt.handle_pty_bytes(b"\x1b[1;1HALT-OLD-SUFFIX");
+        }
+        rt.handle_pty_bytes(b"\x1b[24;1H\n");
+        rt.handle_pty_bytes(b"\x1b[11;1H\x1b[2KNEW");
+    }
+
     #[test]
     fn scroll_fast_path_declines_out_of_band_companion_rewrite() {
         // PX-6182 (CodeRabbit PR #2080 inline Major): a translated
@@ -8210,6 +8315,40 @@ mod scroll_region_copy_tests {
             fast_stats.cells_examined, full_stats.cells_examined,
             "out-of-band companion must decline the fast path (fail-closed full render)"
         );
+    }
+
+    #[test]
+    fn scroll_fast_path_repaints_vim_ascii_suffix_erase() {
+        let mut fast = runtime();
+        drive_with_vim_suffix_erase(&mut fast, false, false);
+        let mut full = runtime();
+        drive_with_vim_suffix_erase(&mut full, false, false);
+        full.pending_full_redraw = true;
+        let fast_stats = fast.tick().expect("erase repaint must present");
+        let full_stats = full.tick().expect("full repaint must present");
+        assert_eq!(fast.headless_rgba(), full.headless_rgba());
+        assert_eq!(
+            fast_stats.cells_examined, full_stats.cells_examined,
+            "partial erase intersecting a retained glyph must fail closed"
+        );
+    }
+
+    #[test]
+    fn scroll_fast_path_repaints_vim_wide_suffix_erase_and_alt_screen() {
+        for alt in [false, true] {
+            let mut fast = runtime();
+            drive_with_vim_suffix_erase(&mut fast, true, alt);
+            let mut full = runtime();
+            drive_with_vim_suffix_erase(&mut full, true, alt);
+            full.pending_full_redraw = true;
+            let fast_stats = fast.tick().expect("wide erase repaint must present");
+            let full_stats = full.tick().expect("wide full repaint must present");
+            assert_eq!(fast.headless_rgba(), full.headless_rgba(), "alt={alt}");
+            assert_eq!(
+                fast_stats.cells_examined, full_stats.cells_examined,
+                "wide partial erase intersecting a retained glyph must fail closed; alt={alt}"
+            );
+        }
     }
 }
 

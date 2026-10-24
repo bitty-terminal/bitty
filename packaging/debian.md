@@ -81,8 +81,12 @@ and:
 2. Generates architecture-specific `Packages` and `Packages.gz` via `scripts/generate-apt-repo.sh`.
 3. Creates the `Release` manifest, computes checksums, and signs `InRelease` and `Release.gpg`
    using the secret `APT_GPG_PRIVATE_KEY`. The `scripts/import-apt-gpg-key.sh`
-   helper accepts armored, base64-encoded, and literal-`\n` escaped secret forms
+   helper accepts armored, base64-encoded, quoted/BOM/CRLF, and literal-`\n` or
+   double-escaped secret forms (including an armored block embedded in text),
    and fails closed unless the imported secret-key fingerprint matches
-   `BCB87D7B489A64168080D900DF4751B6EA711CB8` before anything is signed.
+   `BCB87D7B489A64168080D900DF4751B6EA711CB8` before anything is signed. On
+   failure it prints a bounded shape diagnostic (length, armor presence, UTF-8
+   validity, base64 decode status/length, OpenPGP packet magic) and never the
+   secret value.
 4. Uploads the repository tree, keyring, deb822 source file, and setup script to Cloudflare R2
    at `bitty/apt/` via `wrangler r2 object put`.

@@ -2390,11 +2390,22 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     let layout_before = rt.layout().clone();
     let active_before = rt.active_workspace_index();
     let focus_before = rt.focused_view();
+    let primary_before = rt.primary_view();
     let sessions_before = rt.pane_session_ids();
+    let pane_sessions_without_primary: Vec<_> = sessions_before
+        .iter()
+        .copied()
+        .filter(|id| Some(*id) != primary_before)
+        .collect();
     assert_eq!(
-        sessions_before,
-        vec![ViewId::new(1), ViewId::new(3)],
-        "snapshot must include the surviving pane-session owners"
+        pane_sessions_without_primary,
+        vec![ViewId::new(3)],
+        "snapshot must include the surviving non-primary pane-session owner"
+    );
+    assert_eq!(
+        primary_before,
+        Some(ViewId::new(1)),
+        "the primary session owner is tracked separately from pane sessions"
     );
     let missing = apply_control_envelope(
         &mut rt,
@@ -2413,6 +2424,11 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     );
     assert_eq!(rt.focused_view(), focus_before, "focus unchanged");
     assert_eq!(rt.pane_session_ids(), sessions_before, "sessions unchanged");
+    assert_eq!(
+        rt.primary_view(),
+        primary_before,
+        "primary session unchanged"
+    );
 
     // Creation, rather than a failed stable move, reuses the lowest free id.
     let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);

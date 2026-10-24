@@ -1489,9 +1489,21 @@ impl Runtime {
         self.border_drag.take().is_some()
     }
 
+    /// Consumes the left-button release owned by an externally canceled
+    /// border drag. Returns `true` only for the tombstone, leaving a live
+    /// drag untouched so capture routing keeps its existing behavior.
+    pub(super) fn consume_canceled_border_drag_release(&mut self) -> bool {
+        if self.border_drag.as_ref().is_some_and(|drag| drag.canceled) {
+            self.border_drag = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Marks an active border drag canceled by an external geometry change.
     /// The tombstone is consumed by the matching left-button release through
-    /// [`Self::end_border_drag`], so selection-release/auto-copy cannot run.
+    /// normal or capture routing, so selection-release/auto-copy cannot run.
     pub(super) fn cancel_border_drag(&mut self) {
         if let Some(drag) = self.border_drag.as_mut() {
             drag.canceled = true;

@@ -205,6 +205,11 @@ impl Deref for LayoutMutGuard<'_> {
 
 impl DerefMut for LayoutMutGuard<'_> {
     fn deref_mut(&mut self) -> &mut LayoutNode {
+        // A caller can replace the live tree through this guard without
+        // passing through the public layout-install funnel. Invalidate the
+        // press-time geometry before exposing mutable access so stale border
+        // motion cannot mutate the caller's replacement tree.
+        self.runtime.cancel_border_drag();
         self.runtime.raise_view_id_high_water();
         &mut self.runtime.layout
     }

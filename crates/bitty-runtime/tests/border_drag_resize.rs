@@ -325,6 +325,68 @@ fn canceled_border_drag_release_does_not_finalize_existing_selection() {
 }
 
 #[test]
+fn canceled_border_drag_release_is_consumed_under_mouse_capture() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    // External geometry changes leave a release tombstone so the consumed
+    // border press cannot fall through into selection or auto-copy.
+    rt.set_window_cells(UiRect::new(0, 0, 72, 24));
+    assert!(!rt.border_drag_active());
+
+    // Enable capture after cancellation: the orphan release must still be
+    // consumed by the canceled host gesture rather than sent to the app.
+    rt.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    assert!(rt.mouse_capture_active());
+    rt.drain_pending_input();
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(
+        rt.pending_input().is_empty(),
+        "canceled border release must not reach a newly capturing app"
+    );
+
+    // The tombstone is one-shot: a later ordinary release follows capture
+    // routing normally instead of being swallowed by the stale drag.
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(
+        !rt.pending_input().is_empty(),
+        "after the canceled release, ordinary capture releases remain routed"
+    );
+}
+
+#[test]
+fn layout_mut_cancels_active_border_drag_before_replacement() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    // Keep the same split path and axis so stale motion would visibly apply
+    // the old press delta to this replacement if layout_mut failed to cancel.
+    let replacement = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.25,
+        LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(4), 80, 24)),
+    );
+    *rt.layout_mut() = replacement;
+    assert!(
+        !rt.border_drag_active(),
+        "layout mutation must cancel the drag"
+    );
+    assert!((ratio(&rt) - 0.25).abs() < 1e-6);
+
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert!((ratio(&rt) - 0.25).abs() < 1e-6);
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
+}
+
+#[test]
 fn external_layout_replacement_cancels_border_drag() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());

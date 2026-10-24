@@ -2492,7 +2492,7 @@ impl Runtime {
         // gaps, and split paths captured by a border drag. Internal live
         // border-drag commits explicitly preserve that state.
         if !preserve_border_drag {
-            self.end_border_drag();
+            self.cancel_border_drag();
         }
         // Issue #2528 review: any close ends the active creation chain, even
         // when the closed pane was not focused. Otherwise a stale Left/Top
@@ -2828,7 +2828,7 @@ impl Runtime {
     pub fn set_window_cells(&mut self, rect: UiRect) {
         // Changing the container invalidates any border drag's press-time
         // geometry. Cancel before publishing the new window bounds.
-        self.end_border_drag();
+        self.cancel_border_drag();
         self.window_cells = rect;
         self.container = self.band_exclusive_container();
         self.pending_full_redraw = true;
@@ -2904,7 +2904,7 @@ impl Runtime {
         }
         // A changed container invalidates the press-time geometry captured by
         // any active border drag. Cancel before publishing and reflowing it.
-        self.end_border_drag();
+        self.cancel_border_drag();
         self.container = container;
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();
@@ -3250,7 +3250,7 @@ impl Runtime {
     pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
         // A caller-requested reflow changes the geometry paired with a
         // border drag, so stale motion must not reach the current tree.
-        self.end_border_drag();
+        self.cancel_border_drag();
         let gaps = self.gaps();
         self.layout.reflow_with_gaps(self.container, gaps);
         self.pending_full_redraw = true;

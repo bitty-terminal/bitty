@@ -14,6 +14,7 @@ use bitty_platform::{
 use bitty_runtime::{
     BandContent, ChromeBands, LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
+use bitty_ui::{CellPos, Selection};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -220,6 +221,8 @@ fn resize_cancels_border_drag_before_reflow() {
         &resized,
         "motion from the canceled drag must not mutate reflowed geometry"
     );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
 }
 
 #[test]
@@ -251,6 +254,73 @@ fn chrome_band_refresh_cancels_border_drag_before_reflow() {
         rt.layout(),
         &refreshed,
         "motion from the canceled drag must not mutate refreshed geometry"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
+}
+
+#[test]
+fn set_container_cancels_active_border_drag_before_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.set_container(UiRect::new(0, 0, 72, 24));
+    assert!(!rt.border_drag_active());
+    let changed = rt.layout().clone();
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert_eq!(rt.layout(), &changed);
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
+}
+
+#[test]
+fn set_window_cells_cancels_active_border_drag_before_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.set_window_cells(UiRect::new(0, 0, 72, 24));
+    assert!(!rt.border_drag_active());
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
+}
+
+#[test]
+fn reflow_layout_cancels_active_border_drag_before_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.reflow_layout();
+    assert!(!rt.border_drag_active());
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.is_selection_dragging());
+}
+
+#[test]
+fn canceled_border_drag_release_does_not_finalize_existing_selection() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.set_selection(Selection::simple(CellPos::new(0, 0), CellPos::new(0, 1)));
+    assert!(rt.is_selection_dragging());
+
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.set_window_cells(UiRect::new(0, 0, 72, 24));
+    assert!(!rt.border_drag_active());
+
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(
+        rt.is_selection_dragging(),
+        "the canceled border press must consume its later release"
     );
 }
 

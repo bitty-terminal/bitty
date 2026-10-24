@@ -461,7 +461,7 @@ impl Runtime {
         // The window geometry invalidates the press-time container captured
         // by any active border drag. Cancel before changing the container or
         // reflowing its layout.
-        self.end_border_drag();
+        self.cancel_border_drag();
         // CTX-0375: the primary grid follows the primary owner leaf's
         // *decorated content* frame, not the window grid. The Core-owned
         // decoration (`gaps_out + border + content_inset`, CTX-0294/CTX-0333)
